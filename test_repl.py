@@ -1,7 +1,5 @@
 """Tests for repl.py - Maestro REPL and DAG management."""
 
-import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -365,7 +363,7 @@ class TestMaestroREPL(unittest.TestCase):
         dag.add_task(task)
         repl_instance = repl.MaestroREPL(dag)
         with tempfile.TemporaryDirectory() as tmpdir:
-            dag_path = Path(tmpdir) / ".maestro" / "task_dag.json"
+            _ = Path(tmpdir) / ".maestro" / "task_dag.json"
             success = repl_instance._transition_task("task-1", dags.TaskState.ACTIVE, "test message")
             self.assertTrue(success)
             self.assertEqual(task.state, dags.TaskState.ACTIVE)
@@ -404,7 +402,7 @@ class TestMaestroREPL(unittest.TestCase):
         dag.add_task(task)
         repl_instance = repl.MaestroREPL(dag)
         with tempfile.TemporaryDirectory() as tmpdir:
-            dag_path = Path(tmpdir) / ".maestro" / "task_dag.json"
+            _ = Path(tmpdir) / ".maestro" / "task_dag.json"
             success = repl_instance._mark_failed("task-1", "Test failure")
             self.assertTrue(success)
             self.assertEqual(task.state, dags.TaskState.REVERTED)

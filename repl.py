@@ -1,6 +1,5 @@
 """Maestro REPL: Primary control loop that navigates the task DAG."""
 
-import json
 import subprocess
 from pathlib import Path
 from typing import Any

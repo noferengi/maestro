@@ -5,7 +5,6 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-import config
 
 
 class TaskState(StrEnum):
