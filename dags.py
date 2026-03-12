@@ -188,6 +188,21 @@ class TaskDAG:
 
         return True
 
+    def force_accept(self, task_id: str) -> bool:
+        """
+        Force accept a task (bypassing ACTIVE/VERIFYING states).
+        Useful for testing or manual overrides.
+
+        Returns True if the transition was successful.
+        """
+        task = self._task_map.get(task_id)
+        if task is None:
+            return False
+
+        # Allow transition from any state to ACCEPTED
+        task.state = TaskState.ACCEPTED
+        return True
+
     def mark_as_reverted(self, task_id: str) -> bool:
         """Mark a task as REVERTED (back to design phase)."""
         task = self._task_map.get(task_id)
