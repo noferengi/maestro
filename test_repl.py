@@ -298,13 +298,274 @@ class TestCheckpointManager(unittest.TestCase):
             manager = repl.CheckpointManager(tmpdir)
             self.assertEqual(manager.project_root, Path(tmpdir))
 
-    def test_git_command_not_found(self):
-        """Test handling when git is not available."""
-        # This test may not work in all environments, but tests error handling
-        manager = repl.CheckpointManager("/")
-        success, output = manager.add_files()
-        # In a test environment without git, this should fail gracefully
-        # In a real environment with git, it may succeed or fail for other reasons
+    def test_checkpoint_manager_creation_with_path_object(self):
+        """Test CheckpointManager initialization with Path object."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = repl.CheckpointManager(Path(tmpdir))
+            self.assertEqual(manager.project_root, Path(tmpdir))
+
+    def test_run_git_command_success(self):
+        """Test successful git command execution."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = repl.CheckpointManager(tmpdir)
+            # Initialize git repo first
+            manager._run_git_command("init")
+            manager._run_git_command("config", "user.email", "test@example.com")
+            manager._run_git_command("config", "user.name", "Test User")
+            
+            success, stdout, stderr = manager._run_git_command("status", "--porcelain")
+            self.assertTrue(success)
+            self.assertEqual(stderr, "")
+
+    def test_run_git_command_failure(self):
+        """Test git command failure handling."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = repl.CheckpointManager(tmpdir)
+            # Try to run git command in non-git directory
+            success, stdout, stderr = manager._run_git_command("status", "--porcelain")
+            # This should fail since there's no git repo
+            self.assertFalse(success)
+            self.assertIn("git", stderr.lower()) or self.assertIn("repository", stderr.lower())
+
+    def test_add_files_single_file(self):
+        """Test adding a single file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = repl.CheckpointManager(tmpdir)
+            # Initialize git repo
+            manager._run_git_command("init")
+            manager._run_git_command("config", "user.email", "test@example.com")
+            manager._run_git_command("config", "user.name", "Test User")
+            
+            # Create a test file
+            test_file = Path(tmpdir) / "test.txt"
+            test_file.write_text("test content")
+            
+            success, msg = manager.add_files(["test.txt"])
+            self.assertTrue(success)
+            self.assertIn("Added", msg)
+
+    def test_add_files_multiple_files(self):
+        """Test adding multiple files."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = repl.CheckpointManager(tmpdir)
+            # Initialize git repo
+            manager._run_git_command("init")
+            manager._run_git_command("config", "user.email", "test@example.com")
+            manager._run_git_command("config", "user.name", "Test User")
+            
+            # Create test files
+            (Path(tmpdir) / "file1.txt").write_text("content1")
+            (Path(tmpdir) / "file2.txt").write_text("content2")
+            
+            success, msg = manager.add_files(["file1.txt", "file2.txt"])
+            self.assertTrue(success)
+            self.assertIn("Added", msg)
+
+    def test_add_files_all_changes(self):
+        """Test adding all changes (no specific files)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = repl.CheckpointManager(tmpdir)
+            # Initialize git repo
+            manager._run_git_command("init")
+            manager._run_git_command("config", "user.email", "test@example.com")
+            manager._run_git_command("config", "user.name", "Test User")
+            
+            # Create a test file
+            (Path(tmpdir) / "test.txt").write_text("test content")
+            
+            success, msg = manager.add_files(None)
+            self.assertTrue(success)
+            self.assertIn("All changes", msg)
+
+    def test_commit_success(self):
+        """Test successful commit."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = repl.CheckpointManager(tmpdir)
+            # Initialize git repo
+            manager._run_git_command("init")
+            manager._run_git_command("config", "user.email", "test@example.com")
+            manager._run_git_command("config", "user.name", "Test User")
+            
+            # Create and add a file
+            (Path(tmpdir) / "test.txt").write_text("test content")
+            manager.add_files(["test.txt"])
+            
+            success, msg = manager.commit("Initial commit")
+            self.assertTrue(success)
+            self.assertIn("Commit", msg)
+
+    def test_commit_with_special_characters_in_message(self):
+        """Test commit with special characters in message."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = repl.CheckpointManager(tmpdir)
+            # Initialize git repo
+            manager._run_git_command("init")
+            manager._run_git_command("config", "user.email", "test@example.com")
+            manager._run_git_command("config", "user.name", "Test User")
+            
+            # Create and add a file
+            (Path(tmpdir) / "test.txt").write_text("test content")
+            manager.add_files(["test.txt"])
+            
+            success, msg = manager.commit('Task with "quotes" and special chars')
+            self.assertTrue(success)
+            self.assertIn("Commit", msg)
+
+    def test_commit_failure_no_changes(self):
+        """Test commit failure when there are no changes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = repl.CheckpointManager(tmpdir)
+            # Initialize git repo
+            manager._run_git_command("init")
+            manager._run_git_command("config", "user.email", "test@example.com")
+            manager._run_git_command("config", "user.name", "Test User")
+            
+            # No changes to commit
+            success, msg = manager.commit("Empty commit")
+            self.assertFalse(success)
+            self.assertIn("failed", msg.lower())
+
+    def test_push_success(self):
+        """Test successful push (to empty remote)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = repl.CheckpointManager(tmpdir)
+            # Initialize git repo
+            manager._run_git_command("init")
+            manager._run_git_command("config", "user.email", "test@example.com")
+            manager._run_git_command("config", "user.name", "Test User")
+            
+            # Create and commit a file
+            (Path(tmpdir) / "test.txt").write_text("test content")
+            manager.add_files(["test.txt"])
+            manager.commit("Initial commit")
+            
+            success, msg = manager.push()
+            # Push may fail if no remote is configured, which is expected
+            # We just verify the method runs without crashing
+            self.assertIsInstance(success, bool)
+
+    def test_push_failure_no_remote(self):
+        """Test push failure when no remote is configured."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = repl.CheckpointManager(tmpdir)
+            # Initialize git repo (no remote configured)
+            manager._run_git_command("init")
+            manager._run_git_command("config", "user.email", "test@example.com")
+            manager._run_git_command("config", "user.name", "Test User")
+            
+            success, msg = manager.push()
+            self.assertFalse(success)
+            self.assertIn("failed", msg.lower())
+
+    def test_check_status_clean_repo(self):
+        """Test check status on clean repository."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = repl.CheckpointManager(tmpdir)
+            # Initialize git repo
+            manager._run_git_command("init")
+            manager._run_git_command("config", "user.email", "test@example.com")
+            manager._run_git_command("config", "user.name", "Test User")
+            
+            status = manager.check_status()
+            self.assertIn("dirty", status)
+            self.assertFalse(status["dirty"])
+            self.assertIn("untracked_files", status)
+            self.assertEqual(status["untracked_files"], [])
+            self.assertIn("modified_files", status)
+
+    def test_check_status_dirty_repo(self):
+        """Test check status on dirty repository."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = repl.CheckpointManager(tmpdir)
+            # Initialize git repo
+            manager._run_git_command("init")
+            manager._run_git_command("config", "user.email", "test@example.com")
+            manager._run_git_command("config", "user.name", "Test User")
+            
+            # Create untracked file
+            (Path(tmpdir) / "untracked.txt").write_text("untracked")
+            
+            status = manager.check_status()
+            self.assertIn("dirty", status)
+            # After git add, the file should be tracked
+            manager.add_files(["untracked.txt"])
+            status = manager.check_status()
+            self.assertIn("dirty", status)
+
+    def test_check_status_with_error(self):
+        """Test check status when git command fails."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = repl.CheckpointManager(tmpdir)
+            status = manager.check_status()
+            self.assertIn("error", status)
+
+    def test_checkpoint_full_success(self):
+        """Test full checkpoint (add + commit)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = repl.CheckpointManager(tmpdir)
+            # Initialize git repo
+            manager._run_git_command("init")
+            manager._run_git_command("config", "user.email", "test@example.com")
+            manager._run_git_command("config", "user.name", "Test User")
+            
+            # Create test files
+            (Path(tmpdir) / "file1.txt").write_text("content1")
+            (Path(tmpdir) / "file2.txt").write_text("content2")
+            
+            success, msg = manager.checkpoint("Checkpoint test", ["file1.txt", "file2.txt"])
+            self.assertTrue(success)
+            self.assertIn("Checkpoint", msg)
+
+    def test_checkpoint_add_fails(self):
+        """Test checkpoint when add fails."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = repl.CheckpointManager(tmpdir)
+            # Initialize git repo but don't add files
+            manager._run_git_command("init")
+            manager._run_git_command("config", "user.email", "test@example.com")
+            manager._run_git_command("config", "user.name", "Test User")
+            
+            # Try to checkpoint non-existent files
+            success, msg = manager.checkpoint("Checkpoint test", ["nonexistent.txt"])
+            self.assertFalse(success)
+            self.assertIn("Failed to add", msg)
+
+    def test_checkpoint_commit_fails(self):
+        """Test checkpoint when commit fails."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = repl.CheckpointManager(tmpdir)
+            # Initialize git repo
+            manager._run_git_command("init")
+            manager._run_git_command("config", "user.email", "test@example.com")
+            manager._run_git_command("config", "user.name", "Test User")
+            
+            # Create and add a file
+            (Path(tmpdir) / "test.txt").write_text("test content")
+            manager.add_files(["test.txt"])
+            
+            # First commit should succeed
+            success1, msg1 = manager.checkpoint("First checkpoint")
+            self.assertTrue(success1)
+            
+            # Second commit without changes should fail
+            success2, msg2 = manager.checkpoint("Second checkpoint")
+            self.assertFalse(success2)
+
+    def test_checkpoint_no_files_all_changes(self):
+        """Test checkpoint with no specific files (all changes)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = repl.CheckpointManager(tmpdir)
+            # Initialize git repo
+            manager._run_git_command("init")
+            manager._run_git_command("config", "user.email", "test@example.com")
+            manager._run_git_command("config", "user.name", "Test User")
+            
+            # Create test file
+            (Path(tmpdir) / "test.txt").write_text("test content")
+            
+            success, msg = manager.checkpoint("Checkpoint all changes")
+            self.assertTrue(success)
+            self.assertIn("Checkpoint", msg)
 
 
 class TestMaestroREPL(unittest.TestCase):
