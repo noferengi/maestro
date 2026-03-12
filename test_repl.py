@@ -375,7 +375,7 @@ class TestCheckpointManager(unittest.TestCase):
             
             success, msg = manager.add_files(None)
             self.assertTrue(success)
-            self.assertIn("All changes", msg)
+            self.assertIn("Added all changes", msg)
 
     def test_commit_success(self):
         """Test successful commit."""
