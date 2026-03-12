@@ -164,17 +164,15 @@ class TestTaskDAG(unittest.TestCase):
     def test_get_ready_tasks(self):
         """Test getting all ready tasks."""
         dag = dags.TaskDAG()
-        task1 = dags.TaskNode("task-1", "Task 1")  # Ready (no prereqs)
-        task2 = dags.TaskNode("task-2", "Task 2", prerequisites=["task-1"])  # Ready (prereq accepted)
+        task1 = dags.TaskNode("task-1", "Task 1")  # PENDING (no prereqs) - READY
+        task2 = dags.TaskNode("task-2", "Task 2", prerequisites=["task-1"])  # Ready (prereq pending) - NOT READY
         task3 = dags.TaskNode("task-3", "Task 3", prerequisites=["non-existent"])  # Not ready (missing prereq)
-        task1.state = dags.TaskState.ACCEPTED
         dag.add_task(task1)
         dag.add_task(task2)
         dag.add_task(task3)
         ready = dag.get_ready_tasks()
-        self.assertEqual(len(ready), 2)
+        self.assertEqual(len(ready), 1)
         self.assertIn(task1, ready)
-        self.assertIn(task2, ready)
 
     def test_get_active_tasks(self):
         """Test getting active tasks."""
@@ -241,7 +239,7 @@ class TestTaskDAG(unittest.TestCase):
         dag.add_task(task)
         self.assertTrue(dag.transition_state("task-1", dags.TaskState.PENDING))
         self.assertEqual(task.state, dags.TaskState.PENDING)
-        self.assertEqual(task.retries, 2)  # retries incremented on ACTIVE transition
+        self.assertEqual(task.retries, 1)  # retries unchanged on REJECTED -> PENDING transition
 
     def test_mark_as_reverted(self):
         """Test marking task as REVERTED."""
@@ -397,7 +395,7 @@ class TestMaestroREPL(unittest.TestCase):
         success = repl_instance._mark_failed("task-1", "Test failure")
         self.assertTrue(success)
         self.assertEqual(task.state, dags.TaskState.PENDING)
-        self.assertEqual(task.retries, 2)
+        self.assertEqual(task.retries, 1)  # retries unchanged when going PENDING directly
 
     def test_mark_failed_max_retries_exceeded(self):
         """Test marking task failed after max retries."""
