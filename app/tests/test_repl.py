@@ -5,8 +5,8 @@ import unittest
 from pathlib import Path
 
 import config
-import dags
-import repl
+import app.models.dags as dags
+import app.services.repl as repl
 
 
 class TestTaskNode(unittest.TestCase):

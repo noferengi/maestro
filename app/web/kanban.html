@@ -1,0 +1,1318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kanban Board - TheMaestro</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background: #f5f6f8;
+            height: 100vh;
+            display: flex;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 240px;
+            background: #212529;
+            color: #fff;
+            display: flex;
+            flex-direction: column;
+            padding: 1rem;
+        }
+
+        .sidebar h2 {
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            color: #6c757d;
+            margin-bottom: 0.75rem;
+        }
+
+        .project-tabs {
+            display: flex;
+            flex-direction: column;
+            gap: 0.25rem;
+        }
+
+        .project-tab {
+            padding: 0.75rem;
+            border-radius: 4px;
+            cursor: pointer;
+            color: #adb5bd;
+            transition: all 0.2s;
+            font-size: 0.9rem;
+        }
+
+        .project-tab:hover {
+            background: #343a40;
+            color: #fff;
+        }
+
+        .project-tab.active {
+            background: #495057;
+            color: #fff;
+            border-left: 3px solid #0d6efd;
+        }
+
+        .add-project-btn {
+            margin-top: auto;
+            padding: 0.75rem;
+            background: #495057;
+            border: none;
+            color: #fff;
+            border-radius: 4px;
+            cursor: pointer;
+            text-align: left;
+            transition: all 0.2s;
+        }
+
+        .add-project-btn:hover {
+            background: #6c757d;
+        }
+
+        /* Main Content */
+        .main-content {
+            flex: 1;
+            padding: 2rem;
+            overflow-y: auto;
+        }
+
+        .board-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+        }
+
+        .board-title {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: #212529;
+        }
+
+        /* Kanban Columns */
+        .kanban-board {
+            display: flex;
+            gap: 1.5rem;
+            height: 100%;
+        }
+
+        .column {
+            flex: 1;
+            background: #dee2e6;
+            border-radius: 6px;
+            padding: 1rem;
+            display: flex;
+            flex-direction: column;
+            min-width: 220px;
+        }
+
+        .column-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+            padding-bottom: 0.75rem;
+            border-bottom: 2px solid #ced4da;
+        }
+
+        .column-title {
+            font-weight: 600;
+            color: #212529;
+            font-size: 0.95rem;
+        }
+
+        .task-count {
+            background: #6c757d;
+            color: #fff;
+            padding: 0.15rem 0.5rem;
+            border-radius: 12px;
+            font-size: 0.75rem;
+        }
+
+        .add-task-btn {
+            background: transparent;
+            border: 1px dashed #6c757d;
+            color: #6c757d;
+            padding: 0.5rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            margin-top: 0.5rem;
+            width: 100%;
+            transition: all 0.2s;
+        }
+
+        .add-task-btn:hover {
+            background: rgba(0,0,0,0.05);
+            border-color: #495057;
+            color: #495057;
+        }
+
+        .tasks-container {
+            flex: 1;
+            overflow-y: auto;
+            padding-right: 4px;
+        }
+
+        .task-card {
+            background: #fff;
+            border-radius: 4px;
+            padding: 0.75rem;
+            margin-bottom: 0.75rem;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+            cursor: pointer;
+            transition: transform 0.1s, box-shadow 0.1s;
+            border-left: 4px solid #0d6efd;
+        }
+
+        .task-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+
+        .task-card.architecture { border-left-color: #6f42c1; }
+        .task-card.planning { border-left-color: #ffc107; }
+        .task-card.in-dev { border-left-color: #0d6efd; }
+        .task-card.in-review { border-left-color: #fd7e14; }
+        .task-card.completed { border-left-color: #198754; }
+
+        .task-card.immutable {
+            cursor: default;
+            opacity: 0.9;
+        }
+
+        .task-title {
+            font-weight: 500;
+            color: #212529;
+            margin-bottom: 0.5rem;
+            font-size: 0.9rem;
+        }
+
+        .task-meta {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.75rem;
+            color: #6c757d;
+        }
+
+        .tag {
+            padding: 0.15rem 0.4rem;
+            border-radius: 3px;
+            font-size: 0.65rem;
+            text-transform: uppercase;
+        }
+
+        .task-actions {
+            display: flex;
+            gap: 0.25rem;
+            margin-top: 0.5rem;
+        }
+
+        .action-btn {
+            background: #e9ecef;
+            border: none;
+            padding: 0.25rem 0.5rem;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 0.65rem;
+        }
+
+        .action-btn:hover {
+            background: #dee2e6;
+        }
+
+        /* Modal Styles */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.5);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        .modal-overlay.active {
+            display: flex;
+        }
+
+        .modal {
+            background: #fff;
+            border-radius: 8px;
+            padding: 1.5rem;
+            width: 500px;
+            max-width: 90vw;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+        }
+
+        .modal-title {
+            font-size: 1.2rem;
+            font-weight: 600;
+            color: #212529;
+        }
+
+        .close-btn {
+            background: none;
+            border: none;
+            font-size: 1.5rem;
+            cursor: pointer;
+            color: #6c757d;
+        }
+
+        .modal-body {
+            margin-bottom: 1.5rem;
+        }
+
+        .form-group {
+            margin-bottom: 1rem;
+        }
+
+        .form-label {
+            display: block;
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: #495057;
+            margin-bottom: 0.25rem;
+        }
+
+        .form-input, .form-textarea {
+            width: 100%;
+            padding: 0.5rem;
+            border: 1px solid #ced4da;
+            border-radius: 4px;
+            font-size: 0.9rem;
+            font-family: inherit;
+        }
+
+        .form-textarea {
+            resize: vertical;
+            min-height: 80px;
+        }
+
+        .modal-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 0.75rem;
+        }
+
+        /* Architecture Content Fields - Hidden by default */
+        .arch-content-field {
+            display: none;
+            margin-bottom: 1rem;
+        }
+
+        .btn {
+            padding: 0.5rem 1rem;
+            border-radius: 4px;
+            font-size: 0.85rem;
+            cursor: pointer;
+            border: none;
+        }
+
+        .btn-primary {
+            background: #0d6efd;
+            color: #fff;
+        }
+
+        .btn-primary:hover {
+            background: #0b5ed7;
+        }
+
+        .btn-secondary {
+            background: #6c757d;
+            color: #fff;
+        }
+
+        .btn-secondary:hover {
+            background: #5a6268;
+        }
+
+        /* Timeline Styles for Proof of Work */
+        .timeline {
+            margin-top: 1rem;
+            padding-left: 1rem;
+            border-left: 2px solid #dee2e6;
+        }
+
+        .timeline-item {
+            margin-bottom: 0.75rem;
+            position: relative;
+        }
+
+        .timeline-item::before {
+            content: '';
+            position: absolute;
+            left: -23px;
+            top: 0.35rem;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #6c757d;
+        }
+
+        .timeline-item.completed::before {
+            background: #198754;
+        }
+
+        .timeline-item.in-review::before {
+            background: #fd7e14;
+        }
+
+        .timeline-item.in-dev::before {
+            background: #0d6efd;
+        }
+
+        .timeline-time {
+            font-size: 0.75rem;
+            color: #6c757d;
+        }
+
+        .timeline-status {
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+    </style>
+</head>
+<body>
+    <!-- Sidebar with Project Tabs -->
+    <div class="sidebar">
+        <h2>Projects</h2>
+        <div class="project-tabs">
+            <div class="project-tab active" id="current-project" data-project="TheMaestro">
+                📁 TheMaestro (current)
+            </div>
+            <div class="project-tab" id="project-alpha" data-project="ProjectAlpha">
+                🚀 ProjectAlpha
+            </div>
+            <div class="project-tab" id="project-beta" data-project="ProjectBeta">
+                🎯 ProjectBeta
+            </div>
+        </div>
+        <button class="add-project-btn" id="add-project">
+            + New Project
+        </button>
+    </div>
+
+    <!-- Main Content -->
+    <div class="main-content">
+        <div class="board-header">
+            <h1 class="board-title">TheMaestro</h1>
+            <div id="current-project-display" style="color: #6c757d; font-size: 0.9rem;">
+                Selected: TheMaestro
+            </div>
+        </div>
+
+        <div class="kanban-board">
+            <!-- ARCHITECTURE Column (IMMUTABLE) -->
+            <div class="column" id="column-architecture">
+                <div class="column-header">
+                    <span class="column-title">ARCHITECTURE</span>
+                    <span class="task-count" id="count-architecture">2</span>
+                </div>
+                <div class="tasks-container" id="tasks-architecture">
+                    <div class="task-card architecture immutable" data-id="arch-1">
+                        <div class="task-title">Project Stack</div>
+                        <div class="task-meta">
+                            <span class="tag">core</span>
+                        </div>
+                        <div style="margin-top: 0.5rem; font-size: 0.75rem; color: #495057;">
+                            <strong>Frontend:</strong> HTML/CSS/JS<br>
+                            <strong>Backend:</strong> FastAPI + Uvicorn<br>
+                            <strong>Database:</strong> SQLite (development)<br>
+                            <strong>Style:</strong> Bootstrap CSS
+                        </div>
+                    </div>
+                    <div class="task-card architecture immutable" data-id="arch-2">
+                        <div class="task-title">Code Structure</div>
+                        <div class="task-meta">
+                            <span class="tag">core</span>
+                        </div>
+                        <div style="margin-top: 0.5rem; font-size: 0.75rem; color: #495057;">
+                            <strong>DAGs:</strong> dags.py<br>
+                            <strong>Config:</strong> config.py<br>
+                            <strong>REPL:</strong> repl.py<br>
+                            <strong>Tests:</strong> test_*.py
+                        </div>
+                    </div>
+                </div>
+                <button class="add-task-btn" onclick="openAddTaskModal('architecture')">+ Add Architecture Note</button>
+            </div>
+
+            <!-- PLANNING Column -->
+            <div class="column" id="column-planning">
+                <div class="column-header">
+                    <span class="column-title">PLANNING</span>
+                    <span class="task-count" id="count-planning">3</span>
+                </div>
+                <div class="tasks-container" id="tasks-planning">
+                    <div class="task-card planning" data-id="task-1" data-status="planning">
+                        <div class="task-title">Setup FastAPI development environment</div>
+                        <div class="task-meta">
+                            <span class="tag">backend</span>
+                            <span>by user</span>
+                        </div>
+                        <div class="task-actions">
+                            <button class="action-btn" onclick="editTask('task-1')">Edit</button>
+                            <button class="action-btn" onclick="moveTask('task-1', 'development')">Move to IN PROGRESS</button>
+                        </div>
+                    </div>
+                    <div class="task-card planning" data-id="task-2" data-status="planning">
+                        <div class="task-title">Create Kanban board UI mockup</div>
+                        <div class="task-meta">
+                            <span class="tag">frontend</span>
+                            <span>by user</span>
+                        </div>
+                        <div class="task-actions">
+                            <button class="action-btn" onclick="editTask('task-2')">Edit</button>
+                            <button class="action-btn" onclick="moveTask('task-2', 'development')">Move to IN PROGRESS</button>
+                        </div>
+                    </div>
+                    <div class="task-card planning" data-id="task-3" data-status="planning">
+                        <div class="task-title">Implement AJAX drag-and-drop</div>
+                        <div class="task-meta">
+                            <span class="tag">feature</span>
+                            <span>by user</span>
+                        </div>
+                        <div class="task-actions">
+                            <button class="action-btn" onclick="editTask('task-3')">Edit</button>
+                            <button class="action-btn" onclick="moveTask('task-3', 'development')">Move to IN PROGRESS</button>
+                        </div>
+                    </div>
+                </div>
+                <button class="add-task-btn" onclick="openAddTaskModal('planning')">+ Add Planning Item</button>
+            </div>
+
+            <!-- IN DEVELOPMENT Column -->
+            <div class="column" id="column-development">
+                <div class="column-header">
+                    <span class="column-title">IN PROGRESS</span>
+                    <span class="task-count" id="count-development">2</span>
+                </div>
+                <div class="tasks-container" id="tasks-development">
+                    <div class="task-card in-dev" data-id="task-4" data-status="development">
+                        <div class="task-title">Configure venv and install dependencies</div>
+                        <div class="task-meta">
+                            <span class="tag">setup</span>
+                            <span>by user</span>
+                        </div>
+                        <div class="task-actions">
+                            <button class="action-btn" onclick="editTask('task-4')">Edit</button>
+                            <button class="action-btn" onclick="moveTask('task-4', 'review')">Move to IN REVIEW</button>
+                        </div>
+                    </div>
+                    <div class="task-card in-dev" data-id="task-5" data-status="development">
+                        <div class="task-title">Create app structure and main.py</div>
+                        <div class="task-meta">
+                            <span class="tag">structure</span>
+                            <span>by user</span>
+                        </div>
+                        <div class="task-actions">
+                            <button class="action-btn" onclick="editTask('task-5')">Edit</button>
+                            <button class="action-btn" onclick="moveTask('task-5', 'review')">Move to IN REVIEW</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- IN REVIEW Column -->
+            <div class="column" id="column-review">
+                <div class="column-header">
+                    <span class="column-title">IN REVIEW</span>
+                    <span class="task-count" id="count-review">1</span>
+                </div>
+                <div class="tasks-container" id="tasks-review">
+                    <div class="task-card in-review" data-id="task-6" data-status="review">
+                        <div class="task-title">Review requirements.txt</div>
+                        <div class="task-meta">
+                            <span class="tag">qa</span>
+                            <span>by user</span>
+                        </div>
+                        <div class="task-actions">
+                            <button class="action-btn" onclick="editTask('task-6')">Edit</button>
+                            <button class="action-btn" onclick="moveTask('task-6', 'completed')">Move to COMPLETED</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- COMPLETED Column -->
+            <div class="column" id="column-completed">
+                <div class="column-header">
+                    <span class="column-title">COMPLETED</span>
+                    <span class="task-count" id="count-completed">4</span>
+                </div>
+                <div class="tasks-container" id="tasks-completed">
+                    <div class="task-card completed" data-id="task-7" data-status="completed">
+                        <div class="task-title">Create project structure</div>
+                        <div class="task-meta">
+                            <span class="tag">infrastructure</span>
+                            <span>by user</span>
+                        </div>
+                        <div class="task-actions">
+                            <button class="action-btn" onclick="viewTaskHistory('task-7')">View Proof</button>
+                        </div>
+                    </div>
+                    <div class="task-card completed" data-id="task-8" data-status="completed">
+                        <div class="task-title">Setup .gitignore</div>
+                        <div class="task-meta">
+                            <span class="tag">infrastructure</span>
+                            <span>by user</span>
+                        </div>
+                        <div class="task-actions">
+                            <button class="action-btn" onclick="viewTaskHistory('task-8')">View Proof</button>
+                        </div>
+                    </div>
+                    <div class="task-card completed" data-id="task-9" data-status="completed">
+                        <div class="task-title">Initial commit</div>
+                        <div class="task-meta">
+                            <span class="tag">git</span>
+                            <span>by user</span>
+                        </div>
+                        <div class="task-actions">
+                            <button class="action-btn" onclick="viewTaskHistory('task-9')">View Proof</button>
+                        </div>
+                    </div>
+                    <div class="task-card completed" data-id="task-10" data-status="completed">
+                        <div class="task-title">Create PRD.md</div>
+                        <div class="task-meta">
+                            <span class="tag">docs</span>
+                            <span>by user</span>
+                        </div>
+                        <div class="task-actions">
+                            <button class="action-btn" onclick="viewTaskHistory('task-10')">View Proof</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add/Edit Task Modal -->
+    <div class="modal-overlay" id="task-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 class="modal-title" id="modal-title">Add Task</h2>
+                <button class="close-btn" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label" for="task-title">Task Title</label>
+                    <input type="text" class="form-input" id="task-title" placeholder="Enter task title...">
+                </div>
+                <div class="form-group" id="modal-content-fields">
+                    <!-- Dynamic content fields for architecture tasks -->
+                    <div id="architecture-content-frontend" class="arch-content-field">
+                        <label class="form-label" for="arch-content-frontend">Frontend</label>
+                        <input type="text" class="form-input" id="arch-content-frontend" placeholder="e.g., HTML/CSS/JS...">
+                    </div>
+                    <div id="architecture-content-backend" class="arch-content-field">
+                        <label class="form-label" for="arch-content-backend">Backend</label>
+                        <input type="text" class="form-input" id="arch-content-backend" placeholder="e.g., FastAPI + Uvicorn...">
+                    </div>
+                    <div id="architecture-content-database" class="arch-content-field">
+                        <label class="form-label" for="arch-content-database">Database</label>
+                        <input type="text" class="form-input" id="arch-content-database" placeholder="e.g., SQLite (development)...">
+                    </div>
+                    <div id="architecture-content-style" class="arch-content-field">
+                        <label class="form-label" for="arch-content-style">Style</label>
+                        <input type="text" class="form-input" id="arch-content-style" placeholder="e.g., Bootstrap CSS...">
+                    </div>
+                    <div id="architecture-content-dags" class="arch-content-field">
+                        <label class="form-label" for="arch-content-dags">DAGs</label>
+                        <input type="text" class="form-input" id="arch-content-dags" placeholder="e.g., dags.py...">
+                    </div>
+                    <div id="architecture-content-config" class="arch-content-field">
+                        <label class="form-label" for="arch-content-config">Config</label>
+                        <input type="text" class="form-input" id="arch-content-config" placeholder="e.g., config.py...">
+                    </div>
+                    <div id="architecture-content-repl" class="arch-content-field">
+                        <label class="form-label" for="arch-content-repl">REPL</label>
+                        <input type="text" class="form-input" id="arch-content-repl" placeholder="e.g., repl.py...">
+                    </div>
+                    <div id="architecture-content-tests" class="arch-content-field">
+                        <label class="form-label" for="arch-content-tests">Tests</label>
+                        <input type="text" class="form-input" id="arch-content-tests" placeholder="e.g., test_*.py...">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="task-description">Description</label>
+                    <textarea class="form-textarea" id="task-description" placeholder="Enter task description..."></textarea>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="task-tags">Tags (comma-separated)</label>
+                    <input type="text" class="form-input" id="task-tags" placeholder="backend, frontend, setup...">
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="task-owner">Owner</label>
+                    <input type="text" class="form-input" id="task-owner" placeholder="Enter owner name...">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="saveTask()">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- View Task History Modal -->
+    <div class="modal-overlay" id="history-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 class="modal-title" id="history-modal-title">Task History</h2>
+                <button class="close-btn" onclick="closeHistoryModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="history-content">
+                    <!-- History content will be injected here -->
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-primary" onclick="closeHistoryModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // WIP Limits configuration - maximum cards allowed per column
+        const WIP_LIMITS = {
+            'architecture': 10,
+            'planning': 10,
+            'development': 5,
+            'review': 5,
+            'completed': 15
+        };
+
+        // Task data storage with history tracking
+        const taskData = {
+            'arch-1': {
+                id: 'arch-1',
+                title: 'Project Stack',
+                type: 'architecture',
+                content: {
+                    frontend: 'HTML/CSS/JS',
+                    backend: 'FastAPI + Uvicorn',
+                    database: 'SQLite (development)',
+                    style: 'Bootstrap CSS'
+                },
+                history: [
+                    { status: 'created', timestamp: new Date().toISOString() }
+                ],
+                immutable: true
+            },
+            'arch-2': {
+                id: 'arch-2',
+                title: 'Code Structure',
+                type: 'architecture',
+                content: {
+                    dags: 'dags.py',
+                    config: 'config.py',
+                    repl: 'repl.py',
+                    tests: 'test_*.py'
+                },
+                history: [
+                    { status: 'created', timestamp: new Date().toISOString() }
+                ],
+                immutable: true
+            },
+            'task-1': {
+                id: 'task-1',
+                title: 'Setup FastAPI development environment',
+                type: 'planning',
+                owner: 'user',
+                tags: ['backend'],
+                history: [
+                    { status: 'created', timestamp: new Date('2026-03-13T10:00:00').toISOString() },
+                    { status: 'in-dev', timestamp: new Date('2026-03-13T10:30:00').toISOString() },
+                    { status: 'in-review', timestamp: new Date('2026-03-13T11:00:00').toISOString() },
+                    { status: 'completed', timestamp: new Date('2026-03-13T11:30:00').toISOString() }
+                ],
+                immutable: false
+            },
+            'task-2': {
+                id: 'task-2',
+                title: 'Create Kanban board UI mockup',
+                type: 'planning',
+                owner: 'user',
+                tags: ['frontend'],
+                history: [
+                    { status: 'created', timestamp: new Date('2026-03-13T10:05:00').toISOString() },
+                    { status: 'in-dev', timestamp: new Date('2026-03-13T10:35:00').toISOString() },
+                    { status: 'in-review', timestamp: new Date('2026-03-13T11:05:00').toISOString() },
+                    { status: 'completed', timestamp: new Date('2026-03-13T11:35:00').toISOString() }
+                ],
+                immutable: false
+            },
+            'task-3': {
+                id: 'task-3',
+                title: 'Implement AJAX drag-and-drop',
+                type: 'planning',
+                owner: 'user',
+                tags: ['feature'],
+                history: [
+                    { status: 'created', timestamp: new Date('2026-03-13T10:10:00').toISOString() },
+                    { status: 'in-dev', timestamp: new Date('2026-03-13T10:40:00').toISOString() }
+                ],
+                immutable: false
+            },
+            'task-4': {
+                id: 'task-4',
+                title: 'Configure venv and install dependencies',
+                type: 'in-dev',
+                owner: 'user',
+                tags: ['setup'],
+                history: [
+                    { status: 'created', timestamp: new Date('2026-03-13T10:15:00').toISOString() },
+                    { status: 'in-dev', timestamp: new Date('2026-03-13T10:45:00').toISOString() },
+                    { status: 'in-review', timestamp: new Date('2026-03-13T11:15:00').toISOString() }
+                ],
+                immutable: false
+            },
+            'task-5': {
+                id: 'task-5',
+                title: 'Create app structure and main.py',
+                type: 'in-dev',
+                owner: 'user',
+                tags: ['structure'],
+                history: [
+                    { status: 'created', timestamp: new Date('2026-03-13T10:20:00').toISOString() },
+                    { status: 'in-dev', timestamp: new Date('2026-03-13T10:50:00').toISOString() }
+                ],
+                immutable: false
+            },
+            'task-6': {
+                id: 'task-6',
+                title: 'Review requirements.txt',
+                type: 'in-review',
+                owner: 'user',
+                tags: ['qa'],
+                history: [
+                    { status: 'created', timestamp: new Date('2026-03-13T10:25:00').toISOString() },
+                    { status: 'in-dev', timestamp: new Date('2026-03-13T10:55:00').toISOString() },
+                    { status: 'in-review', timestamp: new Date('2026-03-13T11:20:00').toISOString() }
+                ],
+                immutable: false
+            },
+            'task-7': {
+                id: 'task-7',
+                title: 'Create project structure',
+                type: 'completed',
+                owner: 'user',
+                tags: ['infrastructure'],
+                history: [
+                    { status: 'created', timestamp: new Date('2026-03-13T09:00:00').toISOString() },
+                    { status: 'in-dev', timestamp: new Date('2026-03-13T09:30:00').toISOString() },
+                    { status: 'in-review', timestamp: new Date('2026-03-13T09:45:00').toISOString() },
+                    { status: 'completed', timestamp: new Date('2026-03-13T10:00:00').toISOString() }
+                ],
+                immutable: false
+            },
+            'task-8': {
+                id: 'task-8',
+                title: 'Setup .gitignore',
+                type: 'completed',
+                owner: 'user',
+                tags: ['infrastructure'],
+                history: [
+                    { status: 'created', timestamp: new Date('2026-03-13T09:05:00').toISOString() },
+                    { status: 'in-dev', timestamp: new Date('2026-03-13T09:35:00').toISOString() },
+                    { status: 'in-review', timestamp: new Date('2026-03-13T09:50:00').toISOString() },
+                    { status: 'completed', timestamp: new Date('2026-03-13T10:05:00').toISOString() }
+                ],
+                immutable: false
+            },
+            'task-9': {
+                id: 'task-9',
+                title: 'Initial commit',
+                type: 'completed',
+                owner: 'user',
+                tags: ['git'],
+                history: [
+                    { status: 'created', timestamp: new Date('2026-03-13T09:10:00').toISOString() },
+                    { status: 'in-dev', timestamp: new Date('2026-03-13T09:40:00').toISOString() },
+                    { status: 'in-review', timestamp: new Date('2026-03-13T09:55:00').toISOString() },
+                    { status: 'completed', timestamp: new Date('2026-03-13T10:10:00').toISOString() }
+                ],
+                immutable: false
+            },
+            'task-10': {
+                id: 'task-10',
+                title: 'Create PRD.md',
+                type: 'completed',
+                owner: 'user',
+                tags: ['docs'],
+                history: [
+                    { status: 'created', timestamp: new Date('2026-03-13T09:15:00').toISOString() },
+                    { status: 'in-dev', timestamp: new Date('2026-03-13T09:45:00').toISOString() },
+                    { status: 'in-review', timestamp: new Date('2026-03-13T10:00:00').toISOString() },
+                    { status: 'completed', timestamp: new Date('2026-03-13T10:15:00').toISOString() }
+                ],
+                immutable: false
+            }
+        };
+
+        // Current modal state
+        let currentTaskId = null;
+        let currentTargetStatus = null;
+        let currentProject = 'TheMaestro';
+
+        // Project tab selection
+        document.querySelectorAll('.project-tab').forEach(tab => {
+            tab.addEventListener('click', function() {
+                document.querySelectorAll('.project-tab').forEach(t => t.classList.remove('active'));
+                this.classList.add('active');
+
+                const projectName = this.getAttribute('data-project');
+                document.getElementById('current-project-display').textContent = `Selected: ${projectName}`;
+                document.querySelector('.board-title').textContent = projectName;
+
+                console.log(`Project switched to: ${projectName}`);
+            });
+        });
+
+        // Add project button
+        document.getElementById('add-project').addEventListener('click', function() {
+            const newProjectName = prompt('Enter new project name:');
+            if (newProjectName) {
+                const tabsContainer = document.querySelector('.project-tabs');
+                const newTab = document.createElement('div');
+                newTab.className = 'project-tab active';
+                newTab.id = `project-${newProjectName.toLowerCase()}`;
+                newTab.setAttribute('data-project', newProjectName);
+                newTab.textContent = `📁 ${newProjectName}`;
+                tabsContainer.insertBefore(newTab, this);
+
+                // Update current project display
+                document.getElementById('current-project-display').textContent = `Selected: ${newProjectName}`;
+                document.querySelector('.board-title').textContent = newProjectName;
+
+                console.log(`New project created: ${newProjectName}`);
+            }
+        });
+
+        // Task card click handler
+        document.querySelectorAll('.task-card').forEach(card => {
+            card.addEventListener('click', function(e) {
+                if (e.target.tagName === 'BUTTON' || e.target.classList.contains('action-btn')) {
+                    return; // Let button handlers take care of it
+                }
+                const taskId = this.getAttribute('data-id');
+                const task = taskData[taskId];
+                
+                if (task && task.immutable) {
+                    console.log(`Architecture task clicked (immutable): ${taskId}`);
+                } else if (task) {
+                    console.log(`Task clicked: ${taskId}, Status: ${task.type}`);
+                    // TODO: Implement AJAX calls here
+                }
+            });
+        });
+
+        // Modal functions
+        function openAddTaskModal(targetStatus) {
+            currentTaskId = null;
+            currentTargetStatus = targetStatus;
+            
+            document.getElementById('modal-title').textContent = `Add Task: ${targetStatus.toUpperCase()}`;
+            document.getElementById('task-title').value = '';
+            document.getElementById('task-description').value = '';
+            document.getElementById('task-tags').value = '';
+            document.getElementById('task-owner').value = 'user';
+            showArchContentFields(targetStatus);
+            document.getElementById('task-modal').classList.add('active');
+        }
+
+        function showArchContentFields(targetStatus) {
+                const contentFields = document.getElementById('modal-content-fields');
+                const isArchitecture = targetStatus === 'architecture';
+    
+                if (isArchitecture) {
+                    contentFields.style.display = 'block';
+                    // Show fields based on project type
+                    if (currentProject === 'TheMaestro') {
+                        // Show Code Structure fields
+                        document.getElementById('architecture-content-dags').style.display = 'block';
+                        document.getElementById('architecture-content-config').style.display = 'block';
+                        document.getElementById('architecture-content-repl').style.display = 'block';
+                        document.getElementById('architecture-content-tests').style.display = 'block';
+                        // Hide Project Stack fields
+                        document.getElementById('architecture-content-frontend').style.display = 'none';
+                        document.getElementById('architecture-content-backend').style.display = 'none';
+                        document.getElementById('architecture-content-database').style.display = 'none';
+                        document.getElementById('architecture-content-style').style.display = 'none';
+                    } else {
+                        // Show Project Stack fields
+                        document.getElementById('architecture-content-frontend').style.display = 'block';
+                        document.getElementById('architecture-content-backend').style.display = 'block';
+                        document.getElementById('architecture-content-database').style.display = 'block';
+                        document.getElementById('architecture-content-style').style.display = 'block';
+                        // Hide Code Structure fields
+                        document.getElementById('architecture-content-dags').style.display = 'none';
+                        document.getElementById('architecture-content-config').style.display = 'none';
+                        document.getElementById('architecture-content-repl').style.display = 'none';
+                        document.getElementById('architecture-content-tests').style.display = 'none';
+                    }
+                } else {
+                    contentFields.style.display = 'none';
+                }
+            }
+
+
+        function closeModal() {
+            document.getElementById('task-modal').classList.remove('active');
+            currentTaskId = null;
+            currentTargetStatus = null;
+        }
+
+        function saveTask() {
+            const title = document.getElementById('task-title').value.trim();
+            const description = document.getElementById('task-description').value.trim();
+            const tagsInput = document.getElementById('task-tags').value.trim();
+            const owner = document.getElementById('task-owner').value.trim() || 'user';
+
+            if (!title) {
+                alert('Task title is required!');
+                return;
+            }
+
+            const tags = tagsInput.split(',').map(t => t.trim()).filter(t => t);
+
+            if (currentTaskId) {
+                // Edit existing task
+                taskData[currentTaskId].title = title;
+                taskData[currentTaskId].description = description;
+                taskData[currentTaskId].tags = tags;
+                taskData[currentTaskId].owner = owner;
+
+                // For architecture tasks, update content from fields
+                if (currentTargetStatus === 'architecture') {
+                    taskData[currentTaskId].content = {
+                        frontend: document.getElementById('arch-content-frontend').value,
+                        backend: document.getElementById('arch-content-backend').value,
+                        database: document.getElementById('arch-content-database').value,
+                        style: document.getElementById('arch-content-style').value,
+                        dags: document.getElementById('arch-content-dags').value,
+                        config: document.getElementById('arch-content-config').value,
+                        repl: document.getElementById('arch-content-repl').value,
+                        tests: document.getElementById('arch-content-tests').value
+                    };
+                }
+                
+                console.log(`Task updated: ${currentTaskId}`);
+            } else if (currentTargetStatus) {
+                // Check WIP limit before creating new task
+                if (!canAddTaskToColumn(currentTargetStatus)) {
+                    return;
+                }
+
+                // Create new task
+                // For architecture tasks, we need to capture the 4 content fields. Update the save logic to check if `currentTargetStatus === 'architecture'` and collect the content fields.
+                const newId = `task-${Date.now()}`;
+                taskData[newId] = {
+                    id: newId,
+                    title: title,
+                    type: currentTargetStatus,
+                    description: description,
+                    owner: owner,
+                    tags: tags,
+                    history: [
+                        { status: 'created', timestamp: new Date().toISOString() }
+                    ],
+                    immutable: false
+                };
+
+                // For architecture tasks, capture content fields
+                if (currentTargetStatus === 'architecture') {
+                    taskData[newId].content = {
+                        frontend: document.getElementById('arch-content-frontend').value,
+                        backend: document.getElementById('arch-content-backend').value,
+                        database: document.getElementById('arch-content-database').value,
+                        style: document.getElementById('arch-content-style').value,
+                        dags: document.getElementById('arch-content-dags').value,
+                        config: document.getElementById('arch-content-config').value,
+                        repl: document.getElementById('arch-content-repl').value,
+                        tests: document.getElementById('arch-content-tests').value
+                    };
+                }
+
+                // Add to DOM
+                const tasksContainer = document.getElementById(`tasks-${currentTargetStatus}`);
+                const newCard = createTaskCard(newId, title, tags, owner, currentTargetStatus);
+                tasksContainer.appendChild(newCard);
+
+                // Update count
+                updateTaskCount(currentTargetStatus);
+
+                console.log(`New task created: ${newId}`);
+            }
+
+            closeModal();
+        }
+
+        function canAddTaskToColumn(status) {
+            if (!status || status === 'architecture') return true; // Architecture column has no WIP limit enforcement
+            const check = checkWipLimit(status);
+            if (!check.allowed) {
+                alert(`WIP Limit Reached! Column '${status.toUpperCase()}' has ${check.current} tasks (limit: ${check.limit}).`);
+                return false;
+            }
+            return true;
+        }
+
+        function checkWipLimit(status) {
+            const container = document.getElementById(`tasks-${status}`);
+            if (container) {
+                const currentCount = container.querySelectorAll('.task-card').length;
+                const limit = WIP_LIMITS[status];
+                return { allowed: currentCount < limit, current: currentCount, limit: limit };
+            }
+            return { allowed: true, current: 0, limit: WIP_LIMITS[status] || 10 };
+        }
+
+        function createTaskCard(id, title, tags, owner, status) {
+            const card = document.createElement('div');
+            card.className = `task-card ${status}`;
+            card.setAttribute('data-id', id);
+            card.setAttribute('data-status', status);
+
+            const tagsHtml = tags.map(tag => `<span class="tag">${tag}</span>`).join('') || '<span class="tag">general</span>';
+            const ownerHtml = owner ? `<span>${owner}</span>` : '';
+
+            card.innerHTML = `
+                <div class="task-title">${title}</div>
+                <div class="task-meta">
+                    ${tagsHtml}
+                    ${ownerHtml}
+                </div>
+                <div class="task-actions">
+                    <button class="action-btn" onclick="editTask('${id}')">Edit</button>
+                </div>
+            `;
+
+            // Add move button for appropriate statuses
+            if (status === 'planning') {
+                const moveBtn = card.querySelector('.task-actions');
+                moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'development')">Move to IN PROGRESS</button>`;
+            } else if (status === 'development') {
+                const moveBtn = card.querySelector('.task-actions');
+                moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'review')">Move to IN REVIEW</button>`;
+            } else if (status === 'review') {
+                const moveBtn = card.querySelector('.task-actions');
+                moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'completed')">Move to COMPLETED</button>`;
+            } else if (status === 'completed') {
+                const viewBtn = card.querySelector('.task-actions');
+                viewBtn.innerHTML = `<button class="action-btn" onclick="viewTaskHistory('${id}')">View Proof</button>`;
+            } else if (status === 'architecture') {
+                const editBtn = card.querySelector('.task-actions');
+                if (editBtn) {
+                    editBtn.innerHTML = `<button class="action-btn" onclick="editArchitectureTask('${id}')">Edit</button>`;
+                }
+            }
+
+            return card;
+        }
+
+        function moveTask(taskId, newStatus) {
+            const task = taskData[taskId];
+            
+            if (!task || task.immutable) {
+                console.log('Cannot move immutable architecture task');
+                return;
+            }
+
+            // Add to history
+            task.history.push({
+                status: newStatus,
+                timestamp: new Date().toISOString()
+            });
+
+            // Update task type
+            task.type = newStatus;
+
+            // Find current card
+            const currentCard = document.querySelector(`.task-card[data-id="${taskId}"]`);
+            if (!currentCard) return;
+
+            const currentStatus = currentCard.getAttribute('data-status');
+
+            // Update card DOM
+            currentCard.classList.remove(currentStatus);
+            currentCard.classList.add(newStatus);
+            currentCard.setAttribute('data-status', newStatus);
+
+            // Move card to new column
+            const newContainer = document.getElementById(`tasks-${newStatus}`);
+            const currentContainer = document.getElementById(`tasks-${currentStatus}`);
+
+            if (currentContainer) {
+                currentContainer.removeChild(currentCard);
+            }
+
+            // Update card buttons based on new status
+            const actions = currentCard.querySelector('.task-actions');
+            if (newStatus === 'planning') {
+                actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
+                                     <button class="action-btn" onclick="moveTask('${taskId}', 'development')">Move to IN PROGRESS</button>`;
+            } else if (newStatus === 'development') {
+                actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
+                                     <button class="action-btn" onclick="moveTask('${taskId}', 'review')">Move to IN REVIEW</button>`;
+            } else if (newStatus === 'review') {
+                actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
+                                     <button class="action-btn" onclick="moveTask('${taskId}', 'completed')">Move to COMPLETED</button>`;
+            } else if (newStatus === 'completed') {
+                actions.innerHTML = `<button class="action-btn" onclick="viewTaskHistory('${taskId}')">View Proof</button>`;
+            }
+
+            if (newContainer) {
+                newContainer.appendChild(currentCard);
+            }
+
+            // Update counts
+            updateTaskCount(currentStatus);
+            updateTaskCount(newStatus);
+
+            console.log(`Task ${taskId} moved from ${currentStatus} to ${newStatus}`);
+
+            // If moving to IN PROGRESS, schedule auto-move to IN REVIEW after 15 seconds
+            if (newStatus === 'development') {
+                setTimeout(() => {
+                    if (taskData[taskId]) {
+                        moveTask(taskId, 'review');
+                        console.log(`Auto-moved task ${taskId} to IN REVIEW after 15 seconds`);
+                    }
+                }, 15000);
+            }
+        }
+
+        function editTask(taskId) {
+            const task = taskData[taskId];
+            if (!task) return;
+
+            currentTaskId = taskId;
+            currentTargetStatus = task.type;
+
+            document.getElementById('modal-title').textContent = `Edit Task: ${task.title}`;
+            document.getElementById('task-title').value = task.title;
+            document.getElementById('task-description').value = task.description || '';
+            document.getElementById('task-tags').value = (task.tags || []).join(', ');
+            document.getElementById('task-owner').value = task.owner || 'user';
+
+            document.getElementById('task-modal').classList.add('active');
+        }
+
+        function editArchitectureTask(taskId) {
+            const task = taskData[taskId];
+            if (!task) return;
+
+            currentTaskId = taskId;
+            currentTargetStatus = task.type;
+
+            // Show content as description for editing
+            let contentStr = '';
+            if (task.content) {
+                contentStr = JSON.stringify(task.content, null, 2);
+            }
+
+            document.getElementById('modal-title').textContent = `Edit Architecture: ${task.title}`;
+            document.getElementById('task-title').value = task.title;
+
+            // Populate content fields from task data
+            if (task.content) {
+                const content = task.content;
+                if (content.frontend) document.getElementById('arch-content-frontend').value = content.frontend;
+                if (content.backend) document.getElementById('arch-content-backend').value = content.backend;
+                if (content.database) document.getElementById('arch-content-database').value = content.database;
+                if (content.style) document.getElementById('arch-content-style').value = content.style;
+                if (content.dags) document.getElementById('arch-content-dags').value = content.dags;
+                if (content.config) document.getElementById('arch-content-config').value = content.config;
+                if (content.repl) document.getElementById('arch-content-repl').value = content.repl;
+                if (content.tests) document.getElementById('arch-content-tests').value = content.tests;
+            }
+            showArchContentFields('architecture');
+            document.getElementById('task-description').value = '';
+            document.getElementById('task-tags').value = '';
+            document.getElementById('task-owner').value = '';
+
+            document.getElementById('task-modal').classList.add('active');
+        }
+
+        function viewTaskHistory(taskId) {
+            const task = taskData[taskId];
+            if (!task) return;
+
+            const historyContainer = document.getElementById('history-content');
+            let html = `<div class="form-group"><label class="form-label">Task Details</label>`;
+            html += `<div style="font-size: 0.9rem; color: #495057;">`;
+            html += `<strong>Title:</strong> ${task.title}<br>`;
+            html += `<strong>Owner:</strong> ${task.owner || 'user'}<br>`;
+            html += `<strong>Tags:</strong> ${task.tags ? task.tags.join(', ') : 'none'}<br>`;
+            html += `<strong>Description:</strong> ${task.description || 'N/A'}`;
+            html += `</div></div>`;
+
+            html += `<div class="form-group"><label class="form-label">Proof of Work - Task Timeline</label>`;
+            html += `<div class="timeline">`;
+
+            task.history.forEach(h => {
+                const date = new Date(h.timestamp);
+                const formattedDate = date.toLocaleString();
+                html += `
+                    <div class="timeline-item ${h.status}">
+                        <div class="timeline-status">${h.status}</div>
+                        <div class="timeline-time">${formattedDate}</div>
+                    </div>
+                `;
+            });
+
+            html += `</div></div>`;
+
+            document.getElementById('history-modal-title').textContent = `Task: ${task.title}`;
+            historyContainer.innerHTML = html;
+
+            document.getElementById('history-modal').classList.add('active');
+        }
+
+        function closeHistoryModal() {
+            document.getElementById('history-modal').classList.remove('active');
+        }
+
+        function updateTaskCount(status) {
+            const container = document.getElementById(`tasks-${status}`);
+            if (container) {
+                const count = container.querySelectorAll('.task-card').length;
+                const countElement = document.getElementById(`count-${status}`);
+                if (countElement) {
+                    countElement.textContent = count;
+                }
+            }
+        }
+
+        // Close modals when clicking outside
+        document.getElementById('task-modal').addEventListener('click', function(e) {
+            if (e.target === this) closeModal();
+        });
+
+        document.getElementById('history-modal').addEventListener('click', function(e) {
+            if (e.target === this) closeHistoryModal();
+        });
+    </script>
+</body>
+</html>

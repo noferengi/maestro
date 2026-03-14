@@ -15,11 +15,13 @@ The Maestro Orchestrator is an agentic REPL (Read-Eval-Print-Loop) designed to m
 
 The project state is represented by two parallel structures:
 
-1. **The Blueprint (Design):** Stored in .md files. This is the "Ground Truth."  
-   * `ARCHITECTURE.md`: Global system goals and high-level design.  
-   * `PRD.md`: Itemized requirements and action items.  
-   * `*/AGENTS.md`: Folder-specific design, logic, and instructions for subsequent agents.  
+1. **The Blueprint (Design):** Stored in .md files. This is the "Ground Truth."
+   * `ARCHITECTURE.md`: Global system goals and high-level design.
+   * `PRD.md`: Itemized requirements and action items.
+   * `*/AGENTS.md`: Folder-specific design, logic, and instructions for subsequent agents.
 2. **The Product (Implementation):** The actual source code, tests, and assets.
+
+**Current implementation status:** The Kanban board (`app/web/index.html` + `app/web/kanban.js`) is live and backed by a FastAPI + SQLite persistence layer. The agent scaffold (`app/agent/`) and migration system (`app/migrations/`) exist and are wired into the FastAPI app via `/api/agent/*` routes. The full Wiggum Loop is not yet driven from the board UI.
 
 ## **4. Agent Specialization & Constraints**
 
@@ -56,23 +58,24 @@ The management dashboard consists of three primary views:
 
 1. **Design View:** Live rendered Markdown of the current blueprints.  
 2. **Implementation View:** Real-time status of source files, linter results, and test coverage.  
-3. **Orchestration View (The DAG/Kanban):**  
-   * **DAG Graph:** Visualization of tasks and prerequisites.  
-   * **Logic:** A task ![][image1] is READY if ![][image2], ![][image3].  
+3. **Orchestration View (The DAG/Kanban):**
+   * **DAG Graph:** Visualization of tasks and prerequisites.
+   * **Logic:** A task is READY if its `type` is not `completed` or `architecture` and all task IDs in its `prerequisites` array are in a completed state.
    * **Sprints:** Grouped sets of tasks for focused execution.
 
 ## **7. Safety & Infrastructure**
 
-* **Engine:** llama.cpp hosting Qwen-3-Coder-80B (OpenAI API compatible).  
-* **Venv:** Isolated Python virtual environments for local execution.  
-* **Sandboxing:** MCP tools (File System, Shell) must be wrapped in a permission-layer to prevent destructive commands (e.g., rm -rf /).  
-* **Checkpointing:** Mandatory git push or local commit before any task transitions from ACTIVE to COMPLETED.
+* **Engine:** llama.cpp hosting OmniCoder 9B (Qwen 3.5 9B base), OpenAI-compatible API on `localhost:8008`.
+* **Venv:** Isolated Python virtual environments for local execution.
+* **Sandboxing:** `run_shell()` in `app/agent/tools.py` enforces a blocklist of destructive patterns (`rm -rf`, `del /s`, fork bombs, deep `../` traversal). Soft-delete via `archive_file()` moves files to `.archive/YYYY-MM-DD_HH-MM-SS/` — no hard deletes.
+* **Branch enforcement:** `git_checkout` blocks any target that is not `maestro/task-{id}`, `main`, or `master`.
+* **Checkpointing:** Mandatory git commit on `maestro/task-{id}` branch before any task transitions from ACTIVE to COMPLETED.
 
 ## **8. Data Formats**
 
 * **Structured Querying:** Use JSON-mode/Schema constraints for agent handoffs.  
 * **Task DAG:** Stored as a JSON or YAML manifest representing the state of the Kanban board.  
-* **FITM (Fill-In-The-Middle):** To be explored for code completion/editing tasks to minimize token usage in large contexts.
+* **FITM (Fill-In-The-Middle):** To be explored for code completion/editing tasks to minimize token usage in large contexts. Context window discipline is currently handled by `MAX_TURNS=150` in `app/agent/config.py`, which terminates runaway loops before they exhaust the context window.
 
 ## **9. Future Integration**
 

@@ -1,6 +1,6 @@
 """Debug test for DAG ready logic."""
 
-import repl
+import app.services.repl as repl
 
 dag = repl.create_sample_dag()
 task2 = dag.get_task("task-2")

@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kanban Board - TheMaestro</title>
+    <link rel="stylesheet" href="/static/style.css?v=2">
+    <script src="/static/kanban.js?v=4"></script>
+</head>
+<body>
+    <!-- Inline drag preview initialization -->
+    <script>
+    // Force re-initialization of drag and drop
+    window.addEventListener('DOMContentLoaded', function() {
+        if (typeof enableDragAndDrop === 'function') {
+            enableDragAndDrop();
+        }
+    });
+    </script>
+
+    <!-- Sidebar with Project Tabs -->
+    <div class="sidebar">
+        <h2>Projects</h2>
+        <div class="project-tabs">
+            <div class="project-tab active" id="current-project" data-project="TheMaestro">
+                📁 TheMaestro (current)
+            </div>
+            <div class="project-tab" id="project-alpha" data-project="ProjectAlpha">
+                🚀 ProjectAlpha
+            </div>
+            <div class="project-tab" id="project-beta" data-project="ProjectBeta">
+                🎯 ProjectBeta
+            </div>
+        </div>
+        <button class="add-project-btn" id="add-project">
+            + New Project
+        </button>
+    </div>
+
+    <!-- Main Content -->
+    <div class="main-content">
+        <div class="board-header">
+            <h1 class="board-title">TheMaestro</h1>
+            <div id="current-project-display">
+                Selected: TheMaestro
+            </div>
+            <button class="refresh-btn" onclick="refreshTasks()" title="Refresh from database">
+                🔄 Refresh
+            </button>
+        </div>
+
+        <div class="kanban-board">
+            <!-- ARCHITECTURE Column (IMMUTABLE) -->
+            <div class="column" id="column-architecture">
+                <div class="column-header">
+                    <span class="column-title">ARCHITECTURE</span>
+                    <span class="task-count" id="count-architecture">2</span>
+                </div>
+                <div class="tasks-container" id="tasks-architecture">
+                    <div class="task-card architecture" data-id="arch-1">
+                        <div class="task-title">Project Stack</div>
+                        <div class="task-meta">
+                            <span class="tag">core</span>
+                        </div>
+                        <div class="task-arch-content">
+                            <strong>Frontend:</strong> HTML/CSS/JS<br>
+                            <strong>Backend:</strong> FastAPI + Uvicorn<br>
+                            <strong>Database:</strong> SQLite (development)<br>
+                            <strong>Style:</strong> Bootstrap CSS
+                        </div>
+                    </div>
+                    <div class="task-card architecture" data-id="arch-2">
+                        <div class="task-title">Code Structure</div>
+                        <div class="task-meta">
+                            <span class="tag">core</span>
+                        </div>
+                        <div class="task-arch-content">
+                            <strong>DAGs:</strong> dags.py<br>
+                            <strong>Config:</strong> config.py<br>
+                            <strong>REPL:</strong> repl.py<br>
+                            <strong>Tests:</strong> test_*.py
+                        </div>
+                    </div>
+                </div>
+                <button class="add-task-btn" onclick="openAddTaskModal('architecture')">+ Add Architecture Note</button>
+            </div>
+
+            <!-- PLANNING Column -->
+            <div class="column" id="column-planning">
+                <div class="column-header">
+                    <span class="column-title">PLANNING</span>
+                    <span class="task-count" id="count-planning">0</span>
+                </div>
+                <div class="tasks-container" id="tasks-planning">
+                    <!-- Tasks will be rendered from database -->
+                </div>
+                <button class="add-task-btn" onclick="openAddTaskModal('planning')">+ Add Planning Item</button>
+            </div>
+
+            <!-- IN DEVELOPMENT Column -->
+            <div class="column" id="column-development">
+                <div class="column-header">
+                    <span class="column-title">IN PROGRESS</span>
+                    <span class="task-count" id="count-development">0</span>
+                </div>
+                <div class="tasks-container" id="tasks-development">
+                    <!-- Tasks will be rendered from database -->
+                </div>
+            </div>
+
+            <!-- IN REVIEW Column -->
+            <div class="column" id="column-review">
+                <div class="column-header">
+                    <span class="column-title">IN REVIEW</span>
+                    <span class="task-count" id="count-review">0</span>
+                </div>
+                <div class="tasks-container" id="tasks-review">
+                    <!-- Tasks will be rendered from database -->
+                </div>
+            </div>
+
+            <!-- COMPLETED Column -->
+            <div class="column" id="column-completed">
+                <div class="column-header">
+                    <span class="column-title">COMPLETED</span>
+                    <span class="task-count" id="count-completed">0</span>
+                </div>
+                <div class="tasks-container" id="tasks-completed">
+                    <!-- Tasks will be rendered from database -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add/Edit Task Modal -->
+    <div class="modal-overlay" id="task-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 class="modal-title" id="modal-title">Add Task</h2>
+                <button class="close-btn" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label" for="task-title">Task Title</label>
+                    <input type="text" class="form-input" id="task-title" placeholder="Enter task title...">
+                </div>
+                <div class="form-group" id="modal-content-fields">
+                    <div id="architecture-content-frontend" class="arch-content-field">
+                        <label class="form-label" for="arch-content-frontend">Frontend</label>
+                        <input type="text" class="form-input" id="arch-content-frontend" placeholder="e.g., HTML/CSS/JS...">
+                    </div>
+                    <div id="architecture-content-backend" class="arch-content-field">
+                        <label class="form-label" for="arch-content-backend">Backend</label>
+                        <input type="text" class="form-input" id="arch-content-backend" placeholder="e.g., FastAPI + Uvicorn...">
+                    </div>
+                    <div id="architecture-content-database" class="arch-content-field">
+                        <label class="form-label" for="arch-content-database">Database</label>
+                        <input type="text" class="form-input" id="arch-content-database" placeholder="e.g., SQLite...">
+                    </div>
+                    <div id="architecture-content-style" class="arch-content-field">
+                        <label class="form-label" for="arch-content-style">Style</label>
+                        <input type="text" class="form-input" id="arch-content-style" placeholder="e.g., Bootstrap...">
+                    </div>
+                    <div id="architecture-content-dags" class="arch-content-field">
+                        <label class="form-label" for="arch-content-dags">DAGs</label>
+                        <input type="text" class="form-input" id="arch-content-dags" placeholder="e.g., dags.py...">
+                    </div>
+                    <div id="architecture-content-config" class="arch-content-field">
+                        <label class="form-label" for="arch-content-config">Config</label>
+                        <input type="text" class="form-input" id="arch-content-config" placeholder="e.g., config.py...">
+                    </div>
+                    <div id="architecture-content-repl" class="arch-content-field">
+                        <label class="form-label" for="arch-content-repl">REPL</label>
+                        <input type="text" class="form-input" id="arch-content-repl" placeholder="e.g., repl.py...">
+                    </div>
+                    <div id="architecture-content-tests" class="arch-content-field">
+                        <label class="form-label" for="arch-content-tests">Tests</label>
+                        <input type="text" class="form-input" id="arch-content-tests" placeholder="e.g., test_*.py...">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="task-description">Description</label>
+                    <textarea class="form-textarea" id="task-description" placeholder="Enter task description..."></textarea>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="task-tags">Tags (comma-separated)</label>
+                    <input type="text" class="form-input" id="task-tags" placeholder="backend, frontend, setup...">
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="task-owner">Owner</label>
+                    <input type="text" class="form-input" id="task-owner" placeholder="Enter owner name...">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="saveTask()">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- New Project Modal -->
+    <div class="modal-overlay" id="new-project-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 class="modal-title">New Project</h2>
+                <button class="close-btn" onclick="closeNewProjectModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label" for="new-project-name">Project Name</label>
+                    <input type="text" class="form-input" id="new-project-name" placeholder="Enter project name...">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeNewProjectModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="saveNewProject()">Create</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- View Task History Modal -->
+    <div class="modal-overlay" id="history-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 class="modal-title" id="history-modal-title">Task History</h2>
+                <button class="close-btn" onclick="closeHistoryModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="history-content"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-primary" onclick="closeHistoryModal()">Close</button>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

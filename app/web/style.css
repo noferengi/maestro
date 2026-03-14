@@ -1,0 +1,458 @@
+/* Kanban Board CSS - Extracted from kanban.html */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #f5f6f8;
+    height: 100vh;
+    display: flex;
+}
+
+/* Sidebar */
+.sidebar {
+    width: 240px;
+    background: #212529;
+    color: #fff;
+    display: flex;
+    flex-direction: column;
+    padding: 1rem;
+}
+
+.sidebar h2 {
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    color: #6c757d;
+    margin-bottom: 0.75rem;
+}
+
+.project-tabs {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+.project-tab {
+    padding: 0.75rem;
+    border-radius: 4px;
+    cursor: pointer;
+    color: #adb5bd;
+    transition: all 0.2s;
+    font-size: 0.9rem;
+}
+
+.project-tab:hover {
+    background: #343a40;
+    color: #fff;
+}
+
+.project-tab.active {
+    background: #495057;
+    color: #fff;
+    border-left: 3px solid #0d6efd;
+}
+
+.add-project-btn {
+    margin-top: auto;
+    padding: 0.75rem;
+    background: #495057;
+    border: none;
+    color: #fff;
+    border-radius: 4px;
+    cursor: pointer;
+    text-align: left;
+    transition: all 0.2s;
+}
+
+.add-project-btn:hover {
+    background: #6c757d;
+}
+
+/* Main Content */
+.main-content {
+    flex: 1;
+    padding: 2rem;
+    overflow-y: auto;
+}
+
+.board-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 2rem;
+}
+
+.board-title {
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: #212529;
+}
+
+.refresh-btn {
+    background: #0d6efd;
+    color: white;
+    border: none;
+    padding: 0.5rem 1rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.875rem;
+    transition: background 0.2s;
+    margin-left: 1rem;
+}
+
+.refresh-btn:hover {
+    background: #0b5ed7;
+}
+
+.refresh-btn:active {
+    background: #0a58ca;
+}
+
+/* Kanban Columns */
+.kanban-board {
+    display: flex;
+    gap: 1.5rem;
+    height: 100%;
+}
+
+.column {
+    flex: 1;
+    background: #dee2e6;
+    border-radius: 6px;
+    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+    min-width: 220px;
+}
+
+.column-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+    padding-bottom: 0.75rem;
+    border-bottom: 2px solid #ced4da;
+}
+
+.column-title {
+    font-weight: 600;
+    color: #212529;
+    font-size: 0.95rem;
+}
+
+.task-count {
+    background: #6c757d;
+    color: #fff;
+    padding: 0.15rem 0.5rem;
+    border-radius: 12px;
+    font-size: 0.75rem;
+}
+
+.add-task-btn {
+    background: transparent;
+    border: 1px dashed #6c757d;
+    color: #6c757d;
+    padding: 0.5rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.8rem;
+    margin-top: 0.5rem;
+    width: 100%;
+    transition: all 0.2s;
+}
+
+.add-task-btn:hover {
+    background: rgba(0,0,0,0.05);
+    border-color: #495057;
+    color: #495057;
+}
+
+.tasks-container {
+    flex: 1;
+    overflow-y: auto;
+    padding-right: 4px;
+    min-height: 100px;
+}
+
+/* Drag and Drop Styles */
+.task-card {
+    background: #fff;
+    border-radius: 4px;
+    padding: 0.75rem;
+    margin-bottom: 0.75rem;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+    cursor: grab;
+    transition: transform 0.1s, box-shadow 0.1s, opacity 0.2s;
+    border-left: 4px solid #0d6efd;
+}
+
+.task-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+}
+
+.task-card:active {
+    cursor: grabbing !important;
+}
+
+.task-card.dragging {
+    opacity: 0.4;
+    /* pointer-events: none removed — it causes the browser to cancel the HTML5
+       drag session immediately in Chrome/Edge/Firefox because the element under
+       the cursor appears to have vanished.  Opacity alone is sufficient for the
+       visual ghost effect without breaking drag. */
+    cursor: grabbing !important;
+}
+
+.task-card.architecture { border-left-color: #6f42c1; }
+.task-card.planning { border-left-color: #ffc107; }
+.task-card.development { border-left-color: #0d6efd; }
+.task-card.review { border-left-color: #fd7e14; }
+.task-card.completed { border-left-color: #198754; }
+
+.task-card.immutable {
+    cursor: default;
+    opacity: 0.95;
+}
+
+.task-arch-content {
+    margin-top: 0.5rem;
+    font-size: 0.75rem;
+    color: #495057;
+}
+
+/* Ghost placeholder shown during drag — lives inside the column container */
+.drop-ghost {
+    min-height: 80px;
+    border: 2px dashed #0d6efd;
+    border-radius: 8px;
+    background: rgba(13, 110, 253, 0.08);
+    margin: 4px 0;
+    pointer-events: none;
+    /* smooth push-apart when inserted/removed */
+    animation: ghost-appear 120ms ease-out;
+}
+
+@keyframes ghost-appear {
+    from { opacity: 0; transform: scaleY(0.5); }
+    to   { opacity: 1; transform: scaleY(1); }
+}
+
+.task-title {
+    font-weight: 500;
+    color: #212529;
+    margin-bottom: 0.5rem;
+    font-size: 0.9rem;
+}
+
+.task-meta {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.75rem;
+    color: #6c757d;
+}
+
+.task-meta span:last-child {
+    margin-left: auto;
+}
+
+.tag {
+    padding: 0.15rem 0.4rem;
+    border-radius: 3px;
+    font-size: 0.65rem;
+    text-transform: uppercase;
+}
+
+.task-actions {
+    display: flex;
+    gap: 0.25rem;
+    margin-top: 0.5rem;
+}
+
+.action-btn {
+    background: #e9ecef;
+    border: none;
+    padding: 0.25rem 0.5rem;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.65rem;
+}
+
+.action-btn:hover {
+    background: #dee2e6;
+}
+
+.action-btn-danger {
+    color: #842029;
+}
+
+.action-btn-danger:hover {
+    background: #f8d7da;
+}
+
+/* Modal Styles */
+.modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0,0,0,0.5);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+
+.modal-overlay.active {
+    display: flex;
+}
+
+.modal {
+    background: #fff;
+    border-radius: 8px;
+    padding: 1.5rem;
+    width: 500px;
+    max-width: 90vw;
+    max-height: 90vh;
+    overflow-y: auto;
+}
+
+.modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1.5rem;
+}
+
+.modal-title {
+    font-size: 1.2rem;
+    font-weight: 600;
+    color: #212529;
+}
+
+.close-btn {
+    background: none;
+    border: none;
+    font-size: 1.5rem;
+    cursor: pointer;
+    color: #6c757d;
+}
+
+.modal-body {
+    margin-bottom: 1.5rem;
+}
+
+.form-group {
+    margin-bottom: 1rem;
+}
+
+.form-label {
+    display: block;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: #495057;
+    margin-bottom: 0.25rem;
+}
+
+.form-input, .form-textarea {
+    width: 100%;
+    padding: 0.5rem;
+    border: 1px solid #ced4da;
+    border-radius: 4px;
+    font-size: 0.9rem;
+    font-family: inherit;
+}
+
+.form-textarea {
+    resize: vertical;
+    min-height: 80px;
+}
+
+.modal-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.75rem;
+}
+
+/* Architecture Content Fields - Hidden by default */
+.arch-content-field {
+    display: none;
+    margin-bottom: 1rem;
+}
+
+.btn {
+    padding: 0.5rem 1rem;
+    border-radius: 4px;
+    font-size: 0.85rem;
+    cursor: pointer;
+    border: none;
+}
+
+.btn-primary {
+    background: #0d6efd;
+    color: #fff;
+}
+
+.btn-primary:hover {
+    background: #0b5ed7;
+}
+
+.btn-secondary {
+    background: #6c757d;
+    color: #fff;
+}
+
+.btn-secondary:hover {
+    background: #5a6268;
+}
+
+/* Timeline Styles for Proof of Work */
+.timeline {
+    margin-top: 1rem;
+    padding-left: 1rem;
+    border-left: 2px solid #dee2e6;
+}
+
+.timeline-item {
+    margin-bottom: 0.75rem;
+    position: relative;
+}
+
+.timeline-item::before {
+    content: '';
+    position: absolute;
+    left: -23px;
+    top: 0.35rem;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #6c757d;
+}
+
+.timeline-item.completed::before {
+    background: #198754;
+}
+
+.timeline-item.in-review::before {
+    background: #fd7e14;
+}
+
+.timeline-item.in-dev::before {
+    background: #0d6efd;
+}
+
+.timeline-time {
+    font-size: 0.75rem;
+    color: #6c757d;
+}
+
+.timeline-status {
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+}

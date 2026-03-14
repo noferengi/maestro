@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import dags
-import repl
+import app.models.dags as dags
+import app.services.repl as repl
 
 
 class TestIntegration(unittest.TestCase):

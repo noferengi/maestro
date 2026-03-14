@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import config
-import dags
+import app.models.dags as dags
 
 
 class CheckpointManager:
