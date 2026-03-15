@@ -3,9 +3,9 @@ Kanban Board Database Layer
 SQLite-based persistence for Kanban tasks
 """
 
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, ForeignKey, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
 import os
 
@@ -25,6 +25,69 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
+class LLM(Base):
+    """LLM endpoint configuration."""
+    __tablename__ = "llms"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    address = Column(String, nullable=False, default='localhost')
+    port = Column(Integer, nullable=False, default=8008)
+    model = Column(String, nullable=False, default='')
+    settings = Column(JSON, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint('address', 'port', 'model', name='uq_llm_endpoint'),
+    )
+
+    @property
+    def label(self):
+        return f"{self.address}:{self.port} serving {self.model}"
+
+    def __repr__(self):
+        return f"<LLM(id={self.id}, {self.label})>"
+
+
+class Budget(Base):
+    """Budget configuration with extensible settings."""
+    __tablename__ = "budgets"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String, nullable=False, unique=True)
+    settings = Column(JSON, nullable=True)
+
+    def __repr__(self):
+        return f"<Budget(id={self.id}, name='{self.name}')>"
+
+
+class TransitionVote(Base):
+    __tablename__ = "transition_votes"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String, ForeignKey('tasks.id'), nullable=False)
+    transition = Column(String, nullable=False)
+    stage = Column(String, nullable=False)
+    verdict = Column(String, nullable=False)
+    confidence = Column(Integer, nullable=False)
+    justification = Column(Text, nullable=True)
+    raw_response = Column(JSON, nullable=True)
+    prompt_tokens = Column(Integer, nullable=True)
+    completion_tokens = Column(Integer, nullable=True)
+    model = Column(String, nullable=True)
+    budget_id = Column(Integer, ForeignKey('budgets.id'), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class TransitionResult(Base):
+    __tablename__ = "transition_results"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String, ForeignKey('tasks.id'), nullable=False)
+    transition = Column(String, nullable=False)
+    outcome = Column(String, nullable=False)
+    vote_summary = Column(JSON, nullable=True)
+    total_prompt_tokens = Column(Integer, nullable=True)
+    total_completion_tokens = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class Task(Base):
     """
     Kanban Task Model
@@ -39,6 +102,10 @@ class Task(Base):
     owner = Column(String, default="user")
     tags = Column(JSON, nullable=True, default=list)
     content = Column(JSON, nullable=True)  # For architecture tasks: frontend, backend, etc.
+    llm_id = Column(Integer, ForeignKey('llms.id'), nullable=True)
+    budget_id = Column(Integer, ForeignKey('budgets.id'), nullable=True)
+    llm_ref = relationship('LLM', lazy='joined')
+    budget_ref = relationship('Budget', lazy='joined')
     history = Column(JSON, nullable=True, default=list)  # Array of {status, timestamp}
     prerequisites = Column(JSON, nullable=True, default=list)  # List of prerequisite task IDs
     position = Column(Integer, nullable=True, default=0)  # Position within column (0 = first)
@@ -97,7 +164,7 @@ def init_db_tables():
     print(f"Database tables initialized at: {DATABASE_PATH}")
 
 
-def create_task(title, task_type, description="", owner="user", tags=None, content=None, prerequisites=None, project='TheMaestro'):
+def create_task(title, task_type, description="", owner="user", tags=None, content=None, llm_id=None, budget_id=None, prerequisites=None, project='TheMaestro'):
     """Create a new task"""
     db = SessionLocal()
     try:
@@ -109,6 +176,8 @@ def create_task(title, task_type, description="", owner="user", tags=None, conte
             owner=owner,
             tags=tags or [],
             content=content,
+            llm_id=llm_id,
+            budget_id=budget_id,
             prerequisites=prerequisites or [],
             project=project,
             history=[{"status": "created", "timestamp": datetime.now().isoformat()}]
@@ -258,40 +327,58 @@ def seed_sample_tasks():
     print("Seeding sample tasks...")
     db = SessionLocal()
     try:
+        # Ensure default LLM and Budget exist
+        default_llm = db.query(LLM).filter_by(address='localhost', port=8008, model='Qwen3p5-Omnicoder-9B').first()
+        if not default_llm:
+            default_llm = LLM(address='localhost', port=8008, model='Qwen3p5-Omnicoder-9B')
+            db.add(default_llm)
+            db.commit()
+            db.refresh(default_llm)
+
+        default_budget = db.query(Budget).filter_by(name='Default Budget').first()
+        if not default_budget:
+            default_budget = Budget(name='Default Budget')
+            db.add(default_budget)
+            db.commit()
+            db.refresh(default_budget)
+
+        lid = default_llm.id
+        bid = default_budget.id
+
         # Architecture tasks (immutable)
-        seed_task(db, "arch-1", "Project Stack", "architecture", "Core technology stack for TheMaestro", "user", 
-                  ["core", "infrastructure"], {"frontend": "HTML/CSS/JS", "backend": "FastAPI + Uvicorn", "database": "SQLite (development)", "style": "Bootstrap CSS"}, 0)
+        seed_task(db, "arch-1", "Project Stack", "architecture", "Core technology stack for TheMaestro", "user",
+                  ["core", "infrastructure"], {"frontend": "HTML/CSS/JS", "backend": "FastAPI + Uvicorn", "database": "SQLite (development)", "style": "Bootstrap CSS"}, llm_id=lid, budget_id=bid, position=0)
 
         seed_task(db, "arch-2", "Code Structure", "architecture", "Organizational structure of the codebase", "user",
-                  ["core", "structure"], {"dags": "dags.py", "config": "config.py", "repl": "repl.py", "tests": "test_*.py"}, 1)
+                  ["core", "structure"], {"dags": "dags.py", "config": "config.py", "repl": "repl.py", "tests": "test_*.py"}, llm_id=lid, budget_id=bid, position=1)
 
         # Planning tasks - Position 0, 1, 2
         seed_task(db, "planning-1", "Setup FastAPI development environment", "planning", "Configure Python virtual environment and install dependencies", "user",
-                  ["backend", "setup"], None, 0)
+                  ["backend", "setup"], None, llm_id=lid, budget_id=bid, position=0)
 
         seed_task(db, "planning-2", "Create Kanban board UI mockup", "planning", "Design wireframes for the Kanban board interface", "user",
-                  ["frontend", "design"], None, 1)
+                  ["frontend", "design"], None, llm_id=lid, budget_id=bid, position=1)
 
         seed_task(db, "planning-3", "Implement drag-and-drop", "planning", "Add drag-and-drop functionality for task reordering", "user",
-                  ["feature", "frontend"], None, 2)
+                  ["feature", "frontend"], None, llm_id=lid, budget_id=bid, position=2)
 
         # In Progress tasks (Development) - Position 0, 1
         seed_task(db, "dev-1", "Configure venv and install dependencies", "development", "Set up Python 3.13 virtual environment", "user",
-                  ["setup", "backend"], None, 0)
+                  ["setup", "backend"], None, llm_id=lid, budget_id=bid, position=0)
 
         seed_task(db, "dev-2", "Create app structure and main.py", "development", "Set up FastAPI application with main entry point", "user",
-                  ["structure", "backend"], None, 1)
+                  ["structure", "backend"], None, llm_id=lid, budget_id=bid, position=1)
 
         # In Review tasks - Position 0
         seed_task(db, "review-1", "Review requirements.txt", "review", "Verify all dependencies are properly listed", "user",
-                  ["qa", "backend"], None, 0)
+                  ["qa", "backend"], None, llm_id=lid, budget_id=bid, position=0)
 
         # Completed tasks - Position 0, 1
         seed_task(db, "completed-1", "Initialize Git repository", "completed", "Create .gitignore and initial commit", "user",
-                  ["setup", "devops"], None, 0)
+                  ["setup", "devops"], None, llm_id=lid, budget_id=bid, position=0)
 
         seed_task(db, "completed-2", "Create database schema", "completed", "Define SQLAlchemy models for tasks", "user",
-                  ["database", "backend"], None, 1)
+                  ["database", "backend"], None, llm_id=lid, budget_id=bid, position=1)
 
         print("Successfully seeded 10 sample tasks!")
         return True
@@ -304,7 +391,7 @@ def seed_sample_tasks():
         db.close()
 
 
-def seed_task(db, id, title, task_type, description="", owner="user", tags=None, content=None, position=0, project='TheMaestro'):
+def seed_task(db, id, title, task_type, description="", owner="user", tags=None, content=None, llm_id=None, budget_id=None, position=0, project='TheMaestro'):
     """
     Helper function to create a sample task for seeding.
     Accepts database session as first parameter.
@@ -318,6 +405,8 @@ def seed_task(db, id, title, task_type, description="", owner="user", tags=None,
             owner=owner,
             tags=tags or [],
             content=content,
+            llm_id=llm_id,
+            budget_id=budget_id,
             history=[{"status": "created", "timestamp": datetime.now().isoformat()}],
             position=position,
             project=project
@@ -343,6 +432,22 @@ def seed_sample_tasks_raw(conn):
     now = datetime.utcnow().isoformat()
     history = json.dumps([{"status": "created", "timestamp": now}])
 
+    # Ensure default LLM and Budget rows exist
+    conn.execute(
+        "INSERT OR IGNORE INTO llms (address, port, model) VALUES ('localhost', 8008, 'Qwen3p5-Omnicoder-9B')"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO budgets (name) VALUES ('Default Budget')"
+    )
+    conn.commit()
+
+    llm_id = conn.execute(
+        "SELECT id FROM llms WHERE address='localhost' AND port=8008 AND model='Qwen3p5-Omnicoder-9B'"
+    ).fetchone()[0]
+    budget_id = conn.execute(
+        "SELECT id FROM budgets WHERE name='Default Budget'"
+    ).fetchone()[0]
+
     tasks = [
         ("arch-1",      "Project Stack",                          "architecture", "Core technology stack for TheMaestro",                          "user", json.dumps(["core", "infrastructure"]), json.dumps({"frontend": "HTML/CSS/JS", "backend": "FastAPI + Uvicorn", "database": "SQLite (development)", "style": "Bootstrap CSS"}), history, 0),
         ("arch-2",      "Code Structure",                         "architecture", "Organizational structure of the codebase",                       "user", json.dumps(["core", "structure"]),        json.dumps({"dags": "dags.py", "config": "config.py", "repl": "repl.py", "tests": "test_*.py"}), history, 1),
@@ -361,10 +466,10 @@ def seed_sample_tasks_raw(conn):
             """
             INSERT OR REPLACE INTO tasks
                 (id, title, type, description, owner, tags, content, history, position,
-                 created_at, updated_at, prerequisites, project)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 created_at, updated_at, prerequisites, project, llm_id, budget_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
-            (*t, now, now, json.dumps([]), 'TheMaestro'),
+            (*t, now, now, json.dumps([]), 'TheMaestro', llm_id, budget_id),
         )
         print(f"  Seeded task: {t[0]} - {t[1]}")
     conn.commit()
@@ -373,41 +478,53 @@ def seed_sample_tasks_raw(conn):
 
 def reorder_tasks(task_id, new_position, task_type):
     """
-    Reorder a task within its column
-    new_position is the index where the task should be inserted
-    Updates position and shifts other tasks accordingly
+    Reorder a task within its column, or move it to a different column.
+    new_position is the index where the task should be inserted.
+    task_type is the destination column.
     """
     db = SessionLocal()
     try:
-        # Get all tasks of this type
-        tasks = db.query(Task).filter(Task.type == task_type).order_by(Task.position).all()
-
-        # Find the task's current position
-        task_to_move = None
-        for task in tasks:
-            if task.id == task_id:
-                task_to_move = task
-                break
-
+        task_to_move = db.query(Task).filter(Task.id == task_id).first()
         if not task_to_move:
             return False
 
-        # Get current index in the list
-        current_index = tasks.index(task_to_move)
+        source_type = task_to_move.type
+        is_cross_column = source_type != task_type
 
-        # Clamp new_position to valid range
-        new_position = max(0, min(new_position, len(tasks) - 1))
+        if is_cross_column:
+            # Remove from source column and re-number it
+            source_tasks = (
+                db.query(Task)
+                .filter(Task.type == source_type, Task.id != task_id)
+                .order_by(Task.position)
+                .all()
+            )
+            for i, t in enumerate(source_tasks):
+                t.position = i
 
-        # Reorder the tasks list
-        # Remove the task from its current position
-        tasks.pop(current_index)
-        
-        # Insert at the new position
-        tasks.insert(new_position, task_to_move)
-        
-        # Update all tasks' positions based on their new indices
-        for i, task in enumerate(tasks):
-            task.position = i
+            # Update the task's type to the destination column
+            task_to_move.type = task_type
+
+            # Insert into destination column
+            dest_tasks = (
+                db.query(Task)
+                .filter(Task.type == task_type, Task.id != task_id)
+                .order_by(Task.position)
+                .all()
+            )
+            new_position = max(0, min(new_position, len(dest_tasks)))
+            dest_tasks.insert(new_position, task_to_move)
+            for i, t in enumerate(dest_tasks):
+                t.position = i
+        else:
+            # Same-column reorder
+            tasks = db.query(Task).filter(Task.type == task_type).order_by(Task.position).all()
+            current_index = tasks.index(task_to_move)
+            new_position = max(0, min(new_position, len(tasks) - 1))
+            tasks.pop(current_index)
+            tasks.insert(new_position, task_to_move)
+            for i, t in enumerate(tasks):
+                t.position = i
 
         db.commit()
         return True
@@ -415,5 +532,222 @@ def reorder_tasks(task_id, new_position, task_type):
         db.rollback()
         print(f"Error reordering tasks: {e}")
         return False
+    finally:
+        db.close()
+
+
+# ============================================
+# LLM CRUD
+# ============================================
+
+def get_all_llms():
+    db = SessionLocal()
+    try:
+        return db.query(LLM).order_by(LLM.id).all()
+    finally:
+        db.close()
+
+
+def get_llm(llm_id):
+    db = SessionLocal()
+    try:
+        return db.query(LLM).filter(LLM.id == llm_id).first()
+    finally:
+        db.close()
+
+
+def create_llm(address, port, model, settings=None):
+    db = SessionLocal()
+    try:
+        llm = LLM(address=address, port=port, model=model, settings=settings)
+        db.add(llm)
+        db.commit()
+        db.refresh(llm)
+        return llm
+    except Exception as e:
+        db.rollback()
+        print(f"Error creating LLM: {e}")
+        return None
+    finally:
+        db.close()
+
+
+def update_llm(llm_id, **kwargs):
+    db = SessionLocal()
+    try:
+        llm = db.query(LLM).filter(LLM.id == llm_id).first()
+        if not llm:
+            return None
+        for key, value in kwargs.items():
+            if hasattr(llm, key):
+                setattr(llm, key, value)
+        db.commit()
+        db.refresh(llm)
+        return llm
+    except Exception as e:
+        db.rollback()
+        print(f"Error updating LLM: {e}")
+        return None
+    finally:
+        db.close()
+
+
+def delete_llm(llm_id):
+    db = SessionLocal()
+    try:
+        llm = db.query(LLM).filter(LLM.id == llm_id).first()
+        if not llm:
+            return False
+        db.delete(llm)
+        db.commit()
+        return True
+    except Exception as e:
+        db.rollback()
+        print(f"Error deleting LLM: {e}")
+        return False
+    finally:
+        db.close()
+
+
+# ============================================
+# Budget CRUD
+# ============================================
+
+def get_all_budgets():
+    db = SessionLocal()
+    try:
+        return db.query(Budget).order_by(Budget.id).all()
+    finally:
+        db.close()
+
+
+def get_budget(budget_id):
+    db = SessionLocal()
+    try:
+        return db.query(Budget).filter(Budget.id == budget_id).first()
+    finally:
+        db.close()
+
+
+def create_budget(name, settings=None):
+    db = SessionLocal()
+    try:
+        budget = Budget(name=name, settings=settings)
+        db.add(budget)
+        db.commit()
+        db.refresh(budget)
+        return budget
+    except Exception as e:
+        db.rollback()
+        print(f"Error creating budget: {e}")
+        return None
+    finally:
+        db.close()
+
+
+def update_budget(budget_id, **kwargs):
+    db = SessionLocal()
+    try:
+        budget = db.query(Budget).filter(Budget.id == budget_id).first()
+        if not budget:
+            return None
+        for key, value in kwargs.items():
+            if hasattr(budget, key):
+                setattr(budget, key, value)
+        db.commit()
+        db.refresh(budget)
+        return budget
+    except Exception as e:
+        db.rollback()
+        print(f"Error updating budget: {e}")
+        return None
+    finally:
+        db.close()
+
+
+def delete_budget(budget_id):
+    db = SessionLocal()
+    try:
+        budget = db.query(Budget).filter(Budget.id == budget_id).first()
+        if not budget:
+            return False
+        db.delete(budget)
+        db.commit()
+        return True
+    except Exception as e:
+        db.rollback()
+        print(f"Error deleting budget: {e}")
+        return False
+    finally:
+        db.close()
+
+
+# ============================================
+# TransitionVote CRUD
+# ============================================
+
+def create_transition_vote(task_id, transition, stage, verdict, confidence, justification=None, raw_response=None, prompt_tokens=None, completion_tokens=None, model=None, budget_id=None):
+    db = SessionLocal()
+    try:
+        vote = TransitionVote(
+            task_id=task_id, transition=transition, stage=stage,
+            verdict=verdict, confidence=confidence, justification=justification,
+            raw_response=raw_response, prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens, model=model, budget_id=budget_id
+        )
+        db.add(vote)
+        db.commit()
+        db.refresh(vote)
+        return vote
+    except Exception as e:
+        db.rollback()
+        print(f"Error creating transition vote: {e}")
+        return None
+    finally:
+        db.close()
+
+
+def get_transition_votes(task_id, transition=None):
+    db = SessionLocal()
+    try:
+        q = db.query(TransitionVote).filter(TransitionVote.task_id == task_id)
+        if transition:
+            q = q.filter(TransitionVote.transition == transition)
+        return q.order_by(TransitionVote.created_at).all()
+    finally:
+        db.close()
+
+
+# ============================================
+# TransitionResult CRUD
+# ============================================
+
+def create_transition_result(task_id, transition, outcome, vote_summary=None, total_prompt_tokens=None, total_completion_tokens=None):
+    db = SessionLocal()
+    try:
+        result = TransitionResult(
+            task_id=task_id, transition=transition, outcome=outcome,
+            vote_summary=vote_summary, total_prompt_tokens=total_prompt_tokens,
+            total_completion_tokens=total_completion_tokens
+        )
+        db.add(result)
+        db.commit()
+        db.refresh(result)
+        return result
+    except Exception as e:
+        db.rollback()
+        print(f"Error creating transition result: {e}")
+        return None
+    finally:
+        db.close()
+
+
+def get_transition_results(task_id, transition=None):
+    db = SessionLocal()
+    try:
+        q = db.query(TransitionResult).filter(TransitionResult.task_id == task_id)
+        if transition:
+            q = q.filter(TransitionResult.transition == transition)
+        return q.order_by(TransitionResult.created_at.desc()).all()
     finally:
         db.close()

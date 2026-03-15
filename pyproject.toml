@@ -1,0 +1,25 @@
+[project]
+name = "the-maestro"
+version = "0.1.0"
+description = "Kanban board with agentic LLM orchestration backend"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi==0.135.1",
+    "uvicorn==0.41.0",
+    "sqlalchemy==2.0.48",
+    "python-multipart==0.0.22",
+    "httpx==0.28.1",
+    "aiofiles==25.1.0",
+    "tree-sitter==0.25.2",
+    "tree-sitter-python==0.25.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.2",
+    "pytest-asyncio==1.3.0",
+]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.backends._legacy:_Backend"

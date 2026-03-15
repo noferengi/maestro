@@ -185,6 +185,40 @@ def search_files(pattern: str, directory: str = ".") -> str:
     return "\n".join(results) if results else "No matches found."
 
 
+def read_file_lines(path: str, start: int, end: int) -> str:
+    """Read a specific line range from a file (1-indexed, inclusive on both ends)."""
+    safe_path = _assert_safe_path(path)
+    if not os.path.isfile(safe_path):
+        return f"ERROR: '{path}' is not a file or does not exist."
+    try:
+        with open(safe_path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        total = len(lines)
+        # Clamp to actual file bounds
+        start = max(1, min(start, total))
+        end = max(start, min(end, total))
+        result_lines: list[str] = []
+        for i in range(start, end + 1):
+            result_lines.append(f"{i}: {lines[i - 1].rstrip()}")
+        return "\n".join(result_lines)
+    except OSError as exc:
+        return f"ERROR reading '{path}': {exc}"
+
+
+def count_lines(path: str) -> str:
+    """Return the line count and byte size of a file without reading full content into the response."""
+    safe_path = _assert_safe_path(path)
+    if not os.path.isfile(safe_path):
+        return f"ERROR: '{path}' is not a file or does not exist."
+    try:
+        byte_size = os.path.getsize(safe_path)
+        with open(safe_path, "r", encoding="utf-8", errors="replace") as fh:
+            line_count = sum(1 for _ in fh)
+        return f"{line_count} lines, {byte_size} bytes"
+    except OSError as exc:
+        return f"ERROR reading '{path}': {exc}"
+
+
 def find_files(glob_pattern: str, directory: str = ".") -> str:
     """
     Find files matching a glob pattern under directory.
@@ -321,6 +355,69 @@ def git_diff(path: str | None = None) -> str:
     return out or "(no changes)"
 
 
+def git_log(path: str | None = None, max_count: int = 20) -> str:
+    """
+    Return recent git log entries. Optionally scoped to a specific file path.
+    Read-only operation — safe for research agents.
+    """
+    max_count = min(max(1, max_count), 100)  # clamp to [1, 100]
+    args = ["git", "log", f"--max-count={max_count}",
+            "--format=%h %ai %an | %s"]
+    if path:
+        try:
+            safe_path = _assert_safe_path(path)
+            args.append("--")
+            args.append(safe_path)
+        except ValueError as exc:
+            return f"BLOCKED: {exc}"
+    rc, out, err = _git_run(args)
+    if rc != 0:
+        return f"ERROR: git log failed: {err}"
+    return out or "(no log entries)"
+
+
+def git_blame(path: str) -> str:
+    """
+    Return git blame output for a file, showing last-modified info per line.
+    Read-only operation — safe for research agents.
+    """
+    try:
+        safe_path = _assert_safe_path(path)
+    except ValueError as exc:
+        return f"BLOCKED: {exc}"
+    if not os.path.isfile(safe_path):
+        return f"ERROR: '{path}' is not a file or does not exist."
+    rc, out, err = _git_run(["git", "blame", safe_path])
+    if rc != 0:
+        return f"ERROR: git blame failed: {err}"
+    return out or "(no blame output)"
+
+
+def git_show(ref: str, path: str | None = None) -> str:
+    """
+    Show a file's content at a specific git commit/ref, or show full commit
+    details (message + diffstat) when no path is given.
+    Read-only operation — safe for research agents.
+    """
+    # Validate ref: only allow safe characters
+    if not re.match(r'^[A-Za-z0-9\-_./~^@]+$', ref):
+        return "ERROR: ref contains invalid characters. Only alphanumeric, -, _, ., /, ~, ^, @ are allowed."
+    if path:
+        try:
+            safe_path = _assert_safe_path(path)
+        except ValueError as exc:
+            return f"BLOCKED: {exc}"
+        # Convert to relative path from PROJECT_ROOT for git
+        rel_path = os.path.relpath(safe_path, PROJECT_ROOT).replace("\\", "/")
+        args = ["git", "show", f"{ref}:{rel_path}"]
+    else:
+        args = ["git", "show", ref, "--stat"]
+    rc, out, err = _git_run(args)
+    if rc != 0:
+        return f"ERROR: git show failed: {err}"
+    return out or "(no output)"
+
+
 def git_create_branch(branch_name: str) -> str:
     """
     Create and checkout a new branch.
@@ -404,6 +501,38 @@ def get_task(task_id: str) -> str:
         return f"ERROR fetching task '{task_id}': {exc}"
 
 
+def list_tasks(project: str, column: str | None = None) -> str:
+    """Return task summaries for a project, optionally filtered by column/type."""
+    import json
+    try:
+        db = _import_db()
+        tasks = db.get_tasks_by_project(project)
+        if column:
+            tasks = [t for t in tasks if t.type == column]
+        if not tasks:
+            msg = f"No tasks found for project '{project}'"
+            if column:
+                msg += f" in column '{column}'"
+            return msg + "."
+        summaries = []
+        for t in tasks:
+            desc = (t.description or "")
+            if len(desc) > 100:
+                desc = desc[:97] + "..."
+            summaries.append({
+                "id": t.id,
+                "title": t.title,
+                "type": t.type,
+                "description": desc,
+                "owner": t.owner,
+                "tags": t.tags,
+                "prerequisites": getattr(t, "prerequisites", []) or [],
+            })
+        return json.dumps(summaries, indent=2)
+    except Exception as exc:
+        return f"ERROR listing tasks: {exc}"
+
+
 def update_task_status(task_id: str, new_status: str) -> str:
     """
     Advance a task through the Kanban pipeline.
@@ -463,6 +592,8 @@ def append_task_history(task_id: str, entry: str) -> str:
 
 TOOL_REGISTRY: dict[str, Any] = {
     "read_file": read_file,
+    "read_file_lines": read_file_lines,
+    "count_lines": count_lines,
     "write_file": write_file,
     "append_file": append_file,
     "list_directory": list_directory,
@@ -472,10 +603,14 @@ TOOL_REGISTRY: dict[str, Any] = {
     "run_shell": run_shell,
     "git_status": git_status,
     "git_diff": git_diff,
+    "git_log": git_log,
+    "git_blame": git_blame,
+    "git_show": git_show,
     "git_create_branch": git_create_branch,
     "git_commit": git_commit,
     "git_checkout": git_checkout,
     "get_task": get_task,
+    "list_tasks": list_tasks,
     "update_task_status": update_task_status,
     "append_task_history": append_task_history,
 }
@@ -486,6 +621,36 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "read_file",
             "description": "Read the full text content of a file within the project.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file (relative to project root or absolute)."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file_lines",
+            "description": "Read a specific line range from a file (1-indexed, inclusive). Lines are returned prefixed with line numbers.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file (relative to project root or absolute)."},
+                    "start": {"type": "integer", "description": "First line number to read (1-indexed). Clamped to file bounds."},
+                    "end": {"type": "integer", "description": "Last line number to read (1-indexed, inclusive). Clamped to file bounds."},
+                },
+                "required": ["path", "start", "end"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "count_lines",
+            "description": "Return the line count and byte size of a file without reading the full content.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -631,6 +796,50 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "git_log",
+            "description": "Return recent git log entries. Optionally scoped to a specific file. Read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Optional file path to scope the log to."},
+                    "max_count": {"type": "integer", "description": "Maximum number of log entries to return (1-100, default 20).", "default": 20},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_blame",
+            "description": "Show git blame for a file (last-modified info per line). Read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file to blame."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_show",
+            "description": "Show a file's content at a specific git ref, or show commit details (message + diffstat). Read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ref": {"type": "string", "description": "Git ref (commit hash, branch, tag, HEAD~N, etc.)."},
+                    "path": {"type": "string", "description": "Optional file path to show at the given ref. If omitted, shows commit details + diffstat."},
+                },
+                "required": ["ref"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "git_create_branch",
             "description": f"Create and checkout a new branch. Must be prefixed with '{GIT_SAFETY_BRANCH_PREFIX}'.",
             "parameters": {
@@ -681,6 +890,24 @@ TOOL_SCHEMAS: list[dict] = [
                     "task_id": {"type": "string", "description": "The unique task ID."},
                 },
                 "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_tasks",
+            "description": "List task summaries for a project, optionally filtered by column. Read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name to list tasks for."},
+                    "column": {
+                        "type": "string",
+                        "description": "Optional column/type filter (e.g. 'planning', 'development', 'review', 'completed', 'architecture').",
+                    },
+                },
+                "required": ["project"],
             },
         },
     },

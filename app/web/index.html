@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kanban Board - TheMaestro</title>
-    <link rel="stylesheet" href="/static/style.css?v=2">
-    <script src="/static/kanban.js?v=4"></script>
+    <link rel="stylesheet" href="/static/style.css?v=3">
+    <script src="/static/kanban.js?v=8"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -35,6 +35,16 @@
         <button class="add-project-btn" id="add-project">
             + New Project
         </button>
+
+        <h2 style="margin-top:1.5rem">Global Config</h2>
+        <div class="project-tabs">
+            <div class="project-tab" id="manage-llms-btn" style="cursor:pointer">
+                LLM Endpoints
+            </div>
+            <div class="project-tab" id="manage-budgets-btn" style="cursor:pointer">
+                Budgets
+            </div>
+        </div>
     </div>
 
     <!-- Main Content -->
@@ -85,6 +95,18 @@
                 <button class="add-task-btn" onclick="openAddTaskModal('architecture')">+ Add Architecture Note</button>
             </div>
 
+            <!-- IDEA Column -->
+            <div class="column" id="column-idea">
+                <div class="column-header">
+                    <span class="column-title">IDEAS</span>
+                    <span class="task-count" id="count-idea">0</span>
+                </div>
+                <div class="tasks-container" id="tasks-idea">
+                    <!-- Tasks will be rendered from database -->
+                </div>
+                <button class="add-task-btn" onclick="openAddTaskModal('idea')">+ Add Idea</button>
+            </div>
+
             <!-- PLANNING Column -->
             <div class="column" id="column-planning">
                 <div class="column-header">
@@ -94,7 +116,6 @@
                 <div class="tasks-container" id="tasks-planning">
                     <!-- Tasks will be rendered from database -->
                 </div>
-                <button class="add-task-btn" onclick="openAddTaskModal('planning')">+ Add Planning Item</button>
             </div>
 
             <!-- IN DEVELOPMENT Column -->
@@ -190,6 +211,14 @@
                     <label class="form-label" for="task-owner">Owner</label>
                     <input type="text" class="form-input" id="task-owner" placeholder="Enter owner name...">
                 </div>
+                <div class="form-group" id="task-llm-group">
+                    <label class="form-label" for="task-llm-select">LLM Endpoint</label>
+                    <select class="form-input" id="task-llm-select"></select>
+                </div>
+                <div class="form-group" id="task-budget-group">
+                    <label class="form-label" for="task-budget-select">Budget</label>
+                    <select class="form-input" id="task-budget-select"></select>
+                </div>
             </div>
             <div class="modal-footer">
                 <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
@@ -214,6 +243,78 @@
             <div class="modal-footer">
                 <button class="btn btn-secondary" onclick="closeNewProjectModal()">Cancel</button>
                 <button class="btn btn-primary" onclick="saveNewProject()">Create</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- LLM Management Modal -->
+    <div class="modal-overlay" id="llm-modal">
+        <div class="modal" style="width:600px">
+            <div class="modal-header">
+                <h2 class="modal-title">LLM Endpoints</h2>
+                <button class="close-btn" onclick="closeLlmModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="llm-list"></div>
+                <hr style="margin:1rem 0">
+                <h3 style="font-size:1rem;margin-bottom:0.75rem">Add New LLM</h3>
+                <div class="form-group">
+                    <label class="form-label" for="llm-address">Address</label>
+                    <input type="text" class="form-input" id="llm-address" value="localhost">
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="llm-port">Port</label>
+                    <input type="number" class="form-input" id="llm-port" value="8008">
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="llm-model">Model Name</label>
+                    <input type="text" class="form-input" id="llm-model" placeholder="e.g. Qwen3p5-Omnicoder-9B">
+                </div>
+                <div id="llm-error" class="inline-error" style="display:none"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeLlmModal()">Close</button>
+                <button class="btn btn-primary" onclick="addLlm()">Add LLM</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Budget Management Modal -->
+    <div class="modal-overlay" id="budget-modal">
+        <div class="modal" style="width:600px">
+            <div class="modal-header">
+                <h2 class="modal-title">Budgets</h2>
+                <button class="close-btn" onclick="closeBudgetModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="budget-list"></div>
+                <hr style="margin:1rem 0">
+                <h3 style="font-size:1rem;margin-bottom:0.75rem">Add New Budget</h3>
+                <div class="form-group">
+                    <label class="form-label" for="budget-name">Budget Name</label>
+                    <input type="text" class="form-input" id="budget-name" placeholder="e.g. Premium Budget">
+                </div>
+                <div id="budget-error" class="inline-error" style="display:none"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeBudgetModal()">Close</button>
+                <button class="btn btn-primary" onclick="addBudget()">Add Budget</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Transition Failure Overlay -->
+    <div class="modal-overlay" id="transition-modal">
+        <div class="modal" style="width:700px">
+            <div class="modal-header">
+                <h2 class="modal-title" id="transition-modal-title">Transition Details</h2>
+                <button class="close-btn" onclick="closeTransitionModal()">&times;</button>
+            </div>
+            <div class="modal-body" id="transition-modal-body">
+                <!-- Populated dynamically -->
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeTransitionModal()">Close</button>
             </div>
         </div>
     </div>

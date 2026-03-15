@@ -209,10 +209,28 @@ body {
 }
 
 .task-card.architecture { border-left-color: #6f42c1; }
+.task-card.idea { border-left-color: #17a2b8; }
 .task-card.planning { border-left-color: #ffc107; }
 .task-card.development { border-left-color: #0d6efd; }
 .task-card.review { border-left-color: #fd7e14; }
 .task-card.completed { border-left-color: #198754; }
+
+/* Rejection state */
+.task-card.rejected {
+    border-left-color: #dc3545;
+    box-shadow: 0 0 0 2px rgba(220, 53, 69, 0.3);
+}
+
+/* Processing state (pipeline running) */
+.task-card.processing {
+    border-left-color: #ffc107;
+    animation: pulse-border 2s infinite;
+}
+
+@keyframes pulse-border {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255, 193, 7, 0.4); }
+    50% { box-shadow: 0 0 0 4px rgba(255, 193, 7, 0.1); }
+}
 
 .task-card.immutable {
     cursor: default;
@@ -231,7 +249,7 @@ body {
     border: 2px dashed #0d6efd;
     border-radius: 8px;
     background: rgba(13, 110, 253, 0.08);
-    margin: 4px 0;
+    margin: 0.75rem 0;
     pointer-events: none;
     /* smooth push-apart when inserted/removed */
     animation: ghost-appear 120ms ease-out;
@@ -292,6 +310,17 @@ body {
 
 .action-btn-danger:hover {
     background: #f8d7da;
+}
+
+/* Advance button styling */
+.action-btn-advance {
+    background: #17a2b8;
+    color: white;
+}
+
+.action-btn-advance:hover {
+    background: #138496;
+    color: white;
 }
 
 /* Modal Styles */
@@ -379,6 +408,22 @@ body {
     gap: 0.75rem;
 }
 
+.inline-error {
+    margin-top: 0.75rem;
+    padding: 0.6rem 0.85rem;
+    font-size: 0.85rem;
+    color: #842029;
+    background-color: #f8d7da;
+    border: 1px solid #f5c2c7;
+    border-radius: 6px;
+    animation: fadeInError 0.25s ease-out;
+}
+
+@keyframes fadeInError {
+    from { opacity: 0; transform: translateY(-4px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
 /* Architecture Content Fields - Hidden by default */
 .arch-content-field {
     display: none;
@@ -455,4 +500,192 @@ body {
     font-size: 0.75rem;
     font-weight: 600;
     text-transform: uppercase;
+}
+
+/* ============================================
+   Transition Failure Overlay
+   ============================================ */
+
+.transition-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+    padding: 0.75rem;
+    background: #f8f9fa;
+    border-radius: 6px;
+    border-left: 4px solid #6c757d;
+}
+
+.transition-header.outcome-rejected {
+    border-left-color: #dc3545;
+    background: #fff5f5;
+}
+
+.transition-header.outcome-failed {
+    border-left-color: #dc3545;
+    background: #fff5f5;
+}
+
+.transition-header.outcome-passed {
+    border-left-color: #198754;
+    background: #f0fff4;
+}
+
+.transition-label {
+    font-weight: 600;
+    font-size: 1rem;
+    color: #212529;
+}
+
+.transition-outcome {
+    font-weight: 600;
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    padding: 0.25rem 0.6rem;
+    border-radius: 4px;
+    color: #fff;
+}
+
+.transition-outcome.rejected,
+.transition-outcome.failed {
+    background: #dc3545;
+}
+
+.transition-outcome.passed {
+    background: #198754;
+}
+
+.vote-card {
+    border: 1px solid #dee2e6;
+    border-radius: 6px;
+    padding: 0.75rem;
+    margin-bottom: 0.75rem;
+    background: #fff;
+}
+
+.vote-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.5rem;
+}
+
+.vote-stage {
+    font-weight: 600;
+    font-size: 0.9rem;
+    color: #212529;
+}
+
+.vote-verdict {
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    padding: 0.2rem 0.5rem;
+    border-radius: 3px;
+    color: #fff;
+}
+
+.vote-verdict.verdict-REJECTED { background: #dc3545; }
+.vote-verdict.verdict-NOT_SUITABLE { background: #fd7e14; }
+.vote-verdict.verdict-NEEDS_RESEARCH { background: #ffc107; color: #212529; }
+.vote-verdict.verdict-POSSIBLE { background: #198754; }
+.vote-verdict.verdict-LIKELY { background: #20c997; }
+
+.vote-confidence {
+    font-size: 0.8rem;
+    color: #6c757d;
+    margin-bottom: 0.35rem;
+}
+
+.vote-justification {
+    font-size: 0.85rem;
+    color: #495057;
+    line-height: 1.4;
+    background: #f8f9fa;
+    padding: 0.5rem;
+    border-radius: 4px;
+}
+
+.transition-tokens {
+    display: flex;
+    gap: 1rem;
+    margin-top: 0.75rem;
+    padding: 0.5rem 0.75rem;
+    background: #f8f9fa;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    color: #6c757d;
+}
+
+.transition-timestamp {
+    font-size: 0.8rem;
+    color: #6c757d;
+    margin-top: 0.5rem;
+}
+
+.transition-history-nav {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+}
+
+.transition-history-btn {
+    background: #e9ecef;
+    border: 1px solid #ced4da;
+    padding: 0.3rem 0.6rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.75rem;
+    color: #495057;
+    transition: all 0.15s;
+}
+
+.transition-history-btn:hover {
+    background: #dee2e6;
+}
+
+.transition-history-btn.active {
+    background: #0d6efd;
+    color: #fff;
+    border-color: #0d6efd;
+}
+
+.transition-history-btn.outcome-rejected,
+.transition-history-btn.outcome-failed {
+    border-color: #f5c2c7;
+    color: #842029;
+}
+
+.transition-history-btn.outcome-passed {
+    border-color: #badbcc;
+    color: #0f5132;
+}
+
+/* Rejection count badge on task cards */
+.rejection-badge {
+    display: inline-block;
+    background: #dc3545;
+    color: #fff;
+    font-size: 0.6rem;
+    font-weight: 700;
+    padding: 0.1rem 0.35rem;
+    border-radius: 8px;
+    margin-left: 0.4rem;
+    vertical-align: middle;
+}
+
+/* Processing spinner indicator */
+.processing-indicator {
+    display: inline-block;
+    font-size: 0.7rem;
+    color: #ffc107;
+    margin-left: 0.4rem;
+    animation: spin 1.5s linear infinite;
+}
+
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
 }

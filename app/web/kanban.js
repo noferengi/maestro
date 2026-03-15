@@ -7,6 +7,7 @@ const API_BASE = '/api';
 // WIP Limits configuration - maximum cards allowed per column
 const WIP_LIMITS = {
     'architecture': 10,
+    'idea': 15,
     'planning': 10,
     'development': 5,
     'review': 5,
@@ -16,6 +17,16 @@ const WIP_LIMITS = {
 // Task data storage with history tracking - loaded from database
 let taskData = {};
 let allTasks = [];
+
+// Global LLM and Budget caches
+let allLlms = [];
+let allBudgets = [];
+
+// Transition status cache: taskId -> { status, data, rejectionCount }
+let transitionCache = {};
+
+// Active polling timers: taskId -> intervalId
+let transitionPollers = {};
 
 // Load tasks from database on startup (scoped to currentProject)
 async function loadTasksFromDatabase() {
@@ -42,11 +53,50 @@ async function loadTasksFromDatabase() {
     }
 }
 
+// Load global LLMs and Budgets
+async function loadLlmsAndBudgets() {
+    try {
+        const [llmRes, budgetRes] = await Promise.all([
+            fetch(`${API_BASE}/llms`),
+            fetch(`${API_BASE}/budgets`)
+        ]);
+        if (llmRes.ok) allLlms = await llmRes.json();
+        if (budgetRes.ok) allBudgets = await budgetRes.json();
+    } catch (e) {
+        console.error('Failed to load LLMs/Budgets:', e);
+    }
+}
+
+function populateLlmSelect(selectedId) {
+    const sel = document.getElementById('task-llm-select');
+    sel.innerHTML = '<option value="">(none)</option>';
+    allLlms.forEach(l => {
+        const opt = document.createElement('option');
+        opt.value = l.id;
+        opt.textContent = l.label;
+        if (l.id === selectedId) opt.selected = true;
+        sel.appendChild(opt);
+    });
+}
+
+function populateBudgetSelect(selectedId) {
+    const sel = document.getElementById('task-budget-select');
+    sel.innerHTML = '<option value="">(none)</option>';
+    allBudgets.forEach(b => {
+        const opt = document.createElement('option');
+        opt.value = b.id;
+        opt.textContent = b.name;
+        if (b.id === selectedId) opt.selected = true;
+        sel.appendChild(opt);
+    });
+}
+
 // Refresh tasks from database
 async function refreshTasks() {
     console.log('Refreshing tasks from database...');
     const success = await loadTasksFromDatabase();
     if (success) {
+        await loadTransitionStatuses();
         renderTasksFromDatabase();
         console.log('Tasks refreshed successfully');
     } else {
@@ -68,6 +118,25 @@ let insertIndicator = null;
 let currentInsertIndex = -1;
 let currentInsertContainer = null;
 
+// Column progression for drag-and-drop validation
+const COLUMN_NEXT = {
+    'architecture': 'idea',
+    'idea': 'planning',
+    'planning': 'development',
+    'development': 'review',
+    'review': 'completed'
+};
+
+function isValidDropTarget(sourceContainer, targetContainer) {
+    const sourceCol = sourceContainer.id.replace('tasks-', '');
+    const targetCol = targetContainer.id.replace('tasks-', '');
+    // Always allow reorder within the same column
+    if (sourceCol === targetCol) return true;
+    // Allow moving to the next column only if the task can advance
+    if (COLUMN_NEXT[sourceCol] === targetCol && canTaskAdvance(draggedTaskId)) return true;
+    return false;
+}
+
 // ============================================
 // Task Rendering Functions
 // ============================================
@@ -76,7 +145,7 @@ function renderTasksFromDatabase() {
     console.log('Rendering tasks from database...');
 
     // Clear ALL existing task cards from ALL columns
-    const columns = ['architecture', 'planning', 'development', 'review', 'completed'];
+    const columns = ['architecture', 'idea', 'planning', 'development', 'review', 'completed'];
 
     columns.forEach(columnType => {
         const container = document.getElementById(`tasks-${columnType}`);
@@ -121,7 +190,7 @@ function renderTasksFromDatabase() {
 }
 
 function updateTaskCounts() {
-    const columns = ['architecture', 'planning', 'development', 'review', 'completed'];
+    const columns = ['architecture', 'idea', 'planning', 'development', 'review', 'completed'];
 
     columns.forEach(columnType => {
         const container = document.getElementById(`tasks-${columnType}`);
@@ -141,10 +210,15 @@ function updateTaskCounts() {
 let autoRefreshInterval = null;
 
 document.addEventListener('DOMContentLoaded', async function() {
-    await loadTasksFromDatabase();
+    await Promise.all([loadTasksFromDatabase(), loadLlmsAndBudgets()]);
+
+    // Fetch transition statuses for idea tasks before first render
+    await loadTransitionStatuses();
+
     initializeProjectTabs();
     initializeTaskCards();
     initializeModals();
+    initializeGlobalConfigButtons();
 
     // Render tasks from database after loading
     renderTasksFromDatabase();
@@ -208,7 +282,14 @@ async function switchProject(projectName) {
     document.querySelector('.board-title').textContent = projectName;
 
     console.log(`Project switched to: ${projectName}`);
+
+    // Clear transition cache and pollers for previous project
+    transitionCache = {};
+    Object.values(transitionPollers).forEach(id => clearInterval(id));
+    transitionPollers = {};
+
     await loadTasksFromDatabase();
+    await loadTransitionStatuses();
     renderTasksFromDatabase();
 }
 
@@ -280,6 +361,13 @@ function openAddTaskModal(targetStatus) {
     document.getElementById('task-tags').value = '';
     document.getElementById('task-owner').value = 'user';
     showArchContentFields(targetStatus);
+
+    // Default LLM/Budget selection (first option = default)
+    const defaultLlmId = allLlms.length > 0 ? allLlms[0].id : null;
+    const defaultBudgetId = allBudgets.length > 0 ? allBudgets[0].id : null;
+    populateLlmSelect(defaultLlmId);
+    populateBudgetSelect(defaultBudgetId);
+
     document.getElementById('task-modal').classList.add('active');
 }
 
@@ -383,6 +471,11 @@ async function saveTask() {
         tests: document.getElementById('arch-content-tests').value
     } : null;
 
+    const llmVal = document.getElementById('task-llm-select').value;
+    const budgetVal = document.getElementById('task-budget-select').value;
+    const llm_id = llmVal ? parseInt(llmVal) : null;
+    const budget_id = budgetVal ? parseInt(budgetVal) : null;
+
     if (currentTaskId) {
         // Update existing task via PUT request
         const taskDataPayload = {
@@ -390,6 +483,8 @@ async function saveTask() {
             description,
             owner,
             tags,
+            llm_id,
+            budget_id,
             ...(content && { content })
         };
 
@@ -418,6 +513,8 @@ async function saveTask() {
             description,
             owner,
             tags,
+            llm_id,
+            budget_id,
             project: currentProject,
             ...(content && { content })
         };
@@ -436,16 +533,11 @@ async function saveTask() {
         const newTask = await response.json();
         taskData[newTask.id] = newTask;
         allTasks.push(newTask);
-
-        const tasksContainer = document.getElementById(`tasks-${currentTargetStatus}`);
-        const newCard = createTaskCard(newTask.id, newTask.title, newTask.tags, newTask.owner, currentTargetStatus);
-        tasksContainer.appendChild(newCard);
-
-        updateTaskCount(currentTargetStatus);
         console.log(`New task created: ${newTask.id}`);
     }
 
     closeModal();
+    renderTasksFromDatabase();
 }
 
 function canAddTaskToColumn(status) {
@@ -472,6 +564,12 @@ function checkWipLimit(status) {
 // Task Card Creation
 // ============================================
 
+function canTaskAdvance(id) {
+    const task = taskData[id];
+    if (!task) return false;
+    return !!(task.description && task.llm_id && task.budget_id);
+}
+
 function createTaskCard(id, title, tags, owner, status) {
     const card = document.createElement('div');
     card.className = `task-card ${status}`;
@@ -479,11 +577,26 @@ function createTaskCard(id, title, tags, owner, status) {
     card.setAttribute('data-status', status);
     card.setAttribute('draggable', 'true');
 
+    // Check for rejection/processing state from transition cache
+    const cached = transitionCache[id];
+    const latestOutcome = cached && cached.history.length > 0 ? cached.history[0].outcome : null;
+    const rejectionCount = cached ? cached.rejectionCount : 0;
+
+    if (latestOutcome === 'rejected' || latestOutcome === 'failed') {
+        card.classList.add('rejected');
+    }
+    // If we have an active poller, card is processing
+    if (transitionPollers[id]) {
+        card.classList.add('processing');
+    }
+
     const tagsHtml = tags.map(tag => `<span class="tag">${tag}</span>`).join('') || '<span class="tag">general</span>';
     const ownerHtml = owner ? `<span>${owner}</span>` : '';
+    const rejBadge = rejectionCount > 0 ? `<span class="rejection-badge" title="${rejectionCount} rejection(s)">${rejectionCount}x</span>` : '';
+    const processingSpinner = transitionPollers[id] ? '<span class="processing-indicator">\u25E0</span>' : '';
 
     card.innerHTML = `
-        <div class="task-title">${title}</div>
+        <div class="task-title">${title}${rejBadge}${processingSpinner}</div>
         <div class="task-meta">
             ${tagsHtml}
             ${ownerHtml}
@@ -494,15 +607,48 @@ function createTaskCard(id, title, tags, owner, status) {
         </div>
     `;
 
-    if (status === 'planning') {
-        const moveBtn = card.querySelector('.task-actions');
-        moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'development')">Move to IN PROGRESS</button>`;
+    // Make rejected/failed cards clickable to open transition detail
+    if (rejectionCount > 0) {
+        card.style.cursor = 'pointer';
+        card.addEventListener('click', (e) => {
+            // Don't open overlay if a button was clicked
+            if (e.target.closest('.action-btn')) return;
+            openTransitionModal(id);
+        });
+    }
+
+    const ready = canTaskAdvance(id);
+
+    if (status === 'idea') {
+        const actionsDiv = card.querySelector('.task-actions');
+        const advanceBtn = document.createElement('button');
+        advanceBtn.className = 'action-btn action-btn-advance';
+        if (transitionPollers[id]) {
+            advanceBtn.textContent = 'Processing...';
+            advanceBtn.disabled = true;
+        } else {
+            advanceBtn.textContent = rejectionCount > 0 ? 'Retry Advance' : 'Advance to Planning';
+        }
+        advanceBtn.onclick = (e) => {
+            e.stopPropagation();
+            advanceTask(id);
+        };
+        actionsDiv.appendChild(advanceBtn);
+    } else if (status === 'planning') {
+        if (ready) {
+            const moveBtn = card.querySelector('.task-actions');
+            moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'development')">Move to IN PROGRESS</button>`;
+        }
     } else if (status === 'development') {
-        const moveBtn = card.querySelector('.task-actions');
-        moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'review')">Move to IN REVIEW</button>`;
+        if (ready) {
+            const moveBtn = card.querySelector('.task-actions');
+            moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'review')">Move to IN REVIEW</button>`;
+        }
     } else if (status === 'review') {
-        const moveBtn = card.querySelector('.task-actions');
-        moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'completed')">Move to COMPLETED</button>`;
+        if (ready) {
+            const moveBtn = card.querySelector('.task-actions');
+            moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'completed')">Move to COMPLETED</button>`;
+        }
     } else if (status === 'completed') {
         const viewBtn = card.querySelector('.task-actions');
         viewBtn.innerHTML = `<button class="action-btn" onclick="viewTaskHistory('${id}')">View Proof</button>
@@ -516,6 +662,279 @@ function createTaskCard(id, title, tags, owner, status) {
     }
 
     return card;
+}
+
+// ============================================
+// Advance Task (Idea -> Planning pipeline)
+// ============================================
+
+async function advanceTask(taskId) {
+    try {
+        const response = await fetch(`${API_BASE}/tasks/${taskId}/advance`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+        if (!response.ok) {
+            const err = await response.json();
+            alert(`Advance failed: ${err.detail || 'Unknown error'}`);
+            return;
+        }
+        const result = await response.json();
+        console.log('Advance initiated:', result);
+
+        // Mark card as processing immediately
+        setCardProcessing(taskId, true);
+
+        // Start polling for transition status
+        startTransitionPolling(taskId);
+    } catch (error) {
+        console.error('Error advancing task:', error);
+    }
+}
+
+function setCardProcessing(taskId, processing) {
+    const card = document.querySelector(`.task-card[data-id="${taskId}"]`);
+    if (!card) return;
+    if (processing) {
+        card.classList.add('processing');
+        card.classList.remove('rejected');
+        // Add spinner indicator if not present
+        const titleEl = card.querySelector('.task-title');
+        if (titleEl && !titleEl.querySelector('.processing-indicator')) {
+            const spinner = document.createElement('span');
+            spinner.className = 'processing-indicator';
+            spinner.textContent = '\u25E0'; // half-circle spinner character
+            titleEl.appendChild(spinner);
+        }
+        // Disable the advance button while processing
+        const advBtn = card.querySelector('.action-btn-advance');
+        if (advBtn) {
+            advBtn.disabled = true;
+            advBtn.textContent = 'Processing...';
+        }
+    } else {
+        card.classList.remove('processing');
+        const titleEl = card.querySelector('.task-title');
+        if (titleEl) {
+            const spinner = titleEl.querySelector('.processing-indicator');
+            if (spinner) spinner.remove();
+        }
+    }
+}
+
+function startTransitionPolling(taskId) {
+    // Clear any existing poller for this task
+    if (transitionPollers[taskId]) {
+        clearInterval(transitionPollers[taskId]);
+    }
+
+    const pollInterval = setInterval(async () => {
+        try {
+            const resp = await fetch(`${API_BASE}/tasks/${taskId}/transition-status`);
+            if (!resp.ok) return;
+            const data = await resp.json();
+
+            console.log(`[poll] Task ${taskId} transition-status:`, data);
+
+            // Still no result yet — keep polling
+            if (data.status === 'no_transitions' || !data.outcome) {
+                return;
+            }
+
+            // Pipeline completed — stop polling
+            clearInterval(transitionPollers[taskId]);
+            delete transitionPollers[taskId];
+
+            if (data.outcome === 'passed') {
+                // Reload — card will appear in PLANNING column
+                await loadTasksFromDatabase();
+                // Re-fetch transition data for all idea tasks
+                await loadTransitionStatuses();
+                renderTasksFromDatabase();
+            } else {
+                // rejected or failed
+                setCardProcessing(taskId, false);
+                cacheTransitionData(taskId, data);
+
+                // Mark card as rejected and re-render
+                const card = document.querySelector(`.task-card[data-id="${taskId}"]`);
+                if (card) {
+                    card.classList.add('rejected');
+                }
+
+                // Show the failure overlay
+                openTransitionModal(taskId);
+
+                // Re-render to show rejection badge
+                await loadTasksFromDatabase();
+                await loadTransitionStatuses();
+                renderTasksFromDatabase();
+            }
+        } catch (err) {
+            console.error(`[poll] Error polling transition for ${taskId}:`, err);
+        }
+    }, 2500); // Poll every 2.5 seconds
+
+    transitionPollers[taskId] = pollInterval;
+}
+
+function cacheTransitionData(taskId, data) {
+    if (!transitionCache[taskId]) {
+        transitionCache[taskId] = { history: [], rejectionCount: 0 };
+    }
+    // Avoid duplicates by checking timestamp
+    const exists = transitionCache[taskId].history.some(
+        h => h.created_at === data.created_at && h.transition === data.transition
+    );
+    if (!exists) {
+        transitionCache[taskId].history.unshift(data);
+    }
+    // Count rejections/failures
+    transitionCache[taskId].rejectionCount = transitionCache[taskId].history.filter(
+        h => h.outcome === 'rejected' || h.outcome === 'failed'
+    ).length;
+}
+
+// ============================================
+// Transition Status Loading (for existing tasks)
+// ============================================
+
+async function loadTransitionStatuses() {
+    // Fetch transition status for all idea-column tasks
+    const ideaTasks = allTasks.filter(t => t.type === 'idea');
+    const promises = ideaTasks.map(async (task) => {
+        try {
+            const resp = await fetch(`${API_BASE}/tasks/${task.id}/transition-status`);
+            if (!resp.ok) return;
+            const data = await resp.json();
+            if (data.status === 'no_transitions') return;
+
+            // If the API returns a history array, load all entries
+            if (data.history && Array.isArray(data.history)) {
+                transitionCache[task.id] = { history: [], rejectionCount: 0 };
+                data.history.forEach(entry => cacheTransitionData(task.id, entry));
+            } else {
+                cacheTransitionData(task.id, data);
+            }
+        } catch (err) {
+            // Silently skip — not critical
+        }
+    });
+    await Promise.all(promises);
+}
+
+// ============================================
+// Transition Failure Overlay
+// ============================================
+
+const TRANSITION_LABELS = {
+    'idea_to_planning': 'IDEA \u2192 PLANNING',
+    'planning_to_development': 'PLANNING \u2192 DEVELOPMENT',
+    'development_to_review': 'DEVELOPMENT \u2192 REVIEW',
+    'review_to_completed': 'REVIEW \u2192 COMPLETED',
+};
+
+function openTransitionModal(taskId) {
+    const cached = transitionCache[taskId];
+    if (!cached || cached.history.length === 0) {
+        alert('No transition data available for this task.');
+        return;
+    }
+
+    const task = taskData[taskId];
+    const taskTitle = task ? task.title : taskId;
+
+    document.getElementById('transition-modal-title').textContent = `Transitions: ${taskTitle}`;
+    renderTransitionDetail(taskId, 0);
+    document.getElementById('transition-modal').classList.add('active');
+}
+
+function renderTransitionDetail(taskId, index) {
+    const cached = transitionCache[taskId];
+    if (!cached || !cached.history[index]) return;
+
+    const body = document.getElementById('transition-modal-body');
+    const history = cached.history;
+    const data = history[index];
+
+    let html = '';
+
+    // History navigation if multiple attempts
+    if (history.length > 1) {
+        html += '<div class="transition-history-nav">';
+        history.forEach((h, i) => {
+            const activeClass = i === index ? ' active' : '';
+            const outcomeClass = ` outcome-${h.outcome}`;
+            const label = TRANSITION_LABELS[h.transition] || h.transition;
+            const ts = h.created_at ? new Date(h.created_at).toLocaleDateString() : '';
+            html += `<button class="transition-history-btn${activeClass}${outcomeClass}" `
+                  + `onclick="renderTransitionDetail('${taskId}', ${i})">`
+                  + `#${history.length - i} ${h.outcome.toUpperCase()} ${ts}</button>`;
+        });
+        html += '</div>';
+    }
+
+    // Transition header
+    const transLabel = TRANSITION_LABELS[data.transition] || data.transition;
+    const outcomeClass = `outcome-${data.outcome}`;
+    html += `<div class="transition-header ${outcomeClass}">`;
+    html += `<span class="transition-label">${transLabel}</span>`;
+    html += `<span class="transition-outcome ${data.outcome}">${data.outcome.toUpperCase()}</span>`;
+    html += '</div>';
+
+    // Votes
+    const votes = data.votes || [];
+    if (votes.length > 0) {
+        html += '<h3 style="font-size:0.95rem; margin-bottom:0.5rem; color:#495057;">Stage Votes</h3>';
+        votes.forEach(v => {
+            const verdictClass = `verdict-${v.verdict}`;
+            // Confidence may be 0.0-1.0 (float) or 0-100 (int); normalize to percentage
+            const rawConf = v.confidence;
+            const confPct = rawConf != null
+                ? (rawConf <= 1 ? Math.round(rawConf * 100) : Math.round(rawConf))
+                : null;
+            const confidence = confPct != null ? `${confPct}%` : 'N/A';
+            html += `<div class="vote-card">`;
+            html += `<div class="vote-card-header">`;
+            html += `<span class="vote-stage">${v.stage}</span>`;
+            html += `<span class="vote-verdict ${verdictClass}">${v.verdict}</span>`;
+            html += `</div>`;
+            html += `<div class="vote-confidence">Confidence: ${confidence}</div>`;
+            if (v.justification) {
+                html += `<div class="vote-justification">${escapeHtml(v.justification)}</div>`;
+            }
+            html += '</div>';
+        });
+    }
+
+    // Token usage
+    const promptTok = data.total_prompt_tokens || 0;
+    const compTok = data.total_completion_tokens || 0;
+    if (promptTok || compTok) {
+        html += '<div class="transition-tokens">';
+        html += `<span>Prompt tokens: <strong>${promptTok.toLocaleString()}</strong></span>`;
+        html += `<span>Completion tokens: <strong>${compTok.toLocaleString()}</strong></span>`;
+        html += `<span>Total: <strong>${(promptTok + compTok).toLocaleString()}</strong></span>`;
+        html += '</div>';
+    }
+
+    // Timestamp
+    if (data.created_at) {
+        const ts = new Date(data.created_at).toLocaleString();
+        html += `<div class="transition-timestamp">Evaluated: ${ts}</div>`;
+    }
+
+    body.innerHTML = html;
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+function closeTransitionModal() {
+    document.getElementById('transition-modal').classList.remove('active');
 }
 
 // ============================================
@@ -564,6 +983,11 @@ async function moveTask(taskId, newStatus) {
         return;
     }
 
+    if (!canTaskAdvance(taskId)) {
+        alert('Task cannot advance: it needs a description, LLM, and budget assigned.');
+        return;
+    }
+
     // Update task in database via PUT request
     const response = await fetch(`${API_BASE}/tasks/${taskId}`, {
         method: 'PUT',
@@ -601,17 +1025,22 @@ async function moveTask(taskId, newStatus) {
         }
 
         const actions = currentCard.querySelector('.task-actions');
+        const ready = canTaskAdvance(taskId);
         if (newStatus === 'planning') {
             actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
-                                 <button class="action-btn" onclick="moveTask('${taskId}', 'development')">Move to IN PROGRESS</button>`;
+                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
+                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'development')">Move to IN PROGRESS</button>` : '');
         } else if (newStatus === 'development') {
             actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
-                                 <button class="action-btn" onclick="moveTask('${taskId}', 'review')">Move to IN REVIEW</button>`;
+                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
+                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'review')">Move to IN REVIEW</button>` : '');
         } else if (newStatus === 'review') {
             actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
-                                 <button class="action-btn" onclick="moveTask('${taskId}', 'completed')">Move to COMPLETED</button>`;
+                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
+                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'completed')">Move to COMPLETED</button>` : '');
         } else if (newStatus === 'completed') {
-            actions.innerHTML = `<button class="action-btn" onclick="viewTaskHistory('${taskId}')">View Proof</button>`;
+            actions.innerHTML = `<button class="action-btn" onclick="viewTaskHistory('${taskId}')">View Proof</button>
+                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`;
         }
 
         if (newContainer) {
@@ -651,6 +1080,9 @@ function editTask(taskId) {
     document.getElementById('task-description').value = task.description || '';
     document.getElementById('task-tags').value = (task.tags || []).join(', ');
     document.getElementById('task-owner').value = task.owner || 'user';
+    showArchContentFields(task.type);
+    populateLlmSelect(task.llm_id);
+    populateBudgetSelect(task.budget_id);
 
     document.getElementById('task-modal').classList.add('active');
 }
@@ -844,10 +1276,16 @@ function handleDragEnd(e) {
 }
 
 function handleContainerDragOver(e) {
+    const container = this;
+
+    // Block ghost + drop for invalid targets
+    if (!dragSourceContainer || !isValidDropTarget(dragSourceContainer, container)) {
+        e.dataTransfer.dropEffect = 'none';
+        return;
+    }
+
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
-
-    const container = this;
     // Exclude both the dragging card and the ghost itself from midpoint geometry
     const cards = [...container.querySelectorAll('.task-card:not(.dragging):not(.drop-ghost)')];
 
@@ -918,6 +1356,11 @@ function handleContainerDragLeave(e) {
 async function handleContainerDrop(e) {
     e.preventDefault();
 
+    // Reject drops on invalid targets
+    if (!dragSourceContainer || !currentInsertContainer || !isValidDropTarget(dragSourceContainer, currentInsertContainer)) {
+        return;
+    }
+
     // Capture everything before any await
     const container = currentInsertContainer;
     const insertIndex = currentInsertIndex;
@@ -985,3 +1428,149 @@ function initializeDragAndDrop() {
 
 // Initialize after DOM is ready
 setTimeout(initializeDragAndDrop, 100);
+
+// ============================================
+// Global Config: LLM & Budget Management
+// ============================================
+
+function initializeGlobalConfigButtons() {
+    document.getElementById('manage-llms-btn').addEventListener('click', openLlmModal);
+    document.getElementById('manage-budgets-btn').addEventListener('click', openBudgetModal);
+
+    document.getElementById('llm-modal').addEventListener('click', function(e) {
+        if (e.target === this) closeLlmModal();
+    });
+    document.getElementById('budget-modal').addEventListener('click', function(e) {
+        if (e.target === this) closeBudgetModal();
+    });
+}
+
+function showInlineError(elementId, message, duration = 5000) {
+    const el = document.getElementById(elementId);
+    if (!el) return;
+    el.textContent = message;
+    el.style.display = 'block';
+    // Re-trigger animation
+    el.style.animation = 'none';
+    el.offsetHeight; // reflow
+    el.style.animation = '';
+    clearTimeout(el._hideTimer);
+    el._hideTimer = setTimeout(() => { el.style.display = 'none'; }, duration);
+}
+
+// --- LLM Modal ---
+
+async function openLlmModal() {
+    await loadLlmsAndBudgets();
+    renderLlmList();
+    document.getElementById('llm-modal').classList.add('active');
+}
+
+function closeLlmModal() {
+    document.getElementById('llm-modal').classList.remove('active');
+}
+
+function renderLlmList() {
+    const container = document.getElementById('llm-list');
+    if (allLlms.length === 0) {
+        container.innerHTML = '<p style="color:#6c757d;font-size:0.85rem">No LLM endpoints configured.</p>';
+        return;
+    }
+    let html = '<table style="width:100%;font-size:0.85rem;border-collapse:collapse">';
+    html += '<tr style="border-bottom:1px solid #dee2e6"><th style="text-align:left;padding:0.4rem">ID</th><th style="text-align:left;padding:0.4rem">Endpoint</th><th style="text-align:left;padding:0.4rem">Model</th><th></th></tr>';
+    allLlms.forEach(l => {
+        html += `<tr style="border-bottom:1px solid #f0f0f0">
+            <td style="padding:0.4rem">${l.id}</td>
+            <td style="padding:0.4rem">${l.address}:${l.port}</td>
+            <td style="padding:0.4rem">${l.model}</td>
+            <td style="padding:0.4rem"><button class="action-btn action-btn-danger" onclick="deleteLlmEntry(${l.id})">Delete</button></td>
+        </tr>`;
+    });
+    html += '</table>';
+    container.innerHTML = html;
+}
+
+async function addLlm() {
+    const address = document.getElementById('llm-address').value.trim();
+    const port = parseInt(document.getElementById('llm-port').value) || 8008;
+    const model = document.getElementById('llm-model').value.trim();
+    if (!address || !model) { showInlineError('llm-error', 'Address and model are required.'); return; }
+
+    const res = await fetch(`${API_BASE}/llms`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ address, port, model })
+    });
+    if (!res.ok) {
+        const err = await res.json();
+        showInlineError('llm-error', err.detail || 'Failed to create LLM.');
+        return;
+    }
+    document.getElementById('llm-model').value = '';
+    await loadLlmsAndBudgets();
+    renderLlmList();
+}
+
+async function deleteLlmEntry(id) {
+    if (!confirm('Delete this LLM endpoint?')) return;
+    await fetch(`${API_BASE}/llms/${id}`, { method: 'DELETE' });
+    await loadLlmsAndBudgets();
+    renderLlmList();
+}
+
+// --- Budget Modal ---
+
+async function openBudgetModal() {
+    await loadLlmsAndBudgets();
+    renderBudgetList();
+    document.getElementById('budget-modal').classList.add('active');
+}
+
+function closeBudgetModal() {
+    document.getElementById('budget-modal').classList.remove('active');
+}
+
+function renderBudgetList() {
+    const container = document.getElementById('budget-list');
+    if (allBudgets.length === 0) {
+        container.innerHTML = '<p style="color:#6c757d;font-size:0.85rem">No budgets configured.</p>';
+        return;
+    }
+    let html = '<table style="width:100%;font-size:0.85rem;border-collapse:collapse">';
+    html += '<tr style="border-bottom:1px solid #dee2e6"><th style="text-align:left;padding:0.4rem">ID</th><th style="text-align:left;padding:0.4rem">Name</th><th></th></tr>';
+    allBudgets.forEach(b => {
+        html += `<tr style="border-bottom:1px solid #f0f0f0">
+            <td style="padding:0.4rem">${b.id}</td>
+            <td style="padding:0.4rem">${b.name}</td>
+            <td style="padding:0.4rem"><button class="action-btn action-btn-danger" onclick="deleteBudgetEntry(${b.id})">Delete</button></td>
+        </tr>`;
+    });
+    html += '</table>';
+    container.innerHTML = html;
+}
+
+async function addBudget() {
+    const name = document.getElementById('budget-name').value.trim();
+    if (!name) { showInlineError('budget-error', 'Budget name is required.'); return; }
+
+    const res = await fetch(`${API_BASE}/budgets`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name })
+    });
+    if (!res.ok) {
+        const err = await res.json();
+        showInlineError('budget-error', err.detail || 'Failed to create budget.');
+        return;
+    }
+    document.getElementById('budget-name').value = '';
+    await loadLlmsAndBudgets();
+    renderBudgetList();
+}
+
+async function deleteBudgetEntry(id) {
+    if (!confirm('Delete this budget?')) return;
+    await fetch(`${API_BASE}/budgets/${id}`, { method: 'DELETE' });
+    await loadLlmsAndBudgets();
+    renderBudgetList();
+}

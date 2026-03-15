@@ -75,3 +75,33 @@ STATUS_REJECTED: str = "REJECTED"
 # Signal emitted by the agent when it wants the loop to revert to design phase
 SIGNAL_REVERT: str = "REVERT_TO_DESIGN"
 SIGNAL_ACCEPTED: str = "ACCEPTED"
+
+# ---------------------------------------------------------------------------
+# Intake pipeline settings
+# ---------------------------------------------------------------------------
+
+# Maximum number of research agent calls (including initial + retries)
+RESEARCH_AGENT_MAX_LIVES: int = int(os.getenv("MAESTRO_RESEARCH_LIVES", "3"))
+
+# Tools available to the research agent (restricted set)
+RESEARCH_AGENT_TOOLS: list[str] = [
+    "read_file", "read_file_lines", "count_lines",
+    "search_files", "find_files", "list_directory",
+    "git_status", "git_diff", "git_log", "git_blame", "git_show",
+    "get_task", "list_tasks",
+]
+
+# Enable tie-breaker research agent for split votes
+TIEBREAKER_ENABLED: bool = True
+
+# LLM temperature for structured intake responses (lower = more deterministic)
+INTAKE_LLM_TEMPERATURE: float = float(os.getenv("MAESTRO_INTAKE_TEMP", "0.1"))
+
+# Verdict confidence ranges (inclusive bounds)
+VERDICT_RANGES: dict[str, tuple[int, int]] = {
+    "REJECTED":       (0, 50),
+    "NOT_SUITABLE":   (51, 60),
+    "NEEDS_RESEARCH": (61, 75),
+    "POSSIBLE":       (76, 91),
+    "LIKELY":         (92, 100),
+}
