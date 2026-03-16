@@ -36,14 +36,11 @@ import json
 import logging
 from typing import Any
 
-import httpx
-
 from app.agent.config import (
     LLM_BASE_URL,
     LLM_MODEL,
-    LLM_TIMEOUT_SECONDS,
-    MAX_TOKENS_PER_TURN,
 )
+from app.agent.llm_client import call_llm
 
 logger = logging.getLogger(__name__)
 
@@ -211,12 +208,16 @@ class IntakePipeline:
         task_title: str,
         all_tasks: list[dict],
         budget_id: int | None = None,
+        llm_base_url: str | None = None,
+        llm_model: str | None = None,
     ) -> None:
         self.task_id = task_id
         self.task_description = task_description
         self.task_title = task_title
         self.all_tasks = all_tasks
         self.budget_id = budget_id
+        self.llm_base_url = llm_base_url or LLM_BASE_URL
+        self.llm_model = llm_model or LLM_MODEL
         self.votes: list[dict] = []  # Collect votes from each stage
 
     # ------------------------------------------------------------------
@@ -289,7 +290,12 @@ class IntakePipeline:
             )
 
             try:
-                research_result = await run_research(question=question, context=context)
+                research_result = await run_research(
+                    question=question,
+                    context=context,
+                    llm_base_url=self.llm_base_url,
+                    llm_model=self.llm_model,
+                )
                 research_vote = {
                     "stage": f"{stage_name}_research",
                     "verdict": research_result.vote.get("verdict", VERDICT_NOT_SUITABLE),
@@ -345,6 +351,8 @@ class IntakePipeline:
             tiebreaker_result = await run_tiebreaker(
                 task_description=f"{self.task_title}: {self.task_description}",
                 votes=self.votes,
+                llm_base_url=self.llm_base_url,
+                llm_model=self.llm_model,
             )
 
             tiebreaker_vote = {
@@ -396,47 +404,40 @@ class IntakePipeline:
         Raises json.JSONDecodeError if the response is not valid JSON.
         Raises httpx.TimeoutException on timeout.
         """
-        payload = {
-            "model": LLM_MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.1,  # Low temp for structured responses
-            "max_tokens": MAX_TOKENS_PER_TURN,
-            "response_format": {"type": "json_object"},
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        data = await call_llm(
+            messages,
+            base_url=self.llm_base_url,
+            model=self.llm_model,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+
+        # Extract usage stats
+        usage = data.get("usage", {})
+        raw_content = data["choices"][0]["message"]["content"]
+
+        # Parse the JSON content — strip markdown fences if the model added them
+        cleaned = raw_content.strip()
+        if cleaned.startswith("```"):
+            # Remove ```json ... ``` wrapping
+            lines = cleaned.split("\n")
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            cleaned = "\n".join(lines)
+
+        return {
+            "content": json.loads(cleaned),
+            "prompt_tokens": usage.get("prompt_tokens", 0),
+            "completion_tokens": usage.get("completion_tokens", 0),
+            "model": data.get("model", self.llm_model),
         }
-
-        async with httpx.AsyncClient(timeout=LLM_TIMEOUT_SECONDS) as client:
-            response = await client.post(
-                f"{LLM_BASE_URL}/chat/completions",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            # Extract usage stats
-            usage = data.get("usage", {})
-            raw_content = data["choices"][0]["message"]["content"]
-
-            # Parse the JSON content — strip markdown fences if the model added them
-            cleaned = raw_content.strip()
-            if cleaned.startswith("```"):
-                # Remove ```json ... ``` wrapping
-                lines = cleaned.split("\n")
-                if lines[0].startswith("```"):
-                    lines = lines[1:]
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                cleaned = "\n".join(lines)
-
-            return {
-                "content": json.loads(cleaned),
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-                "model": data.get("model", LLM_MODEL),
-            }
 
     # ------------------------------------------------------------------
     # Vote extraction helper
@@ -474,7 +475,7 @@ class IntakePipeline:
             "raw_response": content,
             "prompt_tokens": llm_result.get("prompt_tokens", 0),
             "completion_tokens": llm_result.get("completion_tokens", 0),
-            "model": llm_result.get("model", LLM_MODEL),
+            "model": llm_result.get("model", self.llm_model),
         }
 
     def _error_vote(self, stage: str, error: Exception) -> dict:
@@ -494,7 +495,7 @@ class IntakePipeline:
             "raw_response": None,
             "prompt_tokens": 0,
             "completion_tokens": 0,
-            "model": LLM_MODEL,
+            "model": self.llm_model,
         }
 
     # ------------------------------------------------------------------
@@ -770,6 +771,8 @@ async def run_intake_pipeline(
     task_title: str,
     all_tasks: list[dict],
     budget_id: int | None = None,
+    llm_base_url: str | None = None,
+    llm_model: str | None = None,
 ) -> dict:
     """
     Convenience function to run the full intake pipeline.
@@ -789,6 +792,12 @@ async def run_intake_pipeline(
         All current tasks in the project (used for conflict detection).
     budget_id : int | None
         Optional LLM budget identifier for token tracking.
+    llm_base_url : str | None
+        Base URL for the LLM endpoint (e.g. ``http://localhost:8008/v1``).
+        Falls back to the global ``LLM_BASE_URL`` config when *None*.
+    llm_model : str | None
+        Model identifier to send in the request payload.
+        Falls back to the global ``LLM_MODEL`` config when *None*.
 
     Returns
     -------
@@ -803,5 +812,7 @@ async def run_intake_pipeline(
         task_title=task_title,
         all_tasks=all_tasks,
         budget_id=budget_id,
+        llm_base_url=llm_base_url,
+        llm_model=llm_model,
     )
     return await pipeline.run()

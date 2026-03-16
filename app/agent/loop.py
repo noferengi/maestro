@@ -18,20 +18,19 @@ import logging
 from dataclasses import dataclass, field
 from typing import Literal
 
-import httpx
-
 from app.agent.config import (
     LLM_BASE_URL,
     LLM_MODEL,
     LLM_TEMPERATURE,
-    LLM_TIMEOUT_SECONDS,
-    MAX_TOKENS_PER_TURN,
     MAX_TURNS,
     MAX_CONSECUTIVE_ERRORS,
     SIGNAL_ACCEPTED,
     SIGNAL_REVERT,
     GIT_SAFETY_BRANCH_PREFIX,
+    CONTEXT_WARNING_ENABLED,
+    CONTEXT_WARNING_THRESHOLDS,
 )
+from app.agent.llm_client import call_llm
 from app.agent.system_prompt import MAESTRO_SYSTEM_PROMPT
 from app.agent.tools import TOOL_SCHEMAS, dispatch_tool
 
@@ -98,15 +97,23 @@ class MaestroLoop:
         self,
         task_id: str,
         max_turns: int = MAX_TURNS,
+        llm_base_url: str | None = None,
+        llm_model: str | None = None,
+        max_context: int | None = None,
     ) -> None:
         self.task_id = task_id
         self.max_turns = max_turns
+        self.llm_base_url = llm_base_url or LLM_BASE_URL
+        self.llm_model = llm_model or LLM_MODEL
+        self.max_context = max_context
         self._messages: list[dict] = []
         self._turn: int = 0
         self._consecutive_errors: int = 0
         self._stop_requested: bool = False
         self._git_branch: str | None = None
         self._files_changed: list[str] = []
+        self._total_tokens: int = 0
+        self._warnings_fired: set[float] = set()
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -188,6 +195,11 @@ class MaestroLoop:
             assistant_message = response.get("choices", [{}])[0].get("message", {})
             self._messages.append(assistant_message)
 
+            # ── Track token usage & inject context warnings ────────────
+            usage = response.get("usage", {})
+            self._total_tokens += usage.get("total_tokens", 0)
+            self._maybe_inject_context_warning()
+
             tool_calls = assistant_message.get("tool_calls") or []
             content = assistant_message.get("content") or ""
 
@@ -263,32 +275,44 @@ class MaestroLoop:
         ]
 
     # ------------------------------------------------------------------
+    # Context window warnings
+    # ------------------------------------------------------------------
+
+    def _maybe_inject_context_warning(self) -> None:
+        """Inject a warning message if token usage crosses a threshold."""
+        if not CONTEXT_WARNING_ENABLED or not self.max_context:
+            return
+        ratio = self._total_tokens / self.max_context
+        for threshold, message in CONTEXT_WARNING_THRESHOLDS:
+            if ratio >= threshold and threshold not in self._warnings_fired:
+                self._warnings_fired.add(threshold)
+                logger.info(
+                    "Task '%s': context usage %.0f%% (threshold %.0f%%).",
+                    self.task_id, ratio * 100, threshold * 100,
+                )
+                self._messages.append({
+                    "role": "user",
+                    "content": message,
+                })
+
+    # ------------------------------------------------------------------
     # LLM call
     # ------------------------------------------------------------------
 
     async def _call_llm(self, messages: list[dict]) -> dict:
         """
-        POST to the llama.cpp OpenAI-compatible endpoint.
+        POST to the OpenAI-compatible endpoint.
         Returns the raw response dict.
         Raises httpx.HTTPError on network failures.
         """
-        payload = {
-            "model": LLM_MODEL,
-            "messages": messages,
-            "tools": TOOL_SCHEMAS,
-            "tool_choice": "auto",
-            "temperature": LLM_TEMPERATURE,
-            "max_tokens": MAX_TOKENS_PER_TURN,
-        }
-
-        async with httpx.AsyncClient(timeout=LLM_TIMEOUT_SECONDS) as client:
-            response = await client.post(
-                f"{LLM_BASE_URL}/chat/completions",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            response.raise_for_status()
-            return response.json()
+        return await call_llm(
+            messages,
+            base_url=self.llm_base_url,
+            model=self.llm_model,
+            temperature=LLM_TEMPERATURE,
+            tools=TOOL_SCHEMAS,
+            tool_choice="auto",
+        )
 
     # ------------------------------------------------------------------
     # Tool call handling

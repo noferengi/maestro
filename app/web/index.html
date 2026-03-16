@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kanban Board - TheMaestro</title>
-    <link rel="stylesheet" href="/static/style.css?v=3">
-    <script src="/static/kanban.js?v=8"></script>
+    <link rel="stylesheet" href="/static/style.css?v=9">
+    <script src="/static/kanban.js?v=9"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -249,7 +249,7 @@
 
     <!-- LLM Management Modal -->
     <div class="modal-overlay" id="llm-modal">
-        <div class="modal" style="width:600px">
+        <div class="modal" style="width:640px">
             <div class="modal-header">
                 <h2 class="modal-title">LLM Endpoints</h2>
                 <button class="close-btn" onclick="closeLlmModal()">&times;</button>
@@ -257,24 +257,88 @@
             <div class="modal-body">
                 <div id="llm-list"></div>
                 <hr style="margin:1rem 0">
-                <h3 style="font-size:1rem;margin-bottom:0.75rem">Add New LLM</h3>
-                <div class="form-group">
-                    <label class="form-label" for="llm-address">Address</label>
-                    <input type="text" class="form-input" id="llm-address" value="localhost">
+
+                <!-- Tabs -->
+                <div class="llm-tabs">
+                    <button class="llm-tab active" id="llm-tab-add" onclick="switchLlmTab('add')">Add New LLM Endpoint</button>
+                    <button class="llm-tab" id="llm-tab-edit" onclick="switchLlmTab('edit')">Edit</button>
                 </div>
-                <div class="form-group">
-                    <label class="form-label" for="llm-port">Port</label>
-                    <input type="number" class="form-input" id="llm-port" value="8008">
+
+                <!-- Add tab -->
+                <div class="llm-tab-content active" id="llm-pane-add">
+                    <div class="form-group">
+                        <label class="form-label" for="llm-address">Address</label>
+                        <input type="text" class="form-input" id="llm-address" value="localhost">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="llm-port">Port</label>
+                        <input type="number" class="form-input" id="llm-port" value="8008">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="llm-model">Model Name</label>
+                        <input type="text" class="form-input" id="llm-model" placeholder="e.g. Qwen3-Coder-Next-80B">
+                    </div>
+                    <div style="display:flex;gap:1rem">
+                        <div class="form-group" style="flex:1">
+                            <label class="form-label" for="llm-parallel">Parallel Sessions</label>
+                            <input type="number" class="form-input" id="llm-parallel" value="1" min="1" max="1024">
+                        </div>
+                        <div class="form-group" style="flex:1">
+                            <label class="form-label" for="llm-max-context">Max Context (tokens)</label>
+                            <input type="text" class="form-input" id="llm-max-context" value="4096"
+                                   inputmode="numeric" pattern="[0-9]*"
+                                   oninput="this.value = this.value.replace(/[^0-9]/g, '')">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="llm-notes">Notes</label>
+                        <textarea class="form-input" id="llm-notes" rows="2"
+                                  placeholder="e.g. Q8_0 quant of Qwen3-Coder-Next-80B finetune v2.1, SWA enabled"></textarea>
+                    </div>
+                    <div id="llm-error" class="inline-error" style="display:none"></div>
                 </div>
-                <div class="form-group">
-                    <label class="form-label" for="llm-model">Model Name</label>
-                    <input type="text" class="form-input" id="llm-model" placeholder="e.g. Qwen3p5-Omnicoder-9B">
+
+                <!-- Edit tab -->
+                <div class="llm-tab-content" id="llm-pane-edit">
+                    <p id="llm-edit-placeholder" style="color:#6c757d;font-size:0.85rem">Click a model name in the table above to edit it.</p>
+                    <div id="llm-edit-form" style="display:none">
+                        <input type="hidden" id="llm-edit-id">
+                        <div class="form-group">
+                            <label class="form-label" for="llm-edit-address">Address</label>
+                            <input type="text" class="form-input" id="llm-edit-address">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="llm-edit-port">Port</label>
+                            <input type="number" class="form-input" id="llm-edit-port">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="llm-edit-model">Model Name</label>
+                            <input type="text" class="form-input" id="llm-edit-model">
+                        </div>
+                        <div style="display:flex;gap:1rem">
+                            <div class="form-group" style="flex:1">
+                                <label class="form-label" for="llm-edit-parallel">Parallel Sessions</label>
+                                <input type="number" class="form-input" id="llm-edit-parallel" min="1" max="1024">
+                            </div>
+                            <div class="form-group" style="flex:1">
+                                <label class="form-label" for="llm-edit-max-context">Max Context (tokens)</label>
+                                <input type="text" class="form-input" id="llm-edit-max-context"
+                                       inputmode="numeric" pattern="[0-9]*"
+                                       oninput="this.value = this.value.replace(/[^0-9]/g, '')">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="llm-edit-notes">Notes</label>
+                            <textarea class="form-input" id="llm-edit-notes" rows="2"
+                                      placeholder="e.g. Q8_0 quant of Qwen3-Coder-Next-80B finetune v2.1, SWA enabled"></textarea>
+                        </div>
+                        <div id="llm-edit-error" class="inline-error" style="display:none"></div>
+                    </div>
                 </div>
-                <div id="llm-error" class="inline-error" style="display:none"></div>
             </div>
             <div class="modal-footer">
                 <button class="btn btn-secondary" onclick="closeLlmModal()">Close</button>
-                <button class="btn btn-primary" onclick="addLlm()">Add LLM</button>
+                <button class="btn btn-primary" id="llm-submit-btn" onclick="addLlm()">Add LLM Endpoint</button>
             </div>
         </div>
     </div>

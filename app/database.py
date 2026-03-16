@@ -34,6 +34,9 @@ class LLM(Base):
     port = Column(Integer, nullable=False, default=8008)
     model = Column(String, nullable=False, default='')
     settings = Column(JSON, nullable=True)
+    parallel_sessions = Column(Integer, nullable=False, default=1)
+    max_context = Column(Integer, nullable=False, default=4096)
+    notes = Column(String, nullable=False, default='')
 
     __table_args__ = (
         UniqueConstraint('address', 'port', 'model', name='uq_llm_endpoint'),
@@ -491,11 +494,13 @@ def reorder_tasks(task_id, new_position, task_type):
         source_type = task_to_move.type
         is_cross_column = source_type != task_type
 
+        project = task_to_move.project or 'TheMaestro'
+
         if is_cross_column:
             # Remove from source column and re-number it
             source_tasks = (
                 db.query(Task)
-                .filter(Task.type == source_type, Task.id != task_id)
+                .filter(Task.type == source_type, Task.project == project, Task.id != task_id)
                 .order_by(Task.position)
                 .all()
             )
@@ -508,7 +513,7 @@ def reorder_tasks(task_id, new_position, task_type):
             # Insert into destination column
             dest_tasks = (
                 db.query(Task)
-                .filter(Task.type == task_type, Task.id != task_id)
+                .filter(Task.type == task_type, Task.project == project, Task.id != task_id)
                 .order_by(Task.position)
                 .all()
             )
@@ -518,7 +523,7 @@ def reorder_tasks(task_id, new_position, task_type):
                 t.position = i
         else:
             # Same-column reorder
-            tasks = db.query(Task).filter(Task.type == task_type).order_by(Task.position).all()
+            tasks = db.query(Task).filter(Task.type == task_type, Task.project == project).order_by(Task.position).all()
             current_index = tasks.index(task_to_move)
             new_position = max(0, min(new_position, len(tasks) - 1))
             tasks.pop(current_index)
@@ -556,10 +561,11 @@ def get_llm(llm_id):
         db.close()
 
 
-def create_llm(address, port, model, settings=None):
+def create_llm(address, port, model, settings=None, parallel_sessions=1, max_context=4096, notes=''):
     db = SessionLocal()
     try:
-        llm = LLM(address=address, port=port, model=model, settings=settings)
+        llm = LLM(address=address, port=port, model=model, settings=settings,
+                   parallel_sessions=parallel_sessions, max_context=max_context, notes=notes)
         db.add(llm)
         db.commit()
         db.refresh(llm)

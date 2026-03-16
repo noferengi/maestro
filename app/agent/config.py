@@ -2,69 +2,117 @@
 app/agent/config.py
 -------------------
 Central configuration for the Maestro agent subsystem.
-All LLM endpoints, safety limits, and filesystem constants live here.
-Import this module everywhere rather than hard-coding values.
+
+Load order (highest priority wins):
+  1. Environment variables  (MAESTRO_* prefix)
+  2. maestro.ini            (project root)
+  3. Built-in defaults      (hardcoded below)
+
+All other modules import from here — never hard-code tuneable values.
 """
 
+from __future__ import annotations
+
+import configparser
 import os
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# LLM / API settings
+# Locate and parse maestro.ini
 # ---------------------------------------------------------------------------
 
-# Base URL for the llama.cpp OpenAI-compatible server
-LLM_BASE_URL: str = os.getenv("MAESTRO_LLM_BASE_URL", "http://localhost:8008/v1")
-
-# Model name as exposed by the llama.cpp server
-LLM_MODEL: str = os.getenv("MAESTRO_LLM_MODEL", "omnicoder-9b")
-
-# Per-request generation settings
-MAX_TOKENS_PER_TURN: int = int(os.getenv("MAESTRO_MAX_TOKENS", "4096"))
-LLM_TEMPERATURE: float = float(os.getenv("MAESTRO_TEMPERATURE", "0.2"))
-LLM_TIMEOUT_SECONDS: int = int(os.getenv("MAESTRO_LLM_TIMEOUT", "120"))
-
-# ---------------------------------------------------------------------------
-# Loop safety limits
-# ---------------------------------------------------------------------------
-
-# Hard cap on agent turns before declaring MAX_TURNS termination
-MAX_TURNS: int = int(os.getenv("MAESTRO_MAX_TURNS", "150"))
-
-# Number of consecutive tool errors before triggering REVERT_TO_DESIGN
-MAX_CONSECUTIVE_ERRORS: int = 3
-
-# Number of task-level retries before triggering REVERT_TO_DESIGN
-MAX_TASK_RETRIES: int = 3
-
-# Hard timeout (seconds) for run_shell calls
-SHELL_TIMEOUT_SECONDS: int = int(os.getenv("MAESTRO_SHELL_TIMEOUT", "30"))
-
-# ---------------------------------------------------------------------------
-# Filesystem paths
-# ---------------------------------------------------------------------------
-
-# Project root — everything stays inside this directory
-PROJECT_ROOT: str = os.getenv(
-    "MAESTRO_PROJECT_ROOT",
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_PROJECT_ROOT_FALLBACK = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..")
 )
 
-# Archive directory for soft-deleted files (relative to PROJECT_ROOT)
-ARCHIVE_DIR: str = os.path.join(PROJECT_ROOT, ".archive")
+_INI_PATH = os.path.join(
+    os.getenv("MAESTRO_PROJECT_ROOT", _PROJECT_ROOT_FALLBACK),
+    "maestro.ini",
+)
 
-# ---------------------------------------------------------------------------
+_cfg = configparser.ConfigParser(
+    # Allow : in values (URLs) without treating it as a delimiter
+    delimiters=("=",),
+    # Keep percent signs literal — our warning messages use %%
+    interpolation=None,
+)
+# Preserve case in keys
+_cfg.optionxform = str  # type: ignore[assignment]
+_cfg.read(_INI_PATH, encoding="utf-8")
+
+
+def _get(section: str, key: str, env_var: str | None, fallback: str) -> str:
+    """Resolve a config value: env → ini → fallback."""
+    if env_var:
+        env_val = os.getenv(env_var)
+        if env_val is not None:
+            return env_val
+    return _cfg.get(section, key, fallback=fallback)
+
+
+def _getint(section: str, key: str, env_var: str | None, fallback: int) -> int:
+    return int(_get(section, key, env_var, str(fallback)))
+
+
+def _getfloat(section: str, key: str, env_var: str | None, fallback: float) -> float:
+    return float(_get(section, key, env_var, str(fallback)))
+
+
+def _getbool(section: str, key: str, env_var: str | None, fallback: bool) -> bool:
+    raw = _get(section, key, env_var, str(fallback)).strip().lower()
+    return raw in ("true", "1", "yes", "on")
+
+
+def _getlist(section: str, key: str, fallback: str) -> list[str]:
+    """Parse a comma-separated list from the INI (no env override)."""
+    raw = _cfg.get(section, key, fallback=fallback)
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+# ===========================================================================
+# LLM / API settings
+# ===========================================================================
+
+LLM_BASE_URL: str = _get("llm", "base_url", "MAESTRO_LLM_BASE_URL", "http://localhost:8008/v1")
+LLM_MODEL: str = _get("llm", "model", "MAESTRO_LLM_MODEL", "omnicoder-9b")
+MAX_TOKENS_PER_TURN: int = _getint("llm", "max_tokens_per_turn", "MAESTRO_MAX_TOKENS", 4096)
+LLM_TEMPERATURE: float = _getfloat("llm", "temperature", "MAESTRO_TEMPERATURE", 0.2)
+LLM_TIMEOUT_SECONDS: int = _getint("llm", "timeout_seconds", "MAESTRO_LLM_TIMEOUT", 120)
+
+# ===========================================================================
+# Loop safety limits
+# ===========================================================================
+
+MAX_TURNS: int = _getint("loop", "max_turns", "MAESTRO_MAX_TURNS", 150)
+MAX_CONSECUTIVE_ERRORS: int = _getint("loop", "max_consecutive_errors", None, 3)
+MAX_TASK_RETRIES: int = _getint("loop", "max_task_retries", None, 3)
+
+# ===========================================================================
+# Shell
+# ===========================================================================
+
+SHELL_TIMEOUT_SECONDS: int = _getint("shell", "timeout_seconds", "MAESTRO_SHELL_TIMEOUT", 30)
+
+# ===========================================================================
+# Filesystem paths
+# ===========================================================================
+
+PROJECT_ROOT: str = _get("paths", "project_root", "MAESTRO_PROJECT_ROOT", "") or _PROJECT_ROOT_FALLBACK
+ARCHIVE_DIR: str = os.path.join(
+    PROJECT_ROOT,
+    _get("paths", "archive_dir", None, ".archive"),
+)
+
+# ===========================================================================
 # Git settings
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
-# All agent work branches are namespaced under this prefix
-GIT_SAFETY_BRANCH_PREFIX: str = "maestro/task-"
+GIT_SAFETY_BRANCH_PREFIX: str = _get("git", "branch_prefix", None, "maestro/task-")
+GIT_ALLOWED_BASE_BRANCHES: list[str] = _getlist("git", "allowed_base_branches", "main, master")
 
-# Branches the agent is allowed to checkout (in addition to maestro/* branches)
-GIT_ALLOWED_BASE_BRANCHES: list[str] = ["main", "master"]
-
-# ---------------------------------------------------------------------------
-# Agent status values (canonical set used across tools + loop)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Agent status values (canonical — not user-tuneable)
+# ===========================================================================
 
 STATUS_PENDING: str = "PENDING"
 STATUS_ACTIVE: str = "ACTIVE"
@@ -72,36 +120,97 @@ STATUS_VERIFYING: str = "VERIFYING"
 STATUS_ACCEPTED: str = "ACCEPTED"
 STATUS_REJECTED: str = "REJECTED"
 
-# Signal emitted by the agent when it wants the loop to revert to design phase
 SIGNAL_REVERT: str = "REVERT_TO_DESIGN"
 SIGNAL_ACCEPTED: str = "ACCEPTED"
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Intake pipeline settings
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
-# Maximum number of research agent calls (including initial + retries)
-RESEARCH_AGENT_MAX_LIVES: int = int(os.getenv("MAESTRO_RESEARCH_LIVES", "3"))
+RESEARCH_AGENT_MAX_LIVES: int = _getint("intake", "research_agent_max_lives", "MAESTRO_RESEARCH_LIVES", 3)
+TIEBREAKER_ENABLED: bool = _getbool("intake", "tiebreaker_enabled", None, True)
+INTAKE_LLM_TEMPERATURE: float = _getfloat("intake", "llm_temperature", "MAESTRO_INTAKE_TEMP", 0.1)
 
-# Tools available to the research agent (restricted set)
-RESEARCH_AGENT_TOOLS: list[str] = [
-    "read_file", "read_file_lines", "count_lines",
-    "search_files", "find_files", "list_directory",
-    "git_status", "git_diff", "git_log", "git_blame", "git_show",
-    "get_task", "list_tasks",
-]
+RESEARCH_AGENT_TOOLS: list[str] = _getlist("intake", "research_agent_tools",
+    "read_file, read_file_lines, count_lines, "
+    "search_files, find_files, list_directory, "
+    "git_status, git_diff, git_log, git_blame, git_show, "
+    "get_task, list_tasks"
+)
 
-# Enable tie-breaker research agent for split votes
-TIEBREAKER_ENABLED: bool = True
+# ===========================================================================
+# LLM capacity limits
+# ===========================================================================
 
-# LLM temperature for structured intake responses (lower = more deterministic)
-INTAKE_LLM_TEMPERATURE: float = float(os.getenv("MAESTRO_INTAKE_TEMP", "0.1"))
+MIN_PARALLEL_SESSIONS: int = _getint("capacity", "min_parallel_sessions", None, 1)
+MAX_PARALLEL_SESSIONS: int = _getint("capacity", "max_parallel_sessions", None, 1024)
+MIN_CONTEXT_SIZE: int = _getint("capacity", "min_context_size", None, 1)
+MAX_CONTEXT_SIZE: int = _getint("capacity", "max_context_size", None, 2 * 1024 * 1024)
 
-# Verdict confidence ranges (inclusive bounds)
-VERDICT_RANGES: dict[str, tuple[int, int]] = {
-    "REJECTED":       (0, 50),
-    "NOT_SUITABLE":   (51, 60),
-    "NEEDS_RESEARCH": (61, 75),
-    "POSSIBLE":       (76, 91),
-    "LIKELY":         (92, 100),
-}
+# ===========================================================================
+# Context window warnings
+# ===========================================================================
+
+CONTEXT_WARNING_ENABLED: bool = _getbool("context_warnings", "enabled", None, True)
+
+def _build_context_thresholds() -> list[tuple[float, str]]:
+    """Build the thresholds list from INI entries."""
+    _defaults = [
+        (0.50, "warn_at_50", (
+            "[SYSTEM WARNING] You have used approximately 50% of your available "
+            "context window.  Begin planning to conclude your current line of work "
+            "within the remaining capacity."
+        )),
+        (0.75, "warn_at_75", (
+            "[SYSTEM WARNING] You have used approximately 75% of your available "
+            "context window.  Prioritise completing your current task.  Avoid "
+            "starting new exploratory work.  Wrap up tool calls and summarise "
+            "findings."
+        )),
+        (0.90, "warn_at_90", (
+            "[SYSTEM CRITICAL] You have used approximately 90% of your available "
+            "context window.  Immediately produce your final output in the required "
+            "format.  Do not make additional tool calls unless absolutely necessary. "
+            "Your generation will be terminated shortly."
+        )),
+    ]
+    thresholds: list[tuple[float, str]] = []
+    for pct, prefix, default_msg in _defaults:
+        enabled = _getbool("context_warnings", f"{prefix}_enabled", None, True)
+        if not enabled:
+            continue
+        msg = _get("context_warnings", f"{prefix}_message", None, default_msg)
+        if msg:
+            thresholds.append((pct, msg))
+    return thresholds
+
+CONTEXT_WARNING_THRESHOLDS: list[tuple[float, str]] = _build_context_thresholds()
+
+# ===========================================================================
+# Scheduler
+# ===========================================================================
+
+SCHEDULER_TICK_INTERVAL: float = _getfloat("scheduler", "tick_interval", None, 5.0)
+SCHEDULER_ENABLED: bool = _getbool("scheduler", "enabled", None, True)
+
+# ===========================================================================
+# Verdict confidence ranges
+# ===========================================================================
+
+def _build_verdict_ranges() -> dict[str, tuple[int, int]]:
+    """Parse verdict ranges from INI or use defaults."""
+    _defaults = {
+        "rejected":       (0, 50),
+        "not_suitable":   (51, 60),
+        "needs_research": (61, 75),
+        "possible":       (76, 91),
+        "likely":         (92, 100),
+    }
+    result: dict[str, tuple[int, int]] = {}
+    for name, (dmin, dmax) in _defaults.items():
+        raw = _cfg.get("verdicts", name, fallback=f"{dmin}, {dmax}")
+        parts = [int(x.strip()) for x in raw.split(",")]
+        result[name.upper()] = (parts[0], parts[1])
+    return result
+
+VERDICT_RANGES: dict[str, tuple[int, int]] = _build_verdict_ranges()

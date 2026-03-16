@@ -200,11 +200,17 @@ body {
 }
 
 .task-card.dragging {
-    opacity: 0.4;
-    /* pointer-events: none removed — it causes the browser to cancel the HTML5
-       drag session immediately in Chrome/Edge/Firefox because the element under
-       the cursor appears to have vanished.  Opacity alone is sufficient for the
-       visual ghost effect without breaking drag. */
+    /* Collapse the card so it doesn't occupy layout space and skew the
+       midpoint calculations of sibling cards during dragover.  We keep a
+       tiny height so the browser still considers the element "visible"
+       enough to sustain the drag session (0-height can cancel it). */
+    height: 1px !important;
+    min-height: 0 !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    border: none !important;
+    overflow: hidden;
+    opacity: 0;
     cursor: grabbing !important;
 }
 
@@ -674,6 +680,43 @@ body {
     border-radius: 8px;
     margin-left: 0.4rem;
     vertical-align: middle;
+}
+
+/* LLM Modal Tabs */
+.llm-tabs {
+    display: flex;
+    border-bottom: 2px solid #dee2e6;
+    margin-bottom: 1rem;
+}
+
+.llm-tab {
+    padding: 0.5rem 1.25rem;
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: #6c757d;
+    border: none;
+    background: none;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -2px;
+    transition: color 0.15s, border-color 0.15s;
+}
+
+.llm-tab:hover {
+    color: #495057;
+}
+
+.llm-tab.active {
+    color: #0d6efd;
+    border-bottom-color: #0d6efd;
+}
+
+.llm-tab-content {
+    display: none;
+}
+
+.llm-tab-content.active {
+    display: block;
 }
 
 /* Processing spinner indicator */

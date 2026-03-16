@@ -26,17 +26,14 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-import httpx
-
 from app.agent.config import (
     LLM_BASE_URL,
     LLM_MODEL,
-    LLM_TIMEOUT_SECONDS,
-    MAX_TOKENS_PER_TURN,
     INTAKE_LLM_TEMPERATURE,
     RESEARCH_AGENT_MAX_LIVES,
     RESEARCH_AGENT_TOOLS,
 )
+from app.agent.llm_client import call_llm
 from app.agent.tools import TOOL_SCHEMAS, TOOL_REGISTRY, dispatch_tool
 
 logger = logging.getLogger(__name__)
@@ -200,12 +197,16 @@ class ResearchAgent:
         max_turns_per_life: int = 20,
         max_lives: int | None = None,
         is_tiebreaker: bool = False,
+        llm_base_url: str | None = None,
+        llm_model: str | None = None,
     ) -> None:
         self.question = question
         self.context = context
         self.max_turns_per_life = max_turns_per_life
         self.max_lives = max_lives or RESEARCH_AGENT_MAX_LIVES
         self.is_tiebreaker = is_tiebreaker
+        self.llm_base_url = llm_base_url or LLM_BASE_URL
+        self.llm_model = llm_model or LLM_MODEL
 
         self._restricted_schemas = _build_restricted_schemas()
         self._accumulated_findings: list[str] = []
@@ -382,23 +383,14 @@ class ResearchAgent:
 
     async def _call_llm(self, messages: list[dict]) -> dict:
         """POST to the LLM endpoint with restricted tool schemas."""
-        payload = {
-            "model": LLM_MODEL,
-            "messages": messages,
-            "tools": self._restricted_schemas,
-            "tool_choice": "auto",
-            "temperature": INTAKE_LLM_TEMPERATURE,
-            "max_tokens": MAX_TOKENS_PER_TURN,
-        }
-
-        async with httpx.AsyncClient(timeout=LLM_TIMEOUT_SECONDS) as client:
-            response = await client.post(
-                f"{LLM_BASE_URL}/chat/completions",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            response.raise_for_status()
-            return response.json()
+        return await call_llm(
+            messages,
+            base_url=self.llm_base_url,
+            model=self.llm_model,
+            temperature=INTAKE_LLM_TEMPERATURE,
+            tools=self._restricted_schemas,
+            tool_choice="auto",
+        )
 
     # ------------------------------------------------------------------
     # Tool call handling (restricted)
@@ -475,6 +467,8 @@ async def run_research(
     context: dict[str, Any],
     max_turns_per_life: int = 20,
     max_lives: int | None = None,
+    llm_base_url: str | None = None,
+    llm_model: str | None = None,
 ) -> ResearchResult:
     """Run a research agent and return its result."""
     agent = ResearchAgent(
@@ -482,6 +476,8 @@ async def run_research(
         context=context,
         max_turns_per_life=max_turns_per_life,
         max_lives=max_lives,
+        llm_base_url=llm_base_url,
+        llm_model=llm_model,
     )
     return await agent.run()
 
@@ -491,6 +487,8 @@ async def run_tiebreaker(
     votes: list[dict],
     max_turns_per_life: int = 20,
     max_lives: int | None = None,
+    llm_base_url: str | None = None,
+    llm_model: str | None = None,
 ) -> ResearchResult:
     """Run a tie-breaker research agent with all voter context."""
     # Build the investigation question from the disagreement
@@ -517,5 +515,7 @@ async def run_tiebreaker(
         max_turns_per_life=max_turns_per_life,
         max_lives=max_lives,
         is_tiebreaker=True,
+        llm_base_url=llm_base_url,
+        llm_model=llm_model,
     )
     return await agent.run()

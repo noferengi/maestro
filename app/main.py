@@ -29,11 +29,19 @@ app = FastAPI(title="Kanban Board API")
 # Mount static files directory
 app.mount("/static", StaticFiles(directory="app/web"), name="static")
 
-# Initialize database on startup
+# Initialize database and scheduler on startup
 @app.on_event("startup")
 def startup_event():
     init_db()
     seed_sample_tasks()
+    from app.agent.scheduler import start_scheduler
+    start_scheduler()
+
+
+@app.on_event("shutdown")
+def shutdown_event():
+    from app.agent.scheduler import stop_scheduler
+    stop_scheduler()
 
 
 # ============================================
@@ -209,6 +217,17 @@ def _run_intake_pipeline(task_id: str) -> None:
             print(f"[intake] Task '{task_id}' not found.")
             return
 
+        # Resolve the task's assigned LLM endpoint
+        llm_base_url = None
+        llm_model = None
+        if task.llm_id:
+            llm_record = get_llm(task.llm_id)
+            if llm_record:
+                scheme = "http"
+                llm_base_url = f"{scheme}://{llm_record.address}:{llm_record.port}/v1"
+                llm_model = llm_record.model
+                print(f"[intake] Using LLM: {llm_base_url} model={llm_model}")
+
         all_tasks = get_all_tasks()
         task_dicts = [task_to_dict(t) for t in all_tasks]
 
@@ -222,6 +241,8 @@ def _run_intake_pipeline(task_id: str) -> None:
                     task_title=task.title,
                     all_tasks=task_dicts,
                     budget_id=task.budget_id,
+                    llm_base_url=llm_base_url,
+                    llm_model=llm_model,
                 )
             )
 
@@ -387,6 +408,9 @@ def llm_to_dict(llm):
         "model": llm.model,
         "label": llm.label,
         "settings": llm.settings,
+        "parallel_sessions": llm.parallel_sessions,
+        "max_context": llm.max_context,
+        "notes": llm.notes,
     }
 
 
@@ -418,13 +442,23 @@ def read_llm(llm_id: int):
 
 @app.post("/api/llms", response_model=dict)
 def create_new_llm(data: dict):
+    from app.agent.config import MIN_PARALLEL_SESSIONS, MAX_PARALLEL_SESSIONS, MIN_CONTEXT_SIZE, MAX_CONTEXT_SIZE
     if not data.get('address') or not data.get('model'):
         raise HTTPException(status_code=400, detail="address and model are required")
+    ps = data.get('parallel_sessions', 1)
+    if not isinstance(ps, int) or ps < MIN_PARALLEL_SESSIONS or ps > MAX_PARALLEL_SESSIONS:
+        raise HTTPException(status_code=400, detail=f"parallel_sessions must be {MIN_PARALLEL_SESSIONS}-{MAX_PARALLEL_SESSIONS}")
+    mc = data.get('max_context', 4096)
+    if not isinstance(mc, int) or mc < MIN_CONTEXT_SIZE or mc > MAX_CONTEXT_SIZE:
+        raise HTTPException(status_code=400, detail=f"max_context must be {MIN_CONTEXT_SIZE}-{MAX_CONTEXT_SIZE}")
     llm = create_llm(
         address=data['address'],
         port=data.get('port', 8008),
         model=data['model'],
         settings=data.get('settings'),
+        parallel_sessions=ps,
+        max_context=mc,
+        notes=data.get('notes', ''),
     )
     if not llm:
         raise HTTPException(status_code=409, detail="LLM with this address/port/model already exists")
@@ -433,7 +467,7 @@ def create_new_llm(data: dict):
 
 @app.put("/api/llms/{llm_id}", response_model=dict)
 def update_existing_llm(llm_id: int, data: dict):
-    allowed = ['address', 'port', 'model', 'settings']
+    allowed = ['address', 'port', 'model', 'settings', 'parallel_sessions', 'max_context', 'notes']
     updates = {k: v for k, v in data.items() if k in allowed}
     llm = update_llm(llm_id, **updates)
     if not llm:
@@ -525,10 +559,29 @@ def _run_loop_in_background(task_id: str) -> None:
     """
     try:
         from app.agent.loop import MaestroLoop  # noqa: PLC0415
+
+        # Resolve the task's assigned LLM endpoint
+        task = get_task(task_id)
+        llm_base_url = None
+        llm_model = None
+        max_context = None
+        if task and task.llm_id:
+            llm_record = get_llm(task.llm_id)
+            if llm_record:
+                llm_base_url = f"http://{llm_record.address}:{llm_record.port}/v1"
+                llm_model = llm_record.model
+                max_context = llm_record.max_context
+                print(f"[agent] Using LLM: {llm_base_url} model={llm_model} ctx={max_context}")
+
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            maestro = MaestroLoop(task_id=task_id)
+            maestro = MaestroLoop(
+                task_id=task_id,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                max_context=max_context,
+            )
             loop.run_until_complete(maestro.run())
         finally:
             loop.close()
@@ -595,3 +648,10 @@ def get_ready_tasks():
     task_dicts = [task_to_dict(t) for t in all_tasks]
     resolver = DAGResolver(task_dicts)
     return resolver.get_ready_tasks()
+
+
+@app.get("/api/scheduler/status", response_model=dict)
+def scheduler_status():
+    """Return the current state of the push-first eager scheduler."""
+    from app.agent.scheduler import get_scheduler_status  # noqa: PLC0415
+    return get_scheduler_status()

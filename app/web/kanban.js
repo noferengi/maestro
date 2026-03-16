@@ -1244,7 +1244,19 @@ function handleDragStart(e) {
     // no dragover/drop events in between).
     const _draggedEl = this;
     setTimeout(() => {
-        if (draggedElement) _draggedEl.classList.add('dragging');
+        if (draggedElement) {
+            _draggedEl.classList.add('dragging');
+            // Collapse the card from layout so it doesn't skew sibling
+            // midpoint calculations during dragover.  Done in JS too so
+            // it works even if the CSS is cached.
+            _draggedEl.style.height = '1px';
+            _draggedEl.style.minHeight = '0';
+            _draggedEl.style.padding = '0';
+            _draggedEl.style.margin = '0';
+            _draggedEl.style.border = 'none';
+            _draggedEl.style.overflow = 'hidden';
+            _draggedEl.style.opacity = '0';
+        }
     }, 0);
 
     // Create a single shared ghost placeholder (not appended yet — inserted into
@@ -1259,6 +1271,14 @@ function handleDragStart(e) {
 
 function handleDragEnd(e) {
     this.classList.remove('dragging');
+    // Clear inline styles set during dragstart collapse
+    this.style.height = '';
+    this.style.minHeight = '';
+    this.style.padding = '';
+    this.style.margin = '';
+    this.style.border = '';
+    this.style.overflow = '';
+    this.style.opacity = '';
 
     if (insertIndicator && insertIndicator.parentNode) {
         insertIndicator.parentNode.removeChild(insertIndicator);
@@ -1477,12 +1497,15 @@ function renderLlmList() {
         return;
     }
     let html = '<table style="width:100%;font-size:0.85rem;border-collapse:collapse">';
-    html += '<tr style="border-bottom:1px solid #dee2e6"><th style="text-align:left;padding:0.4rem">ID</th><th style="text-align:left;padding:0.4rem">Endpoint</th><th style="text-align:left;padding:0.4rem">Model</th><th></th></tr>';
+    html += '<tr style="border-bottom:1px solid #dee2e6"><th style="text-align:left;padding:0.4rem">ID</th><th style="text-align:left;padding:0.4rem">Endpoint</th><th style="text-align:left;padding:0.4rem">Model</th><th style="text-align:left;padding:0.4rem">Sessions</th><th style="text-align:left;padding:0.4rem">Context</th><th></th></tr>';
     allLlms.forEach(l => {
+        const ctx = l.max_context >= 1000 ? `${Math.round(l.max_context / 1000)}k` : l.max_context;
         html += `<tr style="border-bottom:1px solid #f0f0f0">
             <td style="padding:0.4rem">${l.id}</td>
             <td style="padding:0.4rem">${l.address}:${l.port}</td>
             <td style="padding:0.4rem">${l.model}</td>
+            <td style="padding:0.4rem">${l.parallel_sessions}</td>
+            <td style="padding:0.4rem">${ctx}</td>
             <td style="padding:0.4rem"><button class="action-btn action-btn-danger" onclick="deleteLlmEntry(${l.id})">Delete</button></td>
         </tr>`;
     });
@@ -1494,12 +1517,26 @@ async function addLlm() {
     const address = document.getElementById('llm-address').value.trim();
     const port = parseInt(document.getElementById('llm-port').value) || 8008;
     const model = document.getElementById('llm-model').value.trim();
+    const parallelRaw = parseInt(document.getElementById('llm-parallel').value);
+    const contextRaw = parseInt(document.getElementById('llm-max-context').value);
+
     if (!address || !model) { showInlineError('llm-error', 'Address and model are required.'); return; }
+
+    if (isNaN(parallelRaw) || parallelRaw < 1 || parallelRaw > 1024) {
+        showInlineError('llm-error', 'Parallel sessions must be between 1 and 1,024.');
+        return;
+    }
+    const parallel_sessions = parallelRaw;
+    if (isNaN(contextRaw) || contextRaw < 1) {
+        showInlineError('llm-error', 'Max context must be a non-zero number.');
+        return;
+    }
+    const max_context = contextRaw;
 
     const res = await fetch(`${API_BASE}/llms`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ address, port, model })
+        body: JSON.stringify({ address, port, model, parallel_sessions, max_context })
     });
     if (!res.ok) {
         const err = await res.json();
@@ -1507,6 +1544,8 @@ async function addLlm() {
         return;
     }
     document.getElementById('llm-model').value = '';
+    document.getElementById('llm-parallel').value = '1';
+    document.getElementById('llm-max-context').value = '4096';
     await loadLlmsAndBudgets();
     renderLlmList();
 }
