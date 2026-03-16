@@ -7,10 +7,15 @@ Every LLM call in the project — intake pipeline, research agent,
 MaestroLoop — goes through this module.  Callers can override the
 endpoint, model, temperature, and optional payload fields (tools,
 response_format, etc.) per call.
+
+When ``budget_id`` is provided, the call is automatically logged to the
+``budget_entries`` table with full prompt/response payloads for cost
+tracking and dataset building.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -38,6 +43,10 @@ async def call_llm(
     tools: list[dict] | None = None,
     tool_choice: str | None = None,
     response_format: dict | None = None,
+    # Budget tracking — when provided, the call is logged automatically
+    task_id: str | None = None,
+    llm_id: int | None = None,
+    budget_id: int | None = None,
 ) -> dict:
     """
     POST to an OpenAI-compatible ``/chat/completions`` endpoint.
@@ -69,6 +78,13 @@ async def call_llm(
     response_format
         Response format hint (e.g. ``{"type": "json_object"}``).
         Omitted when *None*.
+    task_id
+        Task ID for budget logging (optional but recommended).
+    llm_id
+        **Required.** LLM endpoint ID — every call must reference an endpoint.
+    budget_id
+        **Required.** Budget ID — every call must be tracked.  Tokens and
+        full payloads are logged to the ``budget_entries`` table.
 
     Returns
     -------
@@ -82,6 +98,11 @@ async def call_llm(
     httpx.TimeoutException
         On request timeout.
     """
+    if budget_id is None:
+        raise ValueError("call_llm() requires budget_id — every LLM call must be tracked.")
+    if llm_id is None:
+        raise ValueError("call_llm() requires llm_id — every LLM call must reference an endpoint.")
+
     resolved_url = base_url or LLM_BASE_URL
     resolved_model = model or LLM_MODEL
 
@@ -109,4 +130,56 @@ async def call_llm(
             headers={"Content-Type": "application/json"},
         )
         response.raise_for_status()
-        return response.json()
+        result = response.json()
+
+    # Log every call to budget_entries
+    _log_budget_entry(
+        result, messages,
+        task_id=task_id, llm_id=llm_id, budget_id=budget_id,
+    )
+
+    return result
+
+
+def _log_budget_entry(
+    response: dict,
+    messages: list[dict],
+    *,
+    task_id: str | None,
+    llm_id: int | None,
+    budget_id: int | None,
+) -> None:
+    """Persist a budget entry from an LLM response. Best-effort, never raises."""
+    try:
+        from app.database import create_budget_entry
+
+        usage = response.get("usage", {})
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+
+        # Count tool calls in the response (assistant message may have tool_calls array)
+        tool_call_count = 0
+        for choice in response.get("choices", []):
+            msg = choice.get("message", {})
+            tc = msg.get("tool_calls")
+            if tc:
+                tool_call_count += len(tc)
+        # Every response is at least 1 LLM turn
+        total_turns = max(1, tool_call_count)
+
+        # Serialize payloads
+        prompt_json = json.dumps(messages, ensure_ascii=False, default=str)
+        response_json = json.dumps(response, ensure_ascii=False, default=str)
+
+        create_budget_entry(
+            llm_id=llm_id,
+            budget_id=budget_id,
+            task_id=task_id,
+            prompt_cost=prompt_tokens,
+            generation_cost=completion_tokens,
+            tool_calls=total_turns,
+            prompt_data=prompt_json,
+            response_data=response_json,
+        )
+    except Exception:
+        logger.debug("Failed to log budget entry", exc_info=True)

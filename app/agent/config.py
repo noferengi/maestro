@@ -139,6 +139,22 @@ RESEARCH_AGENT_TOOLS: list[str] = _getlist("intake", "research_agent_tools",
 )
 
 # ===========================================================================
+# Subdivision settings
+# ===========================================================================
+
+SUBDIVISION_MAX_DEPTH: int = _getint("subdivision", "max_depth", None, 3)
+SUBDIVISION_MAX_RETRIES: int = _getint("subdivision", "max_retries_per_level", None, 2)
+SUBDIVISION_MAX_TOTAL_SUB_IDEAS: int = _getint("subdivision", "max_total_sub_ideas", None, 15)
+SUBDIVISION_LLM_TEMPERATURE: float = _getfloat("subdivision", "llm_temperature", None, 0.3)
+
+SUBDIVISION_AGENT_TOOLS: list[str] = _getlist("subdivision", "subdivision_agent_tools",
+    "read_file, read_file_lines, count_lines, "
+    "search_files, find_files, list_directory, "
+    "git_status, git_diff, git_log, git_blame, git_show, "
+    "get_task, list_tasks"
+)
+
+# ===========================================================================
 # LLM capacity limits
 # ===========================================================================
 

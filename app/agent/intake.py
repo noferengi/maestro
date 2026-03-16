@@ -53,6 +53,7 @@ VERDICT_LIKELY = "LIKELY"
 VERDICT_NOT_SUITABLE = "NOT_SUITABLE"
 VERDICT_REJECTED = "REJECTED"
 VERDICT_NEEDS_RESEARCH = "NEEDS_RESEARCH"
+VERDICT_SUBDIVIDE_IDEA = "SUBDIVIDE_IDEA"
 
 _VALID_VERDICTS = {
     VERDICT_POSSIBLE,
@@ -60,6 +61,7 @@ _VALID_VERDICTS = {
     VERDICT_NOT_SUITABLE,
     VERDICT_REJECTED,
     VERDICT_NEEDS_RESEARCH,
+    VERDICT_SUBDIVIDE_IDEA,
 }
 
 # ---------------------------------------------------------------------------
@@ -85,7 +87,7 @@ You MUST respond with a JSON object matching this exact schema:
   "affected_areas": [<string>, ...],
   "effort": "trivial" | "minor" | "moderate" | "significant" | "major",
   "vote": {
-    "verdict": "POSSIBLE" | "LIKELY" | "NOT_SUITABLE" | "REJECTED" | "NEEDS_RESEARCH",
+    "verdict": "POSSIBLE" | "LIKELY" | "NOT_SUITABLE" | "REJECTED" | "NEEDS_RESEARCH" | "SUBDIVIDE_IDEA",
     "confidence": <float 0.0-1.0>,
     "justification": "<one-paragraph explanation>"
   }
@@ -97,6 +99,7 @@ Verdict guidelines:
 - NEEDS_RESEARCH: Task is too vague to assess — needs clarification before proceeding.
 - NOT_SUITABLE: Task is poorly scoped, too large without decomposition, or architecturally questionable.
 - REJECTED: Task is fundamentally unfeasible, contradictory, or harmful to the project.
+- SUBDIVIDE_IDEA: Task is fundamentally sound but too large to implement in a single context window. Should be decomposed into smaller pieces. Only use when the task is good but genuinely too big — not vague (NEEDS_RESEARCH) or bad (REJECTED).
 
 Respond ONLY with the JSON object. No markdown fences, no extra text.\
 """
@@ -123,7 +126,7 @@ You MUST respond with a JSON object matching this exact schema:
   "risks": [<string>, ...],
   "codebase_readiness": "ready" | "needs_refactoring" | "incompatible",
   "vote": {
-    "verdict": "POSSIBLE" | "LIKELY" | "NOT_SUITABLE" | "REJECTED" | "NEEDS_RESEARCH",
+    "verdict": "POSSIBLE" | "LIKELY" | "NOT_SUITABLE" | "REJECTED" | "NEEDS_RESEARCH" | "SUBDIVIDE_IDEA",
     "confidence": <float 0.0-1.0>,
     "justification": "<one-paragraph explanation>"
   }
@@ -135,6 +138,7 @@ Verdict guidelines:
 - NEEDS_RESEARCH: Cannot determine feasibility — too many unknowns.
 - NOT_SUITABLE: Significant architectural incompatibilities or missing foundations.
 - REJECTED: Fundamentally impossible given the current system.
+- SUBDIVIDE_IDEA: Task is fundamentally sound but too large to implement in a single context window. Should be decomposed into smaller pieces. Only use when the task is good but genuinely too big — not vague (NEEDS_RESEARCH) or bad (REJECTED).
 
 Respond ONLY with the JSON object. No markdown fences, no extra text.\
 """
@@ -167,7 +171,7 @@ You MUST respond with a JSON object matching this exact schema:
     {"task_id": "<id>", "task_title": "<title>", "resource": "<what they compete for>"}
   ],
   "vote": {
-    "verdict": "POSSIBLE" | "LIKELY" | "NOT_SUITABLE" | "REJECTED" | "NEEDS_RESEARCH",
+    "verdict": "POSSIBLE" | "LIKELY" | "NOT_SUITABLE" | "REJECTED" | "NEEDS_RESEARCH" | "SUBDIVIDE_IDEA",
     "confidence": <float 0.0-1.0>,
     "justification": "<one-paragraph explanation>"
   }
@@ -179,6 +183,7 @@ Verdict guidelines:
 - NEEDS_RESEARCH: Potential conflicts detected but need human review to resolve.
 - NOT_SUITABLE: High-severity conflicts that would cause integration problems.
 - REJECTED: Direct contradictions with active tasks that cannot be reconciled.
+- SUBDIVIDE_IDEA: Task is fundamentally sound but too large to implement in a single context window. Should be decomposed into smaller pieces. Only use when the task is good but genuinely too big — not vague (NEEDS_RESEARCH) or bad (REJECTED).
 
 Respond ONLY with the JSON object. No markdown fences, no extra text.\
 """
@@ -208,6 +213,7 @@ class IntakePipeline:
         task_title: str,
         all_tasks: list[dict],
         budget_id: int | None = None,
+        llm_id: int | None = None,
         llm_base_url: str | None = None,
         llm_model: str | None = None,
     ) -> None:
@@ -216,6 +222,7 @@ class IntakePipeline:
         self.task_title = task_title
         self.all_tasks = all_tasks
         self.budget_id = budget_id
+        self.llm_id = llm_id
         self.llm_base_url = llm_base_url or LLM_BASE_URL
         self.llm_model = llm_model or LLM_MODEL
         self.votes: list[dict] = []  # Collect votes from each stage
@@ -252,6 +259,10 @@ class IntakePipeline:
         # Handle NEEDS_RESEARCH — spawn research agents for those stages
         if tally["outcome"] == "needs_research":
             tally = await self._handle_needs_research(tally)
+
+        # Handle SUBDIVIDE — delegate to subdivision agent
+        if tally["outcome"] == "subdivide":
+            tally = await self._handle_subdivide(tally)
 
         # Handle TIE — spawn tie-breaker research agent
         if tally["outcome"] == "tie":
@@ -295,6 +306,9 @@ class IntakePipeline:
                     context=context,
                     llm_base_url=self.llm_base_url,
                     llm_model=self.llm_model,
+                    task_id=self.task_id,
+                    llm_id=self.llm_id,
+                    budget_id=self.budget_id,
                 )
                 research_vote = {
                     "stage": f"{stage_name}_research",
@@ -353,6 +367,9 @@ class IntakePipeline:
                 votes=self.votes,
                 llm_base_url=self.llm_base_url,
                 llm_model=self.llm_model,
+                task_id=self.task_id,
+                llm_id=self.llm_id,
+                budget_id=self.budget_id,
             )
 
             tiebreaker_vote = {
@@ -387,6 +404,17 @@ class IntakePipeline:
         return self._build_tally()
 
     # ------------------------------------------------------------------
+    # Subdivision handling
+    # ------------------------------------------------------------------
+
+    async def _handle_subdivide(self, tally: dict) -> dict:
+        """Delegate to the SubdivisionAgent when votes indicate SUBDIVIDE_IDEA."""
+        logger.info("Subdivision triggered for task '%s'.", self.task_id)
+        # The actual subdivision work is done in main.py's _run_intake_pipeline
+        # after receiving the "subdivide" outcome. We just pass the tally through.
+        return tally
+
+    # ------------------------------------------------------------------
     # LLM calling helper
     # ------------------------------------------------------------------
 
@@ -415,6 +443,9 @@ class IntakePipeline:
             model=self.llm_model,
             temperature=0.1,
             response_format={"type": "json_object"},
+            task_id=self.task_id,
+            llm_id=self.llm_id,
+            budget_id=self.budget_id,
         )
 
         # Extract usage stats
@@ -714,6 +745,13 @@ class IntakePipeline:
             "total_completion_tokens": sum(v.get("completion_tokens", 0) for v in self.votes),
         }
 
+        # Check for SUBDIVIDE_IDEA — immediate subdivision (Rule 0)
+        subdivide_votes = [v for v in self.votes if v["verdict"] == VERDICT_SUBDIVIDE_IDEA]
+        if subdivide_votes:
+            result["outcome"] = "subdivide"
+            result["summary"] = f"{len(subdivide_votes)} stage(s) voted SUBDIVIDE_IDEA."
+            return result
+
         # Check for REJECTED — immediate rejection
         for v in self.votes:
             if v["verdict"] == VERDICT_REJECTED:
@@ -771,6 +809,7 @@ async def run_intake_pipeline(
     task_title: str,
     all_tasks: list[dict],
     budget_id: int | None = None,
+    llm_id: int | None = None,
     llm_base_url: str | None = None,
     llm_model: str | None = None,
 ) -> dict:
@@ -812,6 +851,7 @@ async def run_intake_pipeline(
         task_title=task_title,
         all_tasks=all_tasks,
         budget_id=budget_id,
+        llm_id=llm_id,
         llm_base_url=llm_base_url,
         llm_model=llm_model,
     )

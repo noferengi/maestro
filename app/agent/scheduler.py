@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import threading
 from collections import defaultdict
 from typing import Any
@@ -129,7 +130,7 @@ def _tick() -> None:
     """
     # Lazy imports to avoid circular deps at module load
     from app.agent.dag import DAGResolver
-    from database import get_all_tasks, get_task, get_llm
+    from app.database import get_all_tasks, get_task, get_llm
 
     # 1. Cleanup finished sessions
     _cleanup_finished()
@@ -160,7 +161,6 @@ def _tick() -> None:
                 continue
 
         # Cooldown after failure — don't retry for 60s
-        import time
         if task_id in _failed_cooldowns:
             if time.time() - _failed_cooldowns[task_id] < _FAIL_COOLDOWN_SECONDS:
                 continue
@@ -195,7 +195,7 @@ def _tick() -> None:
 
         thread = threading.Thread(
             target=_run_task,
-            args=(task_id, task_type, llm),
+            args=(task_id, task_type, llm, db_task),
             daemon=True,
             name=f"maestro-task-{task_id}",
         )
@@ -204,7 +204,7 @@ def _tick() -> None:
         thread.start()
 
 
-def _run_task(task_id: str, task_type: str, llm: Any) -> None:
+def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None) -> None:
     """
     Execute a single task in its own thread + event loop.
     Releases the LLM session slot when done.
@@ -213,13 +213,14 @@ def _run_task(task_id: str, task_type: str, llm: Any) -> None:
         llm_base_url = f"http://{llm.address}:{llm.port}/v1"
         llm_model = llm.model
         max_context = llm.max_context
+        llm_id = llm.id
+        budget_id = db_task.budget_id if db_task else None
 
         if task_type == "idea":
             _run_intake(task_id, llm_base_url, llm_model)
         else:
-            _run_maestro_loop(task_id, llm_base_url, llm_model, max_context)
+            _run_maestro_loop(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id)
     except Exception:
-        import time
         _failed_cooldowns[task_id] = time.time()
         logger.exception("Task '%s' failed in scheduler dispatch (cooldown %ds).", task_id, int(_FAIL_COOLDOWN_SECONDS))
     finally:
@@ -230,7 +231,7 @@ def _run_task(task_id: str, task_type: str, llm: Any) -> None:
 def _run_intake(task_id: str, llm_base_url: str, llm_model: str) -> None:
     """Run the intake pipeline for an IDEA task."""
     from app.agent.intake import run_intake_pipeline
-    from database import (
+    from app.database import (
         get_task, get_all_tasks, update_task,
         create_transition_vote, create_transition_result,
     )
@@ -257,6 +258,7 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str) -> None:
                 task_title=task.title,
                 all_tasks=task_dicts,
                 budget_id=task.budget_id,
+                llm_id=task.llm_id,
                 llm_base_url=llm_base_url,
                 llm_model=llm_model,
             )
@@ -295,7 +297,10 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str) -> None:
         loop.close()
 
 
-def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str, max_context: int | None = None) -> None:
+def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
+                      max_context: int | None = None,
+                      llm_id: int | None = None,
+                      budget_id: int | None = None) -> None:
     """Run the MaestroLoop for a PLANNING/DEVELOPMENT task."""
     from app.agent.loop import MaestroLoop
 
@@ -307,6 +312,8 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str, max_conte
             llm_base_url=llm_base_url,
             llm_model=llm_model,
             max_context=max_context,
+            llm_id=llm_id,
+            budget_id=budget_id,
         )
         loop.run_until_complete(maestro.run())
     finally:

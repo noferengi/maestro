@@ -68,10 +68,9 @@ class DAGResolver:
         for task in self._tasks:
             if _is_done(task):
                 continue
-            # Skip tasks that are already in flight
+            # Skip tasks that are already in flight or in non-dispatchable states
             task_type = (task.get("type") or "").lower()
-            if task_type in ("development", "review"):
-                # Already active or verifying — don't double-schedule
+            if task_type in ("development", "review", "cancelled", "subdividing"):
                 continue
             if self._all_prerequisites_done(task):
                 ready.append(task)

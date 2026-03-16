@@ -199,6 +199,9 @@ class ResearchAgent:
         is_tiebreaker: bool = False,
         llm_base_url: str | None = None,
         llm_model: str | None = None,
+        task_id: str | None = None,
+        llm_id: int | None = None,
+        budget_id: int | None = None,
     ) -> None:
         self.question = question
         self.context = context
@@ -207,6 +210,9 @@ class ResearchAgent:
         self.is_tiebreaker = is_tiebreaker
         self.llm_base_url = llm_base_url or LLM_BASE_URL
         self.llm_model = llm_model or LLM_MODEL
+        self.task_id = task_id
+        self.llm_id = llm_id
+        self.budget_id = budget_id
 
         self._restricted_schemas = _build_restricted_schemas()
         self._accumulated_findings: list[str] = []
@@ -390,6 +396,9 @@ class ResearchAgent:
             temperature=INTAKE_LLM_TEMPERATURE,
             tools=self._restricted_schemas,
             tool_choice="auto",
+            task_id=self.task_id,
+            llm_id=self.llm_id,
+            budget_id=self.budget_id,
         )
 
     # ------------------------------------------------------------------
@@ -469,6 +478,9 @@ async def run_research(
     max_lives: int | None = None,
     llm_base_url: str | None = None,
     llm_model: str | None = None,
+    task_id: str | None = None,
+    llm_id: int | None = None,
+    budget_id: int | None = None,
 ) -> ResearchResult:
     """Run a research agent and return its result."""
     agent = ResearchAgent(
@@ -478,6 +490,9 @@ async def run_research(
         max_lives=max_lives,
         llm_base_url=llm_base_url,
         llm_model=llm_model,
+        task_id=task_id,
+        llm_id=llm_id,
+        budget_id=budget_id,
     )
     return await agent.run()
 
@@ -489,6 +504,9 @@ async def run_tiebreaker(
     max_lives: int | None = None,
     llm_base_url: str | None = None,
     llm_model: str | None = None,
+    task_id: str | None = None,
+    llm_id: int | None = None,
+    budget_id: int | None = None,
 ) -> ResearchResult:
     """Run a tie-breaker research agent with all voter context."""
     # Build the investigation question from the disagreement
@@ -517,5 +535,8 @@ async def run_tiebreaker(
         is_tiebreaker=True,
         llm_base_url=llm_base_url,
         llm_model=llm_model,
+        task_id=task_id,
+        llm_id=llm_id,
+        budget_id=budget_id,
     )
     return await agent.run()

@@ -27,6 +27,7 @@ class Verdict(Enum):
     NEEDS_RESEARCH = "needs_research"
     POSSIBLE = "possible"
     LIKELY = "likely"
+    SUBDIVIDE_IDEA = "subdivide_idea"
 
     @property
     def confidence_range(self) -> tuple[int, int]:
@@ -40,6 +41,7 @@ _VERDICT_RANGES: dict[Verdict, tuple[int, int]] = {
     Verdict.NEEDS_RESEARCH: (61, 75),
     Verdict.POSSIBLE: (76, 91),
     Verdict.LIKELY: (92, 100),
+    Verdict.SUBDIVIDE_IDEA: (0, 100),  # categorical signal, accepts any confidence
 }
 
 
@@ -95,7 +97,7 @@ class Vote:
 class TallyResult:
     """Aggregated result of all stage votes."""
 
-    outcome: str  # "passed" | "rejected" | "needs_research" | "tie"
+    outcome: str  # "passed" | "rejected" | "needs_research" | "tie" | "subdivide"
     votes: list[Vote]
     rejection_reasons: list[str] = field(default_factory=list)
     research_needed: list[str] = field(default_factory=list)
@@ -108,6 +110,7 @@ def tally_votes(votes: list[Vote]) -> TallyResult:
     """Aggregate stage votes into a single pipeline outcome.
 
     Rules (evaluated in order):
+        0. Any SUBDIVIDE_IDEA vote -> "subdivide" immediately.
         1. Any REJECTED vote -> "rejected" immediately.
         2. Majority NOT_SUITABLE (>= ceil(n/2)+1 when n>=3, or >=2 when n<=3)
            -> "rejected".
@@ -131,6 +134,17 @@ def tally_votes(votes: list[Vote]) -> TallyResult:
     total_prompt = sum(v.prompt_tokens for v in votes)
     total_completion = sum(v.completion_tokens for v in votes)
     n = len(votes)
+
+    # --- Rule 0: any SUBDIVIDE_IDEA -> subdivide immediately ---
+    subdivide_votes = [v for v in votes if v.verdict is Verdict.SUBDIVIDE_IDEA]
+    if subdivide_votes:
+        return TallyResult(
+            outcome="subdivide",
+            votes=votes,
+            summary=f"{len(subdivide_votes)} stage(s) voted SUBDIVIDE_IDEA.",
+            total_prompt_tokens=total_prompt,
+            total_completion_tokens=total_completion,
+        )
 
     # --- Rule 1: any REJECTED -> immediate rejection ---
     rejected_votes = [v for v in votes if v.verdict is Verdict.REJECTED]

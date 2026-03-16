@@ -91,6 +91,45 @@ class TransitionResult(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class BudgetEntry(Base):
+    """Individual LLM call log entry for cost tracking and dataset building."""
+    __tablename__ = "budget_entries"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    llm_id = Column(Integer, ForeignKey('llms.id'), nullable=True)
+    budget_id = Column(Integer, ForeignKey('budgets.id'), nullable=True)
+    task_id = Column(String, ForeignKey('tasks.id'), nullable=True)
+    prompt_cost = Column(Integer, nullable=False, default=0)        # total prompt tokens
+    generation_cost = Column(Integer, nullable=False, default=0)    # total completion tokens
+    tool_calls = Column(Integer, nullable=False, default=0)         # total LLM turns
+    prompt_data = Column(Text, nullable=True)                       # full prompt messages (JSON)
+    response_data = Column(Text, nullable=True)                     # full response (JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<BudgetEntry(id={self.id}, llm={self.llm_id}, budget={self.budget_id}, task={self.task_id}, prompt={self.prompt_cost}, gen={self.generation_cost})>"
+
+
+class SubdivisionRecord(Base):
+    """Audit trail for task subdivision attempts."""
+    __tablename__ = "subdivision_records"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    parent_task_id = Column(String, ForeignKey('tasks.id'), nullable=False)
+    attempt_number = Column(Integer, nullable=False, default=1)
+    generation = Column(Integer, nullable=False, default=1)
+    child_task_ids = Column(JSON, nullable=False)
+    rejection_context = Column(JSON, nullable=True)
+    agent_vote = Column(JSON, nullable=True)
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    status = Column(String, nullable=False, default='active')  # active | superseded | failed
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<SubdivisionRecord(id={self.id}, parent={self.parent_task_id}, attempt={self.attempt_number}, status={self.status})>"
+
+
 class Task(Base):
     """
     Kanban Task Model
@@ -113,6 +152,8 @@ class Task(Base):
     prerequisites = Column(JSON, nullable=True, default=list)  # List of prerequisite task IDs
     position = Column(Integer, nullable=True, default=0)  # Position within column (0 = first)
     project = Column(String, default='TheMaestro')  # Project this task belongs to
+    parent_task_id = Column(String, ForeignKey('tasks.id'), nullable=True)  # Links sub-ideas to origin
+    subdivision_generation = Column(Integer, nullable=False, default=0)  # Recursion depth (0=human)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -755,5 +796,190 @@ def get_transition_results(task_id, transition=None):
         if transition:
             q = q.filter(TransitionResult.transition == transition)
         return q.order_by(TransitionResult.created_at.desc()).all()
+    finally:
+        db.close()
+
+
+# ============================================
+# BudgetEntry CRUD
+# ============================================
+
+def create_budget_entry(llm_id=None, budget_id=None, task_id=None,
+                        prompt_cost=0, generation_cost=0, tool_calls=0,
+                        prompt_data=None, response_data=None):
+    db = SessionLocal()
+    try:
+        entry = BudgetEntry(
+            llm_id=llm_id, budget_id=budget_id, task_id=task_id,
+            prompt_cost=prompt_cost, generation_cost=generation_cost,
+            tool_calls=tool_calls, prompt_data=prompt_data, response_data=response_data,
+        )
+        db.add(entry)
+        db.commit()
+        db.refresh(entry)
+        return entry
+    except Exception as e:
+        db.rollback()
+        print(f"Error creating budget entry: {e}")
+        return None
+    finally:
+        db.close()
+
+
+def get_budget_entries(budget_id=None, llm_id=None, task_id=None, limit=100, offset=0):
+    db = SessionLocal()
+    try:
+        q = db.query(BudgetEntry)
+        if budget_id is not None:
+            q = q.filter(BudgetEntry.budget_id == budget_id)
+        if llm_id is not None:
+            q = q.filter(BudgetEntry.llm_id == llm_id)
+        if task_id is not None:
+            q = q.filter(BudgetEntry.task_id == task_id)
+        return q.order_by(BudgetEntry.created_at.desc()).offset(offset).limit(limit).all()
+    finally:
+        db.close()
+
+
+def get_budget_entry(entry_id):
+    """Get a single budget entry by ID."""
+    db = SessionLocal()
+    try:
+        return db.query(BudgetEntry).filter(BudgetEntry.id == entry_id).first()
+    finally:
+        db.close()
+
+
+# ============================================
+# SubdivisionRecord CRUD
+# ============================================
+
+def create_subdivision_record(parent_task_id, child_task_ids, generation=1,
+                               attempt_number=1, rejection_context=None,
+                               agent_vote=None, prompt_tokens=0,
+                               completion_tokens=0, status='active'):
+    db = SessionLocal()
+    try:
+        record = SubdivisionRecord(
+            parent_task_id=parent_task_id,
+            attempt_number=attempt_number,
+            generation=generation,
+            child_task_ids=child_task_ids,
+            rejection_context=rejection_context,
+            agent_vote=agent_vote,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            status=status,
+        )
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+        return record
+    except Exception as e:
+        db.rollback()
+        print(f"Error creating subdivision record: {e}")
+        return None
+    finally:
+        db.close()
+
+
+def get_subdivision_records(parent_task_id):
+    """Get all subdivision records for a parent task, ordered by creation time."""
+    db = SessionLocal()
+    try:
+        return (db.query(SubdivisionRecord)
+                .filter(SubdivisionRecord.parent_task_id == parent_task_id)
+                .order_by(SubdivisionRecord.created_at.desc())
+                .all())
+    finally:
+        db.close()
+
+
+def update_subdivision_record(record_id, **kwargs):
+    """Update a subdivision record."""
+    db = SessionLocal()
+    try:
+        record = db.query(SubdivisionRecord).filter(SubdivisionRecord.id == record_id).first()
+        if not record:
+            return None
+        for key, value in kwargs.items():
+            if hasattr(record, key):
+                setattr(record, key, value)
+        db.commit()
+        db.refresh(record)
+        return record
+    except Exception as e:
+        db.rollback()
+        print(f"Error updating subdivision record: {e}")
+        return None
+    finally:
+        db.close()
+
+
+def get_child_tasks(parent_task_id):
+    """Get all direct child tasks for a parent task."""
+    db = SessionLocal()
+    try:
+        return (db.query(Task)
+                .filter(Task.parent_task_id == parent_task_id)
+                .order_by(Task.position, Task.created_at)
+                .all())
+    finally:
+        db.close()
+
+
+def get_active_child_tasks(parent_task_id):
+    """Get non-cancelled child tasks for a parent."""
+    db = SessionLocal()
+    try:
+        return (db.query(Task)
+                .filter(Task.parent_task_id == parent_task_id)
+                .filter(Task.type != 'cancelled')
+                .order_by(Task.position, Task.created_at)
+                .all())
+    finally:
+        db.close()
+
+
+def count_total_sub_ideas(root_task_id):
+    """Count all descendant tasks (at any depth) of a root task."""
+    db = SessionLocal()
+    try:
+        count = 0
+        queue = [root_task_id]
+        while queue:
+            parent_id = queue.pop(0)
+            children = (db.query(Task)
+                        .filter(Task.parent_task_id == parent_id)
+                        .filter(Task.type != 'cancelled')
+                        .all())
+            count += len(children)
+            for child in children:
+                queue.append(child.id)
+        return count
+    finally:
+        db.close()
+
+
+def get_budget_summary(budget_id=None):
+    """Aggregate totals for a budget (or all budgets if None)."""
+    from sqlalchemy import func
+    db = SessionLocal()
+    try:
+        q = db.query(
+            func.count(BudgetEntry.id).label('total_entries'),
+            func.coalesce(func.sum(BudgetEntry.prompt_cost), 0).label('total_prompt_tokens'),
+            func.coalesce(func.sum(BudgetEntry.generation_cost), 0).label('total_generation_tokens'),
+            func.coalesce(func.sum(BudgetEntry.tool_calls), 0).label('total_tool_calls'),
+        )
+        if budget_id is not None:
+            q = q.filter(BudgetEntry.budget_id == budget_id)
+        row = q.one()
+        return {
+            'total_entries': row.total_entries,
+            'total_prompt_tokens': row.total_prompt_tokens,
+            'total_generation_tokens': row.total_generation_tokens,
+            'total_tool_calls': row.total_tool_calls,
+        }
     finally:
         db.close()

@@ -100,12 +100,16 @@ class MaestroLoop:
         llm_base_url: str | None = None,
         llm_model: str | None = None,
         max_context: int | None = None,
+        llm_id: int | None = None,
+        budget_id: int | None = None,
     ) -> None:
         self.task_id = task_id
         self.max_turns = max_turns
         self.llm_base_url = llm_base_url or LLM_BASE_URL
         self.llm_model = llm_model or LLM_MODEL
         self.max_context = max_context
+        self.llm_id = llm_id
+        self.budget_id = budget_id
         self._messages: list[dict] = []
         self._turn: int = 0
         self._consecutive_errors: int = 0
@@ -312,6 +316,9 @@ class MaestroLoop:
             temperature=LLM_TEMPERATURE,
             tools=TOOL_SCHEMAS,
             tool_choice="auto",
+            task_id=self.task_id,
+            llm_id=self.llm_id,
+            budget_id=self.budget_id,
         )
 
     # ------------------------------------------------------------------

@@ -159,23 +159,23 @@ function renderTasksFromDatabase() {
     });
 
     // Create task cards from taskData, sorted by position within each column.
-    // Group tasks by type first so the sort is per-column, not global (a global sort
-    // would intermix position=0 cards from every column before any position=1 cards,
-    // causing wrong render order when positions don't perfectly interleave).
+    // Group tasks by type first so the sort is per-column, not global.
+    // "subdividing" tasks render in the idea column; "cancelled" tasks are hidden.
     const tasksByType = {};
     Object.values(taskData).filter(t => t && t.type).forEach(task => {
-        if (!tasksByType[task.type]) tasksByType[task.type] = [];
-        tasksByType[task.type].push(task);
+        if (task.type === 'cancelled') return; // Hide cancelled sub-ideas
+        const renderCol = task.type === 'subdividing' ? 'idea' : task.type;
+        if (!tasksByType[renderCol]) tasksByType[renderCol] = [];
+        tasksByType[renderCol].push(task);
     });
 
     columns.forEach(colType => {
         const tasks = (tasksByType[colType] || []).sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
         tasks.forEach(task => {
-            const container = document.getElementById(`tasks-${task.type}`);
+            const container = document.getElementById(`tasks-${colType}`);
             if (container) {
                 const card = createTaskCard(task.id, task.title, task.tags, task.owner, task.type);
                 container.appendChild(card);
-                console.log(`Created card for task ${task.id}: ${task.title}`);
             }
         });
     });
@@ -231,6 +231,7 @@ document.addEventListener('DOMContentLoaded', async function() {
 function startAutoRefresh() {
     console.log('Starting auto-refresh (5 second interval)...');
     autoRefreshInterval = setInterval(async () => {
+        if (!currentProject) return;  // guard against race before init
         console.log('Auto-refresh: Checking for database updates...');
         try {
             const response = await fetch(`${API_BASE}/projects/${encodeURIComponent(currentProject)}/tasks`);
@@ -570,6 +571,71 @@ function canTaskAdvance(id) {
     return !!(task.description && task.llm_id && task.budget_id);
 }
 
+function scrollToTask(taskId) {
+    const card = document.querySelector(`.task-card[data-id="${taskId}"]`);
+    if (card) {
+        card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        card.style.outline = '2px solid #0d6efd';
+        setTimeout(() => { card.style.outline = ''; }, 2000);
+    }
+}
+
+async function viewChildren(taskId) {
+    try {
+        const resp = await fetch(`${API_BASE}/tasks/${taskId}/children`);
+        if (!resp.ok) return;
+        const children = await resp.json();
+
+        const task = taskData[taskId] || {};
+        const title = task.title || taskId;
+
+        let html = `<h3 style="margin-bottom:1rem">Children of: ${title}</h3>`;
+        if (children.length === 0) {
+            html += '<p style="color:#6c757d">No children found.</p>';
+        } else {
+            children.forEach(c => {
+                const statusColor = c.type === 'cancelled' ? '#dc3545' :
+                                    c.type === 'completed' ? '#198754' :
+                                    c.type === 'planning' ? '#ffc107' : '#0d6efd';
+                html += `
+                    <div style="border:1px solid #dee2e6;border-radius:6px;padding:0.75rem;margin-bottom:0.5rem;border-left:4px solid ${statusColor}">
+                        <strong>${c.title}</strong>
+                        <span style="float:right;font-size:0.75rem;text-transform:uppercase;color:${statusColor};font-weight:600">${c.type}</span>
+                        <div style="font-size:0.85rem;color:#6c757d;margin-top:0.25rem">${c.description || ''}</div>
+                        ${c.subdivision_generation > 0 ? `<span class="subdivision-badge gen" style="margin-top:0.35rem;display:inline-block">Gen ${c.subdivision_generation}</span>` : ''}
+                    </div>
+                `;
+            });
+        }
+
+        // Also show subdivision records
+        const recResp = await fetch(`${API_BASE}/tasks/${taskId}/subdivision-records`);
+        if (recResp.ok) {
+            const records = await recResp.json();
+            if (records.length > 0) {
+                html += '<h4 style="margin-top:1rem;margin-bottom:0.5rem">Subdivision History</h4>';
+                records.forEach(r => {
+                    const statusBg = r.status === 'active' ? '#d1e7dd' :
+                                     r.status === 'superseded' ? '#fff3cd' : '#f8d7da';
+                    html += `
+                        <div style="background:${statusBg};border-radius:4px;padding:0.5rem;margin-bottom:0.35rem;font-size:0.85rem">
+                            Attempt #${r.attempt_number} (gen ${r.generation}) — <strong>${r.status}</strong>
+                            — ${(r.child_task_ids || []).length} children
+                            — ${r.prompt_tokens || 0} prompt / ${r.completion_tokens || 0} completion tokens
+                        </div>
+                    `;
+                });
+            }
+        }
+
+        document.getElementById('transition-modal-title').textContent = 'Subdivision Details';
+        document.getElementById('transition-modal-body').innerHTML = html;
+        document.getElementById('transition-modal').classList.add('active');
+    } catch (err) {
+        console.error('Error viewing children:', err);
+    }
+}
+
 function createTaskCard(id, title, tags, owner, status) {
     const card = document.createElement('div');
     card.className = `task-card ${status}`;
@@ -595,8 +661,29 @@ function createTaskCard(id, title, tags, owner, status) {
     const rejBadge = rejectionCount > 0 ? `<span class="rejection-badge" title="${rejectionCount} rejection(s)">${rejectionCount}x</span>` : '';
     const processingSpinner = transitionPollers[id] ? '<span class="processing-indicator">\u25E0</span>' : '';
 
+    // Subdivision badges
+    const taskObj = taskData[id] || {};
+    const parentId = taskObj.parent_task_id;
+    const generation = taskObj.subdivision_generation || 0;
+    const isSubdividing = status === 'subdividing';
+
+    let subdivBadge = '';
+    if (isSubdividing) {
+        subdivBadge = '<span class="subdivision-badge subdividing" title="Subdividing...">Subdividing</span>';
+        card.classList.add('subdividing');
+    } else if (generation > 0) {
+        subdivBadge = `<span class="subdivision-badge gen" title="Generation ${generation} sub-idea">Gen ${generation}</span>`;
+    }
+
+    let parentLink = '';
+    if (parentId && taskData[parentId]) {
+        const parentTitle = taskData[parentId].title || parentId;
+        parentLink = `<div class="parent-link" onclick="scrollToTask('${parentId}')" title="Parent: ${parentTitle}">&#8593; ${parentTitle}</div>`;
+    }
+
     card.innerHTML = `
-        <div class="task-title">${title}${rejBadge}${processingSpinner}</div>
+        ${parentLink}
+        <div class="task-title">${title}${rejBadge}${processingSpinner}${subdivBadge}</div>
         <div class="task-meta">
             ${tagsHtml}
             ${ownerHtml}
@@ -619,7 +706,14 @@ function createTaskCard(id, title, tags, owner, status) {
 
     const ready = canTaskAdvance(id);
 
-    if (status === 'idea') {
+    if (status === 'subdividing') {
+        // Subdividing — show children button instead of advance
+        const actionsDiv = card.querySelector('.task-actions');
+        actionsDiv.innerHTML = `
+            <button class="action-btn" onclick="viewChildren('${id}')">View Children</button>
+            <button class="action-btn action-btn-danger" onclick="deleteTask('${id}')">Delete</button>
+        `;
+    } else if (status === 'idea') {
         const actionsDiv = card.querySelector('.task-actions');
         const advanceBtn = document.createElement('button');
         advanceBtn.className = 'action-btn action-btn-advance';
@@ -634,6 +728,15 @@ function createTaskCard(id, title, tags, owner, status) {
             advanceTask(id);
         };
         actionsDiv.appendChild(advanceBtn);
+
+        // If this task has children (was previously subdivided and reverted), show children button
+        if (taskObj._hasChildren) {
+            const childBtn = document.createElement('button');
+            childBtn.className = 'action-btn';
+            childBtn.textContent = 'View Children';
+            childBtn.onclick = (e) => { e.stopPropagation(); viewChildren(id); };
+            actionsDiv.appendChild(childBtn);
+        }
     } else if (status === 'planning') {
         if (ready) {
             const moveBtn = card.querySelector('.task-actions');
@@ -1456,12 +1559,16 @@ setTimeout(initializeDragAndDrop, 100);
 function initializeGlobalConfigButtons() {
     document.getElementById('manage-llms-btn').addEventListener('click', openLlmModal);
     document.getElementById('manage-budgets-btn').addEventListener('click', openBudgetModal);
+    document.getElementById('manage-tools-btn').addEventListener('click', openToolsModal);
 
     document.getElementById('llm-modal').addEventListener('click', function(e) {
         if (e.target === this) closeLlmModal();
     });
     document.getElementById('budget-modal').addEventListener('click', function(e) {
         if (e.target === this) closeBudgetModal();
+    });
+    document.getElementById('tools-modal').addEventListener('click', function(e) {
+        if (e.target === this) closeToolsModal();
     });
 }
 
@@ -1632,14 +1739,71 @@ async function deleteLlmEntry(id) {
 
 // --- Budget Modal ---
 
+let _budgetEditingId = null;  // Currently editing budget id (null = add mode)
+
 async function openBudgetModal() {
     await loadLlmsAndBudgets();
     renderBudgetList();
+    switchBudgetTab('add');
     document.getElementById('budget-modal').classList.add('active');
 }
 
 function closeBudgetModal() {
     document.getElementById('budget-modal').classList.remove('active');
+    _budgetEditingId = null;
+}
+
+function switchBudgetTab(tab) {
+    document.getElementById('budget-tab-add').classList.toggle('active', tab === 'add');
+    document.getElementById('budget-tab-edit').classList.toggle('active', tab === 'edit');
+    document.getElementById('budget-pane-add').classList.toggle('active', tab === 'add');
+    document.getElementById('budget-pane-edit').classList.toggle('active', tab === 'edit');
+    const btn = document.getElementById('budget-submit-btn');
+    if (tab === 'add') {
+        btn.textContent = 'Add Budget';
+        btn.onclick = addBudget;
+    } else {
+        btn.textContent = 'Save Changes';
+        btn.onclick = saveBudgetEdit;
+    }
+}
+
+function editBudgetEntry(id) {
+    const budget = allBudgets.find(b => b.id === id);
+    if (!budget) return;
+    _budgetEditingId = id;
+    document.getElementById('budget-edit-id').value = id;
+    document.getElementById('budget-edit-name').value = budget.name;
+    document.getElementById('budget-edit-placeholder').style.display = 'none';
+    document.getElementById('budget-edit-form').style.display = 'block';
+    document.getElementById('budget-edit-error').style.display = 'none';
+    switchBudgetTab('edit');
+    // Fetch usage summary
+    loadBudgetSummary(id);
+}
+
+async function loadBudgetSummary(budgetId) {
+    const el = document.getElementById('budget-summary-content');
+    el.textContent = 'Loading...';
+    try {
+        const res = await fetch(`${API_BASE}/budgets/${budgetId}/summary`);
+        if (!res.ok) { el.textContent = 'Failed to load summary.'; return; }
+        const s = res.json ? await res.json() : {};
+        const totalTokens = (s.total_prompt_tokens || 0) + (s.total_generation_tokens || 0);
+        const totalDisplay = totalTokens >= 1024 ? `${Math.round(totalTokens / 1024)}k` : totalTokens;
+        const promptDisplay = (s.total_prompt_tokens || 0) >= 1024 ? `${Math.round(s.total_prompt_tokens / 1024)}k` : (s.total_prompt_tokens || 0);
+        const genDisplay = (s.total_generation_tokens || 0) >= 1024 ? `${Math.round(s.total_generation_tokens / 1024)}k` : (s.total_generation_tokens || 0);
+        el.innerHTML = `
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.25rem 1rem">
+                <span>LLM Calls:</span><span><strong>${s.total_entries || 0}</strong></span>
+                <span>Prompt Tokens:</span><span><strong>${promptDisplay}</strong></span>
+                <span>Generation Tokens:</span><span><strong>${genDisplay}</strong></span>
+                <span>Total Tokens:</span><span><strong>${totalDisplay}</strong></span>
+                <span>Tool Calls:</span><span><strong>${s.total_tool_calls || 0}</strong></span>
+            </div>`;
+    } catch (e) {
+        el.textContent = 'Error loading summary.';
+    }
 }
 
 function renderBudgetList() {
@@ -1653,7 +1817,7 @@ function renderBudgetList() {
     allBudgets.forEach(b => {
         html += `<tr style="border-bottom:1px solid #f0f0f0">
             <td style="padding:0.4rem">${b.id}</td>
-            <td style="padding:0.4rem">${b.name}</td>
+            <td style="padding:0.4rem"><a href="#" onclick="editBudgetEntry(${b.id}); return false;" style="color:#0d6efd;text-decoration:none;cursor:pointer">${b.name}</a></td>
             <td style="padding:0.4rem"><button class="action-btn action-btn-danger" onclick="deleteBudgetEntry(${b.id})">Delete</button></td>
         </tr>`;
     });
@@ -1680,9 +1844,228 @@ async function addBudget() {
     renderBudgetList();
 }
 
+async function saveBudgetEdit() {
+    if (!_budgetEditingId) return;
+    const name = document.getElementById('budget-edit-name').value.trim();
+    if (!name) { showInlineError('budget-edit-error', 'Budget name is required.'); return; }
+
+    const res = await fetch(`${API_BASE}/budgets/${_budgetEditingId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name })
+    });
+    if (!res.ok) {
+        const err = await res.json();
+        showInlineError('budget-edit-error', err.detail || 'Failed to update budget.');
+        return;
+    }
+    await loadLlmsAndBudgets();
+    renderBudgetList();
+    editBudgetEntry(_budgetEditingId);
+}
+
 async function deleteBudgetEntry(id) {
     if (!confirm('Delete this budget?')) return;
     await fetch(`${API_BASE}/budgets/${id}`, { method: 'DELETE' });
+    if (_budgetEditingId === id) {
+        _budgetEditingId = null;
+        document.getElementById('budget-edit-form').style.display = 'none';
+        document.getElementById('budget-edit-placeholder').style.display = 'block';
+        switchBudgetTab('add');
+    }
     await loadLlmsAndBudgets();
     renderBudgetList();
+}
+
+
+// ============================================
+// Agent Tools Modal
+// ============================================
+
+let _toolsData = null;       // Cached response from /api/agent/tools
+let _toolsFilterAgent = null; // Currently selected agent filter (null = show all)
+
+// Tool categories inferred from name prefixes
+function _toolCategory(name) {
+    if (name.startsWith('git_'))    return 'git';
+    if (name.startsWith('read_') || name.startsWith('write_') || name.startsWith('append_') ||
+        name === 'count_lines' || name === 'list_directory' || name === 'archive_file') return 'file';
+    if (name === 'search_files' || name === 'find_files') return 'search';
+    if (name === 'run_shell')       return 'shell';
+    if (name.startsWith('get_task') || name.startsWith('list_task') ||
+        name.startsWith('update_task') || name.startsWith('append_task')) return 'task';
+    return 'other';
+}
+
+const _CATEGORY_LABELS = {
+    file: 'File I/O', search: 'Search', git: 'Git', shell: 'Execution', task: 'Kanban', other: 'Other'
+};
+
+const _CATEGORY_ORDER = ['file', 'search', 'git', 'shell', 'task', 'other'];
+
+async function openToolsModal() {
+    document.getElementById('tools-modal').classList.add('active');
+    if (!_toolsData) {
+        document.getElementById('tools-card-container').innerHTML = '<em>Loading tools...</em>';
+        try {
+            const res = await fetch(`${API_BASE}/agent/tools`);
+            _toolsData = await res.json();
+        } catch (err) {
+            document.getElementById('tools-card-container').innerHTML = `<em>Error loading tools: ${err}</em>`;
+            return;
+        }
+    }
+    _toolsFilterAgent = null;
+    renderToolsAgentTree();
+    renderToolCards();
+}
+
+function closeToolsModal() {
+    document.getElementById('tools-modal').classList.remove('active');
+}
+
+function renderToolsAgentTree() {
+    const container = document.getElementById('tools-agent-tree');
+    const access = _toolsData.agent_access;
+
+    let html = '';
+    for (const [agentName, info] of Object.entries(access)) {
+        const count = info.tools.length;
+        const isActive = _toolsFilterAgent === agentName;
+        const toolLabel = count === 0 ? 'No direct tools' : `${count} tool${count !== 1 ? 's' : ''}`;
+        html += `
+            <div class="tools-agent-node${isActive ? ' active' : ''}"
+                 onclick="filterToolsByAgent('${agentName}')">
+                <div class="tools-agent-name">${agentName}</div>
+                <div class="tools-agent-desc">${_escapeHtml(info.description)}</div>
+                <div class="tools-agent-count">${toolLabel}</div>
+            </div>
+        `;
+    }
+    container.innerHTML = html;
+}
+
+function filterToolsByAgent(agentName) {
+    if (_toolsFilterAgent === agentName) {
+        _toolsFilterAgent = null;  // Toggle off
+    } else {
+        _toolsFilterAgent = agentName;
+    }
+    renderToolsAgentTree();
+    renderToolCards();
+}
+
+function _escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+}
+
+function renderToolCards() {
+    const container = document.getElementById('tools-card-container');
+    const schemas = _toolsData.tool_schemas;
+    const access = _toolsData.agent_access;
+
+    // Build a set of tool names to show (filtered by agent or all)
+    let visibleTools = null;
+    if (_toolsFilterAgent) {
+        const agentTools = access[_toolsFilterAgent]?.tools || [];
+        if (agentTools.length === 0) {
+            container.innerHTML = `<em style="color:#6c757d">${_toolsFilterAgent} does not dispatch tools directly — it uses structured LLM prompts.</em>`;
+            return;
+        }
+        visibleTools = new Set(agentTools);
+    }
+
+    // Build reverse map: tool name -> list of agent names that have it
+    const toolAgents = {};
+    for (const [agentName, info] of Object.entries(access)) {
+        for (const t of info.tools) {
+            if (!toolAgents[t]) toolAgents[t] = [];
+            toolAgents[t].push(agentName);
+        }
+    }
+
+    // Group schemas by category
+    const grouped = {};
+    for (const schema of schemas) {
+        const name = schema.function.name;
+        if (visibleTools && !visibleTools.has(name)) continue;
+        const cat = _toolCategory(name);
+        if (!grouped[cat]) grouped[cat] = [];
+        grouped[cat].push(schema);
+    }
+
+    let html = '';
+    for (const cat of _CATEGORY_ORDER) {
+        const tools = grouped[cat];
+        if (!tools || tools.length === 0) continue;
+        html += `<div style="font-size:0.78rem;font-weight:600;color:#6c757d;text-transform:uppercase;letter-spacing:0.5px;margin:0.75rem 0 0.35rem;padding-left:0.25rem">${_CATEGORY_LABELS[cat] || cat}</div>`;
+        for (const schema of tools) {
+            html += _renderToolCard(schema, toolAgents);
+        }
+    }
+
+    container.innerHTML = html || '<em>No tools to display.</em>';
+}
+
+function _renderToolCard(schema, toolAgents) {
+    const fn = schema.function;
+    const name = fn.name;
+    const desc = fn.description || '';
+    const params = fn.parameters?.properties || {};
+    const required = new Set(fn.parameters?.required || []);
+    const agents = toolAgents[name] || [];
+
+    // Agent badges
+    let badges = '';
+    for (const a of agents) {
+        const cls = a === 'MaestroLoop' ? 'maestro' : 'research';
+        badges += `<span class="tool-card-badge ${cls}">${a}</span>`;
+    }
+
+    // Parameter list
+    let paramHtml = '';
+    if (Object.keys(params).length > 0) {
+        paramHtml = '<ul class="tool-card-params">';
+        for (const [pName, pDef] of Object.entries(params)) {
+            const type = pDef.type || 'any';
+            const isReq = required.has(pName);
+            const pDesc = pDef.description || '';
+            const defVal = pDef.default !== undefined ? ` = ${JSON.stringify(pDef.default)}` : '';
+            paramHtml += `
+                <li>
+                    <span class="tool-param-name">${pName}</span>
+                    <span class="tool-param-type">${type}${defVal}</span>
+                    ${isReq ? '<span class="tool-param-required">required</span>' : ''}
+                    ${pDesc ? `<div class="tool-param-desc">${_escapeHtml(pDesc)}</div>` : ''}
+                </li>`;
+        }
+        paramHtml += '</ul>';
+    }
+
+    // The "prompt injection" — the description string the LLM sees
+    const promptBlock = `<div class="tool-card-prompt-label">LLM Prompt (what the model sees)</div>
+        <div class="tool-card-prompt">${_escapeHtml(JSON.stringify(schema, null, 2))}</div>`;
+
+    return `
+        <div class="tool-card" id="tool-card-${name}">
+            <div class="tool-card-header" onclick="toggleToolCard('${name}')">
+                <div style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap">
+                    <span class="tool-card-name">${name}</span>
+                    <div class="tool-card-badges">${badges}</div>
+                </div>
+                <span class="tool-card-chevron">&#9654;</span>
+            </div>
+            <div class="tool-card-body">
+                <div class="tool-card-desc">${_escapeHtml(desc)}</div>
+                ${paramHtml}
+                ${promptBlock}
+            </div>
+        </div>`;
+}
+
+function toggleToolCard(name) {
+    const card = document.getElementById(`tool-card-${name}`);
+    if (card) card.classList.toggle('expanded');
 }

@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kanban Board - TheMaestro</title>
-    <link rel="stylesheet" href="/static/style.css?v=10">
-    <script src="/static/kanban.js?v=10"></script>
+    <link rel="stylesheet" href="/static/style.css?v=13">
+    <script src="/static/kanban.js?v=13"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -43,6 +43,9 @@
             </div>
             <div class="project-tab" id="manage-budgets-btn" style="cursor:pointer">
                 Budgets
+            </div>
+            <div class="project-tab" id="manage-tools-btn" style="cursor:pointer">
+                Agent Tools
             </div>
         </div>
     </div>
@@ -346,7 +349,7 @@
 
     <!-- Budget Management Modal -->
     <div class="modal-overlay" id="budget-modal">
-        <div class="modal" style="width:600px">
+        <div class="modal" style="width:640px">
             <div class="modal-header">
                 <h2 class="modal-title">Budgets</h2>
                 <button class="close-btn" onclick="closeBudgetModal()">&times;</button>
@@ -354,16 +357,43 @@
             <div class="modal-body">
                 <div id="budget-list"></div>
                 <hr style="margin:1rem 0">
-                <h3 style="font-size:1rem;margin-bottom:0.75rem">Add New Budget</h3>
-                <div class="form-group">
-                    <label class="form-label" for="budget-name">Budget Name</label>
-                    <input type="text" class="form-input" id="budget-name" placeholder="e.g. Premium Budget">
+
+                <!-- Tabs -->
+                <div class="llm-tabs">
+                    <a href="#" class="llm-tab active" id="budget-tab-add" onclick="switchBudgetTab('add'); return false;">Add New Budget</a>
+                    <span class="llm-tab-sep">|</span>
+                    <a href="#" class="llm-tab" id="budget-tab-edit" onclick="switchBudgetTab('edit'); return false;">Edit</a>
                 </div>
-                <div id="budget-error" class="inline-error" style="display:none"></div>
+
+                <!-- Add tab -->
+                <div class="llm-tab-content active" id="budget-pane-add">
+                    <div class="form-group">
+                        <label class="form-label" for="budget-name">Budget Name</label>
+                        <input type="text" class="form-input" id="budget-name" placeholder="e.g. Premium Budget">
+                    </div>
+                    <div id="budget-error" class="inline-error" style="display:none"></div>
+                </div>
+
+                <!-- Edit tab -->
+                <div class="llm-tab-content" id="budget-pane-edit">
+                    <p id="budget-edit-placeholder" style="color:#6c757d;font-size:0.85rem">Click a budget name in the table above to edit it.</p>
+                    <div id="budget-edit-form" style="display:none">
+                        <input type="hidden" id="budget-edit-id">
+                        <div class="form-group">
+                            <label class="form-label" for="budget-edit-name">Budget Name</label>
+                            <input type="text" class="form-input" id="budget-edit-name">
+                        </div>
+                        <div id="budget-summary-box" style="margin-bottom:1rem;padding:0.75rem;background:#f8f9fa;border-radius:6px;font-size:0.85rem;color:#495057">
+                            <strong>Usage Summary</strong>
+                            <div id="budget-summary-content" style="margin-top:0.35rem">Loading...</div>
+                        </div>
+                        <div id="budget-edit-error" class="inline-error" style="display:none"></div>
+                    </div>
+                </div>
             </div>
             <div class="modal-footer">
                 <button class="btn btn-secondary" onclick="closeBudgetModal()">Close</button>
-                <button class="btn btn-primary" onclick="addBudget()">Add Budget</button>
+                <button class="btn btn-primary" id="budget-submit-btn" onclick="addBudget()">Add Budget</button>
             </div>
         </div>
     </div>
@@ -380,6 +410,26 @@
             </div>
             <div class="modal-footer">
                 <button class="btn btn-secondary" onclick="closeTransitionModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Agent Tools Modal -->
+    <div class="modal-overlay" id="tools-modal">
+        <div class="modal" style="width:900px">
+            <div class="modal-header">
+                <h2 class="modal-title">Agent Tools</h2>
+                <button class="close-btn" onclick="closeToolsModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <!-- Agent Access Tree -->
+                <div id="tools-agent-tree" class="tools-agent-tree"></div>
+                <hr style="margin:1rem 0; border-color:#dee2e6">
+                <!-- Tool Cards -->
+                <div id="tools-card-container" class="tools-card-container"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeToolsModal()">Close</button>
             </div>
         </div>
     </div>
