@@ -49,6 +49,10 @@ _active_sessions_lock = threading.Lock()
 _llm_session_counts: dict[int, int] = defaultdict(int)
 _llm_counts_lock = threading.Lock()
 
+# task_id -> timestamp of last failed dispatch (cooldown to avoid retry storms)
+_failed_cooldowns: dict[str, float] = {}
+_FAIL_COOLDOWN_SECONDS = 60.0  # Wait 60s before retrying a failed task
+
 # Background thread that drives the scheduler tick
 _scheduler_thread: threading.Thread | None = None
 _scheduler_stop = threading.Event()
@@ -144,14 +148,21 @@ def _tick() -> None:
         task_id = task_dict["id"]
         task_type = task_dict.get("type", "")
 
-        # Only dispatch tasks in actionable columns
-        # IDEA tasks need the intake pipeline; PLANNING+ tasks need MaestroLoop
-        if task_type not in ("idea", "planning", "development"):
+        # Only auto-dispatch tasks in columns the MaestroLoop handles.
+        # IDEA tasks require explicit human "Advance to Planning" action —
+        # the scheduler never auto-fires the intake pipeline.
+        if task_type not in ("planning", "development"):
             continue
 
         # Already running?
         with _active_sessions_lock:
             if task_id in _active_sessions and _active_sessions[task_id].is_alive():
+                continue
+
+        # Cooldown after failure — don't retry for 60s
+        import time
+        if task_id in _failed_cooldowns:
+            if time.time() - _failed_cooldowns[task_id] < _FAIL_COOLDOWN_SECONDS:
                 continue
 
         # Resolve the LLM for capacity check
@@ -208,7 +219,9 @@ def _run_task(task_id: str, task_type: str, llm: Any) -> None:
         else:
             _run_maestro_loop(task_id, llm_base_url, llm_model, max_context)
     except Exception:
-        logger.exception("Task '%s' failed in scheduler dispatch.", task_id)
+        import time
+        _failed_cooldowns[task_id] = time.time()
+        logger.exception("Task '%s' failed in scheduler dispatch (cooldown %ds).", task_id, int(_FAIL_COOLDOWN_SECONDS))
     finally:
         with _llm_counts_lock:
             _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)

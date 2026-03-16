@@ -1480,14 +1480,53 @@ function showInlineError(elementId, message, duration = 5000) {
 
 // --- LLM Modal ---
 
+let _llmEditingId = null;  // Currently editing LLM id (null = add mode)
+
 async function openLlmModal() {
     await loadLlmsAndBudgets();
     renderLlmList();
+    switchLlmTab('add');
     document.getElementById('llm-modal').classList.add('active');
 }
 
 function closeLlmModal() {
     document.getElementById('llm-modal').classList.remove('active');
+    _llmEditingId = null;
+}
+
+function switchLlmTab(tab) {
+    // Toggle tab buttons
+    document.getElementById('llm-tab-add').classList.toggle('active', tab === 'add');
+    document.getElementById('llm-tab-edit').classList.toggle('active', tab === 'edit');
+    // Toggle panes
+    document.getElementById('llm-pane-add').classList.toggle('active', tab === 'add');
+    document.getElementById('llm-pane-edit').classList.toggle('active', tab === 'edit');
+    // Update footer button
+    const btn = document.getElementById('llm-submit-btn');
+    if (tab === 'add') {
+        btn.textContent = 'Add LLM Endpoint';
+        btn.onclick = addLlm;
+    } else {
+        btn.textContent = 'Save Changes';
+        btn.onclick = saveLlmEdit;
+    }
+}
+
+function editLlmEntry(id) {
+    const llm = allLlms.find(l => l.id === id);
+    if (!llm) return;
+    _llmEditingId = id;
+    document.getElementById('llm-edit-id').value = id;
+    document.getElementById('llm-edit-address').value = llm.address;
+    document.getElementById('llm-edit-port').value = llm.port;
+    document.getElementById('llm-edit-model').value = llm.model;
+    document.getElementById('llm-edit-parallel').value = llm.parallel_sessions;
+    document.getElementById('llm-edit-max-context').value = llm.max_context;
+    document.getElementById('llm-edit-notes').value = llm.notes || '';
+    document.getElementById('llm-edit-placeholder').style.display = 'none';
+    document.getElementById('llm-edit-form').style.display = 'block';
+    document.getElementById('llm-edit-error').style.display = 'none';
+    switchLlmTab('edit');
 }
 
 function renderLlmList() {
@@ -1499,11 +1538,11 @@ function renderLlmList() {
     let html = '<table style="width:100%;font-size:0.85rem;border-collapse:collapse">';
     html += '<tr style="border-bottom:1px solid #dee2e6"><th style="text-align:left;padding:0.4rem">ID</th><th style="text-align:left;padding:0.4rem">Endpoint</th><th style="text-align:left;padding:0.4rem">Model</th><th style="text-align:left;padding:0.4rem">Sessions</th><th style="text-align:left;padding:0.4rem">Context</th><th></th></tr>';
     allLlms.forEach(l => {
-        const ctx = l.max_context >= 1000 ? `${Math.round(l.max_context / 1000)}k` : l.max_context;
+        const ctx = l.max_context >= 1024 ? `${Math.round(l.max_context / 1024)}k` : l.max_context;
         html += `<tr style="border-bottom:1px solid #f0f0f0">
             <td style="padding:0.4rem">${l.id}</td>
             <td style="padding:0.4rem">${l.address}:${l.port}</td>
-            <td style="padding:0.4rem">${l.model}</td>
+            <td style="padding:0.4rem"><a href="#" onclick="editLlmEntry(${l.id}); return false;" style="color:#0d6efd;text-decoration:none;cursor:pointer">${l.model}</a></td>
             <td style="padding:0.4rem">${l.parallel_sessions}</td>
             <td style="padding:0.4rem">${ctx}</td>
             <td style="padding:0.4rem"><button class="action-btn action-btn-danger" onclick="deleteLlmEntry(${l.id})">Delete</button></td>
@@ -1513,30 +1552,35 @@ function renderLlmList() {
     container.innerHTML = html;
 }
 
-async function addLlm() {
-    const address = document.getElementById('llm-address').value.trim();
-    const port = parseInt(document.getElementById('llm-port').value) || 8008;
-    const model = document.getElementById('llm-model').value.trim();
-    const parallelRaw = parseInt(document.getElementById('llm-parallel').value);
-    const contextRaw = parseInt(document.getElementById('llm-max-context').value);
+function _validateLlmFields(prefix) {
+    const address = document.getElementById(`${prefix}-address`).value.trim();
+    const port = parseInt(document.getElementById(`${prefix}-port`).value) || 8008;
+    const model = document.getElementById(`${prefix}-model`).value.trim();
+    const parallelRaw = parseInt(document.getElementById(`${prefix}-parallel`).value);
+    const contextRaw = parseInt(document.getElementById(`${prefix}-max-context`).value);
+    const notes = (document.getElementById(`${prefix}-notes`) || {}).value || '';
+    const errorId = prefix === 'llm' ? 'llm-error' : 'llm-edit-error';
 
-    if (!address || !model) { showInlineError('llm-error', 'Address and model are required.'); return; }
-
+    if (!address || !model) { showInlineError(errorId, 'Address and model are required.'); return null; }
     if (isNaN(parallelRaw) || parallelRaw < 1 || parallelRaw > 1024) {
-        showInlineError('llm-error', 'Parallel sessions must be between 1 and 1,024.');
-        return;
+        showInlineError(errorId, 'Parallel sessions must be between 1 and 1,024.');
+        return null;
     }
-    const parallel_sessions = parallelRaw;
     if (isNaN(contextRaw) || contextRaw < 1) {
-        showInlineError('llm-error', 'Max context must be a non-zero number.');
-        return;
+        showInlineError(errorId, 'Max context must be a non-zero number.');
+        return null;
     }
-    const max_context = contextRaw;
+    return { address, port, model, parallel_sessions: parallelRaw, max_context: contextRaw, notes };
+}
+
+async function addLlm() {
+    const data = _validateLlmFields('llm');
+    if (!data) return;
 
     const res = await fetch(`${API_BASE}/llms`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ address, port, model, parallel_sessions, max_context })
+        body: JSON.stringify(data)
     });
     if (!res.ok) {
         const err = await res.json();
@@ -1546,13 +1590,42 @@ async function addLlm() {
     document.getElementById('llm-model').value = '';
     document.getElementById('llm-parallel').value = '1';
     document.getElementById('llm-max-context').value = '4096';
+    document.getElementById('llm-notes').value = '';
     await loadLlmsAndBudgets();
     renderLlmList();
+}
+
+async function saveLlmEdit() {
+    if (!_llmEditingId) return;
+    const data = _validateLlmFields('llm-edit');
+    if (!data) return;
+
+    const res = await fetch(`${API_BASE}/llms/${_llmEditingId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+    });
+    if (!res.ok) {
+        const err = await res.json();
+        showInlineError('llm-edit-error', err.detail || 'Failed to update LLM.');
+        return;
+    }
+    await loadLlmsAndBudgets();
+    renderLlmList();
+    // Stay on edit tab, refresh the form with updated data
+    editLlmEntry(_llmEditingId);
 }
 
 async function deleteLlmEntry(id) {
     if (!confirm('Delete this LLM endpoint?')) return;
     await fetch(`${API_BASE}/llms/${id}`, { method: 'DELETE' });
+    // If we were editing this one, reset the edit pane
+    if (_llmEditingId === id) {
+        _llmEditingId = null;
+        document.getElementById('llm-edit-form').style.display = 'none';
+        document.getElementById('llm-edit-placeholder').style.display = 'block';
+        switchLlmTab('add');
+    }
     await loadLlmsAndBudgets();
     renderLlmList();
 }

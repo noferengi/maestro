@@ -520,7 +520,7 @@ class IntakePipeline:
         try:
             result = await self._call_llm(_SCOPE_SYSTEM_PROMPT, user_prompt)
             return self._extract_vote("scope_analysis", result)
-        except (httpx.HTTPStatusError, httpx.TimeoutException) as exc:
+        except Exception as exc:
             return self._error_vote("scope_analysis", exc)
         except (json.JSONDecodeError, KeyError, IndexError) as exc:
             return self._error_vote("scope_analysis", exc)
@@ -625,7 +625,7 @@ class IntakePipeline:
         try:
             result = await self._call_llm(_FEASIBILITY_SYSTEM_PROMPT, user_prompt)
             return self._extract_vote("feasibility_analysis", result)
-        except (httpx.HTTPStatusError, httpx.TimeoutException) as exc:
+        except Exception as exc:
             return self._error_vote("feasibility_analysis", exc)
         except (json.JSONDecodeError, KeyError, IndexError) as exc:
             return self._error_vote("feasibility_analysis", exc)
@@ -681,7 +681,7 @@ class IntakePipeline:
         try:
             result = await self._call_llm(_CONFLICT_SYSTEM_PROMPT, user_prompt)
             return self._extract_vote("conflict_detection", result)
-        except (httpx.HTTPStatusError, httpx.TimeoutException) as exc:
+        except Exception as exc:
             return self._error_vote("conflict_detection", exc)
         except (json.JSONDecodeError, KeyError, IndexError) as exc:
             return self._error_vote("conflict_detection", exc)

@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kanban Board - TheMaestro</title>
-    <link rel="stylesheet" href="/static/style.css?v=9">
-    <script src="/static/kanban.js?v=9"></script>
+    <link rel="stylesheet" href="/static/style.css?v=10">
+    <script src="/static/kanban.js?v=10"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -260,8 +260,9 @@
 
                 <!-- Tabs -->
                 <div class="llm-tabs">
-                    <button class="llm-tab active" id="llm-tab-add" onclick="switchLlmTab('add')">Add New LLM Endpoint</button>
-                    <button class="llm-tab" id="llm-tab-edit" onclick="switchLlmTab('edit')">Edit</button>
+                    <a href="#" class="llm-tab active" id="llm-tab-add" onclick="switchLlmTab('add'); return false;">Add New LLM Endpoint</a>
+                    <span class="llm-tab-sep">|</span>
+                    <a href="#" class="llm-tab" id="llm-tab-edit" onclick="switchLlmTab('edit'); return false;">Edit</a>
                 </div>
 
                 <!-- Add tab -->

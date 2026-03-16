@@ -685,38 +685,46 @@ body {
 /* LLM Modal Tabs */
 .llm-tabs {
     display: flex;
-    border-bottom: 2px solid #dee2e6;
+    align-items: center;
+    gap: 0;
     margin-bottom: 1rem;
+    font-size: 0.9rem;
 }
 
 .llm-tab {
-    padding: 0.5rem 1.25rem;
+    padding: 0;
     cursor: pointer;
     font-size: 0.9rem;
     font-weight: 500;
     color: #6c757d;
     border: none;
     background: none;
-    border-bottom: 2px solid transparent;
-    margin-bottom: -2px;
-    transition: color 0.15s, border-color 0.15s;
+    text-decoration: none;
+    transition: color 0.15s;
 }
 
 .llm-tab:hover {
     color: #495057;
+    text-decoration: underline;
 }
 
 .llm-tab.active {
     color: #0d6efd;
-    border-bottom-color: #0d6efd;
+    text-decoration: none;
+}
+
+.llm-tab-sep {
+    color: #adb5bd;
+    margin: 0 0.6rem;
+    user-select: none;
 }
 
 .llm-tab-content {
-    display: none;
+    display: none !important;
 }
 
 .llm-tab-content.active {
-    display: block;
+    display: block !important;
 }
 
 /* Processing spinner indicator */
