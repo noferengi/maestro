@@ -142,16 +142,24 @@ RESEARCH_AGENT_TOOLS: list[str] = _getlist("intake", "research_agent_tools",
 # Subdivision settings
 # ===========================================================================
 
-SUBDIVISION_MAX_DEPTH: int = _getint("subdivision", "max_depth", None, 3)
-SUBDIVISION_MAX_RETRIES: int = _getint("subdivision", "max_retries_per_level", None, 2)
-SUBDIVISION_MAX_TOTAL_SUB_IDEAS: int = _getint("subdivision", "max_total_sub_ideas", None, 15)
+SUBDIVISION_MAX_DEPTH: int = _getint("subdivision", "max_depth", None, 6)
+SUBDIVISION_MAX_RETRIES: int = _getint("subdivision", "max_retries_per_level", None, 4)
+SUBDIVISION_MAX_TOTAL_SUB_IDEAS: int = _getint("subdivision", "max_total_sub_ideas", None, 30)
 SUBDIVISION_LLM_TEMPERATURE: float = _getfloat("subdivision", "llm_temperature", None, 0.3)
+SUBDIVISION_CONTEXT_BUDGET_RATIO: float = _getfloat("subdivision", "context_budget_ratio", None, 0.30)
+SUBDIVISION_CONTEXT_AWARE_TOOLS: bool = _getbool("subdivision", "context_aware_tools", None, True)
 
 SUBDIVISION_AGENT_TOOLS: list[str] = _getlist("subdivision", "subdivision_agent_tools",
     "read_file, read_file_lines, count_lines, "
     "search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, "
     "get_task, list_tasks"
+)
+
+SUBDIVISION_PLANNING_TOOLS: list[str] = _getlist("subdivision", "subdivision_planning_tools",
+    "generate_architecture_doc, generate_interface_contract, "
+    "generate_mermaid_diagram, spawn_research_agent, "
+    "list_directory, find_files, get_task, list_tasks"
 )
 
 # ===========================================================================

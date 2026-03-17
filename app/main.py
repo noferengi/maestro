@@ -26,6 +26,7 @@ from database import (
     create_subdivision_record, get_subdivision_records,
     get_child_tasks, get_active_child_tasks, count_total_sub_ideas,
     update_subdivision_record,
+    get_descendant_tree, set_big_idea_flag, batch_reorder_tasks,
 )
 
 app = FastAPI(title="Kanban Board API")
@@ -325,6 +326,14 @@ def _create_sub_idea_tasks(task, sub_result, generation):
                 child_ids[i] = latest.id  # use the real ID
                 if prereqs:
                     latest.prerequisites = prereqs
+                # Store interface contracts on child if available
+                child_contracts = {}
+                if hasattr(sub_idea, 'provides') and sub_idea.provides:
+                    child_contracts['provides'] = sub_idea.provides
+                if hasattr(sub_idea, 'consumes') and sub_idea.consumes:
+                    child_contracts['consumes'] = sub_idea.consumes
+                if child_contracts:
+                    latest.interface_contracts = json.dumps(child_contracts)
                 db.commit()
         finally:
             db.close()
@@ -407,8 +416,16 @@ def _handle_subdivision_outcome(task, result, llm_base_url, llm_model, max_conte
         update_task(task.id, type="idea")
         return
 
-    # Create child tasks
+    # Create child tasks (with interface contracts)
     child_ids = _create_sub_idea_tasks(task, sub_result, generation)
+
+    # Set the Big Idea flag on the parent
+    set_big_idea_flag(task.id)
+
+    # Serialize interface contracts for the subdivision record
+    contracts_json = None
+    if sub_result.interface_contracts:
+        contracts_json = json.dumps(sub_result.interface_contracts)
 
     # Create subdivision record
     create_subdivision_record(
@@ -420,6 +437,7 @@ def _handle_subdivision_outcome(task, result, llm_base_url, llm_model, max_conte
         prompt_tokens=sub_result.prompt_tokens,
         completion_tokens=sub_result.completion_tokens,
         status="active",
+        interface_contracts=contracts_json,
     )
 
     print(f"[intake] Task '{task.id}' subdivided into {len(child_ids)} sub-ideas (generation {generation}).")
@@ -748,6 +766,37 @@ def get_task_subdivision_records(task_id: str):
 
 
 # ============================================
+# Descendants API
+# ============================================
+
+@app.get("/api/tasks/{task_id}/descendants", response_model=List[dict])
+def get_task_descendants(task_id: str):
+    """Return a flat list of all descendant task IDs with column, position, and depth info."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return get_descendant_tree(task_id)
+
+
+# ============================================
+# Batch Reorder API
+# ============================================
+
+class BatchReorderRequest(BaseModel):
+    moves: list
+
+@app.post("/api/tasks/batch-reorder")
+def batch_reorder(request: BatchReorderRequest):
+    """Process multiple task reorders in a single transaction."""
+    if not request.moves:
+        return {"success": True, "message": "No moves to process"}
+    success = batch_reorder_tasks(request.moves)
+    if not success:
+        raise HTTPException(status_code=500, detail="Batch reorder failed")
+    return {"success": True, "message": f"Reordered {len(request.moves)} tasks"}
+
+
+# ============================================
 # Completion Rollup — check if parent can be completed
 # ============================================
 
@@ -803,6 +852,8 @@ def task_to_dict(task):
         "project": getattr(task, "project", None) or "TheMaestro",
         "parent_task_id": getattr(task, "parent_task_id", None),
         "subdivision_generation": getattr(task, "subdivision_generation", 0) or 0,
+        "is_big_idea": bool(getattr(task, "is_big_idea", False)),
+        "interface_contracts": json.loads(task.interface_contracts) if getattr(task, "interface_contracts", None) else None,
         "created_at": task.created_at.isoformat() if task.created_at else None,
         "updated_at": task.updated_at.isoformat() if task.updated_at else None
     }

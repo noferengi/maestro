@@ -3,7 +3,7 @@ Kanban Board Database Layer
 SQLite-based persistence for Kanban tasks
 """
 
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, ForeignKey, UniqueConstraint
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, ForeignKey, UniqueConstraint, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
@@ -123,6 +123,7 @@ class SubdivisionRecord(Base):
     agent_vote = Column(JSON, nullable=True)
     prompt_tokens = Column(Integer, default=0)
     completion_tokens = Column(Integer, default=0)
+    interface_contracts = Column(Text, nullable=True)  # JSON: interface contracts from subdivision agent
     status = Column(String, nullable=False, default='active')  # active | superseded | failed
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -154,6 +155,8 @@ class Task(Base):
     project = Column(String, default='TheMaestro')  # Project this task belongs to
     parent_task_id = Column(String, ForeignKey('tasks.id'), nullable=True)  # Links sub-ideas to origin
     subdivision_generation = Column(Integer, nullable=False, default=0)  # Recursion depth (0=human)
+    is_big_idea = Column(Boolean, nullable=False, default=False)  # Flagged when subdivision produces children
+    interface_contracts = Column(Text, nullable=True)  # JSON: API contracts between sub-ideas
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -857,7 +860,8 @@ def get_budget_entry(entry_id):
 def create_subdivision_record(parent_task_id, child_task_ids, generation=1,
                                attempt_number=1, rejection_context=None,
                                agent_vote=None, prompt_tokens=0,
-                               completion_tokens=0, status='active'):
+                               completion_tokens=0, status='active',
+                               interface_contracts=None):
     db = SessionLocal()
     try:
         record = SubdivisionRecord(
@@ -869,6 +873,7 @@ def create_subdivision_record(parent_task_id, child_task_ids, generation=1,
             agent_vote=agent_vote,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
+            interface_contracts=interface_contracts,
             status=status,
         )
         db.add(record)
@@ -957,6 +962,76 @@ def count_total_sub_ideas(root_task_id):
             for child in children:
                 queue.append(child.id)
         return count
+    finally:
+        db.close()
+
+
+def get_descendant_tree(root_task_id):
+    """Return a flat list of all descendants with depth info.
+    Each entry: {'id': ..., 'title': ..., 'type': ..., 'position': ..., 'depth': int, 'parent_task_id': ...}
+    """
+    db = SessionLocal()
+    try:
+        results = []
+        queue = [(root_task_id, 0)]  # (parent_id, depth)
+        while queue:
+            parent_id, depth = queue.pop(0)
+            children = (db.query(Task)
+                        .filter(Task.parent_task_id == parent_id)
+                        .order_by(Task.position, Task.created_at)
+                        .all())
+            for child in children:
+                child_depth = depth + 1
+                results.append({
+                    'id': child.id,
+                    'title': child.title,
+                    'type': child.type,
+                    'position': child.position,
+                    'depth': child_depth,
+                    'parent_task_id': child.parent_task_id,
+                })
+                queue.append((child.id, child_depth))
+        return results
+    finally:
+        db.close()
+
+
+def set_big_idea_flag(task_id):
+    """Set the is_big_idea flag on a task."""
+    db = SessionLocal()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if task:
+            task.is_big_idea = True
+            db.commit()
+            return True
+        return False
+    except Exception as e:
+        db.rollback()
+        print(f"Error setting big idea flag: {e}")
+        return False
+    finally:
+        db.close()
+
+
+def batch_reorder_tasks(moves):
+    """Process multiple task reorders in a single transaction.
+    moves: list of {'task_id': str, 'position': int, 'type': str}
+    """
+    db = SessionLocal()
+    try:
+        for move in moves:
+            task = db.query(Task).filter(Task.id == move['task_id']).first()
+            if task:
+                task.position = move['position']
+                if 'type' in move and move['type']:
+                    task.type = move['type']
+        db.commit()
+        return True
+    except Exception as e:
+        db.rollback()
+        print(f"Error batch reordering tasks: {e}")
+        return False
     finally:
         db.close()
 

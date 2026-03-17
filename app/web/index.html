@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kanban Board - TheMaestro</title>
-    <link rel="stylesheet" href="/static/style.css?v=13">
-    <script src="/static/kanban.js?v=13"></script>
+    <link rel="stylesheet" href="/static/style.css?v=14">
+    <script src="/static/kanban.js?v=14"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -60,6 +60,13 @@
             <button class="refresh-btn" onclick="refreshTasks()" title="Refresh from database">
                 🔄 Refresh
             </button>
+        </div>
+
+        <!-- Breadcrumb bar for Big Idea zoom view -->
+        <div id="breadcrumb-bar" class="breadcrumb-bar" style="display:none">
+            <span class="breadcrumb-segment" onclick="zoomToRoot()" style="cursor:pointer">All Tasks</span>
+            <span id="breadcrumb-trail"></span>
+            <button class="breadcrumb-back" onclick="zoomToRoot()">Back to Board</button>
         </div>
 
         <div class="kanban-board">

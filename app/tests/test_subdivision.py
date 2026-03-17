@@ -272,6 +272,121 @@ class TestSubdivisionConfig:
         assert "read_file" in SUBDIVISION_AGENT_TOOLS
 
 
+class TestBigIdeaConfig:
+    """Verify the updated subdivision config values."""
+
+    def test_doubled_depth(self):
+        from app.agent.config import SUBDIVISION_MAX_DEPTH
+        assert SUBDIVISION_MAX_DEPTH == 6
+
+    def test_doubled_retries(self):
+        from app.agent.config import SUBDIVISION_MAX_RETRIES
+        assert SUBDIVISION_MAX_RETRIES == 4
+
+    def test_doubled_total(self):
+        from app.agent.config import SUBDIVISION_MAX_TOTAL_SUB_IDEAS
+        assert SUBDIVISION_MAX_TOTAL_SUB_IDEAS == 30
+
+    def test_context_budget_ratio(self):
+        from app.agent.config import SUBDIVISION_CONTEXT_BUDGET_RATIO
+        assert SUBDIVISION_CONTEXT_BUDGET_RATIO == 0.30
+
+    def test_planning_tools_loaded(self):
+        from app.agent.config import SUBDIVISION_PLANNING_TOOLS
+        assert isinstance(SUBDIVISION_PLANNING_TOOLS, list)
+        assert "generate_architecture_doc" in SUBDIVISION_PLANNING_TOOLS
+        assert "spawn_research_agent" in SUBDIVISION_PLANNING_TOOLS
+
+
+class TestInterfaceContractParsing:
+    """Test _try_parse with provides/consumes fields."""
+
+    def test_parse_with_provides_consumes(self):
+        from app.agent.subdivide import SubdivisionAgent
+        agent = SubdivisionAgent(
+            parent_task_id="test-1",
+            parent_title="Test",
+            parent_description="Test",
+            llm_id=1,
+            budget_id=1,
+        )
+        content = '''
+        {
+          "sub_ideas": [
+            {
+              "title": "Part A",
+              "description": "First part",
+              "prerequisites": [],
+              "estimated_scope": "small",
+              "rationale": "Foundation",
+              "provides": [{"name": "DataModel", "type": "class"}],
+              "consumes": []
+            },
+            {
+              "title": "Part B",
+              "description": "Second part",
+              "prerequisites": ["sub-0"],
+              "estimated_scope": "medium",
+              "rationale": "Depends on A",
+              "provides": [],
+              "consumes": [{"name": "DataModel", "type": "class", "source": "sub-0"}]
+            }
+          ],
+          "interface_contracts": [
+            {"component": "Part A", "provides": [{"name": "DataModel"}], "consumes": []}
+          ],
+          "decomposition_rationale": "Split by concern",
+          "coverage_check": "A + B = full task",
+          "confidence": 85
+        }
+        '''
+        result = agent._extract_result(content)
+        assert result is not None
+        assert len(result.sub_ideas) == 2
+        assert result.sub_ideas[0].provides == [{"name": "DataModel", "type": "class"}]
+        assert result.sub_ideas[1].consumes == [{"name": "DataModel", "type": "class", "source": "sub-0"}]
+        assert len(result.interface_contracts) == 1
+        assert result.interface_contracts[0]["component"] == "Part A"
+
+
+class TestContextAwareToolSelection:
+    """Verify tool selection for greenfield vs existing code."""
+
+    def test_greenfield_gets_planning_tools(self):
+        from app.agent.subdivide import _build_context_aware_schemas
+        schemas, names = _build_context_aware_schemas(has_source=False)
+        assert "generate_architecture_doc" in names
+        assert "spawn_research_agent" in names
+        assert "list_directory" in names
+        assert "find_files" in names
+        # Codebase tools should NOT be present
+        assert "read_file" not in names
+        assert "git_blame" not in names
+
+    def test_existing_code_gets_all_tools(self):
+        from app.agent.subdivide import _build_context_aware_schemas
+        schemas, names = _build_context_aware_schemas(has_source=True)
+        assert "generate_architecture_doc" in names
+        assert "read_file" in names
+        assert "git_status" in names
+
+
+class TestSubdivisionStrategyGuidance:
+    """Verify prompt no longer says 'Prefer vertical slices'."""
+
+    def test_no_prefer_vertical_slices(self):
+        from app.agent.subdivide import _SUBDIVISION_SYSTEM_PROMPT
+        assert "Prefer vertical slices" not in _SUBDIVISION_SYSTEM_PROMPT
+
+    def test_has_greenfield_guidance(self):
+        from app.agent.subdivide import _SUBDIVISION_SYSTEM_PROMPT
+        assert "greenfield" in _SUBDIVISION_SYSTEM_PROMPT.lower()
+
+    def test_has_planning_tools_guidance(self):
+        from app.agent.subdivide import _SUBDIVISION_SYSTEM_PROMPT
+        assert "generate_architecture_doc" in _SUBDIVISION_SYSTEM_PROMPT
+
+
 # ============================================================
 # Intake pipeline — _build_tally with SUBDIVIDE_IDEA
 # ============================================================

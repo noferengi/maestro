@@ -28,6 +28,20 @@ let transitionCache = {};
 // Active polling timers: taskId -> intervalId
 let transitionPollers = {};
 
+// Big Idea zoom state
+let currentBigIdeaFilter = null;  // task ID or null for root view
+let breadcrumbStack = [];         // array of {id, title} for nested zoom
+
+// Descendant index: parentId -> [childId, ...]
+let childIndex = {};
+// Full descendant index: taskId -> [all descendant IDs recursively]
+let descendantIndex = {};
+
+// Grouped drag state
+let isDraggingGroup = false;
+let dragGroupDescendants = [];  // [{id, column, positionOffset}]
+let dragGroupOldParentPos = 0;
+
 // Load tasks from database on startup (scoped to currentProject)
 async function loadTasksFromDatabase() {
     try {
@@ -45,11 +59,44 @@ async function loadTasksFromDatabase() {
         });
 
         console.log(`Loaded ${allTasks.length} tasks from database for project "${currentProject}"`);
+        buildDescendantIndex();
         return true;
     } catch (error) {
         console.error('Error loading tasks from database:', error);
         // Fallback to empty state
         return false;
+    }
+}
+
+// Build child and descendant indexes from taskData
+function buildDescendantIndex() {
+    childIndex = {};
+    descendantIndex = {};
+
+    // Build childIndex: parentId -> [childId, ...]
+    for (const task of allTasks) {
+        if (task.parent_task_id) {
+            if (!childIndex[task.parent_task_id]) {
+                childIndex[task.parent_task_id] = [];
+            }
+            childIndex[task.parent_task_id].push(task.id);
+        }
+    }
+
+    // Build descendantIndex recursively
+    function getDescendants(taskId) {
+        if (descendantIndex[taskId] !== undefined) return descendantIndex[taskId];
+        const children = childIndex[taskId] || [];
+        let all = [...children];
+        for (const cid of children) {
+            all = all.concat(getDescendants(cid));
+        }
+        descendantIndex[taskId] = all;
+        return all;
+    }
+
+    for (const task of allTasks) {
+        getDescendants(task.id);
     }
 }
 
@@ -161,13 +208,30 @@ function renderTasksFromDatabase() {
     // Create task cards from taskData, sorted by position within each column.
     // Group tasks by type first so the sort is per-column, not global.
     // "subdividing" tasks render in the idea column; "cancelled" tasks are hidden.
+    //
+    // If currentBigIdeaFilter is set, only show descendants of that Big Idea
+    // plus the Big Idea itself.
+    const filteredTasks = Object.values(taskData).filter(t => {
+        if (!t || !t.type) return false;
+        if (t.type === 'cancelled') return false;
+        if (currentBigIdeaFilter) {
+            // Show the Big Idea itself + its descendants
+            if (t.id === currentBigIdeaFilter) return true;
+            const descendants = descendantIndex[currentBigIdeaFilter] || [];
+            return descendants.includes(t.id);
+        }
+        return true;
+    });
+
     const tasksByType = {};
-    Object.values(taskData).filter(t => t && t.type).forEach(task => {
-        if (task.type === 'cancelled') return; // Hide cancelled sub-ideas
+    filteredTasks.forEach(task => {
         const renderCol = task.type === 'subdividing' ? 'idea' : task.type;
         if (!tasksByType[renderCol]) tasksByType[renderCol] = [];
         tasksByType[renderCol].push(task);
     });
+
+    // Update breadcrumb bar
+    updateBreadcrumbBar();
 
     columns.forEach(colType => {
         const tasks = (tasksByType[colType] || []).sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
@@ -242,9 +306,11 @@ function startAutoRefresh() {
                 if (newTasks.length !== allTasks.length) {
                     console.log(`Database changed: ${allTasks.length} -> ${newTasks.length} tasks`);
                     allTasks = newTasks;
+                    taskData = {};
                     allTasks.forEach(task => {
                         taskData[task.id] = task;
                     });
+                    buildDescendantIndex();
                     renderTasksFromDatabase();
                 } else {
                     // Check if any task data changed
@@ -258,9 +324,11 @@ function startAutoRefresh() {
                     if (dataChanged) {
                         console.log('Data changed, refreshing UI...');
                         allTasks = newTasks;
+                        taskData = {};
                         allTasks.forEach(task => {
                             taskData[task.id] = task;
                         });
+                        buildDescendantIndex();
                         renderTasksFromDatabase();
                     }
                 }
@@ -580,6 +648,116 @@ function scrollToTask(taskId) {
     }
 }
 
+// ============================================
+// Big Idea Zoom View
+// ============================================
+
+function zoomIntoBigIdea(taskId) {
+    const task = taskData[taskId];
+    if (!task) return;
+
+    // Push current state onto breadcrumb stack
+    breadcrumbStack.push({ id: taskId, title: task.title });
+    currentBigIdeaFilter = taskId;
+    renderTasksFromDatabase();
+}
+
+function zoomToRoot() {
+    currentBigIdeaFilter = null;
+    breadcrumbStack = [];
+    renderTasksFromDatabase();
+}
+
+function zoomToBreadcrumb(index) {
+    // Zoom to a specific level in the breadcrumb stack
+    if (index < 0) {
+        zoomToRoot();
+        return;
+    }
+    breadcrumbStack = breadcrumbStack.slice(0, index + 1);
+    currentBigIdeaFilter = breadcrumbStack[breadcrumbStack.length - 1].id;
+    renderTasksFromDatabase();
+}
+
+function updateBreadcrumbBar() {
+    const bar = document.getElementById('breadcrumb-bar');
+    const trail = document.getElementById('breadcrumb-trail');
+    if (!bar || !trail) return;
+
+    if (!currentBigIdeaFilter) {
+        bar.style.display = 'none';
+        return;
+    }
+
+    bar.style.display = 'flex';
+    let html = '';
+    breadcrumbStack.forEach((crumb, i) => {
+        html += '<span class="breadcrumb-separator">&gt;</span>';
+        if (i < breadcrumbStack.length - 1) {
+            html += `<span class="breadcrumb-segment" onclick="zoomToBreadcrumb(${i})" style="cursor:pointer">${crumb.title}</span>`;
+        } else {
+            html += `<span class="breadcrumb-current">${crumb.title}</span>`;
+        }
+    });
+    trail.innerHTML = html;
+}
+
+function buildPrereqLabels(taskId) {
+    const task = taskData[taskId];
+    if (!task) return '';
+
+    const prereqs = task.prerequisites || [];
+    let parts = [];
+
+    // "Blocked by" labels
+    if (prereqs.length > 0) {
+        const blockers = prereqs.map(pid => {
+            const prereqTask = taskData[pid];
+            if (!prereqTask) return null;
+            const done = ['completed', 'accepted'].includes((prereqTask.type || '').toLowerCase());
+            const cls = done ? 'prereq-met' : 'prereq-unmet';
+            const symbol = done ? '\u2713' : '\u2717';
+            return `<span class="${cls}">${symbol} ${prereqTask.title || pid}</span>`;
+        }).filter(Boolean);
+        if (blockers.length > 0) {
+            parts.push(`<div class="prereq-label">Blocked by: ${blockers.join(', ')}</div>`);
+        }
+    }
+
+    // "Blocks" labels — find tasks that have this task as a prerequisite
+    const blocksIds = [];
+    const descendants = currentBigIdeaFilter ? (descendantIndex[currentBigIdeaFilter] || []) : [];
+    const scopeIds = currentBigIdeaFilter ? [currentBigIdeaFilter, ...descendants] : Object.keys(taskData);
+    for (const otherId of scopeIds) {
+        const other = taskData[otherId];
+        if (other && (other.prerequisites || []).includes(taskId)) {
+            blocksIds.push(other.title || otherId);
+        }
+    }
+    if (blocksIds.length > 0) {
+        parts.push(`<div class="prereq-label prereq-blocks">Blocks: ${blocksIds.join(', ')}</div>`);
+    }
+
+    return parts.join('');
+}
+
+function buildContractPills(contracts) {
+    if (!contracts) return '';
+    const provides = contracts.provides || [];
+    const consumes = contracts.consumes || [];
+    let html = '<div style="margin-top:0.35rem;display:flex;flex-wrap:wrap;gap:0.25rem">';
+    provides.forEach(p => {
+        const name = typeof p === 'string' ? p : (p.name || '?');
+        html += `<span style="font-size:0.6rem;padding:0.1rem 0.35rem;border-radius:3px;background:#d1e7dd;color:#0f5132">provides: ${name}</span>`;
+    });
+    consumes.forEach(c => {
+        const name = typeof c === 'string' ? c : (c.name || '?');
+        html += `<span style="font-size:0.6rem;padding:0.1rem 0.35rem;border-radius:3px;background:#cff4fc;color:#055160">consumes: ${name}</span>`;
+    });
+    html += '</div>';
+    return (provides.length + consumes.length) > 0 ? html : '';
+}
+
 async function viewChildren(taskId) {
     try {
         const resp = await fetch(`${API_BASE}/tasks/${taskId}/children`);
@@ -603,6 +781,8 @@ async function viewChildren(taskId) {
                         <span style="float:right;font-size:0.75rem;text-transform:uppercase;color:${statusColor};font-weight:600">${c.type}</span>
                         <div style="font-size:0.85rem;color:#6c757d;margin-top:0.25rem">${c.description || ''}</div>
                         ${c.subdivision_generation > 0 ? `<span class="subdivision-badge gen" style="margin-top:0.35rem;display:inline-block">Gen ${c.subdivision_generation}</span>` : ''}
+                        ${c.is_big_idea ? '<span class="big-idea-badge" style="margin-left:0.35rem">Big Idea</span>' : ''}
+                        ${c.interface_contracts ? buildContractPills(c.interface_contracts) : ''}
                     </div>
                 `;
             });
@@ -675,19 +855,38 @@ function createTaskCard(id, title, tags, owner, status) {
         subdivBadge = `<span class="subdivision-badge gen" title="Generation ${generation} sub-idea">Gen ${generation}</span>`;
     }
 
+    // Big Idea badge and styling
+    const isBigIdea = taskObj.is_big_idea;
+    let bigIdeaBadge = '';
+    let contractIndicator = '';
+    if (isBigIdea) {
+        bigIdeaBadge = '<span class="big-idea-badge">Big Idea</span>';
+        card.classList.add('big-idea-card');
+    }
+    if (taskObj.interface_contracts) {
+        contractIndicator = '<span class="contract-indicator" title="Has interface contracts">&#128196;</span>';
+    }
+
     let parentLink = '';
     if (parentId && taskData[parentId]) {
         const parentTitle = taskData[parentId].title || parentId;
         parentLink = `<div class="parent-link" onclick="scrollToTask('${parentId}')" title="Parent: ${parentTitle}">&#8593; ${parentTitle}</div>`;
     }
 
+    // Prerequisite labels for zoom view
+    let prereqHtml = '';
+    if (currentBigIdeaFilter) {
+        prereqHtml = buildPrereqLabels(id);
+    }
+
     card.innerHTML = `
         ${parentLink}
-        <div class="task-title">${title}${rejBadge}${processingSpinner}${subdivBadge}</div>
+        <div class="task-title"${isBigIdea ? ` onclick="zoomIntoBigIdea('${id}')" style="cursor:pointer"` : ''}>${title}${rejBadge}${processingSpinner}${subdivBadge}${bigIdeaBadge}${contractIndicator}</div>
         <div class="task-meta">
             ${tagsHtml}
             ${ownerHtml}
         </div>
+        ${prereqHtml}
         <div class="task-actions">
             <button class="action-btn" onclick="editTask('${id}')">Edit</button>
             <button class="action-btn action-btn-danger" onclick="deleteTask('${id}')">Delete</button>
@@ -1362,6 +1561,28 @@ function handleDragStart(e) {
         }
     }, 0);
 
+    // Grouped drag: if this is a Big Idea, dim all descendants
+    const taskObj = taskData[draggedTaskId] || {};
+    if (taskObj.is_big_idea && descendantIndex[draggedTaskId]) {
+        isDraggingGroup = true;
+        dragGroupOldParentPos = taskObj.position || 0;
+        dragGroupDescendants = [];
+        const descendants = descendantIndex[draggedTaskId] || [];
+        descendants.forEach(descId => {
+            const descTask = taskData[descId];
+            if (descTask) {
+                dragGroupDescendants.push({
+                    id: descId,
+                    column: descTask.type === 'subdividing' ? 'idea' : descTask.type,
+                    position: descTask.position || 0,
+                    positionOffset: (descTask.position || 0) - (taskObj.position || 0),
+                });
+                const descCard = document.querySelector(`[data-id="${descId}"]`);
+                if (descCard) descCard.classList.add('dragging-group');
+            }
+        });
+    }
+
     // Create a single shared ghost placeholder (not appended yet — inserted into
     // the container DOM during dragover so surrounding cards are pushed apart by
     // normal block layout).
@@ -1369,7 +1590,7 @@ function handleDragStart(e) {
     insertIndicator.className = 'drop-ghost';
     insertIndicator.setAttribute('aria-hidden', 'true');
 
-    console.log(`Drag Start: card=${draggedTaskId}`);
+    console.log(`Drag Start: card=${draggedTaskId}${isDraggingGroup ? ' (group)' : ''}`);
 }
 
 function handleDragEnd(e) {
@@ -1387,6 +1608,14 @@ function handleDragEnd(e) {
         insertIndicator.parentNode.removeChild(insertIndicator);
     }
     insertIndicator = null;
+
+    // Clean up group drag state
+    if (isDraggingGroup) {
+        document.querySelectorAll('.dragging-group').forEach(el => el.classList.remove('dragging-group'));
+        isDraggingGroup = false;
+        dragGroupDescendants = [];
+        dragGroupOldParentPos = 0;
+    }
 
     draggedElement = null;
     draggedTaskId = null;
@@ -1512,6 +1741,25 @@ async function handleContainerDrop(e) {
         });
 
         if (response.ok) {
+            // Grouped drag: update descendant positions
+            if (isDraggingGroup && dragGroupDescendants.length > 0) {
+                const positionDelta = newPosition - dragGroupOldParentPos;
+                const moves = dragGroupDescendants.map(desc => ({
+                    task_id: desc.id,
+                    position: Math.max(0, desc.position + positionDelta),
+                    type: desc.column,
+                }));
+                try {
+                    await fetch(`${API_BASE}/tasks/batch-reorder`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ moves }),
+                    });
+                } catch (batchErr) {
+                    console.error('Batch reorder error:', batchErr);
+                }
+            }
+
             // Re-fetch this column's tasks from the server to get authoritative positions
             const freshResponse = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/tasks`);
             if (freshResponse.ok) {
@@ -1519,6 +1767,7 @@ async function handleContainerDrop(e) {
                 // Replace taskData entries with fresh server data
                 freshTasks.forEach(task => { taskData[task.id] = task; });
                 allTasks = freshTasks;
+                buildDescendantIndex();
             }
             renderTasksFromDatabase();
         } else {

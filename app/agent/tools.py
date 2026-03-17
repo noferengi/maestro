@@ -476,6 +476,122 @@ def _import_db():
     return _db
 
 
+# ---------------------------------------------------------------------------
+# Planning tools (pure computation — no I/O, safe for any agent)
+# ---------------------------------------------------------------------------
+
+def generate_architecture_doc(title: str, components: list, relationships: list) -> str:
+    """
+    Produce a structured markdown architecture document.
+    Stays in agent context — NOT written to disk.
+    """
+    lines = [f"# Architecture: {title}", ""]
+
+    if components:
+        lines.append("## Components")
+        for comp in components:
+            if isinstance(comp, dict):
+                name = comp.get("name", "Unnamed")
+                desc = comp.get("description", "")
+                tech = comp.get("technology", "")
+                lines.append(f"### {name}")
+                if desc:
+                    lines.append(f"{desc}")
+                if tech:
+                    lines.append(f"- **Technology:** {tech}")
+                lines.append("")
+            else:
+                lines.append(f"- {comp}")
+        lines.append("")
+
+    if relationships:
+        lines.append("## Relationships")
+        for rel in relationships:
+            if isinstance(rel, dict):
+                src = rel.get("from", "?")
+                dst = rel.get("to", "?")
+                label = rel.get("label", "uses")
+                lines.append(f"- **{src}** --{label}--> **{dst}**")
+            else:
+                lines.append(f"- {rel}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def generate_mermaid_diagram(diagram_type: str, definition: str) -> str:
+    """
+    Validate and format a Mermaid diagram definition.
+    Returns the formatted mermaid markup as a string.
+    """
+    valid_types = {"flowchart", "sequence", "class", "er", "gantt", "stateDiagram", "pie"}
+    # Normalize common aliases
+    type_map = {
+        "flowchart": "flowchart",
+        "flow": "flowchart",
+        "sequence": "sequenceDiagram",
+        "class": "classDiagram",
+        "er": "erDiagram",
+        "gantt": "gantt",
+        "statediagram": "stateDiagram-v2",
+        "state": "stateDiagram-v2",
+        "pie": "pie",
+    }
+    normalized = type_map.get(diagram_type.lower())
+    if not normalized:
+        return (
+            f"ERROR: Invalid diagram type '{diagram_type}'. "
+            f"Valid types: {sorted(type_map.keys())}"
+        )
+
+    # Check if definition already starts with a diagram directive
+    stripped = definition.strip()
+    if any(stripped.startswith(d) for d in type_map.values()):
+        return f"```mermaid\n{stripped}\n```"
+
+    return f"```mermaid\n{normalized}\n{stripped}\n```"
+
+
+def generate_interface_contract(component_name: str, provides: list, consumes: list) -> str:
+    """
+    Define the API surface / interface contract for a component.
+    Returns a structured JSON string describing what this component provides and consumes.
+    """
+    import json as _json
+
+    contract = {
+        "component": component_name,
+        "provides": [],
+        "consumes": [],
+    }
+
+    for item in (provides or []):
+        if isinstance(item, dict):
+            contract["provides"].append(item)
+        else:
+            contract["provides"].append({"name": str(item), "type": "unknown"})
+
+    for item in (consumes or []):
+        if isinstance(item, dict):
+            contract["consumes"].append(item)
+        else:
+            contract["consumes"].append({"name": str(item), "type": "unknown"})
+
+    return _json.dumps(contract, indent=2)
+
+
+def spawn_research_agent(question: str, context: str = "") -> str:
+    """
+    Placeholder for synchronous dispatch — the actual async version is in
+    async_dispatch_tool(). When called synchronously, returns an error
+    directing the caller to use the async path.
+    """
+    return (
+        "ERROR: spawn_research_agent requires async dispatch. "
+        "Use async_dispatch_tool() instead of dispatch_tool()."
+    )
+
+
 def get_task(task_id: str) -> str:
     """Fetch a Kanban task by ID and return it as a JSON string."""
     import json
@@ -613,6 +729,10 @@ TOOL_REGISTRY: dict[str, Any] = {
     "list_tasks": list_tasks,
     "update_task_status": update_task_status,
     "append_task_history": append_task_history,
+    "generate_architecture_doc": generate_architecture_doc,
+    "generate_mermaid_diagram": generate_mermaid_diagram,
+    "generate_interface_contract": generate_interface_contract,
+    "spawn_research_agent": spawn_research_agent,
 }
 
 TOOL_SCHEMAS: list[dict] = [
@@ -948,6 +1068,101 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    # --- Planning tools ---
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_architecture_doc",
+            "description": (
+                "Produce a structured markdown architecture document from components and relationships. "
+                "Pure computation — stays in agent context, NOT written to disk."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Architecture document title."},
+                    "components": {
+                        "type": "array",
+                        "description": "List of components. Each can be a string or {name, description, technology}.",
+                        "items": {},
+                    },
+                    "relationships": {
+                        "type": "array",
+                        "description": "List of relationships. Each can be a string or {from, to, label}.",
+                        "items": {},
+                    },
+                },
+                "required": ["title", "components", "relationships"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_mermaid_diagram",
+            "description": (
+                "Validate and format a Mermaid diagram. Returns formatted mermaid markup. "
+                "Valid types: flowchart, sequence, class, er, gantt, state, pie."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "diagram_type": {
+                        "type": "string",
+                        "description": "Diagram type: flowchart, sequence, class, er, gantt, state, pie.",
+                    },
+                    "definition": {"type": "string", "description": "Mermaid diagram definition body."},
+                },
+                "required": ["diagram_type", "definition"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_interface_contract",
+            "description": (
+                "Define the API surface / interface contract between components. "
+                "Returns structured JSON describing what a component provides and consumes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "component_name": {"type": "string", "description": "Name of the component."},
+                    "provides": {
+                        "type": "array",
+                        "description": "What this component provides (API endpoints, exports, events). Each item can be a string or {name, type, description}.",
+                        "items": {},
+                    },
+                    "consumes": {
+                        "type": "array",
+                        "description": "What this component needs from others. Each item can be a string or {name, type, source}.",
+                        "items": {},
+                    },
+                },
+                "required": ["component_name", "provides", "consumes"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "spawn_research_agent",
+            "description": (
+                "Launch a research agent to investigate a domain question. "
+                "The agent has read-only codebase access and returns findings. "
+                "Use when you need domain knowledge about unfamiliar technologies."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The research question to investigate."},
+                    "context": {"type": "string", "description": "Optional context to provide to the research agent.", "default": ""},
+                },
+                "required": ["question"],
+            },
+        },
+    },
 ]
 
 
@@ -977,3 +1192,45 @@ def dispatch_tool(name: str, arguments: dict) -> str:
         return f"ERROR: {exc}"
     except Exception as exc:
         return f"ERROR: Unexpected error in tool '{name}': {type(exc).__name__}: {exc}"
+
+
+async def async_dispatch_tool(
+    name: str,
+    arguments: dict,
+    *,
+    task_id: str | None = None,
+    llm_id: int | None = None,
+    budget_id: int | None = None,
+    llm_base_url: str | None = None,
+    llm_model: str | None = None,
+) -> str:
+    """
+    Async version of dispatch_tool.
+    For spawn_research_agent: runs the async research agent.
+    For all other tools: falls through to synchronous dispatch_tool.
+    """
+    if name == "spawn_research_agent":
+        try:
+            from app.agent.research import run_research
+            question = arguments.get("question", "")
+            context_str = arguments.get("context", "")
+            context_dict = {"question": question, "context": context_str}
+            result = await run_research(
+                question=question,
+                context=context_dict,
+                task_id=task_id,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+            )
+            return (
+                f"Research findings (verdict: {result.vote.get('verdict', '?')}, "
+                f"confidence: {result.vote.get('confidence', '?')}):\n\n"
+                f"{result.findings}"
+            )
+        except Exception as exc:
+            return f"ERROR: spawn_research_agent failed: {type(exc).__name__}: {exc}"
+
+    # All other tools — synchronous
+    return dispatch_tool(name, arguments)
