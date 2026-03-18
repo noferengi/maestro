@@ -4,8 +4,8 @@
       "task_id": "task-1",
       "description": "Task 1",
       "prerequisites": [],
-      "state": "REVERTED",
-      "retries": 3,
+      "state": "ACTIVE",
+      "retries": 1,
       "agent_type": "coding"
     }
   ]
