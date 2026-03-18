@@ -9,8 +9,11 @@ const WIP_LIMITS = {
     'architecture': 10,
     'idea': 15,
     'planning': 10,
-    'development': 5,
-    'review': 5,
+    'indev': 5,
+    'conceptual_review': 5,
+    'optimization': 5,
+    'security': 5,
+    'full_review': 5,
     'completed': 15
 };
 
@@ -169,9 +172,12 @@ let currentInsertContainer = null;
 const COLUMN_NEXT = {
     'architecture': 'idea',
     'idea': 'planning',
-    'planning': 'development',
-    'development': 'review',
-    'review': 'completed'
+    'planning': 'indev',
+    'indev': 'conceptual_review',
+    'conceptual_review': 'optimization',
+    'optimization': 'security',
+    'security': 'full_review',
+    'full_review': 'completed'
 };
 
 function isValidDropTarget(sourceContainer, targetContainer) {
@@ -192,7 +198,7 @@ function renderTasksFromDatabase() {
     console.log('Rendering tasks from database...');
 
     // Clear ALL existing task cards from ALL columns
-    const columns = ['architecture', 'idea', 'planning', 'development', 'review', 'completed'];
+    const columns = ['architecture', 'idea', 'planning', 'indev', 'conceptual_review', 'optimization', 'security', 'full_review', 'completed'];
 
     columns.forEach(columnType => {
         const container = document.getElementById(`tasks-${columnType}`);
@@ -254,7 +260,7 @@ function renderTasksFromDatabase() {
 }
 
 function updateTaskCounts() {
-    const columns = ['architecture', 'idea', 'planning', 'development', 'review', 'completed'];
+    const columns = ['architecture', 'idea', 'planning', 'indev', 'conceptual_review', 'optimization', 'security', 'full_review', 'completed'];
 
     columns.forEach(columnType => {
         const container = document.getElementById(`tasks-${columnType}`);
@@ -939,14 +945,29 @@ function createTaskCard(id, title, tags, owner, status) {
     } else if (status === 'planning') {
         if (ready) {
             const moveBtn = card.querySelector('.task-actions');
-            moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'development')">Move to IN PROGRESS</button>`;
+            moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'indev')">Move to IN DEVELOPMENT</button>`;
         }
-    } else if (status === 'development') {
+    } else if (status === 'indev') {
         if (ready) {
             const moveBtn = card.querySelector('.task-actions');
-            moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'review')">Move to IN REVIEW</button>`;
+            moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'conceptual_review')">Move to CONCEPTUAL REVIEW</button>`;
         }
-    } else if (status === 'review') {
+    } else if (status === 'conceptual_review') {
+        if (ready) {
+            const moveBtn = card.querySelector('.task-actions');
+            moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'optimization')">Move to OPTIMIZATION</button>`;
+        }
+    } else if (status === 'optimization') {
+        if (ready) {
+            const moveBtn = card.querySelector('.task-actions');
+            moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'security')">Move to SECURITY</button>`;
+        }
+    } else if (status === 'security') {
+        if (ready) {
+            const moveBtn = card.querySelector('.task-actions');
+            moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'full_review')">Move to FINAL REVIEW</button>`;
+        }
+    } else if (status === 'full_review') {
         if (ready) {
             const moveBtn = card.querySelector('.task-actions');
             moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'completed')">Move to COMPLETED</button>`;
@@ -1331,12 +1352,24 @@ async function moveTask(taskId, newStatus) {
         if (newStatus === 'planning') {
             actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
                                  <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
-                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'development')">Move to IN PROGRESS</button>` : '');
-        } else if (newStatus === 'development') {
+                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'indev')">Move to IN DEVELOPMENT</button>` : '');
+        } else if (newStatus === 'indev') {
             actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
                                  <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
-                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'review')">Move to IN REVIEW</button>` : '');
-        } else if (newStatus === 'review') {
+                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'conceptual_review')">Move to CONCEPTUAL REVIEW</button>` : '');
+        } else if (newStatus === 'conceptual_review') {
+            actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
+                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
+                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'optimization')">Move to OPTIMIZATION</button>` : '');
+        } else if (newStatus === 'optimization') {
+            actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
+                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
+                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'security')">Move to SECURITY</button>` : '');
+        } else if (newStatus === 'security') {
+            actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
+                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
+                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'full_review')">Move to FINAL REVIEW</button>` : '');
+        } else if (newStatus === 'full_review') {
             actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
                                  <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
                 + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'completed')">Move to COMPLETED</button>` : '');
@@ -1355,12 +1388,12 @@ async function moveTask(taskId, newStatus) {
         console.log(`Task ${taskId} moved from ${currentStatus} to ${newStatus}`);
     }
 
-    // Auto-move from development to review after 15 seconds
-    if (newStatus === 'development') {
+    // Auto-move from indev to conceptual_review after 15 seconds
+    if (newStatus === 'indev') {
         setTimeout(async () => {
             if (taskData[taskId]) {
-                await moveTask(taskId, 'review');
-                console.log(`Auto-move: Task ${taskId} moved to review after 15 seconds`);
+                await moveTask(taskId, 'conceptual_review');
+                console.log(`Auto-move: Task ${taskId} moved to conceptual_review after 15 seconds`);
             }
         }, 15000);
     }

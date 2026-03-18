@@ -34,7 +34,7 @@ _DONE_STATUSES = {"completed", "accepted"}
 
 # Canonical type-order for priority tie-breaking
 # (lower index = higher priority)
-_TYPE_ORDER = ["architecture", "planning", "development", "review", "completed"]
+_TYPE_ORDER = ["architecture", "idea", "planning", "indev", "conceptual_review", "optimization", "security", "full_review", "completed"]
 
 
 def _is_done(task: dict) -> bool:
@@ -70,7 +70,7 @@ class DAGResolver:
                 continue
             # Skip tasks that are already in flight or in non-dispatchable states
             task_type = (task.get("type") or "").lower()
-            if task_type in ("development", "review", "cancelled", "subdividing"):
+            if task_type in ("indev", "conceptual_review", "optimization", "security", "full_review", "completed", "cancelled", "subdividing"):
                 continue
             if self._all_prerequisites_done(task):
                 ready.append(task)

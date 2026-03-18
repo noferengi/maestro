@@ -131,6 +131,157 @@ class SubdivisionRecord(Base):
         return f"<SubdivisionRecord(id={self.id}, parent={self.parent_task_id}, attempt={self.attempt_number}, status={self.status})>"
 
 
+class PlanningResult(Base):
+    """Audit trail for planning pipeline results."""
+    __tablename__ = "planning_results"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String, ForeignKey('tasks.id'), nullable=False)
+    file_manifest = Column(Text, nullable=True)
+    dependency_graph = Column(Text, nullable=True)
+    interface_contracts = Column(Text, nullable=True)
+    test_strategy = Column(Text, nullable=True)
+    implementation_steps = Column(Text, nullable=True)
+    mermaid_diagrams = Column(Text, nullable=True)
+    pitfalls_identified = Column(Text, nullable=True)
+    review_votes = Column(Text, nullable=True)
+    codebase_survey = Column(Text, nullable=True)
+    best_of_n_designs = Column(Text, nullable=True)
+    selected_design_index = Column(Integer, nullable=True)
+    selection_justification = Column(Text, nullable=True)
+    confidence = Column(Integer, default=0)
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    status = Column(String, nullable=False, default='active')
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<PlanningResult(id={self.id}, task={self.task_id}, status={self.status})>"
+
+
+class ComponentResult(Base):
+    """Audit trail for component-level development agents."""
+    __tablename__ = "component_results"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String, ForeignKey('tasks.id'), nullable=False)
+    component_name = Column(String, nullable=False)
+    step_order = Column(Integer, nullable=False)
+    batch_number = Column(Integer, nullable=False)
+    status = Column(String, nullable=False, default='pending')
+    files_changed = Column(Text, nullable=True)
+    tests_passed = Column(Integer, default=0)
+    turns_used = Column(Integer, default=0)
+    error_detail = Column(Text, nullable=True)
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+    def __repr__(self):
+        return f"<ComponentResult(id={self.id}, task={self.task_id}, component={self.component_name})>"
+
+
+class OptimizationResult(Base):
+    """Audit trail for optimization pipeline."""
+    __tablename__ = "optimization_results"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String, ForeignKey('tasks.id'), nullable=False)
+    baseline_report = Column(Text, nullable=True)
+    proposals = Column(Text, nullable=True)
+    judge_scores = Column(Text, nullable=True)
+    winning_proposal_index = Column(Integer, nullable=True)
+    winning_score = Column(Integer, nullable=True)  # stored as int to avoid Float import
+    post_report = Column(Text, nullable=True)
+    improvement_summary = Column(Text, nullable=True)
+    outcome = Column(String, nullable=False)
+    total_prompt_tokens = Column(Integer, default=0)
+    total_completion_tokens = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<OptimizationResult(id={self.id}, task={self.task_id}, outcome={self.outcome})>"
+
+
+class SecurityReviewResult(Base):
+    """Security review findings with veto power."""
+    __tablename__ = "security_review_results"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String, ForeignKey('tasks.id'), nullable=False)
+    reviewer_type = Column(String, nullable=False)
+    owasp_findings = Column(Text, nullable=True)
+    secrets_detected = Column(Text, nullable=True)
+    dependency_vulnerabilities = Column(Text, nullable=True)
+    data_flow_map = Column(Text, nullable=True)
+    compliance_findings = Column(Text, nullable=True)
+    optimization_regressions = Column(Text, nullable=True)
+    verdict = Column(String, nullable=False)
+    confidence = Column(Integer, nullable=False)
+    justification = Column(Text, nullable=True)
+    critical_count = Column(Integer, default=0)
+    high_count = Column(Integer, default=0)
+    raw_response = Column(Text, nullable=True)
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    model = Column(String, nullable=True)
+    llm_id = Column(Integer, nullable=True)
+    budget_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<SecurityReviewResult(id={self.id}, task={self.task_id}, type={self.reviewer_type})>"
+
+
+class FullReviewResult(Base):
+    """Full/final review findings."""
+    __tablename__ = "full_review_results"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String, ForeignKey('tasks.id'), nullable=False)
+    reviewer_type = Column(String, nullable=False)
+    test_results = Column(Text, nullable=True)
+    quality_findings = Column(Text, nullable=True)
+    requirements_mapping = Column(Text, nullable=True)
+    integration_checks = Column(Text, nullable=True)
+    verdict = Column(String, nullable=False)
+    confidence = Column(Integer, nullable=False)
+    justification = Column(Text, nullable=True)
+    raw_response = Column(Text, nullable=True)
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    model = Column(String, nullable=True)
+    llm_id = Column(Integer, nullable=True)
+    budget_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<FullReviewResult(id={self.id}, task={self.task_id}, type={self.reviewer_type})>"
+
+
+class MergeRecord(Base):
+    """Audit trail for merge-to-main operations."""
+    __tablename__ = "merge_records"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String, ForeignKey('tasks.id'), nullable=False)
+    branch_name = Column(String, nullable=False)
+    merge_commit_sha = Column(String, nullable=True)
+    status = Column(String, nullable=False)
+    test_output = Column(Text, nullable=True)
+    error_detail = Column(Text, nullable=True)
+    security_review_ids = Column(Text, nullable=True)
+    full_review_ids = Column(Text, nullable=True)
+    total_pipeline_tokens = Column(Integer, default=0)
+    llm_id = Column(Integer, nullable=True)
+    budget_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<MergeRecord(id={self.id}, task={self.task_id}, status={self.status})>"
+
+
 class Task(Base):
     """
     Kanban Task Model
@@ -157,6 +308,9 @@ class Task(Base):
     subdivision_generation = Column(Integer, nullable=False, default=0)  # Recursion depth (0=human)
     is_big_idea = Column(Boolean, nullable=False, default=False)  # Flagged when subdivision produces children
     interface_contracts = Column(Text, nullable=True)  # JSON: API contracts between sub-ideas
+    review_notes = Column(Text, nullable=True)
+    demotion_count = Column(Integer, nullable=False, default=0)
+    demotion_history = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -1056,5 +1210,224 @@ def get_budget_summary(budget_id=None):
             'total_generation_tokens': row.total_generation_tokens,
             'total_tool_calls': row.total_tool_calls,
         }
+    finally:
+        db.close()
+
+
+# ============================================
+# PlanningResult CRUD
+# ============================================
+
+def create_planning_result(task_id, **kwargs):
+    db = SessionLocal()
+    try:
+        result = PlanningResult(task_id=task_id, **kwargs)
+        db.add(result)
+        db.commit()
+        db.refresh(result)
+        return result
+    except Exception as e:
+        db.rollback()
+        print(f"Error creating planning result: {e}")
+        return None
+    finally:
+        db.close()
+
+
+def get_planning_result(task_id):
+    """Get the latest active planning result for a task."""
+    db = SessionLocal()
+    try:
+        return (db.query(PlanningResult)
+                .filter(PlanningResult.task_id == task_id, PlanningResult.status == 'active')
+                .order_by(PlanningResult.created_at.desc())
+                .first())
+    finally:
+        db.close()
+
+
+# ============================================
+# ComponentResult CRUD
+# ============================================
+
+def create_component_result(task_id, component_name, step_order, batch_number, **kwargs):
+    db = SessionLocal()
+    try:
+        result = ComponentResult(
+            task_id=task_id, component_name=component_name,
+            step_order=step_order, batch_number=batch_number, **kwargs
+        )
+        db.add(result)
+        db.commit()
+        db.refresh(result)
+        return result
+    except Exception as e:
+        db.rollback()
+        print(f"Error creating component result: {e}")
+        return None
+    finally:
+        db.close()
+
+
+def get_component_results(task_id):
+    db = SessionLocal()
+    try:
+        return (db.query(ComponentResult)
+                .filter(ComponentResult.task_id == task_id)
+                .order_by(ComponentResult.batch_number, ComponentResult.step_order)
+                .all())
+    finally:
+        db.close()
+
+
+def update_component_result(result_id, **kwargs):
+    db = SessionLocal()
+    try:
+        result = db.query(ComponentResult).filter(ComponentResult.id == result_id).first()
+        if not result:
+            return None
+        for key, value in kwargs.items():
+            if hasattr(result, key):
+                setattr(result, key, value)
+        db.commit()
+        db.refresh(result)
+        return result
+    except Exception as e:
+        db.rollback()
+        print(f"Error updating component result: {e}")
+        return None
+    finally:
+        db.close()
+
+
+# ============================================
+# OptimizationResult CRUD
+# ============================================
+
+def create_optimization_result(task_id, outcome, **kwargs):
+    db = SessionLocal()
+    try:
+        result = OptimizationResult(task_id=task_id, outcome=outcome, **kwargs)
+        db.add(result)
+        db.commit()
+        db.refresh(result)
+        return result
+    except Exception as e:
+        db.rollback()
+        print(f"Error creating optimization result: {e}")
+        return None
+    finally:
+        db.close()
+
+
+def get_optimization_result(task_id):
+    db = SessionLocal()
+    try:
+        return (db.query(OptimizationResult)
+                .filter(OptimizationResult.task_id == task_id)
+                .order_by(OptimizationResult.created_at.desc())
+                .first())
+    finally:
+        db.close()
+
+
+# ============================================
+# SecurityReviewResult CRUD
+# ============================================
+
+def create_security_review_result(task_id, reviewer_type, verdict, confidence, **kwargs):
+    db = SessionLocal()
+    try:
+        result = SecurityReviewResult(
+            task_id=task_id, reviewer_type=reviewer_type,
+            verdict=verdict, confidence=confidence, **kwargs
+        )
+        db.add(result)
+        db.commit()
+        db.refresh(result)
+        return result
+    except Exception as e:
+        db.rollback()
+        print(f"Error creating security review result: {e}")
+        return None
+    finally:
+        db.close()
+
+
+def get_security_review_results(task_id):
+    db = SessionLocal()
+    try:
+        return (db.query(SecurityReviewResult)
+                .filter(SecurityReviewResult.task_id == task_id)
+                .order_by(SecurityReviewResult.created_at.desc())
+                .all())
+    finally:
+        db.close()
+
+
+# ============================================
+# FullReviewResult CRUD
+# ============================================
+
+def create_full_review_result(task_id, reviewer_type, verdict, confidence, **kwargs):
+    db = SessionLocal()
+    try:
+        result = FullReviewResult(
+            task_id=task_id, reviewer_type=reviewer_type,
+            verdict=verdict, confidence=confidence, **kwargs
+        )
+        db.add(result)
+        db.commit()
+        db.refresh(result)
+        return result
+    except Exception as e:
+        db.rollback()
+        print(f"Error creating full review result: {e}")
+        return None
+    finally:
+        db.close()
+
+
+def get_full_review_results(task_id):
+    db = SessionLocal()
+    try:
+        return (db.query(FullReviewResult)
+                .filter(FullReviewResult.task_id == task_id)
+                .order_by(FullReviewResult.created_at.desc())
+                .all())
+    finally:
+        db.close()
+
+
+# ============================================
+# MergeRecord CRUD
+# ============================================
+
+def create_merge_record(task_id, branch_name, status, **kwargs):
+    db = SessionLocal()
+    try:
+        record = MergeRecord(
+            task_id=task_id, branch_name=branch_name,
+            status=status, **kwargs
+        )
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+        return record
+    except Exception as e:
+        db.rollback()
+        print(f"Error creating merge record: {e}")
+        return None
+    finally:
+        db.close()
+
+
+def get_merge_record(task_id):
+    db = SessionLocal()
+    try:
+        return (db.query(MergeRecord)
+                .filter(MergeRecord.task_id == task_id)
+                .order_by(MergeRecord.created_at.desc())
+                .first())
     finally:
         db.close()

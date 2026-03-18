@@ -28,6 +28,16 @@ from database import (
     update_subdivision_record,
     get_descendant_tree, set_big_idea_flag, batch_reorder_tasks,
 )
+from database import (
+    PlanningResult, ComponentResult, OptimizationResult,
+    SecurityReviewResult, FullReviewResult, MergeRecord,
+    create_planning_result, get_planning_result,
+    create_component_result, get_component_results,
+    create_optimization_result, get_optimization_result,
+    create_security_review_result, get_security_review_results,
+    create_full_review_result, get_full_review_results,
+    create_merge_record, get_merge_record,
+)
 
 app = FastAPI(title="Kanban Board API")
 
@@ -120,7 +130,7 @@ def create_new_task(task_data: dict):
 
 
 # Column ordering for advancement detection
-_COLUMN_ORDER = ['architecture', 'idea', 'planning', 'development', 'review', 'completed']
+_COLUMN_ORDER = ['architecture', 'idea', 'planning', 'indev', 'conceptual_review', 'optimization', 'security', 'full_review', 'completed']
 
 
 def _is_advancing(old_type: str, new_type: str) -> bool:
@@ -641,21 +651,369 @@ def _run_intake_pipeline(task_id: str) -> None:
         traceback.print_exc()
 
 
+def _run_planning_pipeline_bg(task_id: str) -> None:
+    """Background runner for the planning pipeline."""
+    try:
+        import asyncio
+        from app.agent.planning import run_planning_pipeline
+        from app.agent.planning_gate import run_planning_gate
+
+        task = get_task(task_id)
+        if not task:
+            return
+
+        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
+        all_tasks = [task_to_dict(t) for t in get_all_tasks()]
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            # Run planning pipeline
+            result = loop.run_until_complete(
+                run_planning_pipeline(
+                    task_id=task_id,
+                    task_title=task.title,
+                    task_description=task.description or "",
+                    all_tasks=all_tasks,
+                    llm_base_url=llm_base_url,
+                    llm_model=llm_model,
+                    llm_id=task.llm_id,
+                    budget_id=task.budget_id,
+                    max_context=max_context,
+                )
+            )
+
+            # Store transition result
+            _store_pipeline_result_generic(task_id, result, task.budget_id, "planning_to_indev")
+
+            if result.get("outcome") == "passed":
+                # Run planning gate
+                gate_result = loop.run_until_complete(
+                    run_planning_gate(
+                        task_id=task_id,
+                        planning_result=result,
+                        all_tasks=all_tasks,
+                        max_context=max_context,
+                        llm_base_url=llm_base_url,
+                        llm_model=llm_model,
+                        llm_id=task.llm_id,
+                        budget_id=task.budget_id,
+                    )
+                )
+                if gate_result.get("passed"):
+                    update_task(task_id, type="indev")
+                    print(f"[planning] Task '{task_id}' advanced to IN DEV.")
+                else:
+                    print(f"[planning] Task '{task_id}' failed planning gate.")
+            else:
+                print(f"[planning] Task '{task_id}' planning result: {result.get('outcome')}")
+        finally:
+            loop.close()
+    except Exception as exc:
+        import traceback
+        print(f"[planning] Pipeline for '{task_id}' failed: {exc}")
+        traceback.print_exc()
+
+
+def _run_dev_orchestrator_bg(task_id: str) -> None:
+    """Background runner for the development orchestrator."""
+    try:
+        import asyncio
+        from app.agent.dev_orchestrator import run_dev_orchestrator
+
+        task = get_task(task_id)
+        if not task:
+            return
+
+        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
+        planning_result_obj = get_planning_result(task_id)
+
+        if not planning_result_obj:
+            print(f"[indev] No planning result for task '{task_id}'.")
+            return
+
+        # Reconstruct planning result dict
+        planning_result = {
+            "implementation_steps": json.loads(planning_result_obj.implementation_steps or "[]"),
+            "file_manifest": json.loads(planning_result_obj.file_manifest or "[]"),
+            "dependency_graph": json.loads(planning_result_obj.dependency_graph or "{}"),
+            "interface_contracts": json.loads(planning_result_obj.interface_contracts or "[]"),
+            "test_strategy": json.loads(planning_result_obj.test_strategy or "[]"),
+        }
+
+        llm_record = get_llm(task.llm_id) if task.llm_id else None
+        max_parallel = llm_record.parallel_sessions if llm_record else 1
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                run_dev_orchestrator(
+                    task_id=task_id,
+                    planning_result=planning_result,
+                    max_parallel=max_parallel,
+                    llm_base_url=llm_base_url,
+                    llm_model=llm_model,
+                    llm_id=task.llm_id,
+                    budget_id=task.budget_id,
+                )
+            )
+
+            if result.get("status") == "ACCEPTED":
+                update_task(task_id, type="conceptual_review")
+                print(f"[indev] Task '{task_id}' advanced to CONCEPTUAL REVIEW.")
+            else:
+                update_task(task_id, type="planning")
+                print(f"[indev] Task '{task_id}' reverted to PLANNING: {result.get('error_detail')}")
+        finally:
+            loop.close()
+    except Exception as exc:
+        import traceback
+        print(f"[indev] Orchestrator for '{task_id}' failed: {exc}")
+        traceback.print_exc()
+
+
+def _advance_to_optimization(task_id: str) -> None:
+    """Auto-advance from conceptual review to optimization."""
+    try:
+        import asyncio
+        from app.agent.conceptual_review import run_conceptual_review
+
+        task = get_task(task_id)
+        if not task:
+            return
+
+        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
+        planning_result_obj = get_planning_result(task_id)
+        planning_result = {}
+        if planning_result_obj:
+            planning_result = {
+                "file_manifest": json.loads(planning_result_obj.file_manifest or "[]"),
+                "dependency_graph": json.loads(planning_result_obj.dependency_graph or "{}"),
+                "implementation_steps": json.loads(planning_result_obj.implementation_steps or "[]"),
+                "test_strategy": json.loads(planning_result_obj.test_strategy or "[]"),
+            }
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                run_conceptual_review(
+                    task_id=task_id,
+                    task_description=task.description or "",
+                    planning_result=planning_result,
+                    llm_base_url=llm_base_url,
+                    llm_model=llm_model,
+                    llm_id=task.llm_id,
+                    budget_id=task.budget_id,
+                )
+            )
+            _store_pipeline_result_generic(task_id, result, task.budget_id, "conceptual_to_optimization")
+
+            if result.get("outcome") == "passed":
+                update_task(task_id, type="optimization")
+                print(f"[review] Task '{task_id}' advanced to OPTIMIZATION.")
+            else:
+                update_task(task_id, type="indev")
+                print(f"[review] Task '{task_id}' demoted to IN DEV.")
+        finally:
+            loop.close()
+    except Exception as exc:
+        print(f"[review] Pipeline for '{task_id}' failed: {exc}")
+
+
+def _run_security_pipeline_bg(task_id: str) -> None:
+    """Background runner for security + optimization pipelines."""
+    try:
+        import asyncio
+        from app.agent.optimization import run_optimization_pipeline
+        from app.agent.security_review import run_security_pipeline
+
+        task = get_task(task_id)
+        if not task:
+            return
+
+        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            # Run optimization first
+            opt_result = loop.run_until_complete(
+                run_optimization_pipeline(
+                    task_id=task_id,
+                    task_description=task.description or "",
+                    llm_base_url=llm_base_url,
+                    llm_model=llm_model,
+                    llm_id=task.llm_id,
+                    budget_id=task.budget_id,
+                )
+            )
+            print(f"[optimization] Task '{task_id}': {opt_result.get('outcome')}")
+
+            # Then run security review
+            sec_result = loop.run_until_complete(
+                run_security_pipeline(
+                    task_id=task_id,
+                    task_description=task.description or "",
+                    llm_base_url=llm_base_url,
+                    llm_model=llm_model,
+                    llm_id=task.llm_id,
+                    budget_id=task.budget_id,
+                )
+            )
+            _store_pipeline_result_generic(task_id, sec_result, task.budget_id, "security_review")
+
+            if sec_result.get("outcome") == "passed":
+                update_task(task_id, type="security")
+                # Auto-advance past security to full_review
+                update_task(task_id, type="full_review")
+                print(f"[security] Task '{task_id}' advanced to FULL REVIEW.")
+            else:
+                demotion = sec_result.get("demotion_target", "indev")
+                update_task(task_id, type=demotion)
+                _record_demotion(task_id, "security", demotion, sec_result.get("summary", ""))
+                print(f"[security] Task '{task_id}' demoted to {demotion}.")
+        finally:
+            loop.close()
+    except Exception as exc:
+        print(f"[security] Pipeline for '{task_id}' failed: {exc}")
+
+
+def _run_full_review_bg(task_id: str) -> None:
+    """Background runner for full review pipeline."""
+    try:
+        import asyncio
+        from app.agent.full_review import run_full_review_pipeline
+
+        task = get_task(task_id)
+        if not task:
+            return
+
+        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                run_full_review_pipeline(
+                    task_id=task_id,
+                    task_description=task.description or "",
+                    llm_base_url=llm_base_url,
+                    llm_model=llm_model,
+                    llm_id=task.llm_id,
+                    budget_id=task.budget_id,
+                )
+            )
+            _store_pipeline_result_generic(task_id, result, task.budget_id, "full_review")
+
+            if result.get("outcome") == "passed":
+                # Auto-merge
+                _execute_merge_bg(task_id)
+            else:
+                demotion = result.get("demotion_target", "indev")
+                update_task(task_id, type=demotion)
+                _record_demotion(task_id, "full_review", demotion, result.get("summary", ""))
+                print(f"[full_review] Task '{task_id}' demoted to {demotion}.")
+        finally:
+            loop.close()
+    except Exception as exc:
+        print(f"[full_review] Pipeline for '{task_id}' failed: {exc}")
+
+
+def _execute_merge_bg(task_id: str) -> None:
+    """Background runner for merge to main."""
+    try:
+        from app.agent.merge import execute_merge
+
+        result = execute_merge(task_id)
+
+        if result.status == "merged":
+            print(f"[merge] Task '{task_id}' merged to main ({result.merge_commit_sha}).")
+            _check_completion_rollup(task_id)
+        elif result.status == "conflict":
+            update_task(task_id, type="indev")
+            _record_demotion(task_id, "merge", "indev", result.error_detail or "Merge conflict")
+            print(f"[merge] Task '{task_id}' merge conflict. Demoted to IN DEV.")
+        elif result.status == "test_failure":
+            update_task(task_id, type="indev")
+            _record_demotion(task_id, "merge", "indev", result.error_detail or "Tests failed")
+            print(f"[merge] Task '{task_id}' tests failed after merge. Demoted to IN DEV.")
+        else:
+            print(f"[merge] Task '{task_id}' merge error: {result.error_detail}")
+    except Exception as exc:
+        print(f"[merge] Merge for '{task_id}' failed: {exc}")
+
+
+def _store_pipeline_result_generic(task_id: str, result: dict, budget_id: int | None, transition: str) -> None:
+    """Store a transition result and its votes for any pipeline stage."""
+    create_transition_result(
+        task_id=task_id,
+        transition=transition,
+        outcome=result.get("outcome", "unknown"),
+        vote_summary=result,
+        total_prompt_tokens=result.get("total_prompt_tokens", 0),
+        total_completion_tokens=result.get("total_completion_tokens", 0),
+    )
+    for vote in result.get("votes", []):
+        create_transition_vote(
+            task_id=task_id,
+            transition=transition,
+            stage=vote.get("stage", ""),
+            verdict=vote.get("verdict", ""),
+            confidence=vote.get("confidence", 0),
+            justification=vote.get("justification", ""),
+            raw_response=vote.get("raw_response"),
+            prompt_tokens=vote.get("prompt_tokens", 0),
+            completion_tokens=vote.get("completion_tokens", 0),
+            model=vote.get("model", ""),
+            budget_id=budget_id,
+        )
+
+
+def _record_demotion(task_id: str, from_stage: str, to_stage: str, reason: str) -> None:
+    """Record a demotion event on a task."""
+    from datetime import datetime
+    task = get_task(task_id)
+    if not task:
+        return
+    history = task.demotion_history or []
+    history.append({
+        "from": from_stage,
+        "to": to_stage,
+        "reason": reason[:500],
+        "timestamp": datetime.utcnow().isoformat(),
+    })
+    update_task(task_id, demotion_count=(task.demotion_count or 0) + 1, demotion_history=history)
+
+
+# Pipeline handler dispatch table
+ADVANCE_HANDLERS = {
+    "idea": "_run_intake_pipeline",
+    "planning": "_run_planning_pipeline_bg",
+    "indev": "_run_dev_orchestrator_bg",
+    "conceptual_review": "_advance_to_optimization",
+    "optimization": "_run_security_pipeline_bg",
+    "security": "_run_full_review_bg",
+    "full_review": "_execute_merge_bg",
+}
+
+
 @app.post("/api/tasks/{task_id}/advance", response_model=dict)
 def advance_task(task_id: str, background_tasks: BackgroundTasks):
     """
     Request advancement of a task to the next column.
-    For IDEA -> PLANNING, this triggers the intake pipeline.
-    The pipeline runs asynchronously; poll /api/tasks/{task_id}/transition-status for progress.
+    Detects current column and dispatches the appropriate pipeline.
     """
     task = get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found.")
 
-    if task.type != 'idea':
+    current_type = task.type
+    if current_type not in ADVANCE_HANDLERS:
         raise HTTPException(
             status_code=422,
-            detail=f"Task is in '{task.type}' column. Only IDEA tasks can be advanced via this endpoint."
+            detail=f"Task is in '{current_type}' column. Cannot advance from this column."
         )
 
     # Check required fields
@@ -666,13 +1024,28 @@ def advance_task(task_id: str, background_tasks: BackgroundTasks):
     if not task.budget_id:
         raise HTTPException(status_code=422, detail="Task must have a budget assigned before advancing.")
 
-    # Launch pipeline in background
-    background_tasks.add_task(_run_intake_pipeline, task_id)
+    handler_name = ADVANCE_HANDLERS[current_type]
+
+    # Dispatch to appropriate handler
+    if handler_name == "_run_intake_pipeline":
+        background_tasks.add_task(_run_intake_pipeline, task_id)
+    elif handler_name == "_run_planning_pipeline_bg":
+        background_tasks.add_task(_run_planning_pipeline_bg, task_id)
+    elif handler_name == "_run_dev_orchestrator_bg":
+        background_tasks.add_task(_run_dev_orchestrator_bg, task_id)
+    elif handler_name == "_advance_to_optimization":
+        background_tasks.add_task(_advance_to_optimization, task_id)
+    elif handler_name == "_run_security_pipeline_bg":
+        background_tasks.add_task(_run_security_pipeline_bg, task_id)
+    elif handler_name == "_run_full_review_bg":
+        background_tasks.add_task(_run_full_review_bg, task_id)
+    elif handler_name == "_execute_merge_bg":
+        background_tasks.add_task(_execute_merge_bg, task_id)
 
     return {
         "task_id": task_id,
         "status": "PIPELINE_STARTED",
-        "message": f"Intake pipeline started for task '{task_id}'. Poll /api/tasks/{task_id}/transition-status for updates."
+        "message": f"Pipeline started for task '{task_id}' (from {current_type}). Poll /api/tasks/{task_id}/transition-status for updates."
     }
 
 
@@ -724,6 +1097,179 @@ def get_transition_status(task_id: str):
         "created_at": latest_entry["created_at"],
         "history": all_results,
     }
+
+
+@app.get("/api/tasks/{task_id}/planning-result", response_model=dict)
+def get_task_planning_result(task_id: str):
+    """Get the planning result for a task."""
+    result = get_planning_result(task_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="No planning result found")
+    return {
+        "id": result.id, "task_id": result.task_id,
+        "file_manifest": json.loads(result.file_manifest) if result.file_manifest else None,
+        "dependency_graph": json.loads(result.dependency_graph) if result.dependency_graph else None,
+        "implementation_steps": json.loads(result.implementation_steps) if result.implementation_steps else None,
+        "confidence": result.confidence,
+        "selected_design_index": result.selected_design_index,
+        "status": result.status,
+        "created_at": result.created_at.isoformat() if result.created_at else None,
+    }
+
+
+@app.get("/api/tasks/{task_id}/component-status", response_model=list)
+def get_task_component_status(task_id: str):
+    """Get component agent statuses for a task."""
+    results = get_component_results(task_id)
+    return [
+        {
+            "id": r.id, "component_name": r.component_name,
+            "batch_number": r.batch_number, "step_order": r.step_order,
+            "status": r.status, "turns_used": r.turns_used,
+            "files_changed": json.loads(r.files_changed) if r.files_changed else [],
+            "error_detail": r.error_detail,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in results
+    ]
+
+
+@app.get("/api/tasks/{task_id}/optimization-status", response_model=dict)
+def get_task_optimization_status(task_id: str):
+    """Get optimization pipeline status for a task."""
+    result = get_optimization_result(task_id)
+    if not result:
+        return {"task_id": task_id, "status": "not_run"}
+    return {
+        "outcome": result.outcome,
+        "improvement_summary": result.improvement_summary,
+        "winning_proposal_index": result.winning_proposal_index,
+        "created_at": result.created_at.isoformat() if result.created_at else None,
+    }
+
+
+@app.get("/api/tasks/{task_id}/security-status", response_model=list)
+def get_task_security_status(task_id: str):
+    """Get security review findings for a task."""
+    results = get_security_review_results(task_id)
+    return [
+        {
+            "reviewer_type": r.reviewer_type, "verdict": r.verdict,
+            "confidence": r.confidence, "justification": r.justification,
+            "critical_count": r.critical_count, "high_count": r.high_count,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in results
+    ]
+
+
+@app.get("/api/tasks/{task_id}/full-review-status", response_model=list)
+def get_task_full_review_status(task_id: str):
+    """Get full review findings for a task."""
+    results = get_full_review_results(task_id)
+    return [
+        {
+            "reviewer_type": r.reviewer_type, "verdict": r.verdict,
+            "confidence": r.confidence, "justification": r.justification,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in results
+    ]
+
+
+@app.get("/api/tasks/{task_id}/merge-status", response_model=dict)
+def get_task_merge_status(task_id: str):
+    """Get merge status for a task."""
+    record = get_merge_record(task_id)
+    if not record:
+        return {"task_id": task_id, "status": "not_merged"}
+    return {
+        "branch_name": record.branch_name,
+        "merge_commit_sha": record.merge_commit_sha,
+        "status": record.status,
+        "error_detail": record.error_detail,
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+    }
+
+
+@app.get("/api/tasks/{task_id}/audit-trail", response_model=dict)
+def get_task_audit_trail(task_id: str):
+    """Get the full audit trail for a task across all pipeline stages."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    trail = {
+        "task_id": task_id,
+        "current_type": task.type,
+        "demotion_count": getattr(task, "demotion_count", 0) or 0,
+        "demotion_history": getattr(task, "demotion_history", None),
+        "review_notes": getattr(task, "review_notes", None),
+        "transitions": [],
+        "planning": None,
+        "components": [],
+        "optimization": None,
+        "security_reviews": [],
+        "full_reviews": [],
+        "merge": None,
+    }
+
+    # Transition results
+    results = get_transition_results(task_id)
+    for r in results:
+        trail["transitions"].append({
+            "transition": r.transition,
+            "outcome": r.outcome,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        })
+
+    # Planning
+    pr = get_planning_result(task_id)
+    if pr:
+        trail["planning"] = {"status": pr.status, "created_at": pr.created_at.isoformat() if pr.created_at else None}
+
+    # Components
+    comps = get_component_results(task_id)
+    for c in comps:
+        trail["components"].append({
+            "component_name": c.component_name,
+            "status": c.status,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+        })
+
+    # Optimization
+    opt = get_optimization_result(task_id)
+    if opt:
+        trail["optimization"] = {"status": opt.status, "created_at": opt.created_at.isoformat() if opt.created_at else None}
+
+    # Security reviews
+    sec_reviews = get_security_review_results(task_id)
+    for s in sec_reviews:
+        trail["security_reviews"].append({
+            "reviewer_type": s.reviewer_type,
+            "verdict": s.verdict,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+        })
+
+    # Full reviews
+    fr_reviews = get_full_review_results(task_id)
+    for f in fr_reviews:
+        trail["full_reviews"].append({
+            "reviewer_type": f.reviewer_type,
+            "verdict": f.verdict,
+            "created_at": f.created_at.isoformat() if f.created_at else None,
+        })
+
+    # Merge
+    mr = get_merge_record(task_id)
+    if mr:
+        trail["merge"] = {
+            "status": mr.status,
+            "merge_commit_sha": mr.merge_commit_sha,
+            "created_at": mr.created_at.isoformat() if mr.created_at else None,
+        }
+
+    return trail
 
 
 # ============================================
@@ -854,6 +1400,9 @@ def task_to_dict(task):
         "subdivision_generation": getattr(task, "subdivision_generation", 0) or 0,
         "is_big_idea": bool(getattr(task, "is_big_idea", False)),
         "interface_contracts": json.loads(task.interface_contracts) if getattr(task, "interface_contracts", None) else None,
+        "review_notes": getattr(task, "review_notes", None),
+        "demotion_count": getattr(task, "demotion_count", 0) or 0,
+        "demotion_history": getattr(task, "demotion_history", None),
         "created_at": task.created_at.isoformat() if task.created_at else None,
         "updated_at": task.updated_at.isoformat() if task.updated_at else None
     }
@@ -1101,6 +1650,38 @@ AGENT_TOOL_ACCESS: dict = {
             "git_status", "git_diff", "git_log", "git_blame", "git_show",
             "get_task", "list_tasks",
         ],
+    },
+    "PlanningPipeline": {
+        "description": "5-stage planning pipeline (survey, best-of-N design, review panel, pitfall detection, consolidation). Uses LLM calls — no direct tool dispatch.",
+        "tools": [],
+    },
+    "PlanningGate": {
+        "description": "7-check deterministic gate (plus 1 LLM feasibility check) that validates planning output before advancing to development.",
+        "tools": [],
+    },
+    "DevOrchestrator": {
+        "description": "Batch execution orchestrator for development. Runs component loops in parallel with file write containment.",
+        "tools": "*",
+    },
+    "ConceptualReviewPipeline": {
+        "description": "4 deterministic + 4 LLM reviewers for conceptual review after development. No direct tool dispatch.",
+        "tools": [],
+    },
+    "OptimizationPipeline": {
+        "description": "Profile → propose → vote → implement → verify optimization pipeline. No direct tool dispatch.",
+        "tools": [],
+    },
+    "SecurityPipeline": {
+        "description": "3 parallel security reviewer agents with veto power. Uses allowlisted security scanner shell.",
+        "tools": ["run_shell_security", "read_file", "read_file_lines", "search_files", "find_files", "list_directory"],
+    },
+    "FullReviewPipeline": {
+        "description": "4-agent final review (functional, code quality, integration, UX). Uses allowlisted review runner shell.",
+        "tools": ["run_shell_review", "read_file", "read_file_lines", "search_files", "find_files", "list_directory"],
+    },
+    "MergeWorker": {
+        "description": "Deterministic git merge workflow (no LLM). Verifies branch, merges --no-ff, runs test suite, pushes if configured.",
+        "tools": [],
     },
 }
 

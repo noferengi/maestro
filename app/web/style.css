@@ -221,6 +221,19 @@ body {
 .task-card.review { border-left-color: #fd7e14; }
 .task-card.completed { border-left-color: #198754; }
 
+/* New 9-column layout colors */
+.column#column-indev .column-header { border-bottom-color: #0d6efd; }
+.column#column-conceptual_review .column-header { border-bottom-color: #20c997; }
+.column#column-optimization .column-header { border-bottom-color: #6610f2; }
+.column#column-security .column-header { border-bottom-color: #e83e8c; }
+.column#column-full_review .column-header { border-bottom-color: #fd7e14; }
+
+.task-card.indev { border-left: 4px solid #0d6efd; }
+.task-card.conceptual_review { border-left: 4px solid #20c997; }
+.task-card.optimization { border-left: 4px solid #6610f2; }
+.task-card.security { border-left: 4px solid #e83e8c; }
+.task-card.full_review { border-left: 4px solid #fd7e14; }
+
 /* Rejection state */
 .task-card.rejected {
     border-left-color: #dc3545;

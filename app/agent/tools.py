@@ -703,6 +703,22 @@ def append_task_history(task_id: str, entry: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Allowlisted shell wrappers (delegate to pipeline modules)
+# ---------------------------------------------------------------------------
+
+def _run_shell_security_wrapper(command: str) -> str:
+    """Allowlisted shell for security scanning tools."""
+    from app.agent.security_review import run_shell_security
+    return run_shell_security(command)
+
+
+def _run_shell_review_wrapper(command: str) -> str:
+    """Allowlisted shell for review/test runner tools."""
+    from app.agent.full_review import run_shell_review
+    return run_shell_review(command)
+
+
+# ---------------------------------------------------------------------------
 # Tool registry + schemas
 # ---------------------------------------------------------------------------
 
@@ -733,6 +749,8 @@ TOOL_REGISTRY: dict[str, Any] = {
     "generate_mermaid_diagram": generate_mermaid_diagram,
     "generate_interface_contract": generate_interface_contract,
     "spawn_research_agent": spawn_research_agent,
+    "run_shell_security": _run_shell_security_wrapper,
+    "run_shell_review": _run_shell_review_wrapper,
 }
 
 TOOL_SCHEMAS: list[dict] = [
@@ -1160,6 +1178,42 @@ TOOL_SCHEMAS: list[dict] = [
                     "context": {"type": "string", "description": "Optional context to provide to the research agent.", "default": ""},
                 },
                 "required": ["question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_shell_security",
+            "description": (
+                "Execute a shell command from the security scanner allowlist. "
+                "Only permits: bandit, safety, pip-audit, semgrep, trivy, grype, syft, trufflehog. "
+                "All other commands are blocked."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The shell command to run (must match allowlist)."},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_shell_review",
+            "description": (
+                "Execute a shell command from the review runner allowlist. "
+                "Only permits: pytest, ruff, mypy, black --check, npm test, npm run lint. "
+                "All other commands are blocked."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The shell command to run (must match allowlist)."},
+                },
+                "required": ["command"],
             },
         },
     },

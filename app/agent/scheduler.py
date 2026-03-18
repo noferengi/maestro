@@ -152,7 +152,7 @@ def _tick() -> None:
         # Only auto-dispatch tasks in columns the MaestroLoop handles.
         # IDEA tasks require explicit human "Advance to Planning" action —
         # the scheduler never auto-fires the intake pipeline.
-        if task_type not in ("planning", "development"):
+        if task_type not in ("planning", "indev"):
             continue
 
         # Already running?
@@ -218,6 +218,8 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None) -> No
 
         if task_type == "idea":
             _run_intake(task_id, llm_base_url, llm_model)
+        elif task_type == "indev":
+            _run_dev_orchestrator_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id)
         else:
             _run_maestro_loop(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id)
     except Exception:
@@ -316,6 +318,51 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
             budget_id=budget_id,
         )
         loop.run_until_complete(maestro.run())
+    finally:
+        loop.close()
+
+
+def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
+                                max_context: int | None = None,
+                                llm_id: int | None = None,
+                                budget_id: int | None = None) -> None:
+    """Run the DevOrchestrator for an IN DEV task."""
+    from app.agent.dev_orchestrator import run_dev_orchestrator
+    from app.database import get_planning_result, update_task
+    import json
+
+    planning_result_obj = get_planning_result(task_id)
+    if not planning_result_obj:
+        logger.warning("No planning result for task '%s', skipping.", task_id)
+        return
+
+    planning_result = {
+        "implementation_steps": json.loads(planning_result_obj.implementation_steps or "[]"),
+        "file_manifest": json.loads(planning_result_obj.file_manifest or "[]"),
+        "dependency_graph": json.loads(planning_result_obj.dependency_graph or "{}"),
+        "interface_contracts": json.loads(planning_result_obj.interface_contracts or "[]"),
+        "test_strategy": json.loads(planning_result_obj.test_strategy or "[]"),
+    }
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        result = loop.run_until_complete(
+            run_dev_orchestrator(
+                task_id=task_id,
+                planning_result=planning_result,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                llm_id=llm_id,
+                budget_id=budget_id,
+            )
+        )
+        if result.get("status") == "ACCEPTED":
+            update_task(task_id, type="conceptual_review")
+            logger.info("Task '%s' advanced to CONCEPTUAL REVIEW via scheduler.", task_id)
+        else:
+            update_task(task_id, type="planning")
+            logger.info("Task '%s' reverted to PLANNING: %s", task_id, result.get("error_detail"))
     finally:
         loop.close()
 

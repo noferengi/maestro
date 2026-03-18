@@ -28,6 +28,7 @@ class Verdict(Enum):
     POSSIBLE = "possible"
     LIKELY = "likely"
     SUBDIVIDE_IDEA = "subdivide_idea"
+    CONDITIONAL_PASS = "conditional_pass"
 
     @property
     def confidence_range(self) -> tuple[int, int]:
@@ -42,6 +43,7 @@ _VERDICT_RANGES: dict[Verdict, tuple[int, int]] = {
     Verdict.POSSIBLE: (76, 91),
     Verdict.LIKELY: (92, 100),
     Verdict.SUBDIVIDE_IDEA: (0, 100),  # categorical signal, accepts any confidence
+    Verdict.CONDITIONAL_PASS: (76, 100),  # passes with noted concerns
 }
 
 

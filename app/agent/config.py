@@ -238,3 +238,83 @@ def _build_verdict_ranges() -> dict[str, tuple[int, int]]:
     return result
 
 VERDICT_RANGES: dict[str, tuple[int, int]] = _build_verdict_ranges()
+
+# ===========================================================================
+# Planning pipeline
+# ===========================================================================
+
+PLANNING_BEST_OF_N: int = _getint("planning", "best_of_n", None, 5)
+PLANNING_TEMPERATURE_SPREAD: list[float] = [
+    float(x.strip())
+    for x in _get("planning", "temperature_spread", None, "0.3, 0.4, 0.5, 0.6, 0.7").split(",")
+    if x.strip()
+]
+PLANNING_JUDGE_TEMPERATURE: float = _getfloat("planning", "judge_temperature", None, 0.1)
+PLANNING_MAX_DESIGN_RETRIES: int = _getint("planning", "max_design_retries", None, 3)
+PLANNING_SURVEY_MAX_TURNS: int = _getint("planning", "survey_max_turns", None, 30)
+PLANNING_LLM_TEMPERATURE: float = _getfloat("planning", "llm_temperature", None, 0.2)
+
+# ===========================================================================
+# Planning gate
+# ===========================================================================
+
+PLANNING_GATE_FEASIBILITY_RECHECK: bool = _getbool("planning_gate", "feasibility_recheck_enabled", None, True)
+PLANNING_GATE_CONTEXT_SAFETY_MARGIN: float = _getfloat("planning_gate", "context_safety_margin", None, 0.15)
+
+# ===========================================================================
+# In-development (component loops)
+# ===========================================================================
+
+INDEV_COMPONENT_MAX_TURNS: int = _getint("indev", "component_max_turns", None, 50)
+INDEV_COMPONENT_MAX_RETRIES: int = _getint("indev", "component_max_retries", None, 2)
+INDEV_LLM_TEMPERATURE: float = _getfloat("indev", "llm_temperature", None, 0.2)
+INDEV_ENFORCE_FILE_CONTAINMENT: bool = _getbool("indev", "enforce_file_containment", None, True)
+
+# ===========================================================================
+# Conceptual review
+# ===========================================================================
+
+CONCEPTUAL_REVIEW_MAX_TURNS: int = _getint("conceptual_review", "reviewer_max_turns", None, 15)
+CONCEPTUAL_REVIEW_LLM_TEMPERATURE: float = _getfloat("conceptual_review", "llm_temperature", None, 0.15)
+CONCEPTUAL_REVIEW_HIGH_SEVERITY_BLOCKS: bool = _getbool("conceptual_review", "high_severity_blocks_advance", None, True)
+
+# ===========================================================================
+# Optimization
+# ===========================================================================
+
+OPTIMIZATION_PROPOSAL_COUNT: int = _getint("optimization", "proposal_count", None, 5)
+OPTIMIZATION_JUDGE_COUNT: int = _getint("optimization", "judge_count", None, 3)
+OPTIMIZATION_IMPL_MAX_TURNS: int = _getint("optimization", "implementation_max_turns", None, 100)
+OPTIMIZATION_PROPOSER_TEMPERATURE: float = _getfloat("optimization", "proposer_temperature", None, 0.4)
+OPTIMIZATION_JUDGE_TEMPERATURE: float = _getfloat("optimization", "judge_temperature", None, 0.1)
+OPTIMIZATION_IMPL_TEMPERATURE: float = _getfloat("optimization", "implementation_temperature", None, 0.2)
+OPTIMIZATION_MIN_IMPROVEMENT_PCT: float = _getfloat("optimization", "min_improvement_pct", None, 2.0)
+OPTIMIZATION_MAX_REGRESSION_PCT: float = _getfloat("optimization", "max_regression_pct", None, 5.0)
+
+# ===========================================================================
+# Security review
+# ===========================================================================
+
+SECURITY_REVIEW_LLM_TEMPERATURE: float = _getfloat("security_review", "llm_temperature", None, 0.1)
+SECURITY_REVIEW_VETO_POWER: bool = _getbool("security_review", "veto_power", None, True)
+SECURITY_REVIEW_RESEARCH_LIVES: int = _getint("security_review", "research_agent_max_lives", None, 2)
+
+# ===========================================================================
+# Full review
+# ===========================================================================
+
+FULL_REVIEW_LLM_TEMPERATURE: float = _getfloat("full_review", "llm_temperature", None, 0.1)
+FULL_REVIEW_AUTO_UX: bool = _getbool("full_review", "auto_ux_review", None, True)
+FULL_REVIEW_FRONTEND_PATTERNS: list[str] = _getlist("full_review", "frontend_patterns",
+    "app/web/*.html, app/web/*.js, app/web/*.css"
+)
+FULL_REVIEW_RESEARCH_LIVES: int = _getint("full_review", "research_agent_max_lives", None, 2)
+
+# ===========================================================================
+# Merge
+# ===========================================================================
+
+MERGE_TEST_TIMEOUT: int = _getint("merge", "test_timeout", None, 300)
+MERGE_AUTO_PUSH: bool = _getbool("merge", "auto_push", None, True)
+MERGE_TAG_BRANCHES: bool = _getbool("merge", "tag_merged_branches", None, True)
+MERGE_DELETE_BRANCHES: bool = _getbool("merge", "delete_merged_branches", None, False)
