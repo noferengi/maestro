@@ -171,22 +171,58 @@ class DevOrchestrator:
         )
 
     def _build_batches(self, steps: list[dict]) -> list[list[dict]]:
-        """Group implementation steps into dependency-resolved batches."""
-        # Build dependency graph
-        step_by_component: dict[str, dict] = {}
-        for step in steps:
-            comp = step.get("component", "")
-            step_by_component[comp] = step
+        """Group implementation steps into dependency-resolved batches.
 
-        # Simple batching: group by order field
-        order_groups: dict[int, list[dict]] = {}
+        After grouping by order, scans each batch for file-level conflicts.
+        Any component that claims a file already claimed by an earlier component
+        in the same batch is deferred to the next batch to prevent parallel writes.
+        """
+        order_map: dict[int, list[dict]] = {}
         for step in steps:
             order = step.get("order", 0)
-            if order not in order_groups:
-                order_groups[order] = []
-            order_groups[order].append(step)
+            if order not in order_map:
+                order_map[order] = []
+            order_map[order].append(step)
 
-        return [order_groups[k] for k in sorted(order_groups.keys())]
+        # Iteratively resolve file conflicts until no more exist
+        changed = True
+        while changed:
+            changed = False
+            for order in sorted(order_map.keys()):
+                batch = order_map[order]
+                seen_files: dict[str, str] = {}  # file -> first component name
+                survivors: list[dict] = []
+                deferred: list[dict] = []
+
+                for step in batch:
+                    comp = step.get("component", "unknown")
+                    conflict_file: str | None = None
+                    for f in step.get("files", []):
+                        if f in seen_files:
+                            conflict_file = f
+                            break
+
+                    if conflict_file is not None:
+                        logger.warning(
+                            "[dev_orch] Components '%s' and '%s' both claim '%s' "
+                            "— serializing to avoid write conflict",
+                            seen_files[conflict_file], comp, conflict_file,
+                        )
+                        deferred.append(step)
+                        changed = True
+                    else:
+                        for f in step.get("files", []):
+                            seen_files[f] = comp
+                        survivors.append(step)
+
+                if deferred:
+                    order_map[order] = survivors
+                    next_order = order + 1
+                    if next_order not in order_map:
+                        order_map[next_order] = []
+                    order_map[next_order] = deferred + order_map[next_order]
+
+        return [order_map[k] for k in sorted(order_map.keys()) if order_map[k]]
 
     async def _run_single_component(
         self, step: dict, planning_context: str, batch_idx: int

@@ -61,13 +61,66 @@ class ComponentToolDispatcher:
 # ComponentResult
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Test outcome detection helpers
+# ---------------------------------------------------------------------------
+
+_NON_TESTABLE_EXTENSIONS = {
+    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+    ".md", ".txt", ".rst", ".css", ".html", ".js", ".ts",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".sql",
+}
+
+
+def _is_testable_component(file_list: list[str]) -> bool:
+    """Return True if any file in the manifest looks like testable source code."""
+    for path in file_list:
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in _NON_TESTABLE_EXTENSIONS:
+            return True
+    return False
+
+
+def _is_test_command(fn_name: str, fn_args: dict) -> bool:
+    """Return True if this tool call is running tests."""
+    if fn_name != "run_shell":
+        return False
+    cmd = fn_args.get("command", "").lower()
+    return "pytest" in cmd or "unittest" in cmd
+
+
+def _detect_test_outcome(output: str) -> str | None:
+    """Heuristic parse of pytest output. Returns 'passed', 'failed', or None."""
+    lower = output.lower()
+    has_pytest = (
+        "passed" in lower or "failed" in lower or "error" in lower
+        or "pytest" in lower or "test session starts" in lower
+    )
+    if not has_pytest:
+        return None
+    has_failures = (
+        " failed" in lower or "failures" in lower
+        or " error" in lower or "errors" in lower
+        or "FAILED" in output
+    )
+    if has_failures:
+        return "failed"
+    if "passed" in lower:
+        return "passed"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# ComponentResult
+# ---------------------------------------------------------------------------
+
 @dataclass(slots=True)
 class ComponentLoopResult:
     component_name: str
     status: str  # "ACCEPTED" | "REVERT_TO_DESIGN" | "MAX_TURNS" | "ERROR"
     turns: int = 0
     files_changed: list[str] = field(default_factory=list)
-    tests_passed: int = 0
+    tests_passed: bool = False
     error_detail: str | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -108,6 +161,7 @@ class ComponentLoop:
         self.dispatcher = ComponentToolDispatcher(allowed_write_paths)
         self._total_prompt = 0
         self._total_completion = 0
+        self._tests_passed: bool = False
 
     async def run(self) -> ComponentLoopResult:
         """Run the component implementation loop."""
@@ -166,11 +220,28 @@ class ComponentLoop:
             # Check for terminal signal
             if content:
                 if '"signal": "ACCEPTED"' in content or '"signal":"ACCEPTED"' in content:
+                    component_files = self.step.get("files", [])
+                    if not self._tests_passed and _is_testable_component(component_files):
+                        logger.info(
+                            "[component] '%s' signaled ACCEPTED without passing tests — requesting test run",
+                            self.component_name,
+                        )
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "You signaled ACCEPTED but no passing test run was recorded. "
+                                "Please run the tests first:\n\n"
+                                "  run_shell('python -m pytest <relevant test paths> -v')\n\n"
+                                "Then signal ACCEPTED once tests pass."
+                            ),
+                        })
+                        continue
                     return ComponentLoopResult(
                         component_name=self.component_name,
                         status="ACCEPTED",
                         turns=turn + 1,
                         files_changed=sorted(files_changed),
+                        tests_passed=self._tests_passed,
                         prompt_tokens=self._total_prompt,
                         completion_tokens=self._total_completion,
                     )
@@ -194,6 +265,14 @@ class ComponentLoop:
                         fn_args = {}
 
                     result = self.dispatcher.dispatch(fn_name, fn_args)
+
+                    # Track test outcomes
+                    if _is_test_command(fn_name, fn_args):
+                        test_outcome = _detect_test_outcome(str(result))
+                        if test_outcome == "passed":
+                            self._tests_passed = True
+                        elif test_outcome == "failed":
+                            self._tests_passed = False
 
                     # Track file changes
                     if fn_name in ("write_file", "append_file") and not result.startswith("ERROR"):

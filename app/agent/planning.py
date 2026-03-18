@@ -172,7 +172,7 @@ class PlanningPipeline:
             review_votes = votes
 
             tally = tally_votes(votes)
-            if tally.outcome == "passed":
+            if tally.outcome in ("passed", "conditional_pass"):
                 logger.info("[planning] Design accepted on attempt %d", attempt + 1)
                 break
             else:
@@ -399,7 +399,11 @@ class PlanningPipeline:
     async def _stage_design_review(
         self, design: dict, survey: str
     ) -> list[Vote]:
-        """Three parallel reviewers evaluate the winning design."""
+        """Five parallel reviewers evaluate the winning design.
+
+        Reviewers: coupling, interface, testability, security design, performance.
+        Majority (>=3/5) required to pass.
+        """
         reviewers = [
             {
                 "name": "coupling_reviewer",
@@ -420,6 +424,28 @@ class PlanningPipeline:
                 "focus": (
                     "Review for testability & safety: test strategy adequacy, destructive "
                     "operation risks, safety rule compliance (no hard deletes, branch isolation)."
+                ),
+            },
+            {
+                "name": "security_design_reviewer",
+                "focus": (
+                    "Review for security concerns IN THE DESIGN before any code is written. "
+                    "Look for: authentication/authorization gaps, data flows exposing sensitive "
+                    "information, API endpoints lacking security controls, missing encryption for "
+                    "sensitive data at rest/transit, injection vulnerabilities in the proposed "
+                    "architecture. If the design has fundamental security flaws, vote REJECTED "
+                    "and include 'demotion_target: planning' in your justification."
+                ),
+            },
+            {
+                "name": "performance_reviewer",
+                "focus": (
+                    "Review for performance and scalability concerns. Look for: N+1 query "
+                    "patterns in the proposed data model, missing caching strategy for expensive "
+                    "operations, synchronous blocking in async code paths, unbounded data growth "
+                    "(missing pagination/archival), proposed algorithms with poor time/space "
+                    "complexity. If the design has fundamental scalability flaws, vote REJECTED "
+                    "and include 'demotion_target: planning' in your justification."
                 ),
             },
         ]

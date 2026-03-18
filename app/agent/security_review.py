@@ -29,6 +29,7 @@ from app.agent.config import (
     PROJECT_ROOT,
 )
 from app.agent.llm_client import call_llm
+from app.agent.research import run_research
 from app.agent.verdicts import Vote, Verdict
 
 logger = logging.getLogger(__name__)
@@ -127,48 +128,50 @@ class SecurityPipeline:
         self._total_prompt = 0
         self._total_completion = 0
 
+    _REVIEWERS = [
+        {
+            "type": "offensive",
+            "perspective": "Red Team / Attacker mindset",
+            "focus": (
+                "OWASP Top 10 vulnerabilities, input validation gaps, "
+                "secret/credential exposure, command injection, path traversal, "
+                "data exfiltration vectors."
+            ),
+        },
+        {
+            "type": "defensive",
+            "perspective": "Blue Team / Defender mindset",
+            "focus": (
+                "Auth/authz coverage, error handling & info disclosure, "
+                "dependency CVEs, encryption at rest/transit, security headers, "
+                "rate limiting."
+            ),
+        },
+        {
+            "type": "compliance",
+            "perspective": "Compliance & Data Flow",
+            "focus": (
+                "Data flow tracing (input->output->stores), PCI-DSS, GDPR, "
+                "CCPA, HIPAA compliance, data minimization, optimization regression check."
+            ),
+        },
+    ]
+
     async def run(self) -> SecurityReviewPipelineResult:
-        """Run all 3 security reviewers in parallel."""
+        """Run pre-scan + 3 security reviewers, then research any uncertainties."""
         logger.info("[security] Starting for task '%s'", self.task_id)
 
-        reviewers = [
-            {
-                "type": "offensive",
-                "perspective": "Red Team / Attacker mindset",
-                "focus": (
-                    "OWASP Top 10 vulnerabilities, input validation gaps, "
-                    "secret/credential exposure, command injection, path traversal, "
-                    "data exfiltration vectors."
-                ),
-            },
-            {
-                "type": "defensive",
-                "perspective": "Blue Team / Defender mindset",
-                "focus": (
-                    "Auth/authz coverage, error handling & info disclosure, "
-                    "dependency CVEs, encryption at rest/transit, security headers, "
-                    "rate limiting."
-                ),
-            },
-            {
-                "type": "compliance",
-                "perspective": "Compliance & Data Flow",
-                "focus": (
-                    "Data flow tracing (input->output->stores), PCI-DSS, GDPR, "
-                    "CCPA, HIPAA compliance, data minimization, optimization regression check."
-                ),
-            },
-        ]
+        # Phase 0: Deterministic pre-scan (bandit, detect-secrets)
+        scan_context = await self._run_pre_scan()
 
-        tasks = [self._run_reviewer(r) for r in reviewers]
+        tasks = [self._run_reviewer(r, scan_context) for r in self._REVIEWERS]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         votes: list[Vote] = []
         findings: list[dict] = []
-        demotion_target = None
 
         for i, result in enumerate(results):
-            reviewer_type = reviewers[i]["type"]
+            reviewer_type = self._REVIEWERS[i]["type"]
             if isinstance(result, Exception):
                 logger.warning("[security] Reviewer '%s' failed: %s", reviewer_type, result)
                 votes.append(Vote(
@@ -182,9 +185,13 @@ class SecurityPipeline:
             vote, reviewer_findings = result
             votes.append(vote)
             findings.extend(reviewer_findings)
-
-            # Store individual result
             self._store_reviewer_result(vote, reviewer_findings, reviewer_type)
+
+        # Phase 1: Handle NEEDS_RESEARCH via research agent
+        needs_research = [v for v in votes if v.verdict == Verdict.NEEDS_RESEARCH]
+        if needs_research:
+            votes, extra_findings = await self._handle_needs_research(votes, scan_context)
+            findings.extend(extra_findings)
 
         # Tally with veto rules
         outcome, summary, demotion_target = self._tally_security(votes, findings)
@@ -202,13 +209,110 @@ class SecurityPipeline:
             completion_tokens=self._total_completion,
         )
 
+    async def _run_pre_scan(self) -> str:
+        """Run allowlisted security scanners and return output as context string."""
+        commands = [
+            "python -m bandit -r . -q --no-show-progress",
+            "python -m detect_secrets scan",
+        ]
+        loop = asyncio.get_event_loop()
+        scan_outputs = []
+
+        for cmd in commands:
+            try:
+                result = await loop.run_in_executor(None, run_shell_security, cmd)
+                if result and not result.startswith("ERROR:"):
+                    scanner_name = cmd.split()[2]
+                    scan_outputs.append(f"[{scanner_name}]\n{result[:2000]}")
+                else:
+                    logger.debug("[security] Pre-scan '%s': %s", cmd, result[:200])
+            except Exception as e:
+                logger.warning("[security] Pre-scan '%s' failed: %s", cmd, e)
+
+        if not scan_outputs:
+            return ""
+
+        return (
+            "=== SECURITY SCANNER RESULTS ===\n"
+            + "\n\n".join(scan_outputs)
+            + "\n=== END SCANNER RESULTS ===\n\n"
+        )
+
+    async def _handle_needs_research(
+        self, votes: list[Vote], scan_context: str
+    ) -> tuple[list[Vote], list[dict]]:
+        """Spawn research agent for NEEDS_RESEARCH votes, then re-vote affected reviewers."""
+        research_votes = [v for v in votes if v.verdict == Verdict.NEEDS_RESEARCH]
+        questions = [f"[{v.stage}] {v.justification}" for v in research_votes]
+        question = (
+            f"Security review of task {self.task_id} found uncertain areas:\n"
+            + "\n".join(questions)
+            + "\n\nInvestigate these security concerns. Determine if they represent:\n"
+            "1. Fundamental architectural security flaws → recommend demotion to planning\n"
+            "2. Implementation-level issues → recommend demotion to indev\n"
+            "3. Data handling issues → recommend demotion to optimization\n"
+            "4. False positives or minor concerns that can pass"
+        )
+
+        logger.info(
+            "[security] NEEDS_RESEARCH from %d reviewer(s), spawning research agent.",
+            len(research_votes),
+        )
+        try:
+            research_result = await run_research(
+                question=question,
+                context={"task_id": self.task_id, "task_description": self.task_description},
+                max_lives=SECURITY_REVIEW_RESEARCH_LIVES,
+                llm_base_url=self.llm_base_url,
+                llm_model=self.llm_model,
+                task_id=str(self.task_id),
+                llm_id=self.llm_id,
+                budget_id=self.budget_id,
+            )
+            self._total_prompt += research_result.prompt_tokens
+            self._total_completion += research_result.completion_tokens
+            findings_text = research_result.findings or "No specific findings."
+        except Exception as e:
+            logger.warning("[security] Research agent failed: %s", e)
+            return votes, []
+
+        # Re-vote affected reviewers with research context appended
+        needs_research_stages = {v.stage for v in research_votes}
+        stage_to_reviewer = {f"security_{r['type']}": r for r in self._REVIEWERS}
+        extra_context = f"{scan_context}\n## Security Research Findings\n{findings_text}\n\n"
+
+        re_vote_tasks = []
+        re_vote_stages = []
+        for v in votes:
+            if v.stage in needs_research_stages:
+                reviewer = stage_to_reviewer.get(v.stage)
+                if reviewer:
+                    re_vote_tasks.append(self._run_reviewer(reviewer, extra_context))
+                    re_vote_stages.append(v.stage)
+
+        if not re_vote_tasks:
+            return votes, []
+
+        re_results = await asyncio.gather(*re_vote_tasks, return_exceptions=True)
+        vote_map = {v.stage: v for v in votes}
+        new_findings: list[dict] = []
+
+        for i, stage in enumerate(re_vote_stages):
+            if not isinstance(re_results[i], Exception):
+                new_vote, reviewer_findings = re_results[i]
+                vote_map[stage] = new_vote
+                new_findings.extend(reviewer_findings)
+
+        return list(vote_map.values()), new_findings
+
     async def _run_reviewer(
-        self, reviewer: dict
+        self, reviewer: dict, scan_context: str = ""
     ) -> tuple[Vote, list[dict]]:
         """Run a single security reviewer."""
         prompt = (
             f"You are a security reviewer ({reviewer['perspective']}).\n"
             f"Focus: {reviewer['focus']}\n\n"
+            f"{scan_context}"
             f"Task being reviewed: {self.task_description}\n\n"
             "Analyze for security issues. For each finding, classify severity as "
             "critical/high/medium/low.\n\n"
@@ -302,12 +406,12 @@ class SecurityPipeline:
                     demotion_target,
                 )
 
-        # NEEDS_RESEARCH → conservative rejection
-        research = [v for v in votes if v.verdict == Verdict.NEEDS_RESEARCH]
-        if research:
+        # Any remaining NEEDS_RESEARCH after research agent = conservative reject
+        remaining_research = [v for v in votes if v.verdict == Verdict.NEEDS_RESEARCH]
+        if remaining_research:
             return (
                 "rejected",
-                f"Security research needed: {len(research)} reviewer(s) uncertain. Conservative reject.",
+                f"Security research exhausted: {len(remaining_research)} reviewer(s) still uncertain.",
                 "development",
             )
 

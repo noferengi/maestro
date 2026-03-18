@@ -33,9 +33,11 @@ from app.agent.config import (
     CONCEPTUAL_REVIEW_MAX_TURNS,
     CONCEPTUAL_REVIEW_LLM_TEMPERATURE,
     CONCEPTUAL_REVIEW_HIGH_SEVERITY_BLOCKS,
+    CONCEPTUAL_REVIEW_RESEARCH_LIVES,
     PROJECT_ROOT,
 )
 from app.agent.llm_client import call_llm
+from app.agent.research import run_research
 from app.agent.verdicts import Vote, Verdict, tally_votes
 
 logger = logging.getLogger(__name__)
@@ -89,33 +91,38 @@ class ConceptualReviewPipeline:
 
         all_votes = det_votes + llm_votes
 
-        # Check for high-severity findings
+        # Handle NEEDS_RESEARCH: spawn research agent and re-vote affected LLM reviewers
+        tally = tally_votes(all_votes)
+        if tally.outcome == "needs_research":
+            all_votes = await self._handle_needs_research(all_votes)
+            tally = tally_votes(all_votes)
+
+        # Check for high-severity findings using structured severity prefix
         high_severity = []
         for v in all_votes:
             if v.verdict in (Verdict.REJECTED, Verdict.NOT_SUITABLE):
-                if "critical" in v.justification.lower() or "high" in v.justification.lower():
+                if v.justification.startswith("[HIGH]") or v.justification.startswith("[CRITICAL]"):
                     high_severity.append({
                         "stage": v.stage,
                         "verdict": v.verdict.value,
                         "justification": v.justification,
                     })
 
-        # Tally
-        tally = tally_votes(all_votes)
-
         # Block on high severity if configured
         if CONCEPTUAL_REVIEW_HIGH_SEVERITY_BLOCKS and high_severity:
             outcome = "rejected"
             summary = f"Blocked: {len(high_severity)} high-severity finding(s). {tally.summary}"
         else:
-            outcome = tally.outcome
-            if outcome in ("passed", "tie"):
+            raw_outcome = tally.outcome
+            summary = tally.summary
+            if raw_outcome in ("passed", "conditional_pass", "tie"):
                 outcome = "passed"
-            elif outcome == "needs_research":
-                outcome = "passed"  # Conceptual review passes with research notes
+            elif raw_outcome == "needs_research":
+                # Research agent exhausted without resolution — reject conservatively
+                outcome = "rejected"
+                summary = f"Research exhausted without resolution: {tally.summary}"
             else:
                 outcome = "rejected"
-            summary = tally.summary
 
         logger.info("[conceptual_review] Task '%s': %s", self.task_id, outcome)
 
@@ -329,6 +336,7 @@ class ConceptualReviewPipeline:
     async def _run_single_reviewer(
         self, name: str, focus: str,
         plan_summary: str, det_summary: str,
+        extra_context: str = "",
     ) -> Vote:
         """Run a single LLM reviewer."""
         prompt = (
@@ -336,6 +344,7 @@ class ConceptualReviewPipeline:
             f"Task: {self.task_description}\n\n"
             f"Planning result:\n{plan_summary}\n\n"
             f"Deterministic check results:\n{det_summary}\n\n"
+            f"{extra_context}"
             "Output JSON: {\"verdict\": \"LIKELY|POSSIBLE|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED\", "
             "\"confidence\": <0-100>, \"justification\": \"...\", "
             "\"severity\": \"low|medium|high|critical\"}"
@@ -383,6 +392,91 @@ class ConceptualReviewPipeline:
             justification=justification,
             model=self.llm_model or "",
         )
+
+    # ------------------------------------------------------------------
+    # Research agent dispatch (NEEDS_RESEARCH recovery)
+    # ------------------------------------------------------------------
+
+    async def _handle_needs_research(self, all_votes: list[Vote]) -> list[Vote]:
+        """Spawn a research agent for NEEDS_RESEARCH votes, then re-vote affected LLM reviewers."""
+        research_votes = [v for v in all_votes if v.verdict is Verdict.NEEDS_RESEARCH]
+        questions = [f"[{v.stage}] {v.justification}" for v in research_votes]
+        question = (
+            f"During conceptual review of task {self.task_id}, reviewers raised these "
+            f"questions needing investigation:\n" + "\n".join(questions)
+        )
+
+        logger.info(
+            "[conceptual_review] NEEDS_RESEARCH from %d reviewer(s), spawning research agent.",
+            len(research_votes),
+        )
+        try:
+            research_result = await run_research(
+                question=question,
+                context={"task_id": self.task_id, "task_description": self.task_description},
+                max_lives=CONCEPTUAL_REVIEW_RESEARCH_LIVES,
+                llm_base_url=self.llm_base_url,
+                llm_model=self.llm_model,
+                task_id=str(self.task_id),
+                llm_id=self.llm_id,
+                budget_id=self.budget_id,
+            )
+            self._total_prompt += research_result.prompt_tokens
+            self._total_completion += research_result.completion_tokens
+            findings = research_result.findings or "No specific findings."
+        except Exception as e:
+            logger.warning("[conceptual_review] Research agent failed: %s", e)
+            return all_votes  # Fall back to original votes; tally will re-assess
+
+        # Re-vote only the LLM reviewers that voted NEEDS_RESEARCH
+        needs_research_stages = {v.stage for v in research_votes if v.stage.startswith("l")}
+        if not needs_research_stages:
+            return all_votes  # Only deterministic voters; can't re-run with context
+
+        plan_summary = json.dumps(self.plan, indent=1)[:6000]
+        det_summary = self._summarize_votes([v for v in all_votes if v.stage.startswith("d")])
+        extra_context = f"\n## Research Findings\n{findings}\n\n"
+
+        re_vote_tasks = []
+        re_vote_stages = []
+        for v in all_votes:
+            if v.stage in needs_research_stages:
+                focus = self._get_reviewer_focus(v.stage)
+                re_vote_tasks.append(
+                    self._run_single_reviewer(v.stage, focus, plan_summary, det_summary, extra_context)
+                )
+                re_vote_stages.append(v.stage)
+
+        re_results = await asyncio.gather(*re_vote_tasks, return_exceptions=True)
+
+        vote_map = {v.stage: v for v in all_votes}
+        for i, stage in enumerate(re_vote_stages):
+            if not isinstance(re_results[i], Exception):
+                vote_map[stage] = re_results[i]
+
+        return list(vote_map.values())
+
+    def _get_reviewer_focus(self, stage_name: str) -> str:
+        """Return the focus description for a given LLM reviewer stage."""
+        focuses = {
+            "l1_architecture": (
+                "Review architecture: SOLID principles, separation of concerns, "
+                "naming conventions, module boundaries."
+            ),
+            "l2_security": (
+                "Review security: input validation, injection risks, "
+                "path traversal, OWASP pre-scan."
+            ),
+            "l3_performance": (
+                "Review performance: algorithmic complexity, N+1 queries, "
+                "blocking I/O in async code."
+            ),
+            "l4_api_interface": (
+                "Review API/interface: contract compliance, backward compatibility, "
+                "consistent error shapes."
+            ),
+        }
+        return focuses.get(stage_name, "Review the implementation for correctness and quality.")
 
     # ------------------------------------------------------------------
     # Helpers

@@ -9,6 +9,7 @@ Results stored in transition_results with transition="planning_to_indev".
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -38,6 +39,7 @@ class GateResult:
     checks: list[GateCheck] = field(default_factory=list)
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    llm_check_unavailable: bool = False
 
 
 class PlanningGate:
@@ -86,8 +88,9 @@ class PlanningGate:
         # Check 6: Implementation feasibility re-check (LLM)
         prompt_tokens = 0
         completion_tokens = 0
+        llm_check_unavailable = False
         if PLANNING_GATE_FEASIBILITY_RECHECK:
-            check6, pt, ct = await self._check_feasibility()
+            check6, pt, ct, llm_check_unavailable = await self._check_feasibility()
             checks.append(check6)
             prompt_tokens += pt
             completion_tokens += ct
@@ -121,6 +124,7 @@ class PlanningGate:
             checks=checks,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
+            llm_check_unavailable=llm_check_unavailable,
         )
 
     # ------------------------------------------------------------------
@@ -328,8 +332,12 @@ class PlanningGate:
     # Check 6: Implementation feasibility re-check (LLM)
     # ------------------------------------------------------------------
 
-    async def _check_feasibility(self) -> tuple[GateCheck, int, int]:
-        """LLM confirms plan is still viable."""
+    async def _check_feasibility(self) -> tuple[GateCheck, int, int, bool]:
+        """LLM confirms plan is still viable. Retries up to 3 times with exponential backoff.
+
+        Returns (GateCheck, prompt_tokens, completion_tokens, llm_check_unavailable).
+        llm_check_unavailable=True means all retries failed and the check was skipped.
+        """
         from app.agent.llm_client import call_llm
 
         prompt = (
@@ -337,44 +345,62 @@ class PlanningGate:
             f"Plan summary:\n{json.dumps(self.plan, indent=1)[:4000]}\n\n"
             "Output JSON: {\"feasible\": true/false, \"concerns\": [\"...\"]}"
         )
+        messages = [
+            {"role": "system", "content": "You are a feasibility reviewer. Output only JSON."},
+            {"role": "user", "content": prompt},
+        ]
 
-        try:
-            response = await call_llm(
-                [
-                    {"role": "system", "content": "You are a feasibility reviewer. Output only JSON."},
-                    {"role": "user", "content": prompt},
-                ],
-                base_url=self.llm_base_url,
-                model=self.llm_model,
-                temperature=0.1,
-                response_format={"type": "json_object"},
-                task_id=self.task_id,
-                llm_id=self.llm_id,
-                budget_id=self.budget_id,
-            )
+        max_attempts = 3
+        last_error: Exception | None = None
 
-            usage = response.get("usage", {})
-            pt = usage.get("prompt_tokens", 0)
-            ct = usage.get("completion_tokens", 0)
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = await call_llm(
+                    messages,
+                    base_url=self.llm_base_url,
+                    model=self.llm_model,
+                    temperature=0.1,
+                    response_format={"type": "json_object"},
+                    task_id=self.task_id,
+                    llm_id=self.llm_id,
+                    budget_id=self.budget_id,
+                )
+                usage = response.get("usage", {})
+                pt = usage.get("prompt_tokens", 0)
+                ct = usage.get("completion_tokens", 0)
 
-            content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
-            data = json.loads(content)
-            feasible = data.get("feasible", True)
-            concerns = data.get("concerns", [])
+                content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+                data = json.loads(content)
+                feasible = data.get("feasible", True)
+                concerns = data.get("concerns", [])
 
-            return GateCheck(
-                name="feasibility_recheck",
-                passed=feasible,
-                hard_fail=False,  # Soft fail — warning only
-                detail=f"{'Feasible' if feasible else 'Concerns'}: {'; '.join(concerns) if concerns else 'none'}",
-            ), pt, ct
-        except Exception as e:
-            return GateCheck(
-                name="feasibility_recheck",
-                passed=True,
-                hard_fail=False,
-                detail=f"LLM check failed ({e}), defaulting to pass.",
-            ), 0, 0
+                return GateCheck(
+                    name="feasibility_recheck",
+                    passed=feasible,
+                    hard_fail=False,
+                    detail=f"{'Feasible' if feasible else 'Concerns'}: {'; '.join(concerns) if concerns else 'none'}",
+                ), pt, ct, False
+
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    "[planning_gate] Gate check 6: LLM call failed (attempt %d/%d): %s",
+                    attempt, max_attempts, e,
+                )
+                if attempt < max_attempts:
+                    await asyncio.sleep(2 ** attempt)  # 2s, 4s
+
+        logger.warning(
+            "[planning_gate] Task '%s': feasibility_recheck unavailable after %d attempts — "
+            "proceeding with warning. Last error: %s",
+            self.task_id, max_attempts, last_error,
+        )
+        return GateCheck(
+            name="feasibility_recheck",
+            passed=True,
+            hard_fail=False,
+            detail=f"LLM feasibility recheck unavailable after {max_attempts} attempts",
+        ), 0, 0, True
 
     # ------------------------------------------------------------------
     # Check 7: Context budget
@@ -444,4 +470,5 @@ async def run_planning_gate(
         ],
         "prompt_tokens": result.prompt_tokens,
         "completion_tokens": result.completion_tokens,
+        "llm_check_unavailable": result.llm_check_unavailable,
     }

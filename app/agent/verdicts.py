@@ -99,13 +99,15 @@ class Vote:
 class TallyResult:
     """Aggregated result of all stage votes."""
 
-    outcome: str  # "passed" | "rejected" | "needs_research" | "tie" | "subdivide"
+    outcome: str  # "passed" | "conditional_pass" | "rejected" | "needs_research" | "tie" | "subdivide"
     votes: list[Vote]
     rejection_reasons: list[str] = field(default_factory=list)
     research_needed: list[str] = field(default_factory=list)
     summary: str = ""
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
+    has_conditional_passes: bool = False
+    conditional_pass_notes: list[str] = field(default_factory=list)
 
 
 def tally_votes(votes: list[Vote]) -> TallyResult:
@@ -197,7 +199,7 @@ def tally_votes(votes: list[Vote]) -> TallyResult:
 
     # --- Rules 4 & 5: tie vs passed ---
     _FAIL_ISH = {Verdict.REJECTED, Verdict.NOT_SUITABLE}
-    _PASS_ISH = {Verdict.POSSIBLE, Verdict.LIKELY}
+    _PASS_ISH = {Verdict.POSSIBLE, Verdict.LIKELY, Verdict.CONDITIONAL_PASS}
 
     fail_count = sum(1 for v in votes if v.verdict in _FAIL_ISH)
     pass_count = sum(1 for v in votes if v.verdict in _PASS_ISH)
@@ -211,10 +213,15 @@ def tally_votes(votes: list[Vote]) -> TallyResult:
             total_completion_tokens=total_completion,
         )
 
+    conditional_votes = [v for v in votes if v.verdict is Verdict.CONDITIONAL_PASS]
+    outcome = "conditional_pass" if conditional_votes else "passed"
+    cond_notes = [v.justification for v in conditional_votes]
     return TallyResult(
-        outcome="passed",
+        outcome=outcome,
         votes=votes,
-        summary=f"Pipeline passed: {pass_count}/{n} stages voted favourably.",
+        summary=f"Pipeline {outcome}: {pass_count}/{n} stages voted favourably.",
         total_prompt_tokens=total_prompt,
         total_completion_tokens=total_completion,
+        has_conditional_passes=bool(conditional_votes),
+        conditional_pass_notes=cond_notes,
     )

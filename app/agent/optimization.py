@@ -47,6 +47,10 @@ class OptimizationPipelineResult:
     improvement_summary: str = ""
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    revote_occurred: bool = False
+    round1_vote_tally: dict = field(default_factory=dict)
+    round2_vote_tally: dict = field(default_factory=dict)
+    demotion_target: str = ""
 
 
 class OptimizationPipeline:
@@ -82,7 +86,31 @@ class OptimizationPipeline:
         proposals = await self._phase_proposals(baseline)
 
         # Phase 3: Judge proposals
-        scores, winner_idx, winner_score = await self._phase_judging(proposals)
+        scores, winner_idx, winner_score, r1_tally, r2_tally, revote = await self._phase_judging(proposals)
+
+        # No majority after revote — reject and demote to indev
+        if winner_idx == -1:
+            reason = (
+                f"No consensus on optimization approach after revote. "
+                f"Round 1: {r1_tally}, Round 2: {r2_tally}."
+            )
+            logger.warning("[optimization] Rejecting task '%s': %s", self.task_id, reason)
+            result = OptimizationPipelineResult(
+                task_id=self.task_id,
+                outcome="rejected",
+                baseline_report=baseline,
+                proposals=proposals,
+                judge_scores=scores,
+                improvement_summary=reason,
+                prompt_tokens=self._total_prompt,
+                completion_tokens=self._total_completion,
+                revote_occurred=revote,
+                round1_vote_tally=r1_tally,
+                round2_vote_tally=r2_tally,
+                demotion_target="indev",
+            )
+            self._store_result(result)
+            return result
 
         if not proposals or winner_score < 0.3:
             logger.info("[optimization] No viable proposals, skipping optimization.")
@@ -243,67 +271,94 @@ class OptimizationPipeline:
 
     async def _phase_judging(
         self, proposals: list[dict]
-    ) -> tuple[list[dict], int, float]:
-        """Judge proposals and select winner."""
+    ) -> tuple[list[dict], int, float, dict, dict, bool]:
+        """Judge proposals and select winner via majority vote.
+
+        Returns (all_scores, winner_idx, winner_score, round1_tally, round2_tally, revote_occurred).
+        winner_idx == -1 signals no majority after both rounds.
+        """
         if not proposals:
-            return [], 0, 0.0
+            return [], 0, 0.0, {}, {}, False
 
-        judge_prompt = (
-            "Rate each optimization proposal on a scale of 0-100.\n"
-            "Consider: estimated improvement, implementation risk, code complexity impact.\n\n"
-        )
-        for i, p in enumerate(proposals):
-            judge_prompt += f"\n--- Proposal {i} ---\n{json.dumps(p, indent=1)[:1500]}\n"
+        majority_threshold = OPTIMIZATION_JUDGE_COUNT / 2
 
-        judge_prompt += (
-            "\nOutput JSON: {\"scores\": [{\"index\": 0, \"score\": 0, \"rationale\": \"...\"}], "
-            "\"winner_index\": 0}"
-        )
-
-        tasks = []
-        for _ in range(OPTIMIZATION_JUDGE_COUNT):
-            tasks.append(
-                call_llm(
-                    [
-                        {"role": "system", "content": "You are an optimization judge. Output only JSON."},
-                        {"role": "user", "content": judge_prompt},
-                    ],
-                    base_url=self.llm_base_url,
-                    model=self.llm_model,
-                    temperature=OPTIMIZATION_JUDGE_TEMPERATURE,
-                    response_format={"type": "json_object"},
-                    task_id=self.task_id,
-                    llm_id=self.llm_id,
-                    budget_id=self.budget_id,
-                )
+        def _build_prompt(extra_context: str = "") -> str:
+            p = (
+                "Rate each optimization proposal on a scale of 0-100.\n"
+                "Consider: estimated improvement, implementation risk, code complexity impact.\n\n"
             )
+            for i, prop in enumerate(proposals):
+                p += f"\n--- Proposal {i} ---\n{json.dumps(prop, indent=1)[:1500]}\n"
+            if extra_context:
+                p += f"\n{extra_context}\n"
+            p += (
+                "\nOutput JSON: {\"scores\": [{\"index\": 0, \"score\": 0, \"rationale\": \"...\"}], "
+                "\"winner_index\": 0}"
+            )
+            return p
 
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        async def _run_judges(judge_prompt: str) -> tuple[list[dict], dict[int, int]]:
+            tasks = []
+            for _ in range(OPTIMIZATION_JUDGE_COUNT):
+                tasks.append(
+                    call_llm(
+                        [
+                            {"role": "system", "content": "You are an optimization judge. Output only JSON."},
+                            {"role": "user", "content": judge_prompt},
+                        ],
+                        base_url=self.llm_base_url,
+                        model=self.llm_model,
+                        temperature=OPTIMIZATION_JUDGE_TEMPERATURE,
+                        response_format={"type": "json_object"},
+                        task_id=self.task_id,
+                        llm_id=self.llm_id,
+                        budget_id=self.budget_id,
+                    )
+                )
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            scores: list[dict] = []
+            votes: dict[int, int] = {}
+            for resp in responses:
+                if isinstance(resp, Exception):
+                    continue
+                self._track_tokens(resp)
+                content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+                try:
+                    data = json.loads(content)
+                    scores.append(data)
+                    winner = data.get("winner_index", 0)
+                    votes[winner] = votes.get(winner, 0) + 1
+                except json.JSONDecodeError:
+                    pass
+            return scores, votes
 
-        all_scores = []
-        winner_votes: dict[int, int] = {}
-        for resp in responses:
-            if isinstance(resp, Exception):
-                continue
-            self._track_tokens(resp)
-            content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
-            try:
-                data = json.loads(content)
-                all_scores.append(data)
-                winner = data.get("winner_index", 0)
-                winner_votes[winner] = winner_votes.get(winner, 0) + 1
-            except json.JSONDecodeError:
-                pass
+        # --- Round 1 ---
+        r1_scores, r1_votes = await _run_judges(_build_prompt())
+        r1_tally = dict(r1_votes)
+        best_r1 = max(r1_votes, key=r1_votes.get) if r1_votes else None
+        if best_r1 is not None and r1_votes[best_r1] > majority_threshold:
+            winner_score = r1_votes[best_r1] / OPTIMIZATION_JUDGE_COUNT
+            return r1_scores, best_r1, winner_score, r1_tally, {}, False
 
-        # Pick the most-voted winner
-        if winner_votes:
-            best_idx = max(winner_votes, key=winner_votes.get)
-            best_score = winner_votes[best_idx] / max(len(responses), 1)
-        else:
-            best_idx = 0
-            best_score = 0.0
+        # --- No majority — revote with context ---
+        logger.info("[optimization] No majority in round 1 (tally=%s). Running revote.", r1_tally)
+        vote_summary = ", ".join(
+            f"Proposal {idx}: {count} vote(s)" for idx, count in sorted(r1_tally.items())
+        )
+        revote_context = (
+            f"Previous round had no majority. Votes: {vote_summary}. "
+            "Please reconsider and vote for the strongest proposal."
+        )
+        r2_scores, r2_votes = await _run_judges(_build_prompt(revote_context))
+        r2_tally = dict(r2_votes)
+        best_r2 = max(r2_votes, key=r2_votes.get) if r2_votes else None
+        if best_r2 is not None and r2_votes[best_r2] > majority_threshold:
+            winner_score = r2_votes[best_r2] / OPTIMIZATION_JUDGE_COUNT
+            return r1_scores + r2_scores, best_r2, winner_score, r1_tally, r2_tally, True
 
-        return all_scores, best_idx, best_score
+        # --- Still no majority ---
+        logger.warning("[optimization] No majority after revote (r1=%s, r2=%s).", r1_tally, r2_tally)
+        return r1_scores + r2_scores, -1, 0.0, r1_tally, r2_tally, True
 
     # ------------------------------------------------------------------
     # Phase 4: Implementation

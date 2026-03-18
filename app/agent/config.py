@@ -277,6 +277,7 @@ INDEV_ENFORCE_FILE_CONTAINMENT: bool = _getbool("indev", "enforce_file_containme
 CONCEPTUAL_REVIEW_MAX_TURNS: int = _getint("conceptual_review", "reviewer_max_turns", None, 15)
 CONCEPTUAL_REVIEW_LLM_TEMPERATURE: float = _getfloat("conceptual_review", "llm_temperature", None, 0.15)
 CONCEPTUAL_REVIEW_HIGH_SEVERITY_BLOCKS: bool = _getbool("conceptual_review", "high_severity_blocks_advance", None, True)
+CONCEPTUAL_REVIEW_RESEARCH_LIVES: int = _getint("conceptual_review", "research_agent_max_lives", None, 2)
 
 # ===========================================================================
 # Optimization
