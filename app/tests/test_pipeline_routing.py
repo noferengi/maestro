@@ -23,9 +23,29 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # ---------------------------------------------------------------------------
 
 def _delete_task(task_id):
-    from database import SessionLocal, Task
+    from database import (
+        SessionLocal, Task, TransitionVote, TransitionResult, BudgetEntry,
+        SubdivisionRecord, PlanningResult, ComponentResult,
+        OptimizationResult, SecurityReviewResult, FullReviewResult,
+        MergeRecord,
+    )
     db = SessionLocal()
     try:
+        # Delete all child records that FK-reference this task before deleting
+        # the task itself (required now that PRAGMA foreign_keys=ON is set).
+        # Models with task_id FK column:
+        for model in (
+            TransitionVote, TransitionResult, BudgetEntry,
+            PlanningResult, ComponentResult, OptimizationResult,
+            SecurityReviewResult, FullReviewResult, MergeRecord,
+        ):
+            db.query(model).filter(model.task_id == task_id).delete(synchronize_session=False)
+        # SubdivisionRecord uses parent_task_id, not task_id.
+        db.query(SubdivisionRecord).filter(
+            SubdivisionRecord.parent_task_id == task_id
+        ).delete(synchronize_session=False)
+        # Self-referential child tasks (parent_task_id FK on Task).
+        db.query(Task).filter(Task.parent_task_id == task_id).delete(synchronize_session=False)
         db.query(Task).filter(Task.id == task_id).delete(synchronize_session=False)
         db.commit()
     finally:
