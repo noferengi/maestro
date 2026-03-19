@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Test artefacts
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg
+
+# Databases
+# Production DB is committed (tracked history); test DB is never committed.
+data/test.db
+data/test.db-shm
+data/test.db-wal
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Maestro agent artefacts
+.archive/
+.maestro/task_dag.json

@@ -19,8 +19,11 @@ from pathlib import Path
 # Paths
 # ---------------------------------------------------------------------------
 MIGRATIONS_DIR = Path(__file__).parent / "versions"
-# Project root is three levels up: versions/ -> migrations/ -> app/ -> project/
-DB_PATH = Path(__file__).parent.parent.parent / "data" / "kanban.db"
+# MAESTRO_TEST_DB lets conftest.py redirect the runner to the test database.
+# Production code never sets this variable, so it always falls back to
+# the canonical data/kanban.db path.
+_env_db = os.environ.get("MAESTRO_TEST_DB")
+DB_PATH = Path(_env_db) if _env_db else Path(__file__).parent.parent.parent / "data" / "kanban.db"
 
 
 # ---------------------------------------------------------------------------
