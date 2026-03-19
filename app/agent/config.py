@@ -319,3 +319,31 @@ MERGE_TEST_TIMEOUT: int = _getint("merge", "test_timeout", None, 300)
 MERGE_AUTO_PUSH: bool = _getbool("merge", "auto_push", None, True)
 MERGE_TAG_BRANCHES: bool = _getbool("merge", "tag_merged_branches", None, True)
 MERGE_DELETE_BRANCHES: bool = _getbool("merge", "delete_merged_branches", None, False)
+
+# ===========================================================================
+# Pipeline stage order and completion detection
+# ===========================================================================
+
+PIPELINE_COLUMN_ORDER: list[str] = _getlist(
+    "pipeline", "column_order",
+    "architecture, idea, planning, indev, conceptual_review, "
+    "optimization, security, full_review, completed",
+)
+
+PIPELINE_DONE_STATUSES: frozenset[str] = frozenset(
+    _getlist("pipeline", "done_statuses", "completed, accepted")
+)
+
+# ===========================================================================
+# Tool behaviour limits
+# ===========================================================================
+
+TOOL_MAX_SEARCH_RESULTS: int = _getint("tools", "max_search_results", None, 200)
+TOOL_MAX_GIT_LOG_ENTRIES: int = _getint("tools", "max_git_log_entries", None, 100)
+GIT_TIMEOUT_SECONDS: int = _getint("tools", "git_timeout_seconds", None, 30)
+
+TOOL_LISTING_EXCLUDED_DIRS: set[str] = set(_getlist(
+    "tools", "excluded_directories",
+    ".archive, .git, venv, .venv, __pycache__, node_modules, "
+    ".mypy_cache, .pytest_cache, .ruff_cache, dist, build, .eggs",
+))

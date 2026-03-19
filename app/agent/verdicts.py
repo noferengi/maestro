@@ -22,13 +22,13 @@ from enum import Enum
 class Verdict(Enum):
     """Pipeline verdict with associated confidence ranges."""
 
-    REJECTED = "rejected"
-    NOT_SUITABLE = "not_suitable"
-    NEEDS_RESEARCH = "needs_research"
-    POSSIBLE = "possible"
-    LIKELY = "likely"
-    SUBDIVIDE_IDEA = "subdivide_idea"
-    CONDITIONAL_PASS = "conditional_pass"
+    REJECTED = "REJECTED"
+    NOT_SUITABLE = "NOT_SUITABLE"
+    NEEDS_RESEARCH = "NEEDS_RESEARCH"
+    POSSIBLE = "POSSIBLE"
+    LIKELY = "LIKELY"
+    SUBDIVIDE_IDEA = "SUBDIVIDE_IDEA"
+    CONDITIONAL_PASS = "CONDITIONAL_PASS"
 
     @property
     def confidence_range(self) -> tuple[int, int]:

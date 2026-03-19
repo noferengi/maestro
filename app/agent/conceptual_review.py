@@ -372,7 +372,7 @@ class ConceptualReviewPipeline:
         try:
             data = json.loads(content)
             verdict_str = data.get("verdict", "POSSIBLE").upper()
-            verdict = Verdict(verdict_str.lower())
+            verdict = Verdict(verdict_str)
             confidence = int(data.get("confidence", 80))
             lo, hi = verdict.confidence_range
             confidence = max(lo, min(hi, confidence))

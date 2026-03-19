@@ -18,6 +18,7 @@ from typing import Any
 from app.agent.config import (
     PLANNING_GATE_FEASIBILITY_RECHECK,
     PLANNING_GATE_CONTEXT_SAFETY_MARGIN,
+    PIPELINE_DONE_STATUSES,
     PROJECT_ROOT,
 )
 
@@ -270,12 +271,11 @@ class PlanningGate:
                 detail="No prerequisites.",
             )
 
-        done_statuses = {"completed", "accepted"}
         task_by_id = {t["id"]: t for t in self.all_tasks}
         unfinished = []
         for pid in prereqs:
             ptask = task_by_id.get(pid)
-            if not ptask or ptask.get("type", "").lower() not in done_statuses:
+            if not ptask or ptask.get("type", "").lower() not in PIPELINE_DONE_STATUSES:
                 unfinished.append(pid)
 
         if unfinished:

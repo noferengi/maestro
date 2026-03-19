@@ -39,6 +39,8 @@ from database import (
     create_merge_record, get_merge_record,
 )
 
+from app.agent.config import PIPELINE_COLUMN_ORDER, PIPELINE_DONE_STATUSES
+
 app = FastAPI(title="Kanban Board API")
 
 # Mount static files directory
@@ -129,14 +131,10 @@ def create_new_task(task_data: dict):
     return task_to_dict(task)
 
 
-# Column ordering for advancement detection
-_COLUMN_ORDER = ['architecture', 'idea', 'planning', 'indev', 'conceptual_review', 'optimization', 'security', 'full_review', 'completed']
-
-
 def _is_advancing(old_type: str, new_type: str) -> bool:
     """True when the type change moves a task forward in the pipeline."""
     try:
-        return _COLUMN_ORDER.index(new_type) > _COLUMN_ORDER.index(old_type)
+        return PIPELINE_COLUMN_ORDER.index(new_type) > PIPELINE_COLUMN_ORDER.index(old_type)
     except ValueError:
         return False
 
@@ -178,7 +176,7 @@ def update_existing_task(task_id: str, task_data: dict):
         raise HTTPException(status_code=500, detail="Failed to update task")
 
     # Check for completion rollup if task moved to completed
-    if new_type and new_type.lower() in ("completed", "accepted"):
+    if new_type and new_type.lower() in PIPELINE_DONE_STATUSES:
         _check_completion_rollup(task_id)
 
     return task_to_dict(updated_task)
@@ -1361,7 +1359,7 @@ def _check_completion_rollup(task_id: str):
         return
 
     all_done = all(
-        (c.type or "").lower() in ("completed", "accepted")
+        (c.type or "").lower() in PIPELINE_DONE_STATUSES
         for c in children
     )
 

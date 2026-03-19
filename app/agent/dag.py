@@ -28,13 +28,13 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from typing import Any
 
+from app.agent.config import PIPELINE_COLUMN_ORDER, PIPELINE_DONE_STATUSES
 
 # Status / column names that count as "this task is done"
-_DONE_STATUSES = {"completed", "accepted"}
+_DONE_STATUSES: frozenset[str] = PIPELINE_DONE_STATUSES
 
-# Canonical type-order for priority tie-breaking
-# (lower index = higher priority)
-_TYPE_ORDER = ["architecture", "idea", "planning", "indev", "conceptual_review", "optimization", "security", "full_review", "completed"]
+# Canonical type-order for priority tie-breaking (lower index = higher priority)
+_TYPE_ORDER: list[str] = PIPELINE_COLUMN_ORDER
 
 
 def _is_done(task: dict) -> bool:

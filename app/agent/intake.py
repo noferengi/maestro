@@ -41,28 +41,24 @@ from app.agent.config import (
     LLM_MODEL,
 )
 from app.agent.llm_client import call_llm
+from app.agent.verdicts import Verdict
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Verdict constants
+# Verdict constants — derived from the canonical Verdict enum so that any
+# future rename in verdicts.py propagates here automatically.
 # ---------------------------------------------------------------------------
 
-VERDICT_POSSIBLE = "POSSIBLE"
-VERDICT_LIKELY = "LIKELY"
-VERDICT_NOT_SUITABLE = "NOT_SUITABLE"
-VERDICT_REJECTED = "REJECTED"
-VERDICT_NEEDS_RESEARCH = "NEEDS_RESEARCH"
-VERDICT_SUBDIVIDE_IDEA = "SUBDIVIDE_IDEA"
+VERDICT_POSSIBLE = Verdict.POSSIBLE.value
+VERDICT_LIKELY = Verdict.LIKELY.value
+VERDICT_NOT_SUITABLE = Verdict.NOT_SUITABLE.value
+VERDICT_REJECTED = Verdict.REJECTED.value
+VERDICT_NEEDS_RESEARCH = Verdict.NEEDS_RESEARCH.value
+VERDICT_SUBDIVIDE_IDEA = Verdict.SUBDIVIDE_IDEA.value
 
-_VALID_VERDICTS = {
-    VERDICT_POSSIBLE,
-    VERDICT_LIKELY,
-    VERDICT_NOT_SUITABLE,
-    VERDICT_REJECTED,
-    VERDICT_NEEDS_RESEARCH,
-    VERDICT_SUBDIVIDE_IDEA,
-}
+# All valid verdict strings (excludes CONDITIONAL_PASS which intake doesn't emit)
+_VALID_VERDICTS = {v.value for v in Verdict} - {Verdict.CONDITIONAL_PASS.value}
 
 # ---------------------------------------------------------------------------
 # Stage system prompts

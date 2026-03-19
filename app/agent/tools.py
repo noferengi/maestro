@@ -35,6 +35,10 @@ from app.agent.config import (
     SHELL_TIMEOUT_SECONDS,
     GIT_SAFETY_BRANCH_PREFIX,
     GIT_ALLOWED_BASE_BRANCHES,
+    GIT_TIMEOUT_SECONDS,
+    TOOL_MAX_SEARCH_RESULTS,
+    TOOL_MAX_GIT_LOG_ENTRIES,
+    TOOL_LISTING_EXCLUDED_DIRS,
 )
 
 # ---------------------------------------------------------------------------
@@ -44,26 +48,12 @@ from app.agent.config import (
 # ---------------------------------------------------------------------------
 # Directory exclusions for listing tools
 # ---------------------------------------------------------------------------
-# Directories named in this set are hidden from list_directory, find_files,
-# and search_files. Add any folder you never want agents to browse or search.
-# The project-root .archive folder (ARCHIVE_DIR) is always excluded regardless
-# of this list; .git is always excluded regardless of this list.
-# These are matched against the *basename* of each directory entry.
+# Sourced from maestro.ini [tools] excluded_directories.
+# Add entries there to extend — no code change required.
+# The root .archive folder and .git are always excluded by absolute path
+# regardless of this set.
 
-LISTING_EXCLUDED_DIRS: set[str] = {
-    ".archive",        # soft-delete holding area (also excluded by absolute path)
-    ".git",            # git internals — agents use git_* tools instead
-    "venv",            # Python virtual environment
-    ".venv",           # alternate venv name
-    "__pycache__",     # compiled bytecode
-    "node_modules",    # JS dependencies
-    ".mypy_cache",     # mypy type-check cache
-    ".pytest_cache",   # pytest cache
-    ".ruff_cache",     # ruff linter cache
-    "dist",            # build output
-    "build",           # build output
-    ".eggs",           # setuptools eggs
-}
+LISTING_EXCLUDED_DIRS: set[str] = TOOL_LISTING_EXCLUDED_DIRS
 
 BLOCKED_PATTERNS: list[str] = [
     r"rm\s+-[rRfF]",           # rm -rf / rm -fr etc.
@@ -289,8 +279,8 @@ def search_files(pattern: str, directory: str = ".") -> str:
                         if compiled.search(line):
                             rel = os.path.relpath(fpath, safe_dir)
                             results.append(f"{rel}:{lineno}: {line.rstrip()}")
-                            if len(results) >= 200:
-                                results.append("... (truncated at 200 results)")
+                            if len(results) >= TOOL_MAX_SEARCH_RESULTS:
+                                results.append(f"... (truncated at {TOOL_MAX_SEARCH_RESULTS} results)")
                                 return "\n".join(results)
             except OSError:
                 continue
@@ -350,7 +340,7 @@ def find_files(glob_pattern: str, directory: str = ".") -> str:
     ]
     if not filtered:
         return "No files found matching the pattern."
-    lines = [os.path.relpath(m, safe_dir) for m in sorted(filtered)[:200]]
+    lines = [os.path.relpath(m, safe_dir) for m in sorted(filtered)[:TOOL_MAX_SEARCH_RESULTS]]
     return "\n".join(lines)
 
 
@@ -482,7 +472,7 @@ def _git_run(args: list[str], cwd: str = PROJECT_ROOT) -> tuple[int, str, str]:
             cwd=cwd,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=GIT_TIMEOUT_SECONDS,
         )
         return result.returncode, result.stdout.strip(), result.stderr.strip()
     except Exception as exc:
@@ -517,7 +507,7 @@ def git_log(path: str | None = None, max_count: int = 20) -> str:
     Return recent git log entries. Optionally scoped to a specific file path.
     Read-only operation — safe for research agents.
     """
-    max_count = min(max(1, max_count), 100)  # clamp to [1, 100]
+    max_count = min(max(1, max_count), TOOL_MAX_GIT_LOG_ENTRIES)
     args = ["git", "log", f"--max-count={max_count}",
             "--format=%h %ai %an | %s"]
     if path:

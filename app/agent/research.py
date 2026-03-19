@@ -33,6 +33,7 @@ from app.agent.config import (
     RESEARCH_AGENT_MAX_LIVES,
     RESEARCH_AGENT_TOOLS,
 )
+from app.agent.json_utils import extract_json_block
 from app.agent.llm_client import call_llm
 from app.agent.tools import TOOL_SCHEMAS, TOOL_REGISTRY, dispatch_tool
 
@@ -439,31 +440,15 @@ class ResearchAgent:
 
     def _extract_vote(self, content: str) -> dict | None:
         """Try to extract a verdict JSON from the assistant's content."""
-        if not content:
+        raw = extract_json_block(content)
+        if raw is None:
             return None
-
-        # Try fenced JSON block first
-        import re
-        fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-        if fenced:
-            try:
-                parsed = json.loads(fenced.group(1))
-                if "verdict" in parsed and "confidence" in parsed:
-                    return parsed
-            except (json.JSONDecodeError, ValueError):
-                pass
-
-        # Try bare JSON object
-        start = content.find("{")
-        end = content.rfind("}")
-        if start != -1 and end > start:
-            try:
-                parsed = json.loads(content[start:end + 1])
-                if "verdict" in parsed and "confidence" in parsed:
-                    return parsed
-            except (json.JSONDecodeError, ValueError):
-                pass
-
+        try:
+            parsed = json.loads(raw.strip())
+            if isinstance(parsed, dict) and "verdict" in parsed and "confidence" in parsed:
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
         return None
 
 

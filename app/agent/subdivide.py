@@ -35,7 +35,7 @@ from app.agent.config import (
     SUBDIVISION_CONTEXT_AWARE_TOOLS,
 )
 from app.agent.llm_client import call_llm
-from app.agent.tools import TOOL_SCHEMAS, async_dispatch_tool
+from app.agent.tools import TOOL_SCHEMAS, async_dispatch_tool, LISTING_EXCLUDED_DIRS
 
 logger = logging.getLogger(__name__)
 
@@ -54,11 +54,7 @@ _SOURCE_EXTENSIONS = {
 def _has_meaningful_source_files(project_root: str = PROJECT_ROOT) -> bool:
     """Check if the project directory contains meaningful source code files."""
     for root, dirs, files in os.walk(project_root):
-        # Skip hidden dirs, venv, node_modules
-        dirs[:] = [
-            d for d in dirs
-            if not d.startswith('.') and d not in ('venv', '__pycache__', 'node_modules', '.archive')
-        ]
+        dirs[:] = [d for d in dirs if d not in LISTING_EXCLUDED_DIRS]
         for fname in files:
             ext = os.path.splitext(fname)[1].lower()
             if ext in _SOURCE_EXTENSIONS:

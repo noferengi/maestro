@@ -30,6 +30,7 @@ from app.agent.config import (
     CONTEXT_WARNING_ENABLED,
     CONTEXT_WARNING_THRESHOLDS,
 )
+from app.agent.json_utils import extract_json_block
 from app.agent.llm_client import call_llm
 from app.agent.system_prompt import MAESTRO_SYSTEM_PROMPT
 from app.agent.tools import TOOL_SCHEMAS, dispatch_tool
@@ -395,7 +396,7 @@ class MaestroLoop:
         if not content:
             return None
         # Try to find a JSON block in the content
-        for attempt in [content, self._extract_json_block(content)]:
+        for attempt in [content, extract_json_block(content)]:
             if not attempt:
                 continue
             try:
@@ -408,20 +409,6 @@ class MaestroLoop:
                 continue
         return None
 
-    @staticmethod
-    def _extract_json_block(text: str) -> str | None:
-        """Extract the first ```json ... ``` or bare { ... } block from text."""
-        import re
-        # Try fenced code block
-        fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-        if fenced:
-            return fenced.group(1)
-        # Try bare outermost JSON object
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return text[start : end + 1]
-        return None
 
     # ------------------------------------------------------------------
     # Terminal handlers
