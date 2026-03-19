@@ -15,7 +15,7 @@ class TestSubdivideVerdict:
     """SUBDIVIDE_IDEA is a valid Verdict with full 0-100 confidence range."""
 
     def test_subdivide_idea_exists(self):
-        assert Verdict.SUBDIVIDE_IDEA.value == "subdivide_idea"
+        assert Verdict.SUBDIVIDE_IDEA.value == "SUBDIVIDE_IDEA"
 
     def test_subdivide_idea_confidence_range(self):
         lo, hi = Verdict.SUBDIVIDE_IDEA.confidence_range
