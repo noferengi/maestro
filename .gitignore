@@ -19,8 +19,10 @@ env/
 htmlcov/
 *.egg
 
-# Databases
-# Production DB is committed (tracked history); test DB is never committed.
+# Databases — never commit live data
+data/kanban.db
+data/kanban.db-shm
+data/kanban.db-wal
 data/test.db
 data/test.db-shm
 data/test.db-wal
