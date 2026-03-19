@@ -9,8 +9,12 @@ from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
 import os
 
-# Database path - keep it in the project directory
-DATABASE_PATH = os.path.join(os.path.dirname(__file__), '..', 'data', 'kanban.db')
+# Database path - keep it in the project directory.
+# MAESTRO_TEST_DB env var lets conftest.py redirect to a temp file per session.
+DATABASE_PATH = (
+    os.environ.get("MAESTRO_TEST_DB")
+    or os.path.join(os.path.dirname(__file__), '..', 'data', 'kanban.db')
+)
 
 # Ensure data directory exists
 os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)

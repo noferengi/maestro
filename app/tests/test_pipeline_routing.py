@@ -486,61 +486,70 @@ class TestIntakePipelineMockLLM:
     def test_all_pass_outcome_is_passed(self):
         """intake_all_pass scenario → outcome == 'passed'."""
         task_id = "test-intake-pass"
-        budget_id = _make_budget("test-intake-pass-budget")
-        _make_task(task_id, "idea", description="User auth")
+        budget_id = None
         try:
+            budget_id = _make_budget("test-intake-pass-budget")
+            _make_task(task_id, "idea", description="User auth")
             result = self._run_intake("intake_all_pass", task_id, budget_id)
             assert result["outcome"] == "passed", \
                 f"Expected 'passed', got {result['outcome']!r}. Votes: {result.get('votes')}"
         finally:
             _delete_task(task_id)
-            _cleanup_budget(budget_id)
+            if budget_id is not None:
+                _cleanup_budget(budget_id)
 
     def test_rejected_scope_outcome_is_rejected(self):
         """intake_rejected scenario (scope votes REJECTED) → outcome == 'rejected'."""
         task_id = "test-intake-rej"
-        budget_id = _make_budget("test-intake-rej-budget")
-        _make_task(task_id, "idea", description="User auth")
+        budget_id = None
         try:
+            budget_id = _make_budget("test-intake-rej-budget")
+            _make_task(task_id, "idea", description="User auth")
             result = self._run_intake("intake_rejected", task_id, budget_id)
             assert result["outcome"] == "rejected", \
                 f"Expected 'rejected', got {result['outcome']!r}"
         finally:
             _delete_task(task_id)
-            _cleanup_budget(budget_id)
+            if budget_id is not None:
+                _cleanup_budget(budget_id)
 
     def test_needs_research_triggers_research_then_passes(self):
         """intake_needs_research scenario → research agent runs → outcome == 'passed'."""
         task_id = "test-intake-nr"
-        budget_id = _make_budget("test-intake-nr-budget")
-        _make_task(task_id, "idea", description="User auth")
+        budget_id = None
         try:
+            budget_id = _make_budget("test-intake-nr-budget")
+            _make_task(task_id, "idea", description="User auth")
             result = self._run_intake("intake_needs_research", task_id, budget_id)
             assert result["outcome"] == "passed", \
                 f"Expected 'passed' after research, got {result['outcome']!r}"
         finally:
             _delete_task(task_id)
-            _cleanup_budget(budget_id)
+            if budget_id is not None:
+                _cleanup_budget(budget_id)
 
     def test_tie_triggers_tiebreaker_then_passes(self):
         """intake_tie scenario → tie-breaker fires → outcome == 'passed'."""
         task_id = "test-intake-tie"
-        budget_id = _make_budget("test-intake-tie-budget")
-        _make_task(task_id, "idea", description="User auth")
+        budget_id = None
         try:
+            budget_id = _make_budget("test-intake-tie-budget")
+            _make_task(task_id, "idea", description="User auth")
             result = self._run_intake("intake_tie", task_id, budget_id)
             assert result["outcome"] == "passed", \
                 f"Expected 'passed' after tiebreak, got {result['outcome']!r}"
         finally:
             _delete_task(task_id)
-            _cleanup_budget(budget_id)
+            if budget_id is not None:
+                _cleanup_budget(budget_id)
 
     def test_pass_result_contains_votes(self):
         """Passed intake result must include vote records from all stages."""
         task_id = "test-intake-votes"
-        budget_id = _make_budget("test-intake-votes-budget")
-        _make_task(task_id, "idea", description="User auth")
+        budget_id = None
         try:
+            budget_id = _make_budget("test-intake-votes-budget")
+            _make_task(task_id, "idea", description="User auth")
             result = self._run_intake("intake_all_pass", task_id, budget_id)
             assert "votes" in result
             assert len(result["votes"]) >= 3, \
@@ -549,14 +558,16 @@ class TestIntakePipelineMockLLM:
             assert "scope_analysis" in stages
         finally:
             _delete_task(task_id)
-            _cleanup_budget(budget_id)
+            if budget_id is not None:
+                _cleanup_budget(budget_id)
 
     def test_rejected_result_contains_justification(self):
         """Rejected intake result must carry a justification in the vote."""
         task_id = "test-intake-rej-just"
-        budget_id = _make_budget("test-intake-rej-just-budget")
-        _make_task(task_id, "idea", description="User auth")
+        budget_id = None
         try:
+            budget_id = _make_budget("test-intake-rej-just-budget")
+            _make_task(task_id, "idea", description="User auth")
             result = self._run_intake("intake_rejected", task_id, budget_id)
             assert result["outcome"] == "rejected"
             votes = result.get("votes", [])
@@ -564,7 +575,8 @@ class TestIntakePipelineMockLLM:
                 "At least one vote must carry a justification string"
         finally:
             _delete_task(task_id)
-            _cleanup_budget(budget_id)
+            if budget_id is not None:
+                _cleanup_budget(budget_id)
 
 
 # ---------------------------------------------------------------------------
