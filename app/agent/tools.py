@@ -41,6 +41,30 @@ from app.agent.config import (
 # Safety helpers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Directory exclusions for listing tools
+# ---------------------------------------------------------------------------
+# Directories named in this set are hidden from list_directory, find_files,
+# and search_files. Add any folder you never want agents to browse or search.
+# The project-root .archive folder (ARCHIVE_DIR) is always excluded regardless
+# of this list; .git is always excluded regardless of this list.
+# These are matched against the *basename* of each directory entry.
+
+LISTING_EXCLUDED_DIRS: set[str] = {
+    ".archive",        # soft-delete holding area (also excluded by absolute path)
+    ".git",            # git internals — agents use git_* tools instead
+    "venv",            # Python virtual environment
+    ".venv",           # alternate venv name
+    "__pycache__",     # compiled bytecode
+    "node_modules",    # JS dependencies
+    ".mypy_cache",     # mypy type-check cache
+    ".pytest_cache",   # pytest cache
+    ".ruff_cache",     # ruff linter cache
+    "dist",            # build output
+    "build",           # build output
+    ".eggs",           # setuptools eggs
+}
+
 BLOCKED_PATTERNS: list[str] = [
     r"rm\s+-[rRfF]",           # rm -rf / rm -fr etc.
     r"del\s+/[sfSF]",          # del /s /f
@@ -80,6 +104,67 @@ def _assert_safe_path(path: str) -> str:
             f"the project root '{root}'. Access denied."
         )
     return resolved
+
+
+def _assert_archivable(path: str) -> str:
+    """
+    Extended safety check used exclusively by archive_file.
+
+    Rules (in priority order):
+      1. Path must be inside PROJECT_ROOT (delegates to _assert_safe_path).
+      2. Path must NOT touch .git or anything inside it — git history is
+         permanently protected. Archiving git internals would destroy the repo.
+      3. Path must NOT be inside the root archive directory (ARCHIVE_DIR).
+         Re-archiving an already-archived file makes no sense and is rejected
+         with instructions on how to restore instead.
+
+    Returns the resolved absolute path on success.
+    Raises ValueError with a descriptive message on any violation.
+    """
+    safe = _assert_safe_path(path)          # raises ValueError if outside PROJECT_ROOT
+    root = os.path.realpath(PROJECT_ROOT)
+    git_dir = os.path.join(root, ".git")
+    archive_root = os.path.realpath(ARCHIVE_DIR)
+
+    # Hard reject: .git folder and every path inside it
+    if safe == git_dir or safe.startswith(git_dir + os.sep):
+        raise ValueError(
+            f"HARD REJECTION: '{path}' is inside the .git folder. "
+            "Archiving git internals would permanently destroy repository history. "
+            "This operation is blocked and cannot be overridden."
+        )
+
+    # Hard reject: root archive dir and every path inside it
+    if safe == archive_root or safe.startswith(archive_root + os.sep):
+        raise ValueError(
+            f"HARD REJECTION: '{path}' is already inside the archive directory "
+            f"'{ARCHIVE_DIR}'. Cannot re-archive an archived file. "
+            "If you need to restore it, see the undelete instructions returned "
+            "by calling archive_file on the original path."
+        )
+
+    return safe
+
+
+def _find_archived_copies(rel_path: str) -> list[str]:
+    """
+    Scan ARCHIVE_DIR for all previously archived copies of rel_path.
+    rel_path must be relative to PROJECT_ROOT.
+    Returns a list of absolute paths ordered most-recent first.
+    """
+    archive_root = os.path.realpath(ARCHIVE_DIR)
+    if not os.path.isdir(archive_root):
+        return []
+    found: list[str] = []
+    try:
+        ts_dirs = sorted(os.listdir(archive_root), reverse=True)
+    except OSError:
+        return []
+    for ts_dir in ts_dirs:
+        candidate = os.path.join(archive_root, ts_dir, rel_path)
+        if os.path.exists(candidate):
+            found.append(candidate)
+    return found
 
 
 def _is_command_blocked(command: str) -> tuple[bool, str]:
@@ -137,17 +222,41 @@ def append_file(path: str, content: str) -> str:
 
 
 def list_directory(path: str = ".") -> str:
-    """List files and directories at the given path."""
+    """
+    List files and directories at the given path.
+    Directories named in LISTING_EXCLUDED_DIRS are hidden automatically.
+    The project-root archive folder and .git are always hidden regardless of
+    the exclusion set.
+    """
     safe_path = _assert_safe_path(path)
     if not os.path.isdir(safe_path):
         return f"ERROR: '{path}' is not a directory."
+
+    _archive_real = os.path.realpath(ARCHIVE_DIR)
+    root_real = os.path.realpath(PROJECT_ROOT)
+    git_dir = os.path.join(root_real, ".git")
+
     entries = sorted(os.listdir(safe_path))
     lines: list[str] = []
+    hidden = 0
     for entry in entries:
         full = os.path.join(safe_path, entry)
+        full_real = os.path.realpath(full)
+        # Always hide: project-root archive dir and .git
+        if full_real == _archive_real or full_real == git_dir:
+            hidden += 1
+            continue
+        # Hide any directory whose basename is in the exclusion set
+        if os.path.isdir(full) and entry in LISTING_EXCLUDED_DIRS:
+            hidden += 1
+            continue
         kind = "DIR " if os.path.isdir(full) else "FILE"
         lines.append(f"{kind}  {entry}")
-    return "\n".join(lines) if lines else "(empty directory)"
+
+    result = "\n".join(lines) if lines else "(empty directory)"
+    if hidden:
+        result += f"\n[{hidden} system/excluded director{'ies' if hidden != 1 else 'y'} hidden]"
+    return result
 
 
 def search_files(pattern: str, directory: str = ".") -> str:
@@ -162,11 +271,15 @@ def search_files(pattern: str, directory: str = ".") -> str:
     except re.error as exc:
         return f"ERROR: invalid regex pattern '{pattern}': {exc}"
 
+    _archive_real = os.path.realpath(ARCHIVE_DIR)
     for root, dirs, files in os.walk(safe_dir):
-        # Skip hidden dirs and venv
+        # Skip excluded directories (LISTING_EXCLUDED_DIRS covers .git, venv, etc.)
+        # Also skip the root archive folder by absolute path so nested .archive
+        # subdirectories inside source trees are not affected.
         dirs[:] = [
             d for d in dirs
-            if not d.startswith(".") and d not in ("venv", "__pycache__", "node_modules")
+            if d not in LISTING_EXCLUDED_DIRS
+            and os.path.realpath(os.path.join(root, d)) != _archive_real
         ]
         for fname in files:
             fpath = os.path.join(root, fname)
@@ -227,11 +340,13 @@ def find_files(glob_pattern: str, directory: str = ".") -> str:
     safe_dir = _assert_safe_path(directory)
     full_pattern = os.path.join(safe_dir, "**", glob_pattern)
     matches = _glob.glob(full_pattern, recursive=True)
-    # Filter out venv / __pycache__
+    _archive_real = os.path.realpath(ARCHIVE_DIR)
+    # Filter out excluded directories and the root archive tree
     filtered = [
         m for m in matches
-        if "venv" not in m.split(os.sep)
-        and "__pycache__" not in m.split(os.sep)
+        if not any(part in LISTING_EXCLUDED_DIRS for part in m.split(os.sep))
+        and not os.path.realpath(m).startswith(_archive_real + os.sep)
+        and os.path.realpath(m) != _archive_real
     ]
     if not filtered:
         return "No files found matching the pattern."
@@ -245,18 +360,54 @@ def find_files(glob_pattern: str, directory: str = ".") -> str:
 
 def archive_file(path: str, reason: str = "") -> str:
     """
-    Safely 'delete' a file by moving it into .archive/<timestamp>/<original_path>/.
-    A _reason.txt sidecar is written alongside if reason is provided.
-    NEVER calls shutil.rmtree, os.remove, or any destructive primitive.
-    Returns the archive destination path on success.
+    Safely 'delete' a file or directory by moving it into
+    .archive/<timestamp>/<original_relative_path>.
+
+    Safety guarantees:
+    - NEVER calls shutil.rmtree, os.remove, os.unlink, or any destructive primitive.
+    - HARD REJECTS paths inside .git — the repository must never be touched.
+    - HARD REJECTS paths already inside ARCHIVE_DIR — cannot re-archive.
+    - HARD REJECTS paths outside PROJECT_ROOT — no cross-project accidents.
+
+    Undelete support:
+    - If the target path does not exist but was previously archived, returns
+      the archived location(s) and exact restore instructions.
+
+    Returns the archive destination path and restore instructions on success.
     """
-    safe_path = _assert_safe_path(path)
+    try:
+        safe_path = _assert_archivable(path)
+    except ValueError as exc:
+        return f"BLOCKED: {exc}"
+
+    root_real = os.path.realpath(PROJECT_ROOT)
+    rel_path = os.path.relpath(safe_path, root_real)
+
     if not os.path.exists(safe_path):
+        # Check if this path was previously archived — emit undelete guide
+        archived = _find_archived_copies(rel_path)
+        if archived:
+            lines = [
+                f"ERROR: '{path}' does not exist — it was previously archived.",
+                "",
+                "Archived copies found (most recent first):",
+            ]
+            for loc in archived:
+                lines.append(f"  {loc}")
+            lines += [
+                "",
+                "To restore the most recent copy run:",
+                f'  run_shell(\'python -c "import shutil; '
+                f'shutil.copy(r\\"{archived[0]}\\", r\\"{safe_path}\\")"\')',
+                "",
+                "To restore a directory tree (if a folder was archived) run:",
+                f'  run_shell(\'python -c "import shutil; '
+                f'shutil.copytree(r\\"{archived[0]}\\", r\\"{safe_path}\\")"\')',
+            ]
+            return "\n".join(lines)
         return f"ERROR: '{path}' does not exist — nothing to archive."
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    # Preserve relative structure inside the archive
-    rel_path = os.path.relpath(safe_path, PROJECT_ROOT)
     dest = os.path.join(ARCHIVE_DIR, timestamp, rel_path)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
 
@@ -265,9 +416,15 @@ def archive_file(path: str, reason: str = "") -> str:
     if reason:
         reason_file = dest + "._reason.txt"
         with open(reason_file, "w", encoding="utf-8") as fh:
-            fh.write(reason)
+            fh.write(f"Archived at: {timestamp}\nReason: {reason}\n")
 
-    return f"OK: archived '{path}' → '{dest}'."
+    restore_cmd = (
+        f'python -c "import shutil; shutil.copy(r\\"{dest}\\", r\\"{safe_path}\\")"'
+    )
+    return (
+        f"OK: archived '{path}' → '{dest}'.\n"
+        f"Restore with: run_shell('{restore_cmd}')"
+    )
 
 
 # ---------------------------------------------------------------------------
