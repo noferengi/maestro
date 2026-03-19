@@ -408,10 +408,11 @@ class TestDirectTransitions:
 
     def test_passes_moves_to_optimization(self):
         task_id = "test-trans-pass"
-        budget_id = _make_budget("test-trans-pass-budget")
-        _make_task(task_id, "conceptual_review", description="desc",
-                   llm_id=1, budget_id=budget_id)
+        budget_id = None
         try:
+            budget_id = _make_budget("test-trans-pass-budget")
+            _make_task(task_id, "conceptual_review", description="desc",
+                       budget_id=budget_id)
             import main
             from database import get_task
             with patch("app.agent.conceptual_review.run_conceptual_review",
@@ -424,14 +425,16 @@ class TestDirectTransitions:
             assert updated.type == "optimization"
         finally:
             _delete_task(task_id)
-            _cleanup_budget(budget_id)
+            if budget_id is not None:
+                _cleanup_budget(budget_id)
 
     def test_failure_demotes_to_indev(self):
         task_id = "test-trans-fail"
-        budget_id = _make_budget("test-trans-fail-budget")
-        _make_task(task_id, "conceptual_review", description="desc",
-                   llm_id=1, budget_id=budget_id)
+        budget_id = None
         try:
+            budget_id = _make_budget("test-trans-fail-budget")
+            _make_task(task_id, "conceptual_review", description="desc",
+                       budget_id=budget_id)
             import main
             from database import get_task
             with patch("app.agent.conceptual_review.run_conceptual_review",
@@ -444,7 +447,8 @@ class TestDirectTransitions:
             assert updated.type == "indev"
         finally:
             _delete_task(task_id)
-            _cleanup_budget(budget_id)
+            if budget_id is not None:
+                _cleanup_budget(budget_id)
 
 
 # ---------------------------------------------------------------------------
