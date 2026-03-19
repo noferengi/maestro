@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *.pyo
 *.pyd
@@ -7,6 +8,10 @@ __pycache__/
 dist/
 build/
 .eggs/
+
+# Temp / scratch files created during dev/debugging sessions
+temp_*.py
+debug_*.py
 
 # Virtual environment
 venv/
@@ -37,3 +42,6 @@ Thumbs.db
 # Maestro agent artefacts
 .archive/
 .maestro/task_dag.json
+
+# Claude Code internal worktrees (temp agent sandboxes)
+.claude/worktrees/
