@@ -3,7 +3,7 @@ Kanban Board Database Layer
 SQLite-based persistence for Kanban tasks
 """
 
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, ForeignKey, UniqueConstraint, Boolean
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, ForeignKey, UniqueConstraint, Boolean, event
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
@@ -17,6 +17,14 @@ os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
 
 # Create database engine
 engine = create_engine(f"sqlite:///{DATABASE_PATH}", echo=False)
+
+
+@event.listens_for(engine, "connect")
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+
 
 # Create session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -564,14 +572,14 @@ def seed_sample_tasks():
                   ["feature", "frontend"], None, llm_id=lid, budget_id=bid, position=2)
 
         # In Progress tasks (Development) - Position 0, 1
-        seed_task(db, "dev-1", "Configure venv and install dependencies", "development", "Set up Python 3.13 virtual environment", "user",
+        seed_task(db, "dev-1", "Configure venv and install dependencies", "indev", "Set up Python 3.13 virtual environment", "user",
                   ["setup", "backend"], None, llm_id=lid, budget_id=bid, position=0)
 
-        seed_task(db, "dev-2", "Create app structure and main.py", "development", "Set up FastAPI application with main entry point", "user",
+        seed_task(db, "dev-2", "Create app structure and main.py", "indev", "Set up FastAPI application with main entry point", "user",
                   ["structure", "backend"], None, llm_id=lid, budget_id=bid, position=1)
 
         # In Review tasks - Position 0
-        seed_task(db, "review-1", "Review requirements.txt", "review", "Verify all dependencies are properly listed", "user",
+        seed_task(db, "review-1", "Review requirements.txt", "conceptual_review", "Verify all dependencies are properly listed", "user",
                   ["qa", "backend"], None, llm_id=lid, budget_id=bid, position=0)
 
         # Completed tasks - Position 0, 1
@@ -655,9 +663,9 @@ def seed_sample_tasks_raw(conn):
         ("planning-1",  "Setup FastAPI development environment",  "planning",     "Configure Python virtual environment and install dependencies",   "user", json.dumps(["backend", "setup"]),         None, history, 0),
         ("planning-2",  "Create Kanban board UI mockup",          "planning",     "Design wireframes for the Kanban board interface",                "user", json.dumps(["frontend", "design"]),       None, history, 1),
         ("planning-3",  "Implement drag-and-drop",                "planning",     "Add drag-and-drop functionality for task reordering",             "user", json.dumps(["feature", "frontend"]),      None, history, 2),
-        ("dev-1",       "Configure venv and install dependencies","development",  "Set up Python 3.13 virtual environment",                          "user", json.dumps(["setup", "backend"]),         None, history, 0),
-        ("dev-2",       "Create app structure and main.py",       "development",  "Set up FastAPI application with main entry point",                "user", json.dumps(["structure", "backend"]),     None, history, 1),
-        ("review-1",    "Review requirements.txt",                "review",       "Verify all dependencies are properly listed",                     "user", json.dumps(["qa", "backend"]),             None, history, 0),
+        ("dev-1",       "Configure venv and install dependencies","indev",        "Set up Python 3.13 virtual environment",                          "user", json.dumps(["setup", "backend"]),         None, history, 0),
+        ("dev-2",       "Create app structure and main.py",       "indev",        "Set up FastAPI application with main entry point",                "user", json.dumps(["structure", "backend"]),     None, history, 1),
+        ("review-1",    "Review requirements.txt",                "conceptual_review", "Verify all dependencies are properly listed",               "user", json.dumps(["qa", "backend"]),             None, history, 0),
         ("completed-1", "Initialize Git repository",              "completed",    "Create .gitignore and initial commit",                            "user", json.dumps(["setup", "devops"]),           None, history, 0),
         ("completed-2", "Create database schema",                 "completed",    "Define SQLAlchemy models for tasks",                              "user", json.dumps(["database", "backend"]),       None, history, 1),
     ]
@@ -1246,6 +1254,24 @@ def get_planning_result(task_id):
         db.close()
 
 
+def update_planning_result(db, result_id, **kwargs):
+    """Update a planning result by ID."""
+    try:
+        result = db.query(PlanningResult).filter(PlanningResult.id == result_id).first()
+        if not result:
+            return None
+        for key, value in kwargs.items():
+            if hasattr(result, key):
+                setattr(result, key, value)
+        db.commit()
+        db.refresh(result)
+        return result
+    except Exception as e:
+        db.rollback()
+        print(f"Error updating planning result: {e}")
+        return None
+
+
 # ============================================
 # ComponentResult CRUD
 # ============================================
@@ -1331,6 +1357,24 @@ def get_optimization_result(task_id):
         db.close()
 
 
+def update_optimization_result(db, result_id, **kwargs):
+    """Update an optimization result by ID."""
+    try:
+        result = db.query(OptimizationResult).filter(OptimizationResult.id == result_id).first()
+        if not result:
+            return None
+        for key, value in kwargs.items():
+            if hasattr(result, key):
+                setattr(result, key, value)
+        db.commit()
+        db.refresh(result)
+        return result
+    except Exception as e:
+        db.rollback()
+        print(f"Error updating optimization result: {e}")
+        return None
+
+
 # ============================================
 # SecurityReviewResult CRUD
 # ============================================
@@ -1363,6 +1407,24 @@ def get_security_review_results(task_id):
                 .all())
     finally:
         db.close()
+
+
+def update_security_review_result(db, result_id, **kwargs):
+    """Update a security review result by ID."""
+    try:
+        result = db.query(SecurityReviewResult).filter(SecurityReviewResult.id == result_id).first()
+        if not result:
+            return None
+        for key, value in kwargs.items():
+            if hasattr(result, key):
+                setattr(result, key, value)
+        db.commit()
+        db.refresh(result)
+        return result
+    except Exception as e:
+        db.rollback()
+        print(f"Error updating security review result: {e}")
+        return None
 
 
 # ============================================
@@ -1399,6 +1461,24 @@ def get_full_review_results(task_id):
         db.close()
 
 
+def update_full_review_result(db, result_id, **kwargs):
+    """Update a full review result by ID."""
+    try:
+        result = db.query(FullReviewResult).filter(FullReviewResult.id == result_id).first()
+        if not result:
+            return None
+        for key, value in kwargs.items():
+            if hasattr(result, key):
+                setattr(result, key, value)
+        db.commit()
+        db.refresh(result)
+        return result
+    except Exception as e:
+        db.rollback()
+        print(f"Error updating full review result: {e}")
+        return None
+
+
 # ============================================
 # MergeRecord CRUD
 # ============================================
@@ -1431,3 +1511,21 @@ def get_merge_record(task_id):
                 .first())
     finally:
         db.close()
+
+
+def update_merge_record(db, record_id, **kwargs):
+    """Update a merge record by ID."""
+    try:
+        record = db.query(MergeRecord).filter(MergeRecord.id == record_id).first()
+        if not record:
+            return None
+        for key, value in kwargs.items():
+            if hasattr(record, key):
+                setattr(record, key, value)
+        db.commit()
+        db.refresh(record)
+        return record
+    except Exception as e:
+        db.rollback()
+        print(f"Error updating merge record: {e}")
+        return None

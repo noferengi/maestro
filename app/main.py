@@ -95,7 +95,7 @@ def read_tasks_by_type(task_type: str):
     return [task_to_dict(task) for task in tasks]
 
 
-_HUMAN_CREATABLE_TYPES = {'idea', 'architecture'}
+_HUMAN_CREATABLE_TYPES = frozenset(PIPELINE_COLUMN_ORDER[:2])
 
 
 @app.post("/api/tasks", response_model=dict)

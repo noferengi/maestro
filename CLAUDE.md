@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Session start checklist
+
+Read `SUMMARY.md` in the project root. It contains recent work and prioritized next steps written by the previous session. After reading it, ask yourself: **what should be done next?** If the user hasn't given a specific instruction, surface the top item from the next-steps list and confirm before proceeding.
+
 ## What this is
 
 Project Maestro — a Kanban board with an agentic LLM orchestration backend. The board is the UI face of a "Wiggum Loop": a Do-While that drives a local LLM through Design → Implement → Test → Verify cycles until all DAG task nodes reach ACCEPTED. Tasks transition IDEA → PLANNING → DEVELOPMENT → REVIEW → COMPLETED, gated by a multi-stage intake pipeline with LLM voting.
