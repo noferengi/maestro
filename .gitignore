@@ -46,5 +46,8 @@ Thumbs.db
 # Claude Code internal worktrees (temp agent sandboxes)
 .claude/worktrees/
 
+# Claude Code local project settings (machine-specific)
+.claude/settings.local.json
+
 # Rotating log files — never commit live logs
 logs/
