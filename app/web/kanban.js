@@ -45,6 +45,11 @@ let isDraggingGroup = false;
 let dragGroupDescendants = [];  // [{id, column, positionOffset}]
 let dragGroupOldParentPos = 0;
 
+// Card DOM cache: taskId -> element, built once and reused across renders
+const cardCache = {};
+// Render fingerprint cache: taskId -> string, detects which cards need updating
+const fingerprintCache = {};
+
 // Load tasks from database on startup (scoped to currentProject)
 async function loadTasksFromDatabase() {
     try {
@@ -101,6 +106,22 @@ function buildDescendantIndex() {
     for (const task of allTasks) {
         getDescendants(task.id);
     }
+}
+
+// Cheap fingerprint of the fields that affect card appearance.
+// Only recompute/rebuild a card when this string changes.
+function taskFingerprint(task) {
+    return [
+        task.type,
+        task.position,
+        task.title,
+        task.owner || '',
+        task.parent_task_id || '',
+        task.subdivision_generation || 0,
+        task.is_big_idea ? '1' : '0',
+        task.interface_contracts ? '1' : '0',
+        (task.tags || []).join(','),
+    ].join('|');
 }
 
 // Load global LLMs and Budgets
@@ -197,17 +218,19 @@ function isValidDropTarget(sourceContainer, targetContainer) {
 function renderTasksFromDatabase() {
     console.log('Rendering tasks from database...');
 
+    // Reset caches — full rebuild from scratch
+    Object.keys(cardCache).forEach(id => delete cardCache[id]);
+    Object.keys(fingerprintCache).forEach(id => delete fingerprintCache[id]);
+
     // Clear ALL existing task cards from ALL columns
     const columns = ['architecture', 'idea', 'planning', 'indev', 'conceptual_review', 'optimization', 'security', 'full_review', 'completed'];
 
     columns.forEach(columnType => {
         const container = document.getElementById(`tasks-${columnType}`);
         if (container) {
-            // Remove ALL cards from this container
             while (container.firstChild) {
                 container.removeChild(container.firstChild);
             }
-            console.log(`Cleared ${container.id}: ${container.querySelectorAll('.task-card').length} cards removed`);
         }
     });
 
@@ -246,14 +269,13 @@ function renderTasksFromDatabase() {
             if (container) {
                 const card = createTaskCard(task.id, task.title, task.tags, task.owner, task.type);
                 container.appendChild(card);
+                cardCache[task.id] = card;
+                fingerprintCache[task.id] = taskFingerprint(task);
             }
         });
     });
 
     console.log(`Rendered ${Object.values(taskData).filter(t => t && t.type).length} task cards from database`);
-
-    // Re-attach drag listeners after re-render
-    initializeDragAndDrop();
 
     // Update task counts
     updateTaskCounts();
@@ -273,6 +295,105 @@ function updateTaskCounts() {
     });
 }
 
+// Sort a single column's cards into position order using the cache.
+// appendChild on an existing child moves it — no DOM nodes are created or destroyed.
+function sortColumn(colType) {
+    const container = document.getElementById(`tasks-${colType}`);
+    if (!container) return;
+    const tasks = Object.values(taskData)
+        .filter(t => t && t.type !== 'cancelled' && (t.type === 'subdividing' ? 'idea' : t.type) === colType)
+        .sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+    tasks.forEach(task => {
+        const card = cardCache[task.id];
+        if (card) container.appendChild(card);
+    });
+}
+
+// Diff newTasks against the current DOM/cache state and apply only the changes.
+// Called by the auto-refresh loop instead of a full renderTasksFromDatabase().
+function reconcile(newTasks) {
+    // Zoom view has filtered visibility logic — fall back to full render
+    if (currentBigIdeaFilter) {
+        allTasks = newTasks;
+        taskData = {};
+        allTasks.forEach(t => { taskData[t.id] = t; });
+        buildDescendantIndex();
+        renderTasksFromDatabase();
+        return;
+    }
+
+    const columnsToSort = new Set();
+
+    // 1. Remove tasks that no longer exist
+    for (const id of Object.keys(cardCache)) {
+        if (!newTasks.find(t => t.id === id)) {
+            const card = cardCache[id];
+            if (card.parentNode) card.parentNode.removeChild(card);
+            delete cardCache[id];
+            delete fingerprintCache[id];
+        }
+    }
+
+    // 2. Create new cards and rebuild changed ones
+    for (const task of newTasks) {
+        if (task.type === 'cancelled') continue;
+        const renderCol = task.type === 'subdividing' ? 'idea' : task.type;
+        const newFp = taskFingerprint(task);
+
+        if (!cardCache[task.id]) {
+            // New task — create and insert
+            const card = createTaskCard(task.id, task.title, task.tags, task.owner, task.type);
+            cardCache[task.id] = card;
+            fingerprintCache[task.id] = newFp;
+            columnsToSort.add(renderCol);
+        } else if (fingerprintCache[task.id] !== newFp) {
+            // Changed — rebuild the card element in-place
+            const old = cardCache[task.id];
+            const oldTask = taskData[task.id];
+            if (oldTask) {
+                columnsToSort.add(oldTask.type === 'subdividing' ? 'idea' : oldTask.type);
+            }
+            const newCard = createTaskCard(task.id, task.title, task.tags, task.owner, task.type);
+            if (old.parentNode) old.parentNode.replaceChild(newCard, old);
+            cardCache[task.id] = newCard;
+            fingerprintCache[task.id] = newFp;
+            columnsToSort.add(renderCol);
+        }
+    }
+
+    // 3. Commit new global state
+    allTasks = newTasks;
+    taskData = {};
+    allTasks.forEach(t => { taskData[t.id] = t; });
+    buildDescendantIndex();
+
+    // 4. Re-sort only the columns that had changes
+    for (const col of columnsToSort) {
+        sortColumn(col);
+    }
+
+    updateBreadcrumbBar();
+    updateTaskCounts();
+}
+
+// Rebuild a single card — used when only transition/processing state changes
+// (those aren't in the fingerprint since they're client-side state).
+function refreshCard(taskId) {
+    const task = taskData[taskId];
+    if (!task) return;
+    const newCard = createTaskCard(task.id, task.title, task.tags, task.owner, task.type);
+    const old = cardCache[taskId];
+    if (old && old.parentNode) {
+        old.parentNode.replaceChild(newCard, old);
+    } else {
+        const renderCol = task.type === 'subdividing' ? 'idea' : task.type;
+        const container = document.getElementById(`tasks-${renderCol}`);
+        if (container) container.appendChild(newCard);
+    }
+    cardCache[taskId] = newCard;
+    fingerprintCache[taskId] = taskFingerprint(task);
+}
+
 // ============================================
 // DOM Initialization
 // ============================================
@@ -280,12 +401,14 @@ function updateTaskCounts() {
 let autoRefreshInterval = null;
 
 document.addEventListener('DOMContentLoaded', async function() {
+    // Load projects first so the sidebar is populated before tasks load
+    await loadProjects();
     await Promise.all([loadTasksFromDatabase(), loadLlmsAndBudgets()]);
 
     // Fetch transition statuses for idea tasks before first render
     await loadTransitionStatuses();
 
-    initializeProjectTabs();
+    initializeProjectTabs();   // wires the "+ New Project" button only
     initializeTaskCards();
     initializeModals();
     initializeGlobalConfigButtons();
@@ -299,45 +422,12 @@ document.addEventListener('DOMContentLoaded', async function() {
 
 // Start automatic polling for database changes
 function startAutoRefresh() {
-    console.log('Starting auto-refresh (5 second interval)...');
     autoRefreshInterval = setInterval(async () => {
-        if (!currentProject) return;  // guard against race before init
-        console.log('Auto-refresh: Checking for database updates...');
+        if (!currentProject) return;
         try {
             const response = await fetch(`${API_BASE}/projects/${encodeURIComponent(currentProject)}/tasks`);
             if (response.ok) {
-                const newTasks = await response.json();
-
-                // Compare task counts
-                if (newTasks.length !== allTasks.length) {
-                    console.log(`Database changed: ${allTasks.length} -> ${newTasks.length} tasks`);
-                    allTasks = newTasks;
-                    taskData = {};
-                    allTasks.forEach(task => {
-                        taskData[task.id] = task;
-                    });
-                    buildDescendantIndex();
-                    renderTasksFromDatabase();
-                } else {
-                    // Check if any task data changed
-                    let dataChanged = false;
-                    for (const task of newTasks) {
-                        if (taskData[task.id] && JSON.stringify(taskData[task.id]) !== JSON.stringify(task)) {
-                            dataChanged = true;
-                            break;
-                        }
-                    }
-                    if (dataChanged) {
-                        console.log('Data changed, refreshing UI...');
-                        allTasks = newTasks;
-                        taskData = {};
-                        allTasks.forEach(task => {
-                            taskData[task.id] = task;
-                        });
-                        buildDescendantIndex();
-                        renderTasksFromDatabase();
-                    }
-                }
+                reconcile(await response.json());
             }
         } catch (error) {
             console.error('Auto-refresh error:', error);
@@ -368,15 +458,60 @@ async function switchProject(projectName) {
     renderTasksFromDatabase();
 }
 
-// Initialize project tab selection
-function initializeProjectTabs() {
-    document.querySelectorAll('.project-tab').forEach(tab => {
-        tab.addEventListener('click', function() {
-            const projectName = this.getAttribute('data-project');
-            switchProject(projectName);
+// Load projects from the API and render the sidebar tabs
+async function loadProjects() {
+    try {
+        const resp = await fetch(`${API_BASE}/projects`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const projects = await resp.json();
+
+        const container = document.getElementById('project-tabs-container');
+        container.innerHTML = '';
+
+        projects.forEach(p => {
+            container.appendChild(_buildProjectTab(p.name, p.path, p.description));
         });
+
+        // If no project is selected yet, pick the first one
+        if (!currentProject && projects.length > 0) {
+            switchProject(projects[0].name);
+        } else if (currentProject) {
+            // Re-apply active class
+            const active = container.querySelector(`[data-project="${CSS.escape(currentProject)}"]`);
+            if (active) active.classList.add('active');
+        }
+    } catch (err) {
+        console.error('Failed to load projects:', err);
+    }
+}
+
+function _buildProjectTab(name, path, description) {
+    const tab = document.createElement('div');
+    tab.className = 'project-tab';
+    tab.setAttribute('data-project', name);
+
+    const label = document.createElement('span');
+    label.className = 'project-tab-label';
+    label.textContent = `📁 ${name}`;
+    label.title = path ? `Path: ${path}` : 'No path configured';
+    label.addEventListener('click', () => switchProject(name));
+
+    const gear = document.createElement('button');
+    gear.className = 'project-tab-gear';
+    gear.textContent = '⚙';
+    gear.title = 'Edit project settings';
+    gear.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openEditProjectModal(name, path || '', description || '');
     });
 
+    tab.appendChild(label);
+    tab.appendChild(gear);
+    return tab;
+}
+
+// Initialize project tab selection
+function initializeProjectTabs() {
     // Add project button
     document.getElementById('add-project').addEventListener('click', function() {
         openNewProjectModal();
@@ -419,6 +554,10 @@ function initializeModals() {
     document.getElementById('new-project-name').addEventListener('keydown', function(e) {
         if (e.key === 'Enter') saveNewProject();
         if (e.key === 'Escape') closeNewProjectModal();
+    });
+
+    document.getElementById('edit-project-modal').addEventListener('click', function(e) {
+        if (e.target === this) closeEditProjectModal();
     });
 }
 
@@ -484,6 +623,9 @@ function closeModal() {
 
 function openNewProjectModal() {
     document.getElementById('new-project-name').value = '';
+    document.getElementById('new-project-path').value = '';
+    document.getElementById('new-project-description').value = '';
+    document.getElementById('new-project-error').style.display = 'none';
     document.getElementById('new-project-modal').classList.add('active');
     document.getElementById('new-project-name').focus();
 }
@@ -492,33 +634,105 @@ function closeNewProjectModal() {
     document.getElementById('new-project-modal').classList.remove('active');
 }
 
-function saveNewProject() {
-    const newProjectName = document.getElementById('new-project-name').value.trim();
-    if (!newProjectName) {
+async function saveNewProject() {
+    const name = document.getElementById('new-project-name').value.trim();
+    const path = document.getElementById('new-project-path').value.trim();
+    const description = document.getElementById('new-project-description').value.trim();
+    const errEl = document.getElementById('new-project-error');
+
+    if (!name) {
+        errEl.textContent = 'Project name is required.';
+        errEl.style.display = 'block';
         document.getElementById('new-project-name').focus();
         return;
     }
-    closeNewProjectModal();
 
-    const tabsContainer = document.querySelector('.project-tabs');
-    const addBtn = document.getElementById('add-project');
-    const newTab = document.createElement('div');
-    newTab.className = 'project-tab active';
-    newTab.id = `project-${newProjectName.toLowerCase().replace(/\s+/g, '-')}`;
-    newTab.setAttribute('data-project', newProjectName);
-    newTab.textContent = `📁 ${newProjectName}`;
+    try {
+        const resp = await fetch(`${API_BASE}/projects`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, path, description }),
+        });
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            errEl.textContent = err.detail || `Error ${resp.status}`;
+            errEl.style.display = 'block';
+            return;
+        }
+        closeNewProjectModal();
+        await loadProjects();
+        switchProject(name);
+    } catch (err) {
+        errEl.textContent = `Network error: ${err.message}`;
+        errEl.style.display = 'block';
+    }
+}
 
-    tabsContainer.insertBefore(newTab, addBtn);
+function openEditProjectModal(name, path, description) {
+    document.getElementById('edit-project-original-name').value = name;
+    document.getElementById('edit-project-modal-title').textContent = `Edit: ${name}`;
+    document.getElementById('edit-project-name-display').textContent = name;
+    document.getElementById('edit-project-path').value = path;
+    document.getElementById('edit-project-description').value = description;
+    document.getElementById('edit-project-error').style.display = 'none';
+    document.getElementById('edit-project-modal').classList.add('active');
+    document.getElementById('edit-project-path').focus();
+}
 
-    console.log(`New project created: ${newProjectName}`);
-    // Wire up click handler for the newly created tab
-    newTab.addEventListener('click', function() {
-        const projectName = this.getAttribute('data-project');
-        switchProject(projectName);
-    });
+function closeEditProjectModal() {
+    document.getElementById('edit-project-modal').classList.remove('active');
+}
 
-    // Switch to the new (empty) project
-    switchProject(newProjectName);
+async function saveEditProject() {
+    const name = document.getElementById('edit-project-original-name').value;
+    const path = document.getElementById('edit-project-path').value.trim();
+    const description = document.getElementById('edit-project-description').value.trim();
+    const errEl = document.getElementById('edit-project-error');
+
+    try {
+        const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(name)}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path, description }),
+        });
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            errEl.textContent = err.detail || `Error ${resp.status}`;
+            errEl.style.display = 'block';
+            return;
+        }
+        closeEditProjectModal();
+        await loadProjects();
+    } catch (err) {
+        errEl.textContent = `Network error: ${err.message}`;
+        errEl.style.display = 'block';
+    }
+}
+
+async function deleteProjectFromModal() {
+    const name = document.getElementById('edit-project-original-name').value;
+    if (!confirm(`Delete project "${name}"? This does not delete its tasks.`)) return;
+
+    const errEl = document.getElementById('edit-project-error');
+    try {
+        const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            errEl.textContent = err.detail || `Error ${resp.status}`;
+            errEl.style.display = 'block';
+            return;
+        }
+        closeEditProjectModal();
+        await loadProjects();
+        // If the deleted project was active, switch to first available
+        if (currentProject === name) {
+            const first = document.querySelector('#project-tabs-container .project-tab');
+            if (first) switchProject(first.getAttribute('data-project'));
+        }
+    } catch (err) {
+        errEl.textContent = `Network error: ${err.message}`;
+        errEl.style.display = 'block';
+    }
 }
 
 async function saveTask() {
@@ -822,6 +1036,52 @@ async function viewChildren(taskId) {
     }
 }
 
+async function viewResearchJobs(taskId) {
+    try {
+        const resp = await fetch(`${API_BASE}/tasks/${taskId}/research-jobs`);
+        if (!resp.ok) return;
+        const jobs = await resp.json();
+
+        const task = taskData[taskId] || {};
+        const title = task.title || taskId;
+
+        let html = `<h3 style="margin-bottom:1rem">Research Jobs: ${title}</h3>`;
+        if (jobs.length === 0) {
+            html += '<p style="color:#6c757d">No research jobs for this task.</p>';
+        } else {
+            jobs.forEach(j => {
+                const statusColor = j.status === 'completed' ? '#198754' :
+                                    j.status === 'failed'    ? '#dc3545' :
+                                    j.status === 'cancelled' ? '#fd7e14' : '#6c757d';
+                const findings = j.findings
+                    ? (j.findings.length > 300 ? j.findings.slice(0, 300) + '…' : j.findings)
+                    : '<em style="color:#6c757d">No findings yet.</em>';
+                html += `
+                    <div style="border:1px solid #dee2e6;border-radius:6px;padding:0.75rem;margin-bottom:0.5rem;border-left:4px solid ${statusColor}">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.35rem">
+                            <span style="font-size:0.75rem;text-transform:uppercase;color:${statusColor};font-weight:600">${j.status}</span>
+                            <span class="transition-timestamp">${j.created_at || ''}</span>
+                        </div>
+                        <div style="font-weight:600;margin-bottom:0.25rem">${j.question || ''}</div>
+                        <div style="font-size:0.85rem;color:#495057;margin-bottom:0.35rem">${findings}</div>
+                        <div style="font-size:0.75rem;color:#6c757d">
+                            Lives used: ${j.lives_used ?? '—'} &nbsp;|&nbsp;
+                            Tokens: ${j.prompt_tokens ?? 0} prompt / ${j.completion_tokens ?? 0} completion
+                            ${j.completed_at ? `&nbsp;|&nbsp; Completed: ${j.completed_at}` : ''}
+                        </div>
+                    </div>
+                `;
+            });
+        }
+
+        document.getElementById('transition-modal-title').textContent = 'Research Jobs';
+        document.getElementById('transition-modal-body').innerHTML = html;
+        document.getElementById('transition-modal').classList.add('active');
+    } catch (err) {
+        console.error('Error viewing research jobs:', err);
+    }
+}
+
 function createTaskCard(id, title, tags, owner, status) {
     const card = document.createElement('div');
     card.className = `task-card ${status}`;
@@ -984,6 +1244,18 @@ function createTaskCard(id, title, tags, owner, status) {
         }
     }
 
+    // Research Jobs button — available on any status that can have research (not idea/subdividing/architecture)
+    if (status !== 'idea' && status !== 'subdividing' && status !== 'architecture') {
+        const researchBtn = document.createElement('button');
+        researchBtn.className = 'action-btn';
+        researchBtn.textContent = 'Research Jobs';
+        researchBtn.onclick = (e) => { e.stopPropagation(); viewResearchJobs(id); };
+        card.querySelector('.task-actions').appendChild(researchBtn);
+    }
+
+    card.addEventListener('dragstart', handleDragStart);
+    card.addEventListener('dragend', handleDragEnd);
+
     return card;
 }
 
@@ -1016,7 +1288,7 @@ async function advanceTask(taskId) {
 }
 
 function setCardProcessing(taskId, processing) {
-    const card = document.querySelector(`.task-card[data-id="${taskId}"]`);
+    const card = cardCache[taskId];
     if (!card) return;
     if (processing) {
         card.classList.add('processing');
@@ -1069,29 +1341,22 @@ function startTransitionPolling(taskId) {
             delete transitionPollers[taskId];
 
             if (data.outcome === 'passed') {
-                // Reload — card will appear in PLANNING column
+                // Task promoted — fetch fresh data and reconcile
                 await loadTasksFromDatabase();
-                // Re-fetch transition data for all idea tasks
                 await loadTransitionStatuses();
-                renderTasksFromDatabase();
+                reconcile(allTasks);
             } else {
-                // rejected or failed
+                // rejected or failed — update this card immediately, then sync
                 setCardProcessing(taskId, false);
                 cacheTransitionData(taskId, data);
-
-                // Mark card as rejected and re-render
-                const card = document.querySelector(`.task-card[data-id="${taskId}"]`);
-                if (card) {
-                    card.classList.add('rejected');
-                }
+                refreshCard(taskId);
 
                 // Show the failure overlay
                 openTransitionModal(taskId);
 
-                // Re-render to show rejection badge
                 await loadTasksFromDatabase();
                 await loadTransitionStatuses();
-                renderTasksFromDatabase();
+                reconcile(allTasks);
             }
         } catch (err) {
             console.error(`[poll] Error polling transition for ${taskId}:`, err);

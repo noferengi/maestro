@@ -41,6 +41,7 @@ from app.agent.config import (
     LLM_MODEL,
 )
 from app.agent.llm_client import call_llm
+from app.database import get_project_path
 from app.agent.verdicts import Verdict
 
 logger = logging.getLogger(__name__)
@@ -212,6 +213,7 @@ class IntakePipeline:
         llm_id: int | None = None,
         llm_base_url: str | None = None,
         llm_model: str | None = None,
+        project: str | None = None,
     ) -> None:
         self.task_id = task_id
         self.task_description = task_description
@@ -221,6 +223,7 @@ class IntakePipeline:
         self.llm_id = llm_id
         self.llm_base_url = llm_base_url or LLM_BASE_URL
         self.llm_model = llm_model or LLM_MODEL
+        self.project = project or "TheMaestro"
         self.votes: list[dict] = []  # Collect votes from each stage
 
     # ------------------------------------------------------------------
@@ -549,10 +552,6 @@ class IntakePipeline:
             return self._extract_vote("scope_analysis", result)
         except Exception as exc:
             return self._error_vote("scope_analysis", exc)
-        except (json.JSONDecodeError, KeyError, IndexError) as exc:
-            return self._error_vote("scope_analysis", exc)
-        except Exception as exc:
-            return self._error_vote("scope_analysis", exc)
 
     # ------------------------------------------------------------------
     # Stage 2a: Static Analysis (deterministic, no LLM)
@@ -572,9 +571,47 @@ class IntakePipeline:
         try:
             from app.agent.static_analysis import analyze_project, generate_vote
 
+            # Get the project root for this task - MUST be configured
+            project_root = get_project_path(self.project)
+            if not project_root:
+                raise ValueError(
+                    f"Project '{self.project}' has no configured path. "
+                    "Static analysis cannot proceed. Add this project to the projects table with its filesystem path."
+                )
+
+            # Collect Python files from affected areas in scope analysis
+            # and fall back to analyzing all Python files in the project
+            affected_areas = scope_vote.get("raw_response", {}).get("affected_areas", [])
+            if isinstance(affected_areas, list) and len(affected_areas) > 0:
+                file_paths = []
+                for area in affected_areas:
+                    area_path = os.path.join(project_root, area.lstrip("/"))
+                    if os.path.isdir(area_path):
+                        for root, dirs, files in os.walk(area_path):
+                            # Skip excluded directories
+                            dirs[:] = [d for d in dirs if d not in ("venv", "__pycache__", ".git", ".archive")]
+                            for f in files:
+                                if f.endswith(".py"):
+                                    file_paths.append(os.path.join(root, f))
+                    elif os.path.isfile(area_path) and area_path.endswith(".py"):
+                        file_paths.append(area_path)
+
+                # Deduplicate and normalize paths
+                file_paths = list(set(os.path.normpath(p) for p in file_paths if os.path.isfile(p)))
+            else:
+                # Fall back: analyze all Python files in the project
+                file_paths = []
+                for root, dirs, files in os.walk(project_root):
+                    # Skip excluded directories
+                    dirs[:] = [d for d in dirs if d not in ("venv", "__pycache__", ".git", ".archive")]
+                    for f in files:
+                        if f.endswith(".py"):
+                            file_paths.append(os.path.join(root, f))
+                file_paths = list(set(os.path.normpath(p) for p in file_paths if os.path.isfile(p)))
+
             loop = asyncio.get_running_loop()
             # Run CPU-bound analysis in a thread executor
-            analysis_result = await loop.run_in_executor(None, analyze_project)
+            analysis_result = await loop.run_in_executor(None, analyze_project, file_paths)
             vote_data = await loop.run_in_executor(
                 None, generate_vote, analysis_result, self.task_description,
             )
@@ -654,10 +691,6 @@ class IntakePipeline:
             return self._extract_vote("feasibility_analysis", result)
         except Exception as exc:
             return self._error_vote("feasibility_analysis", exc)
-        except (json.JSONDecodeError, KeyError, IndexError) as exc:
-            return self._error_vote("feasibility_analysis", exc)
-        except Exception as exc:
-            return self._error_vote("feasibility_analysis", exc)
 
     # ------------------------------------------------------------------
     # Stage 3: Conflict Detection (LLM)
@@ -710,10 +743,6 @@ class IntakePipeline:
             return self._extract_vote("conflict_detection", result)
         except Exception as exc:
             return self._error_vote("conflict_detection", exc)
-        except (json.JSONDecodeError, KeyError, IndexError) as exc:
-            return self._error_vote("conflict_detection", exc)
-        except Exception as exc:
-            return self._error_vote("conflict_detection", exc)
 
     # ------------------------------------------------------------------
     # Tally builder
@@ -758,10 +787,12 @@ class IntakePipeline:
                 return result
 
         # Check for majority NOT_SUITABLE
+        # Use the same majority threshold as verdicts.py: (n // 2) + 1
         not_suitable_count = sum(
             1 for v in self.votes if v["verdict"] == VERDICT_NOT_SUITABLE
         )
-        if not_suitable_count >= len(self.votes) / 2:
+        majority_threshold = (len(self.votes) // 2) + 1
+        if not_suitable_count >= majority_threshold:
             result["outcome"] = "rejected"
             for v in self.votes:
                 if v["verdict"] == VERDICT_NOT_SUITABLE:
@@ -808,6 +839,7 @@ async def run_intake_pipeline(
     llm_id: int | None = None,
     llm_base_url: str | None = None,
     llm_model: str | None = None,
+    project: str | None = None,
 ) -> dict:
     """
     Convenience function to run the full intake pipeline.
@@ -833,6 +865,9 @@ async def run_intake_pipeline(
     llm_model : str | None
         Model identifier to send in the request payload.
         Falls back to the global ``LLM_MODEL`` config when *None*.
+    project : str | None
+        Project name to look up the project root for static analysis.
+        Falls back to "TheMaestro" if not provided.
 
     Returns
     -------
@@ -850,5 +885,6 @@ async def run_intake_pipeline(
         llm_id=llm_id,
         llm_base_url=llm_base_url,
         llm_model=llm_model,
+        project=project,
     )
     return await pipeline.run()

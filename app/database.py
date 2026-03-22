@@ -3,11 +3,14 @@ Kanban Board Database Layer
 SQLite-based persistence for Kanban tasks
 """
 
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, ForeignKey, UniqueConstraint, Boolean, event
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, ForeignKey, UniqueConstraint, Boolean, Float, event
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
-from datetime import datetime
+from datetime import datetime, timezone
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 
 # Database path - keep it in the project directory.
 # MAESTRO_TEST_DB env var lets conftest.py redirect to a temp file per session.
@@ -294,6 +297,66 @@ class MergeRecord(Base):
         return f"<MergeRecord(id={self.id}, task={self.task_id}, status={self.status})>"
 
 
+class ResearchJob(Base):
+    """Background research job — tracks inline and queued agent investigations."""
+    __tablename__ = "research_jobs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String, ForeignKey('tasks.id'), nullable=False)
+    parent_job_id = Column(Integer, ForeignKey('research_jobs.id'), nullable=True)
+    question = Column(Text, nullable=False)
+    context = Column(Text, nullable=True)           # JSON string
+    status = Column(String, nullable=False, default='pending')
+    priority = Column(Float, nullable=False, default=0.0)   # lower = higher priority
+    depth = Column(Integer, nullable=False, default=0)
+    verdict = Column(Text, nullable=True)           # JSON vote dict
+    findings = Column(Text, nullable=True)
+    lives_used = Column(Integer, default=0)
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    llm_id = Column(Integer, ForeignKey('llms.id'), nullable=True)
+    budget_id = Column(Integer, ForeignKey('budgets.id'), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+    def __repr__(self):
+        return f"<ResearchJob(id={self.id}, task={self.task_id}, status={self.status})>"
+
+
+class OptimizationBenchmark(Base):
+    """Before/after profiling metrics for optimization sub-tasks."""
+    __tablename__ = "optimization_benchmarks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String, ForeignKey('tasks.id'), nullable=False)
+    parent_task_id = Column(String, ForeignKey('tasks.id'), nullable=False)
+    benchmark_type = Column(String, nullable=False)     # 'before' | 'after'
+    metrics = Column(Text, nullable=False)              # JSON
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<OptimizationBenchmark(id={self.id}, task={self.task_id}, type={self.benchmark_type})>"
+
+
+class Project(Base):
+    """
+    Project registry — maps a project name to its filesystem root.
+
+    Every task references a project by name (tasks.project).  This table
+    stores the canonical filesystem path so the agent can run git operations
+    in the correct repository instead of Maestro's own source tree.
+    """
+    __tablename__ = "projects"
+
+    name = Column(String, primary_key=True)
+    path = Column(String, nullable=True)       # Absolute path to the project root
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<Project(name='{self.name}', path='{self.path}')>"
+
+
 class Task(Base):
     """
     Kanban Task Model
@@ -348,7 +411,7 @@ def init_db():
 
     # Check if file exists first
     if not os.path.exists(DATABASE_PATH):
-        print(f"Database file not found, database is fresh (should_seed=True)")
+        logger.debug("Database file not found, database is fresh (should_seed=True)")
         should_seed = True
 
     # Check if tables exist and are empty
@@ -358,13 +421,13 @@ def init_db():
         try:
             existing_count = db.query(Task).count()
             if existing_count == 0:
-                print(f"Database exists and is empty, tables are fresh (should_seed=True)")
+                logger.debug("Database exists and is empty, tables are fresh (should_seed=True)")
                 should_seed = True
             else:
-                print(f"Database has {existing_count} tasks, not fresh (should_seed=False)")
+                logger.debug("Database has %d tasks, not fresh (should_seed=False)", existing_count)
         except Exception as e:
             # Table doesn't exist - database is corrupted/empty
-            print(f"Database file exists but tables are missing (corrupted), treating as fresh: {e}")
+            logger.debug("Database file exists but tables are missing (corrupted), treating as fresh: %s", e)
             should_seed = True
     finally:
         db.close()
@@ -374,7 +437,7 @@ def init_db():
 def init_db_tables():
     """Initialize database tables (internal use)"""
     Base.metadata.create_all(bind=engine)
-    print(f"Database tables initialized at: {DATABASE_PATH}")
+    logger.info("Database tables initialized at: %s", DATABASE_PATH)
 
 
 def create_task(title, task_type, description="", owner="user", tags=None, content=None, llm_id=None, budget_id=None, prerequisites=None, project='TheMaestro'):
@@ -401,7 +464,7 @@ def create_task(title, task_type, description="", owner="user", tags=None, conte
         return task
     except Exception as e:
         db.rollback()
-        print(f"Error creating task: {e}")
+        logger.error("Error creating task: %s", e)
         return None
     finally:
         db.close()
@@ -414,7 +477,7 @@ def get_task(task_id):
         task = db.query(Task).filter(Task.id == task_id).first()
         return task
     except Exception as e:
-        print(f"Error getting task: {e}")
+        logger.error("Error getting task: %s", e)
         return None
     finally:
         db.close()
@@ -427,7 +490,7 @@ def get_tasks_by_type(task_type):
         tasks = db.query(Task).filter(Task.type == task_type).order_by(Task.position, Task.created_at).all()
         return tasks
     except Exception as e:
-        print(f"Error getting tasks by type: {e}")
+        logger.error("Error getting tasks by type: %s", e)
         return []
     finally:
         db.close()
@@ -457,7 +520,7 @@ def update_task(task_id, **kwargs):
         return task
     except Exception as e:
         db.rollback()
-        print(f"Error updating task: {e}")
+        logger.error("Error updating task: %s", e)
         return None
     finally:
         db.close()
@@ -475,7 +538,7 @@ def delete_task(task_id):
         return False
     except Exception as e:
         db.rollback()
-        print(f"Error deleting task: {e}")
+        logger.error("Error deleting task: %s", e)
         return False
     finally:
         db.close()
@@ -488,8 +551,252 @@ def get_all_tasks():
         tasks = db.query(Task).order_by(Task.created_at).all()
         return tasks
     except Exception as e:
-        print(f"Error getting all tasks: {e}")
+        logger.error("Error getting all tasks: %s", e)
         return []
+    finally:
+        db.close()
+
+
+# ============================================
+# ResearchJob CRUD
+# ============================================
+
+def create_research_job(task_id, question, context=None, priority=0.0, depth=0,
+                        llm_id=None, budget_id=None, parent_job_id=None):
+    """Create a new research job record."""
+    db = SessionLocal()
+    try:
+        job = ResearchJob(
+            task_id=task_id,
+            question=question,
+            context=context,
+            priority=priority,
+            depth=depth,
+            llm_id=llm_id,
+            budget_id=budget_id,
+            parent_job_id=parent_job_id,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        return job
+    except Exception as e:
+        db.rollback()
+        logger.error("Error creating research job: %s", e)
+        return None
+    finally:
+        db.close()
+
+
+def get_research_job(job_id):
+    """Get a research job by ID."""
+    db = SessionLocal()
+    try:
+        return db.query(ResearchJob).filter(ResearchJob.id == job_id).first()
+    except Exception as e:
+        logger.error("Error getting research job %s: %s", job_id, e)
+        return None
+    finally:
+        db.close()
+
+
+def get_pending_research_jobs(limit=10):
+    """Return pending research jobs ordered by priority ASC, created_at ASC."""
+    db = SessionLocal()
+    try:
+        return (
+            db.query(ResearchJob)
+            .filter(ResearchJob.status == 'pending')
+            .order_by(ResearchJob.priority, ResearchJob.created_at)
+            .limit(limit)
+            .all()
+        )
+    except Exception as e:
+        logger.error("Error getting pending research jobs: %s", e)
+        return []
+    finally:
+        db.close()
+
+
+def update_research_job(job_id, **kwargs):
+    """Update a research job with provided fields."""
+    db = SessionLocal()
+    try:
+        job = db.query(ResearchJob).filter(ResearchJob.id == job_id).first()
+        if not job:
+            return None
+        for key, value in kwargs.items():
+            if hasattr(job, key):
+                setattr(job, key, value)
+        if kwargs.get('status') in ('completed', 'failed', 'cancelled'):
+            job.completed_at = datetime.now(timezone.utc)
+        db.commit()
+        db.refresh(job)
+        return job
+    except Exception as e:
+        db.rollback()
+        logger.error("Error updating research job %s: %s", job_id, e)
+        return None
+    finally:
+        db.close()
+
+
+def get_research_jobs_for_task(task_id):
+    """Return all research jobs for a task, most recent first."""
+    db = SessionLocal()
+    try:
+        return (
+            db.query(ResearchJob)
+            .filter(ResearchJob.task_id == task_id)
+            .order_by(ResearchJob.created_at.desc())
+            .all()
+        )
+    except Exception as e:
+        logger.error("Error getting research jobs for task '%s': %s", task_id, e)
+        return []
+    finally:
+        db.close()
+
+
+def count_pending_research_jobs():
+    """Return the number of pending research jobs."""
+    db = SessionLocal()
+    try:
+        return db.query(ResearchJob).filter(ResearchJob.status == 'pending').count()
+    except Exception as e:
+        logger.error("Error counting pending research jobs: %s", e)
+        return 0
+    finally:
+        db.close()
+
+
+# ============================================
+# OptimizationBenchmark CRUD
+# ============================================
+
+def create_optimization_benchmark(task_id, parent_task_id, benchmark_type, metrics):
+    """Record a before/after benchmark for an optimization sub-task."""
+    db = SessionLocal()
+    try:
+        bench = OptimizationBenchmark(
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            benchmark_type=benchmark_type,
+            metrics=metrics if isinstance(metrics, str) else __import__('json').dumps(metrics),
+        )
+        db.add(bench)
+        db.commit()
+        db.refresh(bench)
+        return bench
+    except Exception as e:
+        db.rollback()
+        logger.error("Error creating optimization benchmark: %s", e)
+        return None
+    finally:
+        db.close()
+
+
+def get_optimization_benchmarks(parent_task_id):
+    """Return all benchmarks for a parent task, ordered by created_at."""
+    db = SessionLocal()
+    try:
+        return (
+            db.query(OptimizationBenchmark)
+            .filter(OptimizationBenchmark.parent_task_id == parent_task_id)
+            .order_by(OptimizationBenchmark.created_at)
+            .all()
+        )
+    except Exception as e:
+        logger.error("Error getting benchmarks for task '%s': %s", parent_task_id, e)
+        return []
+    finally:
+        db.close()
+
+
+# ============================================
+# Project CRUD
+# ============================================
+
+def get_all_projects():
+    """Return all projects ordered by name."""
+    db = SessionLocal()
+    try:
+        return db.query(Project).order_by(Project.name).all()
+    except Exception as e:
+        logger.error("Error getting projects: %s", e)
+        return []
+    finally:
+        db.close()
+
+
+def get_project(name: str):
+    """Return a single project by name, or None if not found."""
+    db = SessionLocal()
+    try:
+        return db.query(Project).filter(Project.name == name).first()
+    except Exception as e:
+        logger.error("Error getting project '%s': %s", name, e)
+        return None
+    finally:
+        db.close()
+
+
+def get_project_path(project_name: str) -> str | None:
+    """
+    Return the filesystem path for a project, or None if unknown.
+
+    This is the primary helper used by the agent to resolve which git
+    repository to operate on for a given task.
+    """
+    project = get_project(project_name)
+    return project.path if project else None
+
+
+def upsert_project(name: str, path: str | None = None, description: str | None = None):
+    """
+    Create or update a project.  ``path`` is the absolute filesystem root of
+    the project's git repository.  Passing path=None leaves an existing path
+    unchanged (use empty string to explicitly clear it).
+    """
+    db = SessionLocal()
+    try:
+        existing = db.query(Project).filter(Project.name == name).first()
+        if existing:
+            if path is not None:
+                existing.path = path or None
+            if description is not None:
+                existing.description = description
+            db.commit()
+            db.refresh(existing)
+            return existing
+        else:
+            project = Project(name=name, path=path or None, description=description)
+            db.add(project)
+            db.commit()
+            db.refresh(project)
+            return project
+    except Exception as e:
+        db.rollback()
+        logger.error("Error upserting project '%s': %s", name, e)
+        return None
+    finally:
+        db.close()
+
+
+def delete_project(name: str) -> bool:
+    """Delete a project record (does not affect tasks that reference it)."""
+    db = SessionLocal()
+    try:
+        project = db.query(Project).filter(Project.name == name).first()
+        if not project:
+            return False
+        db.delete(project)
+        db.commit()
+        return True
+    except Exception as e:
+        db.rollback()
+        logger.error("Error deleting project '%s': %s", name, e)
+        return False
     finally:
         db.close()
 
@@ -501,7 +808,7 @@ def get_tasks_by_project(project_name):
         tasks = db.query(Task).filter(Task.project == project_name).order_by(Task.position, Task.created_at).all()
         return tasks
     except Exception as e:
-        print(f"Error getting tasks by project: {e}")
+        logger.error("Error getting tasks by project: %s", e)
         return []
     finally:
         db.close()
@@ -516,7 +823,7 @@ def get_task_history(task_id):
             return task.history
         return []
     except Exception as e:
-        print(f"Error getting task history: {e}")
+        logger.error("Error getting task history: %s", e)
         return []
     finally:
         db.close()
@@ -531,13 +838,13 @@ def seed_sample_tasks():
     is_fresh = init_db()
     
     if not is_fresh:
-        print("Database not fresh, skipping seed.")
+        logger.debug("Database not fresh, skipping seed.")
         return False
     
     # Create tables for fresh database
     init_db_tables()
     
-    print("Seeding sample tasks...")
+    logger.info("Seeding sample tasks...")
     db = SessionLocal()
     try:
         # Ensure default LLM and Budget exist
@@ -593,12 +900,12 @@ def seed_sample_tasks():
         seed_task(db, "completed-2", "Create database schema", "completed", "Define SQLAlchemy models for tasks", "user",
                   ["database", "backend"], None, llm_id=lid, budget_id=bid, position=1)
 
-        print("Successfully seeded 10 sample tasks!")
+        logger.info("Successfully seeded 10 sample tasks!")
         return True
 
     except Exception as e:
         db.rollback()
-        print(f"Error seeding tasks: {e}")
+        logger.error("Error seeding tasks: %s", e)
         return False
     finally:
         db.close()
@@ -627,11 +934,11 @@ def seed_task(db, id, title, task_type, description="", owner="user", tags=None,
         db.add(task)
         db.commit()
         db.refresh(task)
-        print(f"  Created sample task: {id} - {title}")
+        logger.debug("  Created sample task: %s - %s", id, title)
         return task
     except Exception as e:
         db.rollback()
-        print(f"  Error creating sample task {id}: {e}")
+        logger.error("  Error creating sample task %s: %s", id, e)
         return None
 
 
@@ -642,7 +949,7 @@ def seed_sample_tasks_raw(conn):
     conn must already be connected to kanban.db with all migrations applied.
     """
     import json
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     history = json.dumps([{"status": "created", "timestamp": now}])
 
     # Ensure default LLM and Budget rows exist
@@ -684,9 +991,9 @@ def seed_sample_tasks_raw(conn):
             """,
             (*t, now, now, json.dumps([]), 'TheMaestro', llm_id, budget_id),
         )
-        print(f"  Seeded task: {t[0]} - {t[1]}")
+        logger.debug("  Seeded task: %s - %s", t[0], t[1])
     conn.commit()
-    print("Successfully seeded 10 sample tasks (raw)!")
+    logger.info("Successfully seeded 10 sample tasks (raw)!")
 
 
 def reorder_tasks(task_id, new_position, task_type):
@@ -745,7 +1052,7 @@ def reorder_tasks(task_id, new_position, task_type):
         return True
     except Exception as e:
         db.rollback()
-        print(f"Error reordering tasks: {e}")
+        logger.error("Error reordering tasks: %s", e)
         return False
     finally:
         db.close()
@@ -782,7 +1089,7 @@ def create_llm(address, port, model, settings=None, parallel_sessions=1, max_con
         return llm
     except Exception as e:
         db.rollback()
-        print(f"Error creating LLM: {e}")
+        logger.error("Error creating LLM: %s", e)
         return None
     finally:
         db.close()
@@ -802,7 +1109,7 @@ def update_llm(llm_id, **kwargs):
         return llm
     except Exception as e:
         db.rollback()
-        print(f"Error updating LLM: {e}")
+        logger.error("Error updating LLM: %s", e)
         return None
     finally:
         db.close()
@@ -819,7 +1126,7 @@ def delete_llm(llm_id):
         return True
     except Exception as e:
         db.rollback()
-        print(f"Error deleting LLM: {e}")
+        logger.error("Error deleting LLM: %s", e)
         return False
     finally:
         db.close()
@@ -855,7 +1162,7 @@ def create_budget(name, settings=None):
         return budget
     except Exception as e:
         db.rollback()
-        print(f"Error creating budget: {e}")
+        logger.error("Error creating budget: %s", e)
         return None
     finally:
         db.close()
@@ -875,7 +1182,7 @@ def update_budget(budget_id, **kwargs):
         return budget
     except Exception as e:
         db.rollback()
-        print(f"Error updating budget: {e}")
+        logger.error("Error updating budget: %s", e)
         return None
     finally:
         db.close()
@@ -892,7 +1199,7 @@ def delete_budget(budget_id):
         return True
     except Exception as e:
         db.rollback()
-        print(f"Error deleting budget: {e}")
+        logger.error("Error deleting budget: %s", e)
         return False
     finally:
         db.close()
@@ -917,7 +1224,7 @@ def create_transition_vote(task_id, transition, stage, verdict, confidence, just
         return vote
     except Exception as e:
         db.rollback()
-        print(f"Error creating transition vote: {e}")
+        logger.error("Error creating transition vote: %s", e)
         return None
     finally:
         db.close()
@@ -952,7 +1259,7 @@ def create_transition_result(task_id, transition, outcome, vote_summary=None, to
         return result
     except Exception as e:
         db.rollback()
-        print(f"Error creating transition result: {e}")
+        logger.error("Error creating transition result: %s", e)
         return None
     finally:
         db.close()
@@ -989,7 +1296,7 @@ def create_budget_entry(llm_id=None, budget_id=None, task_id=None,
         return entry
     except Exception as e:
         db.rollback()
-        print(f"Error creating budget entry: {e}")
+        logger.error("Error creating budget entry: %s", e)
         return None
     finally:
         db.close()
@@ -1048,7 +1355,7 @@ def create_subdivision_record(parent_task_id, child_task_ids, generation=1,
         return record
     except Exception as e:
         db.rollback()
-        print(f"Error creating subdivision record: {e}")
+        logger.error("Error creating subdivision record: %s", e)
         return None
     finally:
         db.close()
@@ -1081,7 +1388,7 @@ def update_subdivision_record(record_id, **kwargs):
         return record
     except Exception as e:
         db.rollback()
-        print(f"Error updating subdivision record: {e}")
+        logger.error("Error updating subdivision record: %s", e)
         return None
     finally:
         db.close()
@@ -1174,7 +1481,7 @@ def set_big_idea_flag(task_id):
         return False
     except Exception as e:
         db.rollback()
-        print(f"Error setting big idea flag: {e}")
+        logger.error("Error setting big idea flag: %s", e)
         return False
     finally:
         db.close()
@@ -1196,7 +1503,7 @@ def batch_reorder_tasks(moves):
         return True
     except Exception as e:
         db.rollback()
-        print(f"Error batch reordering tasks: {e}")
+        logger.error("Error batch reordering tasks: %s", e)
         return False
     finally:
         db.close()
@@ -1240,7 +1547,7 @@ def create_planning_result(task_id, **kwargs):
         return result
     except Exception as e:
         db.rollback()
-        print(f"Error creating planning result: {e}")
+        logger.error("Error creating planning result: %s", e)
         return None
     finally:
         db.close()
@@ -1272,7 +1579,7 @@ def update_planning_result(db, result_id, **kwargs):
         return result
     except Exception as e:
         db.rollback()
-        print(f"Error updating planning result: {e}")
+        logger.error("Error updating planning result: %s", e)
         return None
 
 
@@ -1293,7 +1600,7 @@ def create_component_result(task_id, component_name, step_order, batch_number, *
         return result
     except Exception as e:
         db.rollback()
-        print(f"Error creating component result: {e}")
+        logger.error("Error creating component result: %s", e)
         return None
     finally:
         db.close()
@@ -1324,7 +1631,7 @@ def update_component_result(result_id, **kwargs):
         return result
     except Exception as e:
         db.rollback()
-        print(f"Error updating component result: {e}")
+        logger.error("Error updating component result: %s", e)
         return None
     finally:
         db.close()
@@ -1344,7 +1651,7 @@ def create_optimization_result(task_id, outcome, **kwargs):
         return result
     except Exception as e:
         db.rollback()
-        print(f"Error creating optimization result: {e}")
+        logger.error("Error creating optimization result: %s", e)
         return None
     finally:
         db.close()
@@ -1375,7 +1682,7 @@ def update_optimization_result(db, result_id, **kwargs):
         return result
     except Exception as e:
         db.rollback()
-        print(f"Error updating optimization result: {e}")
+        logger.error("Error updating optimization result: %s", e)
         return None
 
 
@@ -1396,7 +1703,7 @@ def create_security_review_result(task_id, reviewer_type, verdict, confidence, *
         return result
     except Exception as e:
         db.rollback()
-        print(f"Error creating security review result: {e}")
+        logger.error("Error creating security review result: %s", e)
         return None
     finally:
         db.close()
@@ -1427,7 +1734,7 @@ def update_security_review_result(db, result_id, **kwargs):
         return result
     except Exception as e:
         db.rollback()
-        print(f"Error updating security review result: {e}")
+        logger.error("Error updating security review result: %s", e)
         return None
 
 
@@ -1448,7 +1755,7 @@ def create_full_review_result(task_id, reviewer_type, verdict, confidence, **kwa
         return result
     except Exception as e:
         db.rollback()
-        print(f"Error creating full review result: {e}")
+        logger.error("Error creating full review result: %s", e)
         return None
     finally:
         db.close()
@@ -1479,7 +1786,7 @@ def update_full_review_result(db, result_id, **kwargs):
         return result
     except Exception as e:
         db.rollback()
-        print(f"Error updating full review result: {e}")
+        logger.error("Error updating full review result: %s", e)
         return None
 
 
@@ -1500,7 +1807,7 @@ def create_merge_record(task_id, branch_name, status, **kwargs):
         return record
     except Exception as e:
         db.rollback()
-        print(f"Error creating merge record: {e}")
+        logger.error("Error creating merge record: %s", e)
         return None
     finally:
         db.close()
@@ -1531,5 +1838,5 @@ def update_merge_record(db, record_id, **kwargs):
         return record
     except Exception as e:
         db.rollback()
-        print(f"Error updating merge record: {e}")
+        logger.error("Error updating merge record: %s", e)
         return None

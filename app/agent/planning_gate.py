@@ -448,8 +448,12 @@ async def run_planning_gate(
     llm_model: str | None = None,
     llm_id: int | None = None,
     budget_id: int | None = None,
+    project_path: str | None = None,
 ) -> dict:
     """Run the planning gate and return a result dict."""
+    if project_path is not None:
+        from app.agent.tools import set_task_git_cwd
+        set_task_git_cwd(project_path)
     gate = PlanningGate(
         task_id=task_id,
         planning_result=planning_result,

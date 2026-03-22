@@ -104,8 +104,23 @@ class TestBuildTally:
         assert "static_analysis" in tally["rejection_reasons"][0]
 
     def test_majority_not_suitable_yields_rejected(self):
-        """Majority NOT_SUITABLE => 'rejected' outcome."""
+        """Majority NOT_SUITABLE => 'rejected' outcome (using verdicts.py rule: (n//2)+1)."""
         pipeline = _make_pipeline()
+        # 4 votes: need 3 NOT_SUITABLE (threshold = 4//2 + 1 = 3)
+        pipeline.votes = [
+            _make_vote("scope_analysis", VERDICT_NOT_SUITABLE),
+            _make_vote("static_analysis", VERDICT_NOT_SUITABLE),
+            _make_vote("conflict_detection", VERDICT_NOT_SUITABLE),
+            _make_vote("feasibility_analysis", VERDICT_POSSIBLE),
+        ]
+        tally = pipeline._build_tally()
+        # 3 NOT_SUITABLE out of 4 = threshold 3 >= 3 => rejected
+        assert tally["outcome"] == "rejected"
+
+    def test_two_not_suitable_is_tie(self):
+        """2 NOT_SUITABLE + 2 pass votes => tie (NOT_SUITABLE < threshold)."""
+        pipeline = _make_pipeline()
+        # 4 votes: 2 NOT_SUITABLE < threshold 3 => not rejected, falls through to tie check
         pipeline.votes = [
             _make_vote("scope_analysis", VERDICT_NOT_SUITABLE),
             _make_vote("static_analysis", VERDICT_NOT_SUITABLE),
@@ -113,11 +128,11 @@ class TestBuildTally:
             _make_vote("feasibility_analysis", VERDICT_POSSIBLE),
         ]
         tally = pipeline._build_tally()
-        # 2 NOT_SUITABLE out of 4 = 50% >= 50% threshold
-        assert tally["outcome"] == "rejected"
+        # 2 NOT_SUITABLE < 3 threshold => passed/fail counts: 2 vs 2 => tie
+        assert tally["outcome"] == "tie"
 
     def test_minority_not_suitable_does_not_reject(self):
-        """1 NOT_SUITABLE out of 4 does not trigger rejection."""
+        """1 NOT_SUITABLE out of 4 does not trigger rejection (threshold = (4//2)+1 = 3)."""
         pipeline = _make_pipeline()
         pipeline.votes = [
             _make_vote("scope_analysis", VERDICT_NOT_SUITABLE),
@@ -126,6 +141,7 @@ class TestBuildTally:
             _make_vote("feasibility_analysis", VERDICT_POSSIBLE),
         ]
         tally = pipeline._build_tally()
+        # 1 NOT_SUITABLE < 3 threshold => passed
         assert tally["outcome"] == "passed"
 
     def test_any_needs_research_yields_needs_research(self):
@@ -792,18 +808,23 @@ class TestTieHandling:
 class TestFullPipelineWithMockLLM:
     """End-to-end tests using MockLLM for all LLM calls."""
 
+    def _make_mock_call_llm(self, mock_llm: MockLLM):
+        """Create a mock call_llm that bypasses budget_id enforcement."""
+        async def mock_call_llm(messages, **kwargs):
+            result = mock_llm.complete(messages, tools=kwargs.get("tools"))
+            result.setdefault("usage", {"prompt_tokens": 50, "completion_tokens": 100})
+            return result
+        return mock_call_llm
+
     async def test_full_pipeline_all_pass(self, sample_all_tasks):
         """Full pipeline with all stages passing."""
         mock = MockLLM(scenario="intake_all_pass")
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client_cls.return_value.__aenter__.return_value.post = mock.handle_post
-            # Also patch static analysis to avoid tree-sitter dependency
-            with patch(
-                "app.agent.intake.IntakePipeline._stage_static_analysis",
-                new_callable=AsyncMock,
-            ) as mock_static:
-                mock_static.return_value = _make_vote("static_analysis", VERDICT_POSSIBLE)
+        # Patch static analysis to avoid tree-sitter dependency
+        with patch("app.agent.intake.IntakePipeline._stage_static_analysis", new_callable=AsyncMock) as mock_static:
+            mock_static.return_value = _make_vote("static_analysis", VERDICT_POSSIBLE)
+
+            with patch("app.agent.intake.call_llm", side_effect=self._make_mock_call_llm(mock)):
                 result = await run_intake_pipeline(
                     task_id="task-42",
                     task_description="Add WebSocket support",
@@ -819,8 +840,7 @@ class TestFullPipelineWithMockLLM:
         """Full pipeline short-circuits when scope analysis rejects."""
         mock = MockLLM(scenario="intake_rejected")
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client_cls.return_value.__aenter__.return_value.post = mock.handle_post
+        with patch("app.agent.intake.call_llm", side_effect=self._make_mock_call_llm(mock)):
             result = await run_intake_pipeline(
                 task_id="task-42",
                 task_description="Rewrite everything",
@@ -835,16 +855,12 @@ class TestFullPipelineWithMockLLM:
         """Token usage is tracked across all pipeline stages."""
         mock = MockLLM(scenario="intake_all_pass")
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client_cls.return_value.__aenter__.return_value.post = mock.handle_post
-            with patch(
-                "app.agent.intake.IntakePipeline._stage_static_analysis",
-                new_callable=AsyncMock,
-            ) as mock_static:
-                mock_static.return_value = _make_vote(
-                    "static_analysis", VERDICT_POSSIBLE,
-                    prompt_tokens=0, completion_tokens=0,
-                )
+        with patch("app.agent.intake.IntakePipeline._stage_static_analysis", new_callable=AsyncMock) as mock_static:
+            mock_static.return_value = _make_vote(
+                "static_analysis", VERDICT_POSSIBLE,
+                prompt_tokens=0, completion_tokens=0,
+            )
+            with patch("app.agent.intake.call_llm", side_effect=self._make_mock_call_llm(mock)):
                 result = await run_intake_pipeline(
                     task_id="task-42",
                     task_description="Add feature X",
@@ -857,8 +873,8 @@ class TestFullPipelineWithMockLLM:
         # LLM stages should have contributed some tokens
         llm_votes = [v for v in result["votes"] if v["model"] != "static_analysis"]
         total_llm_prompt = sum(v.get("prompt_tokens", 0) for v in llm_votes)
-        # Mock returns 50 prompt tokens per call
-        assert total_llm_prompt > 0
+        # Mock returns 50 prompt tokens per call (3 LLM calls)
+        assert total_llm_prompt >= 150
 
 
 # ===================================================================

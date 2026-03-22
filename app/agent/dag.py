@@ -25,10 +25,13 @@ The "done" states recognised as satisfying a prerequisite are:
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict, deque
 from typing import Any
 
 from app.agent.config import PIPELINE_COLUMN_ORDER, PIPELINE_DONE_STATUSES
+
+logger = logging.getLogger(__name__)
 
 # Status / column names that count as "this task is done"
 _DONE_STATUSES: frozenset[str] = PIPELINE_DONE_STATUSES
@@ -136,6 +139,10 @@ class DAGResolver:
 
         # If any node still has in_degree > 0, there's a cycle
         if any(deg > 0 for deg in in_degree.values()):
+            logger.error(
+                "DAG has cycle(s) — topological sort aborted for task set: %s",
+                [t["id"] for t in self._tasks if "id" in t],
+            )
             return []  # Caller should check validate_dag() for details
 
         return batches
@@ -202,6 +209,8 @@ class DAGResolver:
                 if dfs(tid, []):
                     errors.append(f"Cycle detected: {cycle_found[-1]}")
 
+        for e in errors:
+            logger.warning("DAG validation error: %s", e)
         return errors
 
     # ------------------------------------------------------------------

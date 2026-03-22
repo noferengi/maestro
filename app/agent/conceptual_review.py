@@ -34,10 +34,13 @@ from app.agent.config import (
     CONCEPTUAL_REVIEW_LLM_TEMPERATURE,
     CONCEPTUAL_REVIEW_HIGH_SEVERITY_BLOCKS,
     CONCEPTUAL_REVIEW_RESEARCH_LIVES,
+    CONCEPTUAL_REVIEW_REVIEWER_TOOLS,
     PROJECT_ROOT,
 )
+from app.agent.json_utils import extract_json_block
 from app.agent.llm_client import call_llm
 from app.agent.research import run_research
+from app.agent.tools import dispatch_tool, build_tool_schemas
 from app.agent.verdicts import Vote, Verdict, tally_votes
 
 logger = logging.getLogger(__name__)
@@ -56,6 +59,8 @@ class ConceptualReviewResult:
 
 class ConceptualReviewPipeline:
     """10-voter read-only conceptual review pipeline."""
+
+    _REVIEWER_SCHEMAS: list[dict] = build_tool_schemas(CONCEPTUAL_REVIEW_REVIEWER_TOOLS)
 
     def __init__(
         self,
@@ -338,58 +343,99 @@ class ConceptualReviewPipeline:
         plan_summary: str, det_summary: str,
         extra_context: str = "",
     ) -> Vote:
-        """Run a single LLM reviewer."""
+        """Run a single LLM reviewer using a mini-loop with tool access."""
         prompt = (
             f"You are reviewing code from the perspective of: {focus}\n\n"
             f"Task: {self.task_description}\n\n"
             f"Planning result:\n{plan_summary}\n\n"
             f"Deterministic check results:\n{det_summary}\n\n"
             f"{extra_context}"
+            "You may use tools to read code files before giving your verdict.\n\n"
             "Output JSON: {\"verdict\": \"LIKELY|POSSIBLE|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED\", "
             "\"confidence\": <0-100>, \"justification\": \"...\", "
             "\"severity\": \"low|medium|high|critical\"}"
         )
 
-        response = await call_llm(
-            [
-                {"role": "system", "content": "You are a code reviewer. Output only JSON."},
-                {"role": "user", "content": prompt},
-            ],
-            base_url=self.llm_base_url,
-            model=self.llm_model,
-            temperature=CONCEPTUAL_REVIEW_LLM_TEMPERATURE,
-            response_format={"type": "json_object"},
-            task_id=self.task_id,
-            llm_id=self.llm_id,
-            budget_id=self.budget_id,
-        )
+        messages: list[dict] = [
+            {"role": "system", "content": "You are a code reviewer. Output your verdict as JSON when ready."},
+            {"role": "user", "content": prompt},
+        ]
 
-        usage = response.get("usage", {})
-        self._total_prompt += usage.get("prompt_tokens", 0)
-        self._total_completion += usage.get("completion_tokens", 0)
+        max_turns = CONCEPTUAL_REVIEW_MAX_TURNS
 
-        content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
-        try:
-            data = json.loads(content)
-            verdict_str = data.get("verdict", "POSSIBLE").upper()
-            verdict = Verdict(verdict_str)
-            confidence = int(data.get("confidence", 80))
-            lo, hi = verdict.confidence_range
-            confidence = max(lo, min(hi, confidence))
-            justification = data.get("justification", "")
-            severity = data.get("severity", "medium")
-            if severity in ("high", "critical"):
-                justification = f"[{severity.upper()}] {justification}"
-        except (json.JSONDecodeError, ValueError):
-            verdict = Verdict.POSSIBLE
-            confidence = 80
-            justification = content[:500]
+        for turn in range(max_turns):
+            response = await call_llm(
+                messages,
+                base_url=self.llm_base_url,
+                model=self.llm_model,
+                temperature=CONCEPTUAL_REVIEW_LLM_TEMPERATURE,
+                tools=self._REVIEWER_SCHEMAS,
+                tool_choice="auto",
+                task_id=self.task_id,
+                llm_id=self.llm_id,
+                budget_id=self.budget_id,
+            )
 
+            usage = response.get("usage", {})
+            self._total_prompt += usage.get("prompt_tokens", 0)
+            self._total_completion += usage.get("completion_tokens", 0)
+
+            assistant_msg = response.get("choices", [{}])[0].get("message", {})
+            messages.append(assistant_msg)
+            tool_calls = assistant_msg.get("tool_calls") or []
+            content = assistant_msg.get("content") or ""
+
+            if tool_calls:
+                for tc in tool_calls:
+                    tc_result = dispatch_tool(
+                        tc["function"]["name"],
+                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                    )
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "content": tc_result,
+                    })
+                continue
+
+            raw = extract_json_block(content)
+            if raw:
+                try:
+                    data = json.loads(raw)
+                    if "verdict" in data:
+                        verdict_str = data.get("verdict", "POSSIBLE").upper()
+                        verdict = Verdict(verdict_str)
+                        confidence = int(data.get("confidence", 80))
+                        lo, hi = verdict.confidence_range
+                        confidence = max(lo, min(hi, confidence))
+                        justification = data.get("justification", "")
+                        severity = data.get("severity", "medium")
+                        if severity in ("high", "critical"):
+                            justification = f"[{severity.upper()}] {justification}"
+                        return Vote(
+                            stage=name,
+                            verdict=verdict,
+                            confidence=confidence,
+                            justification=justification,
+                            model=self.llm_model or "",
+                        )
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            turns_remaining = max_turns - turn - 1
+            if turns_remaining <= 2:
+                messages.append({
+                    "role": "user",
+                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Output your verdict as JSON now.",
+                })
+
+        # Fallback: turns exhausted
         return Vote(
             stage=name,
-            verdict=verdict,
-            confidence=confidence,
-            justification=justification,
+            verdict=Verdict.NEEDS_RESEARCH,
+            confidence=65,
+            justification="Reviewer exhausted turns",
             model=self.llm_model or "",
         )
 
@@ -502,8 +548,12 @@ async def run_conceptual_review(
     llm_model: str | None = None,
     llm_id: int | None = None,
     budget_id: int | None = None,
+    project_path: str | None = None,
 ) -> dict:
     """Run the conceptual review pipeline and return a result dict."""
+    if project_path is not None:
+        from app.agent.tools import set_task_git_cwd
+        set_task_git_cwd(project_path)
     pipeline = ConceptualReviewPipeline(
         task_id=task_id,
         task_description=task_description,

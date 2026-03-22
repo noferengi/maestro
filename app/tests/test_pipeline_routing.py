@@ -483,6 +483,7 @@ class TestIntakePipelineMockLLM:
                     llm_id=1,
                     llm_base_url="http://localhost:8008/v1",
                     llm_model="mock-model",
+                    project=None,  # Pipeline will fail unless project is configured
                 )
 
         return asyncio.run(_go())

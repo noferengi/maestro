@@ -404,6 +404,7 @@ class TestIntakeBuildTallySubdivide:
             all_tasks=[],
             budget_id=1,
             llm_id=1,
+            project="TheMaestro",  # Required for static analysis
         )
         pipeline.votes = [
             {

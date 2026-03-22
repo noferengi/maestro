@@ -28,7 +28,18 @@ from app.agent.config import (
     OPTIMIZATION_IMPL_TEMPERATURE,
     OPTIMIZATION_MIN_IMPROVEMENT_PCT,
     OPTIMIZATION_MAX_REGRESSION_PCT,
+    OPTIMIZATION_MAX_REVIEWER_TURNS,
+    OPTIMIZATION_REVIEWER_TOOLS,
+    OPTIMIZATION_COMPUTE_WEIGHT,
+    OPTIMIZATION_MEMORY_WEIGHT,
+    OPTIMIZATION_READABILITY_PENALTY_MAX,
+    OPTIMIZATION_PREMATURE_MULTIPLIER,
+    OPTIMIZATION_TECH_DEBT_BONUS_PCT,
+    BIG_O_RANKING,
+    OPTIMIZATION_BIG_O_BONUS_PCT,
 )
+from app.agent.json_utils import extract_json_block
+from app.agent.tools import dispatch_tool, build_tool_schemas
 from app.agent.llm_client import call_llm
 
 logger = logging.getLogger(__name__)
@@ -55,6 +66,8 @@ class OptimizationPipelineResult:
 
 class OptimizationPipeline:
     """5-phase optimization pipeline."""
+
+    _REVIEWER_SCHEMAS: list[dict] = build_tool_schemas(OPTIMIZATION_REVIEWER_TOOLS)
 
     def __init__(
         self,
@@ -147,7 +160,7 @@ class OptimizationPipeline:
         post = await self._phase_profiling("post")
 
         # Compare
-        outcome, summary = self._compare_reports(baseline, post)
+        outcome, summary = self._compare_reports(baseline, post, parent_task_id=self.task_id)
 
         result = OptimizationPipelineResult(
             task_id=self.task_id,
@@ -173,44 +186,175 @@ class OptimizationPipeline:
     # ------------------------------------------------------------------
 
     async def _phase_profiling(self, phase_name: str) -> dict:
-        """Run profiling analysis via LLM."""
+        """Run profiling analysis via LLM mini-loop."""
         prompt = (
             f"You are a performance profiler running {phase_name} analysis.\n"
             f"Task: {self.task_description}\n\n"
-            "Analyze and report on:\n"
-            "- Test duration estimates\n"
-            "- Memory usage patterns\n"
-            "- Dependency count\n"
-            "- Hotspot identification\n"
-            "- Code complexity metrics\n\n"
-            "Output JSON: {\"test_duration_ms\": 0, \"memory_peak_mb\": 0, "
-            "\"dep_count\": 0, \"hotspots\": [], \"complexity_score\": 0}"
+            "Step 1 — Read the relevant source files to understand the code.\n"
+            "Step 2 — Determine the Big O class of the critical path by reading the code "
+            "(do not guess; trace the actual algorithm).\n"
+            "Step 3 — Run a synthetic benchmark using run_shell with a Python one-liner. "
+            "Choose scale_n based on operation type: N=10_000 for I/O-bound, "
+            "N=100_000 for CPU-bound, N=1_000_000 for trivial ops. Example:\n"
+            "  python -c \"import time; start=time.perf_counter(); [your_op() for _ in range(N)]; "
+            "print((time.perf_counter()-start)*1000)\"\n"
+            "Step 4 — Estimate peak memory usage (RSS) during the benchmark if measurable.\n"
+            "Step 5 — Identify hotspots (function/line references).\n"
+            "Step 6 — Rate readability_cost from 0.0 (simple, clear) to 1.0 (requires deep "
+            "expertise to understand or maintain).\n"
+            "Step 7 — Determine if this optimization targets a real measured bottleneck "
+            "(is_premature=false) or an assumed one (is_premature=true).\n"
+            "Step 8 — Determine if this resolves known tech debt (tech_debt_resolved=true/false).\n\n"
+            "Output JSON:\n"
+            "{\"test_duration_ms\": 0, \"memory_peak_mb\": 0, \"dep_count\": 0, \"hotspots\": [], "
+            "\"complexity_score\": 0, \"big_o_class\": \"O(n)\", \"scale_n\": 10000, "
+            "\"readability_cost\": 0.0, \"is_premature\": false, \"tech_debt_resolved\": false, "
+            "\"notes\": \"\"}"
         )
 
-        try:
-            response = await call_llm(
-                [
-                    {"role": "system", "content": "You are a performance profiler. Output only JSON."},
-                    {"role": "user", "content": prompt},
-                ],
-                base_url=self.llm_base_url,
-                model=self.llm_model,
-                temperature=0.1,
-                response_format={"type": "json_object"},
-                task_id=self.task_id,
-                llm_id=self.llm_id,
-                budget_id=self.budget_id,
-            )
+        messages: list[dict] = [
+            {"role": "system", "content": "You are a performance profiler. Output your report as JSON when ready."},
+            {"role": "user", "content": prompt},
+        ]
+
+        max_turns = OPTIMIZATION_MAX_REVIEWER_TURNS
+
+        for turn in range(max_turns):
+            try:
+                response = await call_llm(
+                    messages,
+                    base_url=self.llm_base_url,
+                    model=self.llm_model,
+                    temperature=0.1,
+                    tools=self._REVIEWER_SCHEMAS,
+                    tool_choice="auto",
+                    task_id=self.task_id,
+                    llm_id=self.llm_id,
+                    budget_id=self.budget_id,
+                )
+            except Exception as e:
+                logger.warning("[optimization] Profiling (%s) LLM call failed: %s", phase_name, e)
+                return {"error": str(e)}
+
             self._track_tokens(response)
-            content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
-            return json.loads(content)
-        except Exception as e:
-            logger.warning("[optimization] Profiling (%s) failed: %s", phase_name, e)
-            return {"error": str(e)}
+            assistant_msg = response.get("choices", [{}])[0].get("message", {})
+            messages.append(assistant_msg)
+            tool_calls = assistant_msg.get("tool_calls") or []
+            content = assistant_msg.get("content") or ""
+
+            if tool_calls:
+                for tc in tool_calls:
+                    tc_result = dispatch_tool(
+                        tc["function"]["name"],
+                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                    )
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "content": tc_result,
+                    })
+                continue
+
+            raw = extract_json_block(content)
+            if raw:
+                try:
+                    data = json.loads(raw)
+                    if isinstance(data, dict) and ("test_duration_ms" in data or "complexity_score" in data or "big_o_class" in data or "error" in data):
+                        return data
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            turns_remaining = max_turns - turn - 1
+            if turns_remaining <= 2:
+                messages.append({
+                    "role": "user",
+                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Output JSON profiling report now.",
+                })
+
+        return {"error": "Profiler exhausted turns"}
 
     # ------------------------------------------------------------------
     # Phase 2: Proposals
     # ------------------------------------------------------------------
+
+    async def _run_single_proposer(
+        self, lens_name: str, focus: str, baseline: dict
+    ) -> dict | None:
+        """Run a single optimization proposer using a mini-loop."""
+        prompt = (
+            f"You are an optimization proposer with lens: {lens_name}.\n"
+            f"Focus: {focus}\n\n"
+            f"Task: {self.task_description}\n"
+            f"Baseline: {json.dumps(baseline, indent=1)[:2000]}\n\n"
+            "You may use tools to inspect code files.\n\n"
+            "Propose optimizations. Output JSON: "
+            "{\"lens\": \"...\", \"proposals\": [{\"description\": \"...\", "
+            "\"estimated_improvement_pct\": 0, \"risk\": \"low|medium|high\", "
+            "\"implementation_steps\": [\"...\"]}]}"
+        )
+
+        messages: list[dict] = [
+            {"role": "system", "content": "You are an optimization expert. Output your proposals as JSON when ready."},
+            {"role": "user", "content": prompt},
+        ]
+
+        max_turns = OPTIMIZATION_MAX_REVIEWER_TURNS
+
+        for turn in range(max_turns):
+            try:
+                response = await call_llm(
+                    messages,
+                    base_url=self.llm_base_url,
+                    model=self.llm_model,
+                    temperature=OPTIMIZATION_PROPOSER_TEMPERATURE,
+                    tools=self._REVIEWER_SCHEMAS,
+                    tool_choice="auto",
+                    task_id=self.task_id,
+                    llm_id=self.llm_id,
+                    budget_id=self.budget_id,
+                )
+            except Exception as e:
+                logger.warning("[optimization] Proposer (%s) LLM call failed: %s", lens_name, e)
+                return None
+
+            self._track_tokens(response)
+            assistant_msg = response.get("choices", [{}])[0].get("message", {})
+            messages.append(assistant_msg)
+            tool_calls = assistant_msg.get("tool_calls") or []
+            content = assistant_msg.get("content") or ""
+
+            if tool_calls:
+                for tc in tool_calls:
+                    tc_result = dispatch_tool(
+                        tc["function"]["name"],
+                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                    )
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "content": tc_result,
+                    })
+                continue
+
+            raw = extract_json_block(content)
+            if raw:
+                try:
+                    data = json.loads(raw)
+                    if isinstance(data, dict) and "lens" in data:
+                        return data
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            turns_remaining = max_turns - turn - 1
+            if turns_remaining <= 2:
+                messages.append({
+                    "role": "user",
+                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Output JSON proposals now.",
+                })
+
+        return None
 
     async def _phase_proposals(self, baseline: dict) -> list[dict]:
         """Generate N optimization proposals in parallel."""
@@ -222,52 +366,87 @@ class OptimizationPipeline:
             ("bit_level", "IntEnum vs str Enum, bitfield packing, binary formats"),
         ]
 
-        tasks = []
-        for lens_name, focus in lenses[:OPTIMIZATION_PROPOSAL_COUNT]:
-            prompt = (
-                f"You are an optimization proposer with lens: {lens_name}.\n"
-                f"Focus: {focus}\n\n"
-                f"Task: {self.task_description}\n"
-                f"Baseline: {json.dumps(baseline, indent=1)[:2000]}\n\n"
-                "Propose optimizations. Output JSON: "
-                "{\"lens\": \"...\", \"proposals\": [{\"description\": \"...\", "
-                "\"estimated_improvement_pct\": 0, \"risk\": \"low|medium|high\", "
-                "\"implementation_steps\": [\"...\"]}]}"
-            )
-            tasks.append(
-                call_llm(
-                    [
-                        {"role": "system", "content": "You are an optimization expert. Output only JSON."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    base_url=self.llm_base_url,
-                    model=self.llm_model,
-                    temperature=OPTIMIZATION_PROPOSER_TEMPERATURE,
-                    response_format={"type": "json_object"},
-                    task_id=self.task_id,
-                    llm_id=self.llm_id,
-                    budget_id=self.budget_id,
-                )
-            )
-
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        tasks = [
+            self._run_single_proposer(lens_name, focus, baseline)
+            for lens_name, focus in lenses[:OPTIMIZATION_PROPOSAL_COUNT]
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
         proposals = []
-        for resp in responses:
-            if isinstance(resp, Exception):
+        for result in results:
+            if result is None or isinstance(result, Exception):
                 continue
-            self._track_tokens(resp)
-            content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
-            try:
-                proposals.append(json.loads(content))
-            except json.JSONDecodeError:
-                pass
+            proposals.append(result)
 
         return proposals
 
     # ------------------------------------------------------------------
     # Phase 3: Judging
     # ------------------------------------------------------------------
+
+    async def _run_single_judge(self, judge_prompt: str) -> dict | None:
+        """Run a single optimization judge using a mini-loop."""
+        messages: list[dict] = [
+            {"role": "system", "content": "You are an optimization judge. Output your verdict as JSON when ready."},
+            {"role": "user", "content": judge_prompt},
+        ]
+
+        max_turns = OPTIMIZATION_MAX_REVIEWER_TURNS
+
+        for turn in range(max_turns):
+            try:
+                response = await call_llm(
+                    messages,
+                    base_url=self.llm_base_url,
+                    model=self.llm_model,
+                    temperature=OPTIMIZATION_JUDGE_TEMPERATURE,
+                    tools=self._REVIEWER_SCHEMAS,
+                    tool_choice="auto",
+                    task_id=self.task_id,
+                    llm_id=self.llm_id,
+                    budget_id=self.budget_id,
+                )
+            except Exception as e:
+                logger.warning("[optimization] Judge LLM call failed: %s", e)
+                return None
+
+            self._track_tokens(response)
+            assistant_msg = response.get("choices", [{}])[0].get("message", {})
+            messages.append(assistant_msg)
+            tool_calls = assistant_msg.get("tool_calls") or []
+            content = assistant_msg.get("content") or ""
+
+            if tool_calls:
+                for tc in tool_calls:
+                    tc_result = dispatch_tool(
+                        tc["function"]["name"],
+                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                    )
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "content": tc_result,
+                    })
+                continue
+
+            raw = extract_json_block(content)
+            if raw:
+                try:
+                    data = json.loads(raw)
+                    if isinstance(data, dict) and "winner_index" in data:
+                        return data
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            turns_remaining = max_turns - turn - 1
+            if turns_remaining <= 2:
+                messages.append({
+                    "role": "user",
+                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Output JSON judgment now.",
+                })
+
+        return None
 
     async def _phase_judging(
         self, proposals: list[dict]
@@ -298,38 +477,16 @@ class OptimizationPipeline:
             return p
 
         async def _run_judges(judge_prompt: str) -> tuple[list[dict], dict[int, int]]:
-            tasks = []
-            for _ in range(OPTIMIZATION_JUDGE_COUNT):
-                tasks.append(
-                    call_llm(
-                        [
-                            {"role": "system", "content": "You are an optimization judge. Output only JSON."},
-                            {"role": "user", "content": judge_prompt},
-                        ],
-                        base_url=self.llm_base_url,
-                        model=self.llm_model,
-                        temperature=OPTIMIZATION_JUDGE_TEMPERATURE,
-                        response_format={"type": "json_object"},
-                        task_id=self.task_id,
-                        llm_id=self.llm_id,
-                        budget_id=self.budget_id,
-                    )
-                )
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            judge_tasks = [self._run_single_judge(judge_prompt) for _ in range(OPTIMIZATION_JUDGE_COUNT)]
+            results = await asyncio.gather(*judge_tasks, return_exceptions=True)
             scores: list[dict] = []
             votes: dict[int, int] = {}
-            for resp in responses:
-                if isinstance(resp, Exception):
+            for result in results:
+                if result is None or isinstance(result, Exception):
                     continue
-                self._track_tokens(resp)
-                content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
-                try:
-                    data = json.loads(content)
-                    scores.append(data)
-                    winner = data.get("winner_index", 0)
-                    votes[winner] = votes.get(winner, 0) + 1
-                except json.JSONDecodeError:
-                    pass
+                scores.append(result)
+                winner = result.get("winner_index", 0)
+                votes[winner] = votes.get(winner, 0) + 1
             return scores, votes
 
         # --- Round 1 ---
@@ -365,44 +522,180 @@ class OptimizationPipeline:
     # ------------------------------------------------------------------
 
     async def _phase_implementation(self, proposal: dict) -> bool:
-        """Implement the winning optimization (simplified — single LLM call)."""
-        prompt = (
-            "Implement the following optimization.\n\n"
-            f"Proposal: {json.dumps(proposal, indent=1)[:3000]}\n\n"
-            "Describe the exact code changes needed. "
-            "Output JSON: {\"success\": true/false, \"changes\": [{\"file\": \"...\", \"description\": \"...\"}]}"
-        )
+        """
+        Spawn Kanban sub-task cards for each winning optimization proposal so they
+        flow through the full pipeline (IDEA → PLANNING → INDEV → ...).
+        Returns True when all sub-tasks reach a terminal state, False on timeout.
+        """
+        from app.database import create_task, get_task, update_task
 
-        try:
-            response = await call_llm(
-                [
-                    {"role": "system", "content": "You are an implementation agent. Output only JSON."},
-                    {"role": "user", "content": prompt},
-                ],
-                base_url=self.llm_base_url,
-                model=self.llm_model,
-                temperature=OPTIMIZATION_IMPL_TEMPERATURE,
-                response_format={"type": "json_object"},
-                task_id=self.task_id,
-                llm_id=self.llm_id,
-                budget_id=self.budget_id,
-            )
-            self._track_tokens(response)
-            content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
-            data = json.loads(content)
-            return data.get("success", True)
-        except Exception as e:
-            logger.warning("[optimization] Implementation failed: %s", e)
+        parent = get_task(self.task_id)
+        if not parent:
+            logger.warning("[optimization] Parent task '%s' not found.", self.task_id)
             return False
+
+        proposals_list = proposal.get("proposals", [proposal])
+        sub_task_ids: list[str] = []
+
+        for opt in proposals_list:
+            description = self._build_subtask_description(opt, proposal.get("lens", "general"))
+            sub_task = create_task(
+                title=f"Opt: {opt.get('description', 'unnamed')[:60]}",
+                task_type="idea",
+                description=description,
+                owner="maestro-optimizer",
+                tags=["optimization", f"parent:{self.task_id}", f"risk:{opt.get('risk', 'unknown')}"],
+                llm_id=parent.llm_id,
+                budget_id=parent.budget_id,
+                # Inherit parent's prereqs (NOT parent's ID — avoids deadlock)
+                prerequisites=list(parent.prerequisites or []),
+                project=parent.project or "TheMaestro",
+            )
+            if sub_task:
+                update_task(
+                    sub_task.id,
+                    parent_task_id=self.task_id,
+                    subdivision_generation=(parent.subdivision_generation or 0) + 1,
+                )
+                sub_task_ids.append(sub_task.id)
+                logger.info(
+                    "[optimization] Created sub-task '%s' for proposal: %s",
+                    sub_task.id, opt.get("description", "?")[:60],
+                )
+
+        if not sub_task_ids:
+            logger.warning("[optimization] No sub-tasks created for task '%s'.", self.task_id)
+            return False
+
+        update_task(self.task_id, is_big_idea=True)
+        return await self._wait_for_subtasks(sub_task_ids)
+
+    def _build_subtask_description(self, opt: dict, lens: str) -> str:
+        """Build a rich markdown task description for an optimization sub-task."""
+        lines = [
+            f"## Optimization Sub-task (lens: {lens})",
+            "",
+            f"**Parent task:** `{self.task_id}`",
+            "",
+            "### Proposal",
+            f"{opt.get('description', 'No description provided.')}",
+            "",
+        ]
+        if opt.get("rationale"):
+            lines += ["### Rationale", opt["rationale"], ""]
+        if opt.get("implementation_steps"):
+            lines += ["### Implementation Steps"]
+            for step in opt["implementation_steps"]:
+                lines.append(f"- {step}")
+            lines.append("")
+        lines += [
+            "### Benchmarking Requirements",
+            "",
+            "**Compute time is the most precious resource in this project.** "
+            "Improvements to CPU/wall time are weighted highest in the decision framework.",
+            "",
+            "**Before making any code changes**, run a timed benchmark using `run_shell`:",
+            "```bash",
+            "python -c \"import time; start=time.perf_counter(); [YOUR_OP for _ in range(N)]; print((time.perf_counter()-start)*1000)\"",
+            "```",
+            "Choose `scale_n`: N=10_000 for I/O-bound, N=100_000 for CPU-bound, N=1_000_000 for trivial ops.",
+            "",
+            f"Then call `record_benchmark` with `benchmark_type='before'`, `parent_task_id='{self.task_id}'`, and all required metrics:",
+            "```json",
+            "{",
+            "  \"test_duration_ms\": 0,",
+            "  \"memory_peak_mb\": 0,",
+            "  \"complexity_score\": 0,",
+            "  \"big_o_class\": \"O(n)\",",
+            "  \"scale_n\": 10000,",
+            "  \"readability_cost\": 0.0,",
+            "  \"is_premature\": false,",
+            "  \"tech_debt_resolved\": false,",
+            "  \"notes\": \"\"",
+            "}",
+            "```",
+            "",
+            "**Before writing any code, ask yourself:** Is this bottleneck real and measured, "
+            "or assumed? If the profiling data doesn't show it as a hotspot, set `is_premature=true`. "
+            "Premature optimizations require 2× the improvement threshold to be accepted.",
+            "",
+            "**After implementing and verifying changes**, run the same benchmark at the same `scale_n` "
+            "and call `record_benchmark` with `benchmark_type='after'` and updated metrics.",
+            "",
+            "**Readability cost:** Rate 0.0 (identical readability to before) to 1.0 (requires deep "
+            "expertise to maintain). Be honest — clever code has a carrying cost and will reduce your score.",
+            "",
+            f"Risk level: **{opt.get('risk', 'unknown')}**",
+        ]
+        return "\n".join(lines)
+
+    async def _wait_for_subtasks(
+        self,
+        sub_task_ids: list[str],
+        poll_interval: float = 10.0,
+        timeout: float = 3600.0,
+    ) -> bool:
+        """
+        Poll until all sub-tasks reach a terminal state (completed/accepted/rejected)
+        or timeout is exceeded.  Returns True if all completed successfully.
+        """
+        from app.database import get_task
+        from app.agent.config import PIPELINE_DONE_STATUSES
+
+        terminal = PIPELINE_DONE_STATUSES | {"rejected", "idea"}  # idea = stuck/not advancing
+        deadline = asyncio.get_event_loop().time() + timeout
+
+        while asyncio.get_event_loop().time() < deadline:
+            statuses = []
+            for tid in sub_task_ids:
+                task = get_task(tid)
+                statuses.append(task.type if task else "missing")
+
+            done = [s in terminal for s in statuses]
+            logger.debug(
+                "[optimization] Sub-task poll: %s",
+                dict(zip(sub_task_ids, statuses)),
+            )
+
+            if all(done):
+                succeeded = all(
+                    s in PIPELINE_DONE_STATUSES for s in statuses
+                )
+                return succeeded
+
+            await asyncio.sleep(poll_interval)
+
+        logger.warning(
+            "[optimization] Sub-task wait timed out after %.0fs for task '%s'.",
+            timeout, self.task_id,
+        )
+        return False
 
     # ------------------------------------------------------------------
     # Comparison
     # ------------------------------------------------------------------
 
     def _compare_reports(
-        self, baseline: dict, post: dict
+        self, baseline: dict, post: dict, parent_task_id: str | None = None
     ) -> tuple[str, str]:
-        """Compare baseline vs post reports and determine outcome."""
+        """Compare baseline vs post reports and determine outcome.
+
+        If parent_task_id is given and the optimization_benchmarks table has
+        before/after rows for it, use those real metrics.  Otherwise fall back
+        to the complexity_score from the profiling dicts.
+        """
+        if parent_task_id:
+            try:
+                from app.database import get_optimization_benchmarks
+                records = get_optimization_benchmarks(parent_task_id)
+                before_records = [r for r in records if r.benchmark_type == "before"]
+                after_records = [r for r in records if r.benchmark_type == "after"]
+                if before_records and after_records:
+                    return self._compare_benchmarks(before_records, after_records)
+            except Exception as exc:
+                logger.warning("[optimization] Could not load benchmarks for '%s': %s", parent_task_id, exc)
+
+        # Fallback: use complexity_score from profiling dicts
         b_score = baseline.get("complexity_score", 100)
         p_score = post.get("complexity_score", 100)
 
@@ -411,13 +704,163 @@ class OptimizationPipeline:
         else:
             improvement = ((b_score - p_score) / b_score) * 100
 
+        # Apply Big O bonus if both dicts have big_o_class
+        big_o_note = ""
+        b_big_o = baseline.get("big_o_class", "")
+        p_big_o = post.get("big_o_class", "")
+        if b_big_o and p_big_o:
+            b_rank = BIG_O_RANKING.get(b_big_o)
+            p_rank = BIG_O_RANKING.get(p_big_o)
+            if b_rank is not None and p_rank is not None:
+                rank_delta = b_rank - p_rank
+                if rank_delta > 0:
+                    bonus = rank_delta * OPTIMIZATION_BIG_O_BONUS_PCT
+                    improvement += bonus
+                    big_o_note = f", Big O {b_big_o}→{p_big_o} (+{bonus:.0f}%)"
+
+        suffix = f"profiling data{big_o_note}"
+
         if improvement < -OPTIMIZATION_MAX_REGRESSION_PCT:
-            return "rejected", f"Regression of {abs(improvement):.1f}% exceeds {OPTIMIZATION_MAX_REGRESSION_PCT}% limit."
+            return "rejected", f"Regression of {abs(improvement):.1f}% exceeds {OPTIMIZATION_MAX_REGRESSION_PCT}% limit. ({suffix})"
 
         if improvement < OPTIMIZATION_MIN_IMPROVEMENT_PCT:
-            return "skipped", f"Improvement of {improvement:.1f}% below {OPTIMIZATION_MIN_IMPROVEMENT_PCT}% threshold."
+            return "skipped", f"Improvement of {improvement:.1f}% below {OPTIMIZATION_MIN_IMPROVEMENT_PCT}% threshold. ({suffix})"
 
-        return "optimized", f"Improvement of {improvement:.1f}% achieved."
+        return "optimized", f"Improvement of {improvement:.1f}% achieved. ({suffix})"
+
+    def _compare_benchmarks(self, before_records: list, after_records: list) -> tuple[str, str]:
+        """Weighted multi-metric comparison of before/after benchmark records."""
+        import json as _json
+
+        def _parse_metrics(record) -> dict:
+            try:
+                return _json.loads(record.metrics)
+            except Exception:
+                return {}
+
+        # Group by task_id
+        before_by_task: dict[str, dict] = {}
+        for r in before_records:
+            m = _parse_metrics(r)
+            if m:
+                before_by_task[r.task_id] = m
+
+        after_by_task: dict[str, dict] = {}
+        for r in after_records:
+            m = _parse_metrics(r)
+            if m:
+                after_by_task[r.task_id] = m
+
+        common_tasks = set(before_by_task) & set(after_by_task)
+        if not common_tasks:
+            return "skipped", "Benchmark data present but no matching before/after task pairs found."
+
+        task_scores: list[float] = []
+        is_premature_any = False
+        tech_debt_resolved_any = False
+        big_o_transitions: list[str] = []
+
+        for tid in common_tasks:
+            bm = before_by_task[tid]
+            am = after_by_task[tid]
+
+            # --- Compute improvement (lower is better → (before - after) / before × 100) ---
+            compute_imp = 0.0
+            compute_weight_used = 0.0
+            b_dur = bm.get("test_duration_ms")
+            a_dur = am.get("test_duration_ms")
+            if b_dur is not None and a_dur is not None and float(b_dur) != 0:
+                compute_imp = ((float(b_dur) - float(a_dur)) / float(b_dur)) * 100.0
+                compute_weight_used = OPTIMIZATION_COMPUTE_WEIGHT
+
+            memory_imp = 0.0
+            memory_weight_used = 0.0
+            b_mem = bm.get("memory_peak_mb")
+            a_mem = am.get("memory_peak_mb")
+            if b_mem is not None and a_mem is not None and float(b_mem) != 0:
+                memory_imp = ((float(b_mem) - float(a_mem)) / float(b_mem)) * 100.0
+                memory_weight_used = OPTIMIZATION_MEMORY_WEIGHT
+
+            # Weighted aggregate (only include metrics we have data for)
+            total_weight = compute_weight_used + memory_weight_used
+            if total_weight == 0:
+                # No duration or memory data — fall back to complexity_score
+                b_score = bm.get("complexity_score", 100)
+                a_score = am.get("complexity_score", 100)
+                weighted_imp = ((float(b_score) - float(a_score)) / float(b_score) * 100.0) if float(b_score) != 0 else 0.0
+            else:
+                weighted_imp = (
+                    compute_imp * compute_weight_used + memory_imp * memory_weight_used
+                ) / total_weight
+
+            # --- Big O bonus ---
+            b_big_o = bm.get("big_o_class", "")
+            a_big_o = am.get("big_o_class", "")
+            big_o_bonus = 0.0
+            if b_big_o and a_big_o:
+                b_rank = BIG_O_RANKING.get(b_big_o)
+                a_rank = BIG_O_RANKING.get(a_big_o)
+                if b_rank is not None and a_rank is not None:
+                    rank_delta = b_rank - a_rank  # positive = improvement
+                    if rank_delta > 0:
+                        big_o_bonus = rank_delta * OPTIMIZATION_BIG_O_BONUS_PCT
+                        big_o_transitions.append(f"{b_big_o}→{a_big_o} (+{big_o_bonus:.0f}%)")
+            weighted_imp += big_o_bonus
+
+            # --- Readability penalty (from after record) ---
+            readability_cost = am.get("readability_cost")
+            if readability_cost is not None:
+                penalty_fraction = float(readability_cost) * OPTIMIZATION_READABILITY_PENALTY_MAX
+                weighted_imp *= (1.0 - penalty_fraction)
+
+            # --- Qualitative flags ---
+            if am.get("is_premature") is True:
+                is_premature_any = True
+            if am.get("tech_debt_resolved") is True:
+                tech_debt_resolved_any = True
+
+            task_scores.append(weighted_imp)
+
+        improvement = sum(task_scores) / len(task_scores)
+
+        # --- Tech debt bonus ---
+        if tech_debt_resolved_any:
+            improvement += OPTIMIZATION_TECH_DEBT_BONUS_PCT
+
+        # --- Effective threshold (premature multiplier) ---
+        effective_min = (
+            OPTIMIZATION_MIN_IMPROVEMENT_PCT * OPTIMIZATION_PREMATURE_MULTIPLIER
+            if is_premature_any
+            else OPTIMIZATION_MIN_IMPROVEMENT_PCT
+        )
+
+        # --- Build summary ---
+        details: list[str] = [f"weighted score {improvement:.1f}%"]
+        if big_o_transitions:
+            details.append("Big O: " + ", ".join(big_o_transitions))
+        if is_premature_any:
+            details.append(f"premature (threshold ×{OPTIMIZATION_PREMATURE_MULTIPLIER:.0f}={effective_min:.1f}%)")
+        if tech_debt_resolved_any:
+            details.append(f"tech-debt bonus +{OPTIMIZATION_TECH_DEBT_BONUS_PCT:.1f}%")
+        detail_str = "; ".join(details)
+        n = len(common_tasks)
+
+        if improvement < -OPTIMIZATION_MAX_REGRESSION_PCT:
+            return "rejected", (
+                f"Regression of {abs(improvement):.1f}% exceeds {OPTIMIZATION_MAX_REGRESSION_PCT}% limit. "
+                f"(benchmark data, {detail_str}, {n} subtask(s))"
+            )
+
+        if improvement < effective_min:
+            return "skipped", (
+                f"Improvement of {improvement:.1f}% below {effective_min:.1f}% threshold. "
+                f"(benchmark data, {detail_str}, {n} subtask(s))"
+            )
+
+        return "optimized", (
+            f"Improvement of {improvement:.1f}% achieved. "
+            f"(benchmark data, {detail_str}, {n} subtask(s))"
+        )
 
     def _track_tokens(self, response: dict) -> None:
         usage = response.get("usage", {})
@@ -456,8 +899,12 @@ async def run_optimization_pipeline(
     llm_model: str | None = None,
     llm_id: int | None = None,
     budget_id: int | None = None,
+    project_path: str | None = None,
 ) -> dict:
     """Run the optimization pipeline and return a result dict."""
+    if project_path is not None:
+        from app.agent.tools import set_task_git_cwd
+        set_task_git_cwd(project_path)
     pipeline = OptimizationPipeline(
         task_id=task_id,
         task_description=task_description,

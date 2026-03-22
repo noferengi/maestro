@@ -14,7 +14,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from app.agent.config import (
@@ -289,7 +289,7 @@ class DevOrchestrator:
                 error_detail=result.error_detail,
                 prompt_tokens=result.prompt_tokens,
                 completion_tokens=result.completion_tokens,
-                completed_at=datetime.utcnow() if result.status == "ACCEPTED" else None,
+                completed_at=datetime.now(timezone.utc) if result.status == "ACCEPTED" else None,
             )
         except Exception as e:
             logger.error("[dev_orch] Failed to store component result: %s", e)
@@ -308,8 +308,12 @@ async def run_dev_orchestrator(
     llm_model: str | None = None,
     llm_id: int | None = None,
     budget_id: int | None = None,
+    project_path: str | None = None,
 ) -> dict:
     """Run the development orchestrator and return a result dict."""
+    if project_path is not None:
+        from app.agent.tools import set_task_git_cwd
+        set_task_git_cwd(project_path)
     orch = DevOrchestrator(
         task_id=task_id,
         planning_result=planning_result,

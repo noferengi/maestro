@@ -11,7 +11,10 @@ extraction path used by all agents.
 from __future__ import annotations
 
 import json
+import logging
 import re
+
+logger = logging.getLogger(__name__)
 
 
 def extract_json_block(text: str) -> str | None:
@@ -52,4 +55,5 @@ def parse_json_block(text: str) -> dict | None:
         result = json.loads(raw.strip())
         return result if isinstance(result, dict) else None
     except (json.JSONDecodeError, ValueError):
+        logger.debug("JSON parse failed: %s … (truncated)", text[:120])
         return None

@@ -24,6 +24,18 @@ from app.agent.research import (
 from app.agent.tools import TOOL_SCHEMAS, TOOL_REGISTRY
 
 
+def _llm_patch(mock_llm: MockLLM):
+    """Patch app.agent.research.call_llm to delegate to mock_llm.complete().
+
+    The real call_llm raises ValueError when budget_id is None, which prevents
+    tests that construct ResearchAgent without a budget from reaching the LLM.
+    Patching at the research module level bypasses that enforcement.
+    """
+    async def _side_effect(messages, **kwargs):
+        return mock_llm.complete(messages, tools=kwargs.get("tools"))
+    return patch("app.agent.research.call_llm", new=AsyncMock(side_effect=_side_effect))
+
+
 # ===================================================================
 # Tool restriction tests
 # ===================================================================
@@ -35,8 +47,10 @@ class TestToolRestrictions:
     def test_research_agent_tools_list(self):
         """RESEARCH_AGENT_TOOLS contains only read-only tools."""
         expected = {
-            "read_file", "search_files", "find_files", "list_directory",
-            "git_status", "git_diff", "git_log", "git_blame",
+            "read_file", "read_file_lines", "count_lines",
+            "search_files", "find_files", "list_directory",
+            "git_status", "git_diff", "git_log", "git_blame", "git_show",
+            "get_task", "list_tasks",
         }
         assert set(RESEARCH_AGENT_TOOLS) == expected
 
@@ -88,9 +102,10 @@ class TestToolRestrictions:
         assert "update_task_status" not in RESEARCH_AGENT_TOOLS
         assert "append_task_history" not in RESEARCH_AGENT_TOOLS
 
-    def test_get_task_not_in_research_tools(self):
-        """get_task is NOT available to research agents."""
-        assert "get_task" not in RESEARCH_AGENT_TOOLS
+    def test_get_task_in_research_tools(self):
+        """get_task IS available to research agents (read-only task lookup)."""
+        assert "get_task" in RESEARCH_AGENT_TOOLS
+        assert "list_tasks" in RESEARCH_AGENT_TOOLS
 
     def test_all_research_tools_exist_in_registry(self):
         """Every tool in RESEARCH_AGENT_TOOLS exists in the tool registry."""
@@ -348,8 +363,7 @@ class TestResearchAgentWithMockLLM:
             context=sample_task_context,
         )
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client_cls.return_value.__aenter__.return_value.post = mock_llm_pass.handle_post
+        with _llm_patch(mock_llm_pass):
             result = await agent.run()
 
         assert isinstance(result, ResearchResult)
@@ -364,8 +378,7 @@ class TestResearchAgentWithMockLLM:
             context=sample_task_context,
         )
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client_cls.return_value.__aenter__.return_value.post = mock_llm_fail.handle_post
+        with _llm_patch(mock_llm_fail):
             result = await agent.run()
 
         assert result.vote["verdict"] == "REJECTED"
@@ -381,10 +394,7 @@ class TestResearchAgentWithMockLLM:
             max_lives=3,
         )
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client_cls.return_value.__aenter__.return_value.post = (
-                mock_llm_needs_research.handle_post
-            )
+        with _llm_patch(mock_llm_needs_research):
             result = await agent.run()
 
         assert result.vote["verdict"] == "LIKELY"
@@ -401,10 +411,7 @@ class TestResearchAgentWithMockLLM:
             max_lives=2,
         )
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client_cls.return_value.__aenter__.return_value.post = (
-                mock_llm_exhaust_lives.handle_post
-            )
+        with _llm_patch(mock_llm_exhaust_lives):
             result = await agent.run()
 
         assert result.vote["verdict"] == "NOT_SUITABLE"
@@ -418,12 +425,9 @@ class TestResearchAgentWithMockLLM:
             context=sample_task_context,
         )
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client_cls.return_value.__aenter__.return_value.post = mock.handle_post
-            # Also patch dispatch_tool so we don't need real filesystem
-            with patch("app.agent.research.dispatch_tool") as mock_dispatch:
-                mock_dispatch.return_value = "file contents here"
-                result = await agent.run()
+        with _llm_patch(mock), patch("app.agent.research.dispatch_tool") as mock_dispatch:
+            mock_dispatch.return_value = "file contents here"
+            result = await agent.run()
 
         assert result.vote["verdict"] == "LIKELY"
         assert mock.call_count == 2  # tool call + verdict
@@ -436,8 +440,7 @@ class TestResearchAgentWithMockLLM:
             context=sample_task_context,
         )
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client_cls.return_value.__aenter__.return_value.post = mock.handle_post
+        with _llm_patch(mock):
             result = await agent.run()
 
         assert result.vote["verdict"] == "LIKELY"
@@ -451,8 +454,7 @@ class TestResearchAgentWithMockLLM:
             context=sample_task_context,
         )
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client_cls.return_value.__aenter__.return_value.post = mock_llm_pass.handle_post
+        with _llm_patch(mock_llm_pass):
             result = await agent.run()
 
         assert result.prompt_tokens > 0
@@ -477,8 +479,7 @@ class TestTiebreakerAgent:
             is_tiebreaker=True,
         )
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client_cls.return_value.__aenter__.return_value.post = mock.handle_post
+        with _llm_patch(mock):
             result = await agent.run()
 
         assert result.vote["verdict"] == "LIKELY"
@@ -497,8 +498,7 @@ class TestTiebreakerAgent:
             is_tiebreaker=False,
         )
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client_cls.return_value.__aenter__.return_value.post = mock.handle_post
+        with _llm_patch(mock):
             result = await agent.run()
 
         first_call = mock.call_log[0]
@@ -514,8 +514,7 @@ class TestTiebreakerAgent:
             {"verdict": "NOT_SUITABLE", "confidence": 55, "justification": "Too risky"},
         ]
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client_cls.return_value.__aenter__.return_value.post = mock.handle_post
+        with _llm_patch(mock):
             result = await run_tiebreaker(
                 task_description="Add OAuth2 login",
                 votes=votes,
@@ -544,8 +543,7 @@ class TestConvenienceFunctions:
         """run_research() returns a ResearchResult."""
         mock = MockLLM(scenario="pass")
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client_cls.return_value.__aenter__.return_value.post = mock.handle_post
+        with _llm_patch(mock):
             result = await run_research(
                 question="Test question",
                 context={"task_id": "test"},

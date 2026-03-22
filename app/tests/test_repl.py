@@ -3,6 +3,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import config
 import app.models.dags as dags
@@ -568,13 +569,20 @@ class TestCheckpointManager(unittest.TestCase):
             self.assertIn("Checkpoint", msg)
 
 
+def _make_repl(dag: dags.TaskDAG) -> repl.MaestroREPL:
+    """Create a MaestroREPL with a mocked CheckpointManager so tests never touch git."""
+    mock_cm = MagicMock(spec=repl.CheckpointManager)
+    mock_cm.checkpoint.return_value = (True, "mocked checkpoint")
+    return repl.MaestroREPL(dag, checkpoint_manager=mock_cm)
+
+
 class TestMaestroREPL(unittest.TestCase):
     """Test cases for MaestroREPL class."""
 
     def test_repl_creation(self):
         """Test MaestroREPL initialization."""
         dag = dags.TaskDAG()
-        repl_instance = repl.MaestroREPL(dag)
+        repl_instance = _make_repl(dag)
         self.assertEqual(repl_instance.dag, dag)
         self.assertIsNotNone(repl_instance.checkpoint_manager)
         self.assertFalse(repl_instance.running)
@@ -582,7 +590,7 @@ class TestMaestroREPL(unittest.TestCase):
     def test_select_next_task_empty_dag(self):
         """Test selecting next task from empty DAG."""
         dag = dags.TaskDAG()
-        repl_instance = repl.MaestroREPL(dag)
+        repl_instance = _make_repl(dag)
         next_task = repl_instance._select_next_task()
         self.assertIsNone(next_task)
 
@@ -591,7 +599,7 @@ class TestMaestroREPL(unittest.TestCase):
         dag = dags.TaskDAG()
         task = dags.TaskNode("task-1", "Task 1")
         dag.add_task(task)
-        repl_instance = repl.MaestroREPL(dag)
+        repl_instance = _make_repl(dag)
         next_task = repl_instance._select_next_task()
         self.assertEqual(next_task, task)
 
@@ -602,7 +610,7 @@ class TestMaestroREPL(unittest.TestCase):
         task2 = dags.TaskNode("task-2", "Task 2")
         dag.add_task(task1)
         dag.add_task(task2)
-        repl_instance = repl.MaestroREPL(dag)
+        repl_instance = _make_repl(dag)
         next_task = repl_instance._select_next_task()
         self.assertIn(next_task, [task1, task2])
 
@@ -613,7 +621,7 @@ class TestMaestroREPL(unittest.TestCase):
         task2 = dags.TaskNode("task-2", "Task 2")
         dag.add_task(task1)
         dag.add_task(task2)
-        repl_instance = repl.MaestroREPL(dag)
+        repl_instance = _make_repl(dag)
         next_task = repl_instance._select_next_task()
         self.assertEqual(next_task, task2)
 
@@ -622,17 +630,15 @@ class TestMaestroREPL(unittest.TestCase):
         dag = dags.TaskDAG()
         task = dags.TaskNode("task-1", "Task 1")
         dag.add_task(task)
-        repl_instance = repl.MaestroREPL(dag)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            _ = Path(tmpdir) / ".maestro" / "task_dag.json"
-            success = repl_instance._transition_task("task-1", dags.TaskState.ACTIVE, "test message")
-            self.assertTrue(success)
-            self.assertEqual(task.state, dags.TaskState.ACTIVE)
+        repl_instance = _make_repl(dag)
+        success = repl_instance._transition_task("task-1", dags.TaskState.ACTIVE, "test message")
+        self.assertTrue(success)
+        self.assertEqual(task.state, dags.TaskState.ACTIVE)
 
     def test_transition_task_not_found(self):
         """Test transition for non-existent task."""
         dag = dags.TaskDAG()
-        repl_instance = repl.MaestroREPL(dag)
+        repl_instance = _make_repl(dag)
         success = repl_instance._transition_task("non-existent", dags.TaskState.ACTIVE, "test")
         self.assertFalse(success)
 
@@ -641,7 +647,7 @@ class TestMaestroREPL(unittest.TestCase):
         dag = dags.TaskDAG()
         task = dags.TaskNode("task-1", "Task 1", state=dags.TaskState.ACCEPTED)
         dag.add_task(task)
-        repl_instance = repl.MaestroREPL(dag)
+        repl_instance = _make_repl(dag)
         success = repl_instance._transition_task("task-1", dags.TaskState.PENDING, "test")
         self.assertFalse(success)
 
@@ -650,7 +656,7 @@ class TestMaestroREPL(unittest.TestCase):
         dag = dags.TaskDAG()
         task = dags.TaskNode("task-1", "Task 1", state=dags.TaskState.REJECTED, retries=1)
         dag.add_task(task)
-        repl_instance = repl.MaestroREPL(dag)
+        repl_instance = _make_repl(dag)
         success = repl_instance._mark_failed("task-1", "Test failure")
         self.assertTrue(success)
         self.assertEqual(task.state, dags.TaskState.PENDING)
@@ -661,17 +667,15 @@ class TestMaestroREPL(unittest.TestCase):
         dag = dags.TaskDAG()
         task = dags.TaskNode("task-1", "Task 1", state=dags.TaskState.REJECTED, retries=config.ProjectConstants.MAX_FAILURE_RETRIES)
         dag.add_task(task)
-        repl_instance = repl.MaestroREPL(dag)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            _ = Path(tmpdir) / ".maestro" / "task_dag.json"
-            success = repl_instance._mark_failed("task-1", "Test failure")
-            self.assertTrue(success)
-            self.assertEqual(task.state, dags.TaskState.REVERTED)
+        repl_instance = _make_repl(dag)
+        success = repl_instance._mark_failed("task-1", "Test failure")
+        self.assertTrue(success)
+        self.assertEqual(task.state, dags.TaskState.REVERTED)
 
     def test_mark_failed_task_not_found(self):
         """Test marking non-existent task as failed."""
         dag = dags.TaskDAG()
-        repl_instance = repl.MaestroREPL(dag)
+        repl_instance = _make_repl(dag)
         success = repl_instance._mark_failed("non-existent", "Test failure")
         self.assertFalse(success)
 

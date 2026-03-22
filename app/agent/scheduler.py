@@ -31,9 +31,15 @@ import threading
 from collections import defaultdict
 from typing import Any
 
+import json
+
 from app.agent.config import (
     SCHEDULER_TICK_INTERVAL,
     SCHEDULER_ENABLED,
+    SCHEDULER_DISPATCHABLE_TYPES,
+    RESEARCH_JOB_PRIORITY_DEPTH_PENALTY,
+    PIPELINE_COLUMN_ORDER,
+    PIPELINE_DONE_STATUSES,
 )
 
 logger = logging.getLogger(__name__)
@@ -97,11 +103,17 @@ def get_scheduler_status() -> dict:
         active = {tid: t.is_alive() for tid, t in _active_sessions.items()}
     with _llm_counts_lock:
         llm_counts = dict(_llm_session_counts)
+    try:
+        from app.database import count_pending_research_jobs
+        pending_research = count_pending_research_jobs()
+    except Exception:
+        pending_research = 0
     return {
         "running": _scheduler_thread is not None and _scheduler_thread.is_alive(),
         "active_sessions": active,
         "llm_session_counts": llm_counts,
         "tick_interval": SCHEDULER_TICK_INTERVAL,
+        "pending_research_jobs": pending_research,
     }
 
 
@@ -121,12 +133,39 @@ def _scheduler_loop() -> None:
     logger.info("Scheduler loop exiting.")
 
 
+def _compute_dag_depth(task_id: str, by_id: dict) -> int:
+    """Longest prerequisite chain depth for a task (0 = no prerequisites)."""
+    task = by_id.get(task_id)
+    if not task or not task.get("prerequisites"):
+        return 0
+    return max(
+        (_compute_dag_depth(pid, by_id) for pid in task["prerequisites"] if pid in by_id),
+        default=0,
+    ) + 1
+
+
+def _compute_priority(task_dict: dict, by_id: dict) -> float:
+    """Lower score = higher priority. Shallower DAG depth first."""
+    depth = _compute_dag_depth(task_dict["id"], by_id)
+    try:
+        col_idx = PIPELINE_COLUMN_ORDER.index(task_dict.get("type", ""))
+    except ValueError:
+        col_idx = len(PIPELINE_COLUMN_ORDER)
+    return (
+        depth * RESEARCH_JOB_PRIORITY_DEPTH_PENALTY
+        + col_idx * 100
+        + (task_dict.get("position") or 0)
+    )
+
+
 def _tick() -> None:
     """
     Single scheduler tick:
       1. Clean up finished sessions.
       2. Discover DAG-ready tasks.
-      3. For each ready task, check LLM capacity and dispatch if possible.
+      3. Sort by priority (shallow DAG first).
+      4. For each ready task, check LLM capacity and dispatch if possible.
+      5. Dispatch pending research jobs.
     """
     # Lazy imports to avoid circular deps at module load
     from app.agent.dag import DAGResolver
@@ -141,18 +180,18 @@ def _tick() -> None:
     resolver = DAGResolver(task_dicts)
     ready_tasks = resolver.get_ready_tasks()
 
-    if not ready_tasks:
-        return
+    # 3. Sort by priority
+    if ready_tasks:
+        by_id = {t["id"]: t for t in task_dicts}
+        ready_tasks.sort(key=lambda t: _compute_priority(t, by_id))
 
-    # 3. Try to dispatch each ready task
+    # 4. Try to dispatch each ready task
     for task_dict in ready_tasks:
         task_id = task_dict["id"]
         task_type = task_dict.get("type", "")
 
-        # Only auto-dispatch tasks in columns the MaestroLoop handles.
-        # IDEA tasks require explicit human "Advance to Planning" action —
-        # the scheduler never auto-fires the intake pipeline.
-        if task_type not in ("planning", "indev"):
+        # Only auto-dispatch task types configured in SCHEDULER_DISPATCHABLE_TYPES.
+        if task_type not in SCHEDULER_DISPATCHABLE_TYPES:
             continue
 
         # Already running?
@@ -169,6 +208,17 @@ def _tick() -> None:
         db_task = get_task(task_id)
         if not db_task or not db_task.llm_id:
             continue
+
+        # Resolve project path for git tool isolation
+        from app.database import get_project_path as _get_project_path
+        project_path = None
+        if db_task.project:
+            project_path = _get_project_path(db_task.project)
+            if project_path is None:
+                logger.warning(
+                    "Task '%s' project '%s' has no path — git tools use PROJECT_ROOT.",
+                    task_id, db_task.project,
+                )
 
         llm = get_llm(db_task.llm_id)
         if not llm:
@@ -195,7 +245,7 @@ def _tick() -> None:
 
         thread = threading.Thread(
             target=_run_task,
-            args=(task_id, task_type, llm, db_task),
+            args=(task_id, task_type, llm, db_task, project_path),
             daemon=True,
             name=f"maestro-task-{task_id}",
         )
@@ -203,8 +253,91 @@ def _tick() -> None:
             _active_sessions[task_id] = thread
         thread.start()
 
+    # 5. Dispatch pending research jobs
+    _dispatch_research_jobs()
 
-def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None) -> None:
+
+def _dispatch_research_jobs() -> None:
+    """Dispatch pending research jobs that have an LLM assigned."""
+    from app.database import get_pending_research_jobs, update_research_job, get_llm
+
+    pending = get_pending_research_jobs(limit=10)
+    for job in pending:
+        if not job.llm_id:
+            continue
+
+        job_key = f"research-{job.id}"
+        with _active_sessions_lock:
+            if job_key in _active_sessions and _active_sessions[job_key].is_alive():
+                continue
+
+        llm = get_llm(job.llm_id)
+        if not llm:
+            continue
+
+        with _llm_counts_lock:
+            current = _llm_session_counts[llm.id]
+            if current >= llm.parallel_sessions:
+                continue
+            _llm_session_counts[llm.id] += 1
+
+        thread = threading.Thread(
+            target=_run_research_job,
+            args=(job, llm),
+            daemon=True,
+            name=f"maestro-research-{job.id}",
+        )
+        with _active_sessions_lock:
+            _active_sessions[job_key] = thread
+        thread.start()
+
+
+def _run_research_job(job: Any, llm: Any) -> None:
+    """Execute a single research job in its own thread + event loop."""
+    from app.database import update_research_job, get_task as _get_task
+    from app.agent.research import run_research
+    from app.agent.tools import set_task_git_cwd
+    from app.database import get_project_path as _get_project_path
+
+    task = _get_task(job.task_id)
+    if task and task.project:
+        project_path = _get_project_path(task.project)
+        if project_path:
+            set_task_git_cwd(project_path)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        update_research_job(job.id, status="running")
+        context = json.loads(job.context) if job.context else {}
+        llm_base_url = f"http://{llm.address}:{llm.port}/v1"
+        result = loop.run_until_complete(run_research(
+            question=job.question,
+            context=context,
+            task_id=job.task_id,
+            llm_id=job.llm_id,
+            budget_id=job.budget_id,
+            llm_base_url=llm_base_url,
+            llm_model=llm.model,
+        ))
+        update_research_job(
+            job.id, status="completed",
+            verdict=json.dumps(result.vote),
+            findings=result.findings,
+            lives_used=result.lives_used,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+        )
+    except Exception:
+        logger.exception("Research job %d failed in scheduler.", job.id)
+        update_research_job(job.id, status="failed")
+    finally:
+        loop.close()
+        with _llm_counts_lock:
+            _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
+
+
+def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, project_path: str | None = None) -> None:
     """
     Execute a single task in its own thread + event loop.
     Releases the LLM session slot when done.
@@ -217,11 +350,17 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None) -> No
         budget_id = db_task.budget_id if db_task else None
 
         if task_type == "idea":
-            _run_intake(task_id, llm_base_url, llm_model)
+            _run_intake(task_id, llm_base_url, llm_model, project_path)
         elif task_type == "indev":
-            _run_dev_orchestrator_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id)
+            _run_dev_orchestrator_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
+        elif task_type == "conceptual_review":
+            _run_conceptual_review_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
+        elif task_type == "optimization":
+            _run_optimization_security_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
+        elif task_type == "full_review":
+            _run_full_review_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
         else:
-            _run_maestro_loop(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id)
+            _run_maestro_loop(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
     except Exception:
         _failed_cooldowns[task_id] = time.time()
         logger.exception("Task '%s' failed in scheduler dispatch (cooldown %ds).", task_id, int(_FAIL_COOLDOWN_SECONDS))
@@ -230,9 +369,11 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None) -> No
             _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
 
 
-def _run_intake(task_id: str, llm_base_url: str, llm_model: str) -> None:
+def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
+                project_path: str | None = None) -> None:
     """Run the intake pipeline for an IDEA task."""
     from app.agent.intake import run_intake_pipeline
+    from app.agent.tools import set_task_git_cwd
     from app.database import (
         get_task, get_all_tasks, update_task,
         create_transition_vote, create_transition_result,
@@ -241,6 +382,7 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str) -> None:
     task = get_task(task_id)
     if not task:
         return
+    set_task_git_cwd(project_path)
 
     # Require description, llm_id, budget_id before advancing
     if not task.description or not task.llm_id or not task.budget_id:
@@ -263,6 +405,7 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str) -> None:
                 llm_id=task.llm_id,
                 llm_base_url=llm_base_url,
                 llm_model=llm_model,
+                project=task.project or None,  # Must be configured or pipeline will fail
             )
         )
 
@@ -302,7 +445,8 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str) -> None:
 def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
                       max_context: int | None = None,
                       llm_id: int | None = None,
-                      budget_id: int | None = None) -> None:
+                      budget_id: int | None = None,
+                      project_path: str | None = None) -> None:
     """Run the MaestroLoop for a PLANNING/DEVELOPMENT task."""
     from app.agent.loop import MaestroLoop
 
@@ -316,6 +460,7 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
             max_context=max_context,
             llm_id=llm_id,
             budget_id=budget_id,
+            project_path=project_path,
         )
         loop.run_until_complete(maestro.run())
     finally:
@@ -325,11 +470,15 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
 def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
                                 max_context: int | None = None,
                                 llm_id: int | None = None,
-                                budget_id: int | None = None) -> None:
+                                budget_id: int | None = None,
+                                project_path: str | None = None) -> None:
     """Run the DevOrchestrator for an IN DEV task."""
     from app.agent.dev_orchestrator import run_dev_orchestrator
+    from app.agent.tools import set_task_git_cwd
     from app.database import get_planning_result, update_task
     import json
+
+    set_task_git_cwd(project_path)
 
     planning_result_obj = get_planning_result(task_id)
     if not planning_result_obj:
@@ -365,6 +514,254 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
             logger.info("Task '%s' reverted to PLANNING: %s", task_id, result.get("error_detail"))
     finally:
         loop.close()
+
+
+def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
+                                 max_context: int | None = None,
+                                 llm_id: int | None = None,
+                                 budget_id: int | None = None,
+                                 project_path: str | None = None) -> None:
+    """Run the conceptual review pipeline for a CONCEPTUAL_REVIEW task."""
+    from app.agent.conceptual_review import run_conceptual_review
+    from app.agent.tools import set_task_git_cwd
+    from app.database import get_task, update_task, get_planning_result
+    from app.database import (
+        create_transition_vote, create_transition_result,
+    )
+    from datetime import datetime
+    import json as _json
+
+    set_task_git_cwd(project_path)
+
+    task = get_task(task_id)
+    if not task:
+        return
+
+    planning_result_obj = get_planning_result(task_id)
+    planning_result = {}
+    if planning_result_obj:
+        planning_result = {
+            "file_manifest": _json.loads(planning_result_obj.file_manifest or "[]"),
+            "dependency_graph": _json.loads(planning_result_obj.dependency_graph or "{}"),
+            "implementation_steps": _json.loads(planning_result_obj.implementation_steps or "[]"),
+            "test_strategy": _json.loads(planning_result_obj.test_strategy or "[]"),
+        }
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        result = loop.run_until_complete(
+            run_conceptual_review(
+                task_id=task_id,
+                task_description=task.description or "",
+                planning_result=planning_result,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                project_path=project_path,
+            )
+        )
+        create_transition_result(
+            task_id=task_id,
+            transition="conceptual_to_optimization",
+            outcome=result.get("outcome", "unknown"),
+            vote_summary=result,
+            total_prompt_tokens=result.get("total_prompt_tokens", 0),
+            total_completion_tokens=result.get("total_completion_tokens", 0),
+        )
+        if result.get("outcome") == "passed":
+            update_task(task_id, type="optimization")
+            logger.info("Task '%s' advanced to OPTIMIZATION via scheduler.", task_id)
+        else:
+            update_task(task_id, type="indev")
+            _record_demotion_inline(task_id, "conceptual_review", "indev", result.get("summary", ""))
+            logger.info("Task '%s' demoted to INDEV from conceptual review via scheduler.", task_id)
+    finally:
+        loop.close()
+
+
+def _run_optimization_security_task(task_id: str, llm_base_url: str, llm_model: str,
+                                     max_context: int | None = None,
+                                     llm_id: int | None = None,
+                                     budget_id: int | None = None,
+                                     project_path: str | None = None) -> None:
+    """Run optimization then security pipeline for an OPTIMIZATION task."""
+    from app.agent.optimization import run_optimization_pipeline
+    from app.agent.security_review import run_security_pipeline
+    from app.agent.tools import set_task_git_cwd
+    from app.database import get_task, update_task
+    from app.database import (
+        create_transition_vote, create_transition_result,
+    )
+
+    set_task_git_cwd(project_path)
+
+    task = get_task(task_id)
+    if not task:
+        return
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        # Run optimization first
+        opt_result = loop.run_until_complete(
+            run_optimization_pipeline(
+                task_id=task_id,
+                task_description=task.description or "",
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                project_path=project_path,
+            )
+        )
+        logger.info("[optimization] Task '%s' via scheduler: %s", task_id, opt_result.get("outcome"))
+
+        # Run security review
+        sec_result = loop.run_until_complete(
+            run_security_pipeline(
+                task_id=task_id,
+                task_description=task.description or "",
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                project_path=project_path,
+            )
+        )
+        create_transition_result(
+            task_id=task_id,
+            transition="security_review",
+            outcome=sec_result.get("outcome", "unknown"),
+            vote_summary=sec_result,
+            total_prompt_tokens=sec_result.get("total_prompt_tokens", 0),
+            total_completion_tokens=sec_result.get("total_completion_tokens", 0),
+        )
+
+        if sec_result.get("outcome") == "passed":
+            update_task(task_id, type="security")
+            update_task(task_id, type="full_review")
+            logger.info("[security] Task '%s' advanced to FULL REVIEW via scheduler.", task_id)
+        else:
+            demotion = sec_result.get("demotion_target", "indev")
+            update_task(task_id, type=demotion)
+            _record_demotion_inline(task_id, "security", demotion, sec_result.get("summary", ""))
+            logger.warning("[security] Task '%s' demoted to %s via scheduler.", task_id, demotion)
+    finally:
+        loop.close()
+
+
+def _run_full_review_task(task_id: str, llm_base_url: str, llm_model: str,
+                           max_context: int | None = None,
+                           llm_id: int | None = None,
+                           budget_id: int | None = None,
+                           project_path: str | None = None) -> None:
+    """Run the full review pipeline for a FULL_REVIEW task."""
+    from app.agent.full_review import run_full_review_pipeline
+    from app.agent.tools import set_task_git_cwd
+    from app.database import get_task, update_task
+    from app.database import (
+        create_transition_vote, create_transition_result,
+    )
+
+    set_task_git_cwd(project_path)
+
+    task = get_task(task_id)
+    if not task:
+        return
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        result = loop.run_until_complete(
+            run_full_review_pipeline(
+                task_id=task_id,
+                task_description=task.description or "",
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                project_path=project_path,
+            )
+        )
+        create_transition_result(
+            task_id=task_id,
+            transition="full_review",
+            outcome=result.get("outcome", "unknown"),
+            vote_summary=result,
+            total_prompt_tokens=result.get("total_prompt_tokens", 0),
+            total_completion_tokens=result.get("total_completion_tokens", 0),
+        )
+
+        if result.get("outcome") == "passed":
+            # Auto-merge: run execute_merge inline
+            from app.agent.merge import execute_merge
+            from app.database import get_project_path as _get_project_path
+            pp = project_path
+            if not pp and task.project:
+                pp = _get_project_path(task.project)
+            merge_result = execute_merge(task_id, project_path=pp)
+            if merge_result.status == "merged":
+                logger.info("[merge] Task '%s' merged to main via scheduler.", task_id)
+                _check_completion_rollup_inline(task_id)
+            elif merge_result.status == "conflict":
+                update_task(task_id, type="indev")
+                _record_demotion_inline(task_id, "merge", "indev", merge_result.error_detail or "Merge conflict")
+                logger.warning("[merge] Task '%s' merge conflict via scheduler.", task_id)
+            elif merge_result.status == "test_failure":
+                update_task(task_id, type="indev")
+                _record_demotion_inline(task_id, "merge", "indev", merge_result.error_detail or "Tests failed")
+                logger.warning("[merge] Task '%s' tests failed after merge via scheduler.", task_id)
+            elif merge_result.status == "push_failure":
+                update_task(task_id, type="full_review")
+                _record_demotion_inline(task_id, "merge", "full_review", merge_result.error_detail or "Push failed")
+                logger.error("[merge] Task '%s' push failed via scheduler.", task_id)
+            else:
+                logger.error("[merge] Task '%s' merge error via scheduler: %s", task_id, merge_result.error_detail)
+        else:
+            demotion = result.get("demotion_target", "indev")
+            update_task(task_id, type=demotion)
+            _record_demotion_inline(task_id, "full_review", demotion, result.get("summary", ""))
+            logger.warning("[full_review] Task '%s' demoted to %s via scheduler.", task_id, demotion)
+    finally:
+        loop.close()
+
+
+def _record_demotion_inline(task_id: str, from_stage: str, to_stage: str, reason: str) -> None:
+    """Record a demotion event — scheduler-local version (avoids importing from main.py)."""
+    from datetime import datetime, timezone
+    from app.database import get_task, update_task
+    task = get_task(task_id)
+    if not task:
+        return
+    history = task.demotion_history or []
+    history.append({
+        "from": from_stage,
+        "to": to_stage,
+        "reason": reason[:500],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    update_task(task_id, demotion_count=(task.demotion_count or 0) + 1, demotion_history=history)
+
+
+def _check_completion_rollup_inline(task_id: str) -> None:
+    """Mirror of main._check_completion_rollup — avoids circular import."""
+    import app.database as db
+    task = db.get_task(task_id)
+    if not task or not task.parent_task_id:
+        return
+    parent = db.get_task(task.parent_task_id)
+    if not parent:
+        return
+    children = db.get_active_child_tasks(parent.id)
+    if not children:
+        return
+    all_done = all((c.type or "").lower() in PIPELINE_DONE_STATUSES for c in children)
+    if all_done:
+        db.update_task(parent.id, type="completed")
+        logger.info("[rollup] All children of '%s' completed. Parent marked completed.", parent.id)
+        _check_completion_rollup_inline(parent.id)
 
 
 # ---------------------------------------------------------------------------

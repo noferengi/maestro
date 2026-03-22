@@ -15,8 +15,11 @@ Verdict thresholds (confidence -> verdict):
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
+
+logger = logging.getLogger(__name__)
 
 
 class Verdict(Enum):
@@ -128,6 +131,7 @@ def tally_votes(votes: list[Vote]) -> TallyResult:
         neutral:   NEEDS_RESEARCH (neither until resolved)
     """
     if not votes:
+        logger.debug("Tally: 0 votes → outcome=rejected")
         return TallyResult(
             outcome="rejected",
             votes=[],
@@ -142,6 +146,7 @@ def tally_votes(votes: list[Vote]) -> TallyResult:
     # --- Rule 0: any SUBDIVIDE_IDEA -> subdivide immediately ---
     subdivide_votes = [v for v in votes if v.verdict is Verdict.SUBDIVIDE_IDEA]
     if subdivide_votes:
+        logger.debug("Tally: %d votes → outcome=subdivide", n)
         return TallyResult(
             outcome="subdivide",
             votes=votes,
@@ -153,6 +158,7 @@ def tally_votes(votes: list[Vote]) -> TallyResult:
     # --- Rule 1: any REJECTED -> immediate rejection ---
     rejected_votes = [v for v in votes if v.verdict is Verdict.REJECTED]
     if rejected_votes:
+        logger.debug("Tally: %d votes → outcome=rejected", n)
         reasons = [f"[{v.stage}] {v.justification}" for v in rejected_votes]
         return TallyResult(
             outcome="rejected",
@@ -168,6 +174,7 @@ def tally_votes(votes: list[Vote]) -> TallyResult:
     # Majority threshold: for 4 voters need 3+, for 3 voters need 2+, etc.
     majority_threshold = (n // 2) + 1
     if len(not_suitable_votes) >= majority_threshold:
+        logger.debug("Tally: %d votes → outcome=rejected (NOT_SUITABLE majority)", n)
         reasons = [f"[{v.stage}] {v.justification}" for v in not_suitable_votes]
         return TallyResult(
             outcome="rejected",
@@ -184,6 +191,7 @@ def tally_votes(votes: list[Vote]) -> TallyResult:
     # --- Rule 3: any NEEDS_RESEARCH -> needs_research ---
     research_votes = [v for v in votes if v.verdict is Verdict.NEEDS_RESEARCH]
     if research_votes:
+        logger.debug("Tally: %d votes → outcome=needs_research", n)
         stages = [v.stage for v in research_votes]
         return TallyResult(
             outcome="needs_research",
@@ -205,6 +213,7 @@ def tally_votes(votes: list[Vote]) -> TallyResult:
     pass_count = sum(1 for v in votes if v.verdict in _PASS_ISH)
 
     if fail_count == pass_count and fail_count > 0:
+        logger.debug("Tally: %d votes → outcome=tie", n)
         return TallyResult(
             outcome="tie",
             votes=votes,
@@ -215,6 +224,7 @@ def tally_votes(votes: list[Vote]) -> TallyResult:
 
     conditional_votes = [v for v in votes if v.verdict is Verdict.CONDITIONAL_PASS]
     outcome = "conditional_pass" if conditional_votes else "passed"
+    logger.debug("Tally: %d votes → outcome=%s", n, outcome)
     cond_notes = [v.justification for v in conditional_votes]
     return TallyResult(
         outcome=outcome,

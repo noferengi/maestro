@@ -26,14 +26,18 @@ from app.agent.config import (
     MAX_CONSECUTIVE_ERRORS,
     SIGNAL_ACCEPTED,
     SIGNAL_REVERT,
+    SIGNAL_NEEDS_RESEARCH,
     GIT_SAFETY_BRANCH_PREFIX,
     CONTEXT_WARNING_ENABLED,
     CONTEXT_WARNING_THRESHOLDS,
+    INDEV_AGENT_TOOLS,
 )
 from app.agent.json_utils import extract_json_block
 from app.agent.llm_client import call_llm
 from app.agent.system_prompt import MAESTRO_SYSTEM_PROMPT
-from app.agent.tools import TOOL_SCHEMAS, dispatch_tool
+from app.agent.tools import TOOL_SCHEMAS, dispatch_tool, async_dispatch_tool, build_tool_schemas
+
+_INDEV_TOOL_SCHEMAS: list[dict] = build_tool_schemas(INDEV_AGENT_TOOLS)
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +107,7 @@ class MaestroLoop:
         max_context: int | None = None,
         llm_id: int | None = None,
         budget_id: int | None = None,
+        project_path: str | None = None,
     ) -> None:
         self.task_id = task_id
         self.max_turns = max_turns
@@ -111,6 +116,7 @@ class MaestroLoop:
         self.max_context = max_context
         self.llm_id = llm_id
         self.budget_id = budget_id
+        self.project_path = project_path
         self._messages: list[dict] = []
         self._turn: int = 0
         self._consecutive_errors: int = 0
@@ -138,6 +144,11 @@ class MaestroLoop:
             "turns": 0,
             "git_branch": None,
         }
+
+        if self.project_path:
+            from app.agent.tools import set_task_git_cwd
+            set_task_git_cwd(self.project_path)
+            logger.info("Task '%s': git cwd set to '%s'.", self.task_id, self.project_path)
 
         try:
             return await self._loop()
@@ -208,14 +219,29 @@ class MaestroLoop:
             tool_calls = assistant_message.get("tool_calls") or []
             content = assistant_message.get("content") or ""
 
-            # ── Check for terminal signal in content ───────────────────
-            terminal = self._extract_terminal_signal(content)
-            if terminal:
-                return self._handle_terminal(terminal)
+            # ── Check for terminal / research signal in content ────────
+            signal = self._extract_signal(content)
+            if signal:
+                sig_type = signal.get("signal")
+                if sig_type in (SIGNAL_ACCEPTED, SIGNAL_REVERT):
+                    return self._handle_terminal(signal)
+                if sig_type == SIGNAL_NEEDS_RESEARCH:
+                    research_result = await self._handle_needs_research(signal)
+                    self._messages.append({
+                        "role": "user",
+                        "content": (
+                            "[SYSTEM] Research agent completed.\n"
+                            f"Verdict: {research_result.get('verdict', 'unknown')}\n"
+                            f"Findings:\n{research_result.get('findings', 'No findings.')}\n\n"
+                            "Continue your work incorporating these findings."
+                        ),
+                    })
+                    self._consecutive_errors = 0
+                    continue
 
             # ── Dispatch tool calls ────────────────────────────────────
             if tool_calls:
-                tool_result_messages = self._handle_tool_calls(tool_calls)
+                tool_result_messages = await self._handle_tool_calls(tool_calls)
                 self._messages.extend(tool_result_messages)
                 # Reset consecutive error counter if any tool succeeded
                 if not all(
@@ -231,8 +257,8 @@ class MaestroLoop:
                         )
                 continue
 
-            # ── No tool calls and no terminal signal — nudge the agent ─
-            if not tool_calls and not terminal:
+            # ── No tool calls and no signal — nudge the agent ─────────
+            if not tool_calls and not signal:
                 self._messages.append({
                     "role": "user",
                     "content": (
@@ -315,7 +341,7 @@ class MaestroLoop:
             base_url=self.llm_base_url,
             model=self.llm_model,
             temperature=LLM_TEMPERATURE,
-            tools=TOOL_SCHEMAS,
+            tools=_INDEV_TOOL_SCHEMAS,
             tool_choice="auto",
             task_id=self.task_id,
             llm_id=self.llm_id,
@@ -326,10 +352,11 @@ class MaestroLoop:
     # Tool call handling
     # ------------------------------------------------------------------
 
-    def _handle_tool_calls(self, tool_calls: list) -> list[dict]:
+    async def _handle_tool_calls(self, tool_calls: list) -> list[dict]:
         """
         Dispatch each tool call and return a list of tool-role messages
         ready to be appended to the conversation.
+        Uses async_dispatch_tool so spawn_research_agent works properly.
         """
         result_messages: list[dict] = []
 
@@ -361,8 +388,15 @@ class MaestroLoop:
                 if path and path not in self._files_changed:
                     self._files_changed.append(path)
 
-            # Dispatch
-            result_content = dispatch_tool(name, arguments)
+            # Dispatch (async — handles spawn_research_agent correctly)
+            result_content = await async_dispatch_tool(
+                name, arguments,
+                task_id=self.task_id,
+                llm_id=self.llm_id,
+                budget_id=self.budget_id,
+                llm_base_url=self.llm_base_url,
+                llm_model=self.llm_model,
+            )
 
             result_messages.append({
                 "role": "tool",
@@ -388,14 +422,14 @@ class MaestroLoop:
     # Terminal signal extraction
     # ------------------------------------------------------------------
 
-    def _extract_terminal_signal(self, content: str) -> dict | None:
+    def _extract_signal(self, content: str) -> dict | None:
         """
-        Scan the assistant content for a terminal JSON signal.
+        Scan the assistant content for a JSON signal dict.
+        Recognizes ACCEPTED, REVERT_TO_DESIGN, and NEEDS_RESEARCH.
         Returns the parsed dict if found, else None.
         """
         if not content:
             return None
-        # Try to find a JSON block in the content
         for attempt in [content, extract_json_block(content)]:
             if not attempt:
                 continue
@@ -403,12 +437,67 @@ class MaestroLoop:
                 parsed = json.loads(attempt.strip())
                 if isinstance(parsed, dict) and "signal" in parsed:
                     sig = parsed["signal"]
-                    if sig in (SIGNAL_ACCEPTED, SIGNAL_REVERT):
+                    if sig in (SIGNAL_ACCEPTED, SIGNAL_REVERT, SIGNAL_NEEDS_RESEARCH):
                         return parsed
             except (json.JSONDecodeError, ValueError):
                 continue
         return None
 
+
+    # ------------------------------------------------------------------
+    # NEEDS_RESEARCH handler
+    # ------------------------------------------------------------------
+
+    async def _handle_needs_research(self, signal_dict: dict) -> dict:
+        """
+        Run a research agent inline, record the job, and return findings.
+        The loop continues after this — it is not a terminal action.
+        """
+        from app.agent.research import run_research
+        from app.database import create_research_job, update_research_job
+
+        question = signal_dict.get("question", "What do I need to investigate?")
+        context_str = signal_dict.get("context", "")
+
+        job = create_research_job(
+            task_id=self.task_id,
+            question=question,
+            context=json.dumps({"question": question, "context": context_str}),
+            priority=0.0,  # inline = highest priority
+            depth=0,
+            llm_id=self.llm_id,
+            budget_id=self.budget_id,
+        )
+
+        try:
+            if job:
+                update_research_job(job.id, status="running")
+            result = await run_research(
+                question=question,
+                context={"question": question, "task_context": context_str},
+                task_id=self.task_id,
+                llm_id=self.llm_id,
+                budget_id=self.budget_id,
+                llm_base_url=self.llm_base_url,
+                llm_model=self.llm_model,
+            )
+            if job:
+                update_research_job(
+                    job.id, status="completed",
+                    verdict=json.dumps(result.vote),
+                    findings=result.findings,
+                    lives_used=result.lives_used,
+                    prompt_tokens=result.prompt_tokens,
+                    completion_tokens=result.completion_tokens,
+                )
+            return result.vote | {"findings": result.findings}
+        except Exception as exc:
+            logger.exception(
+                "Research job failed for task '%s': %s", self.task_id, exc
+            )
+            if job:
+                update_research_job(job.id, status="failed", findings=str(exc))
+            return {"verdict": "ERROR", "findings": f"Research failed: {exc}"}
 
     # ------------------------------------------------------------------
     # Terminal handlers

@@ -1,9 +1,26 @@
 import sys
 import os
+import logging
 
 # Add app directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# ---------------------------------------------------------------------------
+# Configure logging before anything else imports the logging module
+# ---------------------------------------------------------------------------
+from app.logging_config import configure_logging
+from app.agent.config import LOG_LEVEL, LOG_FILE, LOG_MAX_BYTES, LOG_BACKUP_COUNT
+
+configure_logging(
+    level=LOG_LEVEL,
+    log_file=LOG_FILE or None,
+    max_bytes=LOG_MAX_BYTES,
+    backup_count=LOG_BACKUP_COUNT,
+)
+
+logger = logging.getLogger(__name__)
+
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Body, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -16,6 +33,7 @@ from database import (
     init_db, get_db, create_task, get_task, get_tasks_by_type,
     update_task, delete_task, get_all_tasks, get_task_history, reorder_tasks, seed_sample_tasks,
     get_tasks_by_project,
+    Project, get_all_projects, get_project, upsert_project, delete_project,
     LLM, Budget, BudgetEntry, SubdivisionRecord,
     get_all_llms, get_llm, create_llm, update_llm, delete_llm,
     get_all_budgets, get_budget, create_budget, update_budget, delete_budget,
@@ -37,28 +55,31 @@ from database import (
     create_security_review_result, get_security_review_results,
     create_full_review_result, get_full_review_results,
     create_merge_record, get_merge_record,
+    get_research_jobs_for_task, get_research_job,
 )
 
 from app.agent.config import PIPELINE_COLUMN_ORDER, PIPELINE_DONE_STATUSES
 
-app = FastAPI(title="Kanban Board API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- startup ---
+    init_db()
+    seed_sample_tasks()
+    # Ensure TheMaestro always has a project record (migration backfill covers
+    # existing names, but a fresh DB after reset needs it too).
+    upsert_project("TheMaestro")
+    from app.agent.scheduler import start_scheduler
+    start_scheduler()
+    yield
+    # --- shutdown ---
+    from app.agent.scheduler import stop_scheduler
+    stop_scheduler()
+
+
+app = FastAPI(title="Kanban Board API", lifespan=lifespan)
 
 # Mount static files directory
 app.mount("/static", StaticFiles(directory="app/web"), name="static")
-
-# Initialize database and scheduler on startup
-@app.on_event("startup")
-def startup_event():
-    init_db()
-    seed_sample_tasks()
-    from app.agent.scheduler import start_scheduler
-    start_scheduler()
-
-
-@app.on_event("shutdown")
-def shutdown_event():
-    from app.agent.scheduler import stop_scheduler
-    stop_scheduler()
 
 
 # ============================================
@@ -237,6 +258,21 @@ def _resolve_llm_endpoint(task):
     return llm_base_url, llm_model, max_context
 
 
+def _setup_thread_context(task) -> str | None:
+    """Set _task_git_cwd for the current OS thread. Call once per pipeline runner."""
+    project_path = None
+    if task and task.project:
+        from app.database import get_project_path
+        from app.agent.tools import set_task_git_cwd
+        project_path = get_project_path(task.project)
+        set_task_git_cwd(project_path)
+        if project_path:
+            logger.debug("[thread] git cwd set to '%s' for task '%s'.", project_path, task.id)
+        else:
+            logger.warning("[thread] No project path for project '%s' (task '%s').", task.project, task.id)
+    return project_path
+
+
 def _store_pipeline_result(task_id, result, budget_id):
     """Store a transition result and its individual votes."""
     create_transition_result(
@@ -362,8 +398,7 @@ def _handle_subdivision_outcome(task, result, llm_base_url, llm_model, max_conte
 
     # Check recursion depth limit
     if generation > SUBDIVISION_MAX_DEPTH:
-        print(f"[intake] Task '{task.id}' hit subdivision depth limit ({SUBDIVISION_MAX_DEPTH}). "
-              f"Downgrading to rejected.")
+        logger.warning("[intake] Task '%s' hit subdivision depth limit (%d). Downgrading to rejected.", task.id, SUBDIVISION_MAX_DEPTH)
         update_task(task.id, type="idea")
         return
 
@@ -378,8 +413,7 @@ def _handle_subdivision_outcome(task, result, llm_base_url, llm_model, max_conte
             break
     total_existing = count_total_sub_ideas(root_id)
     if total_existing >= SUBDIVISION_MAX_TOTAL_SUB_IDEAS:
-        print(f"[intake] Total sub-ideas ({total_existing}) >= limit ({SUBDIVISION_MAX_TOTAL_SUB_IDEAS}). "
-              f"Downgrading to rejected.")
+        logger.warning("[intake] Total sub-ideas (%d) >= limit (%d). Downgrading to rejected.", total_existing, SUBDIVISION_MAX_TOTAL_SUB_IDEAS)
         update_task(task.id, type="idea")
         return
 
@@ -402,8 +436,7 @@ def _handle_subdivision_outcome(task, result, llm_base_url, llm_model, max_conte
     )
 
     if not sub_result.sub_ideas or sub_result.confidence < 50:
-        print(f"[intake] Subdivision agent returned low confidence ({sub_result.confidence}) "
-              f"or no sub-ideas. Reverting to idea.")
+        logger.warning("[intake] Subdivision agent returned low confidence (%d) or no sub-ideas. Reverting to idea.", sub_result.confidence)
         update_task(task.id, type="idea")
         return
 
@@ -420,7 +453,7 @@ def _handle_subdivision_outcome(task, result, llm_base_url, llm_model, max_conte
     errors = dag.validate_dag()
     cycle_errors = [e for e in errors if "Cycle" in e]
     if cycle_errors:
-        print(f"[intake] Subdivision produced cyclic DAG: {cycle_errors}. Reverting to idea.")
+        logger.warning("[intake] Subdivision produced cyclic DAG: %s. Reverting to idea.", cycle_errors)
         update_task(task.id, type="idea")
         return
 
@@ -448,7 +481,7 @@ def _handle_subdivision_outcome(task, result, llm_base_url, llm_model, max_conte
         interface_contracts=contracts_json,
     )
 
-    print(f"[intake] Task '{task.id}' subdivided into {len(child_ids)} sub-ideas (generation {generation}).")
+    logger.info("[intake] Task '%s' subdivided into %d sub-ideas (generation %d).", task.id, len(child_ids), generation)
 
 
 def _handle_self_healing_rejection(task, result, llm_base_url, llm_model, max_context, loop):
@@ -458,20 +491,19 @@ def _handle_self_healing_rejection(task, result, llm_base_url, llm_model, max_co
 
     parent_task = get_task(task.parent_task_id)
     if not parent_task:
-        print(f"[intake] Parent task '{task.parent_task_id}' not found. Cannot self-heal.")
+        logger.warning("[intake] Parent task '%s' not found. Cannot self-heal.", task.parent_task_id)
         return
 
     # Find the current active subdivision record
     records = get_subdivision_records(task.parent_task_id)
     active_record = next((r for r in records if r.status == "active"), None)
     if not active_record:
-        print(f"[intake] No active subdivision record for parent '{task.parent_task_id}'.")
+        logger.warning("[intake] No active subdivision record for parent '%s'.", task.parent_task_id)
         return
 
     attempt = active_record.attempt_number
     if attempt >= SUBDIVISION_MAX_RETRIES:
-        print(f"[intake] Subdivision retries exhausted ({attempt}/{SUBDIVISION_MAX_RETRIES}) "
-              f"for parent '{task.parent_task_id}'. Reverting parent to idea.")
+        logger.warning("[intake] Subdivision retries exhausted (%d/%d) for parent '%s'. Reverting parent to idea.", attempt, SUBDIVISION_MAX_RETRIES, task.parent_task_id)
         # Mark record as failed, revert parent
         update_subdivision_record(active_record.id, status="failed")
         update_task(parent_task.id, type="idea")
@@ -540,7 +572,7 @@ def _handle_self_healing_rejection(task, result, llm_base_url, llm_model, max_co
     )
 
     if not sub_result.sub_ideas or sub_result.confidence < 50:
-        print(f"[intake] Retry subdivision returned low confidence. Reverting parent to idea.")
+        logger.warning("[intake] Retry subdivision returned low confidence. Reverting parent to idea.")
         update_task(parent_task.id, type="idea")
         return
 
@@ -557,7 +589,7 @@ def _handle_self_healing_rejection(task, result, llm_base_url, llm_model, max_co
     errors = dag.validate_dag()
     cycle_errors = [e for e in errors if "Cycle" in e]
     if cycle_errors:
-        print(f"[intake] Retry subdivision produced cyclic DAG. Reverting parent to idea.")
+        logger.warning("[intake] Retry subdivision produced cyclic DAG. Reverting parent to idea.")
         update_task(parent_task.id, type="idea")
         return
 
@@ -577,8 +609,7 @@ def _handle_self_healing_rejection(task, result, llm_base_url, llm_model, max_co
         status="active",
     )
 
-    print(f"[intake] Self-healing: re-subdivided '{parent_task.id}' into {len(child_ids)} sub-ideas "
-          f"(attempt {attempt + 1}).")
+    logger.info("[intake] Self-healing: re-subdivided '%s' into %d sub-ideas (attempt %d).", parent_task.id, len(child_ids), attempt + 1)
 
 
 def _run_intake_pipeline(task_id: str) -> None:
@@ -589,12 +620,13 @@ def _run_intake_pipeline(task_id: str) -> None:
 
         task = get_task(task_id)
         if not task:
-            print(f"[intake] Task '{task_id}' not found.")
+            logger.warning("[intake] Task '%s' not found.", task_id)
             return
+        _setup_thread_context(task)
 
         llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
         if llm_base_url:
-            print(f"[intake] Using LLM: {llm_base_url} model={llm_model}")
+            logger.info("[intake] Using LLM: %s model=%s", llm_base_url, llm_model)
 
         all_tasks = get_all_tasks()
         task_dicts = [task_to_dict(t) for t in all_tasks]
@@ -612,6 +644,7 @@ def _run_intake_pipeline(task_id: str) -> None:
                     llm_id=task.llm_id,
                     llm_base_url=llm_base_url,
                     llm_model=llm_model,
+                    project=task.project or None,  # Must be configured or pipeline will fail
                 )
             )
 
@@ -621,7 +654,7 @@ def _run_intake_pipeline(task_id: str) -> None:
             # Act on the result
             if result["outcome"] == "passed":
                 update_task(task_id, type="planning")
-                print(f"[intake] Task '{task_id}' advanced to PLANNING.")
+                logger.info("[intake] Task '%s' advanced to PLANNING.", task_id)
 
             elif result["outcome"] == "subdivide":
                 _handle_subdivision_outcome(
@@ -631,22 +664,20 @@ def _run_intake_pipeline(task_id: str) -> None:
             elif result["outcome"] in ("rejected", "failed"):
                 # Check if this is a system-generated sub-idea that should self-heal
                 if task.parent_task_id:
-                    print(f"[intake] System-generated task '{task_id}' rejected. Triggering self-healing.")
+                    logger.info("[intake] System-generated task '%s' rejected. Triggering self-healing.", task_id)
                     _handle_self_healing_rejection(
                         task, result, llm_base_url, llm_model, max_context, loop
                     )
                 else:
-                    print(f"[intake] Task '{task_id}' pipeline result: {result['outcome']}")
+                    logger.info("[intake] Task '%s' pipeline result: %s", task_id, result['outcome'])
 
             else:
-                print(f"[intake] Task '{task_id}' pipeline result: {result['outcome']}")
+                logger.info("[intake] Task '%s' pipeline result: %s", task_id, result['outcome'])
 
         finally:
             loop.close()
     except Exception as exc:
-        import traceback
-        print(f"[intake] Pipeline for '{task_id}' failed: {exc}")
-        traceback.print_exc()
+        logger.exception("[intake] Pipeline for '%s' failed.", task_id)
 
 
 def _run_planning_pipeline_bg(task_id: str) -> None:
@@ -659,6 +690,7 @@ def _run_planning_pipeline_bg(task_id: str) -> None:
         task = get_task(task_id)
         if not task:
             return
+        project_path = _setup_thread_context(task)
 
         llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
         all_tasks = [task_to_dict(t) for t in get_all_tasks()]
@@ -678,6 +710,7 @@ def _run_planning_pipeline_bg(task_id: str) -> None:
                     llm_id=task.llm_id,
                     budget_id=task.budget_id,
                     max_context=max_context,
+                    project_path=project_path,
                 )
             )
 
@@ -696,21 +729,20 @@ def _run_planning_pipeline_bg(task_id: str) -> None:
                         llm_model=llm_model,
                         llm_id=task.llm_id,
                         budget_id=task.budget_id,
+                        project_path=project_path,
                     )
                 )
                 if gate_result.get("passed"):
                     update_task(task_id, type="indev")
-                    print(f"[planning] Task '{task_id}' advanced to IN DEV.")
+                    logger.info("[planning] Task '%s' advanced to IN DEV.", task_id)
                 else:
-                    print(f"[planning] Task '{task_id}' failed planning gate.")
+                    logger.warning("[planning] Task '%s' failed planning gate.", task_id)
             else:
-                print(f"[planning] Task '{task_id}' planning result: {result.get('outcome')}")
+                logger.info("[planning] Task '%s' planning result: %s", task_id, result.get('outcome'))
         finally:
             loop.close()
     except Exception as exc:
-        import traceback
-        print(f"[planning] Pipeline for '{task_id}' failed: {exc}")
-        traceback.print_exc()
+        logger.exception("[planning] Pipeline for '%s' failed.", task_id)
 
 
 def _run_dev_orchestrator_bg(task_id: str) -> None:
@@ -722,12 +754,13 @@ def _run_dev_orchestrator_bg(task_id: str) -> None:
         task = get_task(task_id)
         if not task:
             return
+        project_path = _setup_thread_context(task)
 
         llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
         planning_result_obj = get_planning_result(task_id)
 
         if not planning_result_obj:
-            print(f"[indev] No planning result for task '{task_id}'.")
+            logger.warning("[indev] No planning result for task '%s'.", task_id)
             return
 
         # Reconstruct planning result dict
@@ -754,21 +787,20 @@ def _run_dev_orchestrator_bg(task_id: str) -> None:
                     llm_model=llm_model,
                     llm_id=task.llm_id,
                     budget_id=task.budget_id,
+                    project_path=project_path,
                 )
             )
 
             if result.get("status") == "ACCEPTED":
                 update_task(task_id, type="conceptual_review")
-                print(f"[indev] Task '{task_id}' advanced to CONCEPTUAL REVIEW.")
+                logger.info("[indev] Task '%s' advanced to CONCEPTUAL REVIEW.", task_id)
             else:
                 update_task(task_id, type="planning")
-                print(f"[indev] Task '{task_id}' reverted to PLANNING: {result.get('error_detail')}")
+                logger.warning("[indev] Task '%s' reverted to PLANNING: %s", task_id, result.get('error_detail'))
         finally:
             loop.close()
     except Exception as exc:
-        import traceback
-        print(f"[indev] Orchestrator for '{task_id}' failed: {exc}")
-        traceback.print_exc()
+        logger.exception("[indev] Orchestrator for '%s' failed.", task_id)
 
 
 def _advance_to_optimization(task_id: str) -> None:
@@ -780,6 +812,7 @@ def _advance_to_optimization(task_id: str) -> None:
         task = get_task(task_id)
         if not task:
             return
+        project_path = _setup_thread_context(task)
 
         llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
         planning_result_obj = get_planning_result(task_id)
@@ -804,20 +837,21 @@ def _advance_to_optimization(task_id: str) -> None:
                     llm_model=llm_model,
                     llm_id=task.llm_id,
                     budget_id=task.budget_id,
+                    project_path=project_path,
                 )
             )
             _store_pipeline_result_generic(task_id, result, task.budget_id, "conceptual_to_optimization")
 
             if result.get("outcome") == "passed":
                 update_task(task_id, type="optimization")
-                print(f"[review] Task '{task_id}' advanced to OPTIMIZATION.")
+                logger.info("[review] Task '%s' advanced to OPTIMIZATION.", task_id)
             else:
                 update_task(task_id, type="indev")
-                print(f"[review] Task '{task_id}' demoted to IN DEV.")
+                logger.warning("[review] Task '%s' demoted to IN DEV.", task_id)
         finally:
             loop.close()
     except Exception as exc:
-        print(f"[review] Pipeline for '{task_id}' failed: {exc}")
+        logger.exception("[review] Pipeline for '%s' failed.", task_id)
 
 
 def _run_security_pipeline_bg(task_id: str) -> None:
@@ -830,6 +864,7 @@ def _run_security_pipeline_bg(task_id: str) -> None:
         task = get_task(task_id)
         if not task:
             return
+        project_path = _setup_thread_context(task)
 
         llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
 
@@ -845,9 +880,10 @@ def _run_security_pipeline_bg(task_id: str) -> None:
                     llm_model=llm_model,
                     llm_id=task.llm_id,
                     budget_id=task.budget_id,
+                    project_path=project_path,
                 )
             )
-            print(f"[optimization] Task '{task_id}': {opt_result.get('outcome')}")
+            logger.info("[optimization] Task '%s': %s", task_id, opt_result.get('outcome'))
 
             # Then run security review
             sec_result = loop.run_until_complete(
@@ -858,6 +894,7 @@ def _run_security_pipeline_bg(task_id: str) -> None:
                     llm_model=llm_model,
                     llm_id=task.llm_id,
                     budget_id=task.budget_id,
+                    project_path=project_path,
                 )
             )
             _store_pipeline_result_generic(task_id, sec_result, task.budget_id, "security_review")
@@ -866,16 +903,16 @@ def _run_security_pipeline_bg(task_id: str) -> None:
                 update_task(task_id, type="security")
                 # Auto-advance past security to full_review
                 update_task(task_id, type="full_review")
-                print(f"[security] Task '{task_id}' advanced to FULL REVIEW.")
+                logger.info("[security] Task '%s' advanced to FULL REVIEW.", task_id)
             else:
                 demotion = sec_result.get("demotion_target", "indev")
                 update_task(task_id, type=demotion)
                 _record_demotion(task_id, "security", demotion, sec_result.get("summary", ""))
-                print(f"[security] Task '{task_id}' demoted to {demotion}.")
+                logger.warning("[security] Task '%s' demoted to %s.", task_id, demotion)
         finally:
             loop.close()
     except Exception as exc:
-        print(f"[security] Pipeline for '{task_id}' failed: {exc}")
+        logger.exception("[security] Pipeline for '%s' failed.", task_id)
 
 
 def _run_full_review_bg(task_id: str) -> None:
@@ -887,6 +924,7 @@ def _run_full_review_bg(task_id: str) -> None:
         task = get_task(task_id)
         if not task:
             return
+        project_path = _setup_thread_context(task)
 
         llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
 
@@ -901,6 +939,7 @@ def _run_full_review_bg(task_id: str) -> None:
                     llm_model=llm_model,
                     llm_id=task.llm_id,
                     budget_id=task.budget_id,
+                    project_path=project_path,
                 )
             )
             _store_pipeline_result_generic(task_id, result, task.budget_id, "full_review")
@@ -912,35 +951,47 @@ def _run_full_review_bg(task_id: str) -> None:
                 demotion = result.get("demotion_target", "indev")
                 update_task(task_id, type=demotion)
                 _record_demotion(task_id, "full_review", demotion, result.get("summary", ""))
-                print(f"[full_review] Task '{task_id}' demoted to {demotion}.")
+                logger.warning("[full_review] Task '%s' demoted to %s.", task_id, demotion)
         finally:
             loop.close()
     except Exception as exc:
-        print(f"[full_review] Pipeline for '{task_id}' failed: {exc}")
+        logger.exception("[full_review] Pipeline for '%s' failed.", task_id)
 
 
 def _execute_merge_bg(task_id: str) -> None:
     """Background runner for merge to main."""
     try:
         from app.agent.merge import execute_merge
+        from app.database import get_project_path
 
-        result = execute_merge(task_id)
+        task = get_task(task_id)
+        project_path = None
+        if task and task.project:
+            project_path = get_project_path(task.project)
+
+        result = execute_merge(task_id, project_path=project_path)
 
         if result.status == "merged":
-            print(f"[merge] Task '{task_id}' merged to main ({result.merge_commit_sha}).")
+            logger.info("[merge] Task '%s' merged to main (%s).", task_id, result.merge_commit_sha)
             _check_completion_rollup(task_id)
         elif result.status == "conflict":
             update_task(task_id, type="indev")
             _record_demotion(task_id, "merge", "indev", result.error_detail or "Merge conflict")
-            print(f"[merge] Task '{task_id}' merge conflict. Demoted to IN DEV.")
+            logger.warning("[merge] Task '%s' merge conflict. Demoted to IN DEV.", task_id)
         elif result.status == "test_failure":
             update_task(task_id, type="indev")
             _record_demotion(task_id, "merge", "indev", result.error_detail or "Tests failed")
-            print(f"[merge] Task '{task_id}' tests failed after merge. Demoted to IN DEV.")
+            logger.warning("[merge] Task '%s' tests failed after merge. Demoted to IN DEV.", task_id)
+        elif result.status == "push_failure":
+            update_task(task_id, type="full_review")
+            _record_demotion(task_id, "merge", "full_review",
+                             result.error_detail or "Push to remote failed")
+            logger.error("[merge] Task '%s' push failed permanently. Demoted to full_review. %s",
+                         task_id, result.error_detail)
         else:
-            print(f"[merge] Task '{task_id}' merge error: {result.error_detail}")
+            logger.error("[merge] Task '%s' merge error: %s", task_id, result.error_detail)
     except Exception as exc:
-        print(f"[merge] Merge for '{task_id}' failed: {exc}")
+        logger.exception("[merge] Merge for '%s' failed.", task_id)
 
 
 def _store_pipeline_result_generic(task_id: str, result: dict, budget_id: int | None, transition: str) -> None:
@@ -971,7 +1022,7 @@ def _store_pipeline_result_generic(task_id: str, result: dict, budget_id: int | 
 
 def _record_demotion(task_id: str, from_stage: str, to_stage: str, reason: str) -> None:
     """Record a demotion event on a task."""
-    from datetime import datetime
+    from datetime import datetime, timezone
     task = get_task(task_id)
     if not task:
         return
@@ -980,7 +1031,7 @@ def _record_demotion(task_id: str, from_stage: str, to_stage: str, reason: str) 
         "from": from_stage,
         "to": to_stage,
         "reason": reason[:500],
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     })
     update_task(task_id, demotion_count=(task.demotion_count or 0) + 1, demotion_history=history)
 
@@ -1310,6 +1361,49 @@ def get_task_subdivision_records(task_id: str):
 
 
 # ============================================
+# Research Jobs API
+# ============================================
+
+def _research_job_to_dict(job) -> dict:
+    return {
+        "id": job.id,
+        "task_id": job.task_id,
+        "status": job.status,
+        "priority": job.priority,
+        "depth": job.depth,
+        "question": job.question,
+        "findings": job.findings,
+        "verdict": job.verdict,
+        "lives_used": job.lives_used,
+        "prompt_tokens": job.prompt_tokens,
+        "completion_tokens": job.completion_tokens,
+        "llm_id": job.llm_id,
+        "budget_id": job.budget_id,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+    }
+
+
+@app.get("/api/tasks/{task_id}/research-jobs", response_model=List[dict])
+def get_task_research_jobs(task_id: str):
+    """Get all research jobs for a task, most recent first."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    jobs = get_research_jobs_for_task(task_id)
+    return [_research_job_to_dict(j) for j in jobs]
+
+
+@app.get("/api/research-jobs/{job_id}", response_model=dict)
+def get_single_research_job(job_id: int):
+    """Get a single research job by ID."""
+    job = get_research_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Research job not found")
+    return _research_job_to_dict(job)
+
+
+# ============================================
 # Descendants API
 # ============================================
 
@@ -1365,7 +1459,7 @@ def _check_completion_rollup(task_id: str):
 
     if all_done:
         update_task(parent.id, type="completed")
-        print(f"[rollup] All children of '{parent.id}' completed. Parent marked completed.")
+        logger.info("[rollup] All children of '%s' completed. Parent marked completed.", parent.id)
         # Recurse upward
         _check_completion_rollup(parent.id)
 
@@ -1428,6 +1522,57 @@ def budget_to_dict(budget):
         "name": budget.name,
         "settings": budget.settings,
     }
+
+
+# ============================================
+# Project API Endpoints
+# ============================================
+
+@app.get("/api/projects", response_model=List[dict])
+def list_projects():
+    """List all known projects with their filesystem paths."""
+    projects = get_all_projects()
+    return [
+        {
+            "name": p.name,
+            "path": p.path or "",
+            "description": p.description or "",
+        }
+        for p in projects
+    ]
+
+
+@app.post("/api/projects", response_model=dict, status_code=201)
+def create_project(data: dict):
+    """Create or update a project record."""
+    name = (data.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Project name is required.")
+    path = (data.get("path") or "").strip() or None
+    description = (data.get("description") or "").strip() or None
+    project = upsert_project(name, path=path, description=description)
+    if not project:
+        raise HTTPException(status_code=500, detail="Failed to create project.")
+    return {"name": project.name, "path": project.path or "", "description": project.description or ""}
+
+
+@app.put("/api/projects/{project_name}", response_model=dict)
+def update_project(project_name: str, data: dict):
+    """Update a project's path and/or description."""
+    path = data.get("path")          # None means "don't change"; pass explicitly
+    description = data.get("description")
+    project = upsert_project(project_name, path=path, description=description)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found or update failed.")
+    return {"name": project.name, "path": project.path or "", "description": project.description or ""}
+
+
+@app.delete("/api/projects/{project_name}")
+def remove_project(project_name: str):
+    """Delete a project record. Tasks that reference it are unaffected."""
+    if not delete_project(project_name):
+        raise HTTPException(status_code=404, detail="Project not found.")
+    return {"deleted": project_name}
 
 
 # ============================================
@@ -1735,7 +1880,13 @@ def _run_loop_in_background(task_id: str) -> None:
                 llm_base_url = f"http://{llm_record.address}:{llm_record.port}/v1"
                 llm_model = llm_record.model
                 max_context = llm_record.max_context
-                print(f"[agent] Using LLM: {llm_base_url} model={llm_model} ctx={max_context}")
+                logger.info("[agent] Using LLM: %s model=%s ctx=%s", llm_base_url, llm_model, max_context)
+
+        # Resolve project path for git tool isolation
+        project_path = None
+        if task and task.project:
+            from app.database import get_project_path
+            project_path = get_project_path(task.project)
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -1747,12 +1898,13 @@ def _run_loop_in_background(task_id: str) -> None:
                 max_context=max_context,
                 llm_id=task.llm_id if task else None,
                 budget_id=task.budget_id if task else None,
+                project_path=project_path,
             )
             loop.run_until_complete(maestro.run())
         finally:
             loop.close()
     except Exception as exc:
-        print(f"[agent] Background loop for '{task_id}' failed: {exc}")
+        logger.exception("[agent] Background loop for '%s' failed.", task_id)
 
 
 @app.post("/api/agent/run/{task_id}", response_model=dict)

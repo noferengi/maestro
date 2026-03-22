@@ -6,7 +6,16 @@ Shared fixtures for the Maestro test suite.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
+
+# Redirect all DB I/O to test.db before any test module imports database.
+# Mirrors the same guard in app/tests/conftest.py — both directories need it
+# so that whichever conftest is loaded first, the env var is set.
+_TEST_DB = Path(__file__).parent.parent / "data" / "test.db"
+os.environ.setdefault("MAESTRO_TEST_DB", str(_TEST_DB))
 
 from app.agent.mock_llm import MockLLM
 

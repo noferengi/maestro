@@ -1,11 +1,26 @@
 """Maestro REPL: Primary control loop that navigates the task DAG."""
 
+import logging
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
 
 import config
 import app.models.dags as dags
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Import TheMaestro's own git root so CheckpointManager can refuse to operate
+# inside it.  Imported lazily to avoid circular deps at collection time.
+# ---------------------------------------------------------------------------
+def _get_maestro_git_root() -> str | None:
+    try:
+        from app.agent.config import MAESTRO_GIT_ROOT
+        return MAESTRO_GIT_ROOT
+    except Exception:
+        return None
 
 
 class CheckpointManager:
@@ -20,6 +35,31 @@ class CheckpointManager:
         """
         self.project_root = Path(project_root)
 
+    def _is_maestro_repo(self) -> bool:
+        """Return True if self.project_root resolves to TheMaestro's own repo."""
+        maestro_root = _get_maestro_git_root()
+        if not maestro_root:
+            return False
+        norm = os.path.normcase(os.path.normpath(str(self.project_root)))
+        if norm == maestro_root or norm.startswith(maestro_root + os.sep):
+            return True
+        # Authoritative check via git
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=self.project_root,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if result.returncode == 0:
+                target = os.path.normcase(os.path.normpath(result.stdout.strip()))
+                return target == maestro_root
+        except Exception:
+            pass
+        return False
+
     def _run_git_command(self, *args: str) -> tuple[bool, str, str]:
         """
         Run a git command and return success status with output.
@@ -27,6 +67,14 @@ class CheckpointManager:
         Returns:
             Tuple of (success, stdout, stderr).
         """
+        if self._is_maestro_repo():
+            return (
+                False,
+                "",
+                "BLOCKED: CheckpointManager refuses to run git commands inside "
+                "TheMaestro's own repository.  Set project_root to the target "
+                "project's path, not TheMaestro's source tree.",
+            )
         try:
             result = subprocess.run(
                 ["git", *args],
@@ -271,13 +319,13 @@ class MaestroREPL:
         self._load_dag(dag_path)
         self.running = True
 
-        print(f"[Maestro] Starting REPL loop for {config.get_app_id()}")
-        print(f"[Maestro] Project root: {self.project_root}")
+        logger.info("[Maestro] Starting REPL loop for %s", config.get_app_id())
+        logger.info("[Maestro] Project root: %s", self.project_root)
 
         while self.running:
             # Check if all tasks are complete
             if self.dag.is_complete():
-                print("[Maestro] All tasks accepted. REPL loop complete.")
+                logger.info("[Maestro] All tasks accepted. REPL loop complete.")
                 break
 
             # Get next ready task
@@ -292,22 +340,22 @@ class MaestroREPL:
                 ]
 
                 if len(terminal_states) == len(all_tasks):
-                    print("[Maestro] All tasks reached terminal state.")
-                    print(f"[Maestro] Accepted: {len(self.dag.get_accepted_tasks())}")
-                    print(f"[Maestro] Reverted: {len([t for t in all_tasks if t.state == dags.TaskState.REVERTED])}")
+                    logger.info("[Maestro] All tasks reached terminal state.")
+                    logger.info("[Maestro] Accepted: %d", len(self.dag.get_accepted_tasks()))
+                    logger.info("[Maestro] Reverted: %d", len([t for t in all_tasks if t.state == dags.TaskState.REVERTED]))
                 else:
-                    print("[Maestro] No tasks ready and some tasks in intermediate states.")
-                    print(f"[Maestro] Active tasks: {len(self.dag.get_active_tasks())}")
+                    logger.info("[Maestro] No tasks ready and some tasks in intermediate states.")
+                    logger.info("[Maestro] Active tasks: %d", len(self.dag.get_active_tasks()))
 
                 break
 
             # Start task
             self.current_task = next_task
-            print(f"[Maestro] Starting task '{next_task.task_id}': {next_task.description}")
-            print(f"[Maestro] Agent: {next_task.agent_type}, Prerequisites: {next_task.prerequisites or []}")
+            logger.info("[Maestro] Starting task '%s': %s", next_task.task_id, next_task.description)
+            logger.info("[Maestro] Agent: %s, Prerequisites: %s", next_task.agent_type, next_task.prerequisites or [])
 
             if not self._transition_task(next_task.task_id, dags.TaskState.ACTIVE, "Task started"):
-                print(f"[Maestro] Failed to start task '{next_task.task_id}'")
+                logger.error("[Maestro] Failed to start task '%s'", next_task.task_id)
                 break
 
             # In a real implementation, the agent would be invoked here
@@ -316,7 +364,7 @@ class MaestroREPL:
 
             # Simulate successful task completion for testing
             # TODO: Replace with actual agent invocation and verification
-            print(f"[Maestro] Task '{next_task.task_id}' completed (simulated)")
+            logger.info("[Maestro] Task '%s' completed (simulated)", next_task.task_id)
             self._transition_task(next_task.task_id, dags.TaskState.ACCEPTED, "Task completed successfully")
 
         self.running = False
@@ -324,7 +372,7 @@ class MaestroREPL:
     def stop(self) -> None:
         """Stop the REPL loop."""
         self.running = False
-        print("[Maestro] REPL loop stopped.")
+        logger.info("[Maestro] REPL loop stopped.")
 
 
 def create_sample_dag() -> dags.TaskDAG:

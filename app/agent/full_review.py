@@ -28,9 +28,14 @@ from app.agent.config import (
     FULL_REVIEW_AUTO_UX,
     FULL_REVIEW_FRONTEND_PATTERNS,
     FULL_REVIEW_RESEARCH_LIVES,
+    FULL_REVIEW_MAX_REVIEWER_TURNS,
+    FULL_REVIEW_CODE_QUALITY_TOOLS,
+    FULL_REVIEW_FUNCTIONAL_TOOLS,
     PROJECT_ROOT,
     SHELL_TIMEOUT_SECONDS,
 )
+from app.agent.json_utils import extract_json_block
+from app.agent.tools import _task_git_cwd, dispatch_tool, build_tool_schemas
 from app.agent.llm_client import call_llm
 from app.agent.verdicts import Vote, Verdict, tally_votes
 
@@ -53,7 +58,7 @@ REVIEW_SHELL_ALLOWLIST = [
 _REVIEW_ALLOWLIST_RE = [re.compile(p) for p in REVIEW_SHELL_ALLOWLIST]
 
 
-def run_shell_review(command: str) -> str:
+def run_shell_review(command: str, *, project_path: str | None = None) -> str:
     """Execute a shell command from the review runner allowlist only."""
     import subprocess
 
@@ -66,13 +71,14 @@ def run_shell_review(command: str) -> str:
         )
 
     try:
+        cwd = project_path or _task_git_cwd.get() or PROJECT_ROOT
         result = subprocess.run(
             command,
             shell=True,
             capture_output=True,
             text=True,
             timeout=SHELL_TIMEOUT_SECONDS,
-            cwd=PROJECT_ROOT,
+            cwd=cwd,
         )
         output = result.stdout + result.stderr
         return output[:8000] if output else "(no output)"
@@ -104,6 +110,12 @@ class FullReviewPipelineResult:
 class FullReviewPipeline:
     """4-agent final review pipeline."""
 
+    def _get_reviewer_schemas(self, reviewer_type: str) -> list[dict]:
+        """Return tool schemas appropriate for the reviewer type."""
+        if reviewer_type in ("code_quality", "integration"):
+            return build_tool_schemas(FULL_REVIEW_CODE_QUALITY_TOOLS)
+        return build_tool_schemas(FULL_REVIEW_FUNCTIONAL_TOOLS)
+
     def __init__(
         self,
         task_id: str,
@@ -114,6 +126,7 @@ class FullReviewPipeline:
         llm_model: str | None = None,
         llm_id: int | None = None,
         budget_id: int | None = None,
+        project_path: str | None = None,
     ):
         self.task_id = task_id
         self.task_description = task_description
@@ -122,6 +135,7 @@ class FullReviewPipeline:
         self.llm_model = llm_model
         self.llm_id = llm_id
         self.budget_id = budget_id
+        self.project_path = project_path
         self._total_prompt = 0
         self._total_completion = 0
 
@@ -219,53 +233,95 @@ class FullReviewPipeline:
         )
 
     async def _run_reviewer(self, reviewer: dict) -> Vote:
-        """Run a single reviewer agent."""
+        """Run a single reviewer agent using a mini-loop with tool access."""
         prompt = (
             f"You are a final reviewer ({reviewer['type']}).\n"
             f"Focus: {reviewer['focus']}\n\n"
             f"Task: {self.task_description}\n"
             f"Files changed: {json.dumps(self.files_changed[:20])}\n\n"
+            "You may use tools to read code files before giving your verdict.\n\n"
             "Output JSON: {\"verdict\": \"LIKELY|POSSIBLE|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED\", "
             "\"confidence\": <0-100>, \"justification\": \"...\"}"
         )
 
-        response = await call_llm(
-            [
-                {"role": "system", "content": "You are a code reviewer. Output only JSON."},
-                {"role": "user", "content": prompt},
-            ],
-            base_url=self.llm_base_url,
-            model=self.llm_model,
-            temperature=FULL_REVIEW_LLM_TEMPERATURE,
-            response_format={"type": "json_object"},
-            task_id=self.task_id,
-            llm_id=self.llm_id,
-            budget_id=self.budget_id,
-        )
+        messages: list[dict] = [
+            {"role": "system", "content": "You are a code reviewer. Output your verdict as JSON when ready."},
+            {"role": "user", "content": prompt},
+        ]
 
-        usage = response.get("usage", {})
-        self._total_prompt += usage.get("prompt_tokens", 0)
-        self._total_completion += usage.get("completion_tokens", 0)
+        schemas = self._get_reviewer_schemas(reviewer["type"])
+        max_turns = FULL_REVIEW_MAX_REVIEWER_TURNS
 
-        content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
-        try:
-            data = json.loads(content)
-            verdict_str = data.get("verdict", "POSSIBLE").upper()
-            verdict = Verdict(verdict_str)
-            confidence = int(data.get("confidence", 80))
-            lo, hi = verdict.confidence_range
-            confidence = max(lo, min(hi, confidence))
-            justification = data.get("justification", "")
-        except (json.JSONDecodeError, ValueError):
-            verdict = Verdict.POSSIBLE
-            confidence = 80
-            justification = content[:500]
+        for turn in range(max_turns):
+            response = await call_llm(
+                messages,
+                base_url=self.llm_base_url,
+                model=self.llm_model,
+                temperature=FULL_REVIEW_LLM_TEMPERATURE,
+                tools=schemas,
+                tool_choice="auto",
+                task_id=self.task_id,
+                llm_id=self.llm_id,
+                budget_id=self.budget_id,
+            )
 
+            usage = response.get("usage", {})
+            self._total_prompt += usage.get("prompt_tokens", 0)
+            self._total_completion += usage.get("completion_tokens", 0)
+
+            assistant_msg = response.get("choices", [{}])[0].get("message", {})
+            messages.append(assistant_msg)
+            tool_calls = assistant_msg.get("tool_calls") or []
+            content = assistant_msg.get("content") or ""
+
+            if tool_calls:
+                for tc in tool_calls:
+                    tc_result = dispatch_tool(
+                        tc["function"]["name"],
+                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                    )
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "content": tc_result,
+                    })
+                continue
+
+            raw = extract_json_block(content)
+            if raw:
+                try:
+                    data = json.loads(raw)
+                    if "verdict" in data:
+                        verdict_str = data.get("verdict", "POSSIBLE").upper()
+                        verdict = Verdict(verdict_str)
+                        confidence = int(data.get("confidence", 80))
+                        lo, hi = verdict.confidence_range
+                        confidence = max(lo, min(hi, confidence))
+                        justification = data.get("justification", "")
+                        return Vote(
+                            stage=f"review_{reviewer['type']}",
+                            verdict=verdict,
+                            confidence=confidence,
+                            justification=justification,
+                            model=self.llm_model or "",
+                        )
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            turns_remaining = max_turns - turn - 1
+            if turns_remaining <= 2:
+                messages.append({
+                    "role": "user",
+                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Output JSON verdict now.",
+                })
+
+        # Fallback: turns exhausted
         return Vote(
             stage=f"review_{reviewer['type']}",
-            verdict=verdict,
-            confidence=confidence,
-            justification=justification,
+            verdict=Verdict.NEEDS_RESEARCH,
+            confidence=65,
+            justification="Reviewer exhausted turns",
             model=self.llm_model or "",
         )
 
@@ -312,7 +368,11 @@ async def run_full_review_pipeline(
     llm_model: str | None = None,
     llm_id: int | None = None,
     budget_id: int | None = None,
+    project_path: str | None = None,
 ) -> dict:
+    if project_path is not None:
+        from app.agent.tools import set_task_git_cwd
+        set_task_git_cwd(project_path)
     pipeline = FullReviewPipeline(
         task_id=task_id,
         task_description=task_description,
@@ -321,6 +381,7 @@ async def run_full_review_pipeline(
         llm_model=llm_model,
         llm_id=llm_id,
         budget_id=budget_id,
+        project_path=project_path,
     )
     result = await pipeline.run()
     return {

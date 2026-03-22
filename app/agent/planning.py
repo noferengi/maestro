@@ -743,8 +743,12 @@ async def run_planning_pipeline(
     llm_id: int | None = None,
     budget_id: int | None = None,
     max_context: int | None = None,
+    project_path: str | None = None,
 ) -> dict:
     """Run the full planning pipeline and return a result dict."""
+    if project_path is not None:
+        from app.agent.tools import set_task_git_cwd
+        set_task_git_cwd(project_path)
     pipeline = PlanningPipeline(
         task_id=task_id,
         task_title=task_title,

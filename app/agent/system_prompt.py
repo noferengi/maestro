@@ -160,6 +160,19 @@ Never end your turn with free-form prose as the terminal action.
        "advice": "<guidance for re-attempt>"
      }}
 
+  C) NEEDS RESEARCH (non-terminal — loop continues after research):
+     {{
+       "signal": "NEEDS_RESEARCH",
+       "task_id": "<task_id>",
+       "question": "<specific investigation question>",
+       "context": "<relevant context for the researcher>"
+     }}
+     Use when you encounter an unknown that blocks progress.  A read-only
+     research agent will investigate the question and return findings.  You
+     will then continue with those findings injected into the conversation.
+     Do NOT emit NEEDS_RESEARCH for questions you can answer with your
+     existing tools — only use it when domain knowledge is genuinely missing.
+
 Tool calls are NOT terminal actions.  You may make as many tool calls as
 needed before emitting the terminal JSON.
 

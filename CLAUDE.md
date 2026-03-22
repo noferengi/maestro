@@ -10,10 +10,24 @@ Read `SUMMARY.md` in the project root. It contains recent work and prioritized n
 
 Project Maestro — a Kanban board with an agentic LLM orchestration backend. The board is the UI face of a "Wiggum Loop": a Do-While that drives a local LLM through Design → Implement → Test → Verify cycles until all DAG task nodes reach ACCEPTED. Tasks transition IDEA → PLANNING → DEVELOPMENT → REVIEW → COMPLETED, gated by a multi-stage intake pipeline with LLM voting.
 
+## Shell / path conventions (Windows)
+
+The shell is bash. Use **forward slashes** — backslashes are treated as escape characters and
+silently dropped, mushing the path together:
+
+```
+# Wrong
+venv\Scripts\python.exe -m pytest app/tests/ -q
+→ /usr/bin/bash: line 1: venvScriptspython.exe: command not found
+
+# Correct
+venv/Scripts/python.exe -m pytest app/tests/ -q
+```
+
 ## Running the server
 
 ```bash
-venv\Scripts\python.exe -m uvicorn app.main:app --port 8000
+venv/Scripts/python.exe -m uvicorn app.main:app --port 8000
 ```
 
 Board is at `http://localhost:8000/`. LLM endpoints are configurable per-task via the UI (managed in the `llms` table). Default expects `llama.cpp` on `http://localhost:8008/v1` (OpenAI-compatible).
@@ -21,9 +35,9 @@ Board is at `http://localhost:8000/`. LLM endpoints are configurable per-task vi
 ## Running tests
 
 ```bash
-venv\Scripts\python.exe -m pytest app/tests/ -v
-venv\Scripts\python.exe -m pytest app/tests/test_repl.py -v      # single file
-venv\Scripts\python.exe -m pytest app/tests/test_repl.py -k "test_name" -v  # single test
+venv/Scripts/python.exe -m pytest app/tests/ -v
+venv/Scripts/python.exe -m pytest app/tests/test_repl.py -v      # single file
+venv/Scripts/python.exe -m pytest app/tests/test_repl.py -k "test_name" -v  # single test
 ```
 
 ## Database migrations
@@ -34,7 +48,7 @@ migrate.bat migrate     # apply pending migrations
 migrate.bat reset       # DESTRUCTIVE: drop everything, re-migrate, re-seed
 ```
 
-Or directly: `venv\Scripts\python.exe app/migrations/runner.py <command>`
+Or directly: `venv/Scripts/python.exe app/migrations/runner.py <command>`
 
 Migrations live in `app/migrations/versions/` as `NNNN_description.py`. Never edit an existing migration — always add a new one. Each exposes `up(conn)`, `down(conn)`, and `description`.
 

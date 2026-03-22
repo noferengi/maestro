@@ -26,8 +26,12 @@ from app.agent.config import (
     SECURITY_REVIEW_LLM_TEMPERATURE,
     SECURITY_REVIEW_VETO_POWER,
     SECURITY_REVIEW_RESEARCH_LIVES,
+    SECURITY_REVIEW_MAX_REVIEWER_TURNS,
+    SECURITY_REVIEWER_TOOLS,
     PROJECT_ROOT,
 )
+from app.agent.json_utils import extract_json_block
+from app.agent.tools import _task_git_cwd, dispatch_tool, build_tool_schemas, set_task_git_cwd
 from app.agent.llm_client import call_llm
 from app.agent.research import run_research
 from app.agent.verdicts import Vote, Verdict
@@ -52,7 +56,7 @@ SECURITY_SCANNER_ALLOWLIST = [
 _SECURITY_ALLOWLIST_RE = [re.compile(p) for p in SECURITY_SCANNER_ALLOWLIST]
 
 
-def run_shell_security(command: str) -> str:
+def run_shell_security(command: str, *, project_path: str | None = None) -> str:
     """Execute a shell command from the security scanner allowlist only.
 
     Unlike run_shell (blocklist), this uses a strict allowlist.
@@ -70,13 +74,14 @@ def run_shell_security(command: str) -> str:
         )
 
     try:
+        cwd = project_path or _task_git_cwd.get() or PROJECT_ROOT
         result = subprocess.run(
             command,
             shell=True,
             capture_output=True,
             text=True,
             timeout=SHELL_TIMEOUT_SECONDS,
-            cwd=PROJECT_ROOT,
+            cwd=cwd,
         )
         output = result.stdout + result.stderr
         return output[:8000] if output else "(no output)"
@@ -109,6 +114,8 @@ class SecurityReviewPipelineResult:
 class SecurityPipeline:
     """3-agent veto-power security gate."""
 
+    _REVIEWER_SCHEMAS: list[dict] = build_tool_schemas(SECURITY_REVIEWER_TOOLS)
+
     def __init__(
         self,
         task_id: str,
@@ -118,6 +125,7 @@ class SecurityPipeline:
         llm_model: str | None = None,
         llm_id: int | None = None,
         budget_id: int | None = None,
+        project_path: str | None = None,
     ):
         self.task_id = task_id
         self.task_description = task_description
@@ -125,6 +133,7 @@ class SecurityPipeline:
         self.llm_model = llm_model
         self.llm_id = llm_id
         self.budget_id = budget_id
+        self.project_path = project_path
         self._total_prompt = 0
         self._total_completion = 0
 
@@ -211,16 +220,19 @@ class SecurityPipeline:
 
     async def _run_pre_scan(self) -> str:
         """Run allowlisted security scanners and return output as context string."""
+        import functools
+
         commands = [
             "python -m bandit -r . -q --no-show-progress",
             "python -m detect_secrets scan",
         ]
         loop = asyncio.get_event_loop()
+        shell_fn = functools.partial(run_shell_security, project_path=self.project_path)
         scan_outputs = []
 
         for cmd in commands:
             try:
-                result = await loop.run_in_executor(None, run_shell_security, cmd)
+                result = await loop.run_in_executor(None, shell_fn, cmd)
                 if result and not result.startswith("ERROR:"):
                     scanner_name = cmd.split()[2]
                     scan_outputs.append(f"[{scanner_name}]\n{result[:2000]}")
@@ -308,14 +320,14 @@ class SecurityPipeline:
     async def _run_reviewer(
         self, reviewer: dict, scan_context: str = ""
     ) -> tuple[Vote, list[dict]]:
-        """Run a single security reviewer."""
+        """Run a single security reviewer using a mini-loop with tool access."""
         prompt = (
             f"You are a security reviewer ({reviewer['perspective']}).\n"
             f"Focus: {reviewer['focus']}\n\n"
             f"{scan_context}"
             f"Task being reviewed: {self.task_description}\n\n"
-            "Analyze for security issues. For each finding, classify severity as "
-            "critical/high/medium/low.\n\n"
+            "Analyze for security issues. You may use tools to inspect code files. "
+            "For each finding, classify severity as critical/high/medium/low.\n\n"
             "Output JSON: {\n"
             "  \"verdict\": \"LIKELY|POSSIBLE|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED\",\n"
             "  \"confidence\": <0-100>,\n"
@@ -327,49 +339,88 @@ class SecurityPipeline:
             "}"
         )
 
-        response = await call_llm(
-            [
-                {"role": "system", "content": "You are a security expert. Output only JSON."},
-                {"role": "user", "content": prompt},
-            ],
-            base_url=self.llm_base_url,
-            model=self.llm_model,
-            temperature=SECURITY_REVIEW_LLM_TEMPERATURE,
-            response_format={"type": "json_object"},
-            task_id=self.task_id,
-            llm_id=self.llm_id,
-            budget_id=self.budget_id,
-        )
+        messages: list[dict] = [
+            {"role": "system", "content": "You are a security expert. Output your verdict as JSON when ready."},
+            {"role": "user", "content": prompt},
+        ]
 
-        usage = response.get("usage", {})
-        self._total_prompt += usage.get("prompt_tokens", 0)
-        self._total_completion += usage.get("completion_tokens", 0)
+        max_turns = SECURITY_REVIEW_MAX_REVIEWER_TURNS
 
-        content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
-        try:
-            data = json.loads(content)
-            verdict_str = data.get("verdict", "POSSIBLE").upper()
-            verdict = Verdict(verdict_str)
-            confidence = int(data.get("confidence", 80))
-            lo, hi = verdict.confidence_range
-            confidence = max(lo, min(hi, confidence))
-            justification = data.get("justification", "")
-            findings = data.get("findings", [])
-        except (json.JSONDecodeError, ValueError):
-            verdict = Verdict.NEEDS_RESEARCH
-            confidence = 65
-            justification = content[:500]
-            findings = []
+        for turn in range(max_turns):
+            response = await call_llm(
+                messages,
+                base_url=self.llm_base_url,
+                model=self.llm_model,
+                temperature=SECURITY_REVIEW_LLM_TEMPERATURE,
+                tools=self._REVIEWER_SCHEMAS,
+                tool_choice="auto",
+                task_id=self.task_id,
+                llm_id=self.llm_id,
+                budget_id=self.budget_id,
+            )
 
+            usage = response.get("usage", {})
+            self._total_prompt += usage.get("prompt_tokens", 0)
+            self._total_completion += usage.get("completion_tokens", 0)
+
+            assistant_msg = response.get("choices", [{}])[0].get("message", {})
+            messages.append(assistant_msg)
+            tool_calls = assistant_msg.get("tool_calls") or []
+            content = assistant_msg.get("content") or ""
+
+            if tool_calls:
+                for tc in tool_calls:
+                    tc_result = dispatch_tool(
+                        tc["function"]["name"],
+                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                    )
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "content": tc_result,
+                    })
+                continue
+
+            raw = extract_json_block(content)
+            if raw:
+                try:
+                    data = json.loads(raw)
+                    if "verdict" in data:
+                        verdict_str = data.get("verdict", "POSSIBLE").upper()
+                        verdict = Verdict(verdict_str)
+                        confidence = int(data.get("confidence", 80))
+                        lo, hi = verdict.confidence_range
+                        confidence = max(lo, min(hi, confidence))
+                        justification = data.get("justification", "")
+                        findings = data.get("findings", [])
+                        vote = Vote(
+                            stage=f"security_{reviewer['type']}",
+                            verdict=verdict,
+                            confidence=confidence,
+                            justification=justification,
+                            model=self.llm_model or "",
+                        )
+                        return vote, findings
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            turns_remaining = max_turns - turn - 1
+            if turns_remaining <= 2:
+                messages.append({
+                    "role": "user",
+                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Output JSON verdict now.",
+                })
+
+        # Fallback: turns exhausted
         vote = Vote(
             stage=f"security_{reviewer['type']}",
-            verdict=verdict,
-            confidence=confidence,
-            justification=justification,
+            verdict=Verdict.NEEDS_RESEARCH,
+            confidence=65,
+            justification="Reviewer exhausted turns",
             model=self.llm_model or "",
         )
-
-        return vote, findings
+        return vote, []
 
     def _tally_security(
         self, votes: list[Vote], findings: list[dict]
@@ -457,8 +508,11 @@ async def run_security_pipeline(
     llm_model: str | None = None,
     llm_id: int | None = None,
     budget_id: int | None = None,
+    project_path: str | None = None,
 ) -> dict:
     """Run the security pipeline and return a result dict."""
+    if project_path:
+        set_task_git_cwd(project_path)
     pipeline = SecurityPipeline(
         task_id=task_id,
         task_description=task_description,
@@ -466,6 +520,7 @@ async def run_security_pipeline(
         llm_model=llm_model,
         llm_id=llm_id,
         budget_id=budget_id,
+        project_path=project_path,
     )
     result = await pipeline.run()
     return {

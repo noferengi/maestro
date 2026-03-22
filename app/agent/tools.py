@@ -14,7 +14,9 @@ The public entry point is dispatch_tool(name, arguments) -> str.
 
 from __future__ import annotations
 
+import contextvars
 import glob as _glob
+import logging
 import os
 import re
 import shutil
@@ -23,6 +25,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Internal imports
@@ -39,7 +43,38 @@ from app.agent.config import (
     TOOL_MAX_SEARCH_RESULTS,
     TOOL_MAX_GIT_LOG_ENTRIES,
     TOOL_LISTING_EXCLUDED_DIRS,
+    MAESTRO_GIT_ROOT,
 )
+
+# ---------------------------------------------------------------------------
+# Per-task git working directory
+# ---------------------------------------------------------------------------
+# Using a ContextVar so parallel agent sessions (each in their own thread or
+# asyncio task) each have an independent working directory. Never defaults to
+# TheMaestro's own source tree — always requires explicit configuration per task.
+_task_git_cwd: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_task_git_cwd", default=None
+)
+
+
+def set_task_git_cwd(path: str | None) -> None:
+    """
+    Set the git working directory for all git tool calls in the current context.
+
+    Call this before dispatching any tools for a task, passing the filesystem
+    path of the project the task belongs to. Pass None to clear the override
+    (git tools will error rather than fall back to TheMaestro's own repo).
+
+    Returns the contextvars.Token so the caller can restore the previous value
+    if needed (e.g. in tests).
+    """
+    _task_git_cwd.set(path)
+
+
+def get_task_git_cwd() -> str | None:
+    """Return the currently active task git working directory, or None."""
+    return _task_git_cwd.get()
+
 
 # ---------------------------------------------------------------------------
 # Safety helpers
@@ -82,16 +117,24 @@ _BLOCKED_RE = re.compile("|".join(BLOCKED_PATTERNS), re.IGNORECASE)
 
 def _assert_safe_path(path: str) -> str:
     """
-    Resolve path and assert it stays inside PROJECT_ROOT.
+    Resolve path and assert it stays inside the effective project root.
+
+    When a task git working directory has been set via set_task_git_cwd(),
+    containment is checked against that path instead of PROJECT_ROOT.
+    This allows agents to operate on managed projects without escaping
+    their own tree.
+
     Returns the absolute resolved path string.
-    Raises ValueError if the path escapes the project root.
+    Raises ValueError if the path escapes the effective root.
     """
     resolved = os.path.realpath(os.path.abspath(path))
-    root = os.path.realpath(PROJECT_ROOT)
+    effective_root = _task_git_cwd.get() or PROJECT_ROOT
+    root = os.path.realpath(effective_root)
     if not resolved.startswith(root):
+        logger.warning("Path escape attempt: %s outside %s", resolved, effective_root)
         raise ValueError(
             f"Path '{path}' resolves to '{resolved}' which is outside "
-            f"the project root '{root}'. Access denied."
+            f"the effective project root '{root}'. Access denied."
         )
     return resolved
 
@@ -161,6 +204,7 @@ def _is_command_blocked(command: str) -> tuple[bool, str]:
     """Return (blocked, reason) for a shell command string."""
     match = _BLOCKED_RE.search(command)
     if match:
+        logger.warning("Shell command blocked by pattern %r: %s", match.group(), command)
         return True, f"Command contains blocked pattern: '{match.group()}'"
     return False, ""
 
@@ -192,7 +236,7 @@ def write_file(path: str, content: str) -> str:
         with open(safe_path, "w", encoding="utf-8") as fh:
             fh.write(content)
         # Stage for git
-        _git_run(["git", "add", safe_path], cwd=PROJECT_ROOT)
+        _git_run(["git", "add", safe_path])
         return f"OK: wrote {len(content)} chars to '{path}' and staged for git."
     except OSError as exc:
         return f"ERROR writing '{path}': {exc}"
@@ -205,7 +249,7 @@ def append_file(path: str, content: str) -> str:
         os.makedirs(os.path.dirname(safe_path), exist_ok=True)
         with open(safe_path, "a", encoding="utf-8") as fh:
             fh.write(content)
-        _git_run(["git", "add", safe_path], cwd=PROJECT_ROOT)
+        _git_run(["git", "add", safe_path])
         return f"OK: appended {len(content)} chars to '{path}'."
     except OSError as exc:
         return f"ERROR appending to '{path}': {exc}"
@@ -401,7 +445,12 @@ def archive_file(path: str, reason: str = "") -> str:
     dest = os.path.join(ARCHIVE_DIR, timestamp, rel_path)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
 
-    shutil.move(safe_path, dest)
+    try:
+        shutil.move(safe_path, dest)
+    except OSError as exc:
+        logger.error("archive_file: failed to move %s → %s: %s", safe_path, dest, exc)
+        return f"ERROR: could not archive '{path}': {exc}"
+    logger.info("Archived %s → %s", safe_path, dest)
 
     if reason:
         reason_file = dest + "._reason.txt"
@@ -421,6 +470,7 @@ def archive_file(path: str, reason: str = "") -> str:
 # Restricted shell
 # ---------------------------------------------------------------------------
 
+# INTERNAL ONLY — not in TOOL_SCHEMAS. LLMs cannot call this.
 def run_shell(command: str, working_dir: str = ".") -> str:
     """
     Execute a shell command with safety restrictions.
@@ -464,17 +514,84 @@ def run_shell(command: str, working_dir: str = ".") -> str:
 # Git tools
 # ---------------------------------------------------------------------------
 
-def _git_run(args: list[str], cwd: str = PROJECT_ROOT) -> tuple[int, str, str]:
-    """Internal helper — run a git command, return (returncode, stdout, stderr)."""
+def _is_inside_maestro_repo(path: str) -> bool:
+    """
+    Return True if *path* is inside TheMaestro's own git repository.
+
+    Resolves the actual git root of *path* (handles symlinks, submodules,
+    worktrees) and compares it to MAESTRO_GIT_ROOT.  Falls back to a simple
+    prefix check if git is unavailable.
+    """
+    if not MAESTRO_GIT_ROOT:
+        return False
+    norm = os.path.normcase(os.path.normpath(path))
+    # Fast prefix check first (avoids a subprocess for the common case)
+    if norm == MAESTRO_GIT_ROOT or norm.startswith(MAESTRO_GIT_ROOT + os.sep):
+        return True
+    # Authoritative check: resolve the actual git root of the target path
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode == 0:
+            target_root = os.path.normcase(os.path.normpath(result.stdout.strip()))
+            return target_root == MAESTRO_GIT_ROOT
+    except Exception:
+        pass
+    return False
+
+
+def _git_run(args: list[str], cwd: str | None = None) -> tuple[int, str, str]:
+    """
+    Internal helper — run a git command, return (returncode, stdout, stderr).
+
+    Working directory resolution order:
+      1. Explicit ``cwd`` argument (rare — used by internal callers that already
+         know the path, e.g. write_file staging).
+      2. The per-task context set via ``set_task_git_cwd()``.
+      3. Hard error — no fallback to TheMaestro's own repo.
+
+    Hard safety rail: any git operation whose resolved working directory falls
+    inside TheMaestro's own git repository is unconditionally blocked.  The
+    agent may only operate on child project repositories.
+    """
+    effective_cwd = cwd or _task_git_cwd.get()
+    if effective_cwd is None:
+        return (
+            1,
+            "",
+            "ERROR: No task git working directory configured. "
+            "Call set_task_git_cwd(project_path) before using git tools.",
+        )
+    # --- SAFETY RAIL ---
+    if _is_inside_maestro_repo(effective_cwd):
+        return (
+            1,
+            "",
+            "BLOCKED: Git operations inside TheMaestro's own repository are "
+            "not permitted.  Configure a separate project path for this task "
+            f"(attempted cwd: {effective_cwd}).",
+        )
     try:
         result = subprocess.run(
             args,
-            cwd=cwd,
+            cwd=effective_cwd,
             capture_output=True,
             text=True,
             timeout=GIT_TIMEOUT_SECONDS,
         )
-        return result.returncode, result.stdout.strip(), result.stderr.strip()
+        rc = result.returncode
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+        logger.debug("git %s rc=%d", args[1:], rc)
+        if rc != 0:
+            logger.warning("git %s failed: %s", args[1:], stderr)
+        return rc, stdout, stderr
     except Exception as exc:
         return 1, "", str(exc)
 
@@ -554,8 +671,9 @@ def git_show(ref: str, path: str | None = None) -> str:
             safe_path = _assert_safe_path(path)
         except ValueError as exc:
             return f"BLOCKED: {exc}"
-        # Convert to relative path from PROJECT_ROOT for git
-        rel_path = os.path.relpath(safe_path, PROJECT_ROOT).replace("\\", "/")
+        # Convert to relative path from the task's working directory for git
+        working_dir = _task_git_cwd.get() or PROJECT_ROOT
+        rel_path = os.path.relpath(safe_path, working_dir).replace("\\", "/")
         args = ["git", "show", f"{ref}:{rel_path}"]
     else:
         args = ["git", "show", ref, "--stat"]
@@ -599,6 +717,7 @@ def git_checkout(branch: str) -> str:
     """
     allowed = branch.startswith(GIT_SAFETY_BRANCH_PREFIX) or branch in GIT_ALLOWED_BASE_BRANCHES
     if not allowed:
+        logger.warning("Blocked git checkout to disallowed branch: %s", branch)
         return (
             f"ERROR: Checkout of '{branch}' is not permitted. "
             f"Only 'maestro/task-*', 'main', and 'master' branches are allowed."
@@ -725,6 +844,32 @@ def generate_interface_contract(component_name: str, provides: list, consumes: l
             contract["consumes"].append({"name": str(item), "type": "unknown"})
 
     return _json.dumps(contract, indent=2)
+
+
+def record_benchmark(task_id: str, parent_task_id: str, benchmark_type: str, metrics: str) -> str:
+    """
+    Record a before/after profiling benchmark for an optimization sub-task.
+    benchmark_type must be 'before' or 'after'.
+    metrics must be a JSON string: {test_duration_ms, memory_peak_mb, complexity_score, ...}
+    """
+    import json as _json
+    if benchmark_type not in ("before", "after"):
+        return "ERROR: benchmark_type must be 'before' or 'after'."
+    try:
+        metrics_dict = _json.loads(metrics) if isinstance(metrics, str) else metrics
+    except _json.JSONDecodeError as exc:
+        return f"ERROR: metrics must be valid JSON: {exc}"
+    try:
+        db = _import_db()
+        db.create_optimization_benchmark(
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            benchmark_type=benchmark_type,
+            metrics=_json.dumps(metrics_dict),
+        )
+        return f"OK: Benchmark '{benchmark_type}' recorded for task '{task_id}' (parent: '{parent_task_id}')."
+    except Exception as exc:
+        return f"ERROR recording benchmark: {exc}"
 
 
 def spawn_research_agent(question: str, context: str = "") -> str:
@@ -866,6 +1011,59 @@ def _run_shell_review_wrapper(command: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# In-dev allowlisted shell (test/lint runners only)
+# ---------------------------------------------------------------------------
+
+_INDEV_ALLOWLIST_PATTERNS: list[str] = [
+    r"^python\s+-m\s+pytest\b",
+    r"^python\s+-m\s+mypy\b",
+    r"^python\s+-m\s+ruff\b",
+    r"^python\s+-m\s+black\s+--check\b",
+    r"^npm\s+test\b",
+    r"^npm\s+run\s+(?:test|build|lint|typecheck)\b",
+    r"^cargo\s+test\b",
+    r"^go\s+test\b",
+    r"^make\s+(?:test|build|lint)\b",
+]
+_INDEV_ALLOWLIST_RE = [re.compile(p) for p in _INDEV_ALLOWLIST_PATTERNS]
+
+
+def run_shell_indev(command: str) -> str:
+    """Execute an allowlisted development command in the task's project directory.
+
+    Only commands matching _INDEV_ALLOWLIST_PATTERNS are permitted.
+    cwd is resolved from the per-task context (_task_git_cwd).
+    """
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return (
+            "ERROR: No task git working directory configured. "
+            "Call set_task_git_cwd(project_path) before using run_shell_indev."
+        )
+
+    command = command.strip()
+    allowed = any(pat.match(command) for pat in _INDEV_ALLOWLIST_RE)
+    if not allowed:
+        return f"Command not in allowlist: {command}"
+
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=SHELL_TIMEOUT_SECONDS,
+            cwd=cwd,
+        )
+        output = result.stdout + result.stderr
+        return output[:8000] if output else f"EXIT_CODE: {result.returncode}"
+    except subprocess.TimeoutExpired:
+        return f"ERROR: Command timed out after {SHELL_TIMEOUT_SECONDS} seconds."
+    except Exception as exc:
+        return f"ERROR running command: {exc}"
+
+
+# ---------------------------------------------------------------------------
 # Tool registry + schemas
 # ---------------------------------------------------------------------------
 
@@ -896,8 +1094,10 @@ TOOL_REGISTRY: dict[str, Any] = {
     "generate_mermaid_diagram": generate_mermaid_diagram,
     "generate_interface_contract": generate_interface_contract,
     "spawn_research_agent": spawn_research_agent,
+    "record_benchmark": record_benchmark,
     "run_shell_security": _run_shell_security_wrapper,
     "run_shell_review": _run_shell_review_wrapper,
+    "run_shell_indev": run_shell_indev,
 }
 
 TOOL_SCHEMAS: list[dict] = [
@@ -1034,25 +1234,6 @@ TOOL_SCHEMAS: list[dict] = [
                     "reason": {"type": "string", "description": "Human-readable reason for archiving.", "default": ""},
                 },
                 "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_shell",
-            "description": (
-                "Execute a shell command in the project directory. "
-                "Destructive commands (rm -rf, del, format, etc.) are blocked. "
-                "30-second hard timeout."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "Shell command to execute."},
-                    "working_dir": {"type": "string", "description": "Working directory for the command.", "default": "."},
-                },
-                "required": ["command"],
             },
         },
     },
@@ -1331,6 +1512,37 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "record_benchmark",
+            "description": (
+                "Record a before/after profiling benchmark for an optimization sub-task. "
+                "Call with benchmark_type='before' before making changes, and 'after' when done. "
+                "Run actual timed benchmarks using run_shell before recording — do NOT estimate. "
+                "metrics must be a JSON string with the following keys: "
+                "test_duration_ms (float, required) — measured wall time in ms for scale_n items; "
+                "memory_peak_mb (float, required) — peak RSS during benchmark in MB; "
+                "complexity_score (int, required) — subjective 0-100 code complexity estimate; "
+                "big_o_class (str) — Big O of the critical path: O(1), O(log n), O(n), O(n log n), O(n^2), O(n^3), O(2^n), O(n!); "
+                "scale_n (int) — N used in the synthetic benchmark run; "
+                "readability_cost (float) — 0.0 (no cost) to 1.0 (very hard to understand); "
+                "is_premature (bool) — true if optimizing a non-bottleneck; "
+                "tech_debt_resolved (bool) — true if this consolidates or resolves known tech debt; "
+                "notes (str) — qualitative notes (optional)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "The ID of the current optimization sub-task."},
+                    "parent_task_id": {"type": "string", "description": "The ID of the parent optimization task."},
+                    "benchmark_type": {"type": "string", "enum": ["before", "after"], "description": "Whether this is a before or after measurement."},
+                    "metrics": {"type": "string", "description": "JSON string with profiling metrics. Required: test_duration_ms, memory_peak_mb, complexity_score. Recommended: big_o_class, scale_n, readability_cost, is_premature, tech_debt_resolved, notes."},
+                },
+                "required": ["task_id", "parent_task_id", "benchmark_type", "metrics"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_shell_security",
             "description": (
                 "Execute a shell command from the security scanner allowlist. "
@@ -1364,7 +1576,37 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_shell_indev",
+            "description": (
+                "Execute an allowlisted development command in the task's project directory. "
+                "Permitted: python -m pytest, python -m mypy, python -m ruff, "
+                "python -m black --check, npm test, npm run (test|build|lint|typecheck), "
+                "cargo test, go test, make (test|build|lint). "
+                "All other commands are blocked. cwd is the task's project directory."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The command to run (must match allowlist)."},
+                },
+                "required": ["command"],
+            },
+        },
+    },
 ]
+
+
+# ---------------------------------------------------------------------------
+# Tool schema filter helper
+# ---------------------------------------------------------------------------
+
+def build_tool_schemas(allowed_names: list[str]) -> list[dict]:
+    """Return a filtered copy of TOOL_SCHEMAS containing only the named tools."""
+    allowed = set(allowed_names)
+    return [s for s in TOOL_SCHEMAS if s.get("function", {}).get("name") in allowed]
 
 
 # ---------------------------------------------------------------------------
@@ -1380,6 +1622,7 @@ def dispatch_tool(name: str, arguments: dict) -> str:
     if name not in TOOL_REGISTRY:
         return f"ERROR: Unknown tool '{name}'. Available tools: {sorted(TOOL_REGISTRY.keys())}"
     func = TOOL_REGISTRY[name]
+    logger.debug("Tool call: %s args=%s", name, list(arguments.keys()))
     try:
         result = func(**arguments)
         # Ensure the result is always a string
@@ -1388,10 +1631,13 @@ def dispatch_tool(name: str, arguments: dict) -> str:
             result = json.dumps(result, default=str)
         return result
     except TypeError as exc:
+        logger.warning("Tool error [%s]: %s", name, exc)
         return f"ERROR: Bad arguments for tool '{name}': {exc}"
     except ValueError as exc:
+        logger.warning("Tool error [%s]: %s", name, exc)
         return f"ERROR: {exc}"
     except Exception as exc:
+        logger.warning("Tool error [%s]: %s", name, exc)
         return f"ERROR: Unexpected error in tool '{name}': {type(exc).__name__}: {exc}"
 
 

@@ -23,10 +23,13 @@ from app.agent.config import (
     INDEV_COMPONENT_MAX_TURNS,
     INDEV_LLM_TEMPERATURE,
     INDEV_ENFORCE_FILE_CONTAINMENT,
+    INDEV_AGENT_TOOLS,
     PROJECT_ROOT,
 )
 from app.agent.llm_client import call_llm
-from app.agent.tools import dispatch_tool, TOOL_SCHEMAS, _assert_safe_path
+from app.agent.tools import dispatch_tool, TOOL_SCHEMAS, _assert_safe_path, build_tool_schemas
+
+_INDEV_TOOL_SCHEMAS: list[dict] = build_tool_schemas(INDEV_AGENT_TOOLS)
 
 logger = logging.getLogger(__name__)
 
@@ -83,10 +86,10 @@ def _is_testable_component(file_list: list[str]) -> bool:
 
 def _is_test_command(fn_name: str, fn_args: dict) -> bool:
     """Return True if this tool call is running tests."""
-    if fn_name != "run_shell":
-        return False
-    cmd = fn_args.get("command", "").lower()
-    return "pytest" in cmd or "unittest" in cmd
+    if fn_name in ("run_shell_indev", "run_shell_review"):
+        cmd = fn_args.get("command", "").lower()
+        return "pytest" in cmd or "unittest" in cmd
+    return False
 
 
 def _detect_test_outcome(output: str) -> str | None:
@@ -186,7 +189,7 @@ class ComponentLoop:
                     base_url=self.llm_base_url,
                     model=self.llm_model,
                     temperature=INDEV_LLM_TEMPERATURE,
-                    tools=TOOL_SCHEMAS,
+                    tools=_INDEV_TOOL_SCHEMAS,
                     task_id=self.task_id,
                     llm_id=self.llm_id,
                     budget_id=self.budget_id,
@@ -231,7 +234,7 @@ class ComponentLoop:
                             "content": (
                                 "You signaled ACCEPTED but no passing test run was recorded. "
                                 "Please run the tests first:\n\n"
-                                "  run_shell('python -m pytest <relevant test paths> -v')\n\n"
+                                "  run_shell_indev('python -m pytest <relevant test paths> -v')\n\n"
                                 "Then signal ACCEPTED once tests pass."
                             ),
                         })
@@ -302,7 +305,7 @@ class ComponentLoop:
             "RULES:\n"
             "- Only write to files in your assigned manifest\n"
             "- Write tests for your component\n"
-            "- Run tests to verify your implementation\n"
+            "- Run tests to verify your implementation using run_shell_indev('python -m pytest ...')\n"
             "- When done, output: {\"signal\": \"ACCEPTED\"}\n"
             "- If you cannot complete, output: {\"signal\": \"REVERT_TO_DESIGN\"}\n"
             "- Never hard-delete files. Use archive_file() for removal.\n"

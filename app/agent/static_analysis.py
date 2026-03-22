@@ -14,10 +14,13 @@ Requires:
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 import tree_sitter_python as tspython
 from tree_sitter import Language, Parser
@@ -208,6 +211,7 @@ def analyze_file(file_path: str) -> FileAnalysis:
     analysis = FileAnalysis(path=file_path)
 
     if not os.path.isfile(file_path):
+        logger.debug("analyze_file: missing %s", file_path)
         return analysis
 
     if not file_path.endswith(".py"):
@@ -216,12 +220,16 @@ def analyze_file(file_path: str) -> FileAnalysis:
 
     try:
         raw = Path(file_path).read_bytes()
-    except (OSError, PermissionError):
+    except (OSError, PermissionError) as e:
+        logger.warning("analyze_file: OSError reading %s: %s", file_path, e)
         return analysis
 
     parser = _make_parser()
     tree = parser.parse(raw)
     root = tree.root_node
+
+    if root is None or root.child_count == 0:
+        logger.warning("analyze_file: tree-sitter parse produced empty tree for %s", file_path)
 
     # --- classes ---
     for cls_node in _children_by_type(root, "class_definition"):
@@ -586,6 +594,10 @@ def generate_vote(analysis: ProjectAnalysis, task_description: str) -> dict[str,
     if task_description:
         justification_parts.append(f"Task: {task_description[:200]}")
 
+    logger.info(
+        "Static analysis vote: %s (confidence=%d) for task: %s",
+        verdict, confidence, task_description[:80],
+    )
     return {
         "verdict": verdict,
         "confidence": confidence,

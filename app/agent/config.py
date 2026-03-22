@@ -110,6 +110,36 @@ ARCHIVE_DIR: str = os.path.join(
 GIT_SAFETY_BRANCH_PREFIX: str = _get("git", "branch_prefix", None, "maestro/task-")
 GIT_ALLOWED_BASE_BRANCHES: list[str] = _getlist("git", "allowed_base_branches", "main, master")
 
+
+def _resolve_git_root(path: str) -> str | None:
+    """
+    Return the absolute, normalised git repository root that contains *path*,
+    or None if *path* is not inside any git repository.
+
+    Uses ``git rev-parse --show-toplevel`` so it handles submodules, worktrees,
+    and symbolic links correctly — no string-manipulation guessing.
+    """
+    import subprocess as _sp  # local import — config.py has no subprocess dep yet
+    try:
+        result = _sp.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode == 0:
+            return os.path.normcase(os.path.normpath(result.stdout.strip()))
+    except Exception:
+        pass
+    return None
+
+
+# The git root of TheMaestro's own source tree.  Any agent git operation
+# whose working directory resolves to this repo is unconditionally blocked.
+MAESTRO_GIT_ROOT: str | None = _resolve_git_root(PROJECT_ROOT)
+
 # ===========================================================================
 # Agent status values (canonical — not user-tuneable)
 # ===========================================================================
@@ -122,6 +152,7 @@ STATUS_REJECTED: str = "REJECTED"
 
 SIGNAL_REVERT: str = "REVERT_TO_DESIGN"
 SIGNAL_ACCEPTED: str = "ACCEPTED"
+SIGNAL_NEEDS_RESEARCH: str = "NEEDS_RESEARCH"
 
 # ===========================================================================
 # Intake pipeline settings
@@ -216,6 +247,9 @@ CONTEXT_WARNING_THRESHOLDS: list[tuple[float, str]] = _build_context_thresholds(
 
 SCHEDULER_TICK_INTERVAL: float = _getfloat("scheduler", "tick_interval", None, 5.0)
 SCHEDULER_ENABLED: bool = _getbool("scheduler", "enabled", None, True)
+SCHEDULER_DISPATCHABLE_TYPES: list[str] = _getlist(
+    "scheduler", "dispatchable_types", "idea, planning, indev"
+)
 
 # ===========================================================================
 # Verdict confidence ranges
@@ -270,6 +304,18 @@ INDEV_COMPONENT_MAX_RETRIES: int = _getint("indev", "component_max_retries", Non
 INDEV_LLM_TEMPERATURE: float = _getfloat("indev", "llm_temperature", None, 0.2)
 INDEV_ENFORCE_FILE_CONTAINMENT: bool = _getbool("indev", "enforce_file_containment", None, True)
 
+# [indev]
+INDEV_AGENT_TOOLS: list[str] = _getlist(
+    "indev", "agent_tools",
+    "read_file, read_file_lines, count_lines, write_file, append_file, list_directory, "
+    "search_files, find_files, archive_file, "
+    "git_status, git_diff, git_log, git_blame, git_show, "
+    "git_create_branch, git_commit, git_checkout, "
+    "get_task, list_tasks, update_task_status, append_task_history, "
+    "generate_architecture_doc, generate_mermaid_diagram, generate_interface_contract, "
+    "spawn_research_agent, record_benchmark, run_shell_indev, run_shell_security, run_shell_review"
+)
+
 # ===========================================================================
 # Conceptual review
 # ===========================================================================
@@ -278,6 +324,13 @@ CONCEPTUAL_REVIEW_MAX_TURNS: int = _getint("conceptual_review", "reviewer_max_tu
 CONCEPTUAL_REVIEW_LLM_TEMPERATURE: float = _getfloat("conceptual_review", "llm_temperature", None, 0.15)
 CONCEPTUAL_REVIEW_HIGH_SEVERITY_BLOCKS: bool = _getbool("conceptual_review", "high_severity_blocks_advance", None, True)
 CONCEPTUAL_REVIEW_RESEARCH_LIVES: int = _getint("conceptual_review", "research_agent_max_lives", None, 2)
+
+# [conceptual_review]
+CONCEPTUAL_REVIEW_REVIEWER_TOOLS: list[str] = _getlist(
+    "conceptual_review", "reviewer_tools",
+    "read_file, read_file_lines, count_lines, search_files, find_files, list_directory, "
+    "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks"
+)
 
 # ===========================================================================
 # Optimization
@@ -292,6 +345,32 @@ OPTIMIZATION_IMPL_TEMPERATURE: float = _getfloat("optimization", "implementation
 OPTIMIZATION_MIN_IMPROVEMENT_PCT: float = _getfloat("optimization", "min_improvement_pct", None, 2.0)
 OPTIMIZATION_MAX_REGRESSION_PCT: float = _getfloat("optimization", "max_regression_pct", None, 5.0)
 
+# [optimization]
+OPTIMIZATION_MAX_REVIEWER_TURNS: int = _getint("optimization", "reviewer_max_turns", None, 5)
+OPTIMIZATION_REVIEWER_TOOLS: list[str] = _getlist(
+    "optimization", "reviewer_tools",
+    "read_file, read_file_lines, count_lines, search_files, find_files, list_directory, "
+    "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks"
+)
+
+# [optimization_weights]
+# Resource weights — higher value = more precious = improvements here count more
+OPTIMIZATION_COMPUTE_WEIGHT: float = _getfloat("optimization_weights", "compute_weight", None, 1.0)
+OPTIMIZATION_MEMORY_WEIGHT: float = _getfloat("optimization_weights", "memory_weight", None, 0.6)
+OPTIMIZATION_STORAGE_WEIGHT: float = _getfloat("optimization_weights", "storage_weight", None, 0.3)
+
+# Qualitative gates
+OPTIMIZATION_READABILITY_PENALTY_MAX: float = _getfloat("optimization_weights", "readability_penalty_max", None, 0.5)
+OPTIMIZATION_PREMATURE_MULTIPLIER: float = _getfloat("optimization_weights", "premature_multiplier", None, 2.0)
+OPTIMIZATION_TECH_DEBT_BONUS_PCT: float = _getfloat("optimization_weights", "tech_debt_bonus_pct", None, 1.0)
+
+# Big O ranking — lower rank = better complexity class
+BIG_O_RANKING: dict[str, int] = {
+    "O(1)": 1, "O(log n)": 2, "O(n)": 3, "O(n log n)": 4,
+    "O(n^2)": 5, "O(n^3)": 6, "O(2^n)": 7, "O(n!)": 8,
+}
+OPTIMIZATION_BIG_O_BONUS_PCT: float = _getfloat("optimization_weights", "big_o_bonus_pct", None, 10.0)
+
 # ===========================================================================
 # Security review
 # ===========================================================================
@@ -299,6 +378,14 @@ OPTIMIZATION_MAX_REGRESSION_PCT: float = _getfloat("optimization", "max_regressi
 SECURITY_REVIEW_LLM_TEMPERATURE: float = _getfloat("security_review", "llm_temperature", None, 0.1)
 SECURITY_REVIEW_VETO_POWER: bool = _getbool("security_review", "veto_power", None, True)
 SECURITY_REVIEW_RESEARCH_LIVES: int = _getint("security_review", "research_agent_max_lives", None, 2)
+
+# [security_review]
+SECURITY_REVIEW_MAX_REVIEWER_TURNS: int = _getint("security_review", "reviewer_max_turns", None, 8)
+SECURITY_REVIEWER_TOOLS: list[str] = _getlist(
+    "security_review", "reviewer_tools",
+    "read_file, read_file_lines, count_lines, search_files, find_files, list_directory, "
+    "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks, run_shell_security"
+)
 
 # ===========================================================================
 # Full review
@@ -311,6 +398,19 @@ FULL_REVIEW_FRONTEND_PATTERNS: list[str] = _getlist("full_review", "frontend_pat
 )
 FULL_REVIEW_RESEARCH_LIVES: int = _getint("full_review", "research_agent_max_lives", None, 2)
 
+# [full_review]
+FULL_REVIEW_MAX_REVIEWER_TURNS: int = _getint("full_review", "reviewer_max_turns", None, 8)
+FULL_REVIEW_CODE_QUALITY_TOOLS: list[str] = _getlist(
+    "full_review", "code_quality_reviewer_tools",
+    "read_file, read_file_lines, count_lines, search_files, find_files, list_directory, "
+    "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks, run_shell_review"
+)
+FULL_REVIEW_FUNCTIONAL_TOOLS: list[str] = _getlist(
+    "full_review", "functional_reviewer_tools",
+    "read_file, read_file_lines, count_lines, search_files, find_files, list_directory, "
+    "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks"
+)
+
 # ===========================================================================
 # Merge
 # ===========================================================================
@@ -319,6 +419,7 @@ MERGE_TEST_TIMEOUT: int = _getint("merge", "test_timeout", None, 300)
 MERGE_AUTO_PUSH: bool = _getbool("merge", "auto_push", None, True)
 MERGE_TAG_BRANCHES: bool = _getbool("merge", "tag_merged_branches", None, True)
 MERGE_DELETE_BRANCHES: bool = _getbool("merge", "delete_merged_branches", None, False)
+MERGE_PUSH_RETRIES: int = _getint("merge", "push_retries", None, 3)
 
 # ===========================================================================
 # Pipeline stage order and completion detection
@@ -335,6 +436,14 @@ PIPELINE_DONE_STATUSES: frozenset[str] = frozenset(
 )
 
 # ===========================================================================
+# Research jobs (background + inline)
+# ===========================================================================
+
+RESEARCH_JOB_MAX_CONCURRENT: int = _getint("research_jobs", "max_concurrent", None, 3)
+RESEARCH_JOB_TIMEOUT_SECONDS: int = _getint("research_jobs", "timeout_seconds", None, 300)
+RESEARCH_JOB_PRIORITY_DEPTH_PENALTY: float = _getfloat("research_jobs", "depth_penalty", None, 10.0)
+
+# ===========================================================================
 # Tool behaviour limits
 # ===========================================================================
 
@@ -347,3 +456,12 @@ TOOL_LISTING_EXCLUDED_DIRS: set[str] = set(_getlist(
     ".archive, .git, venv, .venv, __pycache__, node_modules, "
     ".mypy_cache, .pytest_cache, .ruff_cache, dist, build, .eggs",
 ))
+
+# ===========================================================================
+# Logging
+# ===========================================================================
+
+LOG_LEVEL: str = _get("logging", "level", "MAESTRO_LOG_LEVEL", "INFO")
+LOG_FILE: str = _get("logging", "log_file", "MAESTRO_LOG_FILE", "")
+LOG_MAX_BYTES: int = _getint("logging", "max_bytes", None, 10 * 1024 * 1024)
+LOG_BACKUP_COUNT: int = _getint("logging", "backup_count", None, 5)

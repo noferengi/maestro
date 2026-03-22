@@ -12,7 +12,7 @@ import sqlite3
 import importlib.util
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -111,7 +111,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         mod.up(conn)
         conn.execute(
             "INSERT INTO schema_migrations (migration_id, applied_at) VALUES (?, ?)",
-            (migration_id, datetime.utcnow().isoformat()),
+            (migration_id, datetime.now(timezone.utc).isoformat()),
         )
         conn.commit()
         print("done")
@@ -228,7 +228,7 @@ def _seed_via_runner(conn: sqlite3.Connection) -> None:
 def _inline_seed(conn: sqlite3.Connection) -> None:
     """Fallback seed — identical data to seed_sample_tasks_raw."""
     import json
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     history = json.dumps([{"status": "created", "timestamp": now}])
 
     tasks = [
