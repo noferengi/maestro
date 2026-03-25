@@ -356,3 +356,110 @@ def test_get_single_research_job_not_found():
     client = TestClient(main.app, raise_server_exceptions=False)
     response = client.get("/api/research-jobs/9999999")
     assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Benchmarks API routes
+# ---------------------------------------------------------------------------
+
+def _delete_benchmark_tasks(*task_ids):
+    """Clean up test tasks and their benchmark records from the shared DB."""
+    try:
+        from database import SessionLocal, Task, OptimizationBenchmark
+    except ImportError:
+        from app.database import SessionLocal, Task, OptimizationBenchmark
+
+    db = SessionLocal()
+    try:
+        for task_id in task_ids:
+            db.query(OptimizationBenchmark).filter(
+                (OptimizationBenchmark.task_id == task_id) |
+                (OptimizationBenchmark.parent_task_id == task_id)
+            ).delete(synchronize_session=False)
+        for task_id in task_ids:
+            db.query(Task).filter(Task.id == task_id).delete(synchronize_session=False)
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_get_benchmarks_for_task_route():
+    """GET /api/tasks/{task_id}/benchmarks returns benchmark records for a known parent task."""
+    import os, sys, json
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from starlette.testclient import TestClient
+    import main
+    from database import SessionLocal, Task, create_optimization_benchmark
+
+    parent_id = "task-api-bm-parent"
+    child_id = "task-api-bm-child"
+    _delete_benchmark_tasks(parent_id, child_id)
+
+    db = SessionLocal()
+    try:
+        db.add(Task(id=parent_id, title="BM Parent", type="optimization", project="TestProj", history=[]))
+        db.add(Task(id=child_id, title="BM Child", type="idea", project="TestProj", history=[]))
+        db.commit()
+    finally:
+        db.close()
+
+    try:
+        metrics_before = json.dumps({"test_duration_ms": 200.0, "memory_peak_mb": 50.0, "complexity_score": 40})
+        metrics_after  = json.dumps({"test_duration_ms": 120.0, "memory_peak_mb": 45.0, "complexity_score": 35, "big_o_class": "O(n)"})
+        create_optimization_benchmark(child_id, parent_id, "before", metrics_before)
+        create_optimization_benchmark(child_id, parent_id, "after",  metrics_after)
+
+        client = TestClient(main.app, raise_server_exceptions=True)
+        response = client.get(f"/api/tasks/{parent_id}/benchmarks")
+        assert response.status_code == 200
+        data = response.json()
+        assert isinstance(data, list)
+        assert len(data) == 2
+        types = {r["benchmark_type"] for r in data}
+        assert types == {"before", "after"}
+        for record in data:
+            assert record["parent_task_id"] == parent_id
+            assert record["task_id"] == child_id
+            assert "metrics" in record
+            assert "created_at" in record
+    finally:
+        _delete_benchmark_tasks(parent_id, child_id)
+
+
+def test_get_benchmarks_empty_for_task_without_records():
+    """GET /api/tasks/{task_id}/benchmarks returns [] when no benchmarks exist."""
+    import os, sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from starlette.testclient import TestClient
+    import main
+    from database import SessionLocal, Task
+
+    task_id = "task-api-bm-empty"
+    _delete_benchmark_tasks(task_id)
+
+    db = SessionLocal()
+    try:
+        db.add(Task(id=task_id, title="BM Empty", type="optimization", project="TestProj", history=[]))
+        db.commit()
+    finally:
+        db.close()
+
+    try:
+        client = TestClient(main.app, raise_server_exceptions=True)
+        response = client.get(f"/api/tasks/{task_id}/benchmarks")
+        assert response.status_code == 200
+        assert response.json() == []
+    finally:
+        _delete_benchmark_tasks(task_id)
+
+
+def test_get_benchmarks_for_missing_task_returns_404():
+    """GET /api/tasks/{task_id}/benchmarks returns 404 for unknown task."""
+    import os, sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from starlette.testclient import TestClient
+    import main
+
+    client = TestClient(main.app, raise_server_exceptions=False)
+    response = client.get("/api/tasks/nonexistent-bm-task-zzz/benchmarks")
+    assert response.status_code == 404

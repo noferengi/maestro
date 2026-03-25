@@ -39,9 +39,12 @@ design blueprints (ARCHITECTURE.md, AGENTS.md).
 Follow this exact sequence for every task:
 
   STEP 1 — ORIENT
+    • The project structure is already provided in your initial context —
+      skip directory listing calls (list_directory(".") etc.).
     • Call get_task(task_id) to load the full task definition.
     • Read ARCHITECTURE.md and the nearest AGENTS.md to understand context.
-    • Read any source files mentioned in the task description.
+    • Use read_file() to inspect file structures, then read_file_harder() for
+      specific source sections you need.
     • Summarise your understanding in a brief internal note (not prose output —
       just a tool call to append_task_history with "ORIENT: <summary>").
 
@@ -53,7 +56,8 @@ Follow this exact sequence for every task:
 
   STEP 3 — IMPLEMENT
     • Execute the plan step by step.
-    • Always read a file before overwriting it (use read_file first).
+    • Always call read_file() to see a file's structure, then read_file_harder()
+      to read the specific sections you need before overwriting.
     • Write one logical change at a time; commit after each coherent unit.
     • Branch naming: git_create_branch("{GIT_SAFETY_BRANCH_PREFIX}<task_id>").
 

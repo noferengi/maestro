@@ -52,6 +52,8 @@ class LLM(Base):
     parallel_sessions = Column(Integer, nullable=False, default=1)
     max_context = Column(Integer, nullable=False, default=4096)
     notes = Column(String, nullable=False, default='')
+    cost_per_million_prompt_tokens = Column(Float, nullable=False, default=0.0)
+    cost_per_million_completion_tokens = Column(Float, nullable=False, default=0.0)
 
     __table_args__ = (
         UniqueConstraint('address', 'port', 'model', name='uq_llm_endpoint'),
@@ -71,6 +73,7 @@ class Budget(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String, nullable=False, unique=True)
+    dollar_amount = Column(Float, nullable=False, default=-1.0)
     settings = Column(JSON, nullable=True)
 
     def __repr__(self):
@@ -338,6 +341,33 @@ class OptimizationBenchmark(Base):
         return f"<OptimizationBenchmark(id={self.id}, task={self.task_id}, type={self.benchmark_type})>"
 
 
+class Expense(Base):
+    """Per-LLM-call cost record in microcents (µ¢ = millionths of a US cent).
+
+    One row per LLM call — 1:1 with budget_entries.
+    3-way identity: budget_id + llm_id + budget_entry_id (remote_call_id for external audit).
+    Token columns are always populated.  Cost columns are 0 when LLM rates = $0.00/M.
+    """
+    __tablename__ = "expenses"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    budget_entry_id = Column(Integer, ForeignKey('budget_entries.id'), nullable=True)
+    budget_id = Column(Integer, ForeignKey('budgets.id'), nullable=True)
+    llm_id = Column(Integer, ForeignKey('llms.id'), nullable=True)
+    remote_call_id = Column(String, nullable=True)          # API response "id" (chatcmpl-xxx)
+    task_id = Column(String, ForeignKey('tasks.id'), nullable=True)
+    prompt_tokens = Column(Integer, nullable=False, default=0)
+    completion_tokens = Column(Integer, nullable=False, default=0)
+    total_tokens = Column(Integer, nullable=False, default=0)   # stored sum for easy aggregation
+    prompt_cost_microcents = Column(Integer, nullable=False, default=0)
+    completion_cost_microcents = Column(Integer, nullable=False, default=0)
+    total_cost_microcents = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<Expense(id={self.id}, budget={self.budget_id}, tokens={self.total_tokens}, total_µ¢={self.total_cost_microcents})>"
+
+
 class Project(Base):
     """
     Project registry — maps a project name to its filesystem root.
@@ -355,6 +385,56 @@ class Project(Base):
 
     def __repr__(self):
         return f"<Project(name='{self.name}', path='{self.path}')>"
+
+
+class FileSummary(Base):
+    """DB-cached natural-language file summary keyed on SHA1 + file size.
+
+    The cache key is (sha1_hash, file_size_bytes) — identical file content
+    at any path will hit the same row.  file_path is informational only.
+    """
+    __tablename__ = "file_summaries"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sha1_hash = Column(String, nullable=False)
+    file_size_bytes = Column(Integer, nullable=False)
+    file_path = Column(String, nullable=False)          # last-known path, not a key
+    summary = Column(Text, nullable=False)
+    static_analysis_json = Column(Text, nullable=True)  # JSON from static_analysis.analyze_file()
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint('sha1_hash', 'file_size_bytes', name='uq_file_summary_sha1_size'),
+    )
+
+    def __repr__(self):
+        return f"<FileSummary(id={self.id}, sha1={self.sha1_hash[:8]}…, path='{self.file_path}')>"
+
+
+class FileSummaryJob(Base):
+    """Background job for scheduler-dispatched file summary LLM calls."""
+    __tablename__ = "file_summary_jobs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sha1_hash = Column(String, nullable=False)
+    file_size_bytes = Column(Integer, nullable=False)
+    file_path = Column(String, nullable=False)
+    file_content = Column(Text, nullable=False)          # capped at 32k chars by enqueue
+    static_analysis_json = Column(Text, nullable=True)
+    status = Column(String, nullable=False, default='pending')
+    priority = Column(Float, nullable=False, default=-1.0)  # negative = above research (0.0)
+    llm_id = Column(Integer, ForeignKey('llms.id'), nullable=True)
+    budget_id = Column(Integer, ForeignKey('budgets.id'), nullable=True)
+    task_id = Column(String, nullable=True)
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    error_message = Column(Text, nullable=True)
+    previous_summary = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+    def __repr__(self):
+        return f"<FileSummaryJob(id={self.id}, sha1={self.sha1_hash[:8]}…, status='{self.status}')>"
 
 
 class Task(Base):
@@ -438,6 +518,179 @@ def init_db_tables():
     """Initialize database tables (internal use)"""
     Base.metadata.create_all(bind=engine)
     logger.info("Database tables initialized at: %s", DATABASE_PATH)
+
+
+# ---------------------------------------------------------------------------
+# FileSummary CRUD
+# ---------------------------------------------------------------------------
+
+def get_file_summary(sha1: str, filesize: int) -> "FileSummary | None":
+    """Return a cached FileSummary row for the given sha1+filesize, or None."""
+    db = SessionLocal()
+    try:
+        return (
+            db.query(FileSummary)
+            .filter(FileSummary.sha1_hash == sha1, FileSummary.file_size_bytes == filesize)
+            .first()
+        )
+    finally:
+        db.close()
+
+
+def create_file_summary(
+    sha1: str,
+    filesize: int,
+    path: str,
+    summary: str,
+    static_analysis_json: "str | None" = None,
+) -> "FileSummary":
+    """Insert a new FileSummary row.  Uses INSERT OR IGNORE semantics via
+    try/except so concurrent agents summarising the same file don't crash.
+    Returns the (possibly pre-existing) row.
+    """
+    db = SessionLocal()
+    try:
+        row = FileSummary(
+            sha1_hash=sha1,
+            file_size_bytes=filesize,
+            file_path=path,
+            summary=summary,
+            static_analysis_json=static_analysis_json,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row
+    except Exception:
+        db.rollback()
+        # Race condition: another agent inserted the same sha1+filesize first.
+        # Return the existing row.
+        existing = (
+            db.query(FileSummary)
+            .filter(FileSummary.sha1_hash == sha1, FileSummary.file_size_bytes == filesize)
+            .first()
+        )
+        return existing
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# FileSummaryJob CRUD
+# ---------------------------------------------------------------------------
+
+def create_file_summary_job(
+    sha1: str,
+    filesize: int,
+    path: str,
+    content: str,
+    *,
+    static_analysis_json: "str | None" = None,
+    llm_id: "int | None" = None,
+    budget_id: "int | None" = None,
+    task_id: "str | None" = None,
+    priority: float = -1.0,
+    previous_summary: "str | None" = None,
+) -> "FileSummaryJob":
+    """Insert a new pending file summary job."""
+    db = SessionLocal()
+    try:
+        job = FileSummaryJob(
+            sha1_hash=sha1,
+            file_size_bytes=filesize,
+            file_path=path,
+            file_content=content,
+            static_analysis_json=static_analysis_json,
+            llm_id=llm_id,
+            budget_id=budget_id,
+            task_id=task_id,
+            priority=priority,
+            previous_summary=previous_summary,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        return job
+    finally:
+        db.close()
+
+
+def get_file_summary_by_path(abs_path: str) -> "FileSummary | None":
+    """Return the most recent cached summary for an absolute file path, or None."""
+    abs_path = os.path.normpath(os.path.abspath(abs_path))
+    db = SessionLocal()
+    try:
+        return (
+            db.query(FileSummary)
+            .filter(FileSummary.file_path == abs_path)
+            .order_by(FileSummary.created_at.desc())
+            .first()
+        )
+    finally:
+        db.close()
+
+
+def get_pending_file_summary_jobs(limit: int = 20) -> "list[FileSummaryJob]":
+    """Return pending file summary jobs ordered by priority ASC, created_at ASC."""
+    db = SessionLocal()
+    try:
+        return (
+            db.query(FileSummaryJob)
+            .filter(FileSummaryJob.status == 'pending')
+            .order_by(FileSummaryJob.priority.asc(), FileSummaryJob.created_at.asc())
+            .limit(limit)
+            .all()
+        )
+    finally:
+        db.close()
+
+
+def get_file_summary_job_by_sha1(sha1: str, filesize: int) -> "FileSummaryJob | None":
+    """Find an existing pending or running job for deduplication."""
+    db = SessionLocal()
+    try:
+        return (
+            db.query(FileSummaryJob)
+            .filter(
+                FileSummaryJob.sha1_hash == sha1,
+                FileSummaryJob.file_size_bytes == filesize,
+                FileSummaryJob.status.in_(['pending', 'running']),
+            )
+            .first()
+        )
+    finally:
+        db.close()
+
+
+def update_file_summary_job(job_id: int, **kwargs) -> None:
+    """Update fields on a file summary job; auto-sets completed_at on terminal status."""
+    db = SessionLocal()
+    try:
+        job = db.query(FileSummaryJob).filter(FileSummaryJob.id == job_id).first()
+        if not job:
+            return
+        for key, value in kwargs.items():
+            setattr(job, key, value)
+        if kwargs.get('status') in ('completed', 'failed') and job.completed_at is None:
+            job.completed_at = datetime.utcnow()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.error("Error updating file_summary_job %d: %s", job_id, exc)
+    finally:
+        db.close()
+
+
+def count_pending_file_summary_jobs() -> int:
+    """Return the number of pending file summary jobs."""
+    db = SessionLocal()
+    try:
+        return db.query(FileSummaryJob).filter(FileSummaryJob.status == 'pending').count()
+    except Exception as exc:
+        logger.error("Error counting pending file summary jobs: %s", exc)
+        return 0
+    finally:
+        db.close()
 
 
 def create_task(title, task_type, description="", owner="user", tags=None, content=None, llm_id=None, budget_id=None, prerequisites=None, project='TheMaestro'):
@@ -829,6 +1082,27 @@ def get_task_history(task_id):
         db.close()
 
 
+def append_task_history(task_id, status, message=None):
+    """Append a single history entry to a task without changing any other fields."""
+    db = SessionLocal()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if not task:
+            return
+        entry = {"status": status, "timestamp": datetime.now().isoformat()}
+        if message:
+            entry["message"] = message
+        history = list(task.history or [])
+        history.append(entry)
+        task.history = history
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error("Error appending task history: %s", e)
+    finally:
+        db.close()
+
+
 def seed_sample_tasks():
     """
     Seed the database with sample tasks ONLY if the database is fresh.
@@ -1078,11 +1352,14 @@ def get_llm(llm_id):
         db.close()
 
 
-def create_llm(address, port, model, settings=None, parallel_sessions=1, max_context=4096, notes=''):
+def create_llm(address, port, model, settings=None, parallel_sessions=1, max_context=4096, notes='',
+               cost_per_million_prompt_tokens=0.0, cost_per_million_completion_tokens=0.0):
     db = SessionLocal()
     try:
         llm = LLM(address=address, port=port, model=model, settings=settings,
-                   parallel_sessions=parallel_sessions, max_context=max_context, notes=notes)
+                   parallel_sessions=parallel_sessions, max_context=max_context, notes=notes,
+                   cost_per_million_prompt_tokens=cost_per_million_prompt_tokens,
+                   cost_per_million_completion_tokens=cost_per_million_completion_tokens)
         db.add(llm)
         db.commit()
         db.refresh(llm)
@@ -1152,10 +1429,10 @@ def get_budget(budget_id):
         db.close()
 
 
-def create_budget(name, settings=None):
+def create_budget(name, dollar_amount=-1.0, settings=None):
     db = SessionLocal()
     try:
-        budget = Budget(name=name, settings=settings)
+        budget = Budget(name=name, dollar_amount=dollar_amount, settings=settings)
         db.add(budget)
         db.commit()
         db.refresh(budget)
@@ -1324,6 +1601,66 @@ def get_budget_entry(entry_id):
         return db.query(BudgetEntry).filter(BudgetEntry.id == entry_id).first()
     finally:
         db.close()
+
+
+# ============================================
+# Expense CRUD
+# ============================================
+
+def create_expense(budget_entry_id, budget_id, llm_id, task_id,
+                   prompt_tokens, completion_tokens,
+                   prompt_cost_microcents, completion_cost_microcents,
+                   remote_call_id=None):
+    db = SessionLocal()
+    try:
+        e = Expense(
+            budget_entry_id=budget_entry_id, budget_id=budget_id,
+            llm_id=llm_id, task_id=task_id,
+            remote_call_id=remote_call_id,
+            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            prompt_cost_microcents=prompt_cost_microcents,
+            completion_cost_microcents=completion_cost_microcents,
+            total_cost_microcents=prompt_cost_microcents + completion_cost_microcents,
+        )
+        db.add(e)
+        db.commit()
+        db.refresh(e)
+        return e
+    except Exception as ex:
+        db.rollback()
+        logger.error("Error creating expense: %s", ex)
+        return None
+    finally:
+        db.close()
+
+
+def get_budget_spent_microcents(budget_id: int) -> int:
+    from sqlalchemy import func
+    db = SessionLocal()
+    try:
+        result = db.query(func.coalesce(func.sum(Expense.total_cost_microcents), 0)) \
+                   .filter(Expense.budget_id == budget_id).scalar()
+        return int(result)
+    finally:
+        db.close()
+
+
+def get_budget_remaining_microcents(budget_id: int):
+    """Returns remaining µ¢, or None if infinite (dollar_amount == -1)."""
+    budget = get_budget(budget_id)
+    if budget is None or budget.dollar_amount == -1:
+        return None
+    limit_microcents = int(budget.dollar_amount * 100 * 1_000_000)
+    spent = get_budget_spent_microcents(budget_id)
+    return max(0, limit_microcents - spent)
+
+
+def budget_has_capacity(budget_id: int, worst_case_microcents: int) -> bool:
+    remaining = get_budget_remaining_microcents(budget_id)
+    if remaining is None:
+        return True
+    return remaining >= worst_case_microcents
 
 
 # ============================================

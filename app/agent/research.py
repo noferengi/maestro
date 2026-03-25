@@ -23,7 +23,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass, field
+from itertools import zip_longest
 from typing import Any
 
 from app.agent.config import (
@@ -31,13 +33,87 @@ from app.agent.config import (
     LLM_MODEL,
     INTAKE_LLM_TEMPERATURE,
     RESEARCH_AGENT_MAX_LIVES,
+    RESEARCH_AGENT_MAX_TURNS_PER_LIFE,
     RESEARCH_AGENT_TOOLS,
+    check_context_saturation,
 )
 from app.agent.json_utils import extract_json_block
 from app.agent.llm_client import call_llm
 from app.agent.tools import TOOL_SCHEMAS, TOOL_REGISTRY, dispatch_tool
+from app.database import get_llm
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Grammar-constrained epilogue — GBNF for llama.cpp
+# ---------------------------------------------------------------------------
+# Key order is fixed (grade → justification → verdict) so the sampler can
+# pre-fill tokens in order.  justification-text excludes double-quotes to
+# keep the grammar simple; truncation to 1024 chars is done in Python.
+# NEEDS_RESEARCH is intentionally allowed here — it means "investigation
+# budget was insufficient" and is tagged so tally_votes() won't re-spawn.
+
+_FORCED_VERDICT_GRAMMAR = r"""
+root             ::= "{" ws grade-kv "," ws justification-kv "," ws verdict-kv ws "}"
+grade-kv         ::= "\"grade\": " grade-int
+grade-int        ::= [0-9]+
+justification-kv ::= "\"justification\": \"" [^"]+ "\""
+verdict-kv       ::= "\"verdict\": \"" verdict "\""
+verdict          ::= "REJECTED" | "NOT_SUITABLE" | "POSSIBLE" | "LIKELY" | "NEEDS_RESEARCH"
+ws               ::= [ \t\n]*
+"""
+
+# grade is an integer 0-10000 representing investigation quality in hundredths
+# of a percent (e.g. 9258 = 92.58%).  confidence = grade // 100 (0-100 int).
+# Valid confidence range per verdict — used to clamp to a valid value so that
+# Vote.__post_init__ validation never raises on epilogue results.
+_VERDICT_CONFIDENCE_RANGES: dict[str, tuple[int, int]] = {
+    "REJECTED":       (0,  50),
+    "NOT_SUITABLE":   (51, 60),
+    "NEEDS_RESEARCH": (61, 75),
+    "POSSIBLE":       (76, 91),
+    "LIKELY":         (92, 100),
+}
+
+
+# ---------------------------------------------------------------------------
+# Post-mortem prompt — injected after turn exhaustion, before the next life
+# ---------------------------------------------------------------------------
+
+_POST_MORTEM_PROMPT = """\
+[SYSTEM] You have exhausted your turns for this investigation life without rendering a verdict.
+Before this life closes, produce a structured handoff summary so the next investigator can
+continue from where you left off. Use this exact format:
+
+WHAT I INVESTIGATED: <tools called, paths explored, questions asked>
+WHAT I FOUND: <concrete facts, file contents, code patterns discovered>
+WHAT I AM SATISFIED WITH: <aspects of the question that are now clear>
+WHAT I AM UNSATISFIED WITH: <aspects still unresolved or uncertain>
+WHAT THE NEXT INVESTIGATOR SHOULD FOCUS ON: <specific follow-up files, functions, or questions>
+
+Write only the summary. Do not render a verdict here.\
+"""
+
+
+def _extract_section(text: str, header: str) -> str:
+    """Extract the content under `header:` up to the next all-caps section header."""
+    if not text:
+        return ""
+    lower_text = text.lower()
+    lower_marker = (header + ":").lower()
+    idx = lower_text.find(lower_marker)
+    if idx == -1:
+        return ""
+    content_start = idx + len(lower_marker)
+    remainder = text[content_start:]
+    lines = remainder.split("\n")
+    result: list[str] = []
+    for line in lines:
+        if re.match(r"^[A-Z][A-Z ]{4,}:", line.strip()):
+            break
+        result.append(line)
+    return "\n".join(result).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +140,7 @@ class LifeResult:
     turns_used: int
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    handoff_summary: str = ""  # Structured post-mortem; empty when agent rendered a verdict
 
 
 @dataclass(slots=True)
@@ -195,7 +272,7 @@ class ResearchAgent:
         self,
         question: str,
         context: dict[str, Any],
-        max_turns_per_life: int = 20,
+        max_turns_per_life: int = RESEARCH_AGENT_MAX_TURNS_PER_LIFE,
         max_lives: int | None = None,
         is_tiebreaker: bool = False,
         llm_base_url: str | None = None,
@@ -203,6 +280,7 @@ class ResearchAgent:
         task_id: str | None = None,
         llm_id: int | None = None,
         budget_id: int | None = None,
+        max_context: int = 0,
     ) -> None:
         self.question = question
         self.context = context
@@ -214,9 +292,11 @@ class ResearchAgent:
         self.task_id = task_id
         self.llm_id = llm_id
         self.budget_id = budget_id
+        self.max_context = max_context
 
         self._restricted_schemas = _build_restricted_schemas()
         self._accumulated_findings: list[str] = []
+        self._accumulated_summaries: list[str] = []  # post-mortem per exhausted life
         self._total_prompt_tokens = 0
         self._total_completion_tokens = 0
 
@@ -236,6 +316,19 @@ class ResearchAgent:
 
             if life_result.findings:
                 self._accumulated_findings.append(f"[Life {life_num}] {life_result.findings}")
+            self._accumulated_summaries.append(life_result.handoff_summary)
+
+            # Context overflow — surface immediately, no point spawning more lives
+            if life_result.vote and life_result.vote.get("verdict") == "TOO_LARGE":
+                logger.info("Research agent TOO_LARGE — task scope exceeds context budget")
+                return ResearchResult(
+                    vote=life_result.vote,
+                    lives_used=life_num,
+                    total_turns=total_turns,
+                    findings="\n\n".join(self._accumulated_findings),
+                    prompt_tokens=self._total_prompt_tokens,
+                    completion_tokens=self._total_completion_tokens,
+                )
 
             # If the agent rendered a confident verdict, return it
             if life_result.vote and life_result.vote.get("verdict") != "NEEDS_RESEARCH":
@@ -252,25 +345,124 @@ class ResearchAgent:
             if life_num < self.max_lives:
                 logger.info("Research agent life %d inconclusive, spawning life %d", life_num, life_num + 1)
 
-        # All lives exhausted — return the last vote or a fallback
-        fallback_vote = {
-            "verdict": "NOT_SUITABLE",
-            "confidence": 55,
-            "justification": (
-                f"Research agent exhausted {self.max_lives} lives without reaching a confident verdict. "
-                f"Accumulated findings: {'; '.join(self._accumulated_findings) or 'none'}"
-            ),
-            "findings": "\n\n".join(self._accumulated_findings),
-        }
+        # All lives exhausted — fire a forced verdict epilogue call
+        logger.info("Research agent all lives exhausted — firing forced verdict epilogue")
+        forced_vote = await self._forced_verdict_call()
 
         return ResearchResult(
-            vote=fallback_vote,
+            vote=forced_vote,
             lives_used=self.max_lives,
             total_turns=total_turns,
             findings="\n\n".join(self._accumulated_findings),
             prompt_tokens=self._total_prompt_tokens,
             completion_tokens=self._total_completion_tokens,
         )
+
+    # ------------------------------------------------------------------
+    # Forced verdict epilogue
+    # ------------------------------------------------------------------
+
+    async def _forced_verdict_call(self) -> dict:
+        """
+        Final call after all lives are exhausted.  Uses grammar-constrained
+        generation (GBNF) to force the LLM to emit a structured verdict JSON
+        with a grade (0-9), justification, and verdict.
+
+        NEEDS_RESEARCH is now allowed — it means "investigation budget was
+        insufficient."  The ``source`` tag prevents tally_votes() from
+        re-spawning a research agent for this vote.
+        """
+        accumulated = "\n\n".join(self._accumulated_findings) or "No findings were recorded."
+        context_snippet = json.dumps(self.context, indent=1)[:2000]
+
+        system_prompt = (
+            "You are a Research Agent. ALL research turns have been exhausted. "
+            "You cannot use any tools. You MUST render a final verdict RIGHT NOW "
+            "based solely on the accumulated findings below.\n\n"
+            "Output ONLY this JSON object — key order MUST be exactly: grade, justification, verdict.\n"
+            '{\n'
+            '  "grade": <integer 0-10000 representing investigation quality in hundredths of a percent, e.g. 9258 = 92.58%>,\n'
+            '  "justification": "<your synthesis of the evidence — no double-quote characters>",\n'
+            '  "verdict": "<REJECTED|NOT_SUITABLE|POSSIBLE|LIKELY|NEEDS_RESEARCH>"\n'
+            '}\n\n'
+            "Use NEEDS_RESEARCH only if the investigation budget was genuinely insufficient "
+            "to reach a conclusion.  Use a lower grade for lower-quality investigations."
+        )
+
+        user_msg = (
+            f"Original question: {self.question}\n\n"
+            f"Context:\n{context_snippet}\n\n"
+            f"Accumulated findings from {self.max_lives} research lives:\n{accumulated}\n\n"
+            "Render your final verdict now."
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_msg},
+        ]
+
+        for use_grammar in (True, False):
+            try:
+                kwargs: dict = dict(
+                    base_url=self.llm_base_url,
+                    model=self.llm_model,
+                    temperature=0.1,
+                    max_tokens=512,
+                    task_id=self.task_id,
+                    llm_id=self.llm_id,
+                    budget_id=self.budget_id,
+                )
+                if use_grammar:
+                    kwargs["grammar"] = _FORCED_VERDICT_GRAMMAR
+                response = await call_llm(messages, **kwargs)
+                usage = response.get("usage", {})
+                self._total_prompt_tokens += usage.get("prompt_tokens", 0)
+                self._total_completion_tokens += usage.get("completion_tokens", 0)
+
+                content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+                raw = extract_json_block(content) or content.strip()
+                parsed = json.loads(raw.strip()) if raw else None
+                if parsed and isinstance(parsed, dict):
+                    # grade: integer 0-10000 (hundredths of a percent, e.g. 9258 = 92.58%)
+                    grade = min(10000, max(0, int(parsed.get("grade", 5000))))
+                    verdict = str(parsed.get("verdict", "NOT_SUITABLE"))
+                    # confidence (0-100) derived from grade; clamped to the valid
+                    # range for the verdict so Vote.__post_init__ never raises.
+                    raw_confidence = grade // 100
+                    lo, hi = _VERDICT_CONFIDENCE_RANGES.get(verdict, (0, 100))
+                    confidence = max(lo, min(hi, raw_confidence))
+                    justification = str(parsed.get("justification", ""))[:1024]
+                    logger.info(
+                        "Forced verdict epilogue: %s (grade=%d [%.2f%%], confidence=%d)"
+                        " [grammar=%s]",
+                        verdict, grade, grade / 100.0, confidence, use_grammar,
+                    )
+                    return {
+                        "verdict": verdict,
+                        "confidence": confidence,
+                        "grade": grade,
+                        "justification": justification,
+                        "findings": "\n\n".join(self._accumulated_findings),
+                        "source": "research_agent_epilogue",
+                    }
+            except Exception as exc:
+                logger.warning(
+                    "Forced verdict epilogue attempt (grammar=%s) failed: %s", use_grammar, exc
+                )
+
+        # Ultimate fallback if the epilogue call itself fails
+        return {
+            "verdict": "NOT_SUITABLE",
+            "confidence": 40,
+            "grade": 4000,   # 40.00% — reflects that lives + epilogue all failed
+            "justification": (
+                f"Research agent exhausted {self.max_lives} lives and the forced-verdict "
+                f"epilogue also failed. Accumulated findings: "
+                f"{'; '.join(self._accumulated_findings) or 'none'}"
+            ),
+            "findings": "\n\n".join(self._accumulated_findings),
+            "source": "research_agent_epilogue",
+        }
 
     # ------------------------------------------------------------------
     # Life execution
@@ -287,6 +479,7 @@ class ResearchAgent:
         turns_used = 0
         life_prompt_tokens = 0
         life_completion_tokens = 0
+        _ctx_warned: set[float] = set()
 
         for turn in range(self.max_turns_per_life):
             turns_used += 1
@@ -295,6 +488,28 @@ class ResearchAgent:
             try:
                 response = await self._call_llm(messages)
             except Exception as exc:
+                exc_str = str(exc)
+                if "400" in exc_str or "Bad Request" in exc_str:
+                    # Context window exceeded — terminate this life immediately.
+                    # Continuing would only make the context larger and guarantee every
+                    # subsequent call also fails.
+                    logger.warning(
+                        "Research agent context overflow (life %d, turn %d) — emitting TOO_LARGE",
+                        life_num, turns_used,
+                    )
+                    return LifeResult(
+                        findings=f"Life {life_num} hit context window limit at turn {turns_used}.",
+                        vote={
+                            "verdict": "TOO_LARGE",
+                            "confidence": 100,
+                            "justification": (
+                                "Context window exceeded — task scope is too large "
+                                "for a single research life."
+                            ),
+                            "findings": f"Context overflowed at turn {turns_used} of life {life_num}.",
+                        },
+                        turns_used=turns_used,
+                    )
                 logger.error("Research agent LLM call failed (life %d, turn %d): %s", life_num, turns_used, exc)
                 messages.append({
                     "role": "user",
@@ -303,7 +518,8 @@ class ResearchAgent:
                 continue
 
             usage = response.get("usage", {})
-            life_prompt_tokens += usage.get("prompt_tokens", 0)
+            prompt_tokens_this_call = usage.get("prompt_tokens", 0)
+            life_prompt_tokens += prompt_tokens_this_call
             life_completion_tokens += usage.get("completion_tokens", 0)
 
             assistant_message = response.get("choices", [{}])[0].get("message", {})
@@ -329,6 +545,16 @@ class ResearchAgent:
                 messages.extend(tool_results)
                 continue
 
+            # Context saturation check — only reached when no verdict and no tool calls
+            if check_context_saturation(
+                prompt_tokens_this_call, self.max_context, _ctx_warned, messages
+            ):
+                logger.warning(
+                    "Research agent context saturation (life %d, turn %d) — terminating life gracefully",
+                    life_num, turns_used,
+                )
+                break  # falls through to _post_mortem_call()
+
             # No tool calls and no verdict — nudge
             if not tool_calls and not vote:
                 remaining = self.max_turns_per_life - turns_used
@@ -349,14 +575,54 @@ class ResearchAgent:
                         ),
                     })
 
-        # Turn cap hit without verdict
+        # Turn cap hit without verdict — fire a post-mortem call to capture a structured
+        # handoff summary for the next life.  Tokens are tracked inside the method.
+        handoff_summary = await self._post_mortem_call(life_num, messages)
         return LifeResult(
             findings=f"Life {life_num} exhausted {self.max_turns_per_life} turns without rendering a verdict.",
             vote=None,
             turns_used=turns_used,
             prompt_tokens=life_prompt_tokens,
             completion_tokens=life_completion_tokens,
+            handoff_summary=handoff_summary,
         )
+
+    # ------------------------------------------------------------------
+    # Post-mortem
+    # ------------------------------------------------------------------
+
+    async def _post_mortem_call(self, life_num: int, messages: list[dict]) -> str:
+        """
+        One extra no-tools LLM call after turn exhaustion.  Asks the agent to
+        produce a structured handoff summary so the next life starts with richer
+        context than "exhausted N turns without a verdict."
+
+        Tokens are accumulated into the agent-level totals.  Returns an empty
+        string on failure — the caller always gets a LifeResult regardless.
+        """
+        post_mortem_messages = list(messages) + [
+            {"role": "user", "content": _POST_MORTEM_PROMPT}
+        ]
+        try:
+            response = await call_llm(
+                post_mortem_messages,
+                base_url=self.llm_base_url,
+                model=self.llm_model,
+                temperature=INTAKE_LLM_TEMPERATURE,
+                max_tokens=1024,
+                task_id=self.task_id,
+                llm_id=self.llm_id,
+                budget_id=self.budget_id,
+            )
+            usage = response.get("usage", {})
+            self._total_prompt_tokens += usage.get("prompt_tokens", 0)
+            self._total_completion_tokens += usage.get("completion_tokens", 0)
+            content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+            logger.debug("Research agent post-mortem (life %d): %s", life_num, content[:200])
+            return content.strip()
+        except Exception as exc:
+            logger.warning("Research agent post-mortem call failed (life %d): %s", life_num, exc)
+            return ""
 
     # ------------------------------------------------------------------
     # Context building
@@ -364,22 +630,38 @@ class ResearchAgent:
 
     def _build_life_context(self, life_num: int) -> str:
         """Build the user message for a given life."""
-        parts = []
-
         if life_num == 1:
-            parts.append(f"## Investigation Question\n{self.question}")
+            try:
+                from app.agent.project_snapshot import build_snapshot_with_summaries
+                snapshot = build_snapshot_with_summaries()
+                parts = [snapshot, f"## Investigation Question\n{self.question}"]
+            except Exception:
+                parts = [f"## Investigation Question\n{self.question}"]
             parts.append(f"\n## Context\n```json\n{json.dumps(self.context, indent=2, default=str)}\n```")
         else:
-            parts.append(f"## Investigation Question (continued — life {life_num}/{self.max_lives})\n{self.question}")
+            parts = [f"## Investigation Question (continued — life {life_num}/{self.max_lives})\n{self.question}"]
             parts.append("\n## Previous Investigation Findings")
-            for finding in self._accumulated_findings:
-                parts.append(finding)
+            for i, (findings, summary) in enumerate(
+                zip_longest(self._accumulated_findings, self._accumulated_summaries, fillvalue=""),
+                1,
+            ):
+                parts.append(f"\n### Life {i} of {self.max_lives}")
+                # Prefer the structured post-mortem summary over the raw findings line
+                parts.append(summary if summary else findings)
+
+            # Surface the last "still unresolved" section as a direct focus hint
+            last_summary = self._accumulated_summaries[-1] if self._accumulated_summaries else ""
+            unresolved = _extract_section(last_summary, "WHAT I AM UNSATISFIED WITH")
+            if unresolved:
+                parts.append(f"\n## Still Unresolved (from previous life)\n{unresolved}")
+
+            is_final = life_num == self.max_lives
             parts.append(
                 "\n## Instructions\n"
                 "Continue investigating based on the findings above. "
-                "Focus on resolving the remaining unknowns. "
+                "Focus on resolving the outstanding questions. "
                 f"This is life {life_num} of {self.max_lives} — "
-                f"{'you must render a verdict this time.' if life_num == self.max_lives else 'investigate further or render your verdict.'}"
+                f"{'you MUST render a verdict this time.' if is_final else 'investigate further or render your verdict.'}"
             )
 
         return "\n\n".join(parts)
@@ -459,7 +741,7 @@ class ResearchAgent:
 async def run_research(
     question: str,
     context: dict[str, Any],
-    max_turns_per_life: int = 20,
+    max_turns_per_life: int = RESEARCH_AGENT_MAX_TURNS_PER_LIFE,
     max_lives: int | None = None,
     llm_base_url: str | None = None,
     llm_model: str | None = None,
@@ -468,6 +750,12 @@ async def run_research(
     budget_id: int | None = None,
 ) -> ResearchResult:
     """Run a research agent and return its result."""
+    _max_context = 0
+    if llm_id is not None:
+        _llm_record = get_llm(llm_id)
+        if _llm_record is not None:
+            _max_context = _llm_record.max_context or 0
+
     agent = ResearchAgent(
         question=question,
         context=context,
@@ -478,6 +766,7 @@ async def run_research(
         task_id=task_id,
         llm_id=llm_id,
         budget_id=budget_id,
+        max_context=_max_context,
     )
     return await agent.run()
 
@@ -485,7 +774,7 @@ async def run_research(
 async def run_tiebreaker(
     task_description: str,
     votes: list[dict],
-    max_turns_per_life: int = 20,
+    max_turns_per_life: int = RESEARCH_AGENT_MAX_TURNS_PER_LIFE,
     max_lives: int | None = None,
     llm_base_url: str | None = None,
     llm_model: str | None = None,
@@ -512,6 +801,12 @@ async def run_tiebreaker(
         "all_votes": votes,
     }
 
+    _max_context = 0
+    if llm_id is not None:
+        _llm_record = get_llm(llm_id)
+        if _llm_record is not None:
+            _max_context = _llm_record.max_context or 0
+
     agent = ResearchAgent(
         question=question,
         context=context,
@@ -523,5 +818,6 @@ async def run_tiebreaker(
         task_id=task_id,
         llm_id=llm_id,
         budget_id=budget_id,
+        max_context=_max_context,
     )
     return await agent.run()

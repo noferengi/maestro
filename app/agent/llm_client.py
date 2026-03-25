@@ -43,6 +43,7 @@ async def call_llm(
     tools: list[dict] | None = None,
     tool_choice: str | None = None,
     response_format: dict | None = None,
+    grammar: str | None = None,      # GBNF grammar string for llama.cpp constrained generation
     # Budget tracking — when provided, the call is logged automatically
     task_id: str | None = None,
     llm_id: int | None = None,
@@ -119,6 +120,8 @@ async def call_llm(
         payload["tool_choice"] = tool_choice
     if response_format is not None:
         payload["response_format"] = response_format
+    if grammar is not None:
+        payload["grammar"] = grammar
 
     url = f"{resolved_url}/chat/completions"
     logger.debug("LLM call -> %s  model=%s", url, resolved_model)
@@ -171,7 +174,7 @@ def _log_budget_entry(
         prompt_json = json.dumps(messages, ensure_ascii=False, default=str)
         response_json = json.dumps(response, ensure_ascii=False, default=str)
 
-        create_budget_entry(
+        entry = create_budget_entry(
             llm_id=llm_id,
             budget_id=budget_id,
             task_id=task_id,
@@ -181,5 +184,23 @@ def _log_budget_entry(
             prompt_data=prompt_json,
             response_data=response_json,
         )
+        if entry and budget_id is not None:
+            from app.database import get_llm, create_expense
+            remote_call_id = response.get("id")     # e.g. "chatcmpl-abc123"
+            pp_rate = 0.0
+            tg_rate = 0.0
+            if llm_id is not None:
+                llm_obj = get_llm(llm_id)
+                if llm_obj is not None:
+                    pp_rate = getattr(llm_obj, 'cost_per_million_prompt_tokens', 0.0) or 0.0
+                    tg_rate = getattr(llm_obj, 'cost_per_million_completion_tokens', 0.0) or 0.0
+            pp_uc = int(prompt_tokens * pp_rate * 100)
+            tg_uc = int(completion_tokens * tg_rate * 100)
+            create_expense(
+                budget_entry_id=entry.id, budget_id=budget_id, llm_id=llm_id,
+                task_id=task_id, remote_call_id=remote_call_id,
+                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                prompt_cost_microcents=pp_uc, completion_cost_microcents=tg_uc,
+            )
     except Exception:
         logger.debug("Failed to log budget entry", exc_info=True)

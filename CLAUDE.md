@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Read `SUMMARY.md` in the project root. It contains recent work and prioritized next steps written by the previous session. After reading it, ask yourself: **what should be done next?** If the user hasn't given a specific instruction, surface the top item from the next-steps list and confirm before proceeding.
 
+## After major accomplishments
+
+Run `/update-full-plan` automatically after completing any significant body of work (feature complete, bug fixed, tests passing), or whenever the user asks. There is an older skill that only updates one file — always use `/update-full-plan`.
+
 ## What this is
 
 Project Maestro — a Kanban board with an agentic LLM orchestration backend. The board is the UI face of a "Wiggum Loop": a Do-While that drives a local LLM through Design → Implement → Test → Verify cycles until all DAG task nodes reach ACCEPTED. Tasks transition IDEA → PLANNING → DEVELOPMENT → REVIEW → COMPLETED, gated by a multi-stage intake pipeline with LLM voting.
@@ -41,6 +45,9 @@ venv/Scripts/python.exe -m pytest app/tests/test_repl.py -k "test_name" -v  # si
 ```
 
 ## Database migrations
+
+Use `/migrate` to check status or apply pending migrations — it wraps the commands below and
+keeps things consistent. Prefer the skill over running the commands manually.
 
 ```bash
 migrate.bat status      # see applied vs pending
@@ -94,6 +101,13 @@ Current schema migrations (1–10):
 - `index.html` — board shell; project tabs, five columns (ARCHITECTURE, PLANNING, DEVELOPMENT, REVIEW, COMPLETED), modals for task create/edit, new project, LLM Endpoints and Budgets management.
 - `kanban.js` — all behaviour. Key globals: `taskData`, `allTasks`, `currentProject`, `allLlms`, `allBudgets`, `transitionCache`, `transitionPollers`. Handles transition status polling, LLM/Budget dropdowns on tasks, drag-and-drop reorder. 5-second auto-refresh.
 - `style.css` — all styles.
+- `diagnostics.html` — standalone three-panel LLM diagnostics page. Loads `diag-*.js` in order.
+- `diag-utils.js` — shared globals + pure helpers (`escapeHtml`, `fmtTokens`, `labelEntry`).
+- `diag-tasks.js` — left panel: task list, search filter.
+- `diag-entries.js` — middle panel: entry timeline, session detection, task summary.
+- `diag-session.js` — turn summary table (`buildSessionSummary()`), entry selection (3 fetch paths), `jumpToEntry()`.
+- `diag-render.js` — right panel: `renderConversation()`, `buildCtxBar()` (context-window usage bar with per-segment hover labels), macOS Dock-style magnification (`_initDockZoom()` IIFE — cosine falloff, 5× peak, 24px radius), message rendering, toggle handlers, `DOMContentLoaded` init.
+- `diagnostics.css` — all diagnostics styles including context bar segments (`.ctx-seg`), Dock zoom (`.dock-zooming`), entry type colours, warning banners.
 
 ### Configuration (`maestro.ini`)
 INI file with sections: `[intake]` (research lives, tiebreaker, LLM temperature, allowed research tools), `[subdivision]` (max_depth, max_retries_per_level, max_total_sub_ideas, llm_temperature, subdivision_agent_tools), `[capacity]` (parallel session limits, context window constraints), `[context_warnings]` (three-tier saturation thresholds at 50%/75%/90%), `[scheduler]` (tick interval, enabled flag), `[verdicts]` (confidence range mappings).
@@ -122,6 +136,30 @@ GET  /api/budgets/{id}/summary            — aggregated budget usage
 GET  /api/tasks/{id}/children            — direct child tasks of a subdivided task
 GET  /api/tasks/{id}/subdivision-records — audit trail of subdivision attempts
 ```
+
+## Working with this user
+
+### Always challenge the prompt
+The user self-describes as weak at prompting. Before executing any non-trivial request, ask:
+- Is the idea completely formed? Are there unstated assumptions?
+- Have edge and corner cases been identified?
+- Is there a Devil's Advocate approach — a different angle that might be more effective?
+- Is there a simpler or more direct solution being overlooked?
+
+Push back when the framing seems incomplete. A better-formed problem produces a better solution.
+
+### Python explanations — frame for a C++ background
+The user is a strong C++ engineer learning Python. When explaining Python concepts, use C++ analogues:
+
+- **`async`/`await`** — Python's cooperative multitasking. Unlike C++ threads (which are OS-scheduled preemptively and share memory across actual CPU cores), Python's `asyncio` runs on a **single OS thread** with a single GIL-held interpreter. `await` is a voluntary yield point — the coroutine suspends itself and returns control to the event loop, which can run another coroutine. Think of it like a cooperative fiber/coroutine scheduler (similar to Boost.Coroutine or C++20 coroutines), not pthreads. No true parallelism for CPU-bound work; it shines for I/O-bound work (HTTP calls, disk) where the bottleneck is waiting, not computing.
+
+- **The GIL** — the Global Interpreter Lock. Only one thread executes Python bytecode at a time, even on a multi-core machine. True CPU parallelism in Python requires `multiprocessing` (separate processes, separate memory spaces — like `fork()`). `asyncio` sidesteps the GIL issue because it's single-threaded by design.
+
+- **Memory model** — Python objects live on the heap, reference-counted (like `shared_ptr` everywhere). There are no stack-allocated value types, no cache-line-aware struct layout, no RAII in the C++ sense. The CPython allocator has its own arena/pool system but you don't control it. Variables are always references (pointers), never values. Assignment copies the pointer, not the object — same as `shared_ptr<T> b = a`.
+
+- **Cache behaviour** — Python makes no guarantees about cache-line layout. Objects are heap-allocated individually with header overhead; a Python list of ints is a list of pointers to boxed int objects, not a contiguous int array. For cache-friendly numeric work, use `numpy` (which wraps contiguous C arrays). Don't reason about L1/L3 locality from Python-level code — the abstraction is too high.
+
+- **`asyncio` event loop** — conceptually the same as an `epoll`/`io_uring` + callback loop in C++. One thread, one loop, coroutines registered as tasks. `await asyncio.gather(a, b, c)` runs three coroutines concurrently on that one thread — they interleave at `await` points, not truly in parallel.
 
 ## Safety rules (for the agent tools)
 

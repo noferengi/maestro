@@ -36,6 +36,7 @@ from app.agent.config import (
     CONCEPTUAL_REVIEW_RESEARCH_LIVES,
     CONCEPTUAL_REVIEW_REVIEWER_TOOLS,
     PROJECT_ROOT,
+    check_context_saturation,
 )
 from app.agent.json_utils import extract_json_block
 from app.agent.llm_client import call_llm
@@ -72,6 +73,7 @@ class ConceptualReviewPipeline:
         llm_model: str | None = None,
         llm_id: int | None = None,
         budget_id: int | None = None,
+        max_context: int = 0,
     ):
         self.task_id = task_id
         self.task_description = task_description
@@ -80,6 +82,7 @@ class ConceptualReviewPipeline:
         self.llm_model = llm_model
         self.llm_id = llm_id
         self.budget_id = budget_id
+        self.max_context = max_context
         self._total_prompt = 0
         self._total_completion = 0
 
@@ -362,6 +365,7 @@ class ConceptualReviewPipeline:
         ]
 
         max_turns = CONCEPTUAL_REVIEW_MAX_TURNS
+        _ctx_warned: set[float] = set()
 
         for turn in range(max_turns):
             response = await call_llm(
@@ -377,8 +381,16 @@ class ConceptualReviewPipeline:
             )
 
             usage = response.get("usage", {})
-            self._total_prompt += usage.get("prompt_tokens", 0)
+            prompt_tokens_this_call = usage.get("prompt_tokens", 0)
+            self._total_prompt += prompt_tokens_this_call
             self._total_completion += usage.get("completion_tokens", 0)
+
+            # Context saturation check
+            if check_context_saturation(
+                prompt_tokens_this_call, self.max_context, _ctx_warned, messages
+            ):
+                logger.warning("[conceptual_review] Reviewer '%s' context saturation (turn %d) — terminating", name, turn + 1)
+                break
 
             assistant_msg = response.get("choices", [{}])[0].get("message", {})
             messages.append(assistant_msg)
@@ -554,6 +566,14 @@ async def run_conceptual_review(
     if project_path is not None:
         from app.agent.tools import set_task_git_cwd
         set_task_git_cwd(project_path)
+
+    _max_context = 0
+    if llm_id is not None:
+        from app.database import get_llm as _get_llm
+        _llm_record = _get_llm(llm_id)
+        if _llm_record is not None:
+            _max_context = _llm_record.max_context or 0
+
     pipeline = ConceptualReviewPipeline(
         task_id=task_id,
         task_description=task_description,
@@ -562,6 +582,7 @@ async def run_conceptual_review(
         llm_model=llm_model,
         llm_id=llm_id,
         budget_id=budget_id,
+        max_context=_max_context,
     )
     result = await pipeline.run()
     return {

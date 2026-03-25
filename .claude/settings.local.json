@@ -1,7 +1,26 @@
 {
   "permissions": {
     "allow": [
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/ -q --tb=no)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_optimization_subtasks.py -v)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/ --durations=20 -q --tb=no)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/ -q)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_research_jobs.py -v)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/ -q --tb=short)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_research_agent_unit.py -q --tb=short)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_planning_unit.py -q)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_research_agent_unit.py app/tests/test_verdicts.py -v)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_research_agent_unit.py -v)",
+      "Bash(curl -s http://localhost:8008/v1/models)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_research_agent_unit.py -v -k \"epilogue\")",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_research_agent_unit.py --collect-only -q)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_project_snapshot.py app/tests/test_read_file_redesign.py -v)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/ -v)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_read_file_redesign.py -v)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_file_summary_enrichment.py -v)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_file_summary_enrichment.py::TestListDirectoryEnrichment::test_symlink_escaping_shown_as_protected app/tests/test_file_summary_enrichment.py::TestPrewarm::test_skips_symlink_escaping -v)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_file_summary_enrichment.py::TestWriteInterception::test_write_file_enqueues_at_high_priority -v)"
     ]
   }
 }

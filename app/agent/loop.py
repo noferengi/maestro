@@ -24,13 +24,13 @@ from app.agent.config import (
     LLM_TEMPERATURE,
     MAX_TURNS,
     MAX_CONSECUTIVE_ERRORS,
+    PROJECT_ROOT,
     SIGNAL_ACCEPTED,
     SIGNAL_REVERT,
     SIGNAL_NEEDS_RESEARCH,
     GIT_SAFETY_BRANCH_PREFIX,
-    CONTEXT_WARNING_ENABLED,
-    CONTEXT_WARNING_THRESHOLDS,
     INDEV_AGENT_TOOLS,
+    check_context_saturation,
 )
 from app.agent.json_utils import extract_json_block
 from app.agent.llm_client import call_llm
@@ -123,7 +123,7 @@ class MaestroLoop:
         self._stop_requested: bool = False
         self._git_branch: str | None = None
         self._files_changed: list[str] = []
-        self._total_tokens: int = 0
+        self._last_prompt_tokens: int = 0
         self._warnings_fired: set[float] = set()
 
     # ------------------------------------------------------------------
@@ -184,6 +184,24 @@ class MaestroLoop:
 
     async def _loop(self) -> LoopResult:
         """Core Do-While iteration."""
+        # Pre-warm file summaries for the project (fire-and-forget)
+        _project_root = getattr(self, 'project_path', None) or PROJECT_ROOT
+        if getattr(self, 'llm_id', None) is not None:
+            try:
+                from app.agent.project_snapshot import prewarm_project_summaries
+                import asyncio as _asyncio
+                await _asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: prewarm_project_summaries(
+                        _project_root,
+                        llm_id=self.llm_id,
+                        budget_id=getattr(self, 'budget_id', None),
+                        task_id=self.task_id,
+                    ),
+                )
+            except Exception as exc:
+                logger.warning("prewarm failed (non-fatal): %s", exc)
+
         # Seed the conversation with the task context
         self._messages = self._build_messages()
 
@@ -213,7 +231,7 @@ class MaestroLoop:
 
             # ── Track token usage & inject context warnings ────────────
             usage = response.get("usage", {})
-            self._total_tokens += usage.get("total_tokens", 0)
+            self._last_prompt_tokens = usage.get("prompt_tokens", 0)
             self._maybe_inject_context_warning()
 
             tool_calls = assistant_message.get("tool_calls") or []
@@ -290,12 +308,21 @@ class MaestroLoop:
         Assemble the initial message list:
           [system_prompt, user_task_brief]
         """
+        try:
+            from app.agent.project_snapshot import build_snapshot_with_summaries
+            snapshot = build_snapshot_with_summaries(
+                project_root=getattr(self, 'project_path', None) or None
+            )
+            snapshot_block = f"\n\n{snapshot}"
+        except Exception:
+            snapshot_block = ""
+
         return [
             {"role": "system", "content": MAESTRO_SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": (
-                    f"Your assigned task ID is: **{self.task_id}**\n\n"
+                    f"Your assigned task ID is: **{self.task_id}**{snapshot_block}\n\n"
                     f"Begin by calling get_task('{self.task_id}') to load the full "
                     f"task definition, then follow the workflow in your system prompt.\n\n"
                     f"Your first action should be to create a safety branch: "
@@ -311,20 +338,16 @@ class MaestroLoop:
 
     def _maybe_inject_context_warning(self) -> None:
         """Inject a warning message if token usage crosses a threshold."""
-        if not CONTEXT_WARNING_ENABLED or not self.max_context:
+        if not self.max_context:
             return
-        ratio = self._total_tokens / self.max_context
-        for threshold, message in CONTEXT_WARNING_THRESHOLDS:
-            if ratio >= threshold and threshold not in self._warnings_fired:
-                self._warnings_fired.add(threshold)
-                logger.info(
-                    "Task '%s': context usage %.0f%% (threshold %.0f%%).",
-                    self.task_id, ratio * 100, threshold * 100,
-                )
-                self._messages.append({
-                    "role": "user",
-                    "content": message,
-                })
+        # terminate_threshold=0 disables hard termination — MaestroLoop uses its own signal system
+        check_context_saturation(
+            self._last_prompt_tokens,
+            self.max_context,
+            self._warnings_fired,
+            self._messages,
+            terminate_threshold=0,
+        )
 
     # ------------------------------------------------------------------
     # LLM call

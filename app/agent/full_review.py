@@ -27,12 +27,12 @@ from app.agent.config import (
     FULL_REVIEW_LLM_TEMPERATURE,
     FULL_REVIEW_AUTO_UX,
     FULL_REVIEW_FRONTEND_PATTERNS,
-    FULL_REVIEW_RESEARCH_LIVES,
     FULL_REVIEW_MAX_REVIEWER_TURNS,
     FULL_REVIEW_CODE_QUALITY_TOOLS,
     FULL_REVIEW_FUNCTIONAL_TOOLS,
     PROJECT_ROOT,
     SHELL_TIMEOUT_SECONDS,
+    check_context_saturation,
 )
 from app.agent.json_utils import extract_json_block
 from app.agent.tools import _task_git_cwd, dispatch_tool, build_tool_schemas
@@ -127,6 +127,7 @@ class FullReviewPipeline:
         llm_id: int | None = None,
         budget_id: int | None = None,
         project_path: str | None = None,
+        max_context: int = 0,
     ):
         self.task_id = task_id
         self.task_description = task_description
@@ -136,6 +137,7 @@ class FullReviewPipeline:
         self.llm_id = llm_id
         self.budget_id = budget_id
         self.project_path = project_path
+        self.max_context = max_context
         self._total_prompt = 0
         self._total_completion = 0
 
@@ -251,6 +253,7 @@ class FullReviewPipeline:
 
         schemas = self._get_reviewer_schemas(reviewer["type"])
         max_turns = FULL_REVIEW_MAX_REVIEWER_TURNS
+        _ctx_warned: set[float] = set()
 
         for turn in range(max_turns):
             response = await call_llm(
@@ -266,8 +269,19 @@ class FullReviewPipeline:
             )
 
             usage = response.get("usage", {})
-            self._total_prompt += usage.get("prompt_tokens", 0)
+            prompt_tokens_this_call = usage.get("prompt_tokens", 0)
+            self._total_prompt += prompt_tokens_this_call
             self._total_completion += usage.get("completion_tokens", 0)
+
+            # Context saturation check
+            if check_context_saturation(
+                prompt_tokens_this_call, self.max_context, _ctx_warned, messages
+            ):
+                logger.warning(
+                    "[full_review] Reviewer '%s' context saturation (turn %d) — terminating",
+                    reviewer["type"], turn + 1,
+                )
+                break
 
             assistant_msg = response.get("choices", [{}])[0].get("message", {})
             messages.append(assistant_msg)
@@ -373,6 +387,14 @@ async def run_full_review_pipeline(
     if project_path is not None:
         from app.agent.tools import set_task_git_cwd
         set_task_git_cwd(project_path)
+
+    _max_context = 0
+    if llm_id is not None:
+        from app.database import get_llm as _get_llm
+        _llm_record = _get_llm(llm_id)
+        if _llm_record is not None:
+            _max_context = _llm_record.max_context or 0
+
     pipeline = FullReviewPipeline(
         task_id=task_id,
         task_description=task_description,
@@ -382,6 +404,7 @@ async def run_full_review_pipeline(
         llm_id=llm_id,
         budget_id=budget_id,
         project_path=project_path,
+        max_context=_max_context,
     )
     result = await pipeline.run()
     return {

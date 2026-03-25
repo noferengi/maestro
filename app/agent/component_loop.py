@@ -25,6 +25,7 @@ from app.agent.config import (
     INDEV_ENFORCE_FILE_CONTAINMENT,
     INDEV_AGENT_TOOLS,
     PROJECT_ROOT,
+    check_context_saturation,
 )
 from app.agent.llm_client import call_llm
 from app.agent.tools import dispatch_tool, TOOL_SCHEMAS, _assert_safe_path, build_tool_schemas
@@ -149,6 +150,7 @@ class ComponentLoop:
         llm_model: str | None = None,
         llm_id: int | None = None,
         budget_id: int | None = None,
+        max_context: int = 0,
     ):
         self.task_id = task_id
         self.component_name = component_name
@@ -159,6 +161,7 @@ class ComponentLoop:
         self.llm_model = llm_model
         self.llm_id = llm_id
         self.budget_id = budget_id
+        self.max_context = max_context
 
         # File write containment
         self.dispatcher = ComponentToolDispatcher(allowed_write_paths)
@@ -181,6 +184,7 @@ class ComponentLoop:
 
         consecutive_errors = 0
         files_changed: set[str] = set()
+        _ctx_warned: set[float] = set()
 
         for turn in range(self.max_turns):
             try:
@@ -210,8 +214,27 @@ class ComponentLoop:
 
             consecutive_errors = 0
             usage = response.get("usage", {})
-            self._total_prompt += usage.get("prompt_tokens", 0)
+            prompt_tokens_this_call = usage.get("prompt_tokens", 0)
+            self._total_prompt += prompt_tokens_this_call
             self._total_completion += usage.get("completion_tokens", 0)
+
+            # Context saturation check
+            if check_context_saturation(
+                prompt_tokens_this_call, self.max_context, _ctx_warned, messages
+            ):
+                logger.warning(
+                    "[component] '%s' context saturation (turn %d) — terminating",
+                    self.component_name, turn + 1,
+                )
+                return ComponentLoopResult(
+                    component_name=self.component_name,
+                    status="REVERT_TO_DESIGN",
+                    turns=turn + 1,
+                    files_changed=sorted(files_changed),
+                    error_detail="Context saturation limit reached — terminating component loop.",
+                    prompt_tokens=self._total_prompt,
+                    completion_tokens=self._total_completion,
+                )
 
             choice = response.get("choices", [{}])[0]
             msg = choice.get("message", {})
@@ -263,7 +286,7 @@ class ComponentLoop:
                 for tc in tool_calls:
                     fn_name = tc["function"]["name"]
                     try:
-                        fn_args = json.loads(tc["function"]["arguments"])
+                        fn_args = tc["function"]["arguments"] if isinstance(tc["function"]["arguments"], dict) else json.loads(tc["function"]["arguments"])
                     except json.JSONDecodeError:
                         fn_args = {}
 

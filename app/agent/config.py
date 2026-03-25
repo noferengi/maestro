@@ -159,11 +159,12 @@ SIGNAL_NEEDS_RESEARCH: str = "NEEDS_RESEARCH"
 # ===========================================================================
 
 RESEARCH_AGENT_MAX_LIVES: int = _getint("intake", "research_agent_max_lives", "MAESTRO_RESEARCH_LIVES", 3)
+RESEARCH_AGENT_MAX_TURNS_PER_LIFE: int = _getint("intake", "research_agent_max_turns", None, 20)
 TIEBREAKER_ENABLED: bool = _getbool("intake", "tiebreaker_enabled", None, True)
 INTAKE_LLM_TEMPERATURE: float = _getfloat("intake", "llm_temperature", "MAESTRO_INTAKE_TEMP", 0.1)
 
 RESEARCH_AGENT_TOOLS: list[str] = _getlist("intake", "research_agent_tools",
-    "read_file, read_file_lines, count_lines, "
+    "read_file, read_file_harder, read_file_lines, count_lines, "
     "search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, "
     "get_task, list_tasks"
@@ -173,6 +174,7 @@ RESEARCH_AGENT_TOOLS: list[str] = _getlist("intake", "research_agent_tools",
 # Subdivision settings
 # ===========================================================================
 
+SUBDIVISION_AGENT_MAX_TURNS: int = _getint("subdivision", "max_turns", None, 50)
 SUBDIVISION_MAX_DEPTH: int = _getint("subdivision", "max_depth", None, 6)
 SUBDIVISION_MAX_RETRIES: int = _getint("subdivision", "max_retries_per_level", None, 4)
 SUBDIVISION_MAX_TOTAL_SUB_IDEAS: int = _getint("subdivision", "max_total_sub_ideas", None, 30)
@@ -181,7 +183,7 @@ SUBDIVISION_CONTEXT_BUDGET_RATIO: float = _getfloat("subdivision", "context_budg
 SUBDIVISION_CONTEXT_AWARE_TOOLS: bool = _getbool("subdivision", "context_aware_tools", None, True)
 
 SUBDIVISION_AGENT_TOOLS: list[str] = _getlist("subdivision", "subdivision_agent_tools",
-    "read_file, read_file_lines, count_lines, "
+    "read_file, read_file_harder, read_file_lines, count_lines, "
     "search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, "
     "get_task, list_tasks"
@@ -241,6 +243,54 @@ def _build_context_thresholds() -> list[tuple[float, str]]:
 
 CONTEXT_WARNING_THRESHOLDS: list[tuple[float, str]] = _build_context_thresholds()
 
+CONTEXT_TERMINATE_THRESHOLD: float = _getfloat(
+    "context_warnings", "terminate_threshold", None, 0.95
+)
+
+
+def check_context_saturation(
+    prompt_tokens: int,
+    max_context: int,
+    warned_set: set,
+    messages: list,
+    *,
+    terminate_threshold: float | None = None,
+) -> bool:
+    """
+    Check per-call context saturation, inject nudge messages, and signal hard termination.
+
+    Args:
+        prompt_tokens:       prompt_tokens from the current LLM response (= full context size)
+        max_context:         LLM max_context in tokens (0 → disabled)
+        warned_set:          mutable set[float]; tracks which thresholds have fired this life/session
+        messages:            conversation list to append nudge messages to
+        terminate_threshold: if saturation >= this, return True (caller should break/terminate).
+                             Defaults to CONTEXT_TERMINATE_THRESHOLD when None.
+
+    Returns True if the caller should terminate immediately.
+    """
+    if not CONTEXT_WARNING_ENABLED or max_context <= 0 or prompt_tokens <= 0:
+        return False
+
+    if terminate_threshold is None:
+        terminate_threshold = CONTEXT_TERMINATE_THRESHOLD
+
+    saturation = prompt_tokens / max_context
+
+    # Hard terminate check — evaluated before nudge injection
+    if terminate_threshold > 0 and saturation >= terminate_threshold:
+        return True
+
+    # Nudge threshold injection — fire each level at most once per life/session
+    for threshold_pct, threshold_msg in CONTEXT_WARNING_THRESHOLDS:
+        if saturation >= threshold_pct and threshold_pct not in warned_set:
+            warned_set.add(threshold_pct)
+            messages.append({"role": "user", "content": threshold_msg})
+            break  # inject at most one nudge per turn
+
+    return False
+
+
 # ===========================================================================
 # Scheduler
 # ===========================================================================
@@ -285,7 +335,7 @@ PLANNING_TEMPERATURE_SPREAD: list[float] = [
 ]
 PLANNING_JUDGE_TEMPERATURE: float = _getfloat("planning", "judge_temperature", None, 0.1)
 PLANNING_MAX_DESIGN_RETRIES: int = _getint("planning", "max_design_retries", None, 3)
-PLANNING_SURVEY_MAX_TURNS: int = _getint("planning", "survey_max_turns", None, 30)
+PLANNING_SURVEY_MAX_TURNS: int = _getint("planning", "survey_max_turns", None, 50)
 PLANNING_LLM_TEMPERATURE: float = _getfloat("planning", "llm_temperature", None, 0.2)
 
 # ===========================================================================
@@ -307,7 +357,7 @@ INDEV_ENFORCE_FILE_CONTAINMENT: bool = _getbool("indev", "enforce_file_containme
 # [indev]
 INDEV_AGENT_TOOLS: list[str] = _getlist(
     "indev", "agent_tools",
-    "read_file, read_file_lines, count_lines, write_file, append_file, list_directory, "
+    "read_file, read_file_harder, read_file_lines, count_lines, write_file, append_file, list_directory, "
     "search_files, find_files, archive_file, "
     "git_status, git_diff, git_log, git_blame, git_show, "
     "git_create_branch, git_commit, git_checkout, "
@@ -323,12 +373,12 @@ INDEV_AGENT_TOOLS: list[str] = _getlist(
 CONCEPTUAL_REVIEW_MAX_TURNS: int = _getint("conceptual_review", "reviewer_max_turns", None, 15)
 CONCEPTUAL_REVIEW_LLM_TEMPERATURE: float = _getfloat("conceptual_review", "llm_temperature", None, 0.15)
 CONCEPTUAL_REVIEW_HIGH_SEVERITY_BLOCKS: bool = _getbool("conceptual_review", "high_severity_blocks_advance", None, True)
-CONCEPTUAL_REVIEW_RESEARCH_LIVES: int = _getint("conceptual_review", "research_agent_max_lives", None, 2)
+CONCEPTUAL_REVIEW_RESEARCH_LIVES: int = _getint("conceptual_review", "research_agent_max_lives", None, 3)
 
 # [conceptual_review]
 CONCEPTUAL_REVIEW_REVIEWER_TOOLS: list[str] = _getlist(
     "conceptual_review", "reviewer_tools",
-    "read_file, read_file_lines, count_lines, search_files, find_files, list_directory, "
+    "read_file, read_file_harder, read_file_lines, count_lines, search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks"
 )
 
@@ -346,10 +396,10 @@ OPTIMIZATION_MIN_IMPROVEMENT_PCT: float = _getfloat("optimization", "min_improve
 OPTIMIZATION_MAX_REGRESSION_PCT: float = _getfloat("optimization", "max_regression_pct", None, 5.0)
 
 # [optimization]
-OPTIMIZATION_MAX_REVIEWER_TURNS: int = _getint("optimization", "reviewer_max_turns", None, 5)
+OPTIMIZATION_MAX_REVIEWER_TURNS: int = _getint("optimization", "reviewer_max_turns", None, 50)
 OPTIMIZATION_REVIEWER_TOOLS: list[str] = _getlist(
     "optimization", "reviewer_tools",
-    "read_file, read_file_lines, count_lines, search_files, find_files, list_directory, "
+    "read_file, read_file_harder, read_file_lines, count_lines, search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks"
 )
 
@@ -380,10 +430,10 @@ SECURITY_REVIEW_VETO_POWER: bool = _getbool("security_review", "veto_power", Non
 SECURITY_REVIEW_RESEARCH_LIVES: int = _getint("security_review", "research_agent_max_lives", None, 2)
 
 # [security_review]
-SECURITY_REVIEW_MAX_REVIEWER_TURNS: int = _getint("security_review", "reviewer_max_turns", None, 8)
+SECURITY_REVIEW_MAX_REVIEWER_TURNS: int = _getint("security_review", "reviewer_max_turns", None, 50)
 SECURITY_REVIEWER_TOOLS: list[str] = _getlist(
     "security_review", "reviewer_tools",
-    "read_file, read_file_lines, count_lines, search_files, find_files, list_directory, "
+    "read_file, read_file_harder, read_file_lines, count_lines, search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks, run_shell_security"
 )
 
@@ -399,15 +449,15 @@ FULL_REVIEW_FRONTEND_PATTERNS: list[str] = _getlist("full_review", "frontend_pat
 FULL_REVIEW_RESEARCH_LIVES: int = _getint("full_review", "research_agent_max_lives", None, 2)
 
 # [full_review]
-FULL_REVIEW_MAX_REVIEWER_TURNS: int = _getint("full_review", "reviewer_max_turns", None, 8)
+FULL_REVIEW_MAX_REVIEWER_TURNS: int = _getint("full_review", "reviewer_max_turns", None, 50)
 FULL_REVIEW_CODE_QUALITY_TOOLS: list[str] = _getlist(
     "full_review", "code_quality_reviewer_tools",
-    "read_file, read_file_lines, count_lines, search_files, find_files, list_directory, "
+    "read_file, read_file_harder, read_file_lines, count_lines, search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks, run_shell_review"
 )
 FULL_REVIEW_FUNCTIONAL_TOOLS: list[str] = _getlist(
     "full_review", "functional_reviewer_tools",
-    "read_file, read_file_lines, count_lines, search_files, find_files, list_directory, "
+    "read_file, read_file_harder, read_file_lines, count_lines, search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks"
 )
 
@@ -450,6 +500,10 @@ RESEARCH_JOB_PRIORITY_DEPTH_PENALTY: float = _getfloat("research_jobs", "depth_p
 TOOL_MAX_SEARCH_RESULTS: int = _getint("tools", "max_search_results", None, 200)
 TOOL_MAX_GIT_LOG_ENTRIES: int = _getint("tools", "max_git_log_entries", None, 100)
 GIT_TIMEOUT_SECONDS: int = _getint("tools", "git_timeout_seconds", None, 30)
+
+SNAPSHOT_MAX_DEPTH: int = _getint("snapshot", "max_depth", None, 3)
+SNAPSHOT_MAX_TOKENS: int = _getint("snapshot", "max_tokens", None, 1500)
+SNAPSHOT_CACHE_TTL: int = _getint("snapshot", "cache_ttl_seconds", None, 300)
 
 TOOL_LISTING_EXCLUDED_DIRS: set[str] = set(_getlist(
     "tools", "excluded_directories",

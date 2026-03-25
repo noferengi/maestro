@@ -40,6 +40,7 @@ from app.agent.config import (
     RESEARCH_JOB_PRIORITY_DEPTH_PENALTY,
     PIPELINE_COLUMN_ORDER,
     PIPELINE_DONE_STATUSES,
+    MAX_TOKENS_PER_TURN,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,55 @@ _active_sessions_lock = threading.Lock()
 # Per-LLM active session count: llm_id -> count
 _llm_session_counts: dict[int, int] = defaultdict(int)
 _llm_counts_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# General-purpose completion registry
+# ---------------------------------------------------------------------------
+# Maps an opaque key (e.g. "file_summary:{sha1}:{size}") to a threading.Event.
+# Agents block on event.wait(); workers call signal_completion() when done.
+
+_pending_completions: dict[str, threading.Event] = {}
+_pending_completions_lock = threading.Lock()
+
+
+def get_or_create_completion_event(key: str) -> "tuple[threading.Event, bool]":
+    """Thread-safe get-or-create for a completion event.
+
+    Returns (event, created) where created=True means this call created it.
+    """
+    with _pending_completions_lock:
+        if key in _pending_completions:
+            return _pending_completions[key], False
+        ev = threading.Event()
+        _pending_completions[key] = ev
+        return ev, True
+
+
+def signal_completion(key: str) -> None:
+    """Signal that a job identified by key has completed (success or failure).
+
+    Removes the event from the registry and calls .set() so all waiters wake up.
+    """
+    with _pending_completions_lock:
+        ev = _pending_completions.pop(key, None)
+    if ev is not None:
+        ev.set()
+
+
+def wait_for_completion(key: str, timeout: float = 120.0) -> bool:
+    """Block until the job identified by key completes or timeout expires.
+
+    Returns True if the job completed (or was already cleaned up from the
+    registry — meaning it finished before we started waiting). Returns False
+    on timeout.
+    """
+    with _pending_completions_lock:
+        ev = _pending_completions.get(key)
+    if ev is None:
+        # Key already removed — job completed before we reached this call.
+        return True
+    return ev.wait(timeout=timeout)
+
 
 # task_id -> timestamp of last failed dispatch (cooldown to avoid retry storms)
 _failed_cooldowns: dict[str, float] = {}
@@ -108,12 +158,18 @@ def get_scheduler_status() -> dict:
         pending_research = count_pending_research_jobs()
     except Exception:
         pending_research = 0
+    try:
+        from app.database import count_pending_file_summary_jobs
+        pending_file_summaries = count_pending_file_summary_jobs()
+    except Exception:
+        pending_file_summaries = 0
     return {
         "running": _scheduler_thread is not None and _scheduler_thread.is_alive(),
         "active_sessions": active,
         "llm_session_counts": llm_counts,
         "tick_interval": SCHEDULER_TICK_INTERVAL,
         "pending_research_jobs": pending_research,
+        "pending_file_summary_jobs": pending_file_summaries,
     }
 
 
@@ -131,6 +187,23 @@ def _scheduler_loop() -> None:
             logger.exception("Scheduler tick failed.")
         _scheduler_stop.wait(timeout=SCHEDULER_TICK_INTERVAL)
     logger.info("Scheduler loop exiting.")
+
+
+def _estimate_worst_case_microcents(llm_id: int | None, budget_id: int | None) -> int:
+    """Upper-bound cost of one full context + one max-token completion, in µ¢."""
+    if llm_id is None or budget_id is None:
+        return 0
+    from app.database import get_llm
+    llm = get_llm(llm_id)
+    if llm is None:
+        return 0
+    pp_rate = getattr(llm, 'cost_per_million_prompt_tokens', 0.0) or 0.0
+    tg_rate = getattr(llm, 'cost_per_million_completion_tokens', 0.0) or 0.0
+    if pp_rate == 0 and tg_rate == 0:
+        return 0
+    worst_pp = int(llm.max_context * pp_rate * 100)
+    worst_tg = int(MAX_TOKENS_PER_TURN * tg_rate * 100)
+    return worst_pp + worst_tg
 
 
 def _compute_dag_depth(task_id: str, by_id: dict) -> int:
@@ -161,6 +234,7 @@ def _compute_priority(task_dict: dict, by_id: dict) -> float:
 def _tick() -> None:
     """
     Single scheduler tick:
+      0. Dispatch file summary jobs (highest priority — agents are blocked waiting).
       1. Clean up finished sessions.
       2. Discover DAG-ready tasks.
       3. Sort by priority (shallow DAG first).
@@ -170,6 +244,9 @@ def _tick() -> None:
     # Lazy imports to avoid circular deps at module load
     from app.agent.dag import DAGResolver
     from app.database import get_all_tasks, get_task, get_llm
+
+    # 0. File summary jobs first — blocked agents are waiting on these
+    _dispatch_file_summary_jobs()
 
     # 1. Cleanup finished sessions
     _cleanup_finished()
@@ -207,6 +284,21 @@ def _tick() -> None:
         # Resolve the LLM for capacity check
         db_task = get_task(task_id)
         if not db_task or not db_task.llm_id:
+            continue
+
+        # Budget pre-flight: skip if worst-case cost exceeds remaining budget
+        from app.database import budget_has_capacity
+        worst = _estimate_worst_case_microcents(db_task.llm_id, db_task.budget_id)
+        if worst > 0 and not budget_has_capacity(db_task.budget_id, worst):
+            logger.info(
+                "[scheduler] Skipping task '%s' — budget %s insufficient (%d µ¢ worst-case).",
+                task_id, db_task.budget_id, worst,
+            )
+            from app.database import append_task_history
+            append_task_history(
+                task_id, "budget_skip",
+                message=f"Budget {db_task.budget_id} insufficient ({worst} µ¢ worst-case needed)",
+            )
             continue
 
         # Resolve project path for git tool isolation
@@ -255,6 +347,92 @@ def _tick() -> None:
 
     # 5. Dispatch pending research jobs
     _dispatch_research_jobs()
+
+
+def _dispatch_file_summary_jobs() -> None:
+    """Dispatch pending file summary jobs — top priority, agents are blocked waiting."""
+    from app.database import get_pending_file_summary_jobs, update_file_summary_job, get_llm
+
+    pending = get_pending_file_summary_jobs(limit=20)
+    for job in pending:
+        if not job.llm_id:
+            continue
+
+        job_key = f"file-summary-{job.id}"
+        with _active_sessions_lock:
+            if job_key in _active_sessions and _active_sessions[job_key].is_alive():
+                continue
+
+        llm = get_llm(job.llm_id)
+        if not llm:
+            continue
+
+        with _llm_counts_lock:
+            current = _llm_session_counts[llm.id]
+            if current >= llm.parallel_sessions:
+                continue
+            _llm_session_counts[llm.id] += 1
+
+        update_file_summary_job(job.id, status='running')
+
+        thread = threading.Thread(
+            target=_run_file_summary_job,
+            args=(job, llm),
+            daemon=True,
+            name=f"maestro-file-summary-{job.id}",
+        )
+        with _active_sessions_lock:
+            _active_sessions[job_key] = thread
+        thread.start()
+
+
+def _run_file_summary_job(job: Any, llm: Any) -> None:
+    """Execute a single file summary job in its own thread + event loop."""
+    from app.database import update_file_summary_job
+    from app.agent.file_summary_agent import execute_file_summary
+
+    completion_key = f"file_summary:{job.sha1_hash}:{job.file_size_bytes}"
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        # Re-read the full file from disk so chunked processing sees complete content.
+        # The stored job.file_content is capped at 32k; fall back to it if file is gone.
+        try:
+            with open(job.file_path, "r", encoding="utf-8", errors="replace") as _fh:
+                full_content = _fh.read()
+        except OSError:
+            full_content = job.file_content
+
+        llm_base_url = f"http://{llm.address}:{llm.port}/v1"
+        result = loop.run_until_complete(execute_file_summary(
+            sha1=job.sha1_hash,
+            filesize=job.file_size_bytes,
+            file_path=job.file_path,
+            file_content=full_content,
+            static_analysis_json=job.static_analysis_json,
+            task_id=job.task_id,
+            llm_id=job.llm_id,
+            budget_id=job.budget_id,
+            llm_base_url=llm_base_url,
+            llm_model=llm.model,
+            previous_summary=getattr(job, 'previous_summary', None),
+        ))
+        update_file_summary_job(
+            job.id,
+            status='completed',
+            prompt_tokens=result.get('prompt_tokens', 0),
+            completion_tokens=result.get('completion_tokens', 0),
+        )
+        logger.debug("file_summary job %d completed (sha1=%s…)", job.id, job.sha1_hash[:8])
+    except Exception:
+        logger.exception("File summary job %d failed.", job.id)
+        update_file_summary_job(job.id, status='failed')
+    finally:
+        loop.close()
+        with _llm_counts_lock:
+            _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
+        # Always signal — even on failure — so waiters never hang
+        signal_completion(completion_key)
 
 
 def _dispatch_research_jobs() -> None:

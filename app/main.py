@@ -28,13 +28,14 @@ from sqlalchemy.orm import Session
 from typing import List
 import asyncio
 import json
+import threading
 from pydantic import BaseModel
 from database import (
     init_db, get_db, create_task, get_task, get_tasks_by_type,
     update_task, delete_task, get_all_tasks, get_task_history, reorder_tasks, seed_sample_tasks,
     get_tasks_by_project,
     Project, get_all_projects, get_project, upsert_project, delete_project,
-    LLM, Budget, BudgetEntry, SubdivisionRecord,
+    Task, LLM, Budget, BudgetEntry, SubdivisionRecord, SessionLocal,
     get_all_llms, get_llm, create_llm, update_llm, delete_llm,
     get_all_budgets, get_budget, create_budget, update_budget, delete_budget,
     TransitionVote, TransitionResult,
@@ -56,6 +57,7 @@ from database import (
     create_full_review_result, get_full_review_results,
     create_merge_record, get_merge_record,
     get_research_jobs_for_task, get_research_job,
+    get_optimization_benchmarks,
 )
 
 from app.agent.config import PIPELINE_COLUMN_ORDER, PIPELINE_DONE_STATUSES
@@ -610,6 +612,81 @@ def _handle_self_healing_rejection(task, result, llm_base_url, llm_model, max_co
     )
 
     logger.info("[intake] Self-healing: re-subdivided '%s' into %d sub-ideas (attempt %d).", parent_task.id, len(child_ids), attempt + 1)
+
+
+def _run_regenerate_subdivision(task_id: str) -> None:
+    """Background runner: re-runs the subdivision agent to produce a new set of children.
+
+    Cancels the current active children, marks their record superseded, runs the
+    agent fresh, and creates a new active subdivision record.  The parent task
+    stays in 'subdividing' throughout.
+    """
+    try:
+        import asyncio
+
+        task = get_task(task_id)
+        if not task:
+            logger.warning("[regen] Task '%s' not found.", task_id)
+            return
+        _setup_thread_context(task)
+
+        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
+
+        # Cancel current non-cancelled children
+        current_children = get_child_tasks(task_id)
+        for child in current_children:
+            if child.type != 'cancelled':
+                update_task(child.id, type='cancelled')
+
+        # Supersede the current active record
+        existing_records = get_subdivision_records(task_id)
+        for r in existing_records:
+            if r.status == 'active':
+                update_subdivision_record(r.id, status='superseded')
+
+        # Keep parent in subdividing state
+        update_task(task_id, type='subdividing')
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            sub_result = _execute_subdivision(
+                task, llm_base_url, llm_model, max_context,
+                scope_vote=None,
+                rejection_context=None,
+                loop=loop,
+            )
+        finally:
+            loop.close()
+
+        if not sub_result.sub_ideas or sub_result.confidence < 50:
+            logger.warning(
+                "[regen] Regeneration for '%s' returned low confidence (%d). Task stays in subdividing.",
+                task_id, sub_result.confidence,
+            )
+            return
+
+        generation = (task.subdivision_generation or 0) + 1
+        child_ids = _create_sub_idea_tasks(task, sub_result, generation)
+
+        contracts_json = None
+        if sub_result.interface_contracts:
+            contracts_json = json.dumps(sub_result.interface_contracts)
+
+        create_subdivision_record(
+            parent_task_id=task_id,
+            child_task_ids=child_ids,
+            generation=generation,
+            attempt_number=len(existing_records) + 1,
+            agent_vote=sub_result.raw_output,
+            prompt_tokens=sub_result.prompt_tokens,
+            completion_tokens=sub_result.completion_tokens,
+            interface_contracts=contracts_json,
+            status='active',
+        )
+        logger.info("[regen] Task '%s' regenerated into %d sub-ideas.", task_id, len(child_ids))
+    except Exception:
+        logger.exception("[regen] Regeneration for '%s' failed.", task_id)
 
 
 def _run_intake_pipeline(task_id: str) -> None:
@@ -1360,6 +1437,61 @@ def get_task_subdivision_records(task_id: str):
     ]
 
 
+@app.post("/api/tasks/{task_id}/regenerate-subdivision", status_code=202)
+def regenerate_subdivision_endpoint(task_id: str, background_tasks: BackgroundTasks):
+    """Queue a new subdivision agent run for a Big Idea task.
+
+    Cancels the current active children, supersedes their record, then re-runs
+    the subdivision agent to produce a fresh set of child ideas.
+    """
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not task.is_big_idea:
+        raise HTTPException(status_code=400, detail="Task is not a Big Idea")
+    if not task.llm_id:
+        raise HTTPException(status_code=422, detail="Task must have an LLM assigned before regenerating")
+    if not task.budget_id:
+        raise HTTPException(status_code=422, detail="Task must have a budget assigned before regenerating")
+    background_tasks.add_task(_run_regenerate_subdivision, task_id)
+    return {"status": "queued"}
+
+
+@app.post("/api/tasks/{task_id}/subdivision-records/{record_id}/activate")
+def activate_subdivision_record_endpoint(task_id: str, record_id: int):
+    """Make a previous subdivision record the active one.
+
+    Cancels children belonging to all OTHER records and un-cancels the
+    children of the selected record (restoring them to 'idea' status).
+    """
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    records = get_subdivision_records(task_id)
+    target = next((r for r in records if r.id == record_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="Subdivision record not found")
+
+    target_ids = set(target.child_task_ids or [])
+    children = get_child_tasks(task_id)
+
+    for child in children:
+        if child.id in target_ids:
+            if child.type == 'cancelled':
+                update_task(child.id, type='idea')
+        else:
+            if child.type != 'cancelled':
+                update_task(child.id, type='cancelled')
+
+    for r in records:
+        new_status = 'active' if r.id == record_id else ('superseded' if r.status == 'active' else r.status)
+        if new_status != r.status:
+            update_subdivision_record(r.id, status=new_status)
+
+    return {"status": "activated", "record_id": record_id}
+
+
 # ============================================
 # Research Jobs API
 # ============================================
@@ -1392,6 +1524,26 @@ def get_task_research_jobs(task_id: str):
         raise HTTPException(status_code=404, detail="Task not found")
     jobs = get_research_jobs_for_task(task_id)
     return [_research_job_to_dict(j) for j in jobs]
+
+
+@app.get("/api/tasks/{task_id}/benchmarks", response_model=List[dict])
+def get_task_benchmarks(task_id: str):
+    """Get all optimization benchmarks for a task (as parent), ordered by created_at."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    records = get_optimization_benchmarks(task_id)
+    return [
+        {
+            "id": r.id,
+            "task_id": r.task_id,
+            "parent_task_id": r.parent_task_id,
+            "benchmark_type": r.benchmark_type,
+            "metrics": r.metrics,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in records
+    ]
 
 
 @app.get("/api/research-jobs/{job_id}", response_model=dict)
@@ -1512,6 +1664,8 @@ def llm_to_dict(llm):
         "parallel_sessions": llm.parallel_sessions,
         "max_context": llm.max_context,
         "notes": llm.notes,
+        "cost_per_million_prompt_tokens": llm.cost_per_million_prompt_tokens,
+        "cost_per_million_completion_tokens": llm.cost_per_million_completion_tokens,
     }
 
 
@@ -1520,8 +1674,54 @@ def budget_to_dict(budget):
     return {
         "id": budget.id,
         "name": budget.name,
+        "dollar_amount": budget.dollar_amount,
         "settings": budget.settings,
     }
+
+
+# ============================================
+# Project prewarm helpers
+# ============================================
+
+def _pick_prewarm_resources() -> "tuple[int | None, int | None]":
+    """Return (llm_id, budget_id) for background file-summary prewarm jobs.
+
+    Prefers an infinite budget (dollar_amount == -1); falls back to the first
+    budget found.  Returns (None, None) if either table is empty.
+    """
+    from app.database import get_all_llms, get_all_budgets
+    llms = get_all_llms()
+    if not llms:
+        return None, None
+    budgets = get_all_budgets()
+    if not budgets:
+        return None, None
+    llm_id = llms[0].id
+    # Prefer infinite budgets so prewarm can never exhaust a capped one.
+    infinite = [b for b in budgets if b.dollar_amount == -1.0]
+    budget_id = (infinite or budgets)[0].id
+    return llm_id, budget_id
+
+
+def _trigger_project_prewarm(project_path: str) -> None:
+    """Fire prewarm_project_summaries in a background daemon thread.
+
+    Silently skips if no LLM or budget is configured — prewarm is best-effort.
+    """
+    llm_id, budget_id = _pick_prewarm_resources()
+    if llm_id is None or budget_id is None:
+        logger.debug("prewarm skipped for '%s' — no LLM/budget configured", project_path)
+        return
+
+    def _run():
+        from app.agent.project_snapshot import prewarm_project_summaries
+        try:
+            n = prewarm_project_summaries(project_path, llm_id=llm_id, budget_id=budget_id)
+            logger.info("prewarm triggered by project update: %d jobs for '%s'", n, project_path)
+        except Exception:
+            logger.exception("prewarm failed for '%s'", project_path)
+
+    threading.Thread(target=_run, daemon=True, name=f"prewarm-{project_path[-32:]}").start()
 
 
 # ============================================
@@ -1553,6 +1753,8 @@ def create_project(data: dict):
     project = upsert_project(name, path=path, description=description)
     if not project:
         raise HTTPException(status_code=500, detail="Failed to create project.")
+    if project.path:
+        _trigger_project_prewarm(project.path)
     return {"name": project.name, "path": project.path or "", "description": project.description or ""}
 
 
@@ -1564,6 +1766,8 @@ def update_project(project_name: str, data: dict):
     project = upsert_project(project_name, path=path, description=description)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or update failed.")
+    if project.path:
+        _trigger_project_prewarm(project.path)
     return {"name": project.name, "path": project.path or "", "description": project.description or ""}
 
 
@@ -1611,6 +1815,8 @@ def create_new_llm(data: dict):
         parallel_sessions=ps,
         max_context=mc,
         notes=data.get('notes', ''),
+        cost_per_million_prompt_tokens=float(data.get('cost_per_million_prompt_tokens', 0.0)),
+        cost_per_million_completion_tokens=float(data.get('cost_per_million_completion_tokens', 0.0)),
     )
     if not llm:
         raise HTTPException(status_code=409, detail="LLM with this address/port/model already exists")
@@ -1619,7 +1825,8 @@ def create_new_llm(data: dict):
 
 @app.put("/api/llms/{llm_id}", response_model=dict)
 def update_existing_llm(llm_id: int, data: dict):
-    allowed = ['address', 'port', 'model', 'settings', 'parallel_sessions', 'max_context', 'notes']
+    allowed = ['address', 'port', 'model', 'settings', 'parallel_sessions', 'max_context', 'notes',
+               'cost_per_million_prompt_tokens', 'cost_per_million_completion_tokens']
     updates = {k: v for k, v in data.items() if k in allowed}
     llm = update_llm(llm_id, **updates)
     if not llm:
@@ -1657,6 +1864,7 @@ def create_new_budget(data: dict):
         raise HTTPException(status_code=400, detail="name is required")
     budget = create_budget(
         name=data['name'],
+        dollar_amount=float(data.get('dollar_amount', -1)),
         settings=data.get('settings'),
     )
     if not budget:
@@ -1666,7 +1874,7 @@ def create_new_budget(data: dict):
 
 @app.put("/api/budgets/{budget_id}", response_model=dict)
 def update_existing_budget(budget_id: int, data: dict):
-    allowed = ['name', 'settings']
+    allowed = ['name', 'dollar_amount', 'settings']
     updates = {k: v for k, v in data.items() if k in allowed}
     budget = update_budget(budget_id, **updates)
     if not budget:
@@ -1679,6 +1887,27 @@ def delete_budget_endpoint(budget_id: int):
     if not delete_budget(budget_id):
         raise HTTPException(status_code=404, detail="Budget not found")
     return True
+
+
+@app.get("/api/budgets/{budget_id}/remaining", response_model=dict)
+def get_budget_remaining(budget_id: int):
+    from app.database import get_budget_spent_microcents, get_budget_remaining_microcents
+    budget = get_budget(budget_id)
+    if not budget:
+        raise HTTPException(status_code=404, detail="Budget not found")
+    spent = get_budget_spent_microcents(budget_id)
+    remaining = get_budget_remaining_microcents(budget_id)
+    limit_uc = None if budget.dollar_amount == -1 else int(budget.dollar_amount * 100 * 1_000_000)
+    return {
+        "budget_id": budget_id,
+        "dollar_amount": budget.dollar_amount,
+        "infinite": budget.dollar_amount == -1,
+        "limit_microcents": limit_uc,
+        "spent_microcents": spent,
+        "remaining_microcents": remaining,
+        "spent_dollars": round(spent / 100_000_000, 6) if spent else 0.0,
+        "remaining_dollars": round(remaining / 100_000_000, 6) if remaining is not None else None,
+    }
 
 
 # ============================================
@@ -1709,8 +1938,8 @@ def list_budget_entries(budget_id: int = None, llm_id: int = None, task_id: str 
 
 @app.get("/api/budget-entries/{entry_id}/full", response_model=dict)
 def read_budget_entry_full(entry_id: int):
-    """Get a single budget entry including full prompt/response payloads."""
-    from database import SessionLocal, BudgetEntry as BE
+    """Get a single budget entry including full prompt/response payloads and expense cost data."""
+    from database import SessionLocal, BudgetEntry as BE, Expense
     db = SessionLocal()
     try:
         entry = db.query(BE).filter(BE.id == entry_id).first()
@@ -1719,6 +1948,12 @@ def read_budget_entry_full(entry_id: int):
         result = budget_entry_to_dict(entry)
         result["prompt_data"] = json.loads(entry.prompt_data) if entry.prompt_data else None
         result["response_data"] = json.loads(entry.response_data) if entry.response_data else None
+        expense = db.query(Expense).filter(Expense.budget_entry_id == entry_id).first()
+        result["expense"] = {
+            "prompt_cost_microcents": expense.prompt_cost_microcents,
+            "completion_cost_microcents": expense.completion_cost_microcents,
+            "total_cost_microcents": expense.total_cost_microcents,
+        } if expense else None
         return result
     finally:
         db.close()
@@ -1734,6 +1969,56 @@ def read_budget_summary(budget_id: int):
     summary["budget_id"] = budget_id
     summary["budget_name"] = budget.name
     return summary
+
+
+# ============================================
+# Diagnostics API Endpoints
+# ============================================
+
+@app.get("/api/diagnostics/tasks", response_model=List[dict])
+def list_diagnostic_tasks():
+    """Tasks that have LLM activity, with aggregated token counts. Ordered by most-recent activity."""
+    from sqlalchemy import func, desc
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(
+                Task.id,
+                Task.title,
+                Task.type,
+                Task.project,
+                func.count(BudgetEntry.id).label("entry_count"),
+                func.coalesce(func.sum(BudgetEntry.prompt_cost), 0).label("total_prompt_tokens"),
+                func.coalesce(func.sum(BudgetEntry.generation_cost), 0).label("total_completion_tokens"),
+                func.coalesce(func.sum(BudgetEntry.tool_calls), 0).label("total_tool_calls"),
+                func.max(BudgetEntry.created_at).label("last_activity"),
+            )
+            .join(BudgetEntry, Task.id == BudgetEntry.task_id)
+            .group_by(Task.id)
+            .order_by(desc("last_activity"))
+            .all()
+        )
+        return [
+            {
+                "id": r.id,
+                "title": r.title,
+                "type": r.type,
+                "project": r.project,
+                "entry_count": r.entry_count,
+                "total_prompt_tokens": r.total_prompt_tokens,
+                "total_completion_tokens": r.total_completion_tokens,
+                "total_tool_calls": r.total_tool_calls,
+                "last_activity": r.last_activity.isoformat() if r.last_activity else None,
+            }
+            for r in rows
+        ]
+    finally:
+        db.close()
+
+
+@app.get("/diagnostics")
+def read_diagnostics():
+    return FileResponse("app/web/diagnostics.html")
 
 
 # ============================================

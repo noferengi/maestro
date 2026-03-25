@@ -53,6 +53,7 @@ class DevOrchestrator:
         llm_model: str | None = None,
         llm_id: int | None = None,
         budget_id: int | None = None,
+        max_context: int = 0,
     ):
         self.task_id = task_id
         self.plan = planning_result
@@ -61,6 +62,7 @@ class DevOrchestrator:
         self.llm_model = llm_model
         self.llm_id = llm_id
         self.budget_id = budget_id
+        self.max_context = max_context
 
     async def run(self) -> DevOrchestratorResult:
         """Execute all batches of components."""
@@ -247,6 +249,7 @@ class DevOrchestrator:
                 llm_model=self.llm_model,
                 llm_id=self.llm_id,
                 budget_id=self.budget_id,
+                max_context=self.max_context,
             )
             result = await loop.run()
 
@@ -314,6 +317,14 @@ async def run_dev_orchestrator(
     if project_path is not None:
         from app.agent.tools import set_task_git_cwd
         set_task_git_cwd(project_path)
+
+    _max_context = 0
+    if llm_id is not None:
+        from app.database import get_llm as _get_llm
+        _llm_record = _get_llm(llm_id)
+        if _llm_record is not None:
+            _max_context = _llm_record.max_context or 0
+
     orch = DevOrchestrator(
         task_id=task_id,
         planning_result=planning_result,
@@ -322,6 +333,7 @@ async def run_dev_orchestrator(
         llm_model=llm_model,
         llm_id=llm_id,
         budget_id=budget_id,
+        max_context=_max_context,
     )
     result = await orch.run()
     return {

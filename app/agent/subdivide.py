@@ -28,11 +28,13 @@ from app.agent.config import (
     LLM_BASE_URL,
     LLM_MODEL,
     PROJECT_ROOT,
+    SUBDIVISION_AGENT_MAX_TURNS,
     SUBDIVISION_LLM_TEMPERATURE,
     SUBDIVISION_AGENT_TOOLS,
     SUBDIVISION_PLANNING_TOOLS,
     SUBDIVISION_CONTEXT_BUDGET_RATIO,
     SUBDIVISION_CONTEXT_AWARE_TOOLS,
+    check_context_saturation,
 )
 from app.agent.llm_client import call_llm
 from app.agent.tools import TOOL_SCHEMAS, async_dispatch_tool, LISTING_EXCLUDED_DIRS
@@ -267,7 +269,7 @@ class SubdivisionAgent:
         scope_vote: dict | None = None,
         rejection_context: dict | None = None,
         max_context: int | None = None,
-        max_turns: int = 25,
+        max_turns: int = SUBDIVISION_AGENT_MAX_TURNS,
         llm_base_url: str | None = None,
         llm_model: str | None = None,
         llm_id: int | None = None,
@@ -304,6 +306,8 @@ class SubdivisionAgent:
             {"role": "user", "content": context},
         ]
 
+        _ctx_warned: set[float] = set()
+
         for turn in range(self.max_turns):
             # Hard budget enforcement
             if self._budget_exceeded:
@@ -323,13 +327,23 @@ class SubdivisionAgent:
                 continue
 
             usage = response.get("usage", {})
-            self._total_prompt_tokens += usage.get("prompt_tokens", 0)
+            prompt_tokens_this_call = usage.get("prompt_tokens", 0)
+            self._total_prompt_tokens += prompt_tokens_this_call
             self._total_completion_tokens += usage.get("completion_tokens", 0)
 
             # Check budget after each call
             total_tokens = self._total_prompt_tokens + self._total_completion_tokens
             if total_tokens >= self.token_budget:
                 self._budget_exceeded = True
+
+            # Context saturation check
+            if check_context_saturation(
+                prompt_tokens_this_call, self.max_context or 0, _ctx_warned, messages
+            ):
+                logger.warning(
+                    "SubdivisionAgent context saturation (turn %d) — terminating", turn + 1
+                )
+                break
 
             assistant_message = response.get("choices", [{}])[0].get("message", {})
             messages.append(assistant_message)
@@ -409,8 +423,13 @@ class SubdivisionAgent:
     # ------------------------------------------------------------------
 
     def _build_context(self) -> str:
-        parts = [
-            f"## Task to Decompose",
+        try:
+            from app.agent.project_snapshot import build_snapshot_with_summaries
+            snapshot = build_snapshot_with_summaries()
+            parts = [snapshot, f"## Task to Decompose"]
+        except Exception:
+            parts = [f"## Task to Decompose"]
+        parts += [
             f"**ID:** {self.parent_task_id}",
             f"**Title:** {self.parent_title}",
             f"**Description:**\n{self.parent_description}",

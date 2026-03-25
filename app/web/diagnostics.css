@@ -1,0 +1,806 @@
+/* ============================================================
+   diagnostics.css — Layout and styles for /diagnostics page
+   ============================================================ */
+
+/* Override body for full-viewport three-panel layout */
+.diag-body {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+    background: #f5f6f8;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    color: #212529;
+    margin: 0;
+    padding: 0;
+}
+
+/* ── Header bar ─────────────────────────────────────────── */
+.diag-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.6rem 1.25rem;
+    background: #212529;
+    color: #fff;
+    flex-shrink: 0;
+    gap: 1rem;
+}
+.diag-header-left {
+    display: flex;
+    align-items: center;
+    gap: 0.85rem;
+}
+.diag-header-right {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+.diag-title {
+    font-size: 1rem;
+    font-weight: 600;
+    color: #fff;
+    margin: 0;
+}
+.diag-back-btn {
+    color: #adb5bd;
+    text-decoration: none;
+    font-size: 0.82rem;
+    padding: 0.25rem 0.55rem;
+    border-radius: 4px;
+    border: 1px solid #495057;
+    transition: all 0.15s;
+    white-space: nowrap;
+}
+.diag-back-btn:hover { background: #343a40; color: #fff; }
+
+.diag-search {
+    width: 200px;
+    background: #343a40;
+    color: #fff;
+    border: 1px solid #495057;
+    border-radius: 4px;
+    padding: 0.3rem 0.6rem;
+    font-size: 0.82rem;
+}
+.diag-search::placeholder { color: #6c757d; }
+.diag-search:focus { outline: none; border-color: #0d6efd; }
+
+.diag-refresh-btn {
+    background: transparent;
+    border: 1px solid #495057;
+    color: #adb5bd;
+    padding: 0.25rem 0.55rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.82rem;
+    transition: all 0.15s;
+}
+.diag-refresh-btn:hover { background: #343a40; color: #fff; }
+
+/* ── Three-column workspace ─────────────────────────────── */
+.diag-workspace {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+}
+
+.diag-panel {
+    display: flex;
+    flex-direction: column;
+    border-right: 1px solid #dee2e6;
+    overflow: hidden;
+    background: #fff;
+}
+.diag-panel:last-child { border-right: none; }
+
+.diag-panel-tasks   { width: 260px; flex-shrink: 0; }
+.diag-panel-entries { width: 300px; flex-shrink: 0; }
+.diag-panel-detail  { flex: 1; min-width: 0; }
+
+.diag-panel-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.45rem 0.75rem;
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #6c757d;
+    background: #f8f9fa;
+    border-bottom: 1px solid #dee2e6;
+    flex-shrink: 0;
+}
+
+.diag-panel-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0.4rem;
+}
+.diag-panel-detail .diag-panel-body { padding: 0; }
+
+.diag-count {
+    background: #e9ecef;
+    color: #495057;
+    font-size: 0.68rem;
+    font-weight: 700;
+    padding: 0.1rem 0.4rem;
+    border-radius: 10px;
+    min-width: 20px;
+    text-align: center;
+}
+
+.diag-empty {
+    color: #6c757d;
+    font-size: 0.82rem;
+    padding: 1.5rem 1rem;
+    text-align: center;
+}
+
+/* ── Task list (left panel) ─────────────────────────────── */
+.diag-task-item {
+    padding: 0.55rem 0.7rem;
+    border-radius: 4px;
+    cursor: pointer;
+    border-left: 3px solid transparent;
+    margin-bottom: 2px;
+    transition: background 0.1s;
+}
+.diag-task-item:hover { background: #f0f4ff; }
+.diag-task-item.active {
+    background: #e7f1ff;
+    border-left-color: #0d6efd;
+}
+.diag-task-title {
+    font-size: 0.82rem;
+    font-weight: 500;
+    color: #212529;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-bottom: 0.2rem;
+}
+.diag-task-meta {
+    font-size: 0.7rem;
+    color: #6c757d;
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+}
+.diag-task-type-badge {
+    font-size: 0.65rem;
+    font-weight: 600;
+    padding: 0.1rem 0.35rem;
+    border-radius: 3px;
+    background: #e9ecef;
+    color: #495057;
+    text-transform: uppercase;
+}
+
+/* ── Session groups (middle panel) ──────────────────────── */
+.diag-session {
+    margin-bottom: 0.6rem;
+}
+.diag-session-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #6c757d;
+    padding: 0.25rem 0.5rem;
+    background: #f8f9fa;
+    border-radius: 3px;
+    margin-bottom: 2px;
+}
+.diag-session-info {
+    font-size: 0.65rem;
+    color: #adb5bd;
+    font-weight: 400;
+    text-transform: none;
+}
+
+.diag-entry-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.4rem;
+    padding: 0.4rem 0.55rem;
+    border-radius: 3px;
+    cursor: pointer;
+    border-left: 3px solid #dee2e6;
+    margin-bottom: 2px;
+    background: #fff;
+    transition: background 0.1s, border-color 0.1s;
+    font-size: 0.78rem;
+}
+.diag-entry-item:hover {
+    background: #f0f4ff;
+    border-left-color: #0d6efd;
+}
+.diag-entry-item.active {
+    background: #e7f1ff;
+    border-left-color: #0d6efd;
+}
+.diag-entry-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    margin-top: 3px;
+}
+.diag-entry-body { flex: 1; min-width: 0; }
+.diag-entry-id {
+    font-weight: 600;
+    color: #495057;
+    font-size: 0.75rem;
+    font-family: 'Courier New', monospace;
+}
+.diag-entry-meta {
+    font-size: 0.68rem;
+    color: #6c757d;
+    display: flex;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+    margin-top: 0.1rem;
+}
+
+/* Entry type color dots */
+.type-surveyor     { background: #0d6efd; }
+.type-designer     { background: #6f42c1; }
+.type-reviewer     { background: #20c997; }
+.type-judge        { background: #fd7e14; }
+.type-research     { background: #ffc107; }
+.type-pitfall      { background: #e83e8c; }
+.type-maestro_loop { background: #198754; }
+.type-unknown      { background: #6c757d; }
+
+/* ── Session turn summary table ──────────────────────────── */
+.diag-turn-table-wrap {
+    padding: 0.5rem 0.75rem 0.25rem;
+    background: #f8f9fa;
+    border-bottom: 1px solid #dee2e6;
+    flex-shrink: 0;
+    overflow-x: auto;
+}
+.diag-turn-anchor-row td {
+    background: #eff6ff;
+    font-weight: 500;
+}
+.diag-turn-anchor-row:hover td {
+    background: #dbeafe;
+}
+
+/* ── Conversation detail (right panel) ──────────────────── */
+.diag-conv-header {
+    padding: 0.6rem 1rem;
+    background: #f8f9fa;
+    border-bottom: 1px solid #dee2e6;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+    font-size: 0.78rem;
+    color: #6c757d;
+    flex-shrink: 0;
+}
+.diag-conv-id {
+    font-family: 'Courier New', monospace;
+    font-weight: 700;
+    color: #212529;
+    font-size: 0.82rem;
+}
+.diag-conv-type-label {
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    padding: 0.15rem 0.4rem;
+    border-radius: 3px;
+    color: #fff;
+}
+.diag-conv-type-label.type-surveyor     { background: #0d6efd; }
+.diag-conv-type-label.type-designer     { background: #6f42c1; }
+.diag-conv-type-label.type-reviewer     { background: #20c997; }
+.diag-conv-type-label.type-judge        { background: #fd7e14; }
+.diag-conv-type-label.type-research     { background: #ffc107; color: #212529; }
+.diag-conv-type-label.type-pitfall      { background: #e83e8c; }
+.diag-conv-type-label.type-maestro_loop { background: #198754; }
+.diag-conv-type-label.type-unknown      { background: #6c757d; }
+
+.col-llm {
+    max-width: 8rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.diag-conv-llm {
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 0.15rem 0.4rem;
+    border-radius: 3px;
+    background: #e0f0ff;
+    color: #0369a1;
+    cursor: default;
+}
+
+.diag-finish-badge {
+    padding: 0.15rem 0.45rem;
+    border-radius: 3px;
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    color: #fff;
+}
+.finish-stop      { background: #198754; }
+.finish-length    { background: #dc3545; }
+.finish-tool_calls { background: #0d6efd; }
+.finish-unknown    { background: #6c757d; }
+
+.diag-messages {
+    padding: 0.5rem 0.75rem;
+}
+
+/* ── Individual messages ─────────────────────────────────── */
+.diag-msg {
+    margin-bottom: 0.6rem;
+    border-radius: 4px;
+    overflow: hidden;
+    border: 1px solid #dee2e6;
+}
+.diag-msg-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.3rem 0.6rem;
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #fff;
+}
+.diag-msg-idx {
+    opacity: 0.75;
+    font-size: 0.63rem;
+}
+.diag-msg-body {
+    padding: 0.35rem 0.6rem;
+    font-size: 0.77rem;
+    line-height: 1.5;
+    white-space: normal;   /* container for blocks — pre-wrap only on .diag-msg-text */
+    background: #fff;
+    color: #212529;
+}
+/* Actual text content (system prompts, user messages, assistant replies) */
+.diag-msg-text {
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.msg-system   .diag-msg-header { background: #495057; }
+.msg-user     .diag-msg-header { background: #0d6efd; }
+.msg-assistant .diag-msg-header { background: #6f42c1; }
+.msg-tool     .diag-msg-header { background: #198754; }
+
+/* Tool result: collapsible body */
+.diag-msg-body.tool-result {
+    max-height: 240px;
+    overflow-y: auto;
+    font-family: 'Courier New', monospace;
+    font-size: 0.72rem;
+    background: #f8f9fa;
+    white-space: pre-wrap;  /* explicit — no longer inherited from .diag-msg-body */
+    word-break: break-word;
+}
+.diag-tool-result-header {
+    cursor: pointer;
+}
+.diag-tool-result-header:hover {
+    filter: brightness(1.12);
+}
+.diag-tool-result-label {
+    flex-shrink: 0;
+}
+.diag-tool-result-hint {
+    font-size: 0.65rem;
+    font-weight: 400;
+    opacity: 0.65;
+    text-transform: none;
+    letter-spacing: 0;
+}
+.diag-tool-result-toggle {
+    font-size: 0.7rem;
+    opacity: 0.8;
+    flex-shrink: 0;
+}
+
+
+/* ── Tool group wrapper ───────────────────────────────────── */
+.diag-tool-group {
+    border: 1px solid #c8e6c9;
+    border-radius: 6px;
+    overflow: hidden;
+    margin-bottom: 0.6rem;
+}
+.diag-tool-group .diag-msg {
+    border: none;
+    border-bottom: 1px solid #e8f5e9;
+    border-radius: 0;
+    margin-bottom: 0;
+}
+.diag-tool-group .diag-msg:last-child {
+    border-bottom: none;
+}
+
+/* ── Tool call blocks ────────────────────────────────────── */
+.diag-tool-call {
+    background: #f0fdf4;
+    border: 1px solid #bbf7d0;
+    border-radius: 4px;
+    margin-bottom: 0.25rem;
+    overflow: hidden;
+    white-space: normal; /* reset inherited pre-wrap — prevents template-literal newlines rendering as blank lines */
+}
+.diag-tool-call-header {
+    padding: 0.18rem 0.5rem;
+    background: #dcfce7;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-family: 'Courier New', monospace;
+}
+.diag-tool-call-label {
+    font-size: 0.6rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #166534;
+    background: #bbf7d0;
+    padding: 0.1rem 0.3rem;
+    border-radius: 3px;
+}
+.diag-tool-call-name-text {
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: #166534;
+}
+.diag-tool-args-label {
+    padding: 0.1rem 0.5rem;
+    font-size: 0.58rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #6c757d;
+    background: #f0fdf4;
+    border-top: 1px solid #bbf7d0;
+}
+.diag-tool-call-id-toggle {
+    font-size: 0.6rem;
+    color: #6c757d;
+    cursor: pointer;
+    margin-left: auto;
+    user-select: none;
+}
+.diag-tool-call-id-toggle:hover { color: #495057; }
+.diag-tool-call-id-value {
+    font-size: 0.63rem;
+    color: #adb5bd;
+    font-family: 'Courier New', monospace;
+}
+.diag-tool-call-args {
+    padding: 0.2rem 0.5rem;
+    font-size: 0.72rem;
+    font-family: 'Courier New', monospace;
+    color: #495057;
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 140px;
+    overflow-y: auto;
+    background: #f8fffe;
+}
+
+/* ── [SYSTEM] warning banners ────────────────────────────── */
+.diag-system-warn {
+    padding: 0.5rem 0.75rem;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    margin-bottom: 0.6rem;
+    font-weight: 500;
+    border-left: 4px solid;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.warn-turns    { background: #fff3cd; color: #664d03; border-color: #ffc107; }
+.warn-critical { background: #f8d7da; color: #842029; border-color: #dc3545; }
+.warn-context  { background: #ffe5d0; color: #7d3b00; border-color: #fd7e14; }
+
+/* ── Reasoning (collapsible) ─────────────────────────────── */
+.diag-reasoning-toggle {
+    font-size: 0.75rem;
+    color: #6c757d;
+    cursor: pointer;
+    padding: 0.3rem 0;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+}
+.diag-reasoning-toggle:hover { color: #495057; }
+.diag-reasoning-body {
+    font-style: italic;
+    color: #6c757d;
+    font-size: 0.78rem;
+    padding: 0.4rem 0.6rem;
+    border-left: 3px solid #dee2e6;
+    margin-top: 0.25rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: #f8f9fa;
+    border-radius: 0 4px 4px 0;
+}
+
+/* ── Turn dividers (session view) ───────────────────────── */
+.diag-turn-divider {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.6rem 0 0.5rem;
+    font-size: 0.65rem;
+    font-weight: 600;
+    color: #adb5bd;
+    letter-spacing: 0.04em;
+}
+.diag-turn-divider::before,
+.diag-turn-divider::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: #dee2e6;
+}
+/* Selected entry divider — blue, more prominent */
+.diag-turn-divider-anchor {
+    color: #0d6efd;
+    font-weight: 700;
+    font-size: 0.7rem;
+    margin: 0.6rem 0 0.4rem;
+}
+.diag-turn-divider-anchor::before,
+.diag-turn-divider-anchor::after {
+    background: #0d6efd;
+    opacity: 0.4;
+    height: 2px;
+}
+.diag-turn-divider-end {
+    color: #6c757d;
+    margin-top: 0.75rem;
+}
+.diag-turn-divider-end::before,
+.diag-turn-divider-end::after {
+    background: #6c757d;
+}
+/* When a ctx bar is present the pseudo-element lines are replaced by the bar itself */
+.diag-turn-divider.has-ctx-bar::before,
+.diag-turn-divider.has-ctx-bar::after { display: none; }
+.diag-divider-label { flex-shrink: 0; }
+
+/* ── Context composition bar ─────────────────────────────── */
+/* FLAT flexbox: every segment is a direct child of .ctx-bar.
+   flex-grow = token count → browser distributes proportionally.
+   The bar represents the FULL max_context window; unused capacity
+   is a transparent free-space segment on the right. */
+.ctx-bar {
+    flex: 1;
+    display: flex;
+    align-items: flex-end;
+    height: 32px;
+    background: #1a1d20;
+    border-radius: 3px;
+    overflow: hidden;
+}
+/* When dock-zoom is active, allow scaled segments to pop above the bar */
+.ctx-bar.dock-zooming {
+    overflow: visible;
+    z-index: 10;
+}
+/* All segments share flex-basis:0 so ALL width is flex-grow-driven. */
+.ctx-seg {
+    height: 100%;
+    flex-basis: 0;
+    border-radius: 0;           /* square corners — outline matches element shape exactly */
+    outline: 1px solid rgba(0,0,0,0.55);
+    outline-offset: -1px;       /* inset so it doesn't bleed into neighbours */
+    position: relative;
+    transform-origin: center;   /* symmetric vertical growth — equal up/down */
+    transition: transform 0.08s ease-out;
+    will-change: transform;
+}
+/* Hover: yellow border pop — tooltip is JS-driven (#ctx-tooltip) */
+.ctx-seg:not(.ctx-seg-free):hover {
+    box-shadow: 0 0 0 2px #ffc107;
+    z-index: 5;
+    cursor: pointer;
+}
+
+/* ── JS hover tooltip for context-bar segments ── */
+#ctx-tooltip {
+    position: fixed;
+    display: none;
+    z-index: 9999;
+    pointer-events: none;
+    background: #191c20;
+    border: 1px solid #ffc107;
+    border-radius: 4px;
+    padding: 5px 10px;
+    font: 500 0.93rem / 1.6 'Consolas', 'Monaco', 'Courier New', monospace;
+    color: #f0f0f0;
+    white-space: nowrap;
+}
+.ctx-tip-agent {
+    display: inline-block;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-weight: 700;
+    text-transform: uppercase;
+    font-size: 0.9rem;
+    letter-spacing: 0.04em;
+    margin-right: 6px;
+}
+.ctx-tip-stats {
+    color: #8a9bb0;
+    font-size: 0.9rem;
+}
+.ctx-tip-tool {
+    color: #c8d4e0;
+    margin-top: 2px;
+    font-size: 0.93rem;
+}
+.ctx-tip-arg {
+    padding-left: 1.2em;
+    color: #8a9bb0;
+}
+/* No gap between turns — segments are flush */
+.ctx-seg-gap { margin-left: 0; }
+/* Past turns */
+.ctx-seg-base { background: #5a6370; }       /* gray   — initial system / task context */
+.ctx-seg-asst { background: #5c35a3; }       /* purple — assistant generation tokens   */
+.ctx-seg-tool { background: #1a8066; }       /* teal   — tool results / external input */
+/* Current turn — vivid versions */
+.ctx-seg-current.ctx-seg-base { background: #8b95a3; }
+.ctx-seg-current.ctx-seg-asst { background: #a87df5; }
+.ctx-seg-current.ctx-seg-tool { background: #2dd4a8; }
+/* Free space — remaining context capacity */
+.ctx-seg-free {
+    background: #ffffff;
+    box-shadow: none;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    padding-right: 0.4rem;
+    overflow: hidden;
+}
+.ctx-free-label {
+    font-size: 0.55rem;
+    font-weight: 500;
+    color: #3d4450;
+    white-space: nowrap;
+    letter-spacing: 0.02em;
+}
+/* Summary label to the right of bar */
+.ctx-bar-label {
+    flex-shrink: 0;
+    font-size: 0.65rem;
+    font-weight: 700;
+    white-space: nowrap;
+}
+.ctx-bar-delta { font-weight: 400; color: #ffc107; }
+
+/* ── Highlighted messages (current turn) ─────────────────── */
+.msg-highlighted {
+    box-shadow: 0 0 0 2px #0d6efd44;
+}
+.msg-highlighted .diag-msg-header {
+    position: relative;
+}
+.msg-highlighted .diag-msg-header::after {
+    content: '● THIS TURN';
+    position: absolute;
+    right: 0.5rem;
+    font-size: 0.6rem;
+    opacity: 0.7;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+}
+.msg-highlighted .diag-msg-body {
+    background: #f0f7ff;
+}
+
+/* ── Task summary panel ──────────────────────────────────── */
+.diag-summary-head {
+    padding: 0.65rem 1rem;
+    background: #f8f9fa;
+    border-bottom: 1px solid #dee2e6;
+    flex-shrink: 0;
+}
+.diag-summary-title {
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: #212529;
+    margin-bottom: 0.3rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.diag-summary-meta {
+    display: flex;
+    gap: 0.6rem;
+    align-items: center;
+    font-size: 0.72rem;
+    color: #6c757d;
+    flex-wrap: wrap;
+}
+.diag-summary-scroll {
+    overflow-y: auto;
+    padding: 0.75rem 1rem;
+    flex: 1;
+}
+.diag-summary-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+}
+.diag-summary-table th {
+    text-align: left;
+    padding: 0.25rem 0.5rem;
+    font-size: 0.63rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #6c757d;
+    border-bottom: 2px solid #dee2e6;
+    white-space: nowrap;
+}
+.diag-summary-table th.col-r,
+.diag-summary-table td.col-r { text-align: right; }
+.diag-summary-table td {
+    padding: 0.3rem 0.5rem;
+    border-bottom: 1px solid #f0f0f0;
+    color: #343a40;
+    white-space: nowrap;
+}
+.diag-summary-row { cursor: pointer; transition: background 0.1s; }
+.diag-summary-row:hover { background: #f0f4ff; }
+.diag-summary-row:hover td { border-bottom-color: #e0e8ff; }
+.col-bold { font-weight: 600; color: #212529; }
+.col-dim  { font-size: 0.7rem; color: #6c757d; }
+.ctx-caution  { color: #ffc107; }
+.ctx-warn     { color: #fd7e14; }
+.ctx-critical { color: #dc3545; font-weight: 700; }
+.diag-summary-totals td {
+    border-top: 2px solid #dee2e6;
+    border-bottom: none;
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #495057;
+    padding-top: 0.4rem;
+}
+
+/* ── Loading / Error states ──────────────────────────────── */
+.diag-loading {
+    color: #6c757d;
+    font-size: 0.82rem;
+    padding: 1rem;
+    text-align: center;
+}
+.diag-error {
+    color: #842029;
+    background: #f8d7da;
+    border-radius: 4px;
+    padding: 0.6rem 0.75rem;
+    font-size: 0.82rem;
+    margin: 0.5rem;
+}

@@ -56,6 +56,136 @@ _task_git_cwd: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "_task_git_cwd", default=None
 )
 
+# ---------------------------------------------------------------------------
+# Per-task file read-range tracking
+# ---------------------------------------------------------------------------
+# Maps normalised abs-path → sorted, merged list of (start, end) inclusive
+# line intervals already delivered to the LLM in this session.
+# A path being present (even with an empty interval list) means read_file()
+# has been called on it at least once.
+#
+# Maximum lines served per call — shared by both read_file and read_file_harder.
+_READ_FILE_MAX_LINES = 250
+
+_prepped_files: contextvars.ContextVar[dict[str, list[tuple[int, int]]] | None] = (
+    contextvars.ContextVar("_prepped_files", default=None)
+)
+
+
+def _get_prepped_files() -> dict[str, list[tuple[int, int]]]:
+    d = _prepped_files.get()
+    if d is None:
+        d = {}
+        _prepped_files.set(d)
+    return d
+
+
+def _mark_file_prepped(path: str) -> None:
+    """Register a file as having had read_file() called (no source lines served yet)."""
+    norm = os.path.normpath(os.path.realpath(path))
+    _get_prepped_files().setdefault(norm, [])
+
+
+def _is_file_prepped(path: str) -> bool:
+    return os.path.normpath(os.path.realpath(path)) in _get_prepped_files()
+
+
+def _record_served_range(norm_path: str, start: int, end: int) -> None:
+    """Record that lines start..end (inclusive, 1-indexed) have been delivered."""
+    intervals = _get_prepped_files().setdefault(norm_path, [])
+    intervals.append((start, end))
+    intervals.sort()
+    merged: list[tuple[int, int]] = [intervals[0]]
+    for s, e in intervals[1:]:
+        if s <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    _get_prepped_files()[norm_path] = merged
+
+
+def _next_unserved_range(
+    norm_path: str, req_start: int, req_end: int
+) -> "tuple[int, int] | None":
+    """Return (start, end) of the first ≤_READ_FILE_MAX_LINES unserved lines
+    within [req_start, req_end], or None if the entire range is already served.
+    """
+    served = _get_prepped_files().get(norm_path, [])
+    cursor = req_start
+    for s, e in served:
+        if cursor > req_end:
+            break
+        if cursor < s:
+            # Gap before this served interval
+            gap_end = min(s - 1, req_end, cursor + _READ_FILE_MAX_LINES - 1)
+            return (cursor, gap_end)
+        if cursor <= e:
+            cursor = e + 1  # skip past served interval
+    if cursor <= req_end:
+        return (cursor, min(req_end, cursor + _READ_FILE_MAX_LINES - 1))
+    return None
+
+
+def _serve_file_lines(safe_path: str, start: int, end: int) -> str:
+    """Read lines start..end from safe_path, record as served, return with header.
+
+    Lines are 1-indexed inclusive.  Clamps to actual file length.
+    """
+    norm = os.path.normpath(os.path.realpath(safe_path))
+    try:
+        with open(safe_path, "r", encoding="utf-8", errors="replace") as fh:
+            all_lines = fh.readlines()
+    except OSError as exc:
+        return f"ERROR reading '{safe_path}': {exc}"
+    total = len(all_lines)
+    start = max(1, min(start, total))
+    end   = max(start, min(end, total))
+    _record_served_range(norm, start, end)
+    result = [f"== FILE: {safe_path} (lines {start}–{end} of {total}) =="]
+    for i in range(start, end + 1):
+        result.append(f"{i}: {all_lines[i - 1].rstrip()}")
+    return "\n".join(result)
+
+
+def _served_ranges_str(norm_path: str) -> str:
+    served = _get_prepped_files().get(norm_path, [])
+    return ", ".join(f"{s}–{e}" for s, e in served) if served else "none"
+
+
+# Paths where git init has already been attempted this process lifetime.
+# Prevents repeated init attempts if the first one fails.
+_git_init_attempted: set[str] = set()
+
+
+def ensure_git_repo(path: str) -> None:
+    """If ``path`` has no .git directory, attempt ``git init`` once.
+
+    Subsequent calls for the same path (including after failure) are no-ops.
+    Logs the outcome but never raises — callers should proceed and let the
+    subsequent git command surface any real error.
+    """
+    if os.path.exists(os.path.join(path, ".git")):
+        return
+    if path in _git_init_attempted:
+        return
+    _git_init_attempted.add(path)
+    try:
+        result = subprocess.run(
+            ["git", "init", path],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            logger.info("[git] Initialized new repository at %s", path)
+        else:
+            logger.warning(
+                "[git] git init failed at %s: %s",
+                path, (result.stdout + result.stderr).strip(),
+            )
+    except Exception as exc:
+        logger.warning("[git] git init error at %s: %s", path, exc)
+
 
 def set_task_git_cwd(path: str | None) -> None:
     """
@@ -214,15 +344,59 @@ def _is_command_blocked(command: str) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 def read_file(path: str) -> str:
-    """Read and return a file's text content."""
+    """Read a file's structure: classes, functions, imports, and line ranges.
+
+    Returns a structural summary instead of raw content on the first call.
+    Subsequent calls serve the next 250 unserved source lines.
+    Use read_file_harder() to read a specific line range.
+
+    Note: async_dispatch_tool handles the LLM-summary path automatically.
+    This sync fallback always returns the structural summary only on first call.
+    """
     safe_path = _assert_safe_path(path)
     if not os.path.isfile(safe_path):
         return f"ERROR: '{path}' is not a file or does not exist."
+    norm = os.path.normpath(os.path.realpath(safe_path))
+    from app.agent.project_snapshot import _count_file_lines, build_file_summary
+    # Subsequent call — serve next unserved source lines
+    if norm in _get_prepped_files():
+        total = _count_file_lines(safe_path)
+        unserved = _next_unserved_range(norm, 1, total)
+        if unserved is None:
+            rel = os.path.relpath(safe_path, PROJECT_ROOT)
+            return (
+                f"ALREADY IN CONTEXT: all lines of '{rel}' have been served "
+                f"(ranges: {_served_ranges_str(norm)}). "
+                f"Call read_file_harder('{rel}', start=N) for a specific range."
+            )
+        return _serve_file_lines(safe_path, unserved[0], unserved[1])
+    # First call — structural summary
+    _mark_file_prepped(safe_path)
+    if _count_file_lines(safe_path) <= 25:
+        result = _inline_small_file(safe_path)
+        # Whole file shown inline — record all lines as served
+        try:
+            with open(safe_path, "r", encoding="utf-8", errors="replace") as fh:
+                lc = sum(1 for _ in fh)
+            _record_served_range(norm, 1, lc)
+        except OSError:
+            pass
+        return result
+    return build_file_summary(safe_path)
+
+
+_SMALL_FILE_HEADER = "== FILE (full content): {path} =="
+
+
+def _inline_small_file(abs_path: str) -> str:
+    """Return raw content for tiny files (≤ 25 lines), with a header."""
     try:
-        with open(safe_path, "r", encoding="utf-8", errors="replace") as fh:
-            return fh.read()
+        with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+            content = fh.read()
+        header = f"== FILE (full content): {abs_path} =="
+        return f"{header}\n{content}"
     except OSError as exc:
-        return f"ERROR reading '{path}': {exc}"
+        return f"ERROR reading '{abs_path}': {exc}"
 
 
 def write_file(path: str, content: str) -> str:
@@ -255,12 +429,29 @@ def append_file(path: str, content: str) -> str:
         return f"ERROR appending to '{path}': {exc}"
 
 
+def _get_cached_summary_for_listing(abs_path: str) -> "str | None":
+    """Sync DB lookup for a file's cached summary. Returns first 160 chars or None."""
+    try:
+        from app.database import get_file_summary_by_path
+        row = get_file_summary_by_path(abs_path)
+        if row and row.summary:
+            first = row.summary.split("\n")[0].strip()
+            return (first[:160] + "…") if len(first) > 160 else first
+    except Exception as exc:
+        logger.debug("summary lookup failed for %s: %s", abs_path, exc)
+    return None
+
+
 def list_directory(path: str = ".") -> str:
     """
     List files and directories at the given path.
-    Directories named in LISTING_EXCLUDED_DIRS are hidden automatically.
-    The project-root archive folder and .git are always hidden regardless of
-    the exclusion set.
+
+    Files are shown with their cached summary inline (or SUMMARY NOT AVAILABLE
+    on a cache miss).  Special entries:
+      - .git: shown as DIR with [PROTECTED]
+      - gitignored entries: shown with [PROTECTED — gitignored]
+      - symlinks escaping the project root: shown with [PROTECTED — symlink escapes project]
+      - .archive and LISTING_EXCLUDED_DIRS: hidden (counted in footer)
     """
     safe_path = _assert_safe_path(path)
     if not os.path.isdir(safe_path):
@@ -270,22 +461,61 @@ def list_directory(path: str = ".") -> str:
     root_real = os.path.realpath(PROJECT_ROOT)
     git_dir = os.path.join(root_real, ".git")
 
+    try:
+        from app.agent.project_snapshot import _is_git_ignored, _is_symlink_escaping
+    except Exception:
+        _is_git_ignored = lambda paths, cwd: set()  # noqa: E731
+        _is_symlink_escaping = lambda p, r: False  # noqa: E731
+
     entries = sorted(os.listdir(safe_path))
+    all_full_paths = [os.path.join(safe_path, e) for e in entries]
+    ignored_set = _is_git_ignored(all_full_paths, safe_path)
+
     lines: list[str] = []
     hidden = 0
-    for entry in entries:
-        full = os.path.join(safe_path, entry)
+    for entry, full in zip(entries, all_full_paths):
         full_real = os.path.realpath(full)
-        # Always hide: project-root archive dir and .git
-        if full_real == _archive_real or full_real == git_dir:
+
+        # Always hide: archive dir and excluded dirs (not .git — show it as PROTECTED)
+        if full_real == _archive_real:
             hidden += 1
             continue
-        # Hide any directory whose basename is in the exclusion set
         if os.path.isdir(full) and entry in LISTING_EXCLUDED_DIRS:
             hidden += 1
             continue
-        kind = "DIR " if os.path.isdir(full) else "FILE"
-        lines.append(f"{kind}  {entry}")
+
+        is_dir = os.path.isdir(full)
+        kind = "DIR " if is_dir else "FILE"
+
+        # .git — show as PROTECTED
+        if full_real == git_dir:
+            lines.append(f"{kind}  {entry}/  [PROTECTED]")
+            continue
+
+        # Gitignored
+        if full in ignored_set:
+            suffix = "/" if is_dir else ""
+            lines.append(f"{kind}  {entry}{suffix}  [PROTECTED — gitignored]")
+            continue
+
+        # Symlink escaping project
+        if _is_symlink_escaping(full, root_real):
+            target = os.readlink(full) if os.path.islink(full) else "?"
+            lines.append(f"{kind}  {entry} → {target}  [PROTECTED — symlink escapes project]")
+            continue
+
+        # Normal directory
+        if is_dir:
+            lines.append(f"{kind}  {entry}/")
+            continue
+
+        # Normal file — show with summary
+        summary = _get_cached_summary_for_listing(full)
+        if summary is not None:
+            lines.append(f"{kind}  {entry}  — {summary}")
+        else:
+            logger.debug("list_directory: no cached summary for %s", full)
+            lines.append(f"{kind}  {entry}  — (SUMMARY NOT AVAILABLE)")
 
     result = "\n".join(lines) if lines else "(empty directory)"
     if hidden:
@@ -350,6 +580,60 @@ def read_file_lines(path: str, start: int, end: int) -> str:
         return "\n".join(result_lines)
     except OSError as exc:
         return f"ERROR reading '{path}': {exc}"
+
+
+def read_file_harder(
+    path: str,
+    start: int | None = None,
+    end: int | None = None,
+    count: int | None = None,
+) -> str:
+    """Read up to 250 source-code lines per call, never repeating lines already in context.
+
+    Omit start/end/count to get the next 250 unserved lines from line 1 forward.
+    Provide start (+ optionally end or count) to target a specific range — only the
+    unserved portion of that range is returned, capped at 250 lines.
+
+    If read_file() has not been called first, it is called automatically.
+    """
+    safe_path = _assert_safe_path(path)
+    if not os.path.isfile(safe_path):
+        return f"ERROR: '{path}' is not a file or does not exist."
+
+    # Auto-prep: show structural summary first if not yet done
+    if not _is_file_prepped(safe_path):
+        return read_file(path)
+
+    norm = os.path.normpath(os.path.realpath(safe_path))
+    from app.agent.project_snapshot import _count_file_lines
+    total = _count_file_lines(safe_path)
+
+    # Resolve requested range
+    if end is not None and count is not None:
+        return "ERROR: provide 'end' OR 'count', not both."
+    if start is None:
+        req_start, req_end = 1, total
+    else:
+        req_start = start
+        if count is not None:
+            req_end = start + count - 1
+        elif end is not None:
+            req_end = end
+        else:
+            req_end = start + _READ_FILE_MAX_LINES - 1
+
+    # Clip requested range to unserved lines (max 250)
+    unserved = _next_unserved_range(norm, req_start, min(req_end, total))
+    if unserved is None:
+        rel = os.path.relpath(safe_path, PROJECT_ROOT)
+        served = _get_prepped_files().get(norm, [])
+        next_hint = f" Next unserved: line {served[-1][1] + 1}." if served and served[-1][1] < total else ""
+        return (
+            f"ALREADY IN CONTEXT: lines {req_start}–{min(req_end, total)} of '{rel}' "
+            f"are already in this session (served: {_served_ranges_str(norm)}).{next_hint}"
+        )
+
+    return _serve_file_lines(safe_path, unserved[0], unserved[1])
 
 
 def count_lines(path: str) -> str:
@@ -577,6 +861,7 @@ def _git_run(args: list[str], cwd: str | None = None) -> tuple[int, str, str]:
             "not permitted.  Configure a separate project path for this task "
             f"(attempted cwd: {effective_cwd}).",
         )
+    ensure_git_repo(effective_cwd)
     try:
         result = subprocess.run(
             args,
@@ -1069,6 +1354,7 @@ def run_shell_indev(command: str) -> str:
 
 TOOL_REGISTRY: dict[str, Any] = {
     "read_file": read_file,
+    "read_file_harder": read_file_harder,
     "read_file_lines": read_file_lines,
     "count_lines": count_lines,
     "write_file": write_file,
@@ -1105,11 +1391,41 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the full text content of a file within the project.",
+            "description": (
+                "First call: returns a natural-language summary (LLM-generated, cached) plus "
+                "structural analysis: classes, functions, imports, and line ranges. "
+                "For tiny files (≤ 25 lines) embeds raw content directly. "
+                "Each subsequent call on the same file serves the next 250 unserved source lines — "
+                "never repeating lines already in context. "
+                "Call repeatedly to page through a file, or use read_file_harder() for a specific range."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Path to the file (relative to project root or absolute)."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file_harder",
+            "description": (
+                "Read up to 250 source-code lines per call, never repeating lines already in context. "
+                "Omit start/end/count to get the next 250 unserved lines from line 1 forward. "
+                "Provide start (+ optionally end or count) to target a specific range — only the "
+                "unserved portion of that range is returned. "
+                "If read_file() has not been called first, it is called automatically."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file (relative to project root or absolute)."},
+                    "start": {"type": "integer", "description": "Starting line number (1-indexed). Omit to continue from last served line."},
+                    "end": {"type": "integer", "description": "Ending line number (inclusive). Provide this OR count, not both."},
+                    "count": {"type": "integer", "description": "Number of lines from start. Provide this OR end, not both."},
                 },
                 "required": ["path"],
             },
@@ -1656,6 +1972,75 @@ async def async_dispatch_tool(
     For spawn_research_agent: runs the async research agent.
     For all other tools: falls through to synchronous dispatch_tool.
     """
+    if name == "read_file":
+        path = arguments.get("path", "")
+        safe_path = _assert_safe_path(path)
+        if not os.path.isfile(safe_path):
+            return f"ERROR: '{path}' is not a file or does not exist."
+        norm_path = os.path.normpath(os.path.realpath(safe_path))
+        from app.agent.project_snapshot import _count_file_lines, async_build_file_summary
+        # Subsequent call — serve the next unserved 250-line chunk
+        if norm_path in _get_prepped_files():
+            total = _count_file_lines(safe_path)
+            unserved = _next_unserved_range(norm_path, 1, total)
+            if unserved is None:
+                rel = os.path.relpath(safe_path, PROJECT_ROOT)
+                return (
+                    f"ALREADY IN CONTEXT: all lines of '{rel}' have been served "
+                    f"(ranges: {_served_ranges_str(norm_path)}). "
+                    f"Call read_file_harder('{rel}', start=N) for a specific range."
+                )
+            return _serve_file_lines(safe_path, unserved[0], unserved[1])
+        # First call — LLM-enriched structural summary
+        _mark_file_prepped(safe_path)
+        if _count_file_lines(safe_path) <= 25:
+            result = _inline_small_file(safe_path)
+            try:
+                with open(safe_path, "r", encoding="utf-8", errors="replace") as fh:
+                    lc = sum(1 for _ in fh)
+                _record_served_range(norm_path, 1, lc)
+            except OSError:
+                pass
+            return result
+        return await async_build_file_summary(
+            safe_path,
+            summary_length="brief",
+            task_id=task_id,
+            llm_id=llm_id,
+            budget_id=budget_id,
+        )
+
+    if name in ("write_file", "append_file"):
+        # Capture old summary BEFORE the write (file still has old content)
+        old_summary: str | None = None
+        try:
+            p = _assert_safe_path(arguments.get("path", ""))
+            if os.path.isfile(p) and llm_id is not None:
+                from app.database import get_file_summary_by_path
+                row = get_file_summary_by_path(p)
+                if row:
+                    old_summary = row.summary
+        except Exception:
+            pass
+
+        # Execute the write synchronously
+        result = dispatch_tool(name, arguments)
+
+        # If write succeeded: enqueue high-priority summary update + invalidate snapshot
+        if result.startswith("OK:") and llm_id is not None:
+            try:
+                from app.agent.file_summary_agent import enqueue_file_summary
+                from app.agent.project_snapshot import clear_snapshot_cache
+                safe_p = _assert_safe_path(arguments.get("path", ""))
+                enqueue_file_summary(
+                    safe_p, task_id=task_id, llm_id=llm_id, budget_id=budget_id,
+                    previous_summary=old_summary, priority=-2.0,
+                )
+                clear_snapshot_cache()
+            except Exception as exc:
+                logger.debug("post-write summary enqueue failed (non-fatal): %s", exc)
+        return result
+
     if name == "spawn_research_agent":
         try:
             from app.agent.research import run_research

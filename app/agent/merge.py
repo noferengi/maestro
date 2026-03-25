@@ -34,6 +34,7 @@ from app.agent.config import (
     PROJECT_ROOT,
     GIT_SAFETY_BRANCH_PREFIX,
 )
+from app.agent.tools import ensure_git_repo
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ def execute_merge(task_id: str, project_path: str | None = None) -> MergeResult:
     """
     effective_cwd = project_path or PROJECT_ROOT
     logger.info("[merge] Using project directory: %s", effective_cwd)
+    ensure_git_repo(effective_cwd)
 
     branch = f"{GIT_SAFETY_BRANCH_PREFIX}{task_id}"
     logger.info("[merge] Starting merge for task '%s' (branch: %s)", task_id, branch)

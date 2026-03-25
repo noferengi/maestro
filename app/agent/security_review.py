@@ -29,6 +29,7 @@ from app.agent.config import (
     SECURITY_REVIEW_MAX_REVIEWER_TURNS,
     SECURITY_REVIEWER_TOOLS,
     PROJECT_ROOT,
+    check_context_saturation,
 )
 from app.agent.json_utils import extract_json_block
 from app.agent.tools import _task_git_cwd, dispatch_tool, build_tool_schemas, set_task_git_cwd
@@ -126,6 +127,7 @@ class SecurityPipeline:
         llm_id: int | None = None,
         budget_id: int | None = None,
         project_path: str | None = None,
+        max_context: int = 0,
     ):
         self.task_id = task_id
         self.task_description = task_description
@@ -134,6 +136,7 @@ class SecurityPipeline:
         self.llm_id = llm_id
         self.budget_id = budget_id
         self.project_path = project_path
+        self.max_context = max_context
         self._total_prompt = 0
         self._total_completion = 0
 
@@ -345,6 +348,7 @@ class SecurityPipeline:
         ]
 
         max_turns = SECURITY_REVIEW_MAX_REVIEWER_TURNS
+        _ctx_warned: set[float] = set()
 
         for turn in range(max_turns):
             response = await call_llm(
@@ -360,8 +364,19 @@ class SecurityPipeline:
             )
 
             usage = response.get("usage", {})
-            self._total_prompt += usage.get("prompt_tokens", 0)
+            prompt_tokens_this_call = usage.get("prompt_tokens", 0)
+            self._total_prompt += prompt_tokens_this_call
             self._total_completion += usage.get("completion_tokens", 0)
+
+            # Context saturation check
+            if check_context_saturation(
+                prompt_tokens_this_call, self.max_context, _ctx_warned, messages
+            ):
+                logger.warning(
+                    "[security] Reviewer '%s' context saturation (turn %d) — terminating",
+                    reviewer["type"], turn + 1,
+                )
+                break
 
             assistant_msg = response.get("choices", [{}])[0].get("message", {})
             messages.append(assistant_msg)
@@ -513,6 +528,14 @@ async def run_security_pipeline(
     """Run the security pipeline and return a result dict."""
     if project_path:
         set_task_git_cwd(project_path)
+
+    _max_context = 0
+    if llm_id is not None:
+        from app.database import get_llm as _get_llm
+        _llm_record = _get_llm(llm_id)
+        if _llm_record is not None:
+            _max_context = _llm_record.max_context or 0
+
     pipeline = SecurityPipeline(
         task_id=task_id,
         task_description=task_description,
@@ -521,6 +544,7 @@ async def run_security_pipeline(
         llm_id=llm_id,
         budget_id=budget_id,
         project_path=project_path,
+        max_context=_max_context,
     )
     result = await pipeline.run()
     return {

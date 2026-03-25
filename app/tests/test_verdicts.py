@@ -235,3 +235,52 @@ class TestVoteConfidenceValidation:
     def test_validate_vote_confidence_helper(self):
         with pytest.raises(ValueError):
             validate_vote_confidence(Verdict.LIKELY, 50)  # LIKELY range is [92, 100]
+
+
+# ---------------------------------------------------------------------------
+# Rule 3 — source guard: research_agent_epilogue votes skip research spawn
+# ---------------------------------------------------------------------------
+
+class TestRule3EpilogueSourceGuard:
+    def test_needs_research_from_epilogue_does_not_trigger_research_spawn(self):
+        """A NEEDS_RESEARCH vote tagged source=research_agent_epilogue must not produce needs_research outcome."""
+        epilogue_vote = Vote(
+            stage="research_epilogue",
+            verdict=Verdict.NEEDS_RESEARCH,
+            confidence=70,
+            justification="budget exhausted",
+            raw_response={"source": "research_agent_epilogue"},
+        )
+        likely_vote = Vote(
+            stage="scope",
+            verdict=Verdict.LIKELY,
+            confidence=95,
+            justification="looks fine",
+        )
+        result = tally_votes([epilogue_vote, likely_vote])
+        # The epilogue NEEDS_RESEARCH is filtered; only the LIKELY vote counts -> passed
+        assert result.outcome != "needs_research"
+
+    def test_untagged_needs_research_still_triggers_research_spawn(self):
+        """A NEEDS_RESEARCH vote without source tag must still produce needs_research outcome."""
+        normal_vote = Vote(
+            stage="feasibility",
+            verdict=Verdict.NEEDS_RESEARCH,
+            confidence=70,
+            justification="need more info",
+            raw_response={"source": "some_other_source"},
+        )
+        result = tally_votes([normal_vote])
+        assert result.outcome == "needs_research"
+
+    def test_needs_research_with_no_raw_response_still_triggers(self):
+        """A NEEDS_RESEARCH vote with raw_response=None must still produce needs_research outcome."""
+        vote = Vote(
+            stage="feasibility",
+            verdict=Verdict.NEEDS_RESEARCH,
+            confidence=70,
+            justification="need more info",
+            raw_response=None,
+        )
+        result = tally_votes([vote])
+        assert result.outcome == "needs_research"

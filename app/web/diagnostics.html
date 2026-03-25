@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM Diagnostics — TheMaestro</title>
+    <link rel="stylesheet" href="/static/style.css?v=15">
+    <link rel="stylesheet" href="/static/diagnostics.css?v=15">
+</head>
+<body class="diag-body">
+
+    <!-- Top header bar -->
+    <div class="diag-header">
+        <div class="diag-header-left">
+            <a href="/" class="diag-back-btn">&larr; Board</a>
+            <h1 class="diag-title">LLM Diagnostics</h1>
+        </div>
+        <div class="diag-header-right">
+            <input type="text" id="diag-search" class="diag-search"
+                   placeholder="Search tasks..." oninput="filterTasks(this.value)">
+            <button class="diag-refresh-btn" onclick="loadTasks()">&#8635; Refresh</button>
+        </div>
+    </div>
+
+    <!-- Three-column workspace -->
+    <div class="diag-workspace">
+
+        <!-- LEFT: Task list -->
+        <div class="diag-panel diag-panel-tasks">
+            <div class="diag-panel-header">
+                TASKS
+                <span id="diag-task-count" class="diag-count">0</span>
+            </div>
+            <div class="diag-panel-body" id="task-list">
+                <p class="diag-empty">Loading tasks...</p>
+            </div>
+        </div>
+
+        <!-- MIDDLE: Entry timeline -->
+        <div class="diag-panel diag-panel-entries">
+            <div class="diag-panel-header" id="entries-header">
+                ENTRIES
+                <span id="diag-entry-count" class="diag-count"></span>
+            </div>
+            <div class="diag-panel-body" id="entry-list">
+                <p class="diag-empty">Select a task to view its LLM call history.</p>
+            </div>
+        </div>
+
+        <!-- RIGHT: Conversation detail -->
+        <div class="diag-panel diag-panel-detail">
+            <div class="diag-panel-header" id="detail-header">
+                CONVERSATION
+            </div>
+            <div class="diag-panel-body" id="conversation-detail">
+                <p class="diag-empty">Select an entry to view the full conversation.</p>
+            </div>
+        </div>
+
+    </div>
+
+    <script src="/static/diag-utils.js?v=2"></script>
+    <script src="/static/diag-tasks.js?v=2"></script>
+    <script src="/static/diag-entries.js?v=1"></script>
+    <script src="/static/diag-session.js?v=2"></script>
+    <script src="/static/diag-render.js?v=28"></script>
+</body>
+</html>

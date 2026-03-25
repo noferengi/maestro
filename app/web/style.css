@@ -760,6 +760,12 @@ body {
     text-transform: uppercase;
 }
 
+.timeline-message {
+    font-size: 0.75rem;
+    color: #6c757d;
+    margin-top: 0.1rem;
+}
+
 /* ============================================
    Transition Failure Overlay
    ============================================ */

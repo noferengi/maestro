@@ -309,11 +309,28 @@ class IntakePipeline:
                     llm_id=self.llm_id,
                     budget_id=self.budget_id,
                 )
+                raw_verdict = research_result.vote.get("verdict", VERDICT_NOT_SUITABLE)
+                # TOO_LARGE means the task overflowed the research agent's context window —
+                # treat it as SUBDIVIDE_IDEA so the pipeline routes to subdivision.
+                if raw_verdict == "TOO_LARGE":
+                    logger.info(
+                        "Research agent returned TOO_LARGE for stage '%s' — routing to subdivision",
+                        stage_name,
+                    )
+                    effective_verdict = VERDICT_SUBDIVIDE_IDEA
+                    effective_justification = (
+                        f"Task scope exceeded research agent context window: "
+                        f"{research_result.vote.get('justification', '')}"
+                    )
+                else:
+                    effective_verdict = raw_verdict
+                    effective_justification = research_result.vote.get("justification", "Research completed.")
+
                 research_vote = {
                     "stage": f"{stage_name}_research",
-                    "verdict": research_result.vote.get("verdict", VERDICT_NOT_SUITABLE),
+                    "verdict": effective_verdict,
                     "confidence": research_result.vote.get("confidence", 55),
-                    "justification": research_result.vote.get("justification", "Research completed."),
+                    "justification": effective_justification,
                     "raw_response": research_result.vote,
                     "prompt_tokens": research_result.prompt_tokens,
                     "completion_tokens": research_result.completion_tokens,

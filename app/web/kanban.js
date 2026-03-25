@@ -4,6 +4,12 @@
 // API Configuration
 const API_BASE = '/api';
 
+// Track where each mousedown originated so that click-outside-to-close modals
+// are not triggered by a drag that started inside the modal content and ended
+// on the backdrop.  Only close when both mousedown AND click land on the backdrop.
+let _modalMousedownTarget = null;
+document.addEventListener('mousedown', function(e) { _modalMousedownTarget = e.target; });
+
 // WIP Limits configuration - maximum cards allowed per column
 const WIP_LIMITS = {
     'architecture': 10,
@@ -37,6 +43,9 @@ let breadcrumbStack = [];         // array of {id, title} for nested zoom
 
 // Descendant index: parentId -> [childId, ...]
 let childIndex = {};
+
+// State for the "View Children" subdivision cycling modal
+let _viewChildrenState = null; // { taskId, records, childMap, idx }
 // Full descendant index: taskId -> [all descendant IDs recursively]
 let descendantIndex = {};
 
@@ -540,15 +549,15 @@ function initializeTaskCards() {
 // Initialize modal close behavior
 function initializeModals() {
     document.getElementById('task-modal').addEventListener('click', function(e) {
-        if (e.target === this) closeModal();
+        if (e.target === this && _modalMousedownTarget === this) closeModal();
     });
 
     document.getElementById('history-modal').addEventListener('click', function(e) {
-        if (e.target === this) closeHistoryModal();
+        if (e.target === this && _modalMousedownTarget === this) closeHistoryModal();
     });
 
     document.getElementById('new-project-modal').addEventListener('click', function(e) {
-        if (e.target === this) closeNewProjectModal();
+        if (e.target === this && _modalMousedownTarget === this) closeNewProjectModal();
     });
 
     document.getElementById('new-project-name').addEventListener('keydown', function(e) {
@@ -557,7 +566,7 @@ function initializeModals() {
     });
 
     document.getElementById('edit-project-modal').addEventListener('click', function(e) {
-        if (e.target === this) closeEditProjectModal();
+        if (e.target === this && _modalMousedownTarget === this) closeEditProjectModal();
     });
 }
 
@@ -980,59 +989,169 @@ function buildContractPills(contracts) {
 
 async function viewChildren(taskId) {
     try {
-        const resp = await fetch(`${API_BASE}/tasks/${taskId}/children`);
-        if (!resp.ok) return;
-        const children = await resp.json();
+        const [childResp, recResp] = await Promise.all([
+            fetch(`${API_BASE}/tasks/${taskId}/children`),
+            fetch(`${API_BASE}/tasks/${taskId}/subdivision-records`),
+        ]);
+        if (!childResp.ok) return;
 
-        const task = taskData[taskId] || {};
-        const title = task.title || taskId;
+        const children = await childResp.json();
+        const records  = recResp.ok ? await recResp.json() : [];
 
-        let html = `<h3 style="margin-bottom:1rem">Children of: ${title}</h3>`;
-        if (children.length === 0) {
-            html += '<p style="color:#6c757d">No children found.</p>';
-        } else {
-            children.forEach(c => {
-                const statusColor = c.type === 'cancelled' ? '#dc3545' :
-                                    c.type === 'completed' ? '#198754' :
-                                    c.type === 'planning' ? '#ffc107' : '#0d6efd';
-                html += `
-                    <div style="border:1px solid #dee2e6;border-radius:6px;padding:0.75rem;margin-bottom:0.5rem;border-left:4px solid ${statusColor}">
-                        <strong>${c.title}</strong>
-                        <span style="float:right;font-size:0.75rem;text-transform:uppercase;color:${statusColor};font-weight:600">${c.type}</span>
-                        <div style="font-size:0.85rem;color:#6c757d;margin-top:0.25rem">${c.description || ''}</div>
-                        ${c.subdivision_generation > 0 ? `<span class="subdivision-badge gen" style="margin-top:0.35rem;display:inline-block">Gen ${c.subdivision_generation}</span>` : ''}
-                        ${c.is_big_idea ? '<span class="big-idea-badge" style="margin-left:0.35rem">Big Idea</span>' : ''}
-                        ${c.interface_contracts ? buildContractPills(c.interface_contracts) : ''}
-                    </div>
-                `;
-            });
-        }
+        // childMap: id -> child object (includes cancelled children from all batches)
+        const childMap = {};
+        children.forEach(c => { childMap[c.id] = c; });
 
-        // Also show subdivision records
-        const recResp = await fetch(`${API_BASE}/tasks/${taskId}/subdivision-records`);
-        if (recResp.ok) {
-            const records = await recResp.json();
-            if (records.length > 0) {
-                html += '<h4 style="margin-top:1rem;margin-bottom:0.5rem">Subdivision History</h4>';
-                records.forEach(r => {
-                    const statusBg = r.status === 'active' ? '#d1e7dd' :
-                                     r.status === 'superseded' ? '#fff3cd' : '#f8d7da';
-                    html += `
-                        <div style="background:${statusBg};border-radius:4px;padding:0.5rem;margin-bottom:0.35rem;font-size:0.85rem">
-                            Attempt #${r.attempt_number} (gen ${r.generation}) — <strong>${r.status}</strong>
-                            — ${(r.child_task_ids || []).length} children
-                            — ${r.prompt_tokens || 0} prompt / ${r.completion_tokens || 0} completion tokens
-                        </div>
-                    `;
-                });
-            }
-        }
+        // Default to the active record; fall back to most-recent (index 0)
+        const activeIdx = records.findIndex(r => r.status === 'active');
+        const startIdx  = activeIdx >= 0 ? activeIdx : 0;
+
+        _viewChildrenState = { taskId, records, childMap, idx: startIdx };
 
         document.getElementById('transition-modal-title').textContent = 'Subdivision Details';
-        document.getElementById('transition-modal-body').innerHTML = html;
         document.getElementById('transition-modal').classList.add('active');
+        _renderChildrenView();
     } catch (err) {
         console.error('Error viewing children:', err);
+    }
+}
+
+function _renderChildrenView() {
+    if (!_viewChildrenState) return;
+    const { taskId, records, childMap, idx } = _viewChildrenState;
+    const task = taskData[taskId] || {};
+
+    let html = `<h3 style="margin-bottom:1rem">Children of: ${task.title || taskId}</h3>`;
+
+    if (records.length === 0) {
+        const all = Object.values(childMap);
+        html += all.length === 0
+            ? '<p style="color:#6c757d">No children found.</p>'
+            : all.map(_childCard).join('');
+    } else {
+        const rec         = records[idx];
+        const recChildren = (rec.child_task_ids || []).map(id => childMap[id]).filter(Boolean);
+        html += recChildren.length === 0
+            ? '<p style="color:#6c757d">No children in this set.</p>'
+            : recChildren.map(_childCard).join('');
+    }
+
+    document.getElementById('transition-modal-body').innerHTML = html;
+    _renderChildrenFooter();
+}
+
+function _childCard(c) {
+    const statusColor  = c.type === 'cancelled' ? '#6c757d' :
+                         c.type === 'completed'  ? '#198754' :
+                         c.type === 'planning'   ? '#ffc107' : '#0d6efd';
+    const dimStyle = c.type === 'cancelled' ? 'opacity:0.5;' : '';
+    return `
+        <div style="border:1px solid #dee2e6;border-radius:6px;padding:0.75rem;margin-bottom:0.5rem;border-left:4px solid ${statusColor};${dimStyle}">
+            <strong>${c.title}</strong>
+            <span style="float:right;font-size:0.75rem;text-transform:uppercase;color:${statusColor};font-weight:600">${c.type}</span>
+            <div style="font-size:0.85rem;color:#6c757d;margin-top:0.25rem">${c.description || ''}</div>
+            ${c.subdivision_generation > 0 ? `<span class="subdivision-badge gen" style="margin-top:0.35rem;display:inline-block">Gen ${c.subdivision_generation}</span>` : ''}
+            ${c.is_big_idea ? '<span class="big-idea-badge" style="margin-left:0.35rem">Big Idea</span>' : ''}
+            ${c.interface_contracts ? buildContractPills(c.interface_contracts) : ''}
+        </div>`;
+}
+
+function _fmtTok(n) {
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + 'M';
+    if (n >= 1024)    return Math.round(n / 1024) + 'K';
+    return String(n || 0);
+}
+
+function _renderChildrenFooter() {
+    if (!_viewChildrenState) return;
+    const { taskId, records, idx } = _viewChildrenState;
+    const footerLeft = document.getElementById('transition-modal-footer-left');
+    if (!footerLeft) return;
+
+    const btnStyle = 'font-size:0.78rem;padding:0.2rem 0.5rem;line-height:1.4';
+    let html = '';
+
+    if (records.length > 0) {
+        const rec      = records[idx];
+        const n        = records.length;
+        const pp       = rec.prompt_tokens || 0;
+        const tg       = rec.completion_tokens || 0;
+        const isActive = rec.status === 'active';
+        const statusCol = isActive ? '#198754' : '#6c757d';
+
+        // ← older  N of M  newer →  ·  status  ·  tokens
+        const olderDis = idx >= n - 1 ? 'disabled' : '';
+        const newerDis = idx <= 0     ? 'disabled' : '';
+
+        html += `
+          <button class="btn btn-secondary" style="${btnStyle}" onclick="prevChildRecord()" ${olderDis}>&#8592;</button>
+          <span style="font-size:0.8rem;color:#adb5bd;white-space:nowrap">
+            Set ${idx + 1}&thinsp;/&thinsp;${n}
+            &nbsp;&middot;&nbsp;
+            <span style="color:${statusCol};font-weight:600">${rec.status}</span>
+            &nbsp;&middot;&nbsp;
+            ${_fmtTok(pp)}&thinsp;pp&thinsp;/&thinsp;${_fmtTok(tg)}&thinsp;tg
+          </span>
+          <button class="btn btn-secondary" style="${btnStyle}" onclick="nextChildRecord()" ${newerDis}>&#8594;</button>`;
+
+        if (!isActive) {
+            html += `<button class="btn btn-primary" style="${btnStyle};margin-left:0.4rem"
+                             onclick="activateSubdivisionRecord('${taskId}', ${rec.id})">Activate this set</button>`;
+        }
+    }
+
+    // Regenerate — always available; disabled while a new run is already in progress
+    const task  = taskData[taskId] || {};
+    const busy  = task.type === 'subdividing' && records.some(r => r.status === 'active');
+    html += `<button class="btn btn-warning" style="${btnStyle};margin-left:${records.length > 0 ? '0.75rem' : '0'}"
+                     onclick="regenerateSubdivision('${taskId}')"
+                     ${busy ? 'disabled title="Already regenerating"' : ''}>&#x21BA; Regenerate</button>`;
+
+    footerLeft.innerHTML = html;
+}
+
+function prevChildRecord() {
+    if (!_viewChildrenState) return;
+    const max = _viewChildrenState.records.length - 1;
+    if (_viewChildrenState.idx < max) {
+        _viewChildrenState.idx++;
+        _renderChildrenView();
+    }
+}
+
+function nextChildRecord() {
+    if (!_viewChildrenState) return;
+    if (_viewChildrenState.idx > 0) {
+        _viewChildrenState.idx--;
+        _renderChildrenView();
+    }
+}
+
+async function activateSubdivisionRecord(taskId, recordId) {
+    try {
+        const resp = await fetch(`${API_BASE}/tasks/${taskId}/subdivision-records/${recordId}/activate`, { method: 'POST' });
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            alert('Failed to activate: ' + (err.detail || resp.statusText));
+            return;
+        }
+        await viewChildren(taskId);   // refresh modal with updated statuses
+    } catch (err) {
+        console.error('Error activating record:', err);
+    }
+}
+
+async function regenerateSubdivision(taskId) {
+    try {
+        const resp = await fetch(`${API_BASE}/tasks/${taskId}/regenerate-subdivision`, { method: 'POST' });
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            alert('Failed to regenerate: ' + (err.detail || resp.statusText));
+            return;
+        }
+        closeTransitionModal();   // board auto-refresh will show the Regenerating… state
+    } catch (err) {
+        console.error('Error regenerating:', err);
     }
 }
 
@@ -1079,6 +1198,75 @@ async function viewResearchJobs(taskId) {
         document.getElementById('transition-modal').classList.add('active');
     } catch (err) {
         console.error('Error viewing research jobs:', err);
+    }
+}
+
+async function viewBenchmarks(taskId) {
+    try {
+        const resp = await fetch(`${API_BASE}/tasks/${taskId}/benchmarks`);
+        if (!resp.ok) return;
+        const records = await resp.json();
+
+        const task = taskData[taskId] || {};
+        const title = task.title || taskId;
+
+        let html = `<h3 style="margin-bottom:1rem">Benchmarks: ${title}</h3>`;
+        if (records.length === 0) {
+            html += '<p style="color:#6c757d">No benchmark records for this task.</p>';
+        } else {
+            const byTask = {};
+            records.forEach(r => {
+                if (!byTask[r.task_id]) byTask[r.task_id] = {};
+                byTask[r.task_id][r.benchmark_type] = r;
+            });
+
+            Object.entries(byTask).forEach(([subTaskId, pair]) => {
+                const before = pair['before'];
+                const after  = pair['after'];
+                const bm = before ? JSON.parse(before.metrics || '{}') : {};
+                const am = after  ? JSON.parse(after.metrics  || '{}') : {};
+
+                const durDelta  = (bm.test_duration_ms != null && am.test_duration_ms != null)
+                    ? `${bm.test_duration_ms}ms → ${am.test_duration_ms}ms`
+                    : (bm.test_duration_ms != null ? `${bm.test_duration_ms}ms → ?` : '—');
+                const memDelta  = (bm.memory_peak_mb != null && am.memory_peak_mb != null)
+                    ? `${bm.memory_peak_mb}MB → ${am.memory_peak_mb}MB`
+                    : '—';
+                const bigODelta = (bm.big_o_class && am.big_o_class)
+                    ? `${bm.big_o_class} → ${am.big_o_class}`
+                    : (bm.big_o_class || am.big_o_class || '—');
+                const readCost  = am.readability_cost != null ? am.readability_cost : '—';
+                const premature = am.is_premature ? ' ⚠ premature' : '';
+                const debtBadge = am.tech_debt_resolved ? ' ✓ tech-debt' : '';
+                const notes     = am.notes || bm.notes || '';
+                const scaleN    = am.scale_n || bm.scale_n || '';
+
+                html += `
+                    <div style="border:1px solid #dee2e6;border-radius:6px;padding:0.75rem;margin-bottom:0.75rem;border-left:4px solid #6f42c1">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.4rem">
+                            <span style="font-size:0.75rem;font-weight:600;color:#6f42c1;text-transform:uppercase">Sub-task ${subTaskId}</span>
+                            <span class="transition-timestamp">${(after || before || {}).created_at || ''}</span>
+                        </div>
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.3rem 1rem;font-size:0.85rem;margin-bottom:0.4rem">
+                            <div><span style="color:#6c757d">Duration:</span> ${durDelta}</div>
+                            <div><span style="color:#6c757d">Memory:</span> ${memDelta}</div>
+                            <div><span style="color:#6c757d">Big O:</span> ${bigODelta}</div>
+                            <div><span style="color:#6c757d">Readability cost:</span> ${readCost}</div>
+                            ${scaleN ? `<div><span style="color:#6c757d">Scale N:</span> ${scaleN}</div>` : ''}
+                        </div>
+                        ${(premature || debtBadge) ? `<div style="font-size:0.75rem;color:#6c757d;margin-bottom:0.25rem">${premature}${debtBadge}</div>` : ''}
+                        ${notes ? `<div style="font-size:0.8rem;color:#495057;font-style:italic">${notes}</div>` : ''}
+                        ${!after ? '<div style="font-size:0.75rem;color:#fd7e14">⚠ No after-record yet</div>' : ''}
+                    </div>
+                `;
+            });
+        }
+
+        document.getElementById('transition-modal-title').textContent = 'Optimization Benchmarks';
+        document.getElementById('transition-modal-body').innerHTML = html;
+        document.getElementById('transition-modal').classList.add('active');
+    } catch (err) {
+        console.error('Error viewing benchmarks:', err);
     }
 }
 
@@ -1251,6 +1439,15 @@ function createTaskCard(id, title, tags, owner, status) {
         researchBtn.textContent = 'Research Jobs';
         researchBtn.onclick = (e) => { e.stopPropagation(); viewResearchJobs(id); };
         card.querySelector('.task-actions').appendChild(researchBtn);
+    }
+
+    // Benchmarks button — visible once optimization stage has run
+    if (status === 'optimization' || status === 'security' || status === 'full_review' || status === 'completed') {
+        const benchBtn = document.createElement('button');
+        benchBtn.className = 'action-btn';
+        benchBtn.textContent = 'Benchmarks';
+        benchBtn.onclick = (e) => { e.stopPropagation(); viewBenchmarks(id); };
+        card.querySelector('.task-actions').appendChild(benchBtn);
     }
 
     card.addEventListener('dragstart', handleDragStart);
@@ -1523,6 +1720,9 @@ function escapeHtml(text) {
 
 function closeTransitionModal() {
     document.getElementById('transition-modal').classList.remove('active');
+    _viewChildrenState = null;
+    const fl = document.getElementById('transition-modal-footer-left');
+    if (fl) fl.innerHTML = '';
 }
 
 // ============================================
@@ -1793,6 +1993,7 @@ function viewTaskHistory(taskId) {
         html += `
             <div class="timeline-item ${h.status}">
                 <div class="timeline-status">${h.status}</div>
+                ${h.message ? `<div class="timeline-message">${h.message}</div>` : ''}
                 <div class="timeline-time">${formattedDate}</div>
             </div>
         `;
@@ -2109,13 +2310,13 @@ function initializeGlobalConfigButtons() {
     document.getElementById('manage-tools-btn').addEventListener('click', openToolsModal);
 
     document.getElementById('llm-modal').addEventListener('click', function(e) {
-        if (e.target === this) closeLlmModal();
+        if (e.target === this && _modalMousedownTarget === this) closeLlmModal();
     });
     document.getElementById('budget-modal').addEventListener('click', function(e) {
-        if (e.target === this) closeBudgetModal();
+        if (e.target === this && _modalMousedownTarget === this) closeBudgetModal();
     });
     document.getElementById('tools-modal').addEventListener('click', function(e) {
-        if (e.target === this) closeToolsModal();
+        if (e.target === this && _modalMousedownTarget === this) closeToolsModal();
     });
 }
 
@@ -2177,6 +2378,8 @@ function editLlmEntry(id) {
     document.getElementById('llm-edit-parallel').value = llm.parallel_sessions;
     document.getElementById('llm-edit-max-context').value = llm.max_context;
     document.getElementById('llm-edit-notes').value = llm.notes || '';
+    document.getElementById('llm-edit-cost-prompt').value = llm.cost_per_million_prompt_tokens || 0;
+    document.getElementById('llm-edit-cost-completion').value = llm.cost_per_million_completion_tokens || 0;
     document.getElementById('llm-edit-placeholder').style.display = 'none';
     document.getElementById('llm-edit-form').style.display = 'block';
     document.getElementById('llm-edit-error').style.display = 'none';
@@ -2224,7 +2427,11 @@ function _validateLlmFields(prefix) {
         showInlineError(errorId, 'Max context must be a non-zero number.');
         return null;
     }
-    return { address, port, model, parallel_sessions: parallelRaw, max_context: contextRaw, notes };
+    const costPrompt = parseFloat(document.getElementById(`${prefix}-cost-prompt`)?.value) || 0;
+    const costCompletion = parseFloat(document.getElementById(`${prefix}-cost-completion`)?.value) || 0;
+    return { address, port, model, parallel_sessions: parallelRaw, max_context: contextRaw, notes,
+             cost_per_million_prompt_tokens: costPrompt,
+             cost_per_million_completion_tokens: costCompletion };
 }
 
 async function addLlm() {
@@ -2321,12 +2528,14 @@ function editBudgetEntry(id) {
     _budgetEditingId = id;
     document.getElementById('budget-edit-id').value = id;
     document.getElementById('budget-edit-name').value = budget.name;
+    document.getElementById('budget-edit-dollar-amount').value = budget.dollar_amount ?? -1;
     document.getElementById('budget-edit-placeholder').style.display = 'none';
     document.getElementById('budget-edit-form').style.display = 'block';
     document.getElementById('budget-edit-error').style.display = 'none';
     switchBudgetTab('edit');
-    // Fetch usage summary
+    // Fetch usage summary and remaining
     loadBudgetSummary(id);
+    loadBudgetRemaining(id);
 }
 
 async function loadBudgetSummary(budgetId) {
@@ -2353,6 +2562,26 @@ async function loadBudgetSummary(budgetId) {
     }
 }
 
+async function loadBudgetRemaining(budgetId) {
+    const box = document.getElementById('budget-remaining-box');
+    const txt = document.getElementById('budget-remaining-text');
+    box.style.display = 'none';
+    try {
+        const res = await fetch(`${API_BASE}/budgets/${budgetId}/remaining`);
+        if (!res.ok) return;
+        const r = await res.json();
+        if (r.infinite) {
+            box.style.display = 'none';
+            return;
+        }
+        const spent = r.spent_dollars ? `$${r.spent_dollars.toFixed(4)}` : '$0.00';
+        const limit = `$${Number(r.dollar_amount).toFixed(2)}`;
+        const remaining = r.remaining_dollars != null ? `$${r.remaining_dollars.toFixed(4)}` : '—';
+        txt.textContent = `Spent: ${spent} of ${limit} limit — Remaining: ${remaining}`;
+        box.style.display = 'block';
+    } catch (_) {}
+}
+
 function renderBudgetList() {
     const container = document.getElementById('budget-list');
     if (allBudgets.length === 0) {
@@ -2360,11 +2589,13 @@ function renderBudgetList() {
         return;
     }
     let html = '<table style="width:100%;font-size:0.85rem;border-collapse:collapse">';
-    html += '<tr style="border-bottom:1px solid #dee2e6"><th style="text-align:left;padding:0.4rem">ID</th><th style="text-align:left;padding:0.4rem">Name</th><th></th></tr>';
+    html += '<tr style="border-bottom:1px solid #dee2e6"><th style="text-align:left;padding:0.4rem">ID</th><th style="text-align:left;padding:0.4rem">Name</th><th style="text-align:left;padding:0.4rem">Limit</th><th></th></tr>';
     allBudgets.forEach(b => {
+        const limitLabel = (b.dollar_amount === -1 || b.dollar_amount == null) ? '∞' : `$${Number(b.dollar_amount).toFixed(2)}`;
         html += `<tr style="border-bottom:1px solid #f0f0f0">
             <td style="padding:0.4rem">${b.id}</td>
             <td style="padding:0.4rem"><a href="#" onclick="editBudgetEntry(${b.id}); return false;" style="color:#0d6efd;text-decoration:none;cursor:pointer">${b.name}</a></td>
+            <td style="padding:0.4rem">${limitLabel}</td>
             <td style="padding:0.4rem"><button class="action-btn action-btn-danger" onclick="deleteBudgetEntry(${b.id})">Delete</button></td>
         </tr>`;
     });
@@ -2375,11 +2606,13 @@ function renderBudgetList() {
 async function addBudget() {
     const name = document.getElementById('budget-name').value.trim();
     if (!name) { showInlineError('budget-error', 'Budget name is required.'); return; }
+    const dollarAmount = parseFloat(document.getElementById('budget-dollar-amount').value);
+    const dollar_amount = isNaN(dollarAmount) ? -1 : dollarAmount;
 
     const res = await fetch(`${API_BASE}/budgets`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name })
+        body: JSON.stringify({ name, dollar_amount })
     });
     if (!res.ok) {
         const err = await res.json();
@@ -2387,6 +2620,7 @@ async function addBudget() {
         return;
     }
     document.getElementById('budget-name').value = '';
+    document.getElementById('budget-dollar-amount').value = '-1';
     await loadLlmsAndBudgets();
     renderBudgetList();
 }
@@ -2396,10 +2630,13 @@ async function saveBudgetEdit() {
     const name = document.getElementById('budget-edit-name').value.trim();
     if (!name) { showInlineError('budget-edit-error', 'Budget name is required.'); return; }
 
+    const dollarAmountRaw = parseFloat(document.getElementById('budget-edit-dollar-amount').value);
+    const dollar_amount = isNaN(dollarAmountRaw) ? -1 : dollarAmountRaw;
+
     const res = await fetch(`${API_BASE}/budgets/${_budgetEditingId}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name })
+        body: JSON.stringify({ name, dollar_amount })
     });
     if (!res.ok) {
         const err = await res.json();

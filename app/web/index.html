@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kanban Board - TheMaestro</title>
     <link rel="stylesheet" href="/static/style.css?v=15">
-    <script src="/static/kanban.js?v=15"></script>
+    <script src="/static/kanban.js?v=16"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -39,6 +39,11 @@
             <div class="project-tab" id="manage-tools-btn" style="cursor:pointer">
                 Agent Tools
             </div>
+        </div>
+        <div class="project-tabs" style="margin-top:0.5rem">
+            <a href="/diagnostics" class="project-tab" style="text-decoration:none;color:inherit;display:block">
+                LLM Diagnostics &rarr;
+            </a>
         </div>
     </div>
 
@@ -365,6 +370,16 @@
                                    oninput="this.value = this.value.replace(/[^0-9]/g, '')">
                         </div>
                     </div>
+                    <div style="display:flex;gap:1rem">
+                        <div class="form-group" style="flex:1">
+                            <label class="form-label" for="llm-cost-prompt">Prompt $/M tokens</label>
+                            <input type="number" class="form-input" id="llm-cost-prompt" value="0" min="0" step="0.01" placeholder="0.00">
+                        </div>
+                        <div class="form-group" style="flex:1">
+                            <label class="form-label" for="llm-cost-completion">Completion $/M tokens</label>
+                            <input type="number" class="form-input" id="llm-cost-completion" value="0" min="0" step="0.01" placeholder="0.00">
+                        </div>
+                    </div>
                     <div class="form-group">
                         <label class="form-label" for="llm-notes">Notes</label>
                         <textarea class="form-input" id="llm-notes" rows="2"
@@ -400,6 +415,16 @@
                                 <input type="text" class="form-input" id="llm-edit-max-context"
                                        inputmode="numeric" pattern="[0-9]*"
                                        oninput="this.value = this.value.replace(/[^0-9]/g, '')">
+                            </div>
+                        </div>
+                        <div style="display:flex;gap:1rem">
+                            <div class="form-group" style="flex:1">
+                                <label class="form-label" for="llm-edit-cost-prompt">Prompt $/M tokens</label>
+                                <input type="number" class="form-input" id="llm-edit-cost-prompt" min="0" step="0.01" placeholder="0.00">
+                            </div>
+                            <div class="form-group" style="flex:1">
+                                <label class="form-label" for="llm-edit-cost-completion">Completion $/M tokens</label>
+                                <input type="number" class="form-input" id="llm-edit-cost-completion" min="0" step="0.01" placeholder="0.00">
                             </div>
                         </div>
                         <div class="form-group">
@@ -442,6 +467,12 @@
                         <label class="form-label" for="budget-name">Budget Name</label>
                         <input type="text" class="form-input" id="budget-name" placeholder="e.g. Premium Budget">
                     </div>
+                    <div class="form-group">
+                        <label class="form-label" for="budget-dollar-amount">Dollar Limit ($)</label>
+                        <input type="number" class="form-input" id="budget-dollar-amount" value="-1" min="-1" step="0.01"
+                               placeholder="-1 for unlimited">
+                        <div style="font-size:0.75rem;color:#6c757d;margin-top:0.2rem">-1 = unlimited</div>
+                    </div>
                     <div id="budget-error" class="inline-error" style="display:none"></div>
                 </div>
 
@@ -453,6 +484,15 @@
                         <div class="form-group">
                             <label class="form-label" for="budget-edit-name">Budget Name</label>
                             <input type="text" class="form-input" id="budget-edit-name">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="budget-edit-dollar-amount">Dollar Limit ($)</label>
+                            <input type="number" class="form-input" id="budget-edit-dollar-amount" min="-1" step="0.01"
+                                   placeholder="-1 for unlimited">
+                            <div style="font-size:0.75rem;color:#6c757d;margin-top:0.2rem">-1 = unlimited</div>
+                        </div>
+                        <div id="budget-remaining-box" style="margin-bottom:1rem;padding:0.5rem 0.75rem;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;font-size:0.82rem;color:#166534;display:none">
+                            <span id="budget-remaining-text"></span>
                         </div>
                         <div id="budget-summary-box" style="margin-bottom:1rem;padding:0.75rem;background:#f8f9fa;border-radius:6px;font-size:0.85rem;color:#495057">
                             <strong>Usage Summary</strong>
@@ -480,6 +520,7 @@
                 <!-- Populated dynamically -->
             </div>
             <div class="modal-footer">
+                <div id="transition-modal-footer-left" style="flex:1;display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap"></div>
                 <button class="btn btn-secondary" onclick="closeTransitionModal()">Close</button>
             </div>
         </div>

@@ -19,7 +19,7 @@ import asyncio
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from app.agent.config import (
@@ -30,6 +30,7 @@ from app.agent.config import (
     PLANNING_SURVEY_MAX_TURNS,
     PLANNING_LLM_TEMPERATURE,
     PROJECT_ROOT,
+    check_context_saturation,
 )
 from app.agent.llm_client import call_llm
 from app.agent.verdicts import Vote, Verdict, tally_votes
@@ -233,6 +234,7 @@ class PlanningPipeline:
 
         tool_schemas = _get_survey_tool_schemas()
         survey_result = ""
+        _ctx_warned: set[float] = set()
 
         for turn in range(PLANNING_SURVEY_MAX_TURNS):
             response = await call_llm(
@@ -247,6 +249,16 @@ class PlanningPipeline:
             )
 
             self._track_tokens(response)
+
+            # Context saturation check
+            if check_context_saturation(
+                response.get("usage", {}).get("prompt_tokens", 0),
+                self.max_context or 0,
+                _ctx_warned,
+                messages,
+            ):
+                logger.warning("[planning] Survey context saturation (turn %d) — terminating", turn + 1)
+                break
             choice = response.get("choices", [{}])[0]
             msg = choice.get("message", {})
             content = msg.get("content", "")
@@ -263,7 +275,7 @@ class PlanningPipeline:
             if tool_calls:
                 for tc in tool_calls:
                     fn_name = tc["function"]["name"]
-                    fn_args = json.loads(tc["function"]["arguments"])
+                    fn_args = tc["function"]["arguments"] if isinstance(tc["function"]["arguments"], dict) else json.loads(tc["function"]["arguments"])
                     try:
                         result = dispatch_tool(fn_name, fn_args)
                     except Exception as e:
@@ -322,7 +334,6 @@ class PlanningPipeline:
                     base_url=self.llm_base_url,
                     model=self.llm_model,
                     temperature=temp,
-                    response_format={"type": "json_object"},
                     task_id=self.task_id,
                     llm_id=self.llm_id,
                     budget_id=self.budget_id,
@@ -363,31 +374,37 @@ class PlanningPipeline:
             "You are a design judge. Compare these design proposals and select the best one. "
             "Output JSON: {\"selected_index\": <0-based index>, \"justification\": \"...\"}\n\n"
         )
-        for i, (orig_idx, design) in enumerate(valid):
-            judge_prompt += f"\n--- Design {orig_idx} ---\n{json.dumps(design, indent=1)[:3000]}\n"
+        for orig_idx, design in valid:
+            # Only send the rationale + file list — keeps the prompt small
+            summary = {
+                "rationale": str(design.get("design_rationale", ""))[:400],
+                "files": [f.get("path", "") for f in design.get("file_manifest", [])[:8]],
+            }
+            judge_prompt += f"\n--- Design {orig_idx} ---\n{json.dumps(summary)}\n"
 
-        response = await call_llm(
-            [
-                {"role": "system", "content": "You are a design evaluator. Output only JSON."},
-                {"role": "user", "content": judge_prompt},
-            ],
-            base_url=self.llm_base_url,
-            model=self.llm_model,
-            temperature=PLANNING_JUDGE_TEMPERATURE,
-            response_format={"type": "json_object"},
-            task_id=self.task_id,
-            llm_id=self.llm_id,
-            budget_id=self.budget_id,
-        )
-        self._track_tokens(response)
-
-        content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
         try:
+            response = await call_llm(
+                [
+                    {"role": "system", "content": "You are a design evaluator. Output only JSON. Be concise."},
+                    {"role": "user", "content": judge_prompt},
+                ],
+                base_url=self.llm_base_url,
+                model=self.llm_model,
+                temperature=PLANNING_JUDGE_TEMPERATURE,
+                max_tokens=256,
+                task_id=self.task_id,
+                llm_id=self.llm_id,
+                budget_id=self.budget_id,
+            )
+            self._track_tokens(response)
+
+            content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
             result = json.loads(content)
             idx = int(result.get("selected_index", valid[0][0]))
             if idx < 0 or idx >= len(designs):
                 idx = valid[0][0]
-        except (json.JSONDecodeError, ValueError):
+        except Exception as exc:
+            logger.warning("[planning] Judge call failed (%s), using first valid design %d", exc, valid[0][0])
             idx = valid[0][0]
 
         return idx, designs[idx]
@@ -469,7 +486,6 @@ class PlanningPipeline:
                     base_url=self.llm_base_url,
                     model=self.llm_model,
                     temperature=PLANNING_LLM_TEMPERATURE,
-                    response_format={"type": "json_object"},
                     task_id=self.task_id,
                     llm_id=self.llm_id,
                     budget_id=self.budget_id,
@@ -573,7 +589,6 @@ class PlanningPipeline:
                 base_url=self.llm_base_url,
                 model=self.llm_model,
                 temperature=PLANNING_LLM_TEMPERATURE,
-                response_format={"type": "json_object"},
                 task_id=self.task_id,
                 llm_id=self.llm_id,
                 budget_id=self.budget_id,
@@ -615,7 +630,6 @@ class PlanningPipeline:
                 base_url=self.llm_base_url,
                 model=self.llm_model,
                 temperature=PLANNING_LLM_TEMPERATURE,
-                response_format={"type": "json_object"},
                 task_id=self.task_id,
                 llm_id=self.llm_id,
                 budget_id=self.budget_id,
@@ -707,11 +721,11 @@ class PlanningPipeline:
             from app.database import create_planning_result
             create_planning_result(
                 task_id=result.task_id,
-                file_manifest=json.dumps([vars(f) for f in result.file_manifest]),
+                file_manifest=json.dumps([asdict(f) for f in result.file_manifest]),
                 dependency_graph=json.dumps(result.dependency_graph),
-                interface_contracts=json.dumps([vars(c) for c in result.interface_contracts]),
-                test_strategy=json.dumps([vars(t) for t in result.test_strategy]),
-                implementation_steps=json.dumps([vars(s) for s in result.implementation_steps]),
+                interface_contracts=json.dumps([asdict(c) for c in result.interface_contracts]),
+                test_strategy=json.dumps([asdict(t) for t in result.test_strategy]),
+                implementation_steps=json.dumps([asdict(s) for s in result.implementation_steps]),
                 pitfalls_identified=json.dumps(result.pitfalls_identified),
                 review_votes=json.dumps([
                     {"stage": v.stage, "verdict": v.verdict.value, "confidence": v.confidence,
@@ -765,11 +779,11 @@ async def run_planning_pipeline(
         "task_id": result.task_id,
         "outcome": "passed" if result.confidence >= 60 else "rejected",
         "design_rationale": result.design_rationale,
-        "file_manifest": [vars(f) for f in result.file_manifest],
+        "file_manifest": [asdict(f) for f in result.file_manifest],
         "dependency_graph": result.dependency_graph,
-        "interface_contracts": [vars(c) for c in result.interface_contracts],
-        "test_strategy": [vars(t) for t in result.test_strategy],
-        "implementation_steps": [vars(s) for s in result.implementation_steps],
+        "interface_contracts": [asdict(c) for c in result.interface_contracts],
+        "test_strategy": [asdict(t) for t in result.test_strategy],
+        "implementation_steps": [asdict(s) for s in result.implementation_steps],
         "pitfalls_identified": result.pitfalls_identified,
         "selected_design_index": result.selected_design_index,
         "confidence": result.confidence,

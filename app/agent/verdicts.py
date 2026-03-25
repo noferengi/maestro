@@ -32,6 +32,7 @@ class Verdict(Enum):
     LIKELY = "LIKELY"
     SUBDIVIDE_IDEA = "SUBDIVIDE_IDEA"
     CONDITIONAL_PASS = "CONDITIONAL_PASS"
+    TOO_LARGE = "TOO_LARGE"  # context window exceeded — synthesised internally, triggers subdivision
 
     @property
     def confidence_range(self) -> tuple[int, int]:
@@ -47,6 +48,7 @@ _VERDICT_RANGES: dict[Verdict, tuple[int, int]] = {
     Verdict.LIKELY: (92, 100),
     Verdict.SUBDIVIDE_IDEA: (0, 100),  # categorical signal, accepts any confidence
     Verdict.CONDITIONAL_PASS: (76, 100),  # passes with noted concerns
+    Verdict.TOO_LARGE: (100, 100),  # always 100% — synthesised on context overflow, never LLM-emitted
 }
 
 
@@ -189,7 +191,13 @@ def tally_votes(votes: list[Vote]) -> TallyResult:
         )
 
     # --- Rule 3: any NEEDS_RESEARCH -> needs_research ---
-    research_votes = [v for v in votes if v.verdict is Verdict.NEEDS_RESEARCH]
+    # Votes tagged source="research_agent_epilogue" are excluded: they indicate
+    # "investigation budget was insufficient" and must not re-spawn an agent.
+    research_votes = [
+        v for v in votes
+        if v.verdict is Verdict.NEEDS_RESEARCH
+        and (v.raw_response or {}).get("source") != "research_agent_epilogue"
+    ]
     if research_votes:
         logger.debug("Tally: %d votes → outcome=needs_research", n)
         stages = [v.stage for v in research_votes]
