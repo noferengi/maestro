@@ -54,3 +54,12 @@ function labelEntry(systemContent) {
     if (lc.length > 400)                                               return 'maestro_loop';
     return 'unknown';
 }
+
+/** Classify entry type from the first user message content (for system-less calls like file summaries) */
+function labelEntryFromUser(userContent) {
+    const lc = (userContent || '').toLowerCase();
+    if (lc.includes('summarize the following source file') ||
+        lc.includes('summarize lines ') ||
+        lc.includes('source file') && lc.includes('summarize'))       return 'file_summary';
+    return 'unknown';
+}

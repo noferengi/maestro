@@ -6,15 +6,78 @@ Read `SUMMARY.md` first for context. This file is the execution guide.
 
 ## Status
 
-As of 2026-03-24: all previously planned items are complete. The scheduler-dispatched file
-summary system (migration 0022, completion registry, enqueue/execute split, async wait path)
-was implemented and fully tested this session. 572 tests passing.
+As of 2026-03-25: Column Map View (2D radial layout with drag-to-reposition and DB-persisted
+positions) is complete. 24 migrations applied. 572 tests passing (no new tests for frontend
+features — verify manually).
 
-No outstanding blockers. Suggest new priorities from the user.
+No outstanding blockers. Suggested next: run a real task end-to-end through all 9 stages.
 
 ---
 
-## COMPLETED THIS SESSION — Scheduler-Dispatched File Summary Jobs
+## COMPLETED THIS SESSION — Column Map View (2D Radial Layout)
+
+### What was built
+
+**Migration `0024_map_positions.py`**
+- `map_x REAL` and `map_y REAL` nullable columns on `tasks`.
+- Originally filed as `0011` (collision with existing big-idea migration); renamed to `0024`
+  before applying. Both columns confirmed present in `kanban.db` via `PRAGMA table_info`.
+
+**`database.py`**
+- `map_x`, `map_y` `Float` columns on `Task` SQLAlchemy model.
+- `batch_update_map_positions(updates)` — single-session bulk update, no history side-effects.
+
+**`main.py`**
+- `map_x`/`map_y` in `task_to_dict` and `allowed_fields`.
+- `PATCH /api/tasks/map-positions` — registered **before** `DELETE /api/tasks/{task_id}`
+  so FastAPI doesn't swallow the literal segment as a task ID.
+
+**`kanban.js`** — new Column Map section (appended after `toggleToolCard`):
+
+Module-level shared state:
+- `columnMapActive`, `columnMapType`, `mapTransform`, `mapDragState` — view + pan/zoom
+- `_mapCurrentEdges`, `_mapCurrentNodePositions`, `_mapCurrentColor` — live map state
+- `_mapOffsetX`, `_mapOffsetY` — bounding-box offset (canvas = layout + offset)
+- `_MAP_CARD_W` (230), `_MAP_CARD_H` (130) — card dimensions used by arrow routing
+- `_mapNodeDrag` — `{active, nodeId, startMouseCanvas, groupIds, groupStartLayout}`
+
+Key functions:
+- `openColumnMap / closeColumnMap` — toggle overlay, reset transform, call render
+- `handleColumnClick / handleTasksContainerClick` — click guards (skip cards/buttons)
+- `_mapGetTasksForColumn(colType)` — filters `allTasks`; `idea` includes `subdividing`
+- `_mapComputeLayout(tasks, colType)` — 3-phase: load saved → BFS fan-out for new
+  subdivision children → standard `placeSubtree` for fully-unpositioned roots
+- `renderColumnMap(colType)` — bounding box, canvas size, shared state init,
+  SVG defs, `_mapRedrawArrows()`, node divs with drag listeners, viewport centering,
+  `_mapSavePositions` for newly-positioned nodes
+- `_mapScreenToCanvas(sx, sy)` — `(sx - wrapLeft - panX) / zoom`
+- `_mapStartNodeDrag(e, nodeId)` — collects `groupIds = [nodeId, ...descendantIndex[nodeId]]`,
+  snapshots `groupStartLayout`, adds visual classes
+- `_mapRedrawArrows()` — removes all `<path>` elements, redraws cubics from current positions
+- `_mapSavePositions(toSave)` — async `PATCH /api/tasks/map-positions`, mirrors into `taskData`
+- `setupMapInteraction / teardownMapInteraction` — attaches/removes mousedown/move/up/wheel
+- `reconcile()` patched — skips DOM changes when `columnMapActive`; keeps `taskData` live
+
+`_mmmove` / `_mmup` in `setupMapInteraction`:
+- `_mmmove`: checks `_mapNodeDrag.active` first → moves entire `groupIds` by same delta,
+  updates DOM + `_mapCurrentNodePositions`, calls `_mapRedrawArrows()`
+- `_mmup`: clears drag state, removes CSS classes from whole group, calls `_mapSavePositions`
+  with all moved nodes in one batch
+
+**`style.css`** — new section with: `#column-map-container` fixed overlay, header bar,
+scroll-wrap, `#column-map-canvas`/`#column-map-svg` with `overflow: visible`,
+`.map-node` with `cursor: grab`, `.map-node-dragging` (`scale 1.04`, no transition),
+`.map-node-dragging-child` (lighter, `opacity 0.88`), `.map-btn` variants,
+`.column-header` pointer cursor + hover tint + `↗` glyph hint.
+
+**`index.html`** — `onclick="openColumnMap('...')"` on every column header;
+`onclick="handleTasksContainerClick(event,'...')"` on every `.tasks-container`;
+`#column-map-container` fixed overlay div; versions bumped to `style.css?v=16`,
+`kanban.js?v=20`.
+
+---
+
+## COMPLETED PREVIOUS SESSION — Scheduler-Dispatched File Summary Jobs
 
 > Implemented from plan `pure-wibbling-hummingbird.md`. All steps complete.
 

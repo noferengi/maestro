@@ -13,6 +13,95 @@ OpenAI API compatible, router mode (sequential, parallel_sessions=1).
 
 ---
 
+## Recent Work (2026-03-25 session — Column Map View (2D Radial Layout) — ALL COMPLETE)
+
+### Column Map View — interactive 2D radial canvas per column ✓
+
+Clicking any column header (ARCHITECTURE, IDEAS, PLANNING, etc.) or empty whitespace in a
+column opens a full-screen **Column Map View** — a 2D radial canvas showing tasks as cards
+with thick bezier arrows between connected nodes. Click the header again or "← Back to Board"
+to return.
+
+#### What was built
+
+**Migration `0024_map_positions.py`** (NEW) — adds `map_x REAL` and `map_y REAL` (both
+nullable) to the `tasks` table. Positions are `NULL` until a task is first rendered on the
+map. (Note: originally named `0011` by mistake; renamed before applying to avoid collision
+with the existing `0011` big-idea migration.)
+
+**`database.py`** — `map_x` and `map_y` `Float` columns on `Task` model. New
+`batch_update_map_positions(updates)` function: bulk-updates positions in a single DB
+transaction without touching task history.
+
+**`main.py`** — `map_x`/`map_y` added to `task_to_dict` and `allowed_fields`. New
+`PATCH /api/tasks/map-positions` endpoint: accepts `[{id, map_x, map_y}, ...]`, calls
+`batch_update_map_positions`, returns `{"updated": N}`. No history side-effects.
+
+**`app/web/kanban.js`** — large new section at end of file:
+
+- `openColumnMap(colType)` / `closeColumnMap()` — toggle between kanban and map view.
+  Hides `.kanban-board`, shows `#column-map-container` (fixed overlay, `left: 240px`).
+- `handleColumnClick(e, colType)` / `handleTasksContainerClick(e, colType)` — click
+  guards that skip cards/buttons before opening the map.
+- `_mapComputeLayout(tasks, colType)` — **three-phase** layout engine:
+  - Phase 1: load saved `map_x / map_y` from task data into `nodePositions`
+  - Phase 2: BFS fan-out — newly-subdivided children of positioned parents get radial
+    positions derived from their parent (handles the subdivision case without recomputing
+    the whole board)
+  - Phase 3: standard radial `placeSubtree()` for completely-unpositioned subtrees
+  - IDEAS/ARCHITECTURE: hierarchy via `parent_task_id`
+  - All other columns: hierarchy via `prerequisites`
+  - Returns `{nodes: [{id, x, y, task, newlyPositioned}], edges: [{fromId, toId}]}`
+- `renderColumnMap(colType)` — computes bounding box, sets SVG/canvas size, populates
+  shared state (`_mapCurrentEdges`, `_mapCurrentNodePositions`, `_mapCurrentColor`,
+  `_mapOffsetX`, `_mapOffsetY`), calls `_mapRedrawArrows()`, renders `.map-node` divs,
+  centers viewport, calls `_mapSavePositions()` for newly-positioned nodes.
+- `_mapRedrawArrows()` — removes all SVG `<path>` elements and redraws cubic bezier
+  arrows from current `_mapCurrentNodePositions`. Called once on render and on every
+  node-drag tick. Arrowhead via `<marker id="map-arrowhead">`.
+- `_mapScreenToCanvas(screenX, screenY)` — converts viewport coords to canvas-space
+  coords accounting for pan (`mapTransform.x/y`) and zoom (`mapTransform.scale`).
+- `_mapStartNodeDrag(e, nodeId)` — initiates group drag. Collects dragged node +
+  all descendants via `descendantIndex[nodeId]`. Snapshots layout positions for the
+  whole group. Adds `.map-node-dragging` to grabbed node, `.map-node-dragging-child`
+  to descendants.
+- `_mapSavePositions(toSave)` — async fire-and-forget: `PATCH /api/tasks/map-positions`,
+  mirrors new coords into live `taskData` so next reconcile sees them as saved.
+- `setupMapInteraction()` / `teardownMapInteraction()` — mousedown/mousemove/mouseup/wheel
+  handlers on `#column-map-scroll-wrap`. Mousemove checks `_mapNodeDrag.active` first
+  (node drag), then falls through to canvas pan. Mouseup saves all moved nodes in one
+  batch call.
+- `reconcile()` — skips DOM reconciliation when `columnMapActive`; keeps `taskData`
+  fresh so positions saved during map session are visible immediately on close.
+
+**Group drag behaviour:**
+- Dragging a parent node (BIG IDEA or any node with children) moves the entire cluster —
+  grabbed node + all descendants — by the same delta simultaneously. Arrows redraw live.
+- Dragging a leaf node moves only that node; parent and siblings stay.
+- On mouseup: one `_mapSavePositions` batch call persists all moved nodes.
+
+**Pan / zoom:**
+- Mouse drag on empty canvas: pan. Scroll wheel: zoom toward cursor (0.15×–4×).
+- Canvas transform: `translate(panX, panY) scale(zoom)` on `#column-map-canvas`.
+
+**`app/web/style.css`** — new `Column Map View` section:
+- `#column-map-container` — `position: fixed; left: 240px` overlay, `z-index: 50`
+- `#column-map-scroll-wrap` — `cursor: grab`, `overflow: hidden`
+- `#column-map-canvas`, `#column-map-svg` — `overflow: visible` (dragged nodes and
+  arrows don't clip when moved outside initial bounds)
+- `.map-node` — `cursor: grab; user-select: none`; hover lifts with shadow
+- `.map-node.map-node-dragging` — `scale(1.04)`, heavy shadow, `transition: none`
+  (instant follow, no spring lag), `z-index: 100`
+- `.map-node.map-node-dragging-child` — lighter shadow, `opacity: 0.88`, `z-index: 50`
+- `.map-btn` — small action buttons inside map nodes (Edit, Advance, Children, → Dev)
+- `.column-header` — `cursor: pointer` + hover tint; `::after` adds `↗` hint glyph
+
+**`app/web/index.html`** — `onclick="openColumnMap('...')"` on every column header;
+`onclick="handleTasksContainerClick(event,'...')"` on every `.tasks-container`. New
+`#column-map-container` div (fixed overlay) with header bar and `#column-map-scroll-wrap`.
+
+---
+
 ## Recent Work (2026-03-24 session — Scheduler-Dispatched File Summaries + Testing — ALL COMPLETE)
 
 ### Scheduler-dispatched file summary jobs ✓
@@ -180,8 +269,10 @@ app/
 │   └── mock_llm.py          Dictionary-based mock LLM
 ├── migrations/
 │   ├── runner.py            Standalone sqlite3 migration engine
-│   └── versions/            0001–0022 applied
+│   └── versions/            0001–0024 applied
 │                            0022 = file_summary_jobs table
+│                            0023 = previous_summary column
+│                            0024 = map_x / map_y on tasks (Column Map View)
 ├── models/
 │   └── dags.py              TaskDAG, TaskNode
 ├── services/
@@ -206,7 +297,7 @@ app/
     │                          _initDockZoom() IIFE (cosine falloff, 5× peak, 24px radius).
     └── diagnostics.css      Layout + diagnostic styles.
 data/
-└── kanban.db                SQLite (22 migrations applied)
+└── kanban.db                SQLite (24 migrations applied)
 logs/
 └── maestro.log              Rotating log file
 scripts/
@@ -313,6 +404,11 @@ To advance a task via curl: `curl -X POST http://localhost:8000/api/tasks/{id}/a
 - **Cost stored as µ¢ (microcents)** — rate $/M × 100 = µ¢/token. `dollar_amount == -1` → infinite budget, tokens still tallied.
 - **`isAccumulating` drives all session render choices** — `effectiveMessages`, `effectiveBoundaries`, `effectiveHighlight`, `hlClass`, and `jumpToEntry` eligibility all derived from it.
 - **`ensure_git_repo()` is idempotent per path** — `_git_init_attempted` set prevents retry on failure.
+- **Column Map positions are in layout-space, not canvas-space** — `map_x/map_y` are the coords produced by the radial layout algorithm (centered around 0). Canvas position = layout + `(_mapOffsetX, _mapOffsetY)`. The offset is recomputed from the bounding box each render, so saved positions are stable across sessions regardless of how the bounding box shifts.
+- **`batch_update_map_positions` skips task history** — position saves are high-frequency (one per drag-drop) and must not pollute the `history` column. Dedicated DB function bypasses `update_task()`.
+- **`PATCH /api/tasks/map-positions` must come before `DELETE /api/tasks/{task_id}`** — FastAPI path matching: a literal segment (`map-positions`) must be registered before a parameterised one (`{task_id}`) or the literal is swallowed as a task ID.
+- **Group drag uses `descendantIndex`** — dragging any node moves it + all descendants by the same delta. `descendantIndex` is already built by `buildDescendantIndex()` on every task load; no extra traversal needed at drag time.
+- **`#column-map-canvas` and `#column-map-svg` both need `overflow: visible`** — without it, nodes dragged outside the initial bounding box clip at the canvas edge and arrows disappear past the SVG viewport.
 - **`append_task_history()` touches only the history column** — avoids the side-effect of `update_task()`.
 - **Post-mortem is non-blocking and always caught** — `_post_mortem_call()` returns `""` on any exception. A failed post-mortem silently degrades to the old "exhausted N turns" findings text.
 - **`_modalMousedownTarget` is global** — one `mousedown` listener covers all modals. Close only fires when both `mousedown` and `click` land on the backdrop element.

@@ -308,6 +308,7 @@ class IntakePipeline:
                     task_id=self.task_id,
                     llm_id=self.llm_id,
                     budget_id=self.budget_id,
+                    project_root=get_project_path(self.project),
                 )
                 raw_verdict = research_result.vote.get("verdict", VERDICT_NOT_SUITABLE)
                 # TOO_LARGE means the task overflowed the research agent's context window —

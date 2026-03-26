@@ -46,6 +46,7 @@ from database import (
     get_child_tasks, get_active_child_tasks, count_total_sub_ideas,
     update_subdivision_record,
     get_descendant_tree, set_big_idea_flag, batch_reorder_tasks,
+    batch_update_map_positions,
 )
 from database import (
     PlanningResult, ComponentResult, OptimizationResult,
@@ -170,7 +171,7 @@ def update_existing_task(task_id: str, task_data: dict):
         raise HTTPException(status_code=404, detail="Task not found")
 
     # Only allow updating specific fields
-    allowed_fields = ['title', 'description', 'owner', 'tags', 'content', 'llm_id', 'budget_id', 'type', 'prerequisites']
+    allowed_fields = ['title', 'description', 'owner', 'tags', 'content', 'llm_id', 'budget_id', 'type', 'prerequisites', 'map_x', 'map_y']
     update_data = {key: value for key, value in task_data.items() if key in allowed_fields}
 
     # Gate: advancing a task requires description, llm_id, and budget_id
@@ -203,6 +204,20 @@ def update_existing_task(task_id: str, task_data: dict):
         _check_completion_rollup(task_id)
 
     return task_to_dict(updated_task)
+
+
+@app.patch("/api/tasks/map-positions")
+def batch_update_map_positions_endpoint(updates: list = Body(...)):
+    """
+    Bulk-save Column Map View canvas positions for a list of tasks.
+
+    Body: [{id, map_x, map_y}, ...]
+    Does NOT touch task history — purely a canvas layout persistence call.
+    """
+    if not updates:
+        return {"updated": 0}
+    count = batch_update_map_positions(updates)
+    return {"updated": count}
 
 
 @app.delete("/api/tasks/{task_id}", response_model=bool)
@@ -304,7 +319,9 @@ def _store_pipeline_result(task_id, result, budget_id):
 def _execute_subdivision(task, llm_base_url, llm_model, max_context, scope_vote, rejection_context, loop):
     """Run the SubdivisionAgent and return the result."""
     from app.agent.subdivide import run_subdivision
+    from app.database import get_project_path as _get_project_path
 
+    project_root = _get_project_path(task.project) if task.project else None
     return loop.run_until_complete(
         run_subdivision(
             parent_task_id=task.id,
@@ -317,6 +334,7 @@ def _execute_subdivision(task, llm_base_url, llm_model, max_context, scope_vote,
             llm_model=llm_model,
             llm_id=task.llm_id,
             budget_id=task.budget_id,
+            project_root=project_root,
         )
     )
 
@@ -1647,6 +1665,8 @@ def task_to_dict(task):
         "review_notes": getattr(task, "review_notes", None),
         "demotion_count": getattr(task, "demotion_count", 0) or 0,
         "demotion_history": getattr(task, "demotion_history", None),
+        "map_x": getattr(task, "map_x", None),
+        "map_y": getattr(task, "map_y", None),
         "created_at": task.created_at.isoformat() if task.created_at else None,
         "updated_at": task.updated_at.isoformat() if task.updated_at else None
     }
@@ -1683,32 +1703,51 @@ def budget_to_dict(budget):
 # Project prewarm helpers
 # ============================================
 
-def _pick_prewarm_resources() -> "tuple[int | None, int | None]":
+def _pick_prewarm_resources(
+    project_llm_id: "int | None" = None,
+    project_budget_id: "int | None" = None,
+) -> "tuple[int | None, int | None]":
     """Return (llm_id, budget_id) for background file-summary prewarm jobs.
 
-    Prefers an infinite budget (dollar_amount == -1); falls back to the first
-    budget found.  Returns (None, None) if either table is empty.
+    Uses ``project_llm_id`` / ``project_budget_id`` when the project has them
+    configured.  Falls back to the first available LLM / infinite budget only
+    when the project has none set.
+    Returns (None, None) if no LLM or budget is available.
     """
     from app.database import get_all_llms, get_all_budgets
+
+    # Resolve budget: use project's own if set; otherwise prefer infinite.
+    if project_budget_id is not None:
+        budget_id = project_budget_id
+    else:
+        budgets = get_all_budgets()
+        if not budgets:
+            return None, None
+        infinite = [b for b in budgets if b.dollar_amount == -1.0]
+        budget_id = (infinite or budgets)[0].id
+
+    # Resolve LLM: use project's own if set; otherwise first available.
+    if project_llm_id is not None:
+        return project_llm_id, budget_id
+
     llms = get_all_llms()
     if not llms:
         return None, None
-    budgets = get_all_budgets()
-    if not budgets:
-        return None, None
-    llm_id = llms[0].id
-    # Prefer infinite budgets so prewarm can never exhaust a capped one.
-    infinite = [b for b in budgets if b.dollar_amount == -1.0]
-    budget_id = (infinite or budgets)[0].id
-    return llm_id, budget_id
+    return llms[0].id, budget_id
 
 
-def _trigger_project_prewarm(project_path: str) -> None:
+def _trigger_project_prewarm(
+    project_path: str,
+    project_llm_id: "int | None" = None,
+    project_budget_id: "int | None" = None,
+) -> None:
     """Fire prewarm_project_summaries in a background daemon thread.
 
+    Uses the project's configured LLM/budget if set; falls back to the first
+    available LLM and an infinite budget.
     Silently skips if no LLM or budget is configured — prewarm is best-effort.
     """
-    llm_id, budget_id = _pick_prewarm_resources()
+    llm_id, budget_id = _pick_prewarm_resources(project_llm_id, project_budget_id)
     if llm_id is None or budget_id is None:
         logger.debug("prewarm skipped for '%s' — no LLM/budget configured", project_path)
         return
@@ -1728,18 +1767,20 @@ def _trigger_project_prewarm(project_path: str) -> None:
 # Project API Endpoints
 # ============================================
 
+def _project_to_dict(p) -> dict:
+    return {
+        "name": p.name,
+        "path": p.path or "",
+        "description": p.description or "",
+        "llm_id": p.llm_id,
+        "budget_id": p.budget_id,
+    }
+
+
 @app.get("/api/projects", response_model=List[dict])
 def list_projects():
     """List all known projects with their filesystem paths."""
-    projects = get_all_projects()
-    return [
-        {
-            "name": p.name,
-            "path": p.path or "",
-            "description": p.description or "",
-        }
-        for p in projects
-    ]
+    return [_project_to_dict(p) for p in get_all_projects()]
 
 
 @app.post("/api/projects", response_model=dict, status_code=201)
@@ -1750,25 +1791,37 @@ def create_project(data: dict):
         raise HTTPException(status_code=400, detail="Project name is required.")
     path = (data.get("path") or "").strip() or None
     description = (data.get("description") or "").strip() or None
-    project = upsert_project(name, path=path, description=description)
+    llm_id = data.get("llm_id") or None
+    if llm_id is not None:
+        llm_id = int(llm_id)
+    budget_id = data.get("budget_id") or None
+    if budget_id is not None:
+        budget_id = int(budget_id)
+    project = upsert_project(name, path=path, description=description, llm_id=llm_id, budget_id=budget_id)
     if not project:
         raise HTTPException(status_code=500, detail="Failed to create project.")
     if project.path:
-        _trigger_project_prewarm(project.path)
-    return {"name": project.name, "path": project.path or "", "description": project.description or ""}
+        _trigger_project_prewarm(project.path, project_llm_id=project.llm_id, project_budget_id=project.budget_id)
+    return _project_to_dict(project)
 
 
 @app.put("/api/projects/{project_name}", response_model=dict)
 def update_project(project_name: str, data: dict):
-    """Update a project's path and/or description."""
-    path = data.get("path")          # None means "don't change"; pass explicitly
+    """Update a project's path, description, default LLM, and/or default budget."""
+    path = data.get("path")           # None means "don't change"
     description = data.get("description")
-    project = upsert_project(project_name, path=path, description=description)
+    llm_id = data.get("llm_id", ...)      # Ellipsis = don't change; None = clear
+    if llm_id is not ... and llm_id is not None:
+        llm_id = int(llm_id)
+    budget_id = data.get("budget_id", ...)  # Ellipsis = don't change; None = clear
+    if budget_id is not ... and budget_id is not None:
+        budget_id = int(budget_id)
+    project = upsert_project(project_name, path=path, description=description, llm_id=llm_id, budget_id=budget_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or update failed.")
     if project.path:
-        _trigger_project_prewarm(project.path)
-    return {"name": project.name, "path": project.path or "", "description": project.description or ""}
+        _trigger_project_prewarm(project.path, project_llm_id=project.llm_id, project_budget_id=project.budget_id)
+    return _project_to_dict(project)
 
 
 @app.delete("/api/projects/{project_name}")
@@ -1930,9 +1983,27 @@ def budget_entry_to_dict(entry):
 @app.get("/api/budget-entries", response_model=List[dict])
 def list_budget_entries(budget_id: int = None, llm_id: int = None, task_id: str = None,
                         limit: int = 100, offset: int = 0):
-    """List budget entries with optional filters."""
-    entries = get_budget_entries(budget_id=budget_id, llm_id=llm_id, task_id=task_id,
-                                limit=limit, offset=offset)
+    """List budget entries with optional filters.
+
+    Pass ``task_id=__file_summaries__`` to retrieve all entries that have no task
+    association (project-level file summary jobs).
+    """
+    if task_id == "__file_summaries__":
+        # Special sentinel: return entries where task_id IS NULL
+        from app.database import SessionLocal as _SL, BudgetEntry as _BE
+        db = _SL()
+        try:
+            q = db.query(_BE).filter(_BE.task_id.is_(None))
+            if budget_id is not None:
+                q = q.filter(_BE.budget_id == budget_id)
+            if llm_id is not None:
+                q = q.filter(_BE.llm_id == llm_id)
+            entries = q.order_by(_BE.created_at.desc()).offset(offset).limit(limit).all()
+        finally:
+            db.close()
+    else:
+        entries = get_budget_entries(budget_id=budget_id, llm_id=llm_id, task_id=task_id,
+                                    limit=limit, offset=offset)
     return [budget_entry_to_dict(e) for e in entries]
 
 
@@ -1977,7 +2048,11 @@ def read_budget_summary(budget_id: int):
 
 @app.get("/api/diagnostics/tasks", response_model=List[dict])
 def list_diagnostic_tasks():
-    """Tasks that have LLM activity, with aggregated token counts. Ordered by most-recent activity."""
+    """Tasks that have LLM activity, with aggregated token counts. Ordered by most-recent activity.
+
+    Also includes a synthetic '__file_summaries__' row for budget entries that have no
+    task_id (project-level file summary jobs fired by the scheduler prewarm).
+    """
     from sqlalchemy import func, desc
     db = SessionLocal()
     try:
@@ -1998,7 +2073,7 @@ def list_diagnostic_tasks():
             .order_by(desc("last_activity"))
             .all()
         )
-        return [
+        result = [
             {
                 "id": r.id,
                 "title": r.title,
@@ -2012,6 +2087,33 @@ def list_diagnostic_tasks():
             }
             for r in rows
         ]
+
+        # Synthetic row: budget entries with no task_id (scheduler prewarm file summaries)
+        orphan = (
+            db.query(
+                func.count(BudgetEntry.id).label("entry_count"),
+                func.coalesce(func.sum(BudgetEntry.prompt_cost), 0).label("total_prompt_tokens"),
+                func.coalesce(func.sum(BudgetEntry.generation_cost), 0).label("total_completion_tokens"),
+                func.coalesce(func.sum(BudgetEntry.tool_calls), 0).label("total_tool_calls"),
+                func.max(BudgetEntry.created_at).label("last_activity"),
+            )
+            .filter(BudgetEntry.task_id.is_(None))
+            .one()
+        )
+        if orphan.entry_count > 0:
+            result.insert(0, {
+                "id": "__file_summaries__",
+                "title": "File Summaries",
+                "type": "file_summary",
+                "project": None,
+                "entry_count": orphan.entry_count,
+                "total_prompt_tokens": orphan.total_prompt_tokens,
+                "total_completion_tokens": orphan.total_completion_tokens,
+                "total_tool_calls": orphan.total_tool_calls,
+                "last_activity": orphan.last_activity.isoformat() if orphan.last_activity else None,
+            })
+
+        return result
     finally:
         db.close()
 

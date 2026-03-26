@@ -338,6 +338,7 @@ body {
 
 .task-actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 0.25rem;
     margin-top: 0.5rem;
 }
@@ -1034,6 +1035,7 @@ body {
     animation: pulse-badge 2s infinite;
 }
 
+
 @keyframes pulse-badge {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.5; }
@@ -1197,4 +1199,232 @@ body {
 .prereq-blocks {
     color: #6c757d;
     font-style: italic;
+}
+
+/* ============================================
+   Column Map View — 2D radial layout
+   ============================================ */
+
+/* Column headers get a pointer cursor to hint they're clickable (opens map view) */
+.column-header {
+    cursor: pointer;
+    border-radius: 4px 4px 0 0;
+    transition: background 0.15s;
+}
+
+.column-header:hover {
+    background: rgba(0, 0, 0, 0.055);
+}
+
+.column-header .column-title::after {
+    content: ' \2197';   /* ↗ northeast arrow, subtle hint */
+    font-size: 0.65rem;
+    opacity: 0.35;
+    vertical-align: super;
+}
+
+/* Full-screen overlay for the map */
+#column-map-container {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 240px;   /* sidebar width */
+    right: 0;
+    bottom: 0;
+    z-index: 50;
+    flex-direction: column;
+    background: #eef0f3;
+}
+
+#column-map-header {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.6rem 1.25rem;
+    background: #fff;
+    border-bottom: 2px solid #dee2e6;
+    flex-shrink: 0;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.07);
+}
+
+#column-map-title {
+    font-weight: 700;
+    font-size: 0.95rem;
+    letter-spacing: 0.06em;
+    color: #212529;
+}
+
+#column-map-hint {
+    font-size: 0.76rem;
+    color: #8a9bb0;
+    flex: 1;
+}
+
+#column-map-back-btn {
+    background: #495057;
+    color: #fff;
+    border: none;
+    padding: 0.35rem 0.9rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.82rem;
+    font-weight: 500;
+    transition: background 0.18s;
+    letter-spacing: 0.02em;
+}
+
+#column-map-back-btn:hover {
+    background: #343a40;
+}
+
+/* Scrollable/pannable canvas wrapper */
+#column-map-scroll-wrap {
+    flex: 1;
+    overflow: hidden;
+    position: relative;
+    cursor: grab;
+    user-select: none;
+}
+
+#column-map-scroll-wrap.dragging {
+    cursor: grabbing;
+}
+
+/* Inner canvas — SVG + nodes both live here.
+   overflow: visible so dragged nodes and arrows can extend past the initial bounds. */
+#column-map-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    transform-origin: 0 0;
+    will-change: transform;
+    overflow: visible;
+}
+
+#column-map-svg {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+    overflow: visible;
+}
+
+#column-map-nodes {
+    position: absolute;
+    top: 0;
+    left: 0;
+}
+
+/* Map node cards */
+.map-node {
+    position: absolute;
+    width: 230px;
+    background: #fff;
+    border-radius: 7px;
+    border-left: 5px solid #0d6efd;
+    box-shadow: 0 3px 10px rgba(0,0,0,0.11), 0 1px 3px rgba(0,0,0,0.07);
+    padding: 0.65rem 0.75rem 0.55rem;
+    box-sizing: border-box;
+    transition: box-shadow 0.15s, transform 0.15s;
+    z-index: 2;
+    cursor: grab;
+    user-select: none;
+}
+
+.map-node:hover {
+    box-shadow: 0 6px 20px rgba(0,0,0,0.16), 0 2px 6px rgba(0,0,0,0.09);
+    transform: translateY(-3px);
+    z-index: 20;
+}
+
+/* Node actively being dragged (the one the user grabbed) */
+.map-node.map-node-dragging {
+    cursor: grabbing;
+    z-index: 100;
+    box-shadow: 0 16px 40px rgba(0,0,0,0.22), 0 4px 12px rgba(0,0,0,0.12);
+    transform: scale(1.04);
+    transition: none;   /* follow cursor instantly — no spring lag */
+}
+
+/* Descendant nodes carried along with a group drag */
+.map-node.map-node-dragging-child {
+    z-index: 50;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.16), 0 2px 8px rgba(0,0,0,0.09);
+    opacity: 0.88;
+    transition: none;
+}
+
+/* Buttons inside nodes always show pointer, not the card's grab cursor */
+.map-node button {
+    cursor: pointer;
+}
+
+.map-node-title {
+    font-size: 0.83rem;
+    font-weight: 600;
+    color: #212529;
+    line-height: 1.35;
+    cursor: pointer;
+    margin-bottom: 0.3rem;
+    word-break: break-word;
+}
+
+.map-node-title:hover {
+    color: #0d6efd;
+    text-decoration: underline;
+}
+
+.map-node-meta {
+    font-size: 0.7rem;
+    color: #6c757d;
+    margin-bottom: 0.35rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.2rem;
+    align-items: center;
+    min-height: 1.1em;
+}
+
+.map-node-actions {
+    display: flex;
+    gap: 0.3rem;
+    flex-wrap: wrap;
+    margin-top: 0.4rem;
+    padding-top: 0.35rem;
+    border-top: 1px solid #f0f2f5;
+}
+
+/* Small action buttons inside map nodes */
+.map-btn {
+    font-size: 0.68rem;
+    padding: 0.15rem 0.5rem;
+    border-radius: 3px;
+    border: none;
+    cursor: pointer;
+    font-weight: 500;
+    transition: opacity 0.15s, filter 0.15s;
+    white-space: nowrap;
+}
+
+.map-btn:hover {
+    opacity: 0.82;
+    filter: brightness(1.08);
+}
+
+.map-btn-secondary { background: #6c757d; color: #fff; }
+.map-btn-primary   { background: #0d6efd; color: #fff; }
+.map-btn-info      { background: #0dcaf0; color: #000; }
+.map-btn-warning   { background: #ffc107; color: #000; }
+.map-btn-success   { background: #198754; color: #fff; }
+
+/* Empty-column message */
+.map-empty-msg {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    color: #adb5bd;
+    font-size: 1.1rem;
+    text-align: center;
+    pointer-events: none;
 }

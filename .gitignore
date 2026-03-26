@@ -51,3 +51,6 @@ Thumbs.db
 
 # Rotating log files — never commit live logs
 logs/
+
+# Screenshots / image assets
+*.png

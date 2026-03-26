@@ -497,6 +497,7 @@ def _run_research_job(job: Any, llm: Any) -> None:
             budget_id=job.budget_id,
             llm_base_url=llm_base_url,
             llm_model=llm.model,
+            project_root=_get_project_path(task.project) if task and task.project else None,
         ))
         update_research_job(
             job.id, status="completed",

@@ -256,6 +256,7 @@
 .type-research     { background: #ffc107; }
 .type-pitfall      { background: #e83e8c; }
 .type-maestro_loop { background: #198754; }
+.type-file_summary { background: #17a2b8; }
 .type-unknown      { background: #6c757d; }
 
 /* ── Session turn summary table ──────────────────────────── */
@@ -308,6 +309,7 @@
 .diag-conv-type-label.type-research     { background: #ffc107; color: #212529; }
 .diag-conv-type-label.type-pitfall      { background: #e83e8c; }
 .diag-conv-type-label.type-maestro_loop { background: #198754; }
+.diag-conv-type-label.type-file_summary { background: #17a2b8; }
 .diag-conv-type-label.type-unknown      { background: #6c757d; }
 
 .col-llm {

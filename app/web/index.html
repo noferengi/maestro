@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kanban Board - TheMaestro</title>
-    <link rel="stylesheet" href="/static/style.css?v=15">
-    <script src="/static/kanban.js?v=16"></script>
+    <link rel="stylesheet" href="/static/style.css?v=19">
+    <script src="/static/kanban.js?v=31"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -63,17 +63,18 @@
         <div id="breadcrumb-bar" class="breadcrumb-bar" style="display:none">
             <span class="breadcrumb-segment" onclick="zoomToRoot()" style="cursor:pointer">All Tasks</span>
             <span id="breadcrumb-trail"></span>
+            <span id="breadcrumb-filter-count" style="display:none;margin-left:0.5rem;font-size:0.8rem;color:#6c757d;font-style:italic"></span>
             <button class="breadcrumb-back" onclick="zoomToRoot()">Back to Board</button>
         </div>
 
         <div class="kanban-board">
             <!-- ARCHITECTURE Column (IMMUTABLE) -->
             <div class="column" id="column-architecture">
-                <div class="column-header">
+                <div class="column-header" onclick="openColumnMap('architecture')" title="Click to open Architecture Map">
                     <span class="column-title">ARCHITECTURE</span>
                     <span class="task-count" id="count-architecture">2</span>
                 </div>
-                <div class="tasks-container" id="tasks-architecture">
+                <div class="tasks-container" id="tasks-architecture" onclick="handleTasksContainerClick(event,'architecture')">
                     <div class="task-card architecture" data-id="arch-1">
                         <div class="task-title">Project Stack</div>
                         <div class="task-meta">
@@ -104,11 +105,11 @@
 
             <!-- IDEA Column -->
             <div class="column" id="column-idea">
-                <div class="column-header">
+                <div class="column-header" onclick="openColumnMap('idea')" title="Click to open Ideas Map">
                     <span class="column-title">IDEAS</span>
                     <span class="task-count" id="count-idea">0</span>
                 </div>
-                <div class="tasks-container" id="tasks-idea">
+                <div class="tasks-container" id="tasks-idea" onclick="handleTasksContainerClick(event,'idea')">
                     <!-- Tasks will be rendered from database -->
                 </div>
                 <button class="add-task-btn" onclick="openAddTaskModal('idea')">+ Add Idea</button>
@@ -116,75 +117,90 @@
 
             <!-- PLANNING Column -->
             <div class="column" id="column-planning">
-                <div class="column-header">
+                <div class="column-header" onclick="openColumnMap('planning')" title="Click to open Planning Map">
                     <span class="column-title">PLANNING</span>
                     <span class="task-count" id="count-planning">0</span>
                 </div>
-                <div class="tasks-container" id="tasks-planning">
+                <div class="tasks-container" id="tasks-planning" onclick="handleTasksContainerClick(event,'planning')">
                     <!-- Tasks will be rendered from database -->
                 </div>
             </div>
 
             <!-- IN DEVELOPMENT Column -->
             <div class="column" id="column-indev">
-                <div class="column-header">
+                <div class="column-header" onclick="openColumnMap('indev')" title="Click to open In Development Map">
                     <span class="column-title">IN DEVELOPMENT</span>
                     <span class="task-count" id="count-indev">0</span>
                 </div>
-                <div class="tasks-container" id="tasks-indev">
+                <div class="tasks-container" id="tasks-indev" onclick="handleTasksContainerClick(event,'indev')">
                     <!-- Tasks will be rendered from database -->
                 </div>
             </div>
 
             <!-- CONCEPTUAL REVIEW Column -->
             <div class="column" id="column-conceptual_review">
-                <div class="column-header">
+                <div class="column-header" onclick="openColumnMap('conceptual_review')" title="Click to open Conceptual Review Map">
                     <span class="column-title">CONCEPTUAL REVIEW</span>
                     <span class="task-count" id="count-conceptual_review">0</span>
                 </div>
-                <div class="tasks-container" id="tasks-conceptual_review">
+                <div class="tasks-container" id="tasks-conceptual_review" onclick="handleTasksContainerClick(event,'conceptual_review')">
                     <!-- Tasks will be rendered from database -->
                 </div>
             </div>
 
             <!-- OPTIMIZATION Column -->
             <div class="column" id="column-optimization">
-                <div class="column-header">
+                <div class="column-header" onclick="openColumnMap('optimization')" title="Click to open Optimization Map">
                     <span class="column-title">OPTIMIZATION</span>
                     <span class="task-count" id="count-optimization">0</span>
                 </div>
-                <div class="tasks-container" id="tasks-optimization">
+                <div class="tasks-container" id="tasks-optimization" onclick="handleTasksContainerClick(event,'optimization')">
                 </div>
             </div>
 
             <!-- SECURITY Column -->
             <div class="column" id="column-security">
-                <div class="column-header">
+                <div class="column-header" onclick="openColumnMap('security')" title="Click to open Security Map">
                     <span class="column-title">SECURITY</span>
                     <span class="task-count" id="count-security">0</span>
                 </div>
-                <div class="tasks-container" id="tasks-security">
+                <div class="tasks-container" id="tasks-security" onclick="handleTasksContainerClick(event,'security')">
                 </div>
             </div>
 
             <!-- FULL REVIEW Column -->
             <div class="column" id="column-full_review">
-                <div class="column-header">
+                <div class="column-header" onclick="openColumnMap('full_review')" title="Click to open Final Review Map">
                     <span class="column-title">FINAL REVIEW</span>
                     <span class="task-count" id="count-full_review">0</span>
                 </div>
-                <div class="tasks-container" id="tasks-full_review">
+                <div class="tasks-container" id="tasks-full_review" onclick="handleTasksContainerClick(event,'full_review')">
                 </div>
             </div>
 
             <!-- COMPLETED Column -->
             <div class="column" id="column-completed">
-                <div class="column-header">
+                <div class="column-header" onclick="openColumnMap('completed')" title="Click to open Completed Map">
                     <span class="column-title">COMPLETED</span>
                     <span class="task-count" id="count-completed">0</span>
                 </div>
-                <div class="tasks-container" id="tasks-completed">
+                <div class="tasks-container" id="tasks-completed" onclick="handleTasksContainerClick(event,'completed')">
                     <!-- Tasks will be rendered from database -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Column Map View (2D radial layout) — shown when a column header is clicked -->
+        <div id="column-map-container">
+            <div id="column-map-header">
+                <span id="column-map-title">MAP VIEW</span>
+                <span id="column-map-hint">Scroll to zoom &middot; Drag to pan &middot; Click card title to edit</span>
+                <button id="column-map-back-btn" onclick="closeColumnMap()">&#8592; Back to Board</button>
+            </div>
+            <div id="column-map-scroll-wrap">
+                <div id="column-map-canvas">
+                    <svg id="column-map-svg"></svg>
+                    <div id="column-map-nodes"></div>
                 </div>
             </div>
         </div>
@@ -282,6 +298,16 @@
                     <div style="font-size:0.78rem;color:#6c757d;margin-top:0.25rem">Absolute path to the project's git repository root. Used for all agent git operations.</div>
                 </div>
                 <div class="form-group">
+                    <label class="form-label" for="new-project-llm-select">Default LLM</label>
+                    <select class="form-input" id="new-project-llm-select"></select>
+                    <div style="font-size:0.78rem;color:#6c757d;margin-top:0.25rem">Used for file summarisation and other maintenance jobs not tied to a specific card.</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="new-project-budget-select">Budget</label>
+                    <select class="form-input" id="new-project-budget-select"></select>
+                    <div style="font-size:0.78rem;color:#6c757d;margin-top:0.25rem">Budget charged for project-level maintenance jobs (file summaries, prewarm).</div>
+                </div>
+                <div class="form-group">
                     <label class="form-label" for="new-project-description">Description</label>
                     <textarea class="form-textarea" id="new-project-description" rows="2" placeholder="Optional description..."></textarea>
                 </div>
@@ -311,6 +337,16 @@
                     <label class="form-label" for="edit-project-path">Root Path</label>
                     <input type="text" class="form-input" id="edit-project-path" placeholder="e.g. D:\workspace\MyApp">
                     <div style="font-size:0.78rem;color:#6c757d;margin-top:0.25rem">Absolute path to the project's git repository root. Used for all agent git operations.</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="edit-project-llm-select">Default LLM</label>
+                    <select class="form-input" id="edit-project-llm-select"></select>
+                    <div style="font-size:0.78rem;color:#6c757d;margin-top:0.25rem">Used for file summarisation and other maintenance jobs not tied to a specific card.</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="edit-project-budget-select">Budget</label>
+                    <select class="form-input" id="edit-project-budget-select"></select>
+                    <div style="font-size:0.78rem;color:#6c757d;margin-top:0.25rem">Budget charged for project-level maintenance jobs (file summaries, prewarm).</div>
                 </div>
                 <div class="form-group">
                     <label class="form-label" for="edit-project-description">Description</label>

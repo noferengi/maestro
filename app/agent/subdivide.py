@@ -274,6 +274,7 @@ class SubdivisionAgent:
         llm_model: str | None = None,
         llm_id: int | None = None,
         budget_id: int | None = None,
+        project_root: str | None = None,
     ) -> None:
         self.parent_task_id = parent_task_id
         self.parent_title = parent_title
@@ -286,6 +287,7 @@ class SubdivisionAgent:
         self.llm_model = llm_model or LLM_MODEL
         self.llm_id = llm_id
         self.budget_id = budget_id
+        self.project_root = project_root
 
         # Context-aware tool selection
         self._has_source = _has_meaningful_source_files()
@@ -423,11 +425,14 @@ class SubdivisionAgent:
     # ------------------------------------------------------------------
 
     def _build_context(self) -> str:
-        try:
-            from app.agent.project_snapshot import build_snapshot_with_summaries
-            snapshot = build_snapshot_with_summaries()
-            parts = [snapshot, f"## Task to Decompose"]
-        except Exception:
+        if self.project_root:
+            try:
+                from app.agent.project_snapshot import build_snapshot_with_summaries
+                snapshot = build_snapshot_with_summaries(self.project_root)
+                parts = [snapshot, f"## Task to Decompose"]
+            except Exception:
+                parts = [f"## Task to Decompose"]
+        else:
             parts = [f"## Task to Decompose"]
         parts += [
             f"**ID:** {self.parent_task_id}",
@@ -609,6 +614,7 @@ async def run_subdivision(
     llm_model: str | None = None,
     llm_id: int | None = None,
     budget_id: int | None = None,
+    project_root: str | None = None,
 ) -> SubdivisionResult:
     """Run a subdivision agent and return its result."""
     agent = SubdivisionAgent(
@@ -622,5 +628,6 @@ async def run_subdivision(
         llm_model=llm_model,
         llm_id=llm_id,
         budget_id=budget_id,
+        project_root=project_root,
     )
     return await agent.run()

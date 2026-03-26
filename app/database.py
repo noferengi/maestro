@@ -381,6 +381,8 @@ class Project(Base):
     name = Column(String, primary_key=True)
     path = Column(String, nullable=True)       # Absolute path to the project root
     description = Column(Text, nullable=True)
+    llm_id = Column(Integer, ForeignKey("llms.id"), nullable=True)     # Default LLM for maintenance jobs
+    budget_id = Column(Integer, ForeignKey("budgets.id"), nullable=True)  # Default budget for maintenance jobs
     created_at = Column(DateTime, default=datetime.utcnow)
 
     def __repr__(self):
@@ -466,6 +468,8 @@ class Task(Base):
     review_notes = Column(Text, nullable=True)
     demotion_count = Column(Integer, nullable=False, default=0)
     demotion_history = Column(JSON, nullable=True)
+    map_x = Column(Float, nullable=True)   # Saved 2D canvas X position (Column Map View)
+    map_y = Column(Float, nullable=True)   # Saved 2D canvas Y position (Column Map View)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -779,6 +783,32 @@ def update_task(task_id, **kwargs):
         db.close()
 
 
+def batch_update_map_positions(updates):
+    """
+    Bulk-save map_x / map_y for a list of tasks without touching task history.
+
+    updates: iterable of dicts, each with keys: id, map_x, map_y
+    Returns the number of rows updated.
+    """
+    db = SessionLocal()
+    try:
+        count = 0
+        for u in updates:
+            task = db.query(Task).filter(Task.id == u['id']).first()
+            if task:
+                task.map_x = float(u['map_x'])
+                task.map_y = float(u['map_y'])
+                count += 1
+        db.commit()
+        return count
+    except Exception as e:
+        db.rollback()
+        logger.error("Error batch-updating map positions: %s", e)
+        return 0
+    finally:
+        db.close()
+
+
 def delete_task(task_id):
     """Delete a task"""
     db = SessionLocal()
@@ -1005,11 +1035,21 @@ def get_project_path(project_name: str) -> str | None:
     return project.path if project else None
 
 
-def upsert_project(name: str, path: str | None = None, description: str | None = None):
+def upsert_project(
+    name: str,
+    path: str | None = None,
+    description: str | None = None,
+    llm_id: int | None = ...,     # type: ignore[assignment]
+    budget_id: int | None = ...,  # type: ignore[assignment]
+) -> "Project | None":
     """
     Create or update a project.  ``path`` is the absolute filesystem root of
     the project's git repository.  Passing path=None leaves an existing path
     unchanged (use empty string to explicitly clear it).
+
+    ``llm_id`` and ``budget_id`` follow the same sentinel pattern: the default
+    value of ``...`` (Ellipsis) means "don't change the existing value".
+    Pass an int or None explicitly to set/clear either field.
     """
     db = SessionLocal()
     try:
@@ -1019,11 +1059,21 @@ def upsert_project(name: str, path: str | None = None, description: str | None =
                 existing.path = path or None
             if description is not None:
                 existing.description = description
+            if llm_id is not ...:
+                existing.llm_id = llm_id
+            if budget_id is not ...:
+                existing.budget_id = budget_id
             db.commit()
             db.refresh(existing)
             return existing
         else:
-            project = Project(name=name, path=path or None, description=description)
+            project = Project(
+                name=name,
+                path=path or None,
+                description=description,
+                llm_id=llm_id if llm_id is not ... else None,
+                budget_id=budget_id if budget_id is not ... else None,
+            )
             db.add(project)
             db.commit()
             db.refresh(project)

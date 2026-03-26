@@ -257,8 +257,14 @@ def _assert_safe_path(path: str) -> str:
     Returns the absolute resolved path string.
     Raises ValueError if the path escapes the effective root.
     """
-    resolved = os.path.realpath(os.path.abspath(path))
     effective_root = _task_git_cwd.get() or PROJECT_ROOT
+    # Resolve relative paths against the effective project root, not the process CWD.
+    # Without this, 'PRD.md' would resolve to TheMaestro's directory when an agent
+    # is operating on a different project (e.g. AndroidStreetPass).
+    if os.path.isabs(path):
+        resolved = os.path.realpath(path)
+    else:
+        resolved = os.path.realpath(os.path.join(effective_root, path))
     root = os.path.realpath(effective_root)
     if not resolved.startswith(root):
         logger.warning("Path escape attempt: %s outside %s", resolved, effective_root)

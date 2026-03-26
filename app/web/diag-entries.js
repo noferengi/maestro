@@ -20,8 +20,11 @@ async function selectTask(taskId) {
     renderedSessionKey = null;
 
     try {
+        // __file_summaries__ is a synthetic task for budget entries with no task association.
+        // Use the special sentinel value so the backend returns null-task entries.
+        const fetchTaskId = taskId === '__file_summaries__' ? '__file_summaries__' : taskId;
         // GET /api/budget-entries returns DESC; reverse for chronological order
-        const resp = await fetch(`${API_BASE}/budget-entries?task_id=${encodeURIComponent(taskId)}&limit=500`);
+        const resp = await fetch(`${API_BASE}/budget-entries?task_id=${encodeURIComponent(fetchTaskId)}&limit=500`);
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const entries = await resp.json();
         currentEntries  = entries.reverse(); // ascending chronological

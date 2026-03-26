@@ -93,7 +93,7 @@ def _format_size(size_bytes: int) -> str:
         return f"{size_bytes / (1024 * 1024):.1f}MB"
 
 
-def build_project_snapshot(project_root: str | None = None, max_depth: int | None = None) -> str:
+def build_project_snapshot(project_root: str, max_depth: int | None = None) -> str:
     """Build an indented directory tree with file annotations.
 
     For .py files: shows line count, class count, function count.
@@ -101,9 +101,9 @@ def build_project_snapshot(project_root: str | None = None, max_depth: int | Non
 
     Respects TOOL_LISTING_EXCLUDED_DIRS. Truncates if estimated
     token count exceeds the configured budget.
+
+    project_root must be an explicit path — there is no default fallback.
     """
-    if project_root is None:
-        project_root = PROJECT_ROOT
     if max_depth is None:
         max_depth = _snapshot_max_depth()
 
@@ -446,7 +446,7 @@ def prewarm_project_summaries(
 # ---------------------------------------------------------------------------
 
 def build_snapshot_with_summaries(
-    project_root: str | None = None,
+    project_root: str,
     max_depth: int | None = None,
 ) -> str:
     """Like build_project_snapshot() but appends a cached summary to each file line.
@@ -454,9 +454,9 @@ def build_snapshot_with_summaries(
     Uses the same cache key as build_project_snapshot so they share TTL/invalidation.
     Summary text is the first sentence from the DB cache (get_file_summary_by_path).
     Cache miss → file line emitted without summary (no placeholder noise for the LLM).
+
+    project_root must be an explicit path — there is no default fallback.
     """
-    if project_root is None:
-        project_root = PROJECT_ROOT
     if max_depth is None:
         max_depth = _snapshot_max_depth()
 

@@ -171,9 +171,12 @@ function renderConversation(entry, highlightFrom, anchorEntryId, selectedFull, s
     const effectiveBoundaries = isAccumulating ? sessionBoundaries : null;
     const effectiveHighlight  = isAccumulating ? highlightFrom : null;
 
-    // Infer type from first system message of the anchor entry's context
+    // Infer type from first system message; fall back to first user message for system-less calls
     const firstSys  = effectiveMessages.find(m => m.role === 'system');
-    const entryType = labelEntry(firstSys?.content || '');
+    const firstUser = effectiveMessages.find(m => m.role === 'user');
+    const entryType = firstSys
+        ? labelEntry(firstSys.content || '')
+        : labelEntryFromUser(typeof firstUser?.content === 'string' ? firstUser.content : '');
 
     // Update the type dot for the selected entry in the middle panel
     const dotId = anchorEntryId || entry.id;
@@ -436,9 +439,18 @@ function toggleReasoning(el) {
 // symmetrically (equal up/down), capped at 112.5% to keep the bar tidy.
 
 (function _initDockZoom() {
-    const MAX_SCALE_X  = 5;     // peak horizontal factor — applied as flex-grow multiplier
-    const MAX_SCALE_Y  = 1.0; // peak vertical factor   — applied as scaleY (±6.25% each way)
-    const INFLUENCE_PX = 80;    // ~¼ inch at 96 CSS-DPI
+    const MAX_SCALE_X  = 3;    // peak horizontal factor — applied as flex-grow multiplier
+    const MAX_SCALE_Y  = 1.0;  // peak vertical factor   — applied as scaleY (±6.25% each way)
+    const INFLUENCE_PX = 80;   // ~¼ inch at 96 CSS-DPI
+
+    // Minimum hover width (in CSS pixels) for any segment when computing which segment
+    // the cursor is "over" in virtual space. A 1-px segment would otherwise be skipped
+    // by a single mousemove tick. Expressed as a fraction of a 1920-px reference screen
+    // so it scales naturally on wider/narrower displays. devicePixelRatio is NOT used
+    // here because offsetX / getBoundingClientRect() are already in CSS pixels.
+    function _minHoverPx() {
+        return 24 * (window.innerWidth / 1920);
+    }
 
     let _activeBar = null;
     // Natural (pre-zoom) widths per bar, measured before the first zoom frame.
@@ -455,20 +467,61 @@ function toggleReasoning(el) {
         _naturalWidths.set(bar, cache);
     }
 
+    /**
+     * Given mouse offsetX within the bar and the array of natural segment widths,
+     * return the index of the segment the virtual cursor is over.
+     *
+     * Virtual space: each segment is allocated Math.max(naturalWidth, minHoverPx)
+     * virtual pixels. Mouse offsetX is mapped linearly into this stretched space,
+     * then a simple range scan finds the active segment. This guarantees that even
+     * a 1-px segment occupies minHoverPx virtual pixels, making it reachable.
+     */
+    function _virtualHitTest(relX, barWidth, natWidths) {
+        const minPx = _minHoverPx();
+        // Build virtual widths and cumulative positions in one pass.
+        const virtualWidths = natWidths.map(w => Math.max(w, minPx));
+        const totalVirtual  = virtualWidths.reduce((s, w) => s + w, 0);
+
+        // Map the real mouse position into virtual space.
+        // clamp to [0, barWidth) to handle sub-pixel rounding at edges.
+        const clampedRelX = Math.max(0, Math.min(relX, barWidth - 0.001));
+        // Linear mapping: real [0, barWidth] → virtual [0, totalVirtual]
+        const vX = (clampedRelX / barWidth) * totalVirtual;
+
+        // Scan to find the owning virtual segment.
+        let cursor = 0;
+        for (let i = 0; i < virtualWidths.length; i++) {
+            cursor += virtualWidths[i];
+            if (vX < cursor) return i;
+        }
+        return virtualWidths.length - 1; // clamp to last
+    }
+
     function _apply(bar, mouseX) {
         const barRect  = bar.getBoundingClientRect();
         const relX     = mouseX - barRect.left;
-        const segs     = bar.querySelectorAll('.ctx-seg:not(.ctx-seg-free)');
+        const segs     = Array.from(bar.querySelectorAll('.ctx-seg:not(.ctx-seg-free)'));
         const natCache = _naturalWidths.get(bar);
+
+        if (segs.length === 0) return;
 
         bar.classList.add('dock-zooming');
 
-        segs.forEach(seg => {
-            const r        = seg.getBoundingClientRect();
+        // Collect natural widths for all segments (needed for both hit-test and visual).
+        const natWidths = segs.map(seg => {
+            const r = seg.getBoundingClientRect();
+            return natCache ? (natCache.get(seg) ?? r.width) : r.width;
+        });
+
+        // Virtual hit-test: find which segment the cursor is logically over.
+        const activeIdx = _virtualHitTest(relX, barRect.width, natWidths);
+
+        // Visual magnification: cosine falloff centred on the active segment's real midpoint.
+        // Accumulate real pixel positions from the left edge of the bar.
+        let realCursor = 0;
+        segs.forEach((seg, i) => {
             const origGrow = parseFloat(seg.dataset.origGrow) || 1;
-            // Use the stable pre-zoom width for the threshold (live r.width oscillates
-            // when neighbouring segs are magnified, causing flicker on large segments).
-            const natWidth = natCache ? (natCache.get(seg) ?? r.width) : r.width;
+            const natWidth = natWidths[i];
 
             // Skip magnification for segments already wider than the influence diameter —
             // zooming a large segment further adds no usability value.
@@ -476,14 +529,15 @@ function toggleReasoning(el) {
                 seg.style.flexGrow  = origGrow;
                 seg.style.transform = '';
                 seg.style.zIndex    = '';
+                realCursor += natWidth;
                 return;
             }
 
-            const cx     = r.left + r.width / 2 - barRect.left;
-            // If cursor is inside this segment clamp dist=0 so it always gets max zoom.
-            // Neighbours use normal mouse-to-centre distance for the cosine falloff.
-            const inside = mouseX >= r.left && mouseX <= r.right;
-            const dist   = inside ? 0 : Math.abs(relX - cx);
+            // Real midpoint of this segment in bar-relative coordinates.
+            const midX = realCursor + natWidth / 2;
+            // If this is the virtually-active segment treat dist=0 (max zoom).
+            const dist = (i === activeIdx) ? 0 : Math.abs(relX - midX);
+            realCursor += natWidth;
 
             if (dist >= INFLUENCE_PX) {
                 seg.style.flexGrow  = origGrow;
@@ -548,6 +602,7 @@ function toggleReasoning(el) {
         research:     '#ffc107',
         pitfall:      '#e83e8c',
         maestro_loop: '#198754',
+        file_summary: '#17a2b8',
         unknown:      '#6c757d',
     };
 
@@ -576,12 +631,15 @@ function toggleReasoning(el) {
         const labelFe   = (feIdx === 0 && fullEntries.length > 1) ? fullEntries[1] : fe;
         const labelMsgs = Array.isArray(labelFe.prompt_data) ? labelFe.prompt_data : [];
         const labelSys  = labelMsgs.find(m => m.role === 'system');
+        const labelUser = labelMsgs.find(m => m.role === 'user');
         const rawSys    = labelSys
             ? (typeof labelSys.content === 'string'
                 ? labelSys.content
                 : (Array.isArray(labelSys.content) ? (labelSys.content[0]?.text || '') : ''))
             : '';
-        const agentType  = labelEntry(rawSys);
+        const agentType  = rawSys
+            ? labelEntry(rawSys)
+            : labelEntryFromUser(typeof labelUser?.content === 'string' ? labelUser.content : '');
         const agentColor = TYPE_COLORS[agentType] || '#6c757d';
         const agentText  = agentType === 'research' ? '#212529' : '#fff';
 

@@ -281,6 +281,7 @@ class ResearchAgent:
         llm_id: int | None = None,
         budget_id: int | None = None,
         max_context: int = 0,
+        project_root: str | None = None,
     ) -> None:
         self.question = question
         self.context = context
@@ -293,6 +294,7 @@ class ResearchAgent:
         self.llm_id = llm_id
         self.budget_id = budget_id
         self.max_context = max_context
+        self.project_root = project_root
 
         self._restricted_schemas = _build_restricted_schemas()
         self._accumulated_findings: list[str] = []
@@ -631,11 +633,14 @@ class ResearchAgent:
     def _build_life_context(self, life_num: int) -> str:
         """Build the user message for a given life."""
         if life_num == 1:
-            try:
-                from app.agent.project_snapshot import build_snapshot_with_summaries
-                snapshot = build_snapshot_with_summaries()
-                parts = [snapshot, f"## Investigation Question\n{self.question}"]
-            except Exception:
+            if self.project_root:
+                try:
+                    from app.agent.project_snapshot import build_snapshot_with_summaries
+                    snapshot = build_snapshot_with_summaries(self.project_root)
+                    parts = [snapshot, f"## Investigation Question\n{self.question}"]
+                except Exception:
+                    parts = [f"## Investigation Question\n{self.question}"]
+            else:
                 parts = [f"## Investigation Question\n{self.question}"]
             parts.append(f"\n## Context\n```json\n{json.dumps(self.context, indent=2, default=str)}\n```")
         else:
@@ -748,6 +753,7 @@ async def run_research(
     task_id: str | None = None,
     llm_id: int | None = None,
     budget_id: int | None = None,
+    project_root: str | None = None,
 ) -> ResearchResult:
     """Run a research agent and return its result."""
     _max_context = 0
@@ -767,6 +773,7 @@ async def run_research(
         llm_id=llm_id,
         budget_id=budget_id,
         max_context=_max_context,
+        project_root=project_root,
     )
     return await agent.run()
 

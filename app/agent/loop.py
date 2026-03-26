@@ -308,14 +308,14 @@ class MaestroLoop:
         Assemble the initial message list:
           [system_prompt, user_task_brief]
         """
-        try:
-            from app.agent.project_snapshot import build_snapshot_with_summaries
-            snapshot = build_snapshot_with_summaries(
-                project_root=getattr(self, 'project_path', None) or None
-            )
-            snapshot_block = f"\n\n{snapshot}"
-        except Exception:
-            snapshot_block = ""
+        _project_path = getattr(self, 'project_path', None) or None
+        snapshot_block = ""
+        if _project_path:
+            try:
+                from app.agent.project_snapshot import build_snapshot_with_summaries
+                snapshot_block = f"\n\n{build_snapshot_with_summaries(_project_path)}"
+            except Exception:
+                pass
 
         return [
             {"role": "system", "content": MAESTRO_SYSTEM_PROMPT},
