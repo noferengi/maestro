@@ -439,6 +439,23 @@ class FileSummaryJob(Base):
         return f"<FileSummaryJob(id={self.id}, sha1={self.sha1_hash[:8]}…, status='{self.status}')>"
 
 
+class SearchCache(Base):
+    """
+    Local cache of web search results.
+    Prevents redundant API calls for identical queries.
+    """
+    __tablename__ = "search_cache"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    query = Column(String, nullable=False, index=True, unique=True)
+    result_json = Column(Text, nullable=False)  # Full JSON response from the search provider
+    provider = Column(String, nullable=False, default='brave')
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<SearchCache(id={self.id}, query='{self.query[:40]}…', provider='{self.provider}')>"
+
+
 class Task(Base):
     """
     Kanban Task Model
@@ -693,6 +710,47 @@ def count_pending_file_summary_jobs() -> int:
     except Exception as exc:
         logger.error("Error counting pending file summary jobs: %s", exc)
         return 0
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# SearchCache CRUD
+# ---------------------------------------------------------------------------
+
+def get_search_cache(query: str, provider: str = 'brave') -> "SearchCache | None":
+    """Return a cached search result for the exact query and provider, or None."""
+    db = SessionLocal()
+    try:
+        # Standardise query to improve hit rate (strip whitespace)
+        q = query.strip()
+        return (
+            db.query(SearchCache)
+            .filter(SearchCache.query == q, SearchCache.provider == provider)
+            .first()
+        )
+    finally:
+        db.close()
+
+
+def create_search_cache(query: str, result_json: str, provider: str = 'brave') -> "SearchCache":
+    """Insert a new search cache entry. Returns the created (or existing) row."""
+    db = SessionLocal()
+    try:
+        q = query.strip()
+        row = SearchCache(
+            query=q,
+            result_json=result_json,
+            provider=provider
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row
+    except Exception:
+        db.rollback()
+        # Race/Duplicate: return existing
+        return db.query(SearchCache).filter(SearchCache.query == q, SearchCache.provider == provider).first()
     finally:
         db.close()
 

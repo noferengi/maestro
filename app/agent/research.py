@@ -31,6 +31,7 @@ from typing import Any
 from app.agent.config import (
     LLM_BASE_URL,
     LLM_MODEL,
+    PROJECT_ROOT,
     INTAKE_LLM_TEMPERATURE,
     RESEARCH_AGENT_MAX_LIVES,
     RESEARCH_AGENT_MAX_TURNS_PER_LIFE,
@@ -39,10 +40,33 @@ from app.agent.config import (
 )
 from app.agent.json_utils import extract_json_block
 from app.agent.llm_client import call_llm
-from app.agent.tools import TOOL_SCHEMAS, TOOL_REGISTRY, dispatch_tool
+from app.agent.tools import TOOL_SCHEMAS, TOOL_REGISTRY, dispatch_tool, LISTING_EXCLUDED_DIRS
 from app.database import get_llm
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Source file extensions for greenfield detection
+# ---------------------------------------------------------------------------
+
+_SOURCE_EXTENSIONS = {
+    '.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.kt', '.go',
+    '.rs', '.c', '.cpp', '.h', '.hpp', '.cs', '.rb', '.swift',
+    '.dart', '.scala', '.php', '.lua', '.zig', '.nim',
+}
+
+
+def _has_meaningful_source_files(project_root: str = PROJECT_ROOT) -> bool:
+    """Check if the project directory contains meaningful source code files."""
+    import os
+    for root, dirs, files in os.walk(project_root):
+        dirs[:] = [d for d in dirs if d not in LISTING_EXCLUDED_DIRS]
+        for fname in files:
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in _SOURCE_EXTENSIONS:
+                return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -120,11 +144,20 @@ def _extract_section(text: str, header: str) -> str:
 # Restricted tool schemas — only the tools a research agent is allowed to use
 # ---------------------------------------------------------------------------
 
-def _build_restricted_schemas() -> list[dict]:
-    """Filter TOOL_SCHEMAS to only include tools in RESEARCH_AGENT_TOOLS."""
+def _build_restricted_schemas(has_source: bool = True) -> list[dict]:
+    """Filter TOOL_SCHEMAS to only include tools in RESEARCH_AGENT_TOOLS.
+
+    If has_source is False (greenfield), excludes codebase read tools (read_file, search_files, etc).
+    Always includes list_directory, find_files, git_status, git_log.
+    """
+    allowed = set(RESEARCH_AGENT_TOOLS)
+    if not has_source:
+        # Exclude deep-read tools for greenfield
+        allowed.difference_update({"read_file", "search_files", "git_diff", "git_blame", "git_show"})
+
     return [
         schema for schema in TOOL_SCHEMAS
-        if schema.get("function", {}).get("name") in RESEARCH_AGENT_TOOLS
+        if schema.get("function", {}).get("name") in allowed
     ]
 
 
@@ -296,7 +329,11 @@ class ResearchAgent:
         self.max_context = max_context
         self.project_root = project_root
 
-        self._restricted_schemas = _build_restricted_schemas()
+        # Greenfield detection
+        self._has_source = _has_meaningful_source_files(self.project_root or PROJECT_ROOT)
+        self._restricted_schemas = _build_restricted_schemas(self._has_source)
+        self._allowed_tools = {s["function"]["name"] for s in self._restricted_schemas}
+
         self._accumulated_findings: list[str] = []
         self._accumulated_summaries: list[str] = []  # post-mortem per exhausted life
         self._total_prompt_tokens = 0
@@ -737,6 +774,122 @@ class ResearchAgent:
         except (json.JSONDecodeError, ValueError):
             pass
         return None
+
+
+# ---------------------------------------------------------------------------
+# Web Search Agent — Synthesis and Fetching
+# ---------------------------------------------------------------------------
+
+_WEB_SEARCH_SYSTEM_PROMPT = """You are a **Web Search Synthesis Agent**.
+Your job is to find the answer to a specific user query by analyzing web search results.
+
+== CONTEXT ==
+You will receive:
+1. The original user query.
+2. A list of search result hits (titles, URLs, and snippets).
+
+== YOUR MISSION ==
+1.  Review the search snippets.
+2.  Use the `web_fetch` tool to read the full content of the most promising hits (up to 5).
+3.  **QUIT EARLY** if you find a definitive answer to the user's query.
+4.  Produce a highly compact Markdown summary of the facts you found.
+
+== RULES ==
+- Use `web_fetch(url)` to get the actual content of a page.
+- Focus exclusively on the user's query. Ignore irrelevant content.
+- Format your final response as a Markdown summary.
+- Do NOT return a JSON verdict like the Research Agent. Output prose Markdown.
+- If you find the answer, end your response with: "== ANSWER FOUND =="
+"""
+
+class WebSearchAgent:
+    """
+    Agent that visits web results and synthesizes a summary.
+    """
+    def __init__(
+        self,
+        query: str,
+        results: list[dict],
+        llm_base_url: str | None = None,
+        llm_model: str | None = None,
+        task_id: str | None = None,
+        llm_id: int | None = None,
+        budget_id: int | None = None,
+    ) -> None:
+        self.query = query
+        self.results = results
+        self.llm_base_url = llm_base_url or LLM_BASE_URL
+        self.llm_model = llm_model or LLM_MODEL
+        self.task_id = task_id
+        self.llm_id = llm_id
+        self.budget_id = budget_id
+
+    async def run(self) -> str:
+        messages = [
+            {"role": "system", "content": _WEB_SEARCH_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Query: {self.query}\n\nSearch Results:\n{json.dumps(self.results, indent=2)}"}
+        ]
+
+        # Allowed tools: only web_fetch
+        fetch_schema = [s for s in TOOL_SCHEMAS if s["function"]["name"] == "web_fetch"]
+
+        max_turns = 10
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+
+        for turn in range(max_turns):
+            response = await call_llm(
+                messages,
+                base_url=self.llm_base_url,
+                model=self.llm_model,
+                temperature=0.1,
+                tools=fetch_schema,
+                task_id=self.task_id,
+                llm_id=self.llm_id,
+                budget_id=self.budget_id,
+            )
+
+            usage = response.get("usage", {})
+            total_prompt_tokens += usage.get("prompt_tokens", 0)
+            total_completion_tokens += usage.get("completion_tokens", 0)
+
+            assistant_msg = response.get("choices", [{}])[0].get("message", {})
+            messages.append(assistant_msg)
+
+            tool_calls = assistant_msg.get("tool_calls") or []
+            if not tool_calls:
+                # No more tools — this is the final synthesis
+                return assistant_msg.get("content", "").strip()
+
+            # Execute tool calls
+            for tc in tool_calls:
+                t_id = tc.get("id", "unknown")
+                f_block = tc.get("function", {})
+                name = f_block.get("name", "")
+                args = json.loads(f_block.get("arguments", "{}"))
+
+                if name == "web_fetch":
+                    result = dispatch_tool(name, args)
+                else:
+                    result = f"ERROR: Tool '{name}' not available to WebSearchAgent."
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": t_id,
+                    "name": name,
+                    "content": result,
+                })
+
+            # Check for early exit signal in content (if any)
+            content = assistant_msg.get("content", "")
+            if "== ANSWER FOUND ==" in content:
+                # Need one more turn to produce the final Markdown without tool calls?
+                # Actually if they said it in the content but also made tool calls,
+                # we should probably continue. If they JUST said it, they are done.
+                if not tool_calls:
+                    return content.strip()
+
+        return messages[-1].get("content", "Failed to synthesize web results.")
 
 
 # ---------------------------------------------------------------------------

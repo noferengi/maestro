@@ -1163,6 +1163,95 @@ def record_benchmark(task_id: str, parent_task_id: str, benchmark_type: str, met
         return f"ERROR recording benchmark: {exc}"
 
 
+def web_search(query: str, count: int = 5) -> str:
+    """
+    Execute a web search using the Brave Search API.
+    Returns a JSON string of results with titles, URLs, and snippets.
+    Uses SearchCache to avoid redundant API calls for identical queries.
+    Requires BRAVE_API_KEY from config or environment.
+    """
+    import json as _json
+    from app.database import get_search_cache, create_search_cache
+    from app.agent.config import BRAVE_API_KEY
+
+    # 1. Check local cache first
+    q = query.strip()
+    cached = get_search_cache(q)
+    if cached:
+        logger.info("Search Cache HIT for query: '%s'", q)
+        return cached.result_json
+
+    # 2. Cache miss — call the search provider
+    api_key = BRAVE_API_KEY
+    if not api_key:
+        return "ERROR: BRAVE_API_KEY not set. Web search is unavailable. Add it to [llm] section in maestro.ini or set BRAVE_API_KEY env var."
+
+    try:
+        from brave import Brave
+        logger.info("Search Cache MISS for query: '%s' — calling Brave Search API", q)
+
+        brave = Brave(api_key=api_key)
+        results = brave.search(q=q, count=min(count, 10))
+
+        search_results = []
+        if hasattr(results, 'web') and hasattr(results.web, 'results'):
+            for r in results.web.results:
+                search_results.append({
+                    "title": getattr(r, 'title', 'No Title'),
+                    "url": getattr(r, 'url', 'No URL'),
+                    "description": getattr(r, 'description', 'No Description'),
+                })
+
+        final_json = _json.dumps({"query": q, "results": search_results}, indent=2)
+
+        # 3. Persist to cache for next time
+        create_search_cache(q, final_json)
+
+        return final_json
+    except ImportError:
+        return "ERROR: 'brave' python library not installed. Run 'pip install brave' to enable web search."
+    except Exception as exc:
+        return f"ERROR: Web search failed: {exc}"
+
+
+def web_fetch(url: str) -> str:
+    """
+    Fetch the content of a URL and return a text-only summary.
+    Strips HTML tags, scripts, and styles.
+    """
+    import httpx
+    from bs4 import BeautifulSoup
+
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        with httpx.Client(follow_redirects=True, timeout=15.0) as client:
+            resp = client.get(url, headers=headers)
+            resp.raise_for_status()
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Remove noise
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            tag.decompose()
+
+        # Get text
+        text = soup.get_text(separator="\n")
+
+        # Clean up whitespace
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        clean_text = "\n".join(lines)
+
+        # Truncate to reasonable length for context
+        if len(clean_text) > 8000:
+            clean_text = clean_text[:8000] + "\n... (content truncated)"
+
+        return f"== CONTENT FROM: {url} ==\n\n{clean_text}"
+    except Exception as exc:
+        return f"ERROR fetching URL '{url}': {exc}"
+
+
 def spawn_research_agent(question: str, context: str = "") -> str:
     """
     Placeholder for synchronous dispatch — the actual async version is in
@@ -1382,6 +1471,8 @@ TOOL_REGISTRY: dict[str, Any] = {
     "list_tasks": list_tasks,
     "update_task_status": update_task_status,
     "append_task_history": append_task_history,
+    "web_search": web_search,
+    "web_fetch": web_fetch,
     "generate_architecture_doc": generate_architecture_doc,
     "generate_mermaid_diagram": generate_mermaid_diagram,
     "generate_interface_contract": generate_interface_contract,
@@ -1918,6 +2009,44 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Execute a web search using the Brave Search API. "
+                "Returns a JSON string of results with titles, URLs, and snippets. "
+                "Requires BRAVE_API_KEY environment variable. Use this when you need "
+                "up-to-date information or to research unknown technologies/APIs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query to execute."},
+                    "count": {"type": "integer", "description": "Number of results to return (default 5).", "default": 5},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": (
+                "Fetch the content of a URL and return a text-only summary. "
+                "Strips HTML tags, scripts, and styles. Use this to read the full "
+                "content of a web page after finding interesting URLs in search results."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "The URL to fetch."},
+                },
+                "required": ["url"],
+            },
+        },
+    },
 ]
 
 
@@ -2069,6 +2198,35 @@ async def async_dispatch_tool(
             )
         except Exception as exc:
             return f"ERROR: spawn_research_agent failed: {type(exc).__name__}: {exc}"
+
+    if name == "web_search":
+        try:
+            query = arguments.get("query", "")
+            count = arguments.get("count", 5)
+            from app.agent.tools import web_search as sync_web_search
+            # 1. Get raw results (cached or fresh)
+            raw_json = sync_web_search(query, count)
+            if raw_json.startswith("ERROR:"):
+                return raw_json
+
+            import json as _json
+            data = _json.loads(raw_json)
+            results = data.get("results", [])
+
+            # 2. Run synthesis agent
+            from app.agent.research import WebSearchAgent
+            agent = WebSearchAgent(
+                query=query,
+                results=results,
+                task_id=task_id,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+            )
+            return await agent.run()
+        except Exception as exc:
+            return f"ERROR: agentic web_search failed: {exc}"
 
     # All other tools — synchronous
     return dispatch_tool(name, arguments)

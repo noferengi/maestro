@@ -78,6 +78,7 @@ LLM_MODEL: str = _get("llm", "model", "MAESTRO_LLM_MODEL", "omnicoder-9b")
 MAX_TOKENS_PER_TURN: int = _getint("llm", "max_tokens_per_turn", "MAESTRO_MAX_TOKENS", 4096)
 LLM_TEMPERATURE: float = _getfloat("llm", "temperature", "MAESTRO_TEMPERATURE", 0.2)
 LLM_TIMEOUT_SECONDS: int = _getint("llm", "timeout_seconds", "MAESTRO_LLM_TIMEOUT", 120)
+BRAVE_API_KEY: str = _get("llm", "brave_api_key", "BRAVE_API_KEY", "")
 
 # ===========================================================================
 # Loop safety limits
@@ -164,7 +165,7 @@ TIEBREAKER_ENABLED: bool = _getbool("intake", "tiebreaker_enabled", None, True)
 INTAKE_LLM_TEMPERATURE: float = _getfloat("intake", "llm_temperature", "MAESTRO_INTAKE_TEMP", 0.1)
 
 RESEARCH_AGENT_TOOLS: list[str] = _getlist("intake", "research_agent_tools",
-    "read_file, read_file_harder, read_file_lines, count_lines, "
+    "web_search, read_file, read_file_harder, read_file_lines, count_lines, "
     "search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, "
     "get_task, list_tasks"

@@ -290,7 +290,7 @@ class SubdivisionAgent:
         self.project_root = project_root
 
         # Context-aware tool selection
-        self._has_source = _has_meaningful_source_files()
+        self._has_source = _has_meaningful_source_files(self.project_root or PROJECT_ROOT)
         self._tool_schemas, self._allowed_tools = _build_context_aware_schemas(self._has_source)
 
         # Token budget enforcement

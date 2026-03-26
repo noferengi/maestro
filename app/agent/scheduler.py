@@ -271,6 +271,14 @@ def _tick() -> None:
         if task_type not in SCHEDULER_DISPATCHABLE_TYPES:
             continue
 
+        # For 'idea' tasks, we only auto-dispatch if they haven't been advanced yet.
+        # This prevents the scheduler from re-running intake pipeline every tick.
+        if task_type == "idea":
+            from app.database import get_transition_results
+            existing = get_transition_results(task_id, transition="idea_to_planning")
+            if existing:
+                continue
+
         # Already running?
         with _active_sessions_lock:
             if task_id in _active_sessions and _active_sessions[task_id].is_alive():

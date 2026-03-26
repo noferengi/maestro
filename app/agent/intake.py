@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from typing import Any
 
 from app.agent.config import (
@@ -599,7 +600,8 @@ class IntakePipeline:
 
             # Collect Python files from affected areas in scope analysis
             # and fall back to analyzing all Python files in the project
-            affected_areas = scope_vote.get("raw_response", {}).get("affected_areas", [])
+            raw_scope = scope_vote.get("raw_response") or {}
+            affected_areas = raw_scope.get("affected_areas", [])
             if isinstance(affected_areas, list) and len(affected_areas) > 0:
                 file_paths = []
                 for area in affected_areas:
