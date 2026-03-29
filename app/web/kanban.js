@@ -1713,7 +1713,8 @@ function createTaskCard(id, title, tags, owner, status) {
             <button class="toolbar-btn" title="Subdivide — run subdivision agent on this card" onclick="event.stopPropagation();toolbarSubdivide('${id}')">✂</button>
             <button class="toolbar-btn" title="Run Planning pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','planning')">📋</button>
             <button class="toolbar-btn" title="Run Conceptual Review pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','review')">👁</button>
-            <button class="toolbar-btn" title="Run Security pipeline (optimization + security)" onclick="event.stopPropagation();toolbarRunPipeline('${id}','security')">🔒</button>
+            <button class="toolbar-btn" title="Run Optimization pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','optimization')">⚡</button>
+            <button class="toolbar-btn" title="Run Security pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','security')">🔒</button>
             <button class="toolbar-btn" title="Manual Session — drive tool calls yourself" onclick="event.stopPropagation();openManualSession('${id}')">⌨</button>
             <span class="toolbar-sep"></span>
             <button class="toolbar-btn" title="Run Agent — start MaestroLoop" onclick="event.stopPropagation();runAgentFromToolbar('${id}')">▶</button>
@@ -3844,6 +3845,7 @@ function renderColumnMap(colType) {
                 <button class="toolbar-btn" title="Subdivide" onclick="event.stopPropagation();toolbarSubdivide('${id}')">✂</button>
                 <button class="toolbar-btn" title="Run Planning pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','planning')">📋</button>
                 <button class="toolbar-btn" title="Run Conceptual Review pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','review')">👁</button>
+                <button class="toolbar-btn" title="Run Optimization pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','optimization')">⚡</button>
                 <button class="toolbar-btn" title="Run Security pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','security')">🔒</button>
                 <button class="toolbar-btn" title="Manual Session" onclick="event.stopPropagation();openManualSession('${id}')">⌨</button>
                 <button class="toolbar-btn" title="Run Agent" onclick="event.stopPropagation();runAgentFromToolbar('${id}')">▶</button>
@@ -4422,7 +4424,7 @@ function toolbarStagePicker(taskId, btn) {
 }
 
 async function toolbarRunPipeline(taskId, pipeline) {
-    const labels = { planning: 'Planning', review: 'Conceptual Review', security: 'Security', 'full-review': 'Full Review' };
+    const labels = { planning: 'Planning', review: 'Conceptual Review', optimization: 'Optimization', security: 'Security', 'full-review': 'Full Review' };
     const label = labels[pipeline] || pipeline;
     const resp = await fetch(`${API_BASE}/tasks/${taskId}/run-${pipeline}`, { method: 'POST' });
     const d = await resp.json().catch(() => ({}));

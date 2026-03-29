@@ -959,6 +959,81 @@ def _advance_to_optimization(task_id: str) -> None:
         logger.exception("[review] Pipeline for '%s' failed.", task_id)
 
 
+def _run_optimization_only_bg(task_id: str) -> None:
+    """On-demand: run only the optimization pipeline (no security)."""
+    try:
+        import asyncio
+        from app.agent.optimization import run_optimization_pipeline
+
+        task = get_task(task_id)
+        if not task:
+            return
+        project_path = _setup_thread_context(task)
+        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                run_optimization_pipeline(
+                    task_id=task_id,
+                    task_description=task.description or "",
+                    llm_base_url=llm_base_url,
+                    llm_model=llm_model,
+                    llm_id=task.llm_id,
+                    budget_id=task.budget_id,
+                    project_path=project_path,
+                )
+            )
+            logger.info("[optimization-only] Task '%s': %s", task_id, result.get('outcome'))
+        finally:
+            loop.close()
+    except Exception as exc:
+        logger.exception("[optimization-only] Pipeline for '%s' failed.", task_id)
+
+
+def _run_security_only_bg(task_id: str) -> None:
+    """On-demand: run only the security review pipeline (no optimization)."""
+    try:
+        import asyncio
+        from app.agent.security_review import run_security_pipeline
+
+        task = get_task(task_id)
+        if not task:
+            return
+        project_path = _setup_thread_context(task)
+        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            sec_result = loop.run_until_complete(
+                run_security_pipeline(
+                    task_id=task_id,
+                    task_description=task.description or "",
+                    llm_base_url=llm_base_url,
+                    llm_model=llm_model,
+                    llm_id=task.llm_id,
+                    budget_id=task.budget_id,
+                    project_path=project_path,
+                )
+            )
+            _store_pipeline_result_generic(task_id, sec_result, task.budget_id, "security_review")
+            if sec_result.get("outcome") == "passed":
+                update_task(task_id, type="security")
+                update_task(task_id, type="full_review")
+                logger.info("[security-only] Task '%s' advanced to FULL REVIEW.", task_id)
+            else:
+                demotion = sec_result.get("demotion_target", "indev")
+                update_task(task_id, type=demotion)
+                _record_demotion(task_id, "security", demotion, sec_result.get("summary", ""))
+                logger.warning("[security-only] Task '%s' demoted to %s.", task_id, demotion)
+        finally:
+            loop.close()
+    except Exception as exc:
+        logger.exception("[security-only] Pipeline for '%s' failed.", task_id)
+
+
 def _run_security_pipeline_bg(task_id: str) -> None:
     """Background runner for security + optimization pipelines."""
     try:
@@ -2748,15 +2823,27 @@ def run_conceptual_review_on_demand(task_id: str, background_tasks: BackgroundTa
     return {"task_id": task_id, "status": "STARTED", "pipeline": "conceptual_review"}
 
 
-@app.post("/api/tasks/{task_id}/run-security", response_model=dict)
-def run_security_on_demand(task_id: str, background_tasks: BackgroundTasks):
-    """Manually trigger the optimization + security review pipeline for a task."""
+@app.post("/api/tasks/{task_id}/run-optimization", response_model=dict)
+def run_optimization_on_demand(task_id: str, background_tasks: BackgroundTasks):
+    """Manually trigger the optimization pipeline only (no security)."""
     task = get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     if not task.llm_id or not task.budget_id:
         raise HTTPException(status_code=400, detail="Task needs an LLM endpoint and budget assigned.")
-    background_tasks.add_task(_run_security_pipeline_bg, task_id)
+    background_tasks.add_task(_run_optimization_only_bg, task_id)
+    return {"task_id": task_id, "status": "STARTED", "pipeline": "optimization"}
+
+
+@app.post("/api/tasks/{task_id}/run-security", response_model=dict)
+def run_security_on_demand(task_id: str, background_tasks: BackgroundTasks):
+    """Manually trigger the security review pipeline only (no optimization)."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not task.llm_id or not task.budget_id:
+        raise HTTPException(status_code=400, detail="Task needs an LLM endpoint and budget assigned.")
+    background_tasks.add_task(_run_security_only_bg, task_id)
     return {"task_id": task_id, "status": "STARTED", "pipeline": "security"}
 
 
