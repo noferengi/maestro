@@ -123,8 +123,12 @@ function detectSessions(entries) {
         const prev = entries[i - 1];
         const curr = entries[i];
         const timeDiffMs     = new Date(curr.created_at) - new Date(prev.created_at);
-        const contextGrowing = curr.prompt_cost > prev.prompt_cost;
-        const withinWindow   = timeDiffMs < 5 * 60 * 1000; // 5 minutes
+        
+        // Context is "growing" if prompt_cost is increasing or staying roughly the same.
+        // We allow a small drop (e.g. 15%) to account for tool schema changes or context trimming
+        // that shouldn't necessarily break a session.
+        const contextGrowing = curr.prompt_cost > (prev.prompt_cost * 0.85);
+        const withinWindow   = timeDiffMs < 10 * 60 * 1000; // 10 minutes
 
         if (contextGrowing && withinWindow) {
             current.push(curr);
@@ -161,15 +165,26 @@ function renderEntryList(sessions) {
                 <span class="diag-session-info">${escapeHtml(sessionInfo)}</span>
             </div>`;
 
-        group.forEach(entry => {
-            const active  = entry.id === selectedEntryId ? ' active' : '';
+        const turns = getConceptualTurns(group);
+        turns.forEach(turn => {
+            const entry        = turn.entry;
+            const targetMsgIdx = turn.msgIdx !== undefined ? turn.msgIdx : null;
+            const activeClass  = (entry.id === selectedEntryId) ? ' active' : '';
+
             const tcBadge = entry.tool_calls > 0
                 ? `<span title="${entry.tool_calls} tool call(s)">&#9881; ${entry.tool_calls}</span>`
                 : '';
-            html += `<div class="diag-entry-item${active}" onclick="selectEntry(${entry.id})">
+            const abruptBadge = turn.isAbruptEnd
+                ? `<span class="diag-abrupt-badge" title="Session ended with unresolved tool call">&#9888; abrupt</span>`
+                : '';
+
+            html += `<div class="diag-entry-item${activeClass}${turn.isAbruptEnd ? ' diag-entry-abrupt' : ''}"
+                          data-entry-id="${entry.id}"
+                          data-msg-idx="${targetMsgIdx}"
+                          onclick="selectEntry(${entry.id}, ${targetMsgIdx})">
                 <div class="diag-entry-dot type-unknown" id="dot-${entry.id}"></div>
                 <div class="diag-entry-body">
-                    <div class="diag-entry-id">#${entry.id}</div>
+                    <div class="diag-entry-id">${escapeHtml(turn.label)}${abruptBadge}</div>
                     <div class="diag-entry-meta">
                         <span>pp=${fmtTokens(entry.prompt_cost || 0)}</span>
                         <span>tg=${fmtTokens(entry.generation_cost || 0)}</span>

@@ -537,7 +537,7 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
         budget_id = db_task.budget_id if db_task else None
 
         if task_type == "idea":
-            _run_intake(task_id, llm_base_url, llm_model, project_path)
+            _run_intake(task_id, llm_base_url, llm_model, max_context, project_path)
         elif task_type == "indev":
             _run_dev_orchestrator_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
         elif task_type == "conceptual_review":
@@ -557,6 +557,7 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
 
 
 def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
+                max_context: int | None = None,
                 project_path: str | None = None) -> None:
     """Run the intake pipeline for an IDEA task."""
     from app.agent.intake import run_intake_pipeline
@@ -623,6 +624,11 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
         if result["outcome"] == "passed":
             update_task(task_id, type="planning")
             logger.info("Task '%s' advanced to PLANNING via scheduler.", task_id)
+        elif result["outcome"] == "subdivide":
+            # Lazy import avoids circular import; main.py is fully loaded by call time.
+            from app.main import _handle_subdivision_outcome
+            _handle_subdivision_outcome(task, result, llm_base_url, llm_model, max_context, loop)
+            logger.info("Task '%s' intake result: subdivide (subdivision dispatched via scheduler).", task_id)
         else:
             logger.info("Task '%s' intake result: %s", task_id, result["outcome"])
     finally:
@@ -970,4 +976,5 @@ def _task_to_mini_dict(task: Any) -> dict:
         "type": task.type,
         "position": task.position,
         "prerequisites": task.prerequisites or [],
+        "parent_task_id": getattr(task, "parent_task_id", None),
     }

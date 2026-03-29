@@ -66,6 +66,7 @@ def _fake_db_task(
     project="TestProject",
     description="Do a thing",
     prerequisites=None,
+    parent_task_id=None,
 ):
     task = MagicMock()
     task.id = task_id
@@ -77,6 +78,7 @@ def _fake_db_task(
     task.project = project
     task.description = description
     task.title = "Test Task"
+    task.parent_task_id = parent_task_id
     return task
 
 
@@ -198,6 +200,14 @@ class TestTaskToMiniDict:
         task.prerequisites = None
         result = _task_to_mini_dict(task)
         assert result["prerequisites"] == []
+
+    def test_parent_task_id_mapped(self):
+        task = _fake_db_task(parent_task_id="parent-99")
+        assert _task_to_mini_dict(task)["parent_task_id"] == "parent-99"
+
+    def test_parent_task_id_none_when_absent(self):
+        task = _fake_db_task()
+        assert _task_to_mini_dict(task)["parent_task_id"] is None
 
     def test_returns_plain_dict(self):
         task = _fake_db_task()

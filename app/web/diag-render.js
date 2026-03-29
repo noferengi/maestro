@@ -1,6 +1,8 @@
 /* ============================================================
    diag-render.js — Right panel: conversation and message rendering
-   Depends on: diag-utils.js, diag-session.js (buildSessionSummary, groupMessages, renderToolGroup)
+   Note: This view is a reconstruction of the conversation flow
+   and may not exactly reflect the underlying storage format.
+   Depends on: diag-utils.js, diag-session.js
    ============================================================ */
 
 /**
@@ -49,61 +51,99 @@ function buildCtxBar(entryId) {
     const idx = fullEntries.findIndex(fe => fe.id === entryId);
     if (idx < 0) return '';
 
-    const thisPp = fullEntries[idx].prompt_cost || 0;
-    if (thisPp <= 0) return '';
-
     const maxCtx = allDiagLlms[fullEntries[idx].llm_id]?.max_context || 0;
+    const barScale = 10000;
+    const tokensToScale = (t) => (maxCtx > 0) ? (t / maxCtx * barScale) : t;
 
-    // ── Build coloured segments for each turn 0 … idx ──────────────
+    // ── 1. Identify first tool result index (Turn 1) ───────────────
+
+    let firstToolIdx = -1;
+    for (let i = 0; i < fullEntries.length; i++) {
+        if (i > 0 && (fullEntries[i - 1].tool_calls || 0) > 0) {
+            firstToolIdx = i;
+            break;
+        }
+    }
+    if (firstToolIdx === -1) firstToolIdx = fullEntries.length;
+
+    // ── 2. Build segments ──────────────────────────────────────────
 
     let segHtml = '';
-    for (let i = 0; i <= idx; i++) {
-        const pp     = fullEntries[i].prompt_cost || 0;
+
+    // Turn 0: Merged Setup (SYSTEM/USER split)
+    if (firstToolIdx > 0) {
+        let setupDelta = 0;
+        let sysChars = 0, userChars = 0;
+        for (let i = 0; i < firstToolIdx; i++) {
+            const pp = fullEntries[i].prompt_cost || 0;
+            const prevPp = i > 0 ? (fullEntries[i - 1].prompt_cost || 0) : 0;
+            setupDelta += (pp - prevPp);
+            
+            const msgs = Array.isArray(fullEntries[i].prompt_data) ? fullEntries[i].prompt_data : [];
+            const prevMsgs = i > 0 ? (Array.isArray(fullEntries[i-1].prompt_data) ? fullEntries[i-1].prompt_data : []) : [];
+            const newMsgs = msgs.slice(prevMsgs.length);
+            newMsgs.forEach(m => {
+                const len = _msgCharLen(m);
+                if (m.role === 'system') sysChars += len;
+                else                     userChars += len;
+            });
+        }
+
+        if (setupDelta > 0) {
+            const totalChars = sysChars + userChars || 1;
+            const sysDelta = setupDelta * sysChars / totalChars;
+            const userDelta = setupDelta * userChars / totalChars;
+
+            const gTotal = Math.max(1, Math.round(tokensToScale(setupDelta)));
+            const gSys   = Math.max(1, Math.round(tokensToScale(sysDelta)));
+            const gUser  = Math.max(1, Math.round(tokensToScale(userDelta)));
+
+            // Conceptual Segment 0 — highlightable as a single block
+            const isSelectedInSetup = idx < firstToolIdx;
+            const cur = isSelectedInSetup ? ' ctx-seg-current' : '';
+            
+            segHtml += `<div class="ctx-seg ${cur} ctx-seg-merged-setup" ` +
+                       `style="flex-grow:${gTotal}; display:flex" ` +
+                       `data-fe-idx="0" data-merged-end="${firstToolIdx - 1}">` +
+                       `<div style="flex-grow:${gSys}; background-color:#5a6370; height:100%" title="Initial Prompt (System)"></div>` +
+                       `<div style="flex-grow:${gUser}; background-color:#212529; height:100%" title="Initial Prompt (User)"></div>` +
+                       `</div>`;
+        }
+    }
+
+    // Turns 1 … N: Tool Results
+    for (let i = firstToolIdx; i <= idx; i++) {
+        const pp = fullEntries[i].prompt_cost || 0;
         const prevPp = i > 0 ? (fullEntries[i - 1].prompt_cost || 0) : 0;
-        const delta  = i > 0 ? pp - prevPp : pp;
+        const delta = pp - prevPp;
         if (delta <= 0) continue;
 
         const isCurrent = i === idx;
+        const cur = isCurrent ? ' ctx-seg-current' : '';
 
-        // Split delta by content type via character-count proportioning.
-        let baseTokens = 0, asstTokens = 0, toolTokens = 0;
-        if (i === 0) {
-            baseTokens = delta;
-        } else {
-            const prevMsgs = Array.isArray(fullEntries[i - 1].prompt_data) ? fullEntries[i - 1].prompt_data : [];
-            const currMsgs = Array.isArray(fullEntries[i].prompt_data)     ? fullEntries[i].prompt_data     : [];
-            const newMsgs  = currMsgs.slice(prevMsgs.length);
-            if (newMsgs.length === 0) {
-                toolTokens = delta;
-            } else {
-                let asstChars = 0, toolChars = 0;
-                newMsgs.forEach(m => {
-                    const len = _msgCharLen(m);
-                    if (m.role === 'assistant') asstChars += len;
-                    else                        toolChars += len;
-                });
-                const total = asstChars + toolChars || 1;
-                asstTokens = delta * asstChars / total;
-                toolTokens = delta * toolChars / total;
+        // Segment i represents the result of the tool call made in Entry i-1.
+        let toolCat = 'other';
+        try {
+            const sourceFe = fullEntries[i - 1];
+            const rd = sourceFe?.response_data;
+            const tc = (typeof rd === 'string' ? JSON.parse(rd) : rd)?.choices?.[0]?.message?.tool_calls?.[0];
+            if (tc) {
+                toolCat = labelTool(tc.function?.name || '');
             }
-        }
+        } catch (_) {}
 
-        // One segment per entry — total delta tokens, colour by dominant content type.
-        // Previously split into base/asst/tool sub-segments, which produced multiple
-        // clickable elements with the same entry ID and confused the hover tooltip.
-        const cur      = isCurrent ? ' ctx-seg-current' : '';
-        const rawTotal = baseTokens + asstTokens + toolTokens;
-        const g        = Math.max(1, Math.round(rawTotal));
-        const colorCls = i === 0                  ? 'ctx-seg-base'
-                       : asstTokens >= toolTokens ? 'ctx-seg-asst'
-                       :                            'ctx-seg-tool';
-        segHtml += `<div class="ctx-seg ${colorCls}${cur}" style="flex-grow:${g}" ` +
-                   `data-fe-idx="${i}" data-orig-grow="${g}"></div>`;
+        const colorHex = TOOL_COLORS[toolCat] || '#94a3b8';
+        const g = Math.max(1, Math.round(tokensToScale(delta)));
+
+        segHtml += `<div class="ctx-seg ${cur} tool-cat-${toolCat}" ` +
+                   `style="flex-grow:${g}; background-color:${colorHex}" ` +
+                   `data-fe-idx="${i}"></div>`;
     }
 
-    // ── Free-space segment (remaining context capacity) ────────────
+    // ── 3. Free-space segment ──────────────────────────────────────
 
-    const prevPp   = idx > 0 ? (fullEntries[idx - 1].prompt_cost || 0) : 0;
+    const thisPp = fullEntries[idx].prompt_cost || 0;
+    const prevPp = idx > 0 ? (fullEntries[idx - 1].prompt_cost || 0) : 0;
     const delta    = thisPp - prevPp;
     const deltaStr = delta > 0 ? `+${fmtTokens(delta)}`
                    : delta < 0 ? `\u2212${fmtTokens(Math.abs(delta))}`
@@ -112,14 +152,15 @@ function buildCtxBar(entryId) {
     if (maxCtx > 0) {
         const freeTokens = Math.max(0, maxCtx - thisPp);
         if (freeTokens > 0) {
+            const gFree = Math.max(1, Math.round(tokensToScale(freeTokens)));
             const freeTip = `Free: ${freeTokens.toLocaleString()} tokens remaining`;
-            segHtml += `<div class="ctx-seg ctx-seg-free" style="flex-grow:${Math.round(freeTokens)}" ` +
+            segHtml += `<div class="ctx-seg ctx-seg-free" style="flex-grow:${gFree}" ` +
                        `title="${escapeHtml(freeTip)}">` +
                        `<span class="ctx-free-label">${fmtTokens(freeTokens)} free</span></div>`;
         }
     }
 
-    // ── Assemble bar + label ───────────────────────────────────────
+    // ── 4. Assemble bar + label ────────────────────────────────────
 
     let labelHtml;
     if (maxCtx > 0) {
@@ -145,7 +186,7 @@ function buildCtxBar(entryId) {
  * @param {object|null} selectedFull    - The selected entry's own full data (for its response)
  * @param {Array|null}  sessionBoundaries - Per-entry start message indices
  */
-function renderConversation(entry, highlightFrom, anchorEntryId, selectedFull, sessionBoundaries) {
+function renderConversation(entry, highlightFrom, anchorEntryId, selectedFull, sessionBoundaries, targetMsgIdx = null) {
     const detail = document.getElementById('conversation-detail');
 
     const messages = Array.isArray(entry.prompt_data) ? entry.prompt_data : [];
@@ -218,25 +259,46 @@ function renderConversation(entry, highlightFrom, anchorEntryId, selectedFull, s
 
     html += '<div class="diag-messages">';
 
-    // Render all prompt messages grouped, inserting turn dividers at session boundaries
-    const grouped = groupMessages(effectiveMessages);
+    const groupEntries = cachedSession?.fullEntries || [headerEntry];
+    const conceptualTurns = getConceptualTurns(groupEntries);
+
+    // Precise msgIdx for all conceptual turns
+    conceptualTurns.forEach(t => {
+        const b = (effectiveBoundaries || []).find(b => b.entryId === t.entryId);
+        if (!b) return;
+        if (t.type === 'system' || t.type === 'turn') {
+            t.msgIdx = b.startMsgIdx;
+        } else if (t.type === 'user') {
+            const firstUserIdx = effectiveMessages.slice(b.startMsgIdx).findIndex(m => m.role === 'user');
+            t.msgIdx = (firstUserIdx !== -1) ? b.startMsgIdx + firstUserIdx : b.startMsgIdx;
+        }
+    });
+
+    // Ensure groupMessages breaks at EVERY conceptual turn boundary
+    const allBoundaries = conceptualTurns.map(t => ({ startMsgIdx: t.msgIdx, entryId: t.entryId }));
+    const grouped = groupMessages(effectiveMessages, allBoundaries);
+    
     let msgIdx = 0;
     grouped.forEach(g => {
-        if (effectiveBoundaries) {
-            const boundary = effectiveBoundaries.find(b => b.startMsgIdx === msgIdx);
-            if (boundary) {
-                const isAnchor   = boundary.entryId === anchorEntryId;
-                const divClass   = isAnchor
-                    ? 'diag-turn-divider diag-turn-divider-anchor'
-                    : 'diag-turn-divider diag-turn-divider-other';
-                const anchorAttr = isAnchor ? ' id="turn-anchor"' : '';
-                const ctxBar = buildCtxBar(boundary.entryId);
-                html += `<div class="${divClass}${ctxBar ? ' has-ctx-bar' : ''}"${anchorAttr} data-entry-id="${boundary.entryId}">` +
-                        `<span class="diag-divider-label">── Entry #${boundary.entryId} ──</span>` +
-                        ctxBar +
-                        `</div>`;
-            }
-        }
+        // Render any turn dividers that start at this msgIdx
+        const turnsToRender = conceptualTurns.filter(t => t.msgIdx === msgIdx);
+        turnsToRender.forEach(turn => {
+            const isAnchor = turn.entryId === anchorEntryId && 
+                (targetMsgIdx === null || targetMsgIdx === turn.msgIdx || (turn.type === 'user' && targetMsgIdx === -1));
+            
+            const divClass = isAnchor
+                ? 'diag-turn-divider diag-turn-divider-anchor'
+                : 'diag-turn-divider diag-turn-divider-other';
+            const anchorAttr = isAnchor ? ' id="turn-anchor"' : '';
+            
+            const ctxBar = buildCtxBar(turn.entryId);
+            const dataMsgIdx = turn.msgIdx !== undefined ? ` data-msg-idx="${turn.msgIdx}"` : '';
+            html += `<div class="${divClass}${ctxBar ? ' has-ctx-bar' : ''}"${anchorAttr} data-entry-id="${turn.entryId}"${dataMsgIdx}>` +
+                    `<span class="diag-divider-label">── ${escapeHtml(turn.label)} ──</span>` +
+                    ctxBar +
+                    `</div>`;
+        });
+
         const highlighted = isAccumulating && isSessionView && msgIdx >= effectiveHighlight;
         if (g.type === 'tool_group') {
             html += renderToolGroup(g.messages, msgIdx, highlighted);
@@ -281,9 +343,23 @@ function renderConversation(entry, highlightFrom, anchorEntryId, selectedFull, s
         html += `</div></div>`;
     }
 
+    // Abrupt end: the last entry's LLM response ended with tool_calls but no tool result was ever received.
+    // This means the session was interrupted mid-flight (context exhausted, loop stopped, crash, etc.).
+    const isActualLastEntry = !selectedFull || selectedFull.id === entry.id;
+    const isAbruptEnd = isLastEntry && isActualLastEntry && selectedFinish === 'tool_calls';
+    if (isAbruptEnd) {
+        html += `<div class="diag-abrupt-end">
+            <span class="diag-abrupt-icon">&#9888;</span>
+            <strong>ABRUPT END</strong> — session terminated while tool call was pending;
+            no tool result was ever received by the LLM.
+        </div>`;
+    }
+
     if (isSessionView && anchorEntryId === entry.id) {
-        html += `<div class="diag-turn-divider diag-turn-divider-end">
-            <span>── end of session ──</span>
+        const endLabel  = isAbruptEnd ? '── SESSION ABORTED ──' : '── end of session ──';
+        const endClass  = isAbruptEnd ? 'diag-turn-divider-abort' : 'diag-turn-divider-end';
+        html += `<div class="diag-turn-divider ${endClass}">
+            <span>${endLabel}</span>
         </div>`;
     }
 
@@ -431,162 +507,6 @@ function toggleReasoning(el) {
         : `&#9658; Reasoning (${chars.toLocaleString()} chars) — click to expand`;
 }
 
-// ── macOS Dock-style magnification on context-bar segments ───
-//
-// Horizontal growth is applied via flex-grow (not scaleX) so segments
-// actually displace their neighbours — a true lens effect.  Vertical
-// growth uses scaleY with transform-origin:center so segments grow
-// symmetrically (equal up/down), capped at 112.5% to keep the bar tidy.
-
-(function _initDockZoom() {
-    const MAX_SCALE_X  = 3;    // peak horizontal factor — applied as flex-grow multiplier
-    const MAX_SCALE_Y  = 1.0;  // peak vertical factor   — applied as scaleY (±6.25% each way)
-    const INFLUENCE_PX = 80;   // ~¼ inch at 96 CSS-DPI
-
-    // Minimum hover width (in CSS pixels) for any segment when computing which segment
-    // the cursor is "over" in virtual space. A 1-px segment would otherwise be skipped
-    // by a single mousemove tick. Expressed as a fraction of a 1920-px reference screen
-    // so it scales naturally on wider/narrower displays. devicePixelRatio is NOT used
-    // here because offsetX / getBoundingClientRect() are already in CSS pixels.
-    function _minHoverPx() {
-        return 24 * (window.innerWidth / 1920);
-    }
-
-    let _activeBar = null;
-    // Natural (pre-zoom) widths per bar, measured before the first zoom frame.
-    // Using the live r.width for the large-segment threshold causes oscillation:
-    // neighbouring small segs magnify → large seg gets squeezed below the threshold
-    // → large seg gets zoomed → it grows → back above threshold → reset → repeat.
-    const _naturalWidths = new WeakMap(); // bar → Map<seg, naturalWidthPx>
-
-    function _cacheNaturalWidths(bar) {
-        const cache = new Map();
-        bar.querySelectorAll('.ctx-seg:not(.ctx-seg-free)').forEach(seg => {
-            cache.set(seg, seg.getBoundingClientRect().width);
-        });
-        _naturalWidths.set(bar, cache);
-    }
-
-    /**
-     * Given mouse offsetX within the bar and the array of natural segment widths,
-     * return the index of the segment the virtual cursor is over.
-     *
-     * Virtual space: each segment is allocated Math.max(naturalWidth, minHoverPx)
-     * virtual pixels. Mouse offsetX is mapped linearly into this stretched space,
-     * then a simple range scan finds the active segment. This guarantees that even
-     * a 1-px segment occupies minHoverPx virtual pixels, making it reachable.
-     */
-    function _virtualHitTest(relX, barWidth, natWidths) {
-        const minPx = _minHoverPx();
-        // Build virtual widths and cumulative positions in one pass.
-        const virtualWidths = natWidths.map(w => Math.max(w, minPx));
-        const totalVirtual  = virtualWidths.reduce((s, w) => s + w, 0);
-
-        // Map the real mouse position into virtual space.
-        // clamp to [0, barWidth) to handle sub-pixel rounding at edges.
-        const clampedRelX = Math.max(0, Math.min(relX, barWidth - 0.001));
-        // Linear mapping: real [0, barWidth] → virtual [0, totalVirtual]
-        const vX = (clampedRelX / barWidth) * totalVirtual;
-
-        // Scan to find the owning virtual segment.
-        let cursor = 0;
-        for (let i = 0; i < virtualWidths.length; i++) {
-            cursor += virtualWidths[i];
-            if (vX < cursor) return i;
-        }
-        return virtualWidths.length - 1; // clamp to last
-    }
-
-    function _apply(bar, mouseX) {
-        const barRect  = bar.getBoundingClientRect();
-        const relX     = mouseX - barRect.left;
-        const segs     = Array.from(bar.querySelectorAll('.ctx-seg:not(.ctx-seg-free)'));
-        const natCache = _naturalWidths.get(bar);
-
-        if (segs.length === 0) return;
-
-        bar.classList.add('dock-zooming');
-
-        // Collect natural widths for all segments (needed for both hit-test and visual).
-        const natWidths = segs.map(seg => {
-            const r = seg.getBoundingClientRect();
-            return natCache ? (natCache.get(seg) ?? r.width) : r.width;
-        });
-
-        // Virtual hit-test: find which segment the cursor is logically over.
-        const activeIdx = _virtualHitTest(relX, barRect.width, natWidths);
-
-        // Visual magnification: cosine falloff centred on the active segment's real midpoint.
-        // Accumulate real pixel positions from the left edge of the bar.
-        let realCursor = 0;
-        segs.forEach((seg, i) => {
-            const origGrow = parseFloat(seg.dataset.origGrow) || 1;
-            const natWidth = natWidths[i];
-
-            // Skip magnification for segments already wider than the influence diameter —
-            // zooming a large segment further adds no usability value.
-            if (natWidth >= INFLUENCE_PX * 2) {
-                seg.style.flexGrow  = origGrow;
-                seg.style.transform = '';
-                seg.style.zIndex    = '';
-                realCursor += natWidth;
-                return;
-            }
-
-            // Real midpoint of this segment in bar-relative coordinates.
-            const midX = realCursor + natWidth / 2;
-            // If this is the virtually-active segment treat dist=0 (max zoom).
-            const dist = (i === activeIdx) ? 0 : Math.abs(relX - midX);
-            realCursor += natWidth;
-
-            if (dist >= INFLUENCE_PX) {
-                seg.style.flexGrow  = origGrow;
-                seg.style.transform = '';
-                seg.style.zIndex    = '';
-            } else {
-                // Cosine falloff: 1.0 at dist=0, 0.0 at dist=INFLUENCE_PX
-                const t            = Math.cos((Math.PI / 2) * (dist / INFLUENCE_PX));
-                const factor_x_raw = 1 + (MAX_SCALE_X - 1) * t;
-                // Cap: no segment zooms wider than INFLUENCE_PX*2 px regardless of scale factor.
-                // Without this, medium-large segments balloon while truly large ones are skipped,
-                // producing an inverted size relationship under the cursor.
-                const factor_x = natWidth > 0
-                    ? Math.min(factor_x_raw, (INFLUENCE_PX * 2) / natWidth)
-                    : factor_x_raw;
-                const factor_y = 1 + (MAX_SCALE_Y - 1) * t;
-                seg.style.flexGrow  = origGrow * factor_x;
-                seg.style.transform = `scaleY(${factor_y.toFixed(3)})`;
-                seg.style.zIndex    = Math.round(factor_x * 10);
-            }
-        });
-    }
-
-    function _reset(bar) {
-        bar.classList.remove('dock-zooming');
-        bar.querySelectorAll('.ctx-seg:not(.ctx-seg-free)').forEach(seg => {
-            seg.style.flexGrow  = seg.dataset.origGrow || 1;
-            seg.style.transform = '';
-            seg.style.zIndex    = '';
-        });
-    }
-
-    document.addEventListener('mousemove', e => {
-        const bar = e.target.closest('.ctx-bar');
-        if (_activeBar && _activeBar !== bar) { _reset(_activeBar); _activeBar = null; }
-        if (bar) {
-            // Measure natural widths before the first zoom frame so the threshold
-            // check in _apply sees stable values regardless of neighbour zoom state.
-            if (_activeBar !== bar) _cacheNaturalWidths(bar);
-            _activeBar = bar;
-            _apply(bar, e.clientX);
-        }
-    });
-
-    document.addEventListener('mouseleave', () => {
-        if (_activeBar) { _reset(_activeBar); _activeBar = null; }
-    });
-})();
-
 // ── Context-bar segment hover tooltip ────────────────────────
 //
 // JS-driven tooltip (not CSS ::after) so it renders at a fixed font
@@ -594,18 +514,6 @@ function toggleReasoning(el) {
 // Shows: agent-type badge (colour-coded) + context % + tool call detail.
 
 (function _initCtxTooltip() {
-    const TYPE_COLORS = {
-        surveyor:     '#0d6efd',
-        designer:     '#6f42c1',
-        reviewer:     '#20c997',
-        judge:        '#fd7e14',
-        research:     '#ffc107',
-        pitfall:      '#e83e8c',
-        maestro_loop: '#198754',
-        file_summary: '#17a2b8',
-        unknown:      '#6c757d',
-    };
-
     const tip = document.createElement('div');
     tip.id = 'ctx-tooltip';
     document.body.appendChild(tip);
@@ -616,134 +524,77 @@ function toggleReasoning(el) {
         if (isNaN(feIdx)) return;
         const fullEntries = cachedSession?.fullEntries;
         if (!fullEntries) return;
-        const fe = fullEntries[feIdx];
-        if (!fe) return;
 
-        // Token counts
-        const pp     = fe.prompt_cost || 0;
-        const tg     = fe.generation_cost || 0;
-        const prevPp = feIdx > 0 ? (fullEntries[feIdx - 1]?.prompt_cost || 0) : 0;
-        const delta  = feIdx > 0 ? pp - prevPp : pp;
+        // Merged Segment 0 (Initial Prompt)
+        if (feIdx === 0 && seg.classList.contains('ctx-seg-merged-setup')) {
+            const mergedEndIdx = parseInt(seg.dataset.mergedEnd, 10) || 0;
+            const fe = fullEntries[mergedEndIdx];
+            const pp = fe.prompt_cost || 0;
+            const total = pp + (fe.generation_cost || 0);
+            const llmInfo = allDiagLlms[fe.llm_id] || {};
+            const maxCtx = llmInfo.max_context || 0;
+            const pctTotal = maxCtx > 0 ? `${(total / maxCtx * 100).toFixed(1)}% of total context` : '';
+            const stats = pctTotal ? `${pctTotal} (${fmtTokens(total)})` : fmtTokens(total);
 
-        // Agent type — for turn 0 the system message belongs to the orchestrator that
-        // launched the session, not the agent running it.  Borrow turn 1's label instead
-        // so the badge reflects the actual session type (e.g. RESEARCH not MAESTRO_LOOP).
-        const labelFe   = (feIdx === 0 && fullEntries.length > 1) ? fullEntries[1] : fe;
-        const labelMsgs = Array.isArray(labelFe.prompt_data) ? labelFe.prompt_data : [];
-        const labelSys  = labelMsgs.find(m => m.role === 'system');
-        const labelUser = labelMsgs.find(m => m.role === 'user');
-        const rawSys    = labelSys
-            ? (typeof labelSys.content === 'string'
-                ? labelSys.content
-                : (Array.isArray(labelSys.content) ? (labelSys.content[0]?.text || '') : ''))
-            : '';
-        const agentType  = rawSys
-            ? labelEntry(rawSys)
-            : labelEntryFromUser(typeof labelUser?.content === 'string' ? labelUser.content : '');
-        const agentColor = TYPE_COLORS[agentType] || '#6c757d';
-        const agentText  = agentType === 'research' ? '#212529' : '#fff';
+            tip.innerHTML = `<div><span class="ctx-tip-agent" style="background:#6c757d;color:#fff">SETUP</span>` +
+                            `<span class="ctx-tip-stats">${escapeHtml(stats)}</span></div>` +
+                            `<div class="ctx-tip-tool">Initial Prompt</div>`;
+        } else {
+            const fe = fullEntries[feIdx];
+            if (!fe) return;
 
-        // Line 1: (pp+tg) / max_context — full context footprint of this call
-        const llmInfo  = allDiagLlms[fe.llm_id] || {};
-        const maxCtx   = llmInfo.max_context || 0;
-        const total    = pp + tg;
-        const pctTotal = maxCtx > 0 ? `${(total / maxCtx * 100).toFixed(1)}% of total context` : '';
-        const line1Stats = pctTotal ? `${pctTotal} (${fmtTokens(total)})` : fmtTokens(total);
+            // Token counts
+            const pp     = fe.prompt_cost || 0;
+            const tg     = fe.generation_cost || 0;
+            const prevPp = feIdx > 0 ? (fullEntries[feIdx - 1]?.prompt_cost || 0) : 0;
+            const delta  = feIdx > 0 ? pp - prevPp : pp;
 
-        // Line 2: #id  toolName  cost(+tg △ TG): +delta △ PP
-        // Lines 3+: one ARG per parameter — all args consistent on their own lines
-        const sign = v => (v >= 0 ? '+' : '') + fmtTokens(v);
-        let toolPart = '';
-        const argLines = [];
-        try {
-            // response_data may arrive as a string (TEXT column) — parse defensively.
-            let rd = fe.response_data;
-            if (typeof rd === 'string') rd = JSON.parse(rd);
-            const tc = rd?.choices?.[0]?.message?.tool_calls?.[0];
-            if (tc) {
-                const toolName = tc.function?.name || 'tool';
-                // Set toolPart BEFORE parsing args — if args parsing throws the name still shows.
-                toolPart = ` ${toolName}`;
-                // llama.cpp may return arguments as an already-parsed object, not a string.
-                const rawArgs = tc.function?.arguments;
-                const args = (rawArgs && typeof rawArgs === 'object')
-                    ? rawArgs
-                    : JSON.parse(rawArgs || '{}');
-                Object.keys(args).forEach(k => {
-                    argLines.push(`ARG "${k}": "${String(args[k]).slice(0, 40)}"`);
-                });
-            } else if (feIdx === 0) {
-                // Turn 0 = initial session context.  Clean label on line 2; recursively
-                // expand the response JSON so arrays and objects each get their own lines.
-                toolPart = `  Initial Prompt`;
-                const content = rd?.choices?.[0]?.message?.content;
-                if (content && typeof content === 'string') {
-                    // Recursive line builder.
-                    // Strings/numbers/bools → one line: [pad]"key": "value"
-                    // Arrays               → header line [pad]"key":
-                    //                        then each item indented one level
-                    // Objects              → header line [pad]"key":
-                    //                        then each sub-pair indented one level
-                    const NB  = '\u00a0'; // non-breaking space — survives escapeHtml
-                    const ELL = '\u2026';
-                    const MAX = 55;
-                    function fmtScalar(v) {
-                        const s = v === null ? 'null' : String(v);
-                        return `"${s.slice(0, MAX)}${s.length > MAX ? ELL : ''}"`;
-                    }
-                    function pushVal(lines, key, val, depth) {
-                        if (depth > 3) return; // safety cap
-                        const pad = NB.repeat(depth * 2);
-                        const keyStr = key !== null ? `"${key}": ` : '';
-                        if (Array.isArray(val)) {
-                            if (val.length === 0) {
-                                lines.push(`${pad}${keyStr}[]`);
-                            } else {
-                                lines.push(`${pad}${keyStr}`);
-                                val.forEach(item => {
-                                    if (item !== null && typeof item === 'object') {
-                                        Object.entries(item).forEach(([k, v]) => pushVal(lines, k, v, depth + 1));
-                                    } else {
-                                        lines.push(`${NB.repeat((depth + 1) * 2)}${fmtScalar(item)}`);
-                                    }
-                                });
-                            }
-                        } else if (val !== null && typeof val === 'object') {
-                            lines.push(`${pad}${keyStr}`);
-                            Object.entries(val).forEach(([k, v]) => pushVal(lines, k, v, depth + 1));
-                        } else {
-                            lines.push(`${pad}${keyStr}${fmtScalar(val)}`);
-                        }
-                    }
-                    try {
-                        const raw    = content.trim().replace(/^```[a-z]*\n?|\n?```$/g, '');
-                        const parsed = JSON.parse(raw);
-                        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-                            Object.entries(parsed).forEach(([k, v]) => pushVal(argLines, k, v, 0));
-                        }
-                    } catch (_) {
-                        const trimmed = content.trim();
-                        if (trimmed) argLines.push(`"${trimmed.slice(0, MAX)}${trimmed.length > MAX ? ELL : ''}"`);
-                    }
+            // Agent type (Tooltip uses the agent color from the source call)
+            const sourceFe = feIdx > 0 ? fullEntries[feIdx - 1] : fe;
+            const labelMsgs = Array.isArray(sourceFe.prompt_data) ? sourceFe.prompt_data : [];
+            const labelSys  = labelMsgs.find(m => m.role === 'system');
+            const labelUser = labelMsgs.find(m => m.role === 'user');
+            const agentType = labelSys
+                ? labelEntry(typeof labelSys.content === 'string' ? labelSys.content : '')
+                : labelEntryFromUser(typeof labelUser?.content === 'string' ? labelUser.content : '');
+            const agentColor = TYPE_COLORS[agentType] || '#6c757d';
+            const agentText  = agentType === 'research' ? '#212529' : '#fff';
+
+            // Context stats
+            const llmInfo  = allDiagLlms[fe.llm_id] || {};
+            const maxCtx   = llmInfo.max_context || 0;
+            const total    = pp + tg;
+            const pctTotal = maxCtx > 0 ? `${(total / maxCtx * 100).toFixed(1)}% of total context` : '';
+            const line1Stats = pctTotal ? `${pctTotal} (${fmtTokens(total)})` : fmtTokens(total);
+
+            const sign = v => (v >= 0 ? '+' : '') + fmtTokens(v);
+            let toolName = '';
+            const argLines = [];
+            try {
+                // Segment feIdx represents Entry feIdx. Prompt feIdx contains result of call from feIdx-1.
+                const rd = sourceFe.response_data;
+                const tc = (typeof rd === 'string' ? JSON.parse(rd) : rd)?.choices?.[0]?.message?.tool_calls?.[0];
+                if (tc) {
+                    toolName = `${tc.function?.name || 'tool'}()`;
+                    const rawArgs = tc.function?.arguments;
+                    const args = (rawArgs && typeof rawArgs === 'object') ? rawArgs : JSON.parse(rawArgs || '{}');
+                    Object.keys(args).forEach(k => {
+                        argLines.push(`ARG "${k}": "${String(args[k]).slice(0, 40)}"`);
+                    });
                 }
-            } else {
-                // Non-tool-call turn — show first ~50 chars of text content as context
-                const content = rd?.choices?.[0]?.message?.content;
-                if (content && typeof content === 'string' && content.trim()) {
-                    toolPart = `  "${content.trim().slice(0, 50)}${content.trim().length > 50 ? '\u2026' : ''}"`;
-                }
-            }
-        } catch (_) {}
-        const line2 = `#${fe.id}${toolPart}  cost(${sign(tg)} \u25b3 TG): ${sign(delta)} \u25b3 PP`;
+            } catch (_) {}
 
-        let html =
-            `<div><span class="ctx-tip-agent" style="background:${agentColor};color:${agentText}">${escapeHtml(agentType)}</span>` +
-            `<span class="ctx-tip-stats">${escapeHtml(line1Stats)}</span></div>` +
-            `<div class="ctx-tip-tool">${escapeHtml(line2)}</div>`;
-        argLines.forEach(al => {
-            html += `<div class="ctx-tip-tool ctx-tip-arg">${escapeHtml(al)}</div>`;
-        });
-        tip.innerHTML = html;
+            const line2 = `#${fe.id} ${toolName}`;
+
+            let html =
+                `<div><span class="ctx-tip-agent" style="background:${agentColor};color:${agentText}">${escapeHtml(agentType)}</span>` +
+                `<span class="ctx-tip-stats">${escapeHtml(line1Stats)}</span></div>` +
+                `<div class="ctx-tip-tool">${escapeHtml(line2)}</div>`;
+            argLines.forEach(al => {
+                html += `<div class="ctx-tip-tool ctx-tip-arg">${escapeHtml(al)}</div>`;
+            });
+            tip.innerHTML = html;
+        }
 
         // Position above the bar, horizontally centred on cursor (clamped to viewport)
         const bar     = seg.closest('.ctx-bar');

@@ -9,42 +9,76 @@ All files in this directory are served as static files by FastAPI from the `/sta
 
 ### Board (`index.html` + `kanban.js` + `style.css`)
 
-The main Kanban board. Five columns: IDEA → PLANNING → INDEV → CONCEPTUAL_REVIEW →
-OPTIMIZATION → SECURITY → FULL_REVIEW → COMPLETED. Tasks are draggable within a column
-to reorder. Column transitions are gated by the backend intake pipeline.
+The main Kanban board. Nine columns: ARCHITECTURE → IDEAS → PLANNING → INDEV →
+CONCEPTUAL_REVIEW → OPTIMIZATION → SECURITY → FULL_REVIEW → COMPLETED. Tasks are
+draggable within a column to reorder. Column transitions are gated by the backend intake
+pipeline. Clicking a column header opens the **Column Map View**.
 
-**`index.html`** — Board shell. Project tabs, five column containers, seven modals (task
-create/edit, new project, edit project, LLM endpoints, budgets, tools).
+**`index.html`** — Board shell. Project tabs, nine column containers, the Column Map
+overlay (`#column-map-container`), eight modals (task create/edit, new project, edit
+project, transition, LLM endpoints, budgets, tools). Both New Project and Edit Project
+modals have **Default LLM** and **Budget** dropdowns.
 
-**`kanban.js`** — All board behaviour (~2 000 lines, monolithic). Key globals:
+**`kanban.js`** — All board behaviour. Key globals:
 - `taskData`, `allTasks`, `currentProject` — task state
-- `allLlms`, `allBudgets` — endpoint/budget dropdowns
+- `allLlms`, `allBudgets`, `allProjects` — endpoint/budget/project caches; `allProjects` is `[{name, path, description, llm_id, budget_id}]`
 - `transitionCache`, `transitionPollers` — intake pipeline polling
-- `_modalMousedownTarget` — drag-close fix (global mousedown listener, all 7 modals)
+- `columnMapActive`, `columnMapType` — Column Map View active flag and which column
+- `_mapCurrentEdges`, `_mapCurrentNodePositions`, `_mapCurrentColor`, `_mapOffsetX/Y` — shared map render state
+- `_mapNodeDrag` — drag state (`{active, nodeId, startX, startY, origPositions}`)
+- `_viewChildrenState`, `_childrenPollerTimer` — subdivision View Children / regen polling state
+- `currentBigIdeaFilter`, `breadcrumbStack`, `descendantIndex` — Big Idea zoom navigation state
+- `_modalMousedownTarget` — drag-close fix (global mousedown listener, all modals)
 
 Key patterns:
 - `loadTasksFromDatabase()` — re-fetches and fully rebuilds on project switch
 - `renderTasksFromDatabase()` — groups by type, sorts by `position`, appends cards
+- `reconcile()` — 5-second auto-refresh; skips DOM when `columnMapActive` is true
 - Drag-and-drop POSTs to `/api/tasks/{id}/reorder`, then re-fetches before re-rendering
-- 5-second auto-refresh via `setInterval`
+- New task default LLM is pre-populated from the current project's `llm_id`
+- `populateProjectLlmSelect(elementId, selectedId)` and `populateProjectBudgetSelect(elementId, selectedId)` — shared helpers for project-level dropdowns
 
-**`style.css`** — All board styles (~900 lines, monolithic).
+#### Column Map View
 
-If you need to modify the board, edit `kanban.js`. If you need to modify board styles,
-edit `style.css`.
+Clicking any column header or empty column whitespace opens a full-screen 2D radial
+canvas showing tasks as cards connected by thick cubic-bezier arrows.
+
+Key functions:
+- `openColumnMap(colType)` / `closeColumnMap()` — show/hide; hides `.kanban-board`, shows `#column-map-container`
+- `handleColumnClick(e, colType)` / `handleTasksContainerClick(e, colType)` — click guards
+- `_mapComputeLayout(tasks, colType)` — three-phase layout: (1) load saved `map_x/map_y`; (2) BFS fan-out for newly-subdivided children; (3) radial `placeSubtree()` for unpositioned nodes. IDEAS/ARCHITECTURE use `parent_task_id` hierarchy; others use `prerequisites`.
+- `renderColumnMap(colType)` — computes bounding box, sets canvas dimensions, renders `.map-node` divs, calls `_mapRedrawArrows()`, saves newly-positioned nodes
+- `_mapRedrawArrows()` — removes/redraws all SVG `<path>` bezier arrows; uses `_mapCardEdge()` for edge-to-edge routing
+- `_mapStartNodeDrag(e, nodeId)` — group drag: parent + all descendants move by the same delta
+- `_mapSavePositions(toSave)` — async fire-and-forget `PATCH /api/tasks/map-positions`
+- `setupMapInteraction()` / `teardownMapInteraction()` — pan (canvas drag) + zoom (scroll) on `#column-map-scroll-wrap`
+
+Positions are in **layout-space** (centred around 0), not canvas-space. Canvas position = layout + `(_mapOffsetX, _mapOffsetY)`. Offset is recomputed from the bounding box on each render — saved positions are stable across sessions.
+
+#### View Children (Subdivision Sets)
+
+"View Children" on a Big Idea task opens the transition modal showing all subdivision sets
+as a paginated collection (← older · N of M · newer →).
+
+- **Active set** — the set currently feeding child tasks. Non-active sets show **"Activate this set"** in the footer.
+- **Regeneration** — "Regenerate" keeps the modal open, injects a synthetic `{status: 'generating'}` placeholder as set 1, starts `_startChildrenPoller(taskId)`. The poller (500ms) watches `GET /api/tasks/{id}/subdivision-records` until the newest record leaves `generating` status, then stops and re-renders.
+- `_viewChildrenState = { taskId, records, childMap, idx }` — records sorted newest-first.
+- `_childrenPollerTimer` — `setInterval` ID; stopped by `_stopChildrenPoller()`.
+
+**`style.css`** — All board styles.
 
 ---
 
 ### Diagnostics (`diagnostics.html` + `diag-*.js` + `diagnostics.css`)
 
 A standalone three-panel LLM conversation viewer at `/diagnostics`. Shows every LLM call
-recorded in `budget_entries` grouped by task and session.
+recorded in `budget_entries`, grouped by task and session.
 
 **`diagnostics.html`** — Page shell. Three panels: task list (left), entry timeline
-(middle), conversation detail (right). Loads the five `diag-*.js` files in order.
+(middle), conversation detail (right). Loads the five `diag-*.js` files in dependency order.
 
-**`diagnostics.css`** — All diagnostics styles. Edit here for layout, colours, new
-CSS classes on the diagnostics page.
+**`diagnostics.css`** — All diagnostics styles. Edit here for layout, colours, new CSS
+classes on the diagnostics page.
 
 ---
 
@@ -54,14 +88,16 @@ The original `diagnostics.js` monolith was split into five files. They share glo
 defined in `diag-utils.js`. Load order matters — each file depends on the ones before it.
 
 ```
-diag-utils.js       ← load first
+diag-utils.js       ← load first  (globals, constants, pure helpers)
 diag-tasks.js       ← depends on diag-utils.js
 diag-entries.js     ← depends on diag-utils.js, diag-tasks.js
 diag-session.js     ← depends on diag-utils.js, diag-entries.js
 diag-render.js      ← depends on diag-utils.js, diag-session.js  ← load last
 ```
 
-### `diag-utils.js` — Shared state and pure helpers
+---
+
+### `diag-utils.js` — Shared state, constants, and pure helpers
 
 All global `let` variables live here. Every other file reads/writes them.
 
@@ -71,18 +107,32 @@ All global `let` variables live here. Every other file reads/writes them.
 | `allDiagTasks` | Task list from `GET /api/diagnostics/tasks` |
 | `allDiagLlms` | `id → {name, max_context}` map from `GET /api/llms` |
 | `currentEntries` | Lightweight entries for selected task (ascending) |
-| `currentSessions` | Output of `detectSessions()` — array of entry groups |
+| `currentSessions` | Output of `detectSessions()` — array of session groups |
 | `cachedSession` | `{ groupKey, fullEntries, boundaries }` — avoids re-fetching |
 | `renderedSessionKey` | `groupKey` of what is currently rendered in the DOM |
 
-Pure utility functions (no DOM access):
-- `escapeHtml(str)` — XSS-safe HTML escaping
-- `fmtTokens(n)` — 1024-based formatting (K/M)
-- `formatTimestamp(isoStr)` — locale-formatted date/time
-- `labelEntry(systemContent)` — classify entry type from first system message text
+Shared constants (all other files read these — do not redeclare):
 
-**Edit this file when:** adding a new global, changing token formatting, or changing
-entry type classification keywords.
+| Constant | Purpose |
+|---|---|
+| `TYPE_COLORS` | Agent type → hex colour (surveyor, designer, judge, reviewer, research, pitfall, security, optimization, subdivision, web_agent, maestro_loop, file_summary, unknown) |
+| `TOOL_COLORS` | Tool category → hex colour (read, write, list, search, git, shell, task, plan, web, other) |
+| `TOOL_CATEGORY_MAP` | Tool function name → category string (e.g. `read_file` → `'read'`) |
+
+Pure utility functions (no DOM access):
+
+| Function | What it does |
+|---|---|
+| `escapeHtml(str)` | XSS-safe HTML escaping |
+| `fmtTokens(n)` | 1024-based formatting (K/M) |
+| `formatTimestamp(isoStr)` | Locale-formatted date/time |
+| `labelEntry(systemContent)` | Classify entry type from first system message text; returns a key from `TYPE_COLORS` |
+| `labelEntryFromUser(userContent)` | Fallback classifier for system-less calls (e.g. file summaries); detects `file_summary` |
+| `labelTool(toolName)` | Maps a tool function name to its category via `TOOL_CATEGORY_MAP` |
+| `getConceptualTurns(group)` | Builds `[SYSTEM Prompt, USER Prompt, Turn 1…N]` turn objects for a session group; each turn has `{label, entryId, type, msgIdx, entry}` |
+
+**Edit this file when:** adding a new global, changing token formatting, adding an agent type
+to `TYPE_COLORS`/`labelEntry`, adding a tool to `TOOL_CATEGORY_MAP`, or changing session-turn logic.
 
 ---
 
@@ -96,6 +146,8 @@ Populates the left panel with tasks that have LLM activity.
 | `renderTaskList(tasks)` | Renders task cards with title, type badge, call count, token total |
 | `filterTasks(query)` | Filters `allDiagTasks` by title/id; called by the search input `oninput` |
 
+The synthetic `{id: "__file_summaries__", type: "file_summary"}` row (project prewarm calls with no task) appears at the top of this list when such entries exist.
+
 **Edit this file when:** changing task card appearance, adding columns to the task list,
 or changing what data is fetched on page load.
 
@@ -103,14 +155,14 @@ or changing what data is fetched on page load.
 
 ### `diag-entries.js` — Middle panel: entry timeline and task summary
 
-Populates the middle panel when a task is selected, and the right panel task summary view.
+Populates the middle panel when a task is selected, and the initial task summary in the right panel.
 
 | Function | What it does |
 |---|---|
-| `selectTask(taskId)` | Fetches `/api/budget-entries?task_id=…`; calls `detectSessions()`, `renderEntryList()`, `renderTaskSummary()` |
-| `renderTaskSummary(taskId)` | Renders per-session aggregate table in right panel (initial view before an entry is selected) |
-| `detectSessions(entries)` | Groups ascending entries into sessions: new session when `prompt_cost` drops or time gap > 5 min |
-| `renderEntryList(sessions)` | Renders session groups with per-entry dots, token counts, tool call badges |
+| `selectTask(taskId)` | Fetches budget entries (uses `task_id=__file_summaries__` for the synthetic task); calls `detectSessions()`, `renderEntryList()`, `renderTaskSummary()` |
+| `renderTaskSummary(taskId)` | Renders per-session aggregate table in the right panel |
+| `detectSessions(entries)` | Groups ascending entries into sessions: new session when context drops > 15% OR time gap > 10 minutes |
+| `renderEntryList(sessions)` | Renders session groups using `getConceptualTurns()` for turn labels; each turn is a clickable row |
 
 **Edit this file when:** changing session detection heuristics, changing the entry list
 card layout, or changing what the task-level summary table shows.
@@ -119,16 +171,15 @@ card layout, or changing what the task-level summary table shows.
 
 ### `diag-session.js` — Entry selection, turn summary table, DOM navigation
 
-Handles the three fetch paths when a user clicks an entry, and the per-turn summary table
-that appears above the conversation.
+Handles the three fetch paths when a user clicks an entry, and the per-turn summary table.
 
 | Function | What it does |
 |---|---|
-| `groupMessages(messages)` | Collapses `[assistant + tool…]` runs into `tool_group` objects for grouped rendering |
+| `groupMessages(messages, allBoundaries)` | Collapses `[assistant + tool…]` runs into `tool_group` objects; breaks at every conceptual turn boundary |
 | `renderToolGroup(msgs, startIndex, highlighted)` | Wraps a tool call + results in `.diag-tool-group` |
 | `buildSessionSummary(anchorEntryId)` | Builds the sticky per-turn table (# / Entry / Finish / LLM / Calls / Prompt / Δ Prompt / Ctx% / Generated / Total / Cache / PP$ / TG$ / Total$) |
-| `selectEntry(entryId)` | Three-path fetch logic: Path 1 = DOM-only jump (accumulating), Path 2 = re-render from cache, Path 3 = full fetch |
-| `jumpToEntry(entryId, sessionGroup)` | DOM-only: re-highlights messages, swaps anchor divider, scrolls. No fetch. Only called from Path 1. |
+| `selectEntry(entryId, targetMsgIdx)` | Three-path fetch logic: Path 1 = DOM-only jump (accumulating), Path 2 = re-render from cache, Path 3 = full fetch |
+| `jumpToEntry(entryId, sessionGroup)` | DOM-only: re-highlights messages, swaps anchor divider, scrolls. Only called from Path 1. |
 
 **Edit this file when:** adding columns to the turn summary table, changing session fetch
 logic, or changing how DOM-only navigation works.
@@ -140,25 +191,32 @@ logic, or changing how DOM-only navigation works.
 
 ### `diag-render.js` — Right panel: conversation and message rendering
 
-Renders the full conversation view in the right panel. Also contains the context-window
-usage bar, macOS Dock-style magnification, UI toggle handlers, and the `DOMContentLoaded`
-init call.
+Renders the full conversation view. Contains the context-window usage bar, JS tooltip,
+UI toggle handlers, and the `DOMContentLoaded` init call.
+
+> **Note:** The macOS Dock-style `_initDockZoom()` IIFE (cosine-falloff neighbor
+> magnification, `MAX_SCALE`, `INFLUENCE_PX`, `.dock-zooming`) **has been removed**.
+> Segment hover interaction is now handled by CSS + a separate JS tooltip IIFE.
 
 | Function | What it does |
 |---|---|
-| `_msgCharLen(msg)` | Estimate character length of a message object (for proportioning token deltas by content type) |
-| `buildCtxBar(entryId)` | Build a context-window usage bar for a turn divider. Flat flex segments (base/asst/tool/free) with `flex-grow` = token count. Each coloured segment carries a `data-label` attribute shown on hover via CSS `::after` overlay (entry ID, call tokens, delta, pp, tg, cost). |
-| `renderConversation(entry, highlightFrom, anchorEntryId, selectedFull, sessionBoundaries)` | Main render: builds the conversation header, calls `buildSessionSummary()`, iterates grouped messages with turn dividers, appends `[RESPONSE]` block |
+| `_msgCharLen(msg)` | Estimates character length of a message for proportioning token deltas |
+| `buildCtxBar(entryId)` | Builds the context-window usage bar for a turn divider. Turn 0 is a single merged setup segment (`.ctx-seg-merged-setup`); turns 1…N are individually coloured by **tool category** (inline `background-color` from `TOOL_COLORS`). Free-space segment shows remaining tokens. |
+| `renderConversation(entry, highlightFrom, anchorEntryId, selectedFull, sessionBoundaries, targetMsgIdx)` | Main render: conversation header, `buildSessionSummary()`, grouped messages with turn dividers, `[RESPONSE]` block |
 | `renderMessage(msg, index, highlighted)` | Renders a single message bubble (system/user/assistant/tool). Tool results are collapsible. |
 | `renderToolCall(tc)` | Renders a single tool call block with name, args, collapsible call ID |
 | `renderSystemWarning(content)` | Renders `[SYSTEM]` injected messages as coloured warning banners |
 | `toggleToolResult(bodyId, header)` | Expand/collapse tool result body |
 | `toggleReasoning(el)` | Expand/collapse reasoning block |
-| `_initDockZoom()` (IIFE) | macOS Dock-style magnification on `.ctx-bar` segments. Uses event delegation (`mousemove` on `document`). Cosine falloff: 5× peak scale at cursor, decaying to 1× over 24px (~¼ inch). `transform-origin: bottom center` — segments grow upward. z-index tracks scale. Bar gets `.dock-zooming` class (overflow visible) during interaction. |
+| `_initCtxTooltip()` (IIFE) | Hover tooltip for context-bar segments. Uses event delegation (`mousemove` on `document`). Shows a fixed JS-positioned panel above the cursor: agent-type badge (colour from `TYPE_COLORS`), context % used, tool call name and args. Segments are also **clickable** — clicking a segment calls `selectEntry(fe.id)` to jump to that turn. |
 
 **Edit this file when:** changing how individual messages look, adding new message role
-types, changing the conversation header layout, changing the `[RESPONSE]` block, or
-tuning the Dock zoom parameters (`MAX_SCALE`, `INFLUENCE_PX`).
+types, changing the conversation header, changing the `[RESPONSE]` block, or modifying
+tooltip content.
+
+**Context-bar colours** come from `TOOL_COLORS` in `diag-utils.js` and are set as inline
+`background-color` on each segment. To add a new tool-category colour, edit `TOOL_COLORS`
+and `TOOL_CATEGORY_MAP` in `diag-utils.js`.
 
 ---
 
@@ -176,7 +234,12 @@ Applied as `type-{name}` on `.diag-entry-dot` and `.diag-conv-type-label`:
 | `judge` | `#fd7e14` (orange) |
 | `research` | `#ffc107` (yellow, dark text) |
 | `pitfall` | `#e83e8c` (pink) |
+| `security` | `#dc3545` (red) |
+| `optimization` | `#fd7e14` (orange) |
+| `subdivision` | `#6610f2` (indigo) |
 | `maestro_loop` | `#198754` (green) |
+| `file_summary` | `#17a2b8` (cyan) |
+| `web_agent` | `#d946ef` (fuchsia) |
 | `unknown` | `#6c757d` (gray) |
 
 ### System warning banners
@@ -188,16 +251,27 @@ Applied to `.diag-system-warn`:
 
 ### Context bar (`.ctx-bar` + `.ctx-seg`)
 
-- `.ctx-bar` — flex container representing the full context window; `align-items: flex-end`
-- `.ctx-bar.dock-zooming` — added during Dock magnification; `overflow: visible`, `z-index: 10`
-- `.ctx-seg` — individual segment; `flex-grow` = token count; `transform-origin: bottom center`
-- `.ctx-seg-base` — gray, initial system/task context (turn 0)
-- `.ctx-seg-asst` — purple, assistant generation tokens carried forward
-- `.ctx-seg-tool` — teal, tool results / external input
-- `.ctx-seg-current` — vivid variant of above for the selected turn
-- `.ctx-seg-free` — transparent, remaining context capacity (excluded from hover/zoom)
-- `.ctx-seg-gap` — 3px left margin on first segment of each new turn
-- `.ctx-seg:hover` — 2px yellow box-shadow + `::after` overlay label from `data-label`
+The bar is a flat flexbox representing the full `max_context` window. Segments are
+proportional to token counts via `flex-grow`. The bar scrolls horizontally (`overflow-x: auto`)
+rather than squeezing when turns are too narrow.
+
+| Class | Purpose |
+|---|---|
+| `.ctx-bar` | Flex container; `height: 32px`; `overflow-x: auto`; scrollbar hidden |
+| `.ctx-seg` | Individual segment; `min-width: 12px`; `flex-basis: 0`; colour set by inline `background-color` |
+| `.ctx-seg:not(.ctx-seg-free):hover` | Pure CSS hover: `scaleY(1.15)` upward pop + `box-shadow: 0 0 0 2px #ffc107`. No JS scaling. |
+| `.ctx-seg-merged-setup` | Turn 0 merged system+user prompt segment (contains two inner divs for proportional colouring) |
+| `.ctx-seg-current` | Applied to the segment matching the selected turn |
+| `.ctx-seg-free` | White, transparent-ish; remaining context capacity; not hoverable; contains `.ctx-free-label` |
+| `.ctx-seg-gap` | `margin-left: 0` — segments are flush; class kept for legacy compatibility |
+| `#ctx-tooltip` | Fixed-position JS-driven tooltip; dark panel, yellow border; shown on mousemove over segments |
+| `.ctx-tip-agent` | Coloured agent-type badge inside tooltip |
+| `.ctx-tip-stats` | Muted token count line in tooltip |
+| `.ctx-tip-tool` | Tool call name/args lines in tooltip |
+| `.ctx-tip-arg` | Indented arg lines within the tooltip |
+
+> **Removed:** `.ctx-bar.dock-zooming` (overflow-visible class during Dock magnification),
+> `MAX_SCALE`, `INFLUENCE_PX` JS constants, all cosine-falloff scaling logic.
 
 ### Turn table helpers
 

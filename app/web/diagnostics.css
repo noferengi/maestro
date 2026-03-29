@@ -382,9 +382,9 @@
     word-break: break-word;
 }
 
-.msg-system   .diag-msg-header { background: #495057; }
-.msg-user     .diag-msg-header { background: #0d6efd; }
-.msg-assistant .diag-msg-header { background: #6f42c1; }
+.msg-system   .diag-msg-header { background: #5a6370; }
+.msg-user     .diag-msg-header { background: #212529; }
+.msg-assistant .diag-msg-header { background: #0d6efd; }
 .msg-tool     .diag-msg-header { background: #198754; }
 
 /* Tool result: collapsible body */
@@ -583,16 +583,66 @@
 .diag-turn-divider-end::after {
     background: #6c757d;
 }
+/* Abrupt-end divider — red tint */
+.diag-turn-divider-abort {
+    color: #dc3545;
+    margin-top: 0.75rem;
+    font-weight: 600;
+}
+.diag-turn-divider-abort::before,
+.diag-turn-divider-abort::after {
+    background: #dc3545;
+    opacity: 0.6;
+}
+/* Abrupt-end warning banner */
+.diag-abrupt-end {
+    margin: 0.5rem 0;
+    padding: 0.55rem 0.85rem;
+    background: #fff3cd;
+    border-left: 4px solid #ffc107;
+    border-radius: 4px;
+    font-size: 0.82rem;
+    color: #664d03;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+.diag-abrupt-icon {
+    font-size: 1rem;
+    flex-shrink: 0;
+}
+/* Middle panel: abrupt-end entry item */
+.diag-entry-abrupt .diag-entry-id {
+    color: #dc3545;
+}
+.diag-abrupt-badge {
+    margin-left: 0.4rem;
+    font-size: 0.68rem;
+    font-weight: 600;
+    color: #ffc107;
+    background: #664d03;
+    border-radius: 3px;
+    padding: 0 3px;
+    vertical-align: middle;
+}
 /* When a ctx bar is present the pseudo-element lines are replaced by the bar itself */
 .diag-turn-divider.has-ctx-bar::before,
 .diag-turn-divider.has-ctx-bar::after { display: none; }
-.diag-divider-label { flex-shrink: 0; }
+/* Two-row layout: label on its own line, ctx-bar (+ pct label) on the next line.
+   This ensures the ctx-bar always gets the full panel width regardless of label length. */
+.diag-turn-divider.has-ctx-bar {
+    flex-wrap: wrap;
+    align-items: center;
+}
+.diag-turn-divider.has-ctx-bar .diag-divider-label {
+    width: 100%;
+}
+.diag-divider-label { flex-shrink: 0; text-align: center; }
 
 /* ── Context composition bar ─────────────────────────────── */
 /* FLAT flexbox: every segment is a direct child of .ctx-bar.
-   flex-grow = token count → browser distributes proportionally.
-   The bar represents the FULL max_context window; unused capacity
-   is a transparent free-space segment on the right. */
+   The bar represents the FULL max_context window.
+   If turns are too tiny, they are enforced to a minimum width and the bar scrolls. */
 .ctx-bar {
     flex: 1;
     display: flex;
@@ -600,30 +650,40 @@
     height: 32px;
     background: #1a1d20;
     border-radius: 3px;
-    overflow: hidden;
+    overflow-x: auto;           /* Scroll instead of squeezing tiny turns */
+    scrollbar-width: none;      /* Hide scrollbar for a cleaner look */
 }
-/* When dock-zoom is active, allow scaled segments to pop above the bar */
-.ctx-bar.dock-zooming {
-    overflow: visible;
-    z-index: 10;
-}
-/* All segments share flex-basis:0 so ALL width is flex-grow-driven. */
+.ctx-bar::-webkit-scrollbar { display: none; }
+
+/* All segments share flex-basis:0 so width is proportional to token count,
+   BUT we enforce a 12px minimum width for accessibility. */
 .ctx-seg {
     height: 100%;
+    flex: 1 0 auto;             /* Grow proportionally, don't shrink below content/min-width */
     flex-basis: 0;
-    border-radius: 0;           /* square corners — outline matches element shape exactly */
+    min-width: 12px;            /* 12px of guaranteed resolution for every turn */
+    border-radius: 0;
     outline: 1px solid rgba(0,0,0,0.55);
-    outline-offset: -1px;       /* inset so it doesn't bleed into neighbours */
+    outline-offset: -1px;
     position: relative;
-    transform-origin: center;   /* symmetric vertical growth — equal up/down */
-    transition: transform 0.08s ease-out;
-    will-change: transform;
+    transform-origin: bottom;   /* Pop goes UP ONLY to prevent scroll-hit-area interference */
+    transition: transform 0.1s ease-out;
+    transform: translate3d(0,0,0); /* Isolate layers to prevent sub-pixel jitter in neighbors */
 }
-/* Hover: yellow border pop — tooltip is JS-driven (#ctx-tooltip) */
+
+/* Hover: simple highlight and vertical pop, NO horizontal resizing */
 .ctx-seg:not(.ctx-seg-free):hover {
     box-shadow: 0 0 0 2px #ffc107;
-    z-index: 5;
+    z-index: 10;
     cursor: pointer;
+    transform: scaleY(1.15) translate3d(0,0,0);
+}
+
+/* Free space fills the remaining context proportionally */
+.ctx-seg-free {
+    min-width: 0;
+    flex-grow: 1;
+    flex-shrink: 1;
 }
 
 /* ── JS hover tooltip for context-bar segments ── */
@@ -665,14 +725,10 @@
 }
 /* No gap between turns — segments are flush */
 .ctx-seg-gap { margin-left: 0; }
-/* Past turns */
-.ctx-seg-base { background: #5a6370; }       /* gray   — initial system / task context */
-.ctx-seg-asst { background: #5c35a3; }       /* purple — assistant generation tokens   */
-.ctx-seg-tool { background: #1a8066; }       /* teal   — tool results / external input */
-/* Current turn — vivid versions */
-.ctx-seg-current.ctx-seg-base { background: #8b95a3; }
-.ctx-seg-current.ctx-seg-asst { background: #a87df5; }
-.ctx-seg-current.ctx-seg-tool { background: #2dd4a8; }
+
+/* Past turns / default — colors now assigned via inline style background-color */
+.ctx-seg { background: #5a6370; }
+
 /* Free space — remaining context capacity */
 .ctx-seg-free {
     background: #ffffff;

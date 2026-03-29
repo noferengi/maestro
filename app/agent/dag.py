@@ -57,6 +57,13 @@ class DAGResolver:
     def __init__(self, tasks: list[dict]) -> None:
         self._tasks: list[dict] = tasks
         self._by_id: dict[str, dict] = {t["id"]: t for t in tasks if "id" in t}
+        # parent_task_id → [child task IDs]: built from subdivision hierarchy.
+        # Used by _is_effectively_done to delegate completion to children.
+        self._children_by_parent: dict[str, list[str]] = defaultdict(list)
+        for t in tasks:
+            pid = t.get("parent_task_id")
+            if pid:
+                self._children_by_parent[pid].append(t["id"])
 
     # ------------------------------------------------------------------
     # Public API
@@ -71,9 +78,20 @@ class DAGResolver:
         for task in self._tasks:
             if _is_done(task):
                 continue
-            # Skip tasks that are already in flight or in non-dispatchable states
             task_type = (task.get("type") or "").lower()
-            if task_type in ("indev", "conceptual_review", "optimization", "security", "full_review", "completed", "cancelled", "subdividing"):
+            # Permanently terminal states — never dispatch
+            if task_type in ("security", "completed", "cancelled", "subdividing"):
+                continue
+            # indev / conceptual_review / optimization / full_review are
+            # mid-pipeline stages.  They are NOT excluded here: if there is no
+            # live thread for them (fresh startup, crash recovery) the
+            # _active_sessions guard in scheduler._tick() re-dispatches them.
+            # Excluding them here was the cause of orphaned-after-restart tasks
+            # never being recovered.
+            # Skip Big Idea parents that have children — the scheduler works on
+            # the children directly.  The parent unblocks downstream dependents
+            # via _is_effectively_done once all active children complete.
+            if task.get("id") in self._children_by_parent:
                 continue
             if self._all_prerequisites_done(task):
                 ready.append(task)
@@ -217,14 +235,48 @@ class DAGResolver:
     # Private helpers
     # ------------------------------------------------------------------
 
+    def _is_effectively_done(self, task_id: str, _visited: frozenset | None = None) -> bool:
+        """True if a task is completed/accepted, OR if it is a Big Idea parent
+        whose every active (non-cancelled) child is recursively effectively done.
+
+        This allows a subdivided parent to satisfy a prerequisite edge once all
+        its children finish, without the parent itself needing to reach
+        'completed' state.  Active children that are themselves Big Idea parents
+        are resolved the same way recursively.
+
+        Conservative rules:
+          - Unknown task ID → False.
+          - All children cancelled (no active children) → False (something went
+            wrong; don't silently unblock downstream work).
+          - Cycle guard via _visited frozenset.
+        """
+        if _visited is None:
+            _visited = frozenset()
+        if task_id in _visited:
+            return False  # cycle guard
+        task = self._by_id.get(task_id)
+        if task is None:
+            return False  # unknown → conservative
+        if _is_done(task):
+            return True
+        children = self._children_by_parent.get(task_id)
+        if not children:
+            return False  # not done and no children to delegate to
+        active_children = [
+            cid for cid in children
+            if (self._by_id.get(cid, {}).get("type") or "").lower() != "cancelled"
+        ]
+        if not active_children:
+            return False  # all children cancelled — keep parent blocked
+        return all(
+            self._is_effectively_done(cid, _visited | {task_id})
+            for cid in active_children
+        )
+
     def _all_prerequisites_done(self, task: dict) -> bool:
         """Return True if all prerequisites for task are in a done state."""
         for prereq_id in task.get("prerequisites") or []:
-            prereq = self._by_id.get(prereq_id)
-            if prereq is None:
-                # Unknown prereq — treat as not done (conservative)
-                return False
-            if not _is_done(prereq):
+            if not self._is_effectively_done(prereq_id):
                 return False
         return True
 

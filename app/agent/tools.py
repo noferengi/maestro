@@ -1039,8 +1039,9 @@ def _import_db():
 
 def generate_architecture_doc(title: str, components: list, relationships: list) -> str:
     """
-    Produce a structured markdown architecture document.
-    Stays in agent context — NOT written to disk.
+    Produce a structured markdown architecture document and write it to
+    .maestro/architecture.md in the project root.  Returns a short stub
+    so the full document does not bloat the conversation context.
     """
     lines = [f"# Architecture: {title}", ""]
 
@@ -1073,16 +1074,25 @@ def generate_architecture_doc(title: str, components: list, relationships: list)
                 lines.append(f"- {rel}")
         lines.append("")
 
-    return "\n".join(lines)
+    content = "\n".join(lines)
+    dest = ".maestro/architecture.md"
+    try:
+        safe_path = _assert_safe_path(dest)
+        os.makedirs(os.path.dirname(safe_path), exist_ok=True)
+        with open(safe_path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        _git_run(["git", "add", safe_path])
+        return f"OK: architecture doc '{title}' saved to '{dest}' ({len(components)} components, {len(relationships)} relationships)."
+    except Exception as exc:
+        return f"ERROR saving architecture doc: {exc}"
 
 
 def generate_mermaid_diagram(diagram_type: str, definition: str) -> str:
     """
-    Validate and format a Mermaid diagram definition.
-    Returns the formatted mermaid markup as a string.
+    Validate and format a Mermaid diagram definition, then write it to
+    .maestro/diagrams/{diagram_type}.md in the project root.  Returns a
+    short stub so the diagram body does not bloat the conversation context.
     """
-    valid_types = {"flowchart", "sequence", "class", "er", "gantt", "stateDiagram", "pie"}
-    # Normalize common aliases
     type_map = {
         "flowchart": "flowchart",
         "flow": "flowchart",
@@ -1101,18 +1111,30 @@ def generate_mermaid_diagram(diagram_type: str, definition: str) -> str:
             f"Valid types: {sorted(type_map.keys())}"
         )
 
-    # Check if definition already starts with a diagram directive
     stripped = definition.strip()
     if any(stripped.startswith(d) for d in type_map.values()):
-        return f"```mermaid\n{stripped}\n```"
+        markup = f"```mermaid\n{stripped}\n```"
+    else:
+        markup = f"```mermaid\n{normalized}\n{stripped}\n```"
 
-    return f"```mermaid\n{normalized}\n{stripped}\n```"
+    dest = f".maestro/diagrams/{diagram_type.lower()}.md"
+    try:
+        safe_path = _assert_safe_path(dest)
+        os.makedirs(os.path.dirname(safe_path), exist_ok=True)
+        with open(safe_path, "w", encoding="utf-8") as fh:
+            fh.write(markup)
+        _git_run(["git", "add", safe_path])
+        line_count = markup.count("\n") + 1
+        return f"OK: {normalized} diagram saved to '{dest}' ({line_count} lines)."
+    except Exception as exc:
+        return f"ERROR saving mermaid diagram: {exc}"
 
 
 def generate_interface_contract(component_name: str, provides: list, consumes: list) -> str:
     """
-    Define the API surface / interface contract for a component.
-    Returns a structured JSON string describing what this component provides and consumes.
+    Define the API surface / interface contract for a component and write it
+    to .maestro/contracts/{component_name}.json in the project root.  Returns
+    a short stub so the contract body does not bloat the conversation context.
     """
     import json as _json
 
@@ -1134,7 +1156,21 @@ def generate_interface_contract(component_name: str, provides: list, consumes: l
         else:
             contract["consumes"].append({"name": str(item), "type": "unknown"})
 
-    return _json.dumps(contract, indent=2)
+    content = _json.dumps(contract, indent=2)
+    safe_name = re.sub(r"[^\w\-]", "_", component_name)
+    dest = f".maestro/contracts/{safe_name}.json"
+    try:
+        safe_path = _assert_safe_path(dest)
+        os.makedirs(os.path.dirname(safe_path), exist_ok=True)
+        with open(safe_path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        _git_run(["git", "add", safe_path])
+        return (
+            f"OK: interface contract for '{component_name}' saved to '{dest}' "
+            f"({len(contract['provides'])} provides, {len(contract['consumes'])} consumes)."
+        )
+    except Exception as exc:
+        return f"ERROR saving interface contract: {exc}"
 
 
 def record_benchmark(task_id: str, parent_task_id: str, benchmark_type: str, metrics: str) -> str:
@@ -1165,14 +1201,15 @@ def record_benchmark(task_id: str, parent_task_id: str, benchmark_type: str, met
 
 def web_search(query: str, count: int = 5) -> str:
     """
-    Execute a web search using the Brave Search API.
+    Execute a web search.  Supports DuckDuckGo (free) or Brave Search (requires API key).
+    Provider is selected via [llm] search_provider in maestro.ini (default: duckduckgo).
+
     Returns a JSON string of results with titles, URLs, and snippets.
     Uses SearchCache to avoid redundant API calls for identical queries.
-    Requires BRAVE_API_KEY from config or environment.
     """
     import json as _json
     from app.database import get_search_cache, create_search_cache
-    from app.agent.config import BRAVE_API_KEY
+    from app.agent.config import BRAVE_API_KEY, SEARCH_PROVIDER
 
     # 1. Check local cache first
     q = query.strip()
@@ -1181,37 +1218,67 @@ def web_search(query: str, count: int = 5) -> str:
         logger.info("Search Cache HIT for query: '%s'", q)
         return cached.result_json
 
-    # 2. Cache miss — call the search provider
-    api_key = BRAVE_API_KEY
-    if not api_key:
-        return "ERROR: BRAVE_API_KEY not set. Web search is unavailable. Add it to [llm] section in maestro.ini or set BRAVE_API_KEY env var."
+    # 2. Cache miss — call the selected search provider
+    provider = SEARCH_PROVIDER.lower()
+    search_results = []
 
     try:
-        from brave import Brave
-        logger.info("Search Cache MISS for query: '%s' — calling Brave Search API", q)
+        if provider == "duckduckgo":
+            logger.info("Search Cache MISS for query: '%s' — calling DuckDuckGo", q)
+            search_results = _ddg_search(q, count)
+        elif provider == "brave":
+            if not BRAVE_API_KEY:
+                return "ERROR: BRAVE_API_KEY not set but search_provider='brave'. Web search is unavailable."
+            logger.info("Search Cache MISS for query: '%s' — calling Brave Search API", q)
+            search_results = _brave_search(q, count, BRAVE_API_KEY)
+        else:
+            return f"ERROR: Unknown search_provider '{provider}'. Supported: duckduckgo, brave."
 
-        brave = Brave(api_key=api_key)
-        results = brave.search(q=q, count=min(count, 10))
-
-        search_results = []
-        if hasattr(results, 'web') and hasattr(results.web, 'results'):
-            for r in results.web.results:
-                search_results.append({
-                    "title": getattr(r, 'title', 'No Title'),
-                    "url": getattr(r, 'url', 'No URL'),
-                    "description": getattr(r, 'description', 'No Description'),
-                })
-
-        final_json = _json.dumps({"query": q, "results": search_results}, indent=2)
+        final_json = _json.dumps({"query": q, "provider": provider, "results": search_results}, indent=2)
 
         # 3. Persist to cache for next time
         create_search_cache(q, final_json)
 
         return final_json
-    except ImportError:
-        return "ERROR: 'brave' python library not installed. Run 'pip install brave' to enable web search."
+    except ImportError as e:
+        lib = "duckduckgo-search" if provider == "duckduckgo" else "brave"
+        return f"ERROR: '{lib}' python library not installed. Run 'pip install {lib}' to enable web search. (ImportError: {e})"
     except Exception as exc:
-        return f"ERROR: Web search failed: {exc}"
+        return f"ERROR: {provider.capitalize()} search failed: {exc}"
+
+
+def _ddg_search(query: str, count: int) -> list[dict]:
+    """Internal helper: execute search via duckduckgo_search library."""
+    from duckduckgo_search import DDGS
+    
+    results = []
+    # DDGS.text() is the standard search method in duckduckgo_search 6.x/7.x
+    with DDGS() as ddgs:
+        ddgs_gen = ddgs.text(query, max_results=min(count, 15))
+        for r in ddgs_gen:
+            results.append({
+                "title": r.get("title", "No Title"),
+                "url": r.get("href", "No URL"),
+                "description": r.get("body", "No Description"),
+            })
+    return results
+
+
+def _brave_search(query: str, count: int, api_key: str) -> list[dict]:
+    """Internal helper: execute search via Brave Search API."""
+    from brave import Brave
+    brave = Brave(api_key=api_key)
+    results = brave.search(q=query, count=min(count, 10))
+
+    search_results = []
+    if hasattr(results, 'web') and hasattr(results.web, 'results'):
+        for r in results.web.results:
+            search_results.append({
+                "title": getattr(r, 'title', 'No Title'),
+                "url": getattr(r, 'url', 'No URL'),
+                "description": getattr(r, 'description', 'No Description'),
+            })
+    return search_results
 
 
 def web_fetch(url: str) -> str:

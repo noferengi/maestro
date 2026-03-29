@@ -139,6 +139,121 @@ class TestDAGResolverExclusions:
 
 
 # ============================================================
+# DAGResolver — Big Idea parent / child delegation
+# ============================================================
+
+class TestBigIdeaParentDelegation:
+    """A subdivided Big Idea parent unblocks downstream tasks once all its
+    active children complete, without the parent itself reaching 'completed'."""
+
+    def _make_tasks(self, parent_type, child_types):
+        """Helper: parent + children + one downstream task that prereqs the parent."""
+        tasks = [
+            {
+                "id": "parent",
+                "type": parent_type,
+                "position": 0,
+                "prerequisites": [],
+                "parent_task_id": None,
+            },
+        ]
+        for i, ct in enumerate(child_types):
+            tasks.append({
+                "id": f"child-{i}",
+                "type": ct,
+                "position": i,
+                "prerequisites": [],
+                "parent_task_id": "parent",
+            })
+        tasks.append({
+            "id": "downstream",
+            "type": "idea",
+            "position": 0,
+            "prerequisites": ["parent"],
+            "parent_task_id": None,
+        })
+        return tasks
+
+    def test_parent_not_dispatched_when_has_children(self):
+        """A parent with children must never appear in get_ready_tasks."""
+        from app.agent.dag import DAGResolver
+        tasks = self._make_tasks("idea", ["idea", "idea"])
+        dag = DAGResolver(tasks)
+        ids = [t["id"] for t in dag.get_ready_tasks()]
+        assert "parent" not in ids
+
+    def test_downstream_blocked_while_children_pending(self):
+        """Downstream prereq on parent stays blocked while children are not done."""
+        from app.agent.dag import DAGResolver
+        tasks = self._make_tasks("idea", ["idea", "idea"])
+        dag = DAGResolver(tasks)
+        ids = [t["id"] for t in dag.get_ready_tasks()]
+        assert "downstream" not in ids
+
+    def test_downstream_unblocked_when_all_children_completed(self):
+        """Downstream unblocks once every active child reaches 'completed'."""
+        from app.agent.dag import DAGResolver
+        tasks = self._make_tasks("idea", ["completed", "completed"])
+        dag = DAGResolver(tasks)
+        ids = [t["id"] for t in dag.get_ready_tasks()]
+        assert "downstream" in ids
+
+    def test_downstream_blocked_when_one_child_still_pending(self):
+        """One unfinished child keeps the parent (and downstream) blocked."""
+        from app.agent.dag import DAGResolver
+        tasks = self._make_tasks("idea", ["completed", "idea"])
+        dag = DAGResolver(tasks)
+        ids = [t["id"] for t in dag.get_ready_tasks()]
+        assert "downstream" not in ids
+
+    def test_all_cancelled_children_keeps_downstream_blocked(self):
+        """All-cancelled children → parent still blocked (conservative)."""
+        from app.agent.dag import DAGResolver
+        tasks = self._make_tasks("idea", ["cancelled", "cancelled"])
+        dag = DAGResolver(tasks)
+        ids = [t["id"] for t in dag.get_ready_tasks()]
+        assert "downstream" not in ids
+
+    def test_mixed_cancelled_and_completed_unblocks_downstream(self):
+        """Cancelled children are ignored; all remaining active children done → unblocks."""
+        from app.agent.dag import DAGResolver
+        tasks = self._make_tasks("idea", ["completed", "cancelled"])
+        dag = DAGResolver(tasks)
+        ids = [t["id"] for t in dag.get_ready_tasks()]
+        assert "downstream" in ids
+
+    def test_nested_big_idea_all_grandchildren_done_unblocks(self):
+        """Two levels of subdivision: grandchildren all done → outer downstream unblocks."""
+        from app.agent.dag import DAGResolver
+        tasks = [
+            {"id": "grandparent", "type": "idea",      "position": 0, "prerequisites": [],              "parent_task_id": None},
+            {"id": "parent",      "type": "idea",      "position": 0, "prerequisites": [],              "parent_task_id": "grandparent"},
+            {"id": "child-0",     "type": "completed", "position": 0, "prerequisites": [],              "parent_task_id": "parent"},
+            {"id": "child-1",     "type": "completed", "position": 1, "prerequisites": ["child-0"],     "parent_task_id": "parent"},
+            {"id": "downstream",  "type": "idea",      "position": 0, "prerequisites": ["grandparent"], "parent_task_id": None},
+        ]
+        dag = DAGResolver(tasks)
+        ids = [t["id"] for t in dag.get_ready_tasks()]
+        assert "downstream" in ids
+        assert "grandparent" not in ids
+        assert "parent" not in ids
+
+    def test_nested_big_idea_pending_grandchild_blocks(self):
+        """Two levels: one pending grandchild keeps outer downstream blocked."""
+        from app.agent.dag import DAGResolver
+        tasks = [
+            {"id": "grandparent", "type": "idea",      "position": 0, "prerequisites": [],              "parent_task_id": None},
+            {"id": "parent",      "type": "idea",      "position": 0, "prerequisites": [],              "parent_task_id": "grandparent"},
+            {"id": "child-0",     "type": "completed", "position": 0, "prerequisites": [],              "parent_task_id": "parent"},
+            {"id": "child-1",     "type": "idea",      "position": 1, "prerequisites": ["child-0"],     "parent_task_id": "parent"},
+            {"id": "downstream",  "type": "idea",      "position": 0, "prerequisites": ["grandparent"], "parent_task_id": None},
+        ]
+        dag = DAGResolver(tasks)
+        ids = [t["id"] for t in dag.get_ready_tasks()]
+        assert "downstream" not in ids
+
+
+# ============================================================
 # SubdivisionAgent result parsing
 # ============================================================
 
@@ -289,7 +404,7 @@ class TestBigIdeaConfig:
 
     def test_context_budget_ratio(self):
         from app.agent.config import SUBDIVISION_CONTEXT_BUDGET_RATIO
-        assert SUBDIVISION_CONTEXT_BUDGET_RATIO == 0.30
+        assert SUBDIVISION_CONTEXT_BUDGET_RATIO == 0.60
 
     def test_planning_tools_loaded(self):
         from app.agent.config import SUBDIVISION_PLANNING_TOOLS

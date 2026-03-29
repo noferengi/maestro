@@ -59,7 +59,7 @@ Or directly: `venv/Scripts/python.exe app/migrations/runner.py <command>`
 
 Migrations live in `app/migrations/versions/` as `NNNN_description.py`. Never edit an existing migration — always add a new one. Each exposes `up(conn)`, `down(conn)`, and `description`.
 
-Current schema migrations (0001–0026):
+Current schema migrations (0001–0029):
 - `0001` — initial `tasks` table
 - `0002` — `prerequisites` column (JSON array of task IDs)
 - `0003` — `project` column (string, default `'TheMaestro'`)
@@ -76,6 +76,9 @@ Current schema migrations (0001–0026):
 - `0024` — `map_x`, `map_y` on tasks (Column Map View positions)
 - `0025` — `llm_id` on `projects` (default LLM for project-level maintenance jobs)
 - `0026` — `budget_id` on `projects` (default budget for project-level maintenance jobs)
+- `0027` — search result cache table
+- `0028` — fix subdivision positions (data repair)
+- `0029` — repair phantom `-subN` prerequisite IDs left by old subdivision code (data repair)
 
 ## Architecture
 
@@ -87,16 +90,16 @@ Current schema migrations (0001–0026):
 ### Agent system (`app/agent/`)
 - `loop.py` — `MaestroLoop` class. `_ACTIVE_LOOPS` / `_LOOP_STATUS` dicts power the status/stop API endpoints. Drives Design → Implement → Test → Verify cycles. Uses task's project path for snapshot injection — skips snapshot silently if no project path is set.
 - `intake.py` — Intake pipeline orchestrator for IDEA→PLANNING transitions. 4-stage voting: scope analysis, static analysis, feasibility, conflict detection. Passes `project_root` from task's project to `ResearchAgent` and `SubdivisionAgent`.
-- `research.py` — Research agent with a "lives" system (max 3 per session). Accepts `project_root` param; injects project snapshot into initial context when set.
+- `research.py` — Research agent with a "lives" system (max 3 per session). Accepts `project_root` param; injects project snapshot into initial context when set. `WebSearchAgent` class (private to async `web_search` dispatch) — 10-turn agent that fetches pages and synthesizes findings; only tool available to it is `web_fetch`.
 - `subdivide.py` — Subdivision agent for decomposing oversized ideas. Accepts `project_root` param; injects project snapshot when set. Triggered by SUBDIVIDE_IDEA verdict.
-- `scheduler.py` — Push-first eager task scheduler. Dispatches DAG-ready tasks respecting per-endpoint capacity limits. Passes `project_root` to research jobs. `_dispatch_file_summary_jobs()` runs FIRST in `_tick()`. Completion registry: `get_or_create_completion_event()`, `signal_completion()`, `wait_for_completion()`.
+- `scheduler.py` — Push-first eager task scheduler. Dispatches DAG-ready tasks respecting per-endpoint capacity limits. Passes `project_root` to research jobs. `_dispatch_file_summary_jobs()` runs FIRST in `_tick()`. Completion registry: `get_or_create_completion_event()`, `signal_completion()`, `wait_for_completion()`. `_task_to_mini_dict` includes `parent_task_id` so `DAGResolver` can build the child index. `SCHEDULER_DISPATCHABLE_TYPES` default includes all pipeline stages (`idea, planning, indev, conceptual_review, optimization, full_review`) — orphaned mid-pipeline tasks are re-dispatched on restart; the `_active_sessions` alive-check prevents double-dispatch of running tasks.
 - `llm_client.py` — Centralized HTTP client for all LLM calls. Requires both `llm_id` and `budget_id`. Logs every call to `budget_entries` + `expenses`.
 - `verdicts.py` — Verdict classification with confidence ranges. `Vote` and `TallyResult` dataclasses. `tally_votes()` aggregation logic.
 - `static_analysis.py` — Tree-sitter based deterministic Python code analysis for intake stage 2a.
-- `tools.py` — Agent tools with OpenAI JSON schemas + `dispatch_tool()`. **Relative paths are resolved against `effective_root` (the project path), not the process CWD** — critical for agents operating on non-Maestro projects. Categories: file I/O (read/write/append/list/count), search, git, execution (run_shell with blocklist), deletion (archive_file — soft-delete only), task queries.
+- `tools.py` — Agent tools with OpenAI JSON schemas + `dispatch_tool()`. **Relative paths are resolved against `effective_root` (the project path), not the process CWD** — critical for agents operating on non-Maestro projects. Categories: file I/O (read/write/append/list/count), search (`web_search` dispatches to DuckDuckGo or Brave based on `SEARCH_PROVIDER` config; `web_fetch` for direct URL retrieval), git, execution (run_shell with blocklist), deletion (archive_file — soft-delete only), task queries.
 - `project_snapshot.py` — `build_project_snapshot(project_root)` and `build_snapshot_with_summaries(project_root)` now **require an explicit `project_root`** — there is no default fallback to TheMaestro's own directory. `async_build_file_summary()` uses enqueue+wait pattern. Session cache uses `("llm", path, mtime, size)` prefix to avoid collision with structural entries.
 - `file_summary_agent.py` — `enqueue_file_summary()` + `execute_file_summary()`. Called by scheduler worker thread.
-- `dag.py` — `DAGResolver`: Kahn's topological sort, ready-task finder, cycle detection.
+- `dag.py` — `DAGResolver`: Kahn's topological sort, ready-task finder, cycle detection. `_children_by_parent` index (built from `parent_task_id` fields) enables `_is_effectively_done()` — a Big Idea parent satisfies a prerequisite edge once all its active (non-cancelled) children are recursively done, without the parent itself reaching `completed`. Parents with children are skipped in `get_ready_tasks()` (not directly dispatchable). Mid-pipeline stages (`indev`, `conceptual_review`, `optimization`, `full_review`) are no longer excluded from `get_ready_tasks()` — they surface as ready when their thread dies, enabling restart recovery.
 - `config.py` — constants (endpoint, limits, archive path, branch prefix).
 - `system_prompt.py` — `MAESTRO_SYSTEM_PROMPT`.
 - `mock_llm.py` — Dictionary-based mock LLM for testing.
@@ -150,17 +153,21 @@ Clicking "View Children" on a Big Idea task opens the transition modal showing a
 #### Diagnostics (`diagnostics.html` + `diag-*.js` + `diagnostics.css`)
 A standalone three-panel LLM conversation viewer at `/diagnostics`.
 
-- `diag-utils.js` — shared state globals + pure helpers. `labelEntry(systemContent)` classifies by system message. **`labelEntryFromUser(userContent)`** — fallback classifier for system-less calls (e.g. file summaries); detects `file_summary` type from user message content.
+- `diag-utils.js` — shared state globals and pure helpers. Shared constants: `TYPE_COLORS` (agent type → hex), `TOOL_COLORS` (tool category → hex), `TOOL_CATEGORY_MAP` (tool name → category). Functions: `escapeHtml`, `fmtTokens`, `formatTimestamp`, `labelEntry(systemContent)` (classifies by system prompt; covers surveyor/designer/judge/reviewer/research/pitfall/security/optimization/subdivision/web_agent/maestro_loop), `labelEntryFromUser(userContent)` (fallback for system-less calls; detects `file_summary`), `labelTool(toolName)` (maps tool name to category), `getConceptualTurns(group)` (builds SYSTEM Prompt + USER Prompt + Turn N structure for a session group).
 - `diag-tasks.js` — left panel; fetches `/api/diagnostics/tasks`.
-- `diag-entries.js` — middle panel. Handles synthetic `__file_summaries__` task ID: fetches `GET /api/budget-entries?task_id=__file_summaries__` which returns entries where `task_id IS NULL`.
-- `diag-session.js` — turn summary table, entry selection (3 fetch paths), `jumpToEntry()`.
-- `diag-render.js` — right panel; `renderConversation()`, `buildCtxBar()`, `_initDockZoom()` IIFE. Falls back to `labelEntryFromUser()` when no system message found. `TYPE_COLORS` includes `file_summary: '#17a2b8'` (teal).
-- `diagnostics.css` — `.type-file_summary` added alongside other entry type colours.
+- `diag-entries.js` — middle panel. Handles synthetic `__file_summaries__` task ID: fetches `GET /api/budget-entries?task_id=__file_summaries__` which returns entries where `task_id IS NULL`. Session detection allows up to 15% context drop before splitting a session.
+- `diag-session.js` — turn summary table (`buildSessionSummary()`), entry selection (3 fetch paths), `jumpToEntry()`. `groupMessages()` accepts `allBoundaries` to break at every conceptual turn boundary.
+- `diag-render.js` — right panel; `renderConversation(…, targetMsgIdx)`, `buildCtxBar()`, UI toggles, `_initCtxTooltip()` IIFE, `DOMContentLoaded` init. **`_initDockZoom()` removed** — cosine-falloff neighbor magnification is gone. Segment hover is now pure CSS (`scaleY(1.15)` upward pop, yellow ring). `_initCtxTooltip()` floats a JS-positioned tooltip above the cursor showing agent-type badge, context %, and tool call name/args. Segments are **clickable** — clicking calls `selectEntry(fe.id)` to jump to that turn. Segment colors are tool-category-based (inline `background-color` from `TOOL_COLORS`).
+- `diagnostics.css` — entry type colours including `type-file_summary`. **`.ctx-bar.dock-zooming` removed.** `.ctx-bar` is `overflow-x: auto` (scrolls when narrow). `.ctx-seg` has `min-width: 12px`; hover is CSS-only (`scaleY(1.15)`, yellow `box-shadow`). `#ctx-tooltip` + `.ctx-tip-*` classes added for the JS floating tooltip.
 
 **File Summaries in diagnostics** — `GET /api/diagnostics/tasks` returns a synthetic `{id: "__file_summaries__", type: "file_summary"}` row at the top when any `budget_entries` have `task_id IS NULL` (project prewarm calls that aren't tied to a specific task card).
 
 ### Configuration (`maestro.ini`)
-INI file with sections: `[intake]`, `[subdivision]`, `[capacity]`, `[context_warnings]`, `[scheduler]`, `[verdicts]`.
+INI file with sections: `[intake]`, `[subdivision]`, `[capacity]`, `[context_warnings]`, `[scheduler]`, `[verdicts]`, `[search]`.
+
+- `[intake]` — research lives, tiebreaker, LLM temperature, allowed research tools, `context_budget_ratio` (fraction of context window for research agent, default 0.60). `research_agent_tools` includes `web_search` — dispatches `WebSearchAgent` asynchronously (search + fetch + synthesize). `web_fetch` is intentionally absent; it is private to `WebSearchAgent`.
+- `[subdivision]` — max_depth, max_retries_per_level, max_total_sub_ideas, llm_temperature, subdivision_agent_tools, `context_budget_ratio` (default 0.60). Both `subdivision_agent_tools` and `subdivision_planning_tools` include `web_search` for domain research during decomposition.
+- `[search]` — `provider` (duckduckgo | brave, default duckduckgo), `brave_api_key` (required only if provider=brave). Env overrides: `MAESTRO_SEARCH_PROVIDER`, `BRAVE_API_KEY`.
 
 ### Data flow
 Tasks are per-project. Switching projects calls `loadTasksFromDatabase()` which re-fetches `/api/projects/{name}/tasks` and fully rebuilds `taskData`. `renderTasksFromDatabase()` groups tasks by type, sorts each group by `position`, and appends cards to their column containers. Drag-and-drop reorder POSTs to `/api/tasks/{id}/reorder`, then re-fetches the full project task list to get authoritative positions before re-rendering. When `columnMapActive` is true, `reconcile()` only refreshes `taskData` and skips DOM reconciliation.

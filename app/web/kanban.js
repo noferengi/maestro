@@ -1228,9 +1228,9 @@ function _renderChildrenFooter() {
         }
     }
 
-    // Regenerate — always available; disabled while a new run is already in progress
-    const task  = taskData[taskId] || {};
-    const busy  = task.type === 'subdividing' && records.some(r => r.status === 'active');
+    // Regenerate — disabled only while a regeneration is actively in progress (status='generating').
+    // An 'active' record means subdivision completed successfully — Regenerate should be available then.
+    const busy  = records.some(r => r.status === 'generating');
     html += `<button class="btn btn-warning" style="${btnStyle};margin-left:${records.length > 0 ? '0.75rem' : '0'}"
                      onclick="regenerateSubdivision('${taskId}')"
                      ${busy ? 'disabled title="Already regenerating"' : ''}>&#x21BA; Regenerate</button>`;

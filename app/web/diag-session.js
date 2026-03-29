@@ -1,7 +1,8 @@
 /* ============================================================
    diag-session.js — Session selection, per-turn summary table, and DOM-only navigation
+   Note: This view is a reconstruction of the conversation flow
+   and may not exactly reflect the underlying storage format.
    Depends on: diag-utils.js, diag-entries.js (detectSessions, currentSessions)
-   Calls into: diag-render.js (renderConversation) and diag-render.js (renderMessage via renderToolGroup)
    ============================================================ */
 
 // ── Conversation grouping helpers ────────────────────────────
@@ -10,8 +11,11 @@
  * Collapse consecutive [assistant + tool…] message runs into tool_group objects.
  * Everything else becomes a single-message object.
  * Used by renderConversation() to render tool call/result pairs as a visual unit.
+ *
+ * boundaries: optional array of {startMsgIdx, entryId} to prevent grouping
+ * across entry turn boundaries.
  */
-function groupMessages(messages) {
+function groupMessages(messages, boundaries = []) {
     const out = [];
     let i = 0;
     while (i < messages.length) {
@@ -20,6 +24,10 @@ function groupMessages(messages) {
             const group = [msg];
             let j = i + 1;
             while (j < messages.length && messages[j].role === 'tool') {
+                // If message j starts a new entry boundary, don't group it into this assistant group
+                if (boundaries.some(b => b.startMsgIdx === j)) {
+                    break;
+                }
                 group.push(messages[j]);
                 j++;
             }
@@ -163,16 +171,30 @@ function buildSessionSummary(anchorEntryId) {
  *   Path 2 — same session data cached but not rendered → re-render from cache
  *   Path 3 — different session → full fetch then renderConversation()
  */
-async function selectEntry(entryId) {
+async function selectEntry(entryId, targetMsgIdx = null) {
     selectedEntryId = entryId;
 
     // Update active state in middle panel and scroll the session into view
-    document.querySelectorAll('.diag-entry-item').forEach(el => el.classList.remove('active'));
-    const item = document.querySelector(`.diag-entry-item[onclick="selectEntry(${entryId})"]`);
-    if (item) {
-        item.classList.add('active');
-        const sessionContainer = item.closest('.diag-session');
-        (sessionContainer || item).scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    let _didScrollMiddle = false;
+    document.querySelectorAll('.diag-entry-item').forEach(el => {
+        const eid = parseInt(el.dataset.entryId, 10);
+        const mid = el.dataset.msgIdx === 'null' ? null : parseInt(el.dataset.msgIdx, 10);
+        const active = eid === entryId && mid === targetMsgIdx;
+        el.classList.toggle('active', active);
+        if (active && !_didScrollMiddle) {
+            _didScrollMiddle = true;
+            const sessionContainer = el.closest('.diag-session');
+            (sessionContainer || el).scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+    });
+    // Fallback: if no item matched exactly (e.g. summary-table click with targetMsgIdx=null
+    // and no turn item yet rendered, or first-entry SYSTEM/USER items don't have mid=null),
+    // still scroll the session container for that entry into view.
+    if (!_didScrollMiddle) {
+        const anyItem = document.querySelector(`.diag-entry-item[data-entry-id="${entryId}"]`);
+        if (anyItem) {
+            (anyItem.closest('.diag-session') || anyItem).scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
     }
 
     const sessionGroup = currentSessions.find(g => g.some(e => e.id === entryId));
@@ -186,9 +208,6 @@ async function selectEntry(entryId) {
     }
 
     // ── Path 1: same session already in DOM → DOM-only scroll, zero fetch, zero re-render ──
-    // Only valid for accumulating sessions (Maestro Loop) where the DOM holds all turns.
-    // Non-accumulating sessions (separate pipeline stages) each have independent context
-    // and require a re-render (Path 2) whenever a different entry is selected.
     if (renderedSessionKey === sessionKey && cachedSession?.groupKey === sessionKey
             && sessionGroup?.length > 1) {
         const lastFull  = cachedSession.fullEntries[cachedSession.fullEntries.length - 1];
@@ -196,7 +215,7 @@ async function selectEntry(entryId) {
         const sessionIsAccumulating = (lastFull?.prompt_data?.length ?? 0)
             > (firstFull?.prompt_data?.length ?? 0);
         if (sessionIsAccumulating) {
-            jumpToEntry(entryId, sessionGroup);
+            jumpToEntry(entryId, sessionGroup, targetMsgIdx);
             return;
         }
         // Non-accumulating: fall through to Path 2 to re-render from cache
@@ -206,11 +225,12 @@ async function selectEntry(entryId) {
     // ── Path 2: same session data cached but not rendered (e.g. user switched away) ──
     if (cachedSession?.groupKey === sessionKey) {
         const { fullEntries, boundaries } = cachedSession;
-        const selectedFull  = fullEntries.find(f => f.id === entryId);
-        const fullEntry     = fullEntries[fullEntries.length - 1];
-        const highlightFrom = Array.isArray(selectedFull?.prompt_data) ? selectedFull.prompt_data.length : null;
+        const selectedFull     = fullEntries.find(f => f.id === entryId);
+        const fullEntry        = fullEntries[fullEntries.length - 1];
+        const selectedBoundary = (boundaries || []).find(b => b.entryId === entryId);
+        const highlightFrom    = selectedBoundary?.startMsgIdx ?? null;
         renderedSessionKey  = sessionKey;
-        renderConversation(fullEntry, highlightFrom, entryId, selectedFull, boundaries);
+        renderConversation(fullEntry, highlightFrom, entryId, selectedFull, boundaries, targetMsgIdx);
         return;
     }
 
@@ -232,12 +252,14 @@ async function selectEntry(entryId) {
             const fullEntries = await Promise.all(responses.map(r => r.json()));
             selectedFull      = fullEntries.find(f => f.id === entryId);
             fullEntry         = fullEntries[fullEntries.length - 1];
-            highlightFrom     = Array.isArray(selectedFull?.prompt_data) ? selectedFull.prompt_data.length : null;
             sessionBoundaries = sessionGroup.map((e, i) => ({
                 entryId:     e.id,
                 startMsgIdx: i === 0 ? 0 : (Array.isArray(fullEntries[i - 1].prompt_data)
                     ? fullEntries[i - 1].prompt_data.length : 0),
             }));
+            // highlightFrom = start of the selected turn's own new messages (not end of its prompt)
+            const selectedBoundary = sessionBoundaries.find(b => b.entryId === entryId);
+            highlightFrom = selectedBoundary?.startMsgIdx ?? null;
             cachedSession = { groupKey: sessionKey, fullEntries, boundaries: sessionBoundaries };
         } else {
             const resp = await fetch(`${API_BASE}/budget-entries/${entryId}/full`);
@@ -250,7 +272,7 @@ async function selectEntry(entryId) {
         }
 
         renderedSessionKey = sessionKey;
-        renderConversation(fullEntry, highlightFrom, entryId, selectedFull, sessionBoundaries);
+        renderConversation(fullEntry, highlightFrom, entryId, selectedFull, sessionBoundaries, targetMsgIdx);
     } catch (e) {
         detail.innerHTML = `<div class="diag-error">Failed to load entry: ${escapeHtml(e.message)}</div>`;
     }
@@ -261,17 +283,15 @@ async function selectEntry(entryId) {
  * No fetch, no re-render — just update highlights, swap the anchor divider, scroll.
  * Only called from selectEntry() Path 1 (accumulating sessions).
  */
-function jumpToEntry(entryId, sessionGroup) {
+function jumpToEntry(entryId, sessionGroup, targetMsgIdx = null) {
     if (!cachedSession?.boundaries) return;
     const idx = sessionGroup.findIndex(e => e.id === entryId);
     if (idx < 0) return;
 
-    // Derive highlightFrom: = boundaries[idx+1].startMsgIdx, or end-of-messages if last entry
-    const nextBoundary  = cachedSession.boundaries[idx + 1];
-    const lastFull      = cachedSession.fullEntries[cachedSession.fullEntries.length - 1];
-    const highlightFrom = nextBoundary
-        ? nextBoundary.startMsgIdx
-        : (Array.isArray(lastFull?.prompt_data) ? lastFull.prompt_data.length : 0);
+    // Derive highlightFrom: start of the selected turn's own new messages (= this boundary's startMsgIdx).
+    // Using nextBoundary.startMsgIdx (old code) was off-by-one: it highlighted the NEXT turn's content.
+    const thisBoundary  = cachedSession.boundaries[idx];
+    const highlightFrom = thisBoundary ? thisBoundary.startMsgIdx : 0;
 
     // Re-highlight prompt messages
     document.querySelectorAll('.diag-msg[data-msg-idx]').forEach(el => {
@@ -283,7 +303,15 @@ function jumpToEntry(entryId, sessionGroup) {
     // Swap anchor divider (blue selected ↔ gray other)
     document.querySelectorAll('.diag-turn-divider[data-entry-id]').forEach(el => {
         const eid      = parseInt(el.dataset.entryId, 10);
-        const isAnchor = eid === entryId;
+        const mIdx     = el.hasAttribute('data-msg-idx') ? parseInt(el.getAttribute('data-msg-idx'), 10) : null;
+        
+        // Match entryId AND msgIdx if provided. Handle targetMsgIdx -1 as user prompt.
+        const isAnchor = eid === entryId && (
+            targetMsgIdx === null || 
+            targetMsgIdx === mIdx || 
+            (targetMsgIdx === -1 && mIdx !== 0 && mIdx !== null)
+        );
+        
         el.classList.toggle('diag-turn-divider-anchor', isAnchor);
         el.classList.toggle('diag-turn-divider-other',  !isAnchor);
         if (isAnchor)                     { el.id = 'turn-anchor'; }
@@ -308,7 +336,7 @@ function jumpToEntry(entryId, sessionGroup) {
 
     // Smooth scroll to the anchor
     requestAnimationFrame(() => {
-        const anchor = document.getElementById('turn-anchor');
-        if (anchor) anchor.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        let scrollTarget = document.getElementById('turn-anchor');
+        if (scrollTarget) scrollTarget.scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
 }

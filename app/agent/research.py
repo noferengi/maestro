@@ -36,6 +36,7 @@ from app.agent.config import (
     RESEARCH_AGENT_MAX_LIVES,
     RESEARCH_AGENT_MAX_TURNS_PER_LIFE,
     RESEARCH_AGENT_TOOLS,
+    RESEARCH_CONTEXT_BUDGET_RATIO,
     check_context_saturation,
 )
 from app.agent.json_utils import extract_json_block
@@ -522,6 +523,17 @@ class ResearchAgent:
 
         for turn in range(self.max_turns_per_life):
             turns_used += 1
+
+            # Hard budget check (Saturation)
+            # Calculated once per life based on max_context.
+            budget_tokens = int(self.max_context * RESEARCH_CONTEXT_BUDGET_RATIO) if self.max_context else 0
+            budget_exceeded = budget_tokens > 0 and life_prompt_tokens >= budget_tokens
+
+            if budget_exceeded:
+                messages.append({
+                    "role": "user",
+                    "content": "[SYSTEM] TOKEN BUDGET EXCEEDED. Render your JSON verdict now. No more tool calls.",
+                })
 
             # LLM call
             try:

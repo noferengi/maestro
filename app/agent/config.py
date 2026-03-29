@@ -78,7 +78,13 @@ LLM_MODEL: str = _get("llm", "model", "MAESTRO_LLM_MODEL", "omnicoder-9b")
 MAX_TOKENS_PER_TURN: int = _getint("llm", "max_tokens_per_turn", "MAESTRO_MAX_TOKENS", 4096)
 LLM_TEMPERATURE: float = _getfloat("llm", "temperature", "MAESTRO_TEMPERATURE", 0.2)
 LLM_TIMEOUT_SECONDS: int = _getint("llm", "timeout_seconds", "MAESTRO_LLM_TIMEOUT", 120)
-BRAVE_API_KEY: str = _get("llm", "brave_api_key", "BRAVE_API_KEY", "")
+
+# ===========================================================================
+# Search settings
+# ===========================================================================
+
+SEARCH_PROVIDER: str = _get("search", "provider", "MAESTRO_SEARCH_PROVIDER", "duckduckgo")
+BRAVE_API_KEY: str = _get("search", "brave_api_key", "BRAVE_API_KEY", "")
 
 # ===========================================================================
 # Loop safety limits
@@ -161,6 +167,7 @@ SIGNAL_NEEDS_RESEARCH: str = "NEEDS_RESEARCH"
 
 RESEARCH_AGENT_MAX_LIVES: int = _getint("intake", "research_agent_max_lives", "MAESTRO_RESEARCH_LIVES", 3)
 RESEARCH_AGENT_MAX_TURNS_PER_LIFE: int = _getint("intake", "research_agent_max_turns", None, 20)
+RESEARCH_CONTEXT_BUDGET_RATIO: float = _getfloat("intake", "context_budget_ratio", None, 0.60)
 TIEBREAKER_ENABLED: bool = _getbool("intake", "tiebreaker_enabled", None, True)
 INTAKE_LLM_TEMPERATURE: float = _getfloat("intake", "llm_temperature", "MAESTRO_INTAKE_TEMP", 0.1)
 
@@ -180,7 +187,7 @@ SUBDIVISION_MAX_DEPTH: int = _getint("subdivision", "max_depth", None, 6)
 SUBDIVISION_MAX_RETRIES: int = _getint("subdivision", "max_retries_per_level", None, 4)
 SUBDIVISION_MAX_TOTAL_SUB_IDEAS: int = _getint("subdivision", "max_total_sub_ideas", None, 30)
 SUBDIVISION_LLM_TEMPERATURE: float = _getfloat("subdivision", "llm_temperature", None, 0.3)
-SUBDIVISION_CONTEXT_BUDGET_RATIO: float = _getfloat("subdivision", "context_budget_ratio", None, 0.30)
+SUBDIVISION_CONTEXT_BUDGET_RATIO: float = _getfloat("subdivision", "context_budget_ratio", None, 0.60)
 SUBDIVISION_CONTEXT_AWARE_TOOLS: bool = _getbool("subdivision", "context_aware_tools", None, True)
 
 SUBDIVISION_AGENT_TOOLS: list[str] = _getlist("subdivision", "subdivision_agent_tools",
@@ -299,7 +306,8 @@ def check_context_saturation(
 SCHEDULER_TICK_INTERVAL: float = _getfloat("scheduler", "tick_interval", None, 5.0)
 SCHEDULER_ENABLED: bool = _getbool("scheduler", "enabled", None, True)
 SCHEDULER_DISPATCHABLE_TYPES: list[str] = _getlist(
-    "scheduler", "dispatchable_types", "idea, planning, indev"
+    "scheduler", "dispatchable_types",
+    "idea, planning, indev, conceptual_review, optimization, full_review"
 )
 
 # ===========================================================================

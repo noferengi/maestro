@@ -263,7 +263,9 @@ class TestAdvanceEndpointValidation:
 # ---------------------------------------------------------------------------
 
 class TestSchedulerDispatch:
-    """Scheduler only auto-dispatches planning and indev tasks."""
+    """Scheduler auto-dispatches all pipeline stages (planning, indev,
+    conceptual_review, optimization, full_review) plus idea tasks.
+    Architecture, security, and completed are the only types never dispatched."""
 
     # Patch targets: _tick() uses lazy imports, so we patch at the source module
     _DB_GET_ALL   = "app.database.get_all_tasks"
@@ -331,17 +333,24 @@ class TestSchedulerDispatch:
 
         return mock_thread
 
-    def test_non_dispatchable_columns_never_spawn_threads(self):
-        """Every column except planning/indev must be skipped."""
-        skipped = [
-            "idea", "architecture", "conceptual_review",
-            "optimization", "security", "full_review", "completed",
-        ]
-        for col_type in skipped:
+    def test_truly_non_dispatchable_columns_never_spawn_threads(self):
+        """architecture, security, and completed are never in SCHEDULER_DISPATCHABLE_TYPES."""
+        from app.agent.scheduler import SCHEDULER_DISPATCHABLE_TYPES
+        for col_type in ("architecture", "security", "completed"):
+            assert col_type not in SCHEDULER_DISPATCHABLE_TYPES, \
+                f"'{col_type}' must not be auto-dispatchable"
             task = self._ready_task_dict(f"sched-skip-{col_type}", col_type)
             mock_thread = self._isolated_tick([task])
             mock_thread.assert_not_called(), \
                 f"Scheduler must NOT dispatch '{col_type}'"
+
+    def test_pipeline_stages_are_dispatchable(self):
+        """All mid-pipeline stages must be in SCHEDULER_DISPATCHABLE_TYPES for
+        orphan recovery after server restart."""
+        from app.agent.scheduler import SCHEDULER_DISPATCHABLE_TYPES
+        for col_type in ("indev", "conceptual_review", "optimization", "full_review"):
+            assert col_type in SCHEDULER_DISPATCHABLE_TYPES, \
+                f"'{col_type}' must be auto-dispatchable (restart recovery)"
 
     def test_planning_task_spawns_thread(self):
         """A ready planning task with LLM assigned gets dispatched."""
@@ -361,6 +370,33 @@ class TestSchedulerDispatch:
         task = self._ready_task_dict("sched-indev-1", "indev")
         db_task = MagicMock(llm_id=66, budget_id=1)
         llm = MagicMock(id=66, parallel_sessions=3, address="localhost",
+                        port=8008, model="test")
+        mock_thread = self._isolated_tick([task], db_task=db_task, llm=llm)
+        mock_thread.assert_called_once()
+
+    def test_conceptual_review_task_spawns_thread(self):
+        """An orphaned conceptual_review task is re-dispatched (restart recovery)."""
+        task = self._ready_task_dict("sched-cr-1", "conceptual_review")
+        db_task = MagicMock(llm_id=77, budget_id=1)
+        llm = MagicMock(id=77, parallel_sessions=3, address="localhost",
+                        port=8008, model="test")
+        mock_thread = self._isolated_tick([task], db_task=db_task, llm=llm)
+        mock_thread.assert_called_once()
+
+    def test_optimization_task_spawns_thread(self):
+        """An orphaned optimization task is re-dispatched (restart recovery)."""
+        task = self._ready_task_dict("sched-opt-1", "optimization")
+        db_task = MagicMock(llm_id=78, budget_id=1)
+        llm = MagicMock(id=78, parallel_sessions=3, address="localhost",
+                        port=8008, model="test")
+        mock_thread = self._isolated_tick([task], db_task=db_task, llm=llm)
+        mock_thread.assert_called_once()
+
+    def test_full_review_task_spawns_thread(self):
+        """An orphaned full_review task is re-dispatched (restart recovery)."""
+        task = self._ready_task_dict("sched-fr-1", "full_review")
+        db_task = MagicMock(llm_id=79, budget_id=1)
+        llm = MagicMock(id=79, parallel_sessions=3, address="localhost",
                         port=8008, model="test")
         mock_thread = self._isolated_tick([task], db_task=db_task, llm=llm)
         mock_thread.assert_called_once()

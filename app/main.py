@@ -340,25 +340,25 @@ def _execute_subdivision(task, llm_base_url, llm_model, max_context, scope_vote,
 
 
 def _create_sub_idea_tasks(task, sub_result, generation):
-    """Create child tasks from SubdivisionResult, return list of child IDs."""
-    from datetime import datetime
+    """Create child tasks from SubdivisionResult, return list of child IDs.
+
+    Tasks are created one at a time in index order.  As each task is created
+    its *actual* DB-assigned ID is recorded in `actual_id_map` so that any
+    later sub-idea that lists it as a prerequisite gets the correct real ID,
+    not a pre-generated placeholder that was never inserted into the DB.
+    """
+    from database import SessionLocal, Task as TaskModel
 
     child_ids = []
-    # Build a mapping from sub-N index to real task ID
-    index_to_id = {}
+    # Maps "sub-{i}" → actual task ID, built incrementally as tasks are created.
+    actual_id_map = {}
 
     for i, sub_idea in enumerate(sub_result.sub_ideas):
-        child_id = f"task-{datetime.now().timestamp()}-sub{i}"
-        index_to_id[f"sub-{i}"] = child_id
-        child_ids.append(child_id)
-
-    # Create the actual tasks with resolved prerequisites
-    for i, sub_idea in enumerate(sub_result.sub_ideas):
-        prereqs = []
-        for p in sub_idea.prerequisites:
-            resolved = index_to_id.get(p)
-            if resolved:
-                prereqs.append(resolved)
+        # Resolve prerequisites from already-created siblings' actual IDs.
+        # Because sub-ideas are created in index order, sub-j's prerequisites
+        # can only legally reference sub-k where k < j (enforced by the DAG
+        # validation step above).  Any forward references are silently skipped.
+        prereqs = [actual_id_map[p] for p in sub_idea.prerequisites if p in actual_id_map]
 
         create_task(
             title=sub_idea.title,
@@ -370,26 +370,21 @@ def _create_sub_idea_tasks(task, sub_result, generation):
             budget_id=task.budget_id,
             prerequisites=prereqs,
             project=task.project or "TheMaestro",
+            position=i,
         )
-        # Update the just-created task with parent info
-        # (create_task generates its own ID; we need to use the ID we planned)
-        # Actually, create_task uses timestamp-based IDs, so we need to update
-        # the last created task to set parent_task_id and subdivision_generation
-        from database import SessionLocal, Task as TaskModel
+
         db = SessionLocal()
         try:
-            # Find the most recently created task with this title
             latest = (db.query(TaskModel)
                       .filter(TaskModel.title == sub_idea.title,
                               TaskModel.owner == "system")
                       .order_by(TaskModel.created_at.desc())
                       .first())
             if latest:
+                actual_id_map[f"sub-{i}"] = latest.id
+                child_ids.append(latest.id)
                 latest.parent_task_id = task.id
                 latest.subdivision_generation = generation
-                child_ids[i] = latest.id  # use the real ID
-                if prereqs:
-                    latest.prerequisites = prereqs
                 # Store interface contracts on child if available
                 child_contracts = {}
                 if hasattr(sub_idea, 'provides') and sub_idea.provides:
@@ -500,6 +495,12 @@ def _handle_subdivision_outcome(task, result, llm_base_url, llm_model, max_conte
         status="active",
         interface_contracts=contracts_json,
     )
+
+    # Transition parent back to 'idea' so it is visible on the board and the
+    # Regenerate button works.  The transition_result with outcome="subdivide"
+    # was already stored by the caller, so the scheduler will not re-dispatch
+    # this task for another intake run.
+    update_task(task.id, type="idea")
 
     logger.info("[intake] Task '%s' subdivided into %d sub-ideas (generation %d).", task.id, len(child_ids), generation)
 
@@ -702,6 +703,10 @@ def _run_regenerate_subdivision(task_id: str) -> None:
             interface_contracts=contracts_json,
             status='active',
         )
+        # Reset parent to 'idea' so children are visible on the board and the
+        # scheduler can dispatch them.  The existing transition_result with
+        # outcome="subdivide" ensures the scheduler won't re-run intake on it.
+        update_task(task_id, type='idea')
         logger.info("[regen] Task '%s' regenerated into %d sub-ideas.", task_id, len(child_ids))
     except Exception:
         logger.exception("[regen] Regeneration for '%s' failed.", task_id)
@@ -1968,6 +1973,19 @@ def get_budget_remaining(budget_id: int):
 # ============================================
 
 def budget_entry_to_dict(entry):
+    first_tool = None
+    first_tool_args = None
+    if entry.response_data:
+        try:
+            import json as _json
+            # response_data could be string or dict depending on how it was set
+            rd = _json.loads(entry.response_data) if isinstance(entry.response_data, str) else entry.response_data
+            tcs = rd.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])
+            if tcs:
+                first_tool = tcs[0].get("function", {}).get("name")
+                first_tool_args = tcs[0].get("function", {}).get("arguments")
+        except:
+            pass
     return {
         "id": entry.id,
         "llm_id": entry.llm_id,
@@ -1976,6 +1994,8 @@ def budget_entry_to_dict(entry):
         "prompt_cost": entry.prompt_cost,
         "generation_cost": entry.generation_cost,
         "tool_calls": entry.tool_calls,
+        "first_tool": first_tool,
+        "first_tool_args": first_tool_args,
         "created_at": entry.created_at.isoformat() if entry.created_at else None,
     }
 

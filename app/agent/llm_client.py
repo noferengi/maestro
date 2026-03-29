@@ -126,14 +126,19 @@ async def call_llm(
     url = f"{resolved_url}/chat/completions"
     logger.debug("LLM call -> %s  model=%s", url, resolved_model)
 
-    async with httpx.AsyncClient(timeout=timeout or LLM_TIMEOUT_SECONDS) as client:
-        response = await client.post(
-            url,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        response.raise_for_status()
-        result = response.json()
+    try:
+        async with httpx.AsyncClient(timeout=timeout or LLM_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            response.raise_for_status()
+            result = response.json()
+    except Exception as exc:
+        # Include repr(exc) because some exceptions (like ConnectTimeout) have empty str()
+        logger.error("LLM call failed to %s: %r (str: '%s')", url, exc, exc)
+        raise
 
     # Log every call to budget_entries
     _log_budget_entry(

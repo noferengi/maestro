@@ -301,6 +301,7 @@ class SubdivisionAgent:
 
     async def run(self) -> SubdivisionResult:
         """Execute the subdivision agent and return decomposed sub-ideas."""
+        logger.info("Subdivision agent starting for task '%s' (%s).", self.parent_task_id, self.parent_title)
         system_prompt = self._build_system_prompt()
         context = self._build_context()
         messages = [
@@ -309,6 +310,8 @@ class SubdivisionAgent:
         ]
 
         _ctx_warned: set[float] = set()
+
+        consecutive_failures = 0
 
         for turn in range(self.max_turns):
             # Hard budget enforcement
@@ -320,11 +323,23 @@ class SubdivisionAgent:
 
             try:
                 response = await self._call_llm(messages)
+                consecutive_failures = 0  # Reset on success
+            except asyncio.CancelledError:
+                logger.warning("Subdivision agent cancelled (task '%s').", self.parent_task_id)
+                raise
             except Exception as exc:
-                logger.error("Subdivision agent LLM call failed (turn %d): %s", turn + 1, exc)
+                consecutive_failures += 1
+                exc_type = type(exc).__name__
+                logger.error("Subdivision agent LLM call failed for task '%s' (turn %d) [consecutive=%d]: %s (%s)", 
+                             self.parent_task_id, turn + 1, consecutive_failures, exc, exc_type)
+                
+                if consecutive_failures >= 3:
+                    logger.error("Subdivision agent aborting after 3 consecutive LLM failures.")
+                    break
+
                 messages.append({
                     "role": "user",
-                    "content": f"[SYSTEM] LLM call failed: {exc}. Try a different approach or output your decomposition now.",
+                    "content": f"[SYSTEM] LLM call failed ({exc_type}): {exc}. Try a different approach or output your decomposition now.",
                 })
                 continue
 
@@ -333,9 +348,9 @@ class SubdivisionAgent:
             self._total_prompt_tokens += prompt_tokens_this_call
             self._total_completion_tokens += usage.get("completion_tokens", 0)
 
-            # Check budget after each call
-            total_tokens = self._total_prompt_tokens + self._total_completion_tokens
-            if total_tokens >= self.token_budget:
+            # Check if CURRENT context size exceeds the budget ratio
+            # This is a technical context limit, not a cumulative expenditure limit.
+            if prompt_tokens_this_call >= self.token_budget:
                 self._budget_exceeded = True
 
             # Context saturation check
@@ -484,6 +499,7 @@ class SubdivisionAgent:
             task_id=self.parent_task_id,
             llm_id=self.llm_id,
             budget_id=self.budget_id,
+            timeout=300,
         )
 
     # ------------------------------------------------------------------
