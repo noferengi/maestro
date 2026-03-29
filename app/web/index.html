@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kanban Board - TheMaestro</title>
-    <link rel="stylesheet" href="/static/style.css?v=19">
-    <script src="/static/kanban.js?v=32"></script>
+    <link rel="stylesheet" href="/static/style.css?v=24">
+    <script src="/static/kanban.js?v=38"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -54,6 +54,10 @@
             <div id="current-project-display">
                 Selected: TheMaestro
             </div>
+            <button class="inbox-btn" id="inbox-btn" onclick="openInboxModal()" title="Inbox">
+                ✉
+                <span class="inbox-badge" id="inbox-badge" style="display:none">0</span>
+            </button>
             <button class="refresh-btn" onclick="refreshTasks()" title="Refresh from database">
                 🔄 Refresh
             </button>
@@ -545,6 +549,28 @@
         </div>
     </div>
 
+    <!-- Inbox Modal -->
+    <div class="modal-overlay" id="inbox-modal">
+        <div class="modal inbox-modal">
+            <div class="modal-header">
+                <h2 class="modal-title">
+                    ✉ Inbox
+                    <span class="inbox-modal-unread" id="inbox-modal-unread-label" style="display:none"></span>
+                </h2>
+                <div style="display:flex;gap:0.5rem;align-items:center">
+                    <button class="btn btn-sm btn-secondary" id="inbox-mark-all-btn" onclick="inboxMarkAllRead()" style="display:none">Mark all read</button>
+                    <button class="close-btn" onclick="closeInboxModal()">&times;</button>
+                </div>
+            </div>
+            <div class="modal-body inbox-modal-body" id="inbox-modal-body">
+                <!-- Populated dynamically -->
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeInboxModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Transition Failure Overlay -->
     <div class="modal-overlay" id="transition-modal">
         <div class="modal" style="width:700px">
@@ -594,6 +620,90 @@
             </div>
             <div class="modal-footer">
                 <button class="btn btn-primary" onclick="closeHistoryModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast notifications -->
+    <div id="toast-container"></div>
+
+    <!-- Generic Confirm Modal -->
+    <div class="modal-overlay" id="confirm-modal">
+        <div class="modal" style="width:420px">
+            <div class="modal-header">
+                <h2 class="modal-title" id="confirm-modal-title">Confirm</h2>
+                <button class="close-btn" onclick="_confirmResolve(false)">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p id="confirm-modal-message" style="margin:0;line-height:1.5"></p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="_confirmResolve(false)">Cancel</button>
+                <button class="btn btn-danger" id="confirm-modal-ok" onclick="_confirmResolve(true)">Confirm</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Research Dialog Modal -->
+    <div class="modal-overlay" id="research-dialog-modal">
+        <div class="modal" style="width:500px">
+            <div class="modal-header">
+                <h2 class="modal-title">Research Agent</h2>
+                <button class="close-btn" onclick="closeResearchDialog()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p id="research-dialog-task-label" style="margin:0 0 0.75rem;font-size:0.85rem;color:#6c757d"></p>
+                <label style="font-size:0.85rem;font-weight:600;display:block;margin-bottom:0.4rem">Research question</label>
+                <textarea id="research-dialog-question" rows="4"
+                    style="width:100%;font-size:0.875rem;border:1px solid #ced4da;border-radius:4px;padding:0.5rem;resize:vertical;box-sizing:border-box"
+                    placeholder="What do you want the agent to investigate?"></textarea>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeResearchDialog()">Cancel</button>
+                <button class="btn btn-primary" onclick="submitResearchDialog()">Start Research</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Manual Session Modal -->
+    <div class="modal-overlay" id="manual-session-modal" style="z-index:1001">
+        <div class="modal ms-modal-inner">
+            <div class="modal-header">
+                <h2 class="modal-title" id="ms-title">Manual Session</h2>
+                <button class="close-btn" onclick="closeManualSessionModal()">&times;</button>
+            </div>
+            <div class="ms-body">
+                <!-- Left: tool picker + message input + end session -->
+                <div class="ms-left-panel">
+                    <div class="ms-section-label">Tool</div>
+                    <select id="ms-tool-select" onchange="onMsToolSelect()" class="ms-select">
+                        <option value="">(select a tool)</option>
+                    </select>
+                    <div id="ms-tool-form" class="ms-tool-form"></div>
+                    <button class="btn btn-primary ms-exec-btn" onclick="msExecuteTool()">Execute Tool</button>
+
+                    <hr class="ms-divider">
+                    <div class="ms-section-label">Add Message</div>
+                    <select id="ms-message-role" class="ms-select">
+                        <option value="user">user (my reasoning)</option>
+                        <option value="assistant">assistant</option>
+                    </select>
+                    <textarea id="ms-message-content" class="ms-textarea" rows="3" placeholder="Add a note or observation..."></textarea>
+                    <button class="btn btn-secondary" style="width:100%" onclick="msAddMessage()">Add Message</button>
+
+                    <hr class="ms-divider">
+                    <div class="ms-section-label">End Session</div>
+                    <select id="ms-signal-select" class="ms-select">
+                        <option value="MANUAL_END">MANUAL_END (no board action)</option>
+                        <option value="ACCEPTED">ACCEPTED</option>
+                        <option value="REVERT_TO_DESIGN">REVERT_TO_DESIGN</option>
+                        <option value="FAILED">FAILED</option>
+                    </select>
+                    <textarea id="ms-end-summary" class="ms-textarea" rows="2" placeholder="Summary (optional)"></textarea>
+                    <button class="btn btn-danger" style="width:100%;margin-top:0.3rem" onclick="msEndSession()">End Session</button>
+                </div>
+                <!-- Right: chat log -->
+                <div class="ms-right-panel" id="ms-chat-log"></div>
             </div>
         </div>
     </div>

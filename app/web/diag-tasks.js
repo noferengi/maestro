@@ -21,6 +21,13 @@ async function loadTasks() {
         }
         document.getElementById('diag-task-count').textContent = allDiagTasks.length;
         renderTaskList(allDiagTasks);
+
+        // Auto-select task from URL query param ?task=<id>
+        const params = new URLSearchParams(window.location.search);
+        const focusId = params.get('task');
+        if (focusId && allDiagTasks.find(t => t.id === focusId)) {
+            selectTask(focusId);
+        }
     } catch (e) {
         list.innerHTML = `<div class="diag-error">Failed to load tasks: ${escapeHtml(e.message)}</div>`;
     }

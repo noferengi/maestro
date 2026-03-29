@@ -275,10 +275,12 @@ def get_task(task_id):
 
 
 def get_tasks_by_type(task_type):
-    """Get all tasks of a specific type, ordered by position then created_at."""
+    """Get all active tasks of a specific type, ordered by position then created_at."""
     db = SessionLocal()
     try:
-        tasks = db.query(Task).filter(Task.type == task_type).order_by(Task.position, Task.created_at).all()
+        tasks = (db.query(Task)
+                 .filter(Task.type == task_type, Task.is_active == True)
+                 .order_by(Task.position, Task.created_at).all())
         return tasks
     except Exception as e:
         logger.error("Error getting tasks by type: %s", e)
@@ -288,10 +290,12 @@ def get_tasks_by_type(task_type):
 
 
 def get_tasks_by_project(project_name):
-    """Get all tasks belonging to a specific project, ordered by position then created_at."""
+    """Get all active tasks belonging to a specific project, ordered by position then created_at."""
     db = SessionLocal()
     try:
-        tasks = db.query(Task).filter(Task.project == project_name).order_by(Task.position, Task.created_at).all()
+        tasks = (db.query(Task)
+                 .filter(Task.project == project_name, Task.is_active == True)
+                 .order_by(Task.position, Task.created_at).all())
         return tasks
     except Exception as e:
         logger.error("Error getting tasks by project: %s", e)
@@ -301,10 +305,10 @@ def get_tasks_by_project(project_name):
 
 
 def get_all_tasks():
-    """Get all tasks."""
+    """Get all active tasks."""
     db = SessionLocal()
     try:
-        tasks = db.query(Task).order_by(Task.created_at).all()
+        tasks = db.query(Task).filter(Task.is_active == True).order_by(Task.created_at).all()
         return tasks
     except Exception as e:
         logger.error("Error getting all tasks: %s", e)
@@ -368,19 +372,42 @@ def batch_update_map_positions(updates):
 
 
 def delete_task(task_id):
-    """Delete a task."""
+    """Soft-delete a task and all its descendants by setting is_active=False.
+
+    No rows are removed from the database.  All board queries filter on
+    is_active=True, so deactivated tasks disappear from every view.
+    Cascades to the full descendant tree (via parent_task_id) so deleting
+    a Big Idea also hides its sub-ideas and their sub-ideas.
+    Returns the number of tasks deactivated (>=1) or 0 if not found.
+    """
     db = SessionLocal()
     try:
         task = db.query(Task).filter(Task.id == task_id).first()
-        if task:
-            db.delete(task)
-            db.commit()
-            return True
-        return False
+        if not task:
+            return 0
+
+        # BFS over the parent_task_id tree to collect all descendants.
+        ids_to_deactivate = [task_id]
+        queue = [task_id]
+        while queue:
+            parent_id = queue.pop(0)
+            children = (db.query(Task.id)
+                        .filter(Task.parent_task_id == parent_id,
+                                Task.is_active == True)
+                        .all())
+            for (child_id,) in children:
+                ids_to_deactivate.append(child_id)
+                queue.append(child_id)
+
+        (db.query(Task)
+           .filter(Task.id.in_(ids_to_deactivate))
+           .update({"is_active": False}, synchronize_session=False))
+        db.commit()
+        return len(ids_to_deactivate)
     except Exception as e:
         db.rollback()
-        logger.error("Error deleting task: %s", e)
-        return False
+        logger.error("Error soft-deleting task %s: %s", task_id, e)
+        return 0
     finally:
         db.close()
 

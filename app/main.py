@@ -58,7 +58,12 @@ from database import (
     create_full_review_result, get_full_review_results,
     create_merge_record, get_merge_record,
     get_research_jobs_for_task, get_research_job,
+    create_research_job, update_research_job,
     get_optimization_benchmarks,
+)
+from database import (
+    create_inbox_message, get_inbox_messages, get_inbox_message,
+    mark_inbox_read, mark_all_inbox_read, delete_inbox_message, count_unread_inbox,
 )
 
 from app.agent.config import PIPELINE_COLUMN_ORDER, PIPELINE_DONE_STATUSES
@@ -220,13 +225,13 @@ def batch_update_map_positions_endpoint(updates: list = Body(...)):
     return {"updated": count}
 
 
-@app.delete("/api/tasks/{task_id}", response_model=bool)
+@app.delete("/api/tasks/{task_id}", response_model=dict)
 def delete_task_endpoint(task_id: str):
-    """Delete a task"""
-    result = delete_task(task_id)
-    if not result:
+    """Soft-delete a task and all its descendants (sets is_active=False)."""
+    count = delete_task(task_id)
+    if not count:
         raise HTTPException(status_code=404, detail="Task not found")
-    return result
+    return {"deactivated": count}
 
 
 @app.get("/api/tasks/{task_id}/history", response_model=dict)
@@ -1549,6 +1554,273 @@ def get_task_research_jobs(task_id: str):
     return [_research_job_to_dict(j) for j in jobs]
 
 
+# ============================================
+# Ad-hoc Agent Toolbar Routes
+# ============================================
+
+# In-memory status registry for toolbar-triggered research jobs
+_ADHOC_RESEARCH_JOBS: dict[int, dict] = {}  # job_id -> {status, findings, verdict, error}
+
+
+def _run_adhoc_research(task_id: str, question: str, job_id: int) -> None:
+    """Background runner: executes a standalone research agent triggered from the card toolbar."""
+    import asyncio
+    from app.agent.research import run_research
+    from app.database import get_project_path as _get_project_path
+
+    _ADHOC_RESEARCH_JOBS[job_id] = {"status": "running"}
+    try:
+        task = get_task(task_id)
+        if not task:
+            _ADHOC_RESEARCH_JOBS[job_id] = {"status": "failed", "error": "Task not found"}
+            update_research_job(job_id, status="failed")
+            return
+
+        _setup_thread_context(task)
+        llm_base_url, llm_model, _ = _resolve_llm_endpoint(task)
+        project_root = _get_project_path(task.project) if task.project else None
+
+        context = {
+            "task_id": task.id,
+            "task_title": task.title,
+            "task_description": task.description or "",
+            "task_type": task.type,
+        }
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                run_research(
+                    question=question,
+                    context=context,
+                    llm_base_url=llm_base_url,
+                    llm_model=llm_model,
+                    task_id=task_id,
+                    llm_id=task.llm_id,
+                    budget_id=task.budget_id,
+                    project_root=project_root,
+                )
+            )
+        finally:
+            loop.close()
+
+        vote = result.vote or {}
+        update_research_job(
+            job_id,
+            status="completed",
+            findings=result.findings or "",
+            verdict=vote.get("verdict", ""),
+            lives_used=getattr(result, "lives_used", 1),
+            prompt_tokens=getattr(result, "prompt_tokens", 0),
+            completion_tokens=getattr(result, "completion_tokens", 0),
+        )
+        _ADHOC_RESEARCH_JOBS[job_id] = {
+            "status": "completed",
+            "findings": result.findings or "",
+            "verdict": vote.get("verdict", ""),
+        }
+    except Exception as exc:
+        logger.exception("[toolbar] Ad-hoc research for task '%s' failed.", task_id)
+        err = str(exc)
+        update_research_job(job_id, status="failed")
+        _ADHOC_RESEARCH_JOBS[job_id] = {"status": "failed", "error": err}
+
+
+@app.post("/api/agent/research/{task_id}", response_model=dict)
+def start_adhoc_research(task_id: str, body: dict, background_tasks: BackgroundTasks):
+    """Start an ad-hoc research agent on a task from the card toolbar."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not task.llm_id:
+        raise HTTPException(status_code=422, detail="Task must have an LLM assigned")
+    if not task.budget_id:
+        raise HTTPException(status_code=422, detail="Task must have a budget assigned")
+
+    question = (body.get("question") or "").strip()
+    if not question:
+        raise HTTPException(status_code=422, detail="'question' is required")
+
+    job = create_research_job(
+        task_id=task_id,
+        question=question,
+        llm_id=task.llm_id,
+        budget_id=task.budget_id,
+    )
+    if not job:
+        raise HTTPException(status_code=500, detail="Failed to create research job")
+
+    background_tasks.add_task(_run_adhoc_research, task_id, question, job.id)
+    return {"job_id": job.id, "status": "queued"}
+
+
+@app.get("/api/agent/research/{task_id}/status", response_model=dict)
+def get_adhoc_research_status(task_id: str, job_id: int):
+    """Poll the status of a toolbar-triggered research job."""
+    in_mem = _ADHOC_RESEARCH_JOBS.get(job_id)
+    if in_mem:
+        return in_mem
+
+    # Fall back to DB record (e.g. after server restart)
+    job = get_research_job(job_id)
+    if not job or job.task_id != task_id:
+        raise HTTPException(status_code=404, detail="Research job not found")
+    return {
+        "status": job.status,
+        "findings": job.findings or "",
+        "verdict": job.verdict or "",
+    }
+
+
+@app.post("/api/agent/subdivide/{task_id}", status_code=202)
+def adhoc_subdivide(task_id: str, background_tasks: BackgroundTasks):
+    """Trigger the subdivision agent on any task (toolbar shortcut, no is_big_idea guard)."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not task.llm_id:
+        raise HTTPException(status_code=422, detail="Task must have an LLM assigned")
+    if not task.budget_id:
+        raise HTTPException(status_code=422, detail="Task must have a budget assigned")
+    background_tasks.add_task(_run_regenerate_subdivision, task_id)
+    return {"status": "queued"}
+
+
+# ============================================
+# Manual Session API
+# ============================================
+
+from app.agent.manual_session import ManualSession, _ACTIVE_MANUAL_SESSIONS
+
+_MANUAL_SESSION_DENIED_TOOLS = {"spawn_research_agent"}
+
+
+def _build_manual_session_context(task) -> str:
+    """Build the initial context string shown in a manual session."""
+    lines = [
+        f"Task: {task.title}",
+        f"ID: {task.id}",
+        f"Status: {task.type}",
+        f"Project: {task.project or '(none)'}",
+    ]
+    if task.description:
+        lines.append(f"\nDescription:\n{task.description}")
+    if task.tags:
+        lines.append(f"\nTags: {', '.join(task.tags)}")
+    lines.append(
+        "\n[Manual Session] You are the reasoning layer. Pick tools, see results, iterate."
+        " No LLM is called. End with a signal when done."
+    )
+    return "\n".join(lines)
+
+
+@app.post("/api/manual-session/{task_id}/start", response_model=dict)
+async def start_manual_session(task_id: str):
+    """Start a new manual session for a task."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    context = _build_manual_session_context(task)
+    session = ManualSession.create(task_id, task.title, context)
+    _ACTIVE_MANUAL_SESSIONS[session.session_id] = session
+
+    from app.agent.tools import TOOL_SCHEMAS
+    available = [s for s in TOOL_SCHEMAS if s["function"]["name"] not in _MANUAL_SESSION_DENIED_TOOLS]
+
+    return {
+        "session_id": session.session_id,
+        "task_title": task.title,
+        "messages": session.messages,
+        "available_tools": available,
+        "status": session.status,
+    }
+
+
+@app.get("/api/manual-session/{session_id}", response_model=dict)
+def get_manual_session(session_id: str):
+    """Get current state of a manual session."""
+    session = _ACTIVE_MANUAL_SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found or expired (server may have restarted)")
+
+    from app.agent.tools import TOOL_SCHEMAS
+    available = [s for s in TOOL_SCHEMAS if s["function"]["name"] not in _MANUAL_SESSION_DENIED_TOOLS]
+
+    return {
+        "session_id": session_id,
+        "task_title": session.task_title,
+        "messages": session.messages,
+        "status": session.status,
+        "available_tools": available,
+    }
+
+
+@app.post("/api/manual-session/{session_id}/tool", response_model=dict)
+async def manual_session_tool(session_id: str, body: dict):
+    """Dispatch a tool call in a manual session."""
+    session = _ACTIVE_MANUAL_SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found or expired (server may have restarted)")
+    if session.status == "ended":
+        raise HTTPException(status_code=409, detail="Session has already ended")
+
+    tool_name = (body.get("tool_name") or "").strip()
+    arguments = body.get("arguments") or {}
+
+    if not tool_name:
+        raise HTTPException(status_code=422, detail="'tool_name' is required")
+    if tool_name in _MANUAL_SESSION_DENIED_TOOLS:
+        raise HTTPException(status_code=422, detail=f"Tool '{tool_name}' is not available in manual sessions")
+
+    task = get_task(session.task_id)
+    if task:
+        _setup_thread_context(task)
+
+    from app.agent.tools import async_dispatch_tool
+    result = await async_dispatch_tool(
+        tool_name,
+        arguments,
+        task_id=session.task_id,
+        llm_id=task.llm_id if task else None,
+        budget_id=task.budget_id if task else None,
+        llm_base_url=_resolve_llm_endpoint(task)[0] if task else None,
+        llm_model=_resolve_llm_endpoint(task)[1] if task else None,
+    )
+
+    session.record_tool_call(tool_name, arguments, result)
+    return {"messages": session.messages, "result": result}
+
+
+@app.post("/api/manual-session/{session_id}/message", response_model=dict)
+def manual_session_add_message(session_id: str, body: dict):
+    """Add a user or assistant message to the manual session log."""
+    session = _ACTIVE_MANUAL_SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    if session.status == "ended":
+        raise HTTPException(status_code=409, detail="Session has already ended")
+    role = body.get("role", "user")
+    content = (body.get("content") or "").strip()
+    if content:
+        session.add_message(role, content)
+    return {"messages": session.messages}
+
+
+@app.post("/api/manual-session/{session_id}/end", response_model=dict)
+def end_manual_session(session_id: str, body: dict):
+    """End a manual session with a terminal signal."""
+    session = _ACTIVE_MANUAL_SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    session.end(
+        signal=body.get("signal", "MANUAL_END"),
+        summary=body.get("summary", ""),
+    )
+    return {"status": "ended", "signal": session.signal}
+
+
 @app.get("/api/tasks/{task_id}/benchmarks", response_model=List[dict])
 def get_task_benchmarks(task_id: str):
     """Get all optimization benchmarks for a task (as parent), ordered by created_at."""
@@ -1672,6 +1944,7 @@ def task_to_dict(task):
         "demotion_history": getattr(task, "demotion_history", None),
         "map_x": getattr(task, "map_x", None),
         "map_y": getattr(task, "map_y", None),
+        "is_active": bool(getattr(task, "is_active", True)),
         "created_at": task.created_at.isoformat() if task.created_at else None,
         "updated_at": task.updated_at.isoformat() if task.updated_at else None
     }
@@ -2362,6 +2635,143 @@ def stop_agent_loop(task_id: str):
     return {"task_id": task_id, "status": "STOP_REQUESTED"}
 
 
+# ============================================================
+# Task Quick-Actions (toolbar buttons)
+# ============================================================
+
+@app.post("/api/tasks/{task_id}/demote", response_model=dict)
+def demote_task(task_id: str, body: dict = {}):
+    """Move a task one stage backward in the pipeline.
+
+    Optional body: {"target": "<stage>"}  — force a specific target stage.
+    Without a target the task drops one position in PIPELINE_COLUMN_ORDER.
+    Records a demotion event in demotion_history.
+    """
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    target = body.get("target") if body else None
+    if target:
+        if target not in PIPELINE_COLUMN_ORDER:
+            raise HTTPException(status_code=400, detail=f"Unknown stage '{target}'")
+    else:
+        try:
+            idx = PIPELINE_COLUMN_ORDER.index(task.type)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Current stage '{task.type}' is not in the pipeline")
+        if idx <= 0:
+            raise HTTPException(status_code=400, detail="Task is already at the first stage")
+        target = PIPELINE_COLUMN_ORDER[idx - 1]
+
+    _record_demotion(task_id, from_stage=task.type, to_stage=target, reason="manual demote via toolbar")
+    updated = update_task(task_id, type=target)
+    return task_to_dict(updated)
+
+
+@app.post("/api/tasks/{task_id}/set-stage", response_model=dict)
+def set_task_stage(task_id: str, body: dict):
+    """Manually force a task to any pipeline stage.
+
+    Body: {"stage": "<stage>"}
+    Does NOT record a demotion (use demote endpoint for that).
+    """
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    stage = body.get("stage")
+    if not stage or stage not in PIPELINE_COLUMN_ORDER:
+        raise HTTPException(status_code=400, detail=f"Invalid stage '{stage}'")
+    updated = update_task(task_id, type=stage)
+    return task_to_dict(updated)
+
+
+@app.post("/api/tasks/{task_id}/clone", response_model=dict)
+def clone_task(task_id: str):
+    """Clone a task as a new IDEA in the same project.
+
+    Copies title, description, tags, llm_id, budget_id.
+    New task starts in the 'idea' stage with no history.
+    """
+    import uuid
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    new_task = create_task(
+        id=str(uuid.uuid4()),
+        title=f"[Clone] {task.title}",
+        type="idea",
+        description=task.description or "",
+        owner=task.owner or "user",
+        tags=list(task.tags or []),
+        llm_id=task.llm_id,
+        budget_id=task.budget_id,
+        project=task.project or "TheMaestro",
+    )
+    if not new_task:
+        raise HTTPException(status_code=500, detail="Failed to create clone")
+    return task_to_dict(new_task)
+
+
+@app.post("/api/tasks/{task_id}/pin", response_model=dict)
+def pin_task(task_id: str):
+    """Move a task to position 0 (top of its column)."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    updated = update_task(task_id, position=0)
+    return task_to_dict(updated)
+
+
+@app.post("/api/tasks/{task_id}/run-planning", response_model=dict)
+def run_planning_on_demand(task_id: str, background_tasks: BackgroundTasks):
+    """Manually trigger the planning pipeline for a task (any stage)."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not task.llm_id or not task.budget_id:
+        raise HTTPException(status_code=400, detail="Task needs an LLM endpoint and budget assigned.")
+    background_tasks.add_task(_run_planning_pipeline_bg, task_id)
+    return {"task_id": task_id, "status": "STARTED", "pipeline": "planning"}
+
+
+@app.post("/api/tasks/{task_id}/run-review", response_model=dict)
+def run_conceptual_review_on_demand(task_id: str, background_tasks: BackgroundTasks):
+    """Manually trigger the conceptual review pipeline for a task."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not task.llm_id or not task.budget_id:
+        raise HTTPException(status_code=400, detail="Task needs an LLM endpoint and budget assigned.")
+    background_tasks.add_task(_advance_to_optimization, task_id)
+    return {"task_id": task_id, "status": "STARTED", "pipeline": "conceptual_review"}
+
+
+@app.post("/api/tasks/{task_id}/run-security", response_model=dict)
+def run_security_on_demand(task_id: str, background_tasks: BackgroundTasks):
+    """Manually trigger the optimization + security review pipeline for a task."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not task.llm_id or not task.budget_id:
+        raise HTTPException(status_code=400, detail="Task needs an LLM endpoint and budget assigned.")
+    background_tasks.add_task(_run_security_pipeline_bg, task_id)
+    return {"task_id": task_id, "status": "STARTED", "pipeline": "security"}
+
+
+@app.post("/api/tasks/{task_id}/run-full-review", response_model=dict)
+def run_full_review_on_demand(task_id: str, background_tasks: BackgroundTasks):
+    """Manually trigger the full review pipeline for a task."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not task.llm_id or not task.budget_id:
+        raise HTTPException(status_code=400, detail="Task needs an LLM endpoint and budget assigned.")
+    background_tasks.add_task(_run_full_review_bg, task_id)
+    return {"task_id": task_id, "status": "STARTED", "pipeline": "full_review"}
+
+
 @app.get("/api/agent/tasks/ready", response_model=List[dict])
 def get_ready_tasks():
     """
@@ -2380,3 +2790,56 @@ def scheduler_status():
     """Return the current state of the push-first eager scheduler."""
     from app.agent.scheduler import get_scheduler_status  # noqa: PLC0415
     return get_scheduler_status()
+
+
+# ---------------------------------------------------------------------------
+# Inbox / notification routes
+# ---------------------------------------------------------------------------
+
+@app.get("/api/inbox", response_model=List[dict])
+def list_inbox(unread: bool = False):
+    """Return inbox messages, newest first. ?unread=true filters to unread only."""
+    return get_inbox_messages(unread_only=unread)
+
+
+@app.get("/api/inbox/unread-count", response_model=dict)
+def inbox_unread_count():
+    return {"count": count_unread_inbox()}
+
+
+@app.post("/api/inbox", response_model=dict)
+def create_inbox(payload: dict):
+    """Create an inbox message. Body: {subject, source_type?, task_id?, task_title?, outcome?, data_json?}"""
+    return create_inbox_message(
+        subject=payload.get("subject", "Notification"),
+        source_type=payload.get("source_type", "intake_result"),
+        task_id=payload.get("task_id"),
+        task_title=payload.get("task_title"),
+        outcome=payload.get("outcome"),
+        data_json=payload.get("data_json"),
+    )
+
+
+@app.patch("/api/inbox/{msg_id}", response_model=dict)
+def update_inbox(msg_id: str, payload: dict):
+    """Update an inbox message. Body: {read: bool}"""
+    if "read" in payload:
+        result = mark_inbox_read(msg_id, bool(payload["read"]))
+        if result is None:
+            raise HTTPException(status_code=404, detail=f"Inbox message '{msg_id}' not found.")
+        return result
+    raise HTTPException(status_code=400, detail="No supported fields in payload.")
+
+
+@app.post("/api/inbox/mark-all-read", response_model=dict)
+def inbox_mark_all_read():
+    n = mark_all_inbox_read()
+    return {"marked_read": n}
+
+
+@app.delete("/api/inbox/{msg_id}", response_model=dict)
+def delete_inbox(msg_id: str):
+    ok = delete_inbox_message(msg_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Inbox message '{msg_id}' not found.")
+    return {"deleted": True}

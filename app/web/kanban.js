@@ -38,6 +38,11 @@ let transitionCache = {};
 // Active polling timers: taskId -> intervalId
 let transitionPollers = {};
 
+// Inbox
+let inboxMessages = [];
+let _inboxUnreadCount = 0;
+let _inboxPollInterval = null;
+
 // Big Idea zoom state
 let currentBigIdeaFilter = null;  // task ID or null for root view
 let breadcrumbStack = [];         // array of {id, title} for nested zoom
@@ -50,6 +55,118 @@ let _viewChildrenState = null;   // { taskId, records, childMap, idx }
 let _childrenPollerTimer = null; // interval ID while waiting for regeneration to complete
 // Full descendant index: taskId -> [all descendant IDs recursively]
 let descendantIndex = {};
+
+// ============================================
+// Toast Notifications
+// ============================================
+
+function showToast(message, type = 'info', duration = 4500) {
+    const container = document.getElementById('toast-container');
+    if (!container) return;
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+    toast.innerHTML = `<span class="toast-body">${message}</span><button class="toast-close" onclick="this.parentElement.remove()">&times;</button>`;
+    container.appendChild(toast);
+    setTimeout(() => {
+        toast.classList.add('toast-fade-out');
+        toast.addEventListener('animationend', () => toast.remove());
+    }, duration);
+}
+
+// ============================================
+// Confirm Modal (replaces confirm())
+// ============================================
+
+let _confirmResolveCallback = null;
+
+function showConfirm(title, message, okLabel = 'Confirm') {
+    return new Promise(resolve => {
+        _confirmResolveCallback = resolve;
+        document.getElementById('confirm-modal-title').textContent = title;
+        document.getElementById('confirm-modal-message').textContent = message;
+        document.getElementById('confirm-modal-ok').textContent = okLabel;
+        document.getElementById('confirm-modal').classList.add('active');
+    });
+}
+
+function _confirmResolve(result) {
+    document.getElementById('confirm-modal').classList.remove('active');
+    if (_confirmResolveCallback) {
+        _confirmResolveCallback(result);
+        _confirmResolveCallback = null;
+    }
+}
+
+// Backdrop click for confirm modal
+document.addEventListener('DOMContentLoaded', function() {
+    const overlay = document.getElementById('confirm-modal');
+    if (overlay) {
+        overlay.addEventListener('click', function(e) {
+            if (e.target === this && _modalMousedownTarget === this) _confirmResolve(false);
+        });
+    }
+    const rdOverlay = document.getElementById('research-dialog-modal');
+    if (rdOverlay) {
+        rdOverlay.addEventListener('click', function(e) {
+            if (e.target === this && _modalMousedownTarget === this) closeResearchDialog();
+        });
+    }
+});
+
+// ============================================
+// Research Dialog Modal (replaces prompt())
+// ============================================
+
+let _researchDialogTaskId = null;
+
+function closeResearchDialog() {
+    _researchDialogTaskId = null;
+    document.getElementById('research-dialog-modal').classList.remove('active');
+    document.getElementById('research-dialog-question').value = '';
+}
+
+async function submitResearchDialog() {
+    const question = document.getElementById('research-dialog-question').value.trim();
+    if (!question) { showToast('Enter a research question first.', 'warning'); return; }
+    const taskId = _researchDialogTaskId;
+    closeResearchDialog();
+    try {
+        const resp = await fetch(`${API_BASE}/agent/research/${taskId}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ question }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.detail || 'Research failed to start', 'error'); return; }
+        _pollResearchJob(taskId, data.job_id);
+        showToast(`Research job #${data.job_id} queued.`, 'info');
+    } catch (e) {
+        showToast('Error starting research: ' + e.message, 'error');
+    }
+}
+
+// Highlighted cards (localStorage-backed)
+let _highlightedCards = new Set(JSON.parse(localStorage.getItem('maestro_highlights') || '[]'));
+
+function _saveHighlights() {
+    try { localStorage.setItem('maestro_highlights', JSON.stringify([..._highlightedCards])); } catch (_) {}
+}
+
+function _applyHighlightState(el, taskId) {
+    el.classList.toggle('highlighted', _highlightedCards.has(taskId));
+    const btn = el.querySelector('.card-highlight-btn');
+    if (btn) btn.textContent = _highlightedCards.has(taskId) ? '★' : '☆';
+}
+
+function toggleHighlight(taskId) {
+    if (_highlightedCards.has(taskId)) { _highlightedCards.delete(taskId); }
+    else { _highlightedCards.add(taskId); }
+    _saveHighlights();
+    const card = cardCache[taskId];
+    if (card) _applyHighlightState(card, taskId);
+    const mapNode = document.getElementById(`map-node-${taskId}`);
+    if (mapNode) _applyHighlightState(mapNode, taskId);
+}
 
 // Grouped drag state
 let isDraggingGroup = false;
@@ -412,6 +529,7 @@ function reconcile(newTasks) {
         if (!cardCache[task.id]) {
             // New task — create and insert
             const card = createTaskCard(task.id, task.title, task.tags, task.owner, task.type);
+            _applyHighlightState(card, task.id);
             cardCache[task.id] = card;
             fingerprintCache[task.id] = newFp;
             columnsToSort.add(renderCol);
@@ -423,6 +541,7 @@ function reconcile(newTasks) {
                 columnsToSort.add(oldTask.type === 'subdividing' ? 'idea' : oldTask.type);
             }
             const newCard = createTaskCard(task.id, task.title, task.tags, task.owner, task.type);
+            _applyHighlightState(newCard, task.id);
             if (old.parentNode) old.parentNode.replaceChild(newCard, old);
             cardCache[task.id] = newCard;
             fingerprintCache[task.id] = newFp;
@@ -451,6 +570,7 @@ function refreshCard(taskId) {
     const task = taskData[taskId];
     if (!task) return;
     const newCard = createTaskCard(task.id, task.title, task.tags, task.owner, task.type);
+    _applyHighlightState(newCard, taskId);
     const old = cardCache[taskId];
     if (old && old.parentNode) {
         old.parentNode.replaceChild(newCard, old);
@@ -487,6 +607,10 @@ document.addEventListener('DOMContentLoaded', async function() {
 
     // Start auto-refresh every 5 seconds
     startAutoRefresh();
+
+    // Load inbox and start badge polling
+    await loadInbox();
+    _inboxPollInterval = setInterval(refreshInboxBadge, 60_000);
 });
 
 // Start automatic polling for database changes
@@ -830,7 +954,7 @@ async function saveEditProject() {
 
 async function deleteProjectFromModal() {
     const name = document.getElementById('edit-project-original-name').value;
-    if (!confirm(`Delete project "${name}"? This does not delete its tasks.`)) return;
+    if (!await showConfirm('Delete Project', `Delete project "${name}"? This does not delete its tasks.`, 'Delete')) return;
 
     const errEl = document.getElementById('edit-project-error');
     try {
@@ -861,7 +985,7 @@ async function saveTask() {
     const owner = document.getElementById('task-owner').value.trim() || 'user';
 
     if (!title) {
-        alert('Task title is required!');
+        showToast('Task title is required.', 'warning');
         return;
     }
 
@@ -903,7 +1027,7 @@ async function saveTask() {
         });
 
         if (!response.ok) {
-            alert('Failed to update task');
+            showToast('Failed to update task', 'error');
             return;
         }
 
@@ -934,7 +1058,7 @@ async function saveTask() {
         });
 
         if (!response.ok) {
-            alert('Failed to create task');
+            showToast('Failed to create task', 'error');
             return;
         }
 
@@ -952,7 +1076,7 @@ function canAddTaskToColumn(status) {
     if (!status || status === 'architecture') return true;
     const check = checkWipLimit(status);
     if (!check.allowed) {
-        alert(`WIP Limit Reached! Column '${status.toUpperCase()}' has ${check.current} tasks (limit: ${check.limit}).`);
+        showToast(`WIP limit reached — column ${status.toUpperCase()} is at ${check.current}/${check.limit} tasks.`, 'warning');
         return false;
     }
     return true;
@@ -1260,7 +1384,7 @@ async function activateSubdivisionRecord(taskId, recordId) {
         const resp = await fetch(`${API_BASE}/tasks/${taskId}/subdivision-records/${recordId}/activate`, { method: 'POST' });
         if (!resp.ok) {
             const err = await resp.json().catch(() => ({}));
-            alert('Failed to activate: ' + (err.detail || resp.statusText));
+            showToast('Failed to activate: ' + (err.detail || resp.statusText), 'error');
             return;
         }
         await viewChildren(taskId);   // refresh modal with updated statuses
@@ -1274,7 +1398,7 @@ async function regenerateSubdivision(taskId) {
         const resp = await fetch(`${API_BASE}/tasks/${taskId}/regenerate-subdivision`, { method: 'POST' });
         if (!resp.ok) {
             const err = await resp.json().catch(() => ({}));
-            alert('Failed to regenerate: ' + (err.detail || resp.statusText));
+            showToast('Failed to regenerate: ' + (err.detail || resp.statusText), 'error');
             return;
         }
         // Keep the modal open. Inject a synthetic "generating" placeholder as the newest
@@ -1442,6 +1566,67 @@ async function viewBenchmarks(taskId) {
     }
 }
 
+// ============================================
+// Agent Toolbar Functions
+// ============================================
+
+function openResearchDialog(taskId) {
+    _researchDialogTaskId = taskId;
+    const task = taskData[taskId];
+    const label = task ? `Task: ${task.title}` : `Task ID: ${taskId}`;
+    document.getElementById('research-dialog-task-label').textContent = label;
+    document.getElementById('research-dialog-question').value = '';
+    document.getElementById('research-dialog-modal').classList.add('active');
+    setTimeout(() => document.getElementById('research-dialog-question').focus(), 50);
+}
+
+function _pollResearchJob(taskId, jobId) {
+    const timer = setInterval(async () => {
+        try {
+            const resp = await fetch(`${API_BASE}/agent/research/${taskId}/status?job_id=${jobId}`);
+            if (!resp.ok) { clearInterval(timer); return; }
+            const data = await resp.json();
+            if (data.status === 'completed') {
+                clearInterval(timer);
+                const verdict = data.verdict ? ` [${data.verdict}]` : '';
+                showToast(`Research #${jobId} complete${verdict} — open Research Jobs on the card for findings.`, 'success', 7000);
+            } else if (data.status === 'failed') {
+                clearInterval(timer);
+                showToast(`Research #${jobId} failed: ${data.error || 'unknown error'}`, 'error');
+            }
+        } catch (_) { clearInterval(timer); }
+    }, 3000);
+}
+
+async function toolbarSubdivide(taskId) {
+    const task = taskData[taskId];
+    const title = task ? `"${task.title}"` : `task ${taskId}`;
+    const ok = await showConfirm('Subdivide Task', `Run the subdivision agent on ${title}? Existing children will be cancelled.`, 'Subdivide');
+    if (!ok) return;
+    try {
+        const resp = await fetch(`${API_BASE}/agent/subdivide/${taskId}`, { method: 'POST' });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.detail || 'Subdivide failed', 'error'); return; }
+        if (taskData[taskId]) {
+            taskData[taskId].type = 'subdividing';
+            refreshCard(taskId);
+        }
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+    }
+}
+
+async function runAgentFromToolbar(taskId) {
+    try {
+        const resp = await fetch(`${API_BASE}/agent/run/${taskId}`, { method: 'POST' });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.detail || 'Could not start agent', 'error'); return; }
+        showToast('MaestroLoop started.', 'success');
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+    }
+}
+
 function createTaskCard(id, title, tags, owner, status) {
     const card = document.createElement('div');
     card.className = `task-card ${status}`;
@@ -1514,6 +1699,7 @@ function createTaskCard(id, title, tags, owner, status) {
     }
 
     card.innerHTML = `
+        <button class="card-highlight-btn" title="Highlight card" onclick="event.stopPropagation();toggleHighlight('${id}')">☆</button>
         ${parentLink}
         <div class="task-title"${isBigIdea ? ` onclick="zoomIntoBigIdea('${id}')" style="cursor:pointer"` : ''}>${title}${rejBadge}${processingSpinner}${subdivBadge}${bigIdeaBadge}${contractIndicator}</div>
         <div class="task-meta">
@@ -1521,11 +1707,31 @@ function createTaskCard(id, title, tags, owner, status) {
             ${ownerHtml}
         </div>
         ${prereqHtml}
+        <div class="card-toolbar">
+            <span class="toolbar-sep"></span>
+            <button class="toolbar-btn" title="Research — run a research agent on this card" onclick="event.stopPropagation();openResearchDialog('${id}')">🔍</button>
+            <button class="toolbar-btn" title="Subdivide — run subdivision agent on this card" onclick="event.stopPropagation();toolbarSubdivide('${id}')">✂</button>
+            <button class="toolbar-btn" title="Run Planning pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','planning')">📋</button>
+            <button class="toolbar-btn" title="Run Conceptual Review pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','review')">👁</button>
+            <button class="toolbar-btn" title="Run Security pipeline (optimization + security)" onclick="event.stopPropagation();toolbarRunPipeline('${id}','security')">🔒</button>
+            <button class="toolbar-btn" title="Manual Session — drive tool calls yourself" onclick="event.stopPropagation();openManualSession('${id}')">⌨</button>
+            <span class="toolbar-sep"></span>
+            <button class="toolbar-btn" title="Run Agent — start MaestroLoop" onclick="event.stopPropagation();runAgentFromToolbar('${id}')">▶</button>
+            <button class="toolbar-btn" title="Stop Agent — request graceful halt" onclick="event.stopPropagation();toolbarStopAgent('${id}')">⏹</button>
+            <button class="toolbar-btn" title="Demote — move one stage backward" onclick="event.stopPropagation();toolbarDemote('${id}')">↩</button>
+            <button class="toolbar-btn" title="Set Stage — move to any pipeline stage" onclick="event.stopPropagation();toolbarStagePicker('${id}',this)">⚙</button>
+            <span class="toolbar-sep"></span>
+            <button class="toolbar-btn" title="Open in Diagnostics" onclick="event.stopPropagation();toolbarOpenDiagnostics('${id}')">📊</button>
+            <button class="toolbar-btn" title="Clone as new Idea" onclick="event.stopPropagation();toolbarClone('${id}')">⧉</button>
+            <button class="toolbar-btn" title="Pin to top of column" onclick="event.stopPropagation();toolbarPin('${id}')">📌</button>
+            <button class="toolbar-btn" title="Open in Column Map (DAG view)" onclick="event.stopPropagation();toolbarOpenMap('${id}')">🔗</button>
+        </div>
         <div class="task-actions">
             <button class="action-btn" onclick="editTask('${id}')">Edit</button>
             <button class="action-btn action-btn-danger" onclick="deleteTask('${id}')">Delete</button>
         </div>
     `;
+    _applyHighlightState(card, id);
 
     // Make rejected/failed cards clickable to open transition detail
     if (rejectionCount > 0) {
@@ -1663,7 +1869,7 @@ async function advanceTask(taskId) {
         });
         if (!response.ok) {
             const err = await response.json();
-            alert(`Advance failed: ${err.detail || 'Unknown error'}`);
+            showToast('Advance failed: ' + (err.detail || 'Unknown error'), 'error');
             return;
         }
         const result = await response.json();
@@ -1731,6 +1937,10 @@ function startTransitionPolling(taskId) {
             // Pipeline completed — stop polling
             clearInterval(transitionPollers[taskId]);
             delete transitionPollers[taskId];
+
+            // Save every result to inbox (pass or fail) for later review
+            const taskTitle = allTasks.find(t => t.id === taskId)?.title || taskId;
+            _inboxSaveTransitionResult(taskId, taskTitle, data);
 
             if (data.outcome === 'passed') {
                 // Task promoted — fetch fresh data and reconcile
@@ -1817,7 +2027,7 @@ const TRANSITION_LABELS = {
 function openTransitionModal(taskId) {
     const cached = transitionCache[taskId];
     if (!cached || cached.history.length === 0) {
-        alert('No transition data available for this task.');
+        showToast('No transition data available for this task.', 'info');
         return;
     }
 
@@ -1922,18 +2132,232 @@ function closeTransitionModal() {
 }
 
 // ============================================
+// Inbox
+// ============================================
+
+async function loadInbox() {
+    try {
+        const resp = await fetch(`${API_BASE}/inbox`);
+        if (!resp.ok) return;
+        inboxMessages = await resp.json();
+        _inboxUnreadCount = inboxMessages.filter(m => !m.read).length;
+        _updateInboxBadge();
+    } catch (e) {
+        console.error('[inbox] load failed:', e);
+    }
+}
+
+async function refreshInboxBadge() {
+    try {
+        const resp = await fetch(`${API_BASE}/inbox/unread-count`);
+        if (!resp.ok) return;
+        const { count } = await resp.json();
+        _inboxUnreadCount = count;
+        _updateInboxBadge();
+    } catch (e) { /* silent */ }
+}
+
+function _updateInboxBadge() {
+    const badge = document.getElementById('inbox-badge');
+    if (!badge) return;
+    if (_inboxUnreadCount > 0) {
+        badge.textContent = _inboxUnreadCount > 99 ? '99+' : String(_inboxUnreadCount);
+        badge.style.display = 'flex';
+    } else {
+        badge.style.display = 'none';
+    }
+}
+
+function openInboxModal() {
+    _renderInboxList();
+    document.getElementById('inbox-modal').classList.add('active');
+}
+
+function closeInboxModal() {
+    document.getElementById('inbox-modal').classList.remove('active');
+}
+
+function _inboxOutcomeClass(outcome) {
+    if (!outcome) return 'inbox-outcome-unknown';
+    const o = outcome.toLowerCase();
+    if (o === 'rejected') return 'inbox-outcome-rejected';
+    if (o === 'failed')   return 'inbox-outcome-failed';
+    if (o === 'passed')   return 'inbox-outcome-passed';
+    if (o.startsWith('subdivide')) return 'inbox-outcome-subdivide';
+    return 'inbox-outcome-unknown';
+}
+
+function _inboxRelTime(isoStr) {
+    if (!isoStr) return '';
+    const d = new Date(isoStr.endsWith('Z') ? isoStr : isoStr + 'Z');
+    const diffMs = Date.now() - d.getTime();
+    const diffMin = Math.floor(diffMs / 60_000);
+    if (diffMin < 1)  return 'just now';
+    if (diffMin < 60) return `${diffMin}m ago`;
+    const diffHr = Math.floor(diffMin / 60);
+    if (diffHr < 24)  return `${diffHr}h ago`;
+    return `${Math.floor(diffHr / 24)}d ago`;
+}
+
+function _renderInboxList() {
+    const body = document.getElementById('inbox-modal-body');
+    const unreadLabel = document.getElementById('inbox-modal-unread-label');
+    const markAllBtn = document.getElementById('inbox-mark-all-btn');
+    const unread = inboxMessages.filter(m => !m.read).length;
+
+    if (unread > 0) {
+        unreadLabel.textContent = `${unread} unread`;
+        unreadLabel.style.display = 'inline-block';
+        markAllBtn.style.display = '';
+    } else {
+        unreadLabel.style.display = 'none';
+        markAllBtn.style.display = 'none';
+    }
+
+    if (inboxMessages.length === 0) {
+        body.innerHTML = '<div class="inbox-empty">No messages yet.<br>Intake pipeline results will appear here.</div>';
+        return;
+    }
+
+    body.innerHTML = inboxMessages.map(msg => {
+        const outcomeClass = _inboxOutcomeClass(msg.outcome);
+        const outcomeLabel = msg.outcome ? msg.outcome.toUpperCase().replace('_', ' ') : '—';
+        const taskChip = msg.task_title
+            ? `<span class="inbox-item-task" title="${msg.task_title}">${msg.task_title}</span>`
+            : '';
+        return `
+        <div class="inbox-item ${msg.read ? '' : 'unread'}" data-id="${msg.id}" onclick="inboxOpenMessage('${msg.id}')">
+            <div class="inbox-unread-dot"></div>
+            <div class="inbox-item-body">
+                <div class="inbox-item-subject">${msg.subject}</div>
+                <div class="inbox-item-meta">
+                    ${taskChip}
+                    <span class="inbox-outcome-badge ${outcomeClass}">${outcomeLabel}</span>
+                    <span class="inbox-item-time">${_inboxRelTime(msg.created_at)}</span>
+                </div>
+            </div>
+            <div class="inbox-item-actions">
+                <button class="inbox-delete-btn" title="Delete" onclick="inboxDelete(event, '${msg.id}')">×</button>
+            </div>
+        </div>`.trim();
+    }).join('');
+}
+
+async function inboxOpenMessage(msgId) {
+    const msg = inboxMessages.find(m => m.id === msgId);
+    if (!msg) return;
+
+    // Mark as read
+    if (!msg.read) {
+        await fetch(`${API_BASE}/inbox/${msgId}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ read: true }),
+        });
+        msg.read = true;
+        _inboxUnreadCount = Math.max(0, _inboxUnreadCount - 1);
+        _updateInboxBadge();
+        _renderInboxList();
+    }
+
+    // Load into transition modal using cached data
+    if (msg.data_json && msg.task_id) {
+        try {
+            const data = JSON.parse(msg.data_json);
+            cacheTransitionData(msg.task_id, data);
+            closeInboxModal();
+            openTransitionModal(msg.task_id);
+            return;
+        } catch (e) {
+            console.error('[inbox] failed to parse data_json:', e);
+        }
+    }
+
+    // Fallback: just open transition modal if task has cached data
+    if (msg.task_id && transitionCache[msg.task_id]) {
+        closeInboxModal();
+        openTransitionModal(msg.task_id);
+    }
+}
+
+async function inboxMarkAllRead() {
+    await fetch(`${API_BASE}/inbox/mark-all-read`, { method: 'POST' });
+    inboxMessages.forEach(m => { m.read = true; });
+    _inboxUnreadCount = 0;
+    _updateInboxBadge();
+    _renderInboxList();
+}
+
+async function inboxDelete(event, msgId) {
+    event.stopPropagation();
+    await fetch(`${API_BASE}/inbox/${msgId}`, { method: 'DELETE' });
+    const idx = inboxMessages.findIndex(m => m.id === msgId);
+    if (idx !== -1) {
+        if (!inboxMessages[idx].read) _inboxUnreadCount = Math.max(0, _inboxUnreadCount - 1);
+        inboxMessages.splice(idx, 1);
+    }
+    _updateInboxBadge();
+    _renderInboxList();
+}
+
+async function _inboxSaveTransitionResult(taskId, taskTitle, data) {
+    const outcome = data.outcome || 'unknown';
+    const outcomeLabel = outcome.charAt(0).toUpperCase() + outcome.slice(1).replace('_', ' ');
+    const subject = `Intake: ${taskTitle} — ${outcomeLabel}`;
+    try {
+        const resp = await fetch(`${API_BASE}/inbox`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                subject,
+                source_type: 'intake_result',
+                task_id: taskId,
+                task_title: taskTitle,
+                outcome,
+                data_json: JSON.stringify(data),
+            }),
+        });
+        if (resp.ok) {
+            const msg = await resp.json();
+            inboxMessages.unshift(msg);
+            _inboxUnreadCount++;
+            _updateInboxBadge();
+        }
+    } catch (e) {
+        console.error('[inbox] save failed:', e);
+    }
+}
+
+// ============================================
 // Task Deletion
 // ============================================
 
 async function deleteTask(taskId) {
-    if (!confirm('Delete this task? This cannot be undone.')) return;
+    const task = taskData[taskId];
+    const hasChildren = task && task.is_big_idea;
+    const msg = hasChildren
+        ? 'Hide this task and all its children? They will no longer appear on the board.'
+        : 'Hide this task? It will no longer appear on the board.';
+    if (!await showConfirm('Hide Task', msg, 'Hide')) return;
 
     const response = await fetch(`${API_BASE}/tasks/${taskId}`, { method: 'DELETE' });
     if (!response.ok) {
-        alert('Failed to delete task');
+        const data = await response.json().catch(() => ({}));
+        showToast(data.detail || 'Failed to hide task', 'error');
         return;
     }
 
+    const data = await response.json();
+    const count = data.deactivated || 1;
+
+    // Remove task and any descendants from local state
+    const idsToRemove = new Set(
+        allTasks.filter(t => t.id === taskId || (function walk(id) {
+            return allTasks.some(c => c.parent_task_id === id &&
+                (c.id === taskId || walk(c.id)));
+        })(t.id)).map(t => t.id)
+    );
+    // Simpler: just remove the clicked task from DOM immediately; reconcile will clean the rest
     delete taskData[taskId];
     allTasks = allTasks.filter(t => t.id !== taskId);
     const card = document.querySelector(`.task-card[data-id="${taskId}"]`);
@@ -1942,6 +2366,9 @@ async function deleteTask(taskId) {
         card.remove();
         if (container) updateTaskCount(container.id.replace('tasks-', ''));
     }
+    if (count > 1) showToast(`Hidden ${count} tasks (task + children).`, 'info');
+    // Full reload so descendant cards disappear too
+    if (count > 1) await loadTasksFromDatabase();
 }
 
 // ============================================
@@ -1958,7 +2385,7 @@ async function moveTask(taskId, newStatus) {
 
     if (!task) {
         console.error('Task not found in taskData:', taskId);
-        alert('Task not found');
+        showToast('Task not found', 'error');
         return;
     }
 
@@ -1968,7 +2395,7 @@ async function moveTask(taskId, newStatus) {
     }
 
     if (!canTaskAdvance(taskId)) {
-        alert('Task cannot advance: it needs a description, LLM, and budget assigned.');
+        showToast('Task cannot advance — it needs a description, LLM, and budget assigned.', 'warning');
         return;
     }
 
@@ -1984,7 +2411,7 @@ async function moveTask(taskId, newStatus) {
     if (!response.ok) {
         const errorText = await response.text();
         console.error('Error response:', errorText);
-        alert('Failed to move task: ' + errorText);
+        showToast('Failed to move task: ' + errorText, 'error');
         return;
     }
 
@@ -2090,7 +2517,7 @@ async function saveEditTask() {
     const owner = document.getElementById('task-owner').value.trim() || 'user';
 
     if (!title) {
-        alert('Task title is required!');
+        showToast('Task title is required.', 'warning');
         return;
     }
 
@@ -2123,7 +2550,7 @@ async function saveEditTask() {
     });
 
     if (!response.ok) {
-        alert('Failed to update task');
+        showToast('Failed to update task', 'error');
         return;
     }
 
@@ -2674,7 +3101,7 @@ async function saveLlmEdit() {
 }
 
 async function deleteLlmEntry(id) {
-    if (!confirm('Delete this LLM endpoint?')) return;
+    if (!await showConfirm('Delete LLM Endpoint', 'Delete this LLM endpoint?', 'Delete')) return;
     await fetch(`${API_BASE}/llms/${id}`, { method: 'DELETE' });
     // If we were editing this one, reset the edit pane
     if (_llmEditingId === id) {
@@ -2845,7 +3272,7 @@ async function saveBudgetEdit() {
 }
 
 async function deleteBudgetEntry(id) {
-    if (!confirm('Delete this budget?')) return;
+    if (!await showConfirm('Delete Budget', 'Delete this budget?', 'Delete')) return;
     await fetch(`${API_BASE}/budgets/${id}`, { method: 'DELETE' });
     if (_budgetEditingId === id) {
         _budgetEditingId = null;
@@ -3116,7 +3543,7 @@ function handleTasksContainerClick(e, colType) {
     openColumnMap(colType);
 }
 
-function openColumnMap(colType) {
+function openColumnMap(colType, focusNodeId) {
     columnMapActive = true;
     columnMapType = colType;
     mapTransform = { x: 0, y: 0, scale: 1 };
@@ -3130,6 +3557,34 @@ function openColumnMap(colType) {
 
     renderColumnMap(colType);
     setupMapInteraction();
+
+    // If a specific node was requested, scroll/pan to it and pulse-highlight it
+    if (focusNodeId) {
+        setTimeout(() => _mapFocusNode(focusNodeId), 80);
+    }
+}
+
+function _mapFocusNode(nodeId) {
+    const node = document.getElementById(`map-node-${nodeId}`);
+    if (!node) return;
+
+    // Read the node's layout position from shared state
+    const pos = _mapCurrentNodePositions[nodeId];
+    if (pos) {
+        // Center the viewport on this node
+        const wrap = document.getElementById('column-map-scroll-wrap');
+        const cx = wrap.clientWidth  / 2;
+        const cy = wrap.clientHeight / 2;
+        mapTransform.x = cx - pos.cx;
+        mapTransform.y = cy - pos.cy;
+        const canvas = document.getElementById('column-map-canvas');
+        canvas.style.transform = `translate(${mapTransform.x}px,${mapTransform.y}px) scale(${mapTransform.scale})`;
+        _mapRedrawArrows();
+    }
+
+    // Pulse-highlight the node
+    node.classList.add('map-node-focus');
+    setTimeout(() => node.classList.remove('map-node-focus'), 2000);
 }
 
 function closeColumnMap() {
@@ -3381,9 +3836,27 @@ function renderColumnMap(colType) {
             actionHtml += ` <button class="map-btn map-btn-warning" onclick="moveTask('${id}','indev')">&#8594; Dev</button>`;
 
         node.innerHTML = `
+            <button class="card-highlight-btn" title="Highlight" onclick="event.stopPropagation();toggleHighlight('${id}')">☆</button>
             <div class="map-node-title" onclick="editTask('${id}')">${task.title || '(untitled)'}${badges ? ' ' + badges : ''}</div>
             <div class="map-node-meta">${tagHtml}${ownerHtml}</div>
+            <div class="card-toolbar" style="margin-bottom:0.3rem">
+                <button class="toolbar-btn" title="Research" onclick="event.stopPropagation();openResearchDialog('${id}')">🔍</button>
+                <button class="toolbar-btn" title="Subdivide" onclick="event.stopPropagation();toolbarSubdivide('${id}')">✂</button>
+                <button class="toolbar-btn" title="Run Planning pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','planning')">📋</button>
+                <button class="toolbar-btn" title="Run Conceptual Review pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','review')">👁</button>
+                <button class="toolbar-btn" title="Run Security pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','security')">🔒</button>
+                <button class="toolbar-btn" title="Manual Session" onclick="event.stopPropagation();openManualSession('${id}')">⌨</button>
+                <button class="toolbar-btn" title="Run Agent" onclick="event.stopPropagation();runAgentFromToolbar('${id}')">▶</button>
+                <button class="toolbar-btn" title="Stop Agent" onclick="event.stopPropagation();toolbarStopAgent('${id}')">⏹</button>
+                <button class="toolbar-btn" title="Demote one stage" onclick="event.stopPropagation();toolbarDemote('${id}')">↩</button>
+                <button class="toolbar-btn" title="Set Stage" onclick="event.stopPropagation();toolbarStagePicker('${id}',this)">⚙</button>
+                <button class="toolbar-btn" title="Open in Diagnostics" onclick="event.stopPropagation();toolbarOpenDiagnostics('${id}')">📊</button>
+                <button class="toolbar-btn" title="Clone as new Idea" onclick="event.stopPropagation();toolbarClone('${id}')">⧉</button>
+                <button class="toolbar-btn" title="Pin to top of column" onclick="event.stopPropagation();toolbarPin('${id}')">📌</button>
+            </div>
             <div class="map-node-actions">${actionHtml}</div>`;
+
+        _applyHighlightState(node, id);
 
         // Drag-to-reposition — mousedown on the card body (not buttons/links)
         node.addEventListener('mousedown', (e) => _mapStartNodeDrag(e, id));
@@ -3613,5 +4086,382 @@ function teardownMapInteraction() {
     if (wrap._mmmove)  { document.removeEventListener('mousemove', wrap._mmmove); delete wrap._mmmove;  }
     if (wrap._mmup)    { document.removeEventListener('mouseup', wrap._mmup);  delete wrap._mmup;    }
     if (wrap._mmwheel) { wrap.removeEventListener('wheel', wrap._mmwheel);      delete wrap._mmwheel; }
+}
+
+
+// ============================================
+// Manual Session
+// ============================================
+
+let _manualSessionId = null;
+let _manualSessionTools = [];  // Available tool schemas
+
+function _msEscapeHtml(str) {
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+function _msToolCategory(name) {
+    const map = {
+        read_file: 'file', write_file: 'file', append_file: 'file',
+        list_directory: 'file', count_lines: 'file', archive_file: 'file',
+        web_search: 'search', web_fetch: 'search',
+        git_status: 'git', git_diff: 'git', git_add: 'git', git_commit: 'git',
+        git_checkout: 'git', git_log: 'git',
+        run_shell: 'shell',
+        get_task: 'task', list_tasks: 'task', update_task_status: 'task',
+        create_mermaid_diagram: 'plan', write_interface_contract: 'plan',
+    };
+    return map[name] || 'other';
+}
+
+async function openManualSession(taskId) {
+    try {
+        const resp = await fetch(`${API_BASE}/manual-session/${taskId}/start`, { method: 'POST' });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.detail || 'Failed to start session', 'error'); return; }
+        _manualSessionId = data.session_id;
+        _manualSessionTools = data.available_tools || [];
+        document.getElementById('ms-title').textContent = `Manual Session — ${data.task_title}`;
+        _msPopulateToolSelect();
+        _msRenderMessages(data.messages);
+        document.getElementById('manual-session-modal').classList.add('active');
+    } catch (e) {
+        showToast('Error starting manual session: ' + e.message, 'error');
+    }
+}
+
+async function closeManualSessionModal() {
+    if (_manualSessionId) {
+        if (!await showConfirm('End Session', 'End this manual session and close?', 'End Session')) return;
+        fetch(`${API_BASE}/manual-session/${_manualSessionId}/end`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ signal: 'MANUAL_END', summary: 'Closed by user' }),
+        }).catch(() => {});
+        _manualSessionId = null;
+    }
+    document.getElementById('manual-session-modal').classList.remove('active');
+}
+
+function _msPopulateToolSelect() {
+    const sel = document.getElementById('ms-tool-select');
+    sel.innerHTML = '<option value="">(select a tool)</option>';
+
+    const groups = {};
+    _manualSessionTools.forEach(schema => {
+        const name = schema.function.name;
+        const cat = _msToolCategory(name);
+        if (!groups[cat]) groups[cat] = [];
+        groups[cat].push(schema);
+    });
+
+    Object.entries(groups).sort(([a], [b]) => a.localeCompare(b)).forEach(([cat, tools]) => {
+        const og = document.createElement('optgroup');
+        og.label = cat.toUpperCase();
+        tools.forEach(s => {
+            const opt = document.createElement('option');
+            opt.value = s.function.name;
+            opt.textContent = s.function.name;
+            og.appendChild(opt);
+        });
+        sel.appendChild(og);
+    });
+}
+
+function onMsToolSelect() {
+    const toolName = document.getElementById('ms-tool-select').value;
+    const form = document.getElementById('ms-tool-form');
+    form.innerHTML = '';
+    if (!toolName) return;
+
+    const schema = _manualSessionTools.find(s => s.function.name === toolName);
+    if (!schema) return;
+
+    const props = schema.function.parameters?.properties || {};
+    const required = new Set(schema.function.parameters?.required || []);
+
+    Object.entries(props).forEach(([key, spec]) => {
+        const label = document.createElement('label');
+        label.textContent = key + (required.has(key) ? ' *' : '');
+        label.className = 'ms-arg-label';
+
+        const isLong = spec.type === 'string' && (key === 'content' || key === 'path' || (spec.description || '').length > 40);
+        const input = document.createElement('textarea');
+        input.id = `ms-arg-${key}`;
+        input.rows = isLong ? 3 : 1;
+        input.placeholder = spec.description || '';
+        input.className = 'ms-arg-input';
+
+        form.appendChild(label);
+        form.appendChild(input);
+    });
+}
+
+async function msExecuteTool() {
+    if (!_manualSessionId) return;
+    const toolName = document.getElementById('ms-tool-select').value;
+    if (!toolName) { showToast('Select a tool first.', 'warning'); return; }
+
+    const schema = _manualSessionTools.find(s => s.function.name === toolName);
+    if (!schema) return;
+
+    const props = schema.function.parameters?.properties || {};
+    const args = {};
+    for (const key of Object.keys(props)) {
+        const el = document.getElementById(`ms-arg-${key}`);
+        const val = el ? el.value.trim() : '';
+        if (val) {
+            const t = (schema.function.parameters.properties[key] || {}).type;
+            if (t === 'integer' || t === 'number') {
+                const n = Number(val);
+                args[key] = isNaN(n) ? val : n;
+            } else if (t === 'boolean') {
+                args[key] = val === 'true' || val === '1';
+            } else if (t === 'object' || t === 'array') {
+                try { args[key] = JSON.parse(val); } catch { args[key] = val; }
+            } else {
+                args[key] = val;
+            }
+        }
+    }
+
+    const execBtn = document.querySelector('.ms-exec-btn');
+    execBtn.disabled = true;
+    execBtn.textContent = 'Running…';
+
+    try {
+        const resp = await fetch(`${API_BASE}/manual-session/${_manualSessionId}/tool`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tool_name: toolName, arguments: args }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+            if (resp.status === 404) {
+                showToast('Session lost — server may have restarted. Start a new session.', 'error');
+                _manualSessionId = null;
+            } else {
+                showToast(data.detail || 'Tool execution error', 'error');
+            }
+            return;
+        }
+        _msRenderMessages(data.messages);
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+    } finally {
+        execBtn.disabled = false;
+        execBtn.textContent = 'Execute Tool';
+    }
+}
+
+async function msAddMessage() {
+    if (!_manualSessionId) return;
+    const role = document.getElementById('ms-message-role').value;
+    const content = document.getElementById('ms-message-content').value.trim();
+    if (!content) return;
+
+    try {
+        const resp = await fetch(`${API_BASE}/manual-session/${_manualSessionId}/message`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ role, content }),
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+            _msRenderMessages(data.messages);
+            document.getElementById('ms-message-content').value = '';
+        }
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+    }
+}
+
+async function msEndSession() {
+    if (!_manualSessionId) { closeManualSessionModal(); return; }
+    const signal = document.getElementById('ms-signal-select').value;
+    const summary = document.getElementById('ms-end-summary').value.trim();
+    try {
+        await fetch(`${API_BASE}/manual-session/${_manualSessionId}/end`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ signal, summary }),
+        });
+    } catch (_) {}
+    _manualSessionId = null;
+    document.getElementById('manual-session-modal').classList.remove('active');
+}
+
+function _msRenderMessages(messages) {
+    const log = document.getElementById('ms-chat-log');
+    if (!log) return;
+    log.innerHTML = '';
+
+    messages.forEach(msg => {
+        const div = document.createElement('div');
+        div.className = `ms-msg ms-msg-${msg.role}`;
+
+        if (msg.role === 'tool_call') {
+            const argsStr = msg.arguments ? JSON.stringify(msg.arguments, null, 2) : '';
+            div.innerHTML = `<span class="ms-tool-name">⚙ ${_msEscapeHtml(msg.tool_name || '')}</span>`
+                + (argsStr ? `<pre class="ms-tool-args">${_msEscapeHtml(argsStr)}</pre>` : '');
+        } else if (msg.role === 'tool_result') {
+            const result = msg.content || '';
+            const copyBtn = document.createElement('button');
+            copyBtn.className = 'ms-copy-btn';
+            copyBtn.textContent = 'Copy';
+            copyBtn.onclick = () => navigator.clipboard.writeText(result);
+            const pre = document.createElement('pre');
+            pre.className = 'ms-tool-result-pre';
+            pre.textContent = result;
+            div.appendChild(copyBtn);
+            div.appendChild(pre);
+        } else {
+            div.innerHTML = `<span class="ms-role-badge">${_msEscapeHtml(msg.role)}</span>`
+                + `<span class="ms-content">${_msEscapeHtml(msg.content || '')}</span>`;
+        }
+
+        log.appendChild(div);
+    });
+
+    log.scrollTop = log.scrollHeight;
+}
+
+// ============================================================
+// Toolbar Quick-Actions
+// ============================================================
+
+async function toolbarStopAgent(taskId) {
+    const resp = await fetch(`${API_BASE}/agent/stop/${taskId}`, { method: 'POST' });
+    if (resp.ok) {
+        showToast('Stop requested — loop will halt at its next opportunity.', 'info');
+    } else {
+        const d = await resp.json().catch(() => ({}));
+        showToast(d.detail || 'No active loop for this task.', 'error');
+    }
+}
+
+async function toolbarDemote(taskId) {
+    const task = taskData[taskId];
+    const label = task ? task.type : taskId;
+    if (!await showConfirm('Demote Task', `Move "${label}" one stage backward in the pipeline?`, 'Demote')) return;
+    const resp = await fetch(`${API_BASE}/tasks/${taskId}/demote`, { method: 'POST' });
+    const d = await resp.json().catch(() => ({}));
+    if (resp.ok) {
+        showToast(`Demoted to "${d.type}".`, 'success');
+        await loadTasksFromDatabase();
+    } else {
+        showToast(d.detail || 'Demote failed.', 'error');
+    }
+}
+
+// Stage picker — small flyout positioned near the button
+let _stagePickerTaskId = null;
+function _removeStagePicker() {
+    const el = document.getElementById('_stage-picker-flyout');
+    if (el) el.remove();
+    _stagePickerTaskId = null;
+}
+
+const _STAGE_LABELS = {
+    architecture: 'Architecture', idea: 'Ideas', planning: 'Planning',
+    indev: 'In Dev', conceptual_review: 'Review', optimization: 'Optimization',
+    security: 'Security', full_review: 'Full Review', completed: 'Completed',
+};
+
+function toolbarStagePicker(taskId, btn) {
+    // Toggle off if same task already open
+    if (_stagePickerTaskId === taskId) { _removeStagePicker(); return; }
+    _removeStagePicker();
+    _stagePickerTaskId = taskId;
+
+    const flyout = document.createElement('div');
+    flyout.id = '_stage-picker-flyout';
+    flyout.className = 'stage-picker-flyout';
+
+    const pipeline = ['architecture','idea','planning','indev','conceptual_review','optimization','security','full_review','completed'];
+    const current = taskData[taskId]?.type;
+    pipeline.forEach(stage => {
+        const item = document.createElement('button');
+        item.className = 'stage-picker-item' + (stage === current ? ' current' : '');
+        item.textContent = _STAGE_LABELS[stage] || stage;
+        item.onclick = async () => {
+            _removeStagePicker();
+            const resp = await fetch(`${API_BASE}/tasks/${taskId}/set-stage`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ stage }),
+            });
+            const d = await resp.json().catch(() => ({}));
+            if (resp.ok) {
+                showToast(`Moved to "${_STAGE_LABELS[stage] || stage}".`, 'success');
+                await loadTasksFromDatabase();
+            } else {
+                showToast(d.detail || 'Stage change failed.', 'error');
+            }
+        };
+        flyout.appendChild(item);
+    });
+
+    document.body.appendChild(flyout);
+
+    // Position below the button
+    const rect = btn.getBoundingClientRect();
+    flyout.style.left = rect.left + 'px';
+    flyout.style.top  = (rect.bottom + 4) + 'px';
+
+    // Close on outside click
+    setTimeout(() => {
+        document.addEventListener('click', function _closeStage(e) {
+            if (!flyout.contains(e.target)) { _removeStagePicker(); document.removeEventListener('click', _closeStage); }
+        });
+    }, 0);
+}
+
+async function toolbarRunPipeline(taskId, pipeline) {
+    const labels = { planning: 'Planning', review: 'Conceptual Review', security: 'Security', 'full-review': 'Full Review' };
+    const label = labels[pipeline] || pipeline;
+    const resp = await fetch(`${API_BASE}/tasks/${taskId}/run-${pipeline}`, { method: 'POST' });
+    const d = await resp.json().catch(() => ({}));
+    if (resp.ok) {
+        showToast(`${label} pipeline started.`, 'success');
+    } else {
+        showToast(d.detail || `${label} pipeline failed to start.`, 'error');
+    }
+}
+
+async function toolbarClone(taskId) {
+    const resp = await fetch(`${API_BASE}/tasks/${taskId}/clone`, { method: 'POST' });
+    const d = await resp.json().catch(() => ({}));
+    if (resp.ok) {
+        showToast(`Cloned as new idea: "${d.title}".`, 'success');
+        await loadTasksFromDatabase();
+    } else {
+        showToast(d.detail || 'Clone failed.', 'error');
+    }
+}
+
+async function toolbarPin(taskId) {
+    const resp = await fetch(`${API_BASE}/tasks/${taskId}/pin`, { method: 'POST' });
+    const d = await resp.json().catch(() => ({}));
+    if (resp.ok) {
+        showToast('Pinned to top of column.', 'success');
+        await loadTasksFromDatabase();
+    } else {
+        showToast(d.detail || 'Pin failed.', 'error');
+    }
+}
+
+function toolbarOpenDiagnostics(taskId) {
+    window.open(`/diagnostics?task=${encodeURIComponent(taskId)}`, '_blank');
+}
+
+function toolbarOpenMap(taskId) {
+    const task = taskData[taskId];
+    if (!task) return;
+    openColumnMap(task.type, taskId);
 }
 

@@ -116,6 +116,7 @@ class Task(Base):
     demotion_history = Column(JSON, nullable=True)
     map_x = Column(Float, nullable=True)   # Saved 2D canvas X position (Column Map View)
     map_y = Column(Float, nullable=True)   # Saved 2D canvas Y position (Column Map View)
+    is_active = Column(Boolean, nullable=False, default=True)  # False = soft-deleted (hidden everywhere)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -492,3 +493,28 @@ class SearchCache(Base):
 
     def __repr__(self):
         return f"<SearchCache(id={self.id}, query='{self.query[:40]}…', provider='{self.provider}')>"
+
+
+# ---------------------------------------------------------------------------
+# Inbox / notification table
+# ---------------------------------------------------------------------------
+
+class InboxMessage(Base):
+    """
+    Persistent notification inbox — stores pipeline results and agent alerts
+    for later review by the user.  One row per notification event.
+    """
+    __tablename__ = "inbox_messages"
+
+    id = Column(String, primary_key=True)                       # UUID
+    subject = Column(String, nullable=False)
+    source_type = Column(String, nullable=False, default='intake_result')
+    task_id = Column(String, nullable=True)                     # soft ref — no FK (task may be deleted)
+    task_title = Column(String, nullable=True)                  # snapshot at creation time
+    outcome = Column(String, nullable=True)                     # rejected | passed | failed | subdivide
+    data_json = Column(Text, nullable=True)                     # full payload snapshot (JSON string)
+    read = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<InboxMessage(id={self.id[:8]}…, subject='{self.subject[:40]}', read={self.read})>"

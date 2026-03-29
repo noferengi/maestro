@@ -59,7 +59,7 @@ Or directly: `venv/Scripts/python.exe app/migrations/runner.py <command>`
 
 Migrations live in `app/migrations/versions/` as `NNNN_description.py`. Never edit an existing migration — always add a new one. Each exposes `up(conn)`, `down(conn)`, and `description`.
 
-Current schema migrations (0001–0029):
+Current schema migrations (0001–0031):
 - `0001` — initial `tasks` table
 - `0002` — `prerequisites` column (JSON array of task IDs)
 - `0003` — `project` column (string, default `'TheMaestro'`)
@@ -79,12 +79,14 @@ Current schema migrations (0001–0029):
 - `0027` — search result cache table
 - `0028` — fix subdivision positions (data repair)
 - `0029` — repair phantom `-subN` prerequisite IDs left by old subdivision code (data repair)
+- `0030` — `inbox_messages` table
+- `0031` — `is_active BOOLEAN DEFAULT 1` on tasks (soft-delete support)
 
 ## Architecture
 
 ### Backend (`app/`)
-- `main.py` — FastAPI app. All routes. Mounts static files from `app/web/`. On startup calls `init_db()` + `seed_sample_tasks()` (skips seeding if data exists). Contains `_project_to_dict()` helper and `_pick_prewarm_resources()` / `_trigger_project_prewarm()` helpers that use the project's own `llm_id` and `budget_id` when set.
-- `database.py` — SQLAlchemy models (`Task`, `LLM`, `Budget`, `Project`, `TransitionVote`, `TransitionResult`, `BudgetEntry`, `Expense`, `SubdivisionRecord`, `FileSummary`, `FileSummaryJob`) + all DB CRUD functions. `batch_update_map_positions(updates)` bulk-updates `map_x`/`map_y` without touching task history. `upsert_project()` uses `...` (Ellipsis) sentinel for `llm_id` and `budget_id` — pass Ellipsis to leave unchanged, pass None to clear.
+- `main.py` — FastAPI app. All routes. Mounts static files from `app/web/`. On startup calls `init_db()` + `seed_sample_tasks()` (skips seeding if data exists). Contains `_project_to_dict()` helper and `_pick_prewarm_resources()` / `_trigger_project_prewarm()` helpers that use the project's own `llm_id` and `budget_id` when set. Quick-action endpoints: `/demote`, `/set-stage`, `/clone`, `/pin`, `/run-planning`, `/run-review`, `/run-security`, `/run-full-review`.
+- `database.py` — SQLAlchemy models (`Task`, `LLM`, `Budget`, `Project`, `TransitionVote`, `TransitionResult`, `BudgetEntry`, `Expense`, `SubdivisionRecord`, `FileSummary`, `FileSummaryJob`) + all DB CRUD functions. `batch_update_map_positions(updates)` bulk-updates `map_x`/`map_y` without touching task history. `upsert_project()` uses `...` (Ellipsis) sentinel for `llm_id` and `budget_id` — pass Ellipsis to leave unchanged, pass None to clear. `delete_task()` is a **soft-delete**: sets `is_active=False` on the target and all descendants via BFS; returns count deactivated. All read queries (`get_tasks_by_project`, `get_tasks_by_type`, `get_all_tasks`) filter `is_active=True`.
 - `migrations/runner.py` — standalone sqlite3 migration engine, no SQLAlchemy dependency.
 
 ### Agent system (`app/agent/`)
@@ -127,11 +129,20 @@ Each project record has: `name` (PK), `path` (absolute filesystem root), `descri
   - `_viewChildrenState`, `_childrenPollerTimer` — subdivision view/regen state
   - `currentBigIdeaFilter`, `breadcrumbStack`, `descendantIndex` — Big Idea zoom state
   - `_modalMousedownTarget` — drag-close fix (global mousedown listener, all modals)
+  - `_stagePickerTaskId` — currently open stage-picker flyout task ID (null = closed)
+
+**Card toolbar** — hover-revealed on every card (and map node), `flex-wrap` layout in three groups separated by `.toolbar-sep` dividers:
+- **Agents**: 🔍 Research · ✂ Subdivide · 📋 Planning pipeline · 👁 Conceptual Review · 🔒 Security pipeline · ⌨ Manual Session
+- **Control**: ▶ Run Agent · ⏹ Stop · ↩ Demote · ⚙ Stage picker
+- **Actions**: 📊 Diagnostics · ⧉ Clone · 📌 Pin · 🔗 Map
+
+`toolbarStagePicker(taskId, btn)` — opens a positioned flyout (`.stage-picker-flyout`) listing all 9 pipeline stages; current stage highlighted. Closes on outside click. `toolbarOpenMap(taskId)` — calls `openColumnMap(task.type, taskId)` which pans the map to center on the node and pulses a gold ring (`map-node-focus` animation). `toolbarOpenDiagnostics(taskId)` — opens `/diagnostics?task=<id>` in a new tab.
 
 #### Column Map View
 Clicking any column header or empty whitespace in a column opens a full-screen **Column Map View** — a 2D radial canvas showing tasks as cards with thick bezier arrows between connected nodes. Click the header again or "← Back to Board" to return.
 
-- `openColumnMap(colType)` / `closeColumnMap()` — toggle. Hides `.kanban-board`, shows `#column-map-container`.
+- `openColumnMap(colType, focusNodeId?)` / `closeColumnMap()` — toggle. Hides `.kanban-board`, shows `#column-map-container`. Optional `focusNodeId` pans to center on that node and plays a 3× gold-pulse animation (`_mapFocusNode`).
+- `_mapFocusNode(nodeId)` — reads node's layout position from `_mapCurrentNodePositions`, sets `mapTransform` to center on it, redraws arrows, adds `.map-node-focus` CSS class (keyframe animation, auto-removed after 2s).
 - `handleColumnClick(e, colType)` / `handleTasksContainerClick(e, colType)` — click guards.
 - `_mapComputeLayout(tasks, colType)` — three-phase layout engine: (1) load saved `map_x/map_y`; (2) BFS fan-out for newly-subdivided children; (3) standard radial `placeSubtree()` for unpositioned nodes. IDEAS/ARCHITECTURE use `parent_task_id` hierarchy; all others use `prerequisites`.
 - `renderColumnMap(colType)` — computes bounding box, sets canvas size, populates shared state, calls `_mapRedrawArrows()`, renders `.map-node` divs, saves newly-positioned nodes.
@@ -154,7 +165,7 @@ Clicking "View Children" on a Big Idea task opens the transition modal showing a
 A standalone three-panel LLM conversation viewer at `/diagnostics`.
 
 - `diag-utils.js` — shared state globals and pure helpers. Shared constants: `TYPE_COLORS` (agent type → hex), `TOOL_COLORS` (tool category → hex), `TOOL_CATEGORY_MAP` (tool name → category). Functions: `escapeHtml`, `fmtTokens`, `formatTimestamp`, `labelEntry(systemContent)` (classifies by system prompt; covers surveyor/designer/judge/reviewer/research/pitfall/security/optimization/subdivision/web_agent/maestro_loop), `labelEntryFromUser(userContent)` (fallback for system-less calls; detects `file_summary`), `labelTool(toolName)` (maps tool name to category), `getConceptualTurns(group)` (builds SYSTEM Prompt + USER Prompt + Turn N structure for a session group).
-- `diag-tasks.js` — left panel; fetches `/api/diagnostics/tasks`.
+- `diag-tasks.js` — left panel; fetches `/api/diagnostics/tasks`. After render, checks `?task=<id>` URL query param and auto-calls `selectTask()` if the ID exists in the list (deep-link support from the board's 📊 toolbar button).
 - `diag-entries.js` — middle panel. Handles synthetic `__file_summaries__` task ID: fetches `GET /api/budget-entries?task_id=__file_summaries__` which returns entries where `task_id IS NULL`. Session detection allows up to 15% context drop before splitting a session.
 - `diag-session.js` — turn summary table (`buildSessionSummary()`), entry selection (3 fetch paths), `jumpToEntry()`. `groupMessages()` accepts `allBoundaries` to break at every conceptual turn boundary.
 - `diag-render.js` — right panel; `renderConversation(…, targetMsgIdx)`, `buildCtxBar()`, UI toggles, `_initCtxTooltip()` IIFE, `DOMContentLoaded` init. **`_initDockZoom()` removed** — cosine-falloff neighbor magnification is gone. Segment hover is now pure CSS (`scaleY(1.15)` upward pop, yellow ring). `_initCtxTooltip()` floats a JS-positioned tooltip above the cursor showing agent-type badge, context %, and tool call name/args. Segments are **clickable** — clicking calls `selectEntry(fe.id)` to jump to that turn. Segment colors are tool-category-based (inline `background-color` from `TOOL_COLORS`).
@@ -178,16 +189,25 @@ GET    /api/projects                      — list projects (name, path, descrip
 POST   /api/projects                      — create project
 PUT    /api/projects/{name}               — update project (llm_id/budget_id use Ellipsis sentinel)
 DELETE /api/projects/{name}               — delete project record
-GET    /api/projects/{project_name}/tasks — all tasks for a project
+GET    /api/projects/{project_name}/tasks — all tasks for a project (active only)
 POST   /api/tasks                         — create task (include project field)
 PUT    /api/tasks/{id}                    — update task
+DELETE /api/tasks/{id}                    — soft-delete: sets is_active=False on task + all descendants; returns {deactivated: N}
 POST   /api/tasks/{id}/reorder            — {position, type} — reorder within column
 PATCH  /api/tasks/map-positions           — [{id, map_x, map_y}] — bulk-save 2D positions (no history)
 POST   /api/tasks/{task_id}/advance       — trigger intake pipeline (IDEA→PLANNING)
 GET    /api/tasks/{task_id}/transition-status — latest transition result + vote history
+POST   /api/tasks/{task_id}/demote        — move one stage backward; optional body {target} to force a stage; records demotion
+POST   /api/tasks/{task_id}/set-stage     — {stage} force to any pipeline stage (no demotion record)
+POST   /api/tasks/{task_id}/clone         — duplicate as new IDEA in same project
+POST   /api/tasks/{task_id}/pin           — set position=0 (top of column)
+POST   /api/tasks/{task_id}/run-planning  — trigger PlanningPipeline + gate in background
+POST   /api/tasks/{task_id}/run-review    — trigger ConceptualReviewPipeline in background
+POST   /api/tasks/{task_id}/run-security  — trigger OptimizationPipeline + SecurityPipeline in background
+POST   /api/tasks/{task_id}/run-full-review — trigger FullReviewPipeline in background
 POST   /api/agent/run/{task_id}           — start MaestroLoop (background)
 GET    /api/agent/status/{task_id}        — loop status
-POST   /api/agent/stop/{task_id}          — request graceful stop
+POST   /api/agent/stop/{task_id}          — request graceful stop (MaestroLoop only; pipeline agents are not stoppable)
 GET    /api/agent/tasks/ready             — DAG-ready tasks
 GET    /api/scheduler/status              — scheduler state
 CRUD   /api/llms, /api/llms/{id}          — LLM endpoint management
