@@ -59,7 +59,7 @@ Or directly: `venv/Scripts/python.exe app/migrations/runner.py <command>`
 
 Migrations live in `app/migrations/versions/` as `NNNN_description.py`. Never edit an existing migration — always add a new one. Each exposes `up(conn)`, `down(conn)`, and `description`.
 
-Current schema migrations (0001–0031):
+Current schema migrations (0001–0032):
 - `0001` — initial `tasks` table
 - `0002` — `prerequisites` column (JSON array of task IDs)
 - `0003` — `project` column (string, default `'TheMaestro'`)
@@ -81,12 +81,35 @@ Current schema migrations (0001–0031):
 - `0029` — repair phantom `-subN` prerequisite IDs left by old subdivision code (data repair)
 - `0030` — `inbox_messages` table
 - `0031` — `is_active BOOLEAN DEFAULT 1` on tasks (soft-delete support)
+- `0032` — `compute_nodes` table; `compute_node_id` FK on `llms`
+
+## Debugging scheduler and card status
+
+Use `scripts/inspect_cards.py` to diagnose why cards aren't progressing. All output is ASCII-safe (Windows cp1252 terminal compatible).
+
+```bash
+venv/Scripts/python.exe scripts/inspect_cards.py                  # overview: all cards, transitions, subdivision records
+venv/Scripts/python.exe scripts/inspect_cards.py prereqs          # prerequisite chain analysis — blocked/satisfied/phantom IDs
+venv/Scripts/python.exe scripts/inspect_cards.py scheduler        # simulated scheduler state: READY/BLOCKED/PARENT_SKIP/DONE_SKIPPED/STUCK_SUBDIVIDING
+venv/Scripts/python.exe scripts/inspect_cards.py activity         # recent LLM activity timeline + idle dispatchable tasks
+venv/Scripts/python.exe scripts/inspect_cards.py activity --hours 48  # look back 48 hours
+venv/Scripts/python.exe scripts/inspect_cards.py votes            # transition vote detail for all tasks
+venv/Scripts/python.exe scripts/inspect_cards.py votes --task <id>   # votes for a specific task
+venv/Scripts/python.exe scripts/inspect_cards.py budget           # LLM capacity and budget spending summary
+venv/Scripts/python.exe scripts/inspect_cards.py children         # parent->child tree with LLM activity counts
+venv/Scripts/python.exe scripts/inspect_cards.py all              # run all sections
+```
+
+Key diagnostics to check first when cards are stuck:
+1. `scheduler` — shows READY (should dispatch), BLOCKED (waiting on prereqs), STUCK_SUBDIVIDING (needs recovery)
+2. `prereqs` — reveals transitive DAG locks and phantom prerequisite IDs
+3. `activity --hours 4` — confirms the scheduler is actually dispatching tasks
 
 ## Architecture
 
 ### Backend (`app/`)
 - `main.py` — FastAPI app. All routes. Mounts static files from `app/web/`. On startup calls `init_db()` + `seed_sample_tasks()` (skips seeding if data exists). Contains `_project_to_dict()` helper and `_pick_prewarm_resources()` / `_trigger_project_prewarm()` helpers that use the project's own `llm_id` and `budget_id` when set. Quick-action endpoints: `/demote`, `/set-stage`, `/clone`, `/pin`, `/run-planning`, `/run-review`, `/run-security`, `/run-full-review`.
-- `database.py` — SQLAlchemy models (`Task`, `LLM`, `Budget`, `Project`, `TransitionVote`, `TransitionResult`, `BudgetEntry`, `Expense`, `SubdivisionRecord`, `FileSummary`, `FileSummaryJob`) + all DB CRUD functions. `batch_update_map_positions(updates)` bulk-updates `map_x`/`map_y` without touching task history. `upsert_project()` uses `...` (Ellipsis) sentinel for `llm_id` and `budget_id` — pass Ellipsis to leave unchanged, pass None to clear. `delete_task()` is a **soft-delete**: sets `is_active=False` on the target and all descendants via BFS; returns count deactivated. All read queries (`get_tasks_by_project`, `get_tasks_by_type`, `get_all_tasks`) filter `is_active=True`.
+- `database.py` — SQLAlchemy models (`ComputeNode`, `Task`, `LLM`, `Budget`, `Project`, `TransitionVote`, `TransitionResult`, `BudgetEntry`, `Expense`, `SubdivisionRecord`, `FileSummary`, `FileSummaryJob`) + all DB CRUD functions. `batch_update_map_positions(updates)` bulk-updates `map_x`/`map_y` without touching task history. `upsert_project()` uses `...` (Ellipsis) sentinel for `llm_id` and `budget_id` — pass Ellipsis to leave unchanged, pass None to clear. `delete_task()` is a **soft-delete**: sets `is_active=False` on the target and all descendants via BFS; returns count deactivated. All read queries (`get_tasks_by_project`, `get_tasks_by_type`, `get_all_tasks`) filter `is_active=True`. `ComputeNode` CRUD: `get_all_compute_nodes`, `get_compute_node`, `create_compute_node`, `update_compute_node`, `delete_compute_node` (all in `crud_infra.py`).
 - `migrations/runner.py` — standalone sqlite3 migration engine, no SQLAlchemy dependency.
 
 ### Agent system (`app/agent/`)
@@ -94,7 +117,7 @@ Current schema migrations (0001–0031):
 - `intake.py` — Intake pipeline orchestrator for IDEA→PLANNING transitions. 4-stage voting: scope analysis, static analysis, feasibility, conflict detection. Passes `project_root` from task's project to `ResearchAgent` and `SubdivisionAgent`.
 - `research.py` — Research agent with a "lives" system (max 3 per session). Accepts `project_root` param; injects project snapshot into initial context when set. `WebSearchAgent` class (private to async `web_search` dispatch) — 10-turn agent that fetches pages and synthesizes findings; only tool available to it is `web_fetch`.
 - `subdivide.py` — Subdivision agent for decomposing oversized ideas. Accepts `project_root` param; injects project snapshot when set. Triggered by SUBDIVIDE_IDEA verdict.
-- `scheduler.py` — Push-first eager task scheduler. Dispatches DAG-ready tasks respecting per-endpoint capacity limits. Passes `project_root` to research jobs. `_dispatch_file_summary_jobs()` runs FIRST in `_tick()`. Completion registry: `get_or_create_completion_event()`, `signal_completion()`, `wait_for_completion()`. `_task_to_mini_dict` includes `parent_task_id` so `DAGResolver` can build the child index. `SCHEDULER_DISPATCHABLE_TYPES` default includes all pipeline stages (`idea, planning, indev, conceptual_review, optimization, full_review`) — orphaned mid-pipeline tasks are re-dispatched on restart; the `_active_sessions` alive-check prevents double-dispatch of running tasks.
+- `scheduler.py` — Push-first eager task scheduler. Dispatches DAG-ready tasks respecting per-endpoint capacity limits **and** per-compute-node capacity limits. Passes `project_root` to research jobs. `_dispatch_file_summary_jobs()` runs FIRST in `_tick()`. Completion registry: `get_or_create_completion_event()`, `signal_completion()`, `wait_for_completion()`. `_task_to_mini_dict` includes `parent_task_id` so `DAGResolver` can build the child index. `SCHEDULER_DISPATCHABLE_TYPES` default includes all pipeline stages (`idea, planning, indev, conceptual_review, optimization, full_review`) — orphaned mid-pipeline tasks are re-dispatched on restart; the `_active_sessions` alive-check prevents double-dispatch of running tasks. At the start of each `_tick()`, `node_active_counts` is built by summing `_llm_session_counts` grouped by `compute_node_id`; the node cap is checked before the per-LLM cap and the local count is incremented within the tick to prevent over-dispatch.
 - `llm_client.py` — Centralized HTTP client for all LLM calls. Requires both `llm_id` and `budget_id`. Logs every call to `budget_entries` + `expenses`.
 - `verdicts.py` — Verdict classification with confidence ranges. `Vote` and `TallyResult` dataclasses. `tally_votes()` aggregation logic.
 - `static_analysis.py` — Tree-sitter based deterministic Python code analysis for intake stage 2a.
@@ -118,10 +141,10 @@ Each project record has: `name` (PK), `path` (absolute filesystem root), `descri
 ### Frontend (`app/web/`)
 
 #### Board (`index.html` + `kanban.js` + `style.css`)
-- `index.html` — board shell; project tabs, nine columns (ARCHITECTURE, IDEAS, PLANNING, INDEV, CONCEPTUAL_REVIEW, OPTIMIZATION, SECURITY, FULL_REVIEW, COMPLETED), the Column Map overlay (`#column-map-container`), eight modals (task create/edit, new project, edit project, transition, LLM endpoints, budgets, tools). New/Edit Project modals both have **Default LLM** and **Budget** dropdowns.
+- `index.html` — board shell; project tabs, nine columns (ARCHITECTURE, IDEAS, PLANNING, INDEV, CONCEPTUAL_REVIEW, OPTIMIZATION, SECURITY, FULL_REVIEW, COMPLETED), the Column Map overlay (`#column-map-container`), nine modals (task create/edit, new project, edit project, transition, LLM endpoints, budgets, tools, **compute nodes**). New/Edit Project modals both have **Default LLM** and **Budget** dropdowns. The **LLM Endpoints** modal Add/Edit panes each have a **Compute Node** dropdown.
 - `kanban.js` — all board behaviour. Key globals:
   - `taskData`, `allTasks`, `currentProject` — task state
-  - `allLlms`, `allBudgets`, `allProjects` — endpoint/budget/project caches
+  - `allLlms`, `allBudgets`, `allComputeNodes`, `allProjects` — endpoint/budget/compute node/project caches
   - `transitionCache`, `transitionPollers` — intake pipeline polling
   - `columnMapActive`, `columnMapType` — Column Map View state flag
   - `_mapCurrentEdges`, `_mapCurrentNodePositions`, `_mapCurrentColor`, `_mapOffsetX/Y` — shared map render state
@@ -210,8 +233,9 @@ GET    /api/agent/status/{task_id}        — loop status
 POST   /api/agent/stop/{task_id}          — request graceful stop (MaestroLoop only; pipeline agents are not stoppable)
 GET    /api/agent/tasks/ready             — DAG-ready tasks
 GET    /api/scheduler/status              — scheduler state
-CRUD   /api/llms, /api/llms/{id}          — LLM endpoint management
+CRUD   /api/llms, /api/llms/{id}          — LLM endpoint management (compute_node_id accepted in create/update)
 CRUD   /api/budgets, /api/budgets/{id}    — budget management
+CRUD   /api/compute-nodes, /api/compute-nodes/{id} — compute node management
 GET    /api/budget-entries                — budget entry listing; task_id=__file_summaries__ returns null-task entries
 GET    /api/budget-entries/{id}/full      — single entry with full prompt/response
 GET    /api/budgets/{id}/summary          — aggregated budget usage

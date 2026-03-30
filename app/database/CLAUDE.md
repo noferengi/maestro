@@ -23,15 +23,16 @@ monkeypatching on `app.database.X` works correctly.
 | File | Responsibility | ~Lines |
 |---|---|---|
 | `session.py` | `DATABASE_PATH`, `engine`, `Base`, `SessionLocal`, `get_db`, `init_db_tables` | 60 |
-| `models.py` | All 20 SQLAlchemy model classes | 330 |
+| `models.py` | All 22 SQLAlchemy model classes | 365 |
 | `crud_tasks.py` | Task CRUD + history + reorder + seed + subdivision traversal + `init_db` | 380 |
 | `crud_projects.py` | Project CRUD + `get_project_path` | 100 |
-| `crud_infra.py` | LLM + Budget CRUD | 130 |
+| `crud_infra.py` | LLM + Budget + ComputeNode CRUD | 230 |
 | `crud_costs.py` | BudgetEntry + Expense + budget math helpers | 130 |
 | `crud_pipeline.py` | All pipeline audit tables (votes, planning, component, optimization, security, full review, merge, subdivision records) | 340 |
 | `crud_jobs.py` | ResearchJob + FileSummaryJob + OptimizationBenchmark | 220 |
 | `crud_files.py` | FileSummary + SearchCache | 100 |
-| `__init__.py` | Re-exports everything from the above modules | 140 |
+| `crud_inbox.py` | InboxMessage CRUD (create, list, get, mark read, mark all read, delete, count unread) | 90 |
+| `__init__.py` | Re-exports everything from the above modules | 160 |
 
 ## Dependency graph (no cycles)
 
@@ -79,7 +80,8 @@ __init__.py        (imports from all of the above)
 ## Models at a glance
 
 **Infrastructure / config**
-- `LLM` — endpoint config (address, port, model, cost rates)
+- `ComputeNode` — physical/virtual host that one or more LLM endpoints run on (`name`, `description`, `max_parallel_sessions`); enforces a node-level concurrency cap in the scheduler
+- `LLM` — endpoint config (address, port, model, cost rates, optional `compute_node_id` FK)
 - `Budget` — spending limit config (`dollar_amount == -1` = infinite)
 - `Project` — name → filesystem path registry
 
@@ -108,3 +110,6 @@ __init__.py        (imports from all of the above)
 **Caches**
 - `FileSummary` — LLM-generated file summaries keyed by (sha1, size)
 - `SearchCache` — web search result cache keyed by (query, provider)
+
+**Inbox / notifications**
+- `InboxMessage` — persistent user notification (id=UUID, subject, source_type, task_id, task_title, outcome, data_json, read, created_at). No FK on task_id — the task may be deleted but the message should survive. `data_json` stores the full transition-status payload snapshot so the message can be re-rendered in the transition modal without re-fetching.

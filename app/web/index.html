@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kanban Board - TheMaestro</title>
-    <link rel="stylesheet" href="/static/style.css?v=24">
-    <script src="/static/kanban.js?v=39"></script>
+    <link rel="stylesheet" href="/static/style.css?v=25">
+    <script src="/static/kanban.js?v=41"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -39,6 +39,9 @@
             <div class="project-tab" id="manage-tools-btn" style="cursor:pointer">
                 Agent Tools
             </div>
+            <div class="project-tab" id="manage-compute-nodes-btn" style="cursor:pointer">
+                Compute Nodes
+            </div>
         </div>
         <div class="project-tabs" style="margin-top:0.5rem">
             <a href="/diagnostics" class="project-tab" style="text-decoration:none;color:inherit;display:block">
@@ -57,6 +60,9 @@
             <button class="inbox-btn" id="inbox-btn" onclick="openInboxModal()" title="Inbox">
                 ✉
                 <span class="inbox-badge" id="inbox-badge" style="display:none">0</span>
+            </button>
+            <button class="refresh-btn" onclick="openSchedulerModal()" title="Scheduler queue" id="scheduler-queue-btn">
+                ⚙ Queue
             </button>
             <button class="refresh-btn" onclick="refreshTasks()" title="Refresh from database">
                 🔄 Refresh
@@ -421,6 +427,12 @@
                         </div>
                     </div>
                     <div class="form-group">
+                        <label class="form-label" for="llm-compute-node">Compute Node</label>
+                        <select class="form-input" id="llm-compute-node">
+                            <option value="">(none)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
                         <label class="form-label" for="llm-notes">Notes</label>
                         <textarea class="form-input" id="llm-notes" rows="2"
                                   placeholder="e.g. Q8_0 quant of Qwen3-Coder-Next-80B finetune v2.1, SWA enabled"></textarea>
@@ -466,6 +478,12 @@
                                 <label class="form-label" for="llm-edit-cost-completion">Completion $/M tokens</label>
                                 <input type="number" class="form-input" id="llm-edit-cost-completion" min="0" step="0.01" placeholder="0.00">
                             </div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="llm-edit-compute-node">Compute Node</label>
+                            <select class="form-input" id="llm-edit-compute-node">
+                                <option value="">(none)</option>
+                            </select>
                         </div>
                         <div class="form-group">
                             <label class="form-label" for="llm-edit-notes">Notes</label>
@@ -588,6 +606,69 @@
         </div>
     </div>
 
+    <!-- Compute Node Management Modal -->
+    <div class="modal-overlay" id="compute-node-modal">
+        <div class="modal" style="width:640px">
+            <div class="modal-header">
+                <h2 class="modal-title">Compute Nodes</h2>
+                <button class="close-btn" onclick="closeComputeNodeModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="compute-node-list"></div>
+                <hr style="margin:1rem 0">
+
+                <!-- Tabs -->
+                <div class="llm-tabs">
+                    <a href="#" class="llm-tab active" id="cn-tab-add" onclick="switchComputeNodeTab('add'); return false;">Add New Compute Node</a>
+                    <span class="llm-tab-sep">|</span>
+                    <a href="#" class="llm-tab" id="cn-tab-edit" onclick="switchComputeNodeTab('edit'); return false;">Edit</a>
+                </div>
+
+                <!-- Add tab -->
+                <div class="llm-tab-content active" id="cn-pane-add">
+                    <div class="form-group">
+                        <label class="form-label" for="cn-name">Name</label>
+                        <input type="text" class="form-input" id="cn-name" placeholder="e.g. GPU Server 1">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="cn-description">Description</label>
+                        <input type="text" class="form-input" id="cn-description" placeholder="e.g. RTX 4090 x2, 128GB RAM">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="cn-max-sessions">Max Parallel Sessions (node-level cap)</label>
+                        <input type="number" class="form-input" id="cn-max-sessions" value="1" min="1" max="1024">
+                    </div>
+                    <div id="cn-error" class="inline-error" style="display:none"></div>
+                </div>
+
+                <!-- Edit tab -->
+                <div class="llm-tab-content" id="cn-pane-edit">
+                    <p id="cn-edit-placeholder" style="color:#6c757d;font-size:0.85rem">Click a node name in the table above to edit it.</p>
+                    <div id="cn-edit-form" style="display:none">
+                        <input type="hidden" id="cn-edit-id">
+                        <div class="form-group">
+                            <label class="form-label" for="cn-edit-name">Name</label>
+                            <input type="text" class="form-input" id="cn-edit-name">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="cn-edit-description">Description</label>
+                            <input type="text" class="form-input" id="cn-edit-description">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="cn-edit-max-sessions">Max Parallel Sessions</label>
+                            <input type="number" class="form-input" id="cn-edit-max-sessions" min="1" max="1024">
+                        </div>
+                        <div id="cn-edit-error" class="inline-error" style="display:none"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeComputeNodeModal()">Close</button>
+                <button class="btn btn-primary" id="cn-submit-btn" onclick="addComputeNode()">Add Compute Node</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Agent Tools Modal -->
     <div class="modal-overlay" id="tools-modal">
         <div class="modal" style="width:900px">
@@ -661,6 +742,23 @@
             <div class="modal-footer">
                 <button class="btn btn-secondary" onclick="closeResearchDialog()">Cancel</button>
                 <button class="btn btn-primary" onclick="submitResearchDialog()">Start Research</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Scheduler Queue Modal -->
+    <div class="modal-overlay" id="scheduler-modal">
+        <div class="modal" style="width:780px;max-height:85vh;display:flex;flex-direction:column">
+            <div class="modal-header">
+                <h2 class="modal-title">Scheduler Queue</h2>
+                <button class="close-btn" onclick="closeSchedulerModal()">&times;</button>
+            </div>
+            <div class="modal-body" id="scheduler-modal-body" style="overflow-y:auto;flex:1;padding:1rem">
+                <p style="color:#6c757d">Loading…</p>
+            </div>
+            <div class="modal-footer">
+                <span id="scheduler-modal-status" style="flex:1;font-size:0.8rem;color:#6c757d"></span>
+                <button class="btn btn-secondary" onclick="closeSchedulerModal()">Close</button>
             </div>
         </div>
     </div>

@@ -20,6 +20,19 @@ from .session import Base
 # Infrastructure / configuration tables
 # ---------------------------------------------------------------------------
 
+class ComputeNode(Base):
+    """Physical or virtual compute resource that hosts one or more LLM endpoints."""
+    __tablename__ = "compute_nodes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String, nullable=False, unique=True)
+    description = Column(Text, nullable=True)
+    max_parallel_sessions = Column(Integer, nullable=False, default=1)
+
+    def __repr__(self):
+        return f"<ComputeNode(id={self.id}, name='{self.name}', max={self.max_parallel_sessions})>"
+
+
 class LLM(Base):
     """LLM endpoint configuration."""
     __tablename__ = "llms"
@@ -34,6 +47,7 @@ class LLM(Base):
     notes = Column(String, nullable=False, default='')
     cost_per_million_prompt_tokens = Column(Float, nullable=False, default=0.0)
     cost_per_million_completion_tokens = Column(Float, nullable=False, default=0.0)
+    compute_node_id = Column(Integer, ForeignKey("compute_nodes.id"), nullable=True)
 
     __table_args__ = (
         UniqueConstraint('address', 'port', 'model', name='uq_llm_endpoint'),

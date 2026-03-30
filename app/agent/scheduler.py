@@ -53,6 +53,10 @@ logger = logging.getLogger(__name__)
 _active_sessions: dict[str, threading.Thread] = {}
 _active_sessions_lock = threading.Lock()
 
+# session key -> llm_id for all active sessions (tasks, file summaries, research, recovery)
+# Protected by _active_sessions_lock.  Used to enforce the one-LLM-at-a-time policy.
+_session_llm_ids: dict[str, int] = {}
+
 # Per-LLM active session count: llm_id -> count
 _llm_session_counts: dict[int, int] = defaultdict(int)
 _llm_counts_lock = threading.Lock()
@@ -148,11 +152,145 @@ def stop_scheduler() -> None:
 
 
 def get_scheduler_status() -> dict:
-    """Return a snapshot of the scheduler's state."""
+    """Return a snapshot of the scheduler's state with active/queued/blocked task details."""
+    from app.agent.dag import DAGResolver
+    from app.database import get_all_tasks, get_llm
+
     with _active_sessions_lock:
-        active = {tid: t.is_alive() for tid, t in _active_sessions.items()}
+        active_session_ids: set[str] = {
+            tid for tid, t in _active_sessions.items() if t.is_alive()
+        }
+        # Determine currently pinned LLM (one-at-a-time policy)
+        pinned_llm_id: int | None = None
+        active_llm_set = {
+            lid for key, lid in _session_llm_ids.items()
+            if key in _active_sessions and _active_sessions[key].is_alive()
+        }
+        if active_llm_set:
+            pinned_llm_id = next(iter(active_llm_set))
     with _llm_counts_lock:
         llm_counts = dict(_llm_session_counts)
+
+    now = time.time()
+
+    # LLM info cache: llm_id → {id, name, current, max}
+    llm_info_cache: dict[int, dict] = {}
+
+    def _llm_info(llm_id: int | None) -> dict | None:
+        if llm_id is None:
+            return None
+        if llm_id not in llm_info_cache:
+            llm = get_llm(llm_id)
+            if llm:
+                llm_info_cache[llm_id] = {
+                    "id": llm.id,
+                    "name": llm.model or f"LLM {llm.id}",
+                    "current": llm_counts.get(llm.id, 0),
+                    "max": llm.parallel_sessions,
+                }
+            else:
+                llm_info_cache[llm_id] = None  # type: ignore[assignment]
+        return llm_info_cache[llm_id]
+
+    # Gather tasks and compute DAG
+    try:
+        all_tasks = get_all_tasks()
+    except Exception:
+        all_tasks = []
+
+    task_dicts = [_task_to_mini_dict(t) for t in all_tasks]
+    resolver = DAGResolver(task_dicts)
+    ready_tasks = resolver.get_ready_tasks()
+    ready_ids: set[str] = {t["id"] for t in ready_tasks}
+
+    # Big-idea parents (have children — skipped by DAG as non-dispatchable)
+    children_by_parent: set[str] = {
+        t.get("parent_task_id")
+        for t in task_dicts
+        if t.get("parent_task_id")
+    }
+
+    dispatchable_set = set(SCHEDULER_DISPATCHABLE_TYPES)
+    done_set = {s.lower() for s in PIPELINE_DONE_STATUSES}
+    never_dispatch = {"security", "completed", "cancelled", "subdividing", "accepted"}
+
+    active_list: list[dict] = []
+    queued_list: list[dict] = []
+    blocked_list: list[dict] = []
+
+    task_by_id = {t.id: t for t in all_tasks}
+
+    for task in all_tasks:
+        tid = task.id
+        task_type = (task.type or "").lower()
+
+        # Only care about dispatchable types that aren't terminal
+        if task_type not in dispatchable_set:
+            continue
+        if task_type in never_dispatch or task_type in done_set:
+            continue
+
+        info = _llm_info(task.llm_id)
+        entry = {
+            "id": tid,
+            "title": (task.title or tid)[:80],
+            "type": task_type,
+            "project": task.project or "",
+            "llm_id": task.llm_id,
+            "llm_name": info["name"] if info else "(no LLM)",
+        }
+
+        if tid in active_session_ids:
+            active_list.append(entry)
+        elif tid in ready_ids:
+            # Ready but not dispatched — determine why
+            if not task.llm_id:
+                reason = "no_llm"
+            elif tid in _failed_cooldowns and (now - _failed_cooldowns[tid]) < _FAIL_COOLDOWN_SECONDS:
+                remaining = int(_FAIL_COOLDOWN_SECONDS - (now - _failed_cooldowns[tid]))
+                reason = f"cooldown ({remaining}s)"
+            elif info and llm_counts.get(task.llm_id, 0) >= info["max"]:
+                reason = "at_capacity"
+            else:
+                reason = "pending"
+            entry["reason"] = reason
+            queued_list.append(entry)
+        else:
+            # Not ready — find blocking prerequisites
+            blocking = [
+                p for p in (task.prerequisites or [])
+                if not resolver._is_effectively_done(p)  # noqa: SLF001
+            ]
+            # Also note if it's a parent-is-working case
+            if tid in children_by_parent:
+                continue  # Big Idea parent with children — not directly dispatchable
+            entry["blocking_prereqs"] = blocking[:6]
+            # Include titles for blocking prereqs where available
+            entry["blocking_titles"] = [
+                (task_by_id[p].title or p)[:40] if p in task_by_id else p
+                for p in blocking[:6]
+            ]
+            blocked_list.append(entry)
+
+    # Sort queued by scheduler priority
+    by_mini = {t["id"]: t for t in task_dicts}
+    queued_list.sort(key=lambda t: _compute_priority(by_mini.get(t["id"], {}), by_mini))
+
+    # LLM capacities summary (only LLMs with tasks in our lists)
+    seen_llm_ids = {
+        t["llm_id"] for t in active_list + queued_list + blocked_list
+        if t.get("llm_id") is not None
+    }
+    llm_capacities = {}
+    for lid in seen_llm_ids:
+        info = _llm_info(lid)
+        if info:
+            llm_capacities[str(lid)] = {
+                "name": info["name"],
+                "current": info["current"],
+                "max": info["max"],
+            }
+
     try:
         from app.database import count_pending_research_jobs
         pending_research = count_pending_research_jobs()
@@ -163,13 +301,22 @@ def get_scheduler_status() -> dict:
         pending_file_summaries = count_pending_file_summary_jobs()
     except Exception:
         pending_file_summaries = 0
+
     return {
         "running": _scheduler_thread is not None and _scheduler_thread.is_alive(),
-        "active_sessions": active,
+        # Legacy fields kept for backwards compat
+        "active_sessions": {tid: True for tid in active_session_ids},
         "llm_session_counts": llm_counts,
         "tick_interval": SCHEDULER_TICK_INTERVAL,
         "pending_research_jobs": pending_research,
         "pending_file_summary_jobs": pending_file_summaries,
+        # One-LLM-at-a-time policy: the currently pinned LLM ID (null = no active sessions)
+        "pinned_llm_id": pinned_llm_id,
+        # Rich queue data
+        "active": active_list,
+        "queued": queued_list,
+        "blocked": blocked_list,
+        "llm_capacities": llm_capacities,
     }
 
 
@@ -234,30 +381,69 @@ def _compute_priority(task_dict: dict, by_id: dict) -> float:
 def _tick() -> None:
     """
     Single scheduler tick:
-      0. Dispatch file summary jobs (highest priority — agents are blocked waiting).
-      1. Clean up finished sessions.
-      2. Discover DAG-ready tasks.
-      3. Sort by priority (shallow DAG first).
+      0. Clean up finished sessions.
+      1. Determine which LLM (if any) is already active — one-LLM-at-a-time policy.
+      2. Dispatch file summary jobs (highest priority — agents are blocked waiting).
+      3. Discover DAG-ready tasks and sort by priority.
       4. For each ready task, check LLM capacity and dispatch if possible.
       5. Dispatch pending research jobs.
+      6. Recover stranded subdivision tasks (voted SUBDIVIDE but have no children).
+
+    One-LLM-at-a-time policy: the llama.cpp router can only run one model at a time.
+    Switching models requires unloading the current model first.  If we dispatch to
+    multiple LLM IDs simultaneously the router thrashes between models and nothing
+    makes progress.  Solution: once a session is active for a given LLM, only dispatch
+    more work to that same LLM until ALL its sessions finish, then pick the next LLM.
+    File summary jobs respect the same constraint (they use the same LLM as their task).
     """
     # Lazy imports to avoid circular deps at module load
     from app.agent.dag import DAGResolver
-    from app.database import get_all_tasks, get_task, get_llm
+    from app.database import get_all_tasks, get_task, get_llm, get_compute_node
 
-    # 0. File summary jobs first — blocked agents are waiting on these
-    _dispatch_file_summary_jobs()
-
-    # 1. Cleanup finished sessions
+    # 0. Cleanup finished sessions (also removes from _session_llm_ids)
     _cleanup_finished()
 
-    # 2. Get all tasks, compute DAG readiness
+    # 0b. Build per-compute-node active session counts from current _llm_session_counts.
+    #     node_active_counts[node_id] = sum of active sessions for all LLMs on that node.
+    #     We also keep a local llm->node cache so we don't re-fetch inside the loop.
+    _llm_node_cache: dict[int, int | None] = {}   # llm_id -> compute_node_id (or None)
+    _node_obj_cache: dict[int, object] = {}        # node_id -> ComputeNode object
+    node_active_counts: dict[int, int] = defaultdict(int)
+    with _llm_counts_lock:
+        snap = dict(_llm_session_counts)
+    for llm_id, count in snap.items():
+        if count <= 0:
+            continue
+        if llm_id not in _llm_node_cache:
+            llm_obj = get_llm(llm_id)
+            raw_nid = getattr(llm_obj, 'compute_node_id', None) if llm_obj else None
+            _llm_node_cache[llm_id] = raw_nid if isinstance(raw_nid, int) else None
+        node_id = _llm_node_cache[llm_id]
+        if node_id is not None:
+            node_active_counts[node_id] += count
+
+    # 1. Determine the currently pinned LLM (one-at-a-time policy).
+    #    allowed_llm_id = None  → nothing is running; first dispatch pins a new LLM.
+    #    allowed_llm_id = N     → only dispatch to LLM N until it drains completely.
+    with _active_sessions_lock:
+        active_llm_ids: set[int] = {
+            lid for key, lid in _session_llm_ids.items()
+            if key in _active_sessions and _active_sessions[key].is_alive()
+        }
+    allowed_llm_id: int | None = next(iter(active_llm_ids)) if active_llm_ids else None
+    if allowed_llm_id is not None:
+        logger.debug("[scheduler] One-LLM policy: pinned to LLM %d.", allowed_llm_id)
+
+    # 2. File summary jobs first — blocked agents are waiting on these.
+    #    Pass allowed_llm_id so they respect the same one-at-a-time constraint.
+    allowed_llm_id = _dispatch_file_summary_jobs(allowed_llm_id)
+
+    # 3. Get all tasks, compute DAG readiness, sort by priority
     all_tasks = get_all_tasks()
     task_dicts = [_task_to_mini_dict(t) for t in all_tasks]
     resolver = DAGResolver(task_dicts)
     ready_tasks = resolver.get_ready_tasks()
 
-    # 3. Sort by priority
     if ready_tasks:
         by_id = {t["id"]: t for t in task_dicts}
         ready_tasks.sort(key=lambda t: _compute_priority(t, by_id))
@@ -294,6 +480,18 @@ def _tick() -> None:
         if not db_task or not db_task.llm_id:
             continue
 
+        llm = get_llm(db_task.llm_id)
+        if not llm:
+            continue
+
+        # One-LLM-at-a-time: skip tasks whose LLM differs from the active one.
+        if allowed_llm_id is not None and llm.id != allowed_llm_id:
+            continue
+        # Pin to this LLM for the rest of this tick.
+        if allowed_llm_id is None:
+            allowed_llm_id = llm.id
+            logger.info("[scheduler] One-LLM policy: pinning to LLM %d (%s).", llm.id, llm.model)
+
         # Budget pre-flight: skip if worst-case cost exceeds remaining budget
         from app.database import budget_has_capacity
         worst = _estimate_worst_case_microcents(db_task.llm_id, db_task.budget_id)
@@ -320,9 +518,23 @@ def _tick() -> None:
                     task_id, db_task.project,
                 )
 
-        llm = get_llm(db_task.llm_id)
-        if not llm:
-            continue
+        # Check compute node capacity (node-level cap above per-LLM cap)
+        _raw_nid = getattr(llm, 'compute_node_id', None)
+        node_id = _raw_nid if isinstance(_raw_nid, int) else None
+        if node_id is not None:
+            if node_id not in _llm_node_cache:
+                _llm_node_cache[node_id] = node_id  # sentinel so we don't re-fetch
+            if node_id not in _node_obj_cache:
+                _node_obj_cache[node_id] = get_compute_node(node_id)
+            node_obj = _node_obj_cache.get(node_id)
+            if node_obj is not None:
+                node_cur = node_active_counts[node_id]
+                if node_cur >= node_obj.max_parallel_sessions:
+                    logger.debug(
+                        "Compute node %d ('%s') at capacity (%d/%d), deferring task '%s'.",
+                        node_id, node_obj.name, node_cur, node_obj.max_parallel_sessions, task_id,
+                    )
+                    continue
 
         # Check LLM capacity
         with _llm_counts_lock:
@@ -333,8 +545,10 @@ def _tick() -> None:
                     llm.id, current, llm.parallel_sessions, task_id,
                 )
                 continue
-            # Reserve a slot
+            # Reserve a slot — also track node-level count for this tick
             _llm_session_counts[llm.id] += 1
+        if node_id is not None:
+            node_active_counts[node_id] += 1
 
         # Dispatch
         logger.info(
@@ -351,14 +565,22 @@ def _tick() -> None:
         )
         with _active_sessions_lock:
             _active_sessions[task_id] = thread
+            _session_llm_ids[task_id] = llm.id
         thread.start()
 
-    # 5. Dispatch pending research jobs
-    _dispatch_research_jobs()
+    # 5. Dispatch pending research jobs (respects one-LLM policy)
+    _dispatch_research_jobs(allowed_llm_id)
+
+    # 6. Recover stranded subdivision tasks (respects one-LLM policy)
+    _dispatch_stranded_subdivisions(allowed_llm_id)
 
 
-def _dispatch_file_summary_jobs() -> None:
-    """Dispatch pending file summary jobs — top priority, agents are blocked waiting."""
+def _dispatch_file_summary_jobs(allowed_llm_id: "int | None") -> "int | None":
+    """Dispatch pending file summary jobs — top priority, agents are blocked waiting.
+
+    Respects the one-LLM-at-a-time policy.  Returns the (possibly updated)
+    allowed_llm_id so the caller can propagate the pin to subsequent dispatch phases.
+    """
     from app.database import get_pending_file_summary_jobs, update_file_summary_job, get_llm
 
     pending = get_pending_file_summary_jobs(limit=20)
@@ -374,6 +596,12 @@ def _dispatch_file_summary_jobs() -> None:
         llm = get_llm(job.llm_id)
         if not llm:
             continue
+
+        # One-LLM-at-a-time gate
+        if allowed_llm_id is not None and llm.id != allowed_llm_id:
+            continue
+        if allowed_llm_id is None:
+            allowed_llm_id = llm.id
 
         with _llm_counts_lock:
             current = _llm_session_counts[llm.id]
@@ -391,7 +619,10 @@ def _dispatch_file_summary_jobs() -> None:
         )
         with _active_sessions_lock:
             _active_sessions[job_key] = thread
+            _session_llm_ids[job_key] = llm.id
         thread.start()
+
+    return allowed_llm_id
 
 
 def _run_file_summary_job(job: Any, llm: Any) -> None:
@@ -443,8 +674,11 @@ def _run_file_summary_job(job: Any, llm: Any) -> None:
         signal_completion(completion_key)
 
 
-def _dispatch_research_jobs() -> None:
-    """Dispatch pending research jobs that have an LLM assigned."""
+def _dispatch_research_jobs(allowed_llm_id: "int | None") -> None:
+    """Dispatch pending research jobs that have an LLM assigned.
+
+    Respects the one-LLM-at-a-time policy.
+    """
     from app.database import get_pending_research_jobs, update_research_job, get_llm
 
     pending = get_pending_research_jobs(limit=10)
@@ -461,6 +695,10 @@ def _dispatch_research_jobs() -> None:
         if not llm:
             continue
 
+        # One-LLM-at-a-time gate
+        if allowed_llm_id is not None and llm.id != allowed_llm_id:
+            continue
+
         with _llm_counts_lock:
             current = _llm_session_counts[llm.id]
             if current >= llm.parallel_sessions:
@@ -475,6 +713,7 @@ def _dispatch_research_jobs() -> None:
         )
         with _active_sessions_lock:
             _active_sessions[job_key] = thread
+            _session_llm_ids[job_key] = llm.id
         thread.start()
 
 
@@ -518,6 +757,130 @@ def _run_research_job(job: Any, llm: Any) -> None:
     except Exception:
         logger.exception("Research job %d failed in scheduler.", job.id)
         update_research_job(job.id, status="failed")
+    finally:
+        loop.close()
+        with _llm_counts_lock:
+            _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
+
+
+def _dispatch_stranded_subdivisions(allowed_llm_id: "int | None") -> None:
+    """Detect Big Idea tasks that voted SUBDIVIDE but have no active children, and re-trigger subdivision.
+
+    Two cases:
+      - type == 'subdividing' with 0 children: subdivision ran but produced nothing (crashed, low confidence).
+      - type == 'idea' with outcome='subdivide' in transition_results and 0 children: intake voted subdivide
+        but subdivision was never started (ghost parent).
+    """
+    from app.database import get_all_tasks, get_task, get_llm, get_transition_results
+
+    try:
+        all_tasks = get_all_tasks()
+    except Exception:
+        return
+
+    # Count active children per parent
+    child_counts: dict[str, int] = {}
+    for t in all_tasks:
+        if t.parent_task_id:
+            child_counts[t.parent_task_id] = child_counts.get(t.parent_task_id, 0) + 1
+
+    for task in all_tasks:
+        tid = task.id
+        ttype = (task.type or "").lower()
+
+        if ttype not in ("idea", "subdividing"):
+            continue
+        if child_counts.get(tid, 0) > 0:
+            continue  # Has children — not stranded
+
+        stored_result_str: str | None = None
+
+        if ttype == "idea":
+            # Must have a prior subdivide vote to be a stranded subdivision
+            results = get_transition_results(tid, transition="idea_to_planning")
+            if not results or results[0].outcome != "subdivide":
+                continue
+            stored_result_str = results[0].vote_summary
+        # For "subdividing" with 0 children: always stranded regardless
+
+        # Already running recovery for this task?
+        recovery_key = f"subdivision-recovery-{tid}"
+        with _active_sessions_lock:
+            if recovery_key in _active_sessions and _active_sessions[recovery_key].is_alive():
+                continue
+
+        # Cooldown after prior failure
+        if tid in _failed_cooldowns:
+            if time.time() - _failed_cooldowns[tid] < _FAIL_COOLDOWN_SECONDS:
+                continue
+
+        if not task.llm_id:
+            continue
+
+        llm = get_llm(task.llm_id)
+        if not llm:
+            continue
+
+        # One-LLM-at-a-time gate
+        if allowed_llm_id is not None and llm.id != allowed_llm_id:
+            continue
+
+        with _llm_counts_lock:
+            current = _llm_session_counts[llm.id]
+            if current >= llm.parallel_sessions:
+                continue
+            _llm_session_counts[llm.id] += 1
+
+        # Parse the stored intake result dict (contains "votes" array for context)
+        stored_result: dict = {}
+        if stored_result_str:
+            try:
+                stored_result = json.loads(stored_result_str)
+            except Exception:
+                stored_result = {"outcome": "subdivide", "votes": []}
+        else:
+            stored_result = {"outcome": "subdivide", "votes": []}
+
+        logger.info(
+            "[scheduler] Dispatching subdivision recovery for stranded task '%s' (type=%s).",
+            tid, ttype,
+        )
+
+        thread = threading.Thread(
+            target=_run_subdivision_recovery,
+            args=(tid, llm, stored_result),
+            daemon=True,
+            name=f"maestro-subdivision-recovery-{tid}",
+        )
+        with _active_sessions_lock:
+            _active_sessions[recovery_key] = thread
+            _session_llm_ids[recovery_key] = llm.id
+        thread.start()
+
+
+def _run_subdivision_recovery(task_id: str, llm: Any, stored_result: dict) -> None:
+    """Execute subdivision recovery for a stranded task in its own thread + event loop."""
+    from app.main import _handle_subdivision_outcome
+    from app.database import get_task
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        task = get_task(task_id)
+        if not task:
+            logger.warning("[scheduler] Subdivision recovery: task '%s' not found.", task_id)
+            return
+        llm_base_url = f"http://{llm.address}:{llm.port}/v1"
+        _handle_subdivision_outcome(
+            task, stored_result, llm_base_url, llm.model, llm.max_context, loop
+        )
+        logger.info("[scheduler] Subdivision recovery complete for task '%s'.", task_id)
+    except Exception:
+        _failed_cooldowns[task_id] = time.time()
+        logger.exception(
+            "[scheduler] Subdivision recovery failed for task '%s' (cooldown %ds).",
+            task_id, int(_FAIL_COOLDOWN_SECONDS),
+        )
     finally:
         loop.close()
         with _llm_counts_lock:
@@ -967,6 +1330,7 @@ def _cleanup_finished() -> None:
         finished = [tid for tid, t in _active_sessions.items() if not t.is_alive()]
         for tid in finished:
             del _active_sessions[tid]
+            _session_llm_ids.pop(tid, None)
 
 
 def _task_to_mini_dict(task: Any) -> dict:

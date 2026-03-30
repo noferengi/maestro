@@ -38,6 +38,8 @@ from database import (
     Task, LLM, Budget, BudgetEntry, SubdivisionRecord, SessionLocal,
     get_all_llms, get_llm, create_llm, update_llm, delete_llm,
     get_all_budgets, get_budget, create_budget, update_budget, delete_budget,
+    ComputeNode, get_all_compute_nodes, get_compute_node,
+    create_compute_node, update_compute_node, delete_compute_node,
     TransitionVote, TransitionResult,
     create_transition_vote, get_transition_votes,
     create_transition_result, get_transition_results,
@@ -2039,6 +2041,17 @@ def llm_to_dict(llm):
         "notes": llm.notes,
         "cost_per_million_prompt_tokens": llm.cost_per_million_prompt_tokens,
         "cost_per_million_completion_tokens": llm.cost_per_million_completion_tokens,
+        "compute_node_id": getattr(llm, "compute_node_id", None),
+    }
+
+
+def compute_node_to_dict(node):
+    """Convert SQLAlchemy ComputeNode model to dictionary."""
+    return {
+        "id": node.id,
+        "name": node.name,
+        "description": node.description,
+        "max_parallel_sessions": node.max_parallel_sessions,
     }
 
 
@@ -2226,14 +2239,24 @@ def create_new_llm(data: dict):
     )
     if not llm:
         raise HTTPException(status_code=409, detail="LLM with this address/port/model already exists")
+    # Optionally assign a compute node
+    if 'compute_node_id' in data:
+        node_id = data['compute_node_id'] or None
+        update_llm(llm.id, compute_node_id=node_id)
+        llm = get_llm(llm.id)
     return llm_to_dict(llm)
 
 
 @app.put("/api/llms/{llm_id}", response_model=dict)
 def update_existing_llm(llm_id: int, data: dict):
     allowed = ['address', 'port', 'model', 'settings', 'parallel_sessions', 'max_context', 'notes',
-               'cost_per_million_prompt_tokens', 'cost_per_million_completion_tokens']
+               'cost_per_million_prompt_tokens', 'cost_per_million_completion_tokens',
+               'compute_node_id']
     updates = {k: v for k, v in data.items() if k in allowed}
+    # Normalize compute_node_id: empty string or 0 → None
+    if 'compute_node_id' in updates:
+        raw = updates['compute_node_id']
+        updates['compute_node_id'] = int(raw) if raw else None
     llm = update_llm(llm_id, **updates)
     if not llm:
         raise HTTPException(status_code=404, detail="LLM not found")
@@ -2314,6 +2337,57 @@ def get_budget_remaining(budget_id: int):
         "spent_dollars": round(spent / 100_000_000, 6) if spent else 0.0,
         "remaining_dollars": round(remaining / 100_000_000, 6) if remaining is not None else None,
     }
+
+
+# ============================================
+# Compute Node API Endpoints (global, not project-scoped)
+# ============================================
+
+@app.get("/api/compute-nodes", response_model=List[dict])
+def list_compute_nodes():
+    return [compute_node_to_dict(n) for n in get_all_compute_nodes()]
+
+
+@app.get("/api/compute-nodes/{node_id}", response_model=dict)
+def read_compute_node(node_id: int):
+    node = get_compute_node(node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Compute node not found")
+    return compute_node_to_dict(node)
+
+
+@app.post("/api/compute-nodes", response_model=dict)
+def create_new_compute_node(data: dict):
+    if not data.get('name'):
+        raise HTTPException(status_code=400, detail="name is required")
+    mps = data.get('max_parallel_sessions', 1)
+    if not isinstance(mps, int) or mps < 1:
+        raise HTTPException(status_code=400, detail="max_parallel_sessions must be >= 1")
+    node = create_compute_node(
+        name=data['name'],
+        description=data.get('description'),
+        max_parallel_sessions=mps,
+    )
+    if not node:
+        raise HTTPException(status_code=409, detail="Compute node with this name already exists")
+    return compute_node_to_dict(node)
+
+
+@app.put("/api/compute-nodes/{node_id}", response_model=dict)
+def update_existing_compute_node(node_id: int, data: dict):
+    allowed = ['name', 'description', 'max_parallel_sessions']
+    updates = {k: v for k, v in data.items() if k in allowed}
+    node = update_compute_node(node_id, **updates)
+    if not node:
+        raise HTTPException(status_code=404, detail="Compute node not found")
+    return compute_node_to_dict(node)
+
+
+@app.delete("/api/compute-nodes/{node_id}", response_model=bool)
+def delete_compute_node_endpoint(node_id: int):
+    if not delete_compute_node(node_id):
+        raise HTTPException(status_code=404, detail="Compute node not found")
+    return True
 
 
 # ============================================

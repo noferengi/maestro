@@ -27,10 +27,11 @@ const WIP_LIMITS = {
 let taskData = {};
 let allTasks = [];
 
-// Global LLM and Budget caches
+// Global LLM, Budget, and Compute Node caches
 let allLlms = [];
 let allProjects = [];  // [{name, path, description, llm_id, budget_id}] — kept in sync with loadProjects()
 let allBudgets = [];
+let allComputeNodes = [];  // [{id, name, description, max_parallel_sessions}]
 
 // Transition status cache: taskId -> { status, data, rejectionCount }
 let transitionCache = {};
@@ -252,17 +253,19 @@ function taskFingerprint(task) {
     ].join('|');
 }
 
-// Load global LLMs and Budgets
+// Load global LLMs, Budgets, and Compute Nodes
 async function loadLlmsAndBudgets() {
     try {
-        const [llmRes, budgetRes] = await Promise.all([
+        const [llmRes, budgetRes, cnRes] = await Promise.all([
             fetch(`${API_BASE}/llms`),
-            fetch(`${API_BASE}/budgets`)
+            fetch(`${API_BASE}/budgets`),
+            fetch(`${API_BASE}/compute-nodes`),
         ]);
         if (llmRes.ok) allLlms = await llmRes.json();
         if (budgetRes.ok) allBudgets = await budgetRes.json();
+        if (cnRes.ok) allComputeNodes = await cnRes.json();
     } catch (e) {
-        console.error('Failed to load LLMs/Budgets:', e);
+        console.error('Failed to load LLMs/Budgets/ComputeNodes:', e);
     }
 }
 
@@ -316,6 +319,21 @@ function populateProjectBudgetSelect(elementId, selectedId) {
         opt.value = b.id;
         opt.textContent = b.name;
         if (b.id === selectedId) opt.selected = true;
+        sel.appendChild(opt);
+    });
+}
+
+// Populate a compute node dropdown (elementId) with allComputeNodes.
+// Includes a "(none)" option.
+function populateComputeNodeSelect(elementId, selectedId) {
+    const sel = document.getElementById(elementId);
+    if (!sel) return;
+    sel.innerHTML = '<option value="">(none)</option>';
+    allComputeNodes.forEach(n => {
+        const opt = document.createElement('option');
+        opt.value = n.id;
+        opt.textContent = n.name;
+        if (n.id === selectedId) opt.selected = true;
         sel.appendChild(opt);
     });
 }
@@ -625,6 +643,17 @@ function startAutoRefresh() {
         } catch (error) {
             console.error('Auto-refresh error:', error);
         }
+        // Update queue button label (fire-and-forget, no render when modal is closed)
+        if (!_schedulerModalPoller) {
+            fetch(`${API_BASE}/scheduler/status`).then(r => r.ok ? r.json() : null).then(data => {
+                if (!data) return;
+                const queueBtn = document.getElementById('scheduler-queue-btn');
+                if (queueBtn) {
+                    const total = (data.active || []).length + (data.queued || []).length;
+                    queueBtn.textContent = total > 0 ? `⚙ Queue (${total})` : '⚙ Queue';
+                }
+            }).catch(() => {});
+        }
     }, 5000);
 }
 
@@ -756,6 +785,10 @@ function initializeModals() {
 
     document.getElementById('transition-modal').addEventListener('click', function(e) {
         if (e.target === this && _modalMousedownTarget === this) closeTransitionModal();
+    });
+
+    document.getElementById('scheduler-modal').addEventListener('click', function(e) {
+        if (e.target === this && _modalMousedownTarget === this) closeSchedulerModal();
     });
 }
 
@@ -2133,6 +2166,187 @@ function closeTransitionModal() {
 }
 
 // ============================================
+// Scheduler Queue Modal
+// ============================================
+
+let _schedulerModalPoller = null;
+
+function openSchedulerModal() {
+    document.getElementById('scheduler-modal').classList.add('active');
+    _fetchAndRenderScheduler();
+    _schedulerModalPoller = setInterval(_fetchAndRenderScheduler, 3000);
+}
+
+function closeSchedulerModal() {
+    document.getElementById('scheduler-modal').classList.remove('active');
+    if (_schedulerModalPoller) {
+        clearInterval(_schedulerModalPoller);
+        _schedulerModalPoller = null;
+    }
+}
+
+async function _fetchAndRenderScheduler() {
+    try {
+        const resp = await fetch(`${API_BASE}/scheduler/status`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        _renderSchedulerModal(data);
+        const ts = new Date().toLocaleTimeString();
+        const statusEl = document.getElementById('scheduler-modal-status');
+        if (statusEl) statusEl.textContent = `Updated ${ts} · ${data.running ? 'Scheduler running' : 'Scheduler stopped'}`;
+    } catch (e) {
+        const body = document.getElementById('scheduler-modal-body');
+        if (body) body.innerHTML = `<p style="color:#dc3545">Failed to load: ${e.message}</p>`;
+    }
+}
+
+function _renderSchedulerModal(data) {
+    const body = document.getElementById('scheduler-modal-body');
+    if (!body) return;
+
+    const { active = [], queued = [], blocked = [], llm_capacities = {},
+            pending_research_jobs = 0, pending_file_summary_jobs = 0 } = data;
+
+    // Update header button label
+    const queueBtn = document.getElementById('scheduler-queue-btn');
+    if (queueBtn) {
+        const total = active.length + queued.length;
+        queueBtn.textContent = total > 0 ? `⚙ Queue (${total})` : '⚙ Queue';
+    }
+
+    // Collect all LLM IDs that appear in any list
+    const allLlmIds = new Set();
+    const noLlmTasks = { active: [], queued: [], blocked: [] };
+
+    for (const task of [...active, ...queued, ...blocked]) {
+        if (task.llm_id != null) allLlmIds.add(String(task.llm_id));
+        else {
+            if (active.includes(task)) noLlmTasks.active.push(task);
+            else if (queued.includes(task)) noLlmTasks.queued.push(task);
+            else noLlmTasks.blocked.push(task);
+        }
+    }
+
+    // Build a map: llm_id → { active[], queued[], blocked[] }
+    const byLlm = {};
+    for (const lid of allLlmIds) {
+        byLlm[lid] = { active: [], queued: [], blocked: [] };
+    }
+    for (const t of active) {
+        const key = t.llm_id != null ? String(t.llm_id) : null;
+        if (key) byLlm[key].active.push(t);
+    }
+    for (const t of queued) {
+        const key = t.llm_id != null ? String(t.llm_id) : null;
+        if (key) byLlm[key].queued.push(t);
+    }
+    for (const t of blocked) {
+        const key = t.llm_id != null ? String(t.llm_id) : null;
+        if (key) byLlm[key].blocked.push(t);
+    }
+
+    const escHtml = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+    function taskRow(t, bucket) {
+        const typeColor = {
+            idea:'#6c757d', planning:'#0d6efd', indev:'#198754',
+            conceptual_review:'#20c997', optimization:'#fd7e14',
+            full_review:'#dc3545'
+        }[t.type] || '#6c757d';
+
+        let badge = '';
+        if (bucket === 'active') {
+            badge = `<span style="background:#198754;color:#fff;padding:1px 6px;border-radius:3px;font-size:0.7rem;font-weight:600">RUNNING</span>`;
+        } else if (bucket === 'queued') {
+            const reasonColor = t.reason === 'at_capacity' ? '#fd7e14' : t.reason === 'cooldown' ? '#dc3545' : '#6c757d';
+            badge = `<span style="background:${reasonColor};color:#fff;padding:1px 6px;border-radius:3px;font-size:0.7rem;font-weight:600">${escHtml(t.reason || 'QUEUED')}</span>`;
+        } else {
+            badge = `<span style="background:#6c757d;color:#fff;padding:1px 6px;border-radius:3px;font-size:0.7rem;font-weight:600">BLOCKED</span>`;
+        }
+
+        let extra = '';
+        if (bucket === 'blocked' && t.blocking_titles && t.blocking_titles.length) {
+            extra = `<div style="font-size:0.72rem;color:#6c757d;margin-top:2px">Waiting on: ${t.blocking_titles.map(escHtml).join(', ')}</div>`;
+        }
+
+        return `<div style="display:flex;align-items:flex-start;gap:0.5rem;padding:5px 0;border-bottom:1px solid #2a2a2a">
+            <span style="width:8px;height:8px;border-radius:50%;background:${typeColor};margin-top:5px;flex-shrink:0"></span>
+            <div style="flex:1;min-width:0">
+                <div style="font-size:0.82rem;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escHtml(t.title)}">${escHtml(t.title)}</div>
+                <div style="font-size:0.72rem;color:#6c757d">${escHtml(t.type)} · ${escHtml(t.project || '—')}</div>
+                ${extra}
+            </div>
+            <div style="flex-shrink:0">${badge}</div>
+        </div>`;
+    }
+
+    function llmSection(lid, tasks, cap) {
+        const capInfo = cap || { name: tasks.active[0]?.llm_name || tasks.queued[0]?.llm_name || tasks.blocked[0]?.llm_name || `LLM ${lid}`, current: 0, max: '?' };
+        const slotText = `${capInfo.current}/${capInfo.max} slots`;
+        const totalTasks = tasks.active.length + tasks.queued.length + tasks.blocked.length;
+        if (totalTasks === 0) return '';
+
+        let html = `<div style="margin-bottom:1.2rem">
+            <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.4rem;padding-bottom:0.3rem;border-bottom:2px solid #333">
+                <span style="font-weight:700;font-size:0.9rem">${escHtml(capInfo.name)}</span>
+                <span style="font-size:0.75rem;color:#6c757d;margin-left:auto">${slotText}</span>
+            </div>`;
+
+        if (tasks.active.length) {
+            html += `<div style="font-size:0.72rem;color:#198754;font-weight:600;margin-bottom:2px">ACTIVE (${tasks.active.length})</div>`;
+            html += tasks.active.map(t => taskRow(t, 'active')).join('');
+        }
+        if (tasks.queued.length) {
+            html += `<div style="font-size:0.72rem;color:#fd7e14;font-weight:600;margin:6px 0 2px">QUEUED (${tasks.queued.length})</div>`;
+            html += tasks.queued.map(t => taskRow(t, 'queued')).join('');
+        }
+        if (tasks.blocked.length) {
+            html += `<div style="font-size:0.72rem;color:#6c757d;font-weight:600;margin:6px 0 2px">BLOCKED (${tasks.blocked.length})</div>`;
+            html += tasks.blocked.map(t => taskRow(t, 'blocked')).join('');
+        }
+
+        html += '</div>';
+        return html;
+    }
+
+    let html = '';
+
+    if (allLlmIds.size === 0 && noLlmTasks.active.length === 0 && noLlmTasks.queued.length === 0 && noLlmTasks.blocked.length === 0) {
+        html = '<p style="color:#6c757d;text-align:center;padding:2rem 0">No dispatchable tasks in queue.</p>';
+    } else {
+        // Sort LLM groups: those with active tasks first, then by name
+        const sortedLids = Array.from(allLlmIds).sort((a, b) => {
+            const aActive = byLlm[a].active.length;
+            const bActive = byLlm[b].active.length;
+            if (aActive !== bActive) return bActive - aActive;
+            const aName = (llm_capacities[a]?.name || '').toLowerCase();
+            const bName = (llm_capacities[b]?.name || '').toLowerCase();
+            return aName.localeCompare(bName);
+        });
+
+        for (const lid of sortedLids) {
+            html += llmSection(lid, byLlm[lid], llm_capacities[lid]);
+        }
+
+        // Unassigned tasks
+        const unassignedTotal = noLlmTasks.active.length + noLlmTasks.queued.length + noLlmTasks.blocked.length;
+        if (unassignedTotal > 0) {
+            html += llmSection('(none)', noLlmTasks, { name: 'No LLM Assigned', current: 0, max: 0 });
+        }
+    }
+
+    // Footer summary
+    const summaryParts = [];
+    if (pending_research_jobs > 0) summaryParts.push(`${pending_research_jobs} research job${pending_research_jobs !== 1 ? 's' : ''} pending`);
+    if (pending_file_summary_jobs > 0) summaryParts.push(`${pending_file_summary_jobs} file summary job${pending_file_summary_jobs !== 1 ? 's' : ''} pending`);
+    if (summaryParts.length) {
+        html += `<div style="font-size:0.78rem;color:#6c757d;border-top:1px solid #333;padding-top:0.5rem;margin-top:0.5rem">${summaryParts.join(' · ')}</div>`;
+    }
+
+    body.innerHTML = html;
+}
+
+// ============================================
 // Inbox
 // ============================================
 
@@ -2932,6 +3146,7 @@ function initializeGlobalConfigButtons() {
     document.getElementById('manage-llms-btn').addEventListener('click', openLlmModal);
     document.getElementById('manage-budgets-btn').addEventListener('click', openBudgetModal);
     document.getElementById('manage-tools-btn').addEventListener('click', openToolsModal);
+    document.getElementById('manage-compute-nodes-btn').addEventListener('click', openComputeNodeModal);
 
     document.getElementById('llm-modal').addEventListener('click', function(e) {
         if (e.target === this && _modalMousedownTarget === this) closeLlmModal();
@@ -2941,6 +3156,9 @@ function initializeGlobalConfigButtons() {
     });
     document.getElementById('tools-modal').addEventListener('click', function(e) {
         if (e.target === this && _modalMousedownTarget === this) closeToolsModal();
+    });
+    document.getElementById('compute-node-modal').addEventListener('click', function(e) {
+        if (e.target === this && _modalMousedownTarget === this) closeComputeNodeModal();
     });
 }
 
@@ -2964,6 +3182,8 @@ let _llmEditingId = null;  // Currently editing LLM id (null = add mode)
 async function openLlmModal() {
     await loadLlmsAndBudgets();
     renderLlmList();
+    populateComputeNodeSelect('llm-compute-node', null);
+    populateComputeNodeSelect('llm-edit-compute-node', null);
     switchLlmTab('add');
     document.getElementById('llm-modal').classList.add('active');
 }
@@ -3004,6 +3224,7 @@ function editLlmEntry(id) {
     document.getElementById('llm-edit-notes').value = llm.notes || '';
     document.getElementById('llm-edit-cost-prompt').value = llm.cost_per_million_prompt_tokens || 0;
     document.getElementById('llm-edit-cost-completion').value = llm.cost_per_million_completion_tokens || 0;
+    populateComputeNodeSelect('llm-edit-compute-node', llm.compute_node_id || null);
     document.getElementById('llm-edit-placeholder').style.display = 'none';
     document.getElementById('llm-edit-form').style.display = 'block';
     document.getElementById('llm-edit-error').style.display = 'none';
@@ -3053,9 +3274,12 @@ function _validateLlmFields(prefix) {
     }
     const costPrompt = parseFloat(document.getElementById(`${prefix}-cost-prompt`)?.value) || 0;
     const costCompletion = parseFloat(document.getElementById(`${prefix}-cost-completion`)?.value) || 0;
+    const cnRaw = document.getElementById(`${prefix}-compute-node`)?.value;
+    const compute_node_id = cnRaw ? parseInt(cnRaw) : null;
     return { address, port, model, parallel_sessions: parallelRaw, max_context: contextRaw, notes,
              cost_per_million_prompt_tokens: costPrompt,
-             cost_per_million_completion_tokens: costCompletion };
+             cost_per_million_completion_tokens: costCompletion,
+             compute_node_id };
 }
 
 async function addLlm() {
@@ -3310,6 +3534,131 @@ const _CATEGORY_LABELS = {
 };
 
 const _CATEGORY_ORDER = ['file', 'search', 'git', 'shell', 'task', 'other'];
+
+// --- Compute Node Modal ---
+
+let _cnEditingId = null;  // Currently editing compute node id (null = add mode)
+
+async function openComputeNodeModal() {
+    await loadLlmsAndBudgets();
+    renderComputeNodeList();
+    switchComputeNodeTab('add');
+    document.getElementById('compute-node-modal').classList.add('active');
+}
+
+function closeComputeNodeModal() {
+    document.getElementById('compute-node-modal').classList.remove('active');
+    _cnEditingId = null;
+}
+
+function switchComputeNodeTab(tab) {
+    document.getElementById('cn-tab-add').classList.toggle('active', tab === 'add');
+    document.getElementById('cn-tab-edit').classList.toggle('active', tab === 'edit');
+    document.getElementById('cn-pane-add').classList.toggle('active', tab === 'add');
+    document.getElementById('cn-pane-edit').classList.toggle('active', tab === 'edit');
+    const btn = document.getElementById('cn-submit-btn');
+    if (tab === 'add') {
+        btn.textContent = 'Add Compute Node';
+        btn.onclick = addComputeNode;
+    } else {
+        btn.textContent = 'Save Changes';
+        btn.onclick = saveComputeNodeEdit;
+    }
+}
+
+function editComputeNodeEntry(id) {
+    const node = allComputeNodes.find(n => n.id === id);
+    if (!node) return;
+    _cnEditingId = id;
+    document.getElementById('cn-edit-id').value = id;
+    document.getElementById('cn-edit-name').value = node.name;
+    document.getElementById('cn-edit-description').value = node.description || '';
+    document.getElementById('cn-edit-max-sessions').value = node.max_parallel_sessions;
+    document.getElementById('cn-edit-placeholder').style.display = 'none';
+    document.getElementById('cn-edit-form').style.display = 'block';
+    document.getElementById('cn-edit-error').style.display = 'none';
+    switchComputeNodeTab('edit');
+}
+
+function renderComputeNodeList() {
+    const container = document.getElementById('compute-node-list');
+    if (allComputeNodes.length === 0) {
+        container.innerHTML = '<p style="color:#6c757d;font-size:0.85rem">No compute nodes configured.</p>';
+        return;
+    }
+    let html = '<table style="width:100%;font-size:0.85rem;border-collapse:collapse">';
+    html += '<tr style="border-bottom:1px solid #dee2e6"><th style="text-align:left;padding:0.4rem">ID</th><th style="text-align:left;padding:0.4rem">Name</th><th style="text-align:left;padding:0.4rem">Max Sessions</th><th style="text-align:left;padding:0.4rem">Description</th><th></th></tr>';
+    allComputeNodes.forEach(n => {
+        html += `<tr style="border-bottom:1px solid #f0f0f0">
+            <td style="padding:0.4rem">${n.id}</td>
+            <td style="padding:0.4rem"><a href="#" onclick="editComputeNodeEntry(${n.id}); return false;" style="color:#0d6efd;text-decoration:none;cursor:pointer">${escapeHtml(n.name)}</a></td>
+            <td style="padding:0.4rem">${n.max_parallel_sessions}</td>
+            <td style="padding:0.4rem;color:#6c757d">${escapeHtml(n.description || '')}</td>
+            <td style="padding:0.4rem"><button class="action-btn action-btn-danger" onclick="deleteComputeNodeEntry(${n.id})">Delete</button></td>
+        </tr>`;
+    });
+    html += '</table>';
+    container.innerHTML = html;
+}
+
+async function addComputeNode() {
+    const name = document.getElementById('cn-name').value.trim();
+    const description = document.getElementById('cn-description').value.trim();
+    const mps = parseInt(document.getElementById('cn-max-sessions').value) || 1;
+    if (!name) { showInlineError('cn-error', 'Name is required.'); return; }
+    if (mps < 1) { showInlineError('cn-error', 'Max sessions must be >= 1.'); return; }
+
+    const res = await fetch(`${API_BASE}/compute-nodes`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, description: description || null, max_parallel_sessions: mps })
+    });
+    if (!res.ok) {
+        const err = await res.json();
+        showInlineError('cn-error', err.detail || 'Failed to create compute node.');
+        return;
+    }
+    document.getElementById('cn-name').value = '';
+    document.getElementById('cn-description').value = '';
+    document.getElementById('cn-max-sessions').value = '1';
+    await loadLlmsAndBudgets();
+    renderComputeNodeList();
+}
+
+async function saveComputeNodeEdit() {
+    if (!_cnEditingId) return;
+    const name = document.getElementById('cn-edit-name').value.trim();
+    const description = document.getElementById('cn-edit-description').value.trim();
+    const mps = parseInt(document.getElementById('cn-edit-max-sessions').value) || 1;
+    if (!name) { showInlineError('cn-edit-error', 'Name is required.'); return; }
+
+    const res = await fetch(`${API_BASE}/compute-nodes/${_cnEditingId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, description: description || null, max_parallel_sessions: mps })
+    });
+    if (!res.ok) {
+        const err = await res.json();
+        showInlineError('cn-edit-error', err.detail || 'Failed to update compute node.');
+        return;
+    }
+    await loadLlmsAndBudgets();
+    renderComputeNodeList();
+    editComputeNodeEntry(_cnEditingId);
+}
+
+async function deleteComputeNodeEntry(id) {
+    if (!await showConfirm('Delete Compute Node', 'Delete this compute node? LLM endpoints assigned to it will become unassigned.', 'Delete')) return;
+    await fetch(`${API_BASE}/compute-nodes/${id}`, { method: 'DELETE' });
+    if (_cnEditingId === id) {
+        _cnEditingId = null;
+        document.getElementById('cn-edit-form').style.display = 'none';
+        document.getElementById('cn-edit-placeholder').style.display = 'block';
+        switchComputeNodeTab('add');
+    }
+    await loadLlmsAndBudgets();
+    renderComputeNodeList();
+}
 
 async function openToolsModal() {
     document.getElementById('tools-modal').classList.add('active');

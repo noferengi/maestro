@@ -9,7 +9,7 @@ expenses, and job tables via foreign keys.
 import logging
 
 from .session import SessionLocal
-from .models import LLM, Budget
+from .models import LLM, Budget, ComputeNode
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +159,80 @@ def delete_budget(budget_id):
     except Exception as e:
         db.rollback()
         logger.error("Error deleting budget: %s", e)
+        return False
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# ComputeNode CRUD
+# ---------------------------------------------------------------------------
+
+def get_all_compute_nodes():
+    db = SessionLocal()
+    try:
+        return db.query(ComputeNode).order_by(ComputeNode.id).all()
+    finally:
+        db.close()
+
+
+def get_compute_node(node_id):
+    db = SessionLocal()
+    try:
+        return db.query(ComputeNode).filter(ComputeNode.id == node_id).first()
+    finally:
+        db.close()
+
+
+def create_compute_node(name, description=None, max_parallel_sessions=1):
+    db = SessionLocal()
+    try:
+        node = ComputeNode(name=name, description=description,
+                           max_parallel_sessions=max_parallel_sessions)
+        db.add(node)
+        db.commit()
+        db.refresh(node)
+        return node
+    except Exception as e:
+        db.rollback()
+        logger.error("Error creating compute node: %s", e)
+        return None
+    finally:
+        db.close()
+
+
+def update_compute_node(node_id, **kwargs):
+    db = SessionLocal()
+    try:
+        node = db.query(ComputeNode).filter(ComputeNode.id == node_id).first()
+        if not node:
+            return None
+        for key, value in kwargs.items():
+            if hasattr(node, key):
+                setattr(node, key, value)
+        db.commit()
+        db.refresh(node)
+        return node
+    except Exception as e:
+        db.rollback()
+        logger.error("Error updating compute node: %s", e)
+        return None
+    finally:
+        db.close()
+
+
+def delete_compute_node(node_id):
+    db = SessionLocal()
+    try:
+        node = db.query(ComputeNode).filter(ComputeNode.id == node_id).first()
+        if not node:
+            return False
+        db.delete(node)
+        db.commit()
+        return True
+    except Exception as e:
+        db.rollback()
+        logger.error("Error deleting compute node: %s", e)
         return False
     finally:
         db.close()

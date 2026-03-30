@@ -48,7 +48,7 @@ if globals().get('_initialized'):
         'app.database.crud_tasks', 'app.database.crud_projects',
         'app.database.crud_infra', 'app.database.crud_costs',
         'app.database.crud_pipeline', 'app.database.crud_jobs',
-        'app.database.crud_files',
+        'app.database.crud_files', 'app.database.crud_inbox',
     ]:
         if _sub in _sys.modules:
             _il.reload(_sys.modules[_sub])
@@ -66,6 +66,7 @@ from .session import (
 
 # Models
 from .models import (
+    ComputeNode,
     LLM,
     Budget,
     Project,
@@ -86,6 +87,7 @@ from .models import (
     OptimizationBenchmark,
     FileSummary,
     SearchCache,
+    InboxMessage,
 )
 
 # Task CRUD + seeding + helpers
@@ -122,7 +124,7 @@ from .crud_projects import (
     delete_project,
 )
 
-# LLM + Budget CRUD
+# LLM + Budget + ComputeNode CRUD
 from .crud_infra import (
     get_all_llms,
     get_llm,
@@ -134,6 +136,11 @@ from .crud_infra import (
     create_budget,
     update_budget,
     delete_budget,
+    get_all_compute_nodes,
+    get_compute_node,
+    create_compute_node,
+    update_compute_node,
+    delete_compute_node,
 )
 
 # BudgetEntry + Expense + budget math
@@ -203,16 +210,27 @@ from .crud_files import (
     create_search_cache,
 )
 
+# Inbox / notifications
+from .crud_inbox import (
+    create_inbox_message,
+    get_inbox_messages,
+    get_inbox_message,
+    mark_inbox_read,
+    mark_all_inbox_read,
+    delete_inbox_message,
+    count_unread_inbox,
+)
+
 __all__ = [
     # session
     "DATABASE_PATH", "engine", "SessionLocal", "Base", "get_db", "init_db_tables",
     # models
-    "LLM", "Budget", "Project", "Task", "BudgetEntry", "Expense",
+    "ComputeNode", "LLM", "Budget", "Project", "Task", "BudgetEntry", "Expense",
     "TransitionVote", "TransitionResult", "SubdivisionRecord",
     "PlanningResult", "ComponentResult", "OptimizationResult",
     "SecurityReviewResult", "FullReviewResult", "MergeRecord",
     "ResearchJob", "FileSummaryJob", "OptimizationBenchmark",
-    "FileSummary", "SearchCache",
+    "FileSummary", "SearchCache", "InboxMessage",
     # crud_tasks
     "init_db", "seed_sample_tasks", "seed_task", "seed_sample_tasks_raw",
     "create_task", "get_task", "get_tasks_by_type", "get_tasks_by_project",
@@ -225,6 +243,8 @@ __all__ = [
     # crud_infra
     "get_all_llms", "get_llm", "create_llm", "update_llm", "delete_llm",
     "get_all_budgets", "get_budget", "create_budget", "update_budget", "delete_budget",
+    "get_all_compute_nodes", "get_compute_node", "create_compute_node",
+    "update_compute_node", "delete_compute_node",
     # crud_costs
     "create_budget_entry", "get_budget_entries", "get_budget_entry",
     "create_expense", "get_budget_spent_microcents", "get_budget_remaining_microcents",
@@ -248,6 +268,9 @@ __all__ = [
     # crud_files
     "get_file_summary", "create_file_summary", "get_file_summary_by_path",
     "get_search_cache", "create_search_cache",
+    # crud_inbox
+    "create_inbox_message", "get_inbox_messages", "get_inbox_message",
+    "mark_inbox_read", "mark_all_inbox_read", "delete_inbox_message", "count_unread_inbox",
 ]
 
 # Sentinel — presence of this flag on a subsequent execution means we're
