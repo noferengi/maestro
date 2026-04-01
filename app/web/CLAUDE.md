@@ -9,19 +9,15 @@ All files in this directory are served as static files by FastAPI from the `/sta
 
 ### Board (`index.html` + `kanban.js` + `style.css`)
 
-The main Kanban board. Nine columns: ARCHITECTURE → IDEAS → PLANNING → INDEV →
-CONCEPTUAL_REVIEW → OPTIMIZATION → SECURITY → FULL_REVIEW → COMPLETED. Tasks are
-draggable within a column to reorder. Column transitions are gated by the backend intake
-pipeline. Clicking a column header opens the **Column Map View**.
+The main Kanban board. Layout: a **`#arch-bar`** horizontal band spanning full width at the top, followed by eight pipeline columns: IDEAS → PLANNING → INDEV → CONCEPTUAL_REVIEW → OPTIMIZATION → SECURITY → FULL_REVIEW → COMPLETED. Tasks are draggable within a column to reorder. Column transitions are gated by the backend intake pipeline. Clicking a column header opens the **Column Map View**.
 
-**`index.html`** — Board shell. Project tabs, nine column containers, the Column Map
-overlay (`#column-map-container`), eight modals (task create/edit, new project, edit
-project, transition, LLM endpoints, budgets, tools). Both New Project and Edit Project
-modals have **Default LLM** and **Budget** dropdowns.
+**`index.html`** — Board shell. Project tabs, the `#arch-bar` architecture bar, eight pipeline column containers, the Column Map overlay (`#column-map-container`), nine modals (task create/edit, new project, edit project, transition, LLM endpoints, budgets, tools, compute nodes). Both New Project and Edit Project modals have **Default LLM** and **Budget** dropdowns. The task create/edit modal has shared `#arch-category` and `#arch-priority` selects for architecture cards (shown/hidden by `showArchContentFields()`).
 
 **`kanban.js`** — All board behaviour. Key globals:
 - `taskData`, `allTasks`, `currentProject` — task state
 - `allLlms`, `allBudgets`, `allProjects` — endpoint/budget/project caches; `allProjects` is `[{name, path, description, llm_id, budget_id}]`
+- `ARCH_CATEGORY_COLORS` — `{category: hexColor}` map for the 14 architecture card category badges
+- `_archBarCollapsed` — boolean persisted in `localStorage`; drives `#arch-bar.collapsed` CSS class
 - `transitionCache`, `transitionPollers` — intake pipeline polling
 - `columnMapActive`, `columnMapType` — Column Map View active flag and which column
 - `_mapCurrentEdges`, `_mapCurrentNodePositions`, `_mapCurrentColor`, `_mapOffsetX/Y` — shared map render state
@@ -32,11 +28,38 @@ modals have **Default LLM** and **Budget** dropdowns.
 
 Key patterns:
 - `loadTasksFromDatabase()` — re-fetches and fully rebuilds on project switch
-- `renderTasksFromDatabase()` — groups by type, sorts by `position`, appends cards
-- `reconcile()` — 5-second auto-refresh; skips DOM when `columnMapActive` is true
+- `renderTasksFromDatabase()` — groups pipeline tasks by type, sorts by `position`, appends cards; then calls `renderArchBar()`. Architecture tasks (`type='architecture'`) are **not** in the pipeline columns array and never rendered there.
+- `renderArchBar()` — rebuilds `.arch-card` elements in `#arch-cards` from arch tasks in `taskData`, sorted by priority then position
+- `toggleArchBar()` — flips `_archBarCollapsed`, saves to `localStorage`, toggles `#arch-bar.collapsed`
+- `reconcile()` — 5-second auto-refresh; skips DOM when `columnMapActive` is true; arch tasks are tracked via `fingerprintCache` but not added to `cardCache`; calls `renderArchBar()` when any arch fingerprint changes
+- `deleteTask()` — detects `task.type === 'architecture'` and calls `renderArchBar()` instead of searching for a `.task-card` DOM element
+- `showArchContentFields(targetStatus)` — shows/hides `#arch-category`/`#arch-priority` selects and hides LLM/budget/owner/tags for architecture type; relabels description field
 - Drag-and-drop POSTs to `/api/tasks/{id}/reorder`, then re-fetches before re-rendering
 - New task default LLM is pre-populated from the current project's `llm_id`
 - `populateProjectLlmSelect(elementId, selectedId)` and `populateProjectBudgetSelect(elementId, selectedId)` — shared helpers for project-level dropdowns
+
+#### Architecture Bar (`#arch-bar`)
+
+A dark navy band spanning the full board width above the pipeline columns. Architecture cards are stored as `type='architecture'` tasks in the DB and rendered **only** here — never in kanban columns.
+
+**Card schema** (`content` JSON field):
+- `category` — one of 14 fixed values: `Platform`, `Design`, `Testing`, `Security`, `Performance`, `API`, `Tooling`, `Data`, `UX`, `Accessibility`, `Compliance`, `Deployment`, `Observability`, `General`
+- `priority` — `critical` | `high` | `normal` | `low`; controls injection order in agent context and left-border stripe colour on the card
+- Card body text is the task's `description` field
+
+Each card shows a coloured category badge (`ARCH_CATEGORY_COLORS`), title, 3-line body excerpt, and a priority stripe (red=critical, orange=high, blue=normal, grey=low). Hover reveals Edit/Del buttons. The bar is collapsible; state persists in `localStorage`.
+
+**Agent injection** — `build_architecture_context(project_name, agent_type)` in `project_snapshot.py` fetches arch cards and formats them as a `== PROJECT ARCHITECTURE & CONSTRAINTS ==` block. `ARCH_CATEGORY_RELEVANCE` maps agent type to a category set filter:
+
+| Agent | Categories |
+|---|---|
+| `loop` (implementation) | all |
+| `research` | all |
+| `subdivision` | Platform, Design, Testing, Performance, API, Data, Tooling, General |
+| `conceptual_review` | Design, API, Data, Security, Accessibility, Compliance, General |
+| `security` | Security, Compliance, API, Data, Platform, General |
+| `optimization` | Performance, Platform, Data, Observability, Tooling, General |
+| `file_summary` | Platform, Tooling, Data, General |
 
 #### Column Map View
 
@@ -46,7 +69,7 @@ canvas showing tasks as cards connected by thick cubic-bezier arrows.
 Key functions:
 - `openColumnMap(colType)` / `closeColumnMap()` — show/hide; hides `.kanban-board`, shows `#column-map-container`
 - `handleColumnClick(e, colType)` / `handleTasksContainerClick(e, colType)` — click guards
-- `_mapComputeLayout(tasks, colType)` — three-phase layout: (1) load saved `map_x/map_y`; (2) BFS fan-out for newly-subdivided children; (3) radial `placeSubtree()` for unpositioned nodes. IDEAS/ARCHITECTURE use `parent_task_id` hierarchy; others use `prerequisites`.
+- `_mapComputeLayout(tasks, colType)` — three-phase layout: (1) load saved `map_x/map_y`; (2) BFS fan-out for newly-subdivided children; (3) radial `placeSubtree()` for unpositioned nodes. IDEAS use `parent_task_id` hierarchy; all others use `prerequisites`. Architecture tasks have no column map (they live in the arch bar).
 - `renderColumnMap(colType)` — computes bounding box, sets canvas dimensions, renders `.map-node` divs, calls `_mapRedrawArrows()`, saves newly-positioned nodes
 - `_mapRedrawArrows()` — removes/redraws all SVG `<path>` bezier arrows; uses `_mapCardEdge()` for edge-to-edge routing
 - `_mapStartNodeDrag(e, nodeId)` — group drag: parent + all descendants move by the same delta

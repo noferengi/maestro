@@ -24,9 +24,10 @@ import pytest
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_summary_row(summary: str) -> MagicMock:
+def _make_summary_row(summary: str, short_summary: str | None = None) -> MagicMock:
     row = MagicMock()
     row.summary = summary
+    row.short_summary = short_summary  # None → simulates pre-migration rows
     return row
 
 
@@ -676,5 +677,5 @@ class TestExecuteFileSummaryPromptBranching:
                 previous_summary=None,
             ))
 
-        assert "Summarize the following source file" in captured_prompts[0]
+        assert "Analyze this source file" in captured_prompts[0]
         assert "Previous summary" not in captured_prompts[0]

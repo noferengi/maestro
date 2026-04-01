@@ -28,9 +28,13 @@ class ComputeNode(Base):
     name = Column(String, nullable=False, unique=True)
     description = Column(Text, nullable=True)
     max_parallel_sessions = Column(Integer, nullable=False, default=1)
+    max_loaded_models = Column(Integer, nullable=False, default=1)
 
     def __repr__(self):
-        return f"<ComputeNode(id={self.id}, name='{self.name}', max={self.max_parallel_sessions})>"
+        return (
+            f"<ComputeNode(id={self.id}, name='{self.name}', "
+            f"sessions={self.max_parallel_sessions}, models={self.max_loaded_models})>"
+        )
 
 
 class LLM(Base):
@@ -480,7 +484,8 @@ class FileSummary(Base):
     sha1_hash = Column(String, nullable=False)
     file_size_bytes = Column(Integer, nullable=False)
     file_path = Column(String, nullable=False)          # last-known path, not a key
-    summary = Column(Text, nullable=False)
+    summary = Column(Text, nullable=False)              # comprehensive multi-paragraph description
+    short_summary = Column(Text, nullable=True)         # exactly 2 sentences for listings/snapshots
     static_analysis_json = Column(Text, nullable=True)  # JSON from static_analysis.analyze_file()
     created_at = Column(DateTime, default=datetime.utcnow)
 

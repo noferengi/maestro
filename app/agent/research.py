@@ -412,7 +412,16 @@ class ResearchAgent:
         insufficient."  The ``source`` tag prevents tally_votes() from
         re-spawning a research agent for this vote.
         """
-        accumulated = "\n\n".join(self._accumulated_findings) or "No findings were recorded."
+        # Prefer the structured post-mortem summaries (rich handoff content) over
+        # the generic "Life N exhausted N turns" fallback strings in _accumulated_findings.
+        summary_parts = [s for s in self._accumulated_summaries if s]
+        finding_parts = [f for f in self._accumulated_findings if f]
+        if summary_parts:
+            accumulated = "\n\n".join(summary_parts)
+        elif finding_parts:
+            accumulated = "\n\n".join(finding_parts)
+        else:
+            accumulated = "No findings were recorded."
         context_snippet = json.dumps(self.context, indent=1)[:2000]
 
         system_prompt = (
@@ -561,6 +570,8 @@ class ResearchAgent:
                         },
                         turns_used=turns_used,
                     )
+                # Failed call does not count as a turn — the LLM produced no work.
+                turns_used -= 1
                 logger.error("Research agent LLM call failed (life %d, turn %d): %s", life_num, turns_used, exc)
                 messages.append({
                     "role": "user",
@@ -682,15 +693,30 @@ class ResearchAgent:
     def _build_life_context(self, life_num: int) -> str:
         """Build the user message for a given life."""
         if life_num == 1:
+            parts: list[str] = []
+
+            # Project file structure snapshot
             if self.project_root:
                 try:
                     from app.agent.project_snapshot import build_snapshot_with_summaries
-                    snapshot = build_snapshot_with_summaries(self.project_root)
-                    parts = [snapshot, f"## Investigation Question\n{self.question}"]
+                    parts.append(build_snapshot_with_summaries(self.project_root))
                 except Exception:
-                    parts = [f"## Investigation Question\n{self.question}"]
-            else:
-                parts = [f"## Investigation Question\n{self.question}"]
+                    pass
+
+            # Architecture / constraint cards for this project
+            if self.task_id:
+                try:
+                    from app.database import get_task as _get_task
+                    from app.agent.project_snapshot import build_architecture_context
+                    _task_rec = _get_task(self.task_id)
+                    if _task_rec and _task_rec.project:
+                        _arch = build_architecture_context(_task_rec.project, agent_type='research')
+                        if _arch:
+                            parts.append(_arch)
+                except Exception:
+                    pass
+
+            parts.append(f"## Investigation Question\n{self.question}")
             parts.append(f"\n## Context\n```json\n{json.dumps(self.context, indent=2, default=str)}\n```")
         else:
             parts = [f"## Investigation Question (continued — life {life_num}/{self.max_lives})\n{self.question}"]

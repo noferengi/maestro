@@ -440,15 +440,30 @@ class SubdivisionAgent:
     # ------------------------------------------------------------------
 
     def _build_context(self) -> str:
+        parts: list[str] = []
+
+        # Project file structure snapshot
         if self.project_root:
             try:
                 from app.agent.project_snapshot import build_snapshot_with_summaries
-                snapshot = build_snapshot_with_summaries(self.project_root)
-                parts = [snapshot, f"## Task to Decompose"]
+                parts.append(build_snapshot_with_summaries(self.project_root))
             except Exception:
-                parts = [f"## Task to Decompose"]
-        else:
-            parts = [f"## Task to Decompose"]
+                pass
+
+        # Architecture / constraint cards (filtered for subdivision work)
+        if self.parent_task_id:
+            try:
+                from app.database import get_task as _get_task
+                from app.agent.project_snapshot import build_architecture_context
+                _task_rec = _get_task(self.parent_task_id)
+                if _task_rec and _task_rec.project:
+                    _arch = build_architecture_context(_task_rec.project, agent_type='subdivision')
+                    if _arch:
+                        parts.append(_arch)
+            except Exception:
+                pass
+
+        parts.append("## Task to Decompose")
         parts += [
             f"**ID:** {self.parent_task_id}",
             f"**Title:** {self.parent_title}",

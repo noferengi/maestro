@@ -62,6 +62,7 @@ function buildSessionSummary(anchorEntryId) {
 
     let rows = '';
     let grandPP = 0, grandTG = 0, grandCost = 0, grandCached = 0;
+    let lastMaxCtx = 0;
 
     fullEntries.forEach((fe, i) => {
         const pp       = fe.prompt_cost || 0;
@@ -98,6 +99,7 @@ function buildSessionSummary(anchorEntryId) {
         const llmInfo  = allDiagLlms[fe.llm_id] || {};
         const llmName  = llmInfo.name || fe.llm_id || '—';
         const maxCtx   = llmInfo.max_context || 0;
+        if (maxCtx > 0) lastMaxCtx = maxCtx;
         const prevPp   = i > 0 ? (fullEntries[i-1].prompt_cost || 0) : 0;
         const deltaPp  = i > 0 ? pp - prevPp : pp;
         const ctxPct   = maxCtx > 0 ? Math.round(pp / maxCtx * 100) : null;
@@ -149,9 +151,9 @@ function buildSessionSummary(anchorEntryId) {
             <tbody>${rows}</tbody>
             <tfoot><tr class="diag-summary-totals">
                 <td colspan="5">ALL TURNS</td>
-                <td class="col-r">${fmtTokens(grandPP)}</td>
-                <td></td>
-                <td></td>
+                <td class="col-r" title="Final prompt size (last turn)">${fmtTokens(fullEntries[fullEntries.length - 1].prompt_cost || 0)}</td>
+                <td class="col-r">${fmtTokens(fullEntries[fullEntries.length - 1].prompt_cost - fullEntries[0].prompt_cost || 0)}</td>
+                <td class="col-r">${fmtTokens(fullEntries[fullEntries.length - 1].prompt_cost / (lastMaxCtx || 1) * 100)}</td>
                 <td class="col-r">${fmtTokens(grandTG)}</td>
                 <td class="col-r col-bold">${fmtTokens(grandPP + grandTG)}</td>
                 <td class="col-r col-dim">${grandCacheStr}</td>

@@ -10,9 +10,29 @@ const API_BASE = '/api';
 let _modalMousedownTarget = null;
 document.addEventListener('mousedown', function(e) { _modalMousedownTarget = e.target; });
 
+// Category colours for architecture cards (displayed as badge text colour)
+const ARCH_CATEGORY_COLORS = {
+    Platform:      '#17a2b8',
+    Design:        '#a78bfa',
+    Testing:       '#20c997',
+    Security:      '#f87171',
+    Performance:   '#fb923c',
+    API:           '#60a5fa',
+    Tooling:       '#fbbf24',
+    Data:          '#818cf8',
+    UX:            '#f472b6',
+    Accessibility: '#34d399',
+    Compliance:    '#e879f9',
+    Deployment:    '#4ade80',
+    Observability: '#38bdf8',
+    General:       '#6c757d',
+};
+
+// Whether the arch bar is collapsed (persisted in localStorage)
+let _archBarCollapsed = localStorage.getItem('archBarCollapsed') === '1';
+
 // WIP Limits configuration - maximum cards allowed per column
 const WIP_LIMITS = {
-    'architecture': 10,
     'idea': 15,
     'planning': 10,
     'indev': 5,
@@ -31,7 +51,7 @@ let allTasks = [];
 let allLlms = [];
 let allProjects = [];  // [{name, path, description, llm_id, budget_id}] — kept in sync with loadProjects()
 let allBudgets = [];
-let allComputeNodes = [];  // [{id, name, description, max_parallel_sessions}]
+let allComputeNodes = [];  // [{id, name, description, max_parallel_sessions, max_loaded_models}]
 
 // Transition status cache: taskId -> { status, data, rejectionCount }
 let transitionCache = {};
@@ -421,7 +441,7 @@ function renderTasksFromDatabase() {
     Object.keys(fingerprintCache).forEach(id => delete fingerprintCache[id]);
 
     // Clear ALL existing task cards from ALL columns
-    const columns = ['architecture', 'idea', 'planning', 'indev', 'conceptual_review', 'optimization', 'security', 'full_review', 'completed'];
+    const columns = ['idea', 'planning', 'indev', 'conceptual_review', 'optimization', 'security', 'full_review', 'completed'];
 
     columns.forEach(columnType => {
         const container = document.getElementById(`tasks-${columnType}`);
@@ -473,12 +493,13 @@ function renderTasksFromDatabase() {
 
     console.log(`Rendered ${Object.values(taskData).filter(t => t && t.type).length} task cards from database`);
 
-    // Update task counts
+    // Update task counts and arch bar
     updateTaskCounts();
+    renderArchBar();
 }
 
 function updateTaskCounts() {
-    const columns = ['architecture', 'idea', 'planning', 'indev', 'conceptual_review', 'optimization', 'security', 'full_review', 'completed'];
+    const columns = ['idea', 'planning', 'indev', 'conceptual_review', 'optimization', 'security', 'full_review', 'completed'];
 
     columns.forEach(columnType => {
         const container = document.getElementById(`tasks-${columnType}`);
@@ -489,6 +510,70 @@ function updateTaskCounts() {
             countElement.textContent = count;
         }
     });
+}
+
+// ============================================
+// PROJECT ARCHITECTURE horizontal bar
+// ============================================
+
+function toggleArchBar() {
+    _archBarCollapsed = !_archBarCollapsed;
+    localStorage.setItem('archBarCollapsed', _archBarCollapsed ? '1' : '0');
+    const bar = document.getElementById('arch-bar');
+    if (bar) bar.classList.toggle('collapsed', _archBarCollapsed);
+    const btn = document.getElementById('arch-bar-toggle');
+    if (btn) btn.textContent = _archBarCollapsed ? '\u25BC' : '\u25B2';
+}
+
+function renderArchBar() {
+    const container = document.getElementById('arch-cards');
+    const countEl   = document.getElementById('arch-bar-count');
+    if (!container) return;
+
+    // Gather and sort architecture tasks: critical first, then high, normal, low; then by position
+    const priorityOrder = { critical: 0, high: 1, normal: 2, low: 3 };
+    const archTasks = Object.values(taskData)
+        .filter(t => t && t.type === 'architecture')
+        .sort((a, b) => {
+            const pa = priorityOrder[(a.content || {}).priority] ?? 2;
+            const pb = priorityOrder[(b.content || {}).priority] ?? 2;
+            if (pa !== pb) return pa - pb;
+            return (a.position ?? 0) - (b.position ?? 0);
+        });
+
+    // Update count badge
+    if (countEl) countEl.textContent = archTasks.length > 0 ? `${archTasks.length} card${archTasks.length !== 1 ? 's' : ''}` : '';
+
+    // Rebuild cards
+    container.innerHTML = '';
+    archTasks.forEach(task => {
+        const content  = task.content || {};
+        const category = content.category || 'General';
+        const priority = content.priority || 'normal';
+        const color    = ARCH_CATEGORY_COLORS[category] || ARCH_CATEGORY_COLORS.General;
+        const body     = (task.description || '').trim();
+
+        const card = document.createElement('div');
+        card.className = `arch-card prio-${priority}`;
+        card.dataset.id = task.id;
+        card.innerHTML = `
+            <div class="arch-card-category" style="color:${color}">${escapeHtml(category)}</div>
+            <div class="arch-card-title">${escapeHtml(task.title || '')}</div>
+            ${body ? `<div class="arch-card-body">${escapeHtml(body)}</div>` : ''}
+            <div class="arch-card-prio-badge prio-${priority}">${priority === 'critical' ? 'CRITICAL' : priority === 'high' ? 'HIGH' : priority === 'low' ? 'low' : ''}</div>
+            <div class="arch-card-toolbar">
+                <button class="arch-card-btn" onclick="event.stopPropagation();editArchitectureTask('${task.id}')">Edit</button>
+                <button class="arch-card-btn danger" onclick="event.stopPropagation();deleteTask('${task.id}')">Del</button>
+            </div>`;
+        card.addEventListener('click', () => editArchitectureTask(task.id));
+        container.appendChild(card);
+    });
+
+    // Apply collapsed state
+    const bar = document.getElementById('arch-bar');
+    if (bar) bar.classList.toggle('collapsed', _archBarCollapsed);
+    const btn = document.getElementById('arch-bar-toggle');
+    if (btn) btn.textContent = _archBarCollapsed ? '\u25BC' : '\u25B2';
 }
 
 // Sort a single column's cards into position order using the cache.
@@ -538,9 +623,20 @@ function reconcile(newTasks) {
         }
     }
 
-    // 2. Create new cards and rebuild changed ones
+    // 2. Create new cards and rebuild changed ones; architecture tasks are handled
+    //    by renderArchBar() — skip them here entirely.
+    let archChanged = false;
     for (const task of newTasks) {
         if (task.type === 'cancelled') continue;
+        if (task.type === 'architecture') {
+            // Track whether any arch card changed so we know to re-render the bar
+            const newFp = taskFingerprint(task);
+            if (!fingerprintCache[task.id] || fingerprintCache[task.id] !== newFp) {
+                archChanged = true;
+                fingerprintCache[task.id] = newFp;
+            }
+            continue;
+        }
         const renderCol = task.type === 'subdividing' ? 'idea' : task.type;
         const newFp = taskFingerprint(task);
 
@@ -577,6 +673,9 @@ function reconcile(newTasks) {
     for (const col of columnsToSort) {
         sortColumn(col);
     }
+
+    // 5. Re-render arch bar if anything changed there
+    if (archChanged) renderArchBar();
 
     updateBreadcrumbBar();
     updateTaskCounts();
@@ -678,6 +777,15 @@ async function switchProject(projectName) {
     await loadTasksFromDatabase();
     await loadTransitionStatuses();
     renderTasksFromDatabase();
+
+    // If the column map is open, re-render it for the new project's tasks.
+    // Update the title so it reflects the new project context.
+    if (columnMapActive && columnMapType) {
+        const label = MAP_COLUMN_LABELS[columnMapType] || (columnMapType.toUpperCase() + ' MAP');
+        document.getElementById('column-map-title').textContent = label;
+        mapTransform = { x: 0, y: 0, scale: 1 };
+        renderColumnMap(columnMapType);
+    }
 }
 
 // Load projects from the API and render the sidebar tabs
@@ -821,33 +929,20 @@ function openAddTaskModal(targetStatus) {
 }
 
 function showArchContentFields(targetStatus) {
-    const contentFields = document.getElementById('modal-content-fields');
-    const isArchitecture = targetStatus === 'architecture';
-
-    if (isArchitecture) {
-        contentFields.style.display = 'block';
-        if (currentProject === 'TheMaestro') {
-            document.getElementById('architecture-content-dags').style.display = 'block';
-            document.getElementById('architecture-content-config').style.display = 'block';
-            document.getElementById('architecture-content-repl').style.display = 'block';
-            document.getElementById('architecture-content-tests').style.display = 'block';
-            document.getElementById('architecture-content-frontend').style.display = 'none';
-            document.getElementById('architecture-content-backend').style.display = 'none';
-            document.getElementById('architecture-content-database').style.display = 'none';
-            document.getElementById('architecture-content-style').style.display = 'none';
-        } else {
-            document.getElementById('architecture-content-frontend').style.display = 'block';
-            document.getElementById('architecture-content-backend').style.display = 'block';
-            document.getElementById('architecture-content-database').style.display = 'block';
-            document.getElementById('architecture-content-style').style.display = 'block';
-            document.getElementById('architecture-content-dags').style.display = 'none';
-            document.getElementById('architecture-content-config').style.display = 'none';
-            document.getElementById('architecture-content-repl').style.display = 'none';
-            document.getElementById('architecture-content-tests').style.display = 'none';
-        }
-    } else {
-        contentFields.style.display = 'none';
-    }
+    const isArch = targetStatus === 'architecture';
+    // Show category+priority selects only for architecture cards
+    document.getElementById('modal-content-fields').style.display = isArch ? 'block' : 'none';
+    // Architecture cards don't need LLM / budget assignment
+    document.getElementById('task-llm-group').style.display    = isArch ? 'none' : 'block';
+    document.getElementById('task-budget-group').style.display = isArch ? 'none' : 'block';
+    // Owner / tags are also not meaningful for arch cards — hide them
+    const ownerRow = document.getElementById('task-owner') && document.getElementById('task-owner').closest('.form-group');
+    const tagsRow  = document.getElementById('task-tags')  && document.getElementById('task-tags').closest('.form-group');
+    if (ownerRow) ownerRow.style.display = isArch ? 'none' : 'block';
+    if (tagsRow)  tagsRow.style.display  = isArch ? 'none' : 'block';
+    // Relabel description for architecture cards
+    const descLabel = document.querySelector('label[for="task-description"]');
+    if (descLabel) descLabel.textContent = isArch ? 'Body (the constraint or fact)' : 'Description';
 }
 
 function closeModal() {
@@ -1026,18 +1121,13 @@ async function saveTask() {
 
     // Build content object for architecture tasks
     const content = currentTargetStatus === 'architecture' ? {
-        frontend: document.getElementById('arch-content-frontend').value,
-        backend: document.getElementById('arch-content-backend').value,
-        database: document.getElementById('arch-content-database').value,
-        style: document.getElementById('arch-content-style').value,
-        dags: document.getElementById('arch-content-dags').value,
-        config: document.getElementById('arch-content-config').value,
-        repl: document.getElementById('arch-content-repl').value,
-        tests: document.getElementById('arch-content-tests').value
+        category: document.getElementById('arch-category').value || 'General',
+        priority: document.getElementById('arch-priority').value || 'normal',
     } : null;
 
-    const llmVal = document.getElementById('task-llm-select').value;
-    const budgetVal = document.getElementById('task-budget-select').value;
+    const isArch = currentTargetStatus === 'architecture';
+    const llmVal = !isArch ? document.getElementById('task-llm-select').value : '';
+    const budgetVal = !isArch ? document.getElementById('task-budget-select').value : '';
     const llm_id = llmVal ? parseInt(llmVal) : null;
     const budget_id = budgetVal ? parseInt(budgetVal) : null;
 
@@ -1046,10 +1136,7 @@ async function saveTask() {
         const taskDataPayload = {
             title,
             description,
-            owner,
-            tags,
-            llm_id,
-            budget_id,
+            ...(isArch ? {} : { owner, tags, llm_id, budget_id }),
             ...(content && { content })
         };
 
@@ -1076,10 +1163,7 @@ async function saveTask() {
             title,
             type: currentTargetStatus,
             description,
-            owner,
-            tags,
-            llm_id,
-            budget_id,
+            ...(isArch ? {} : { owner, tags, llm_id, budget_id }),
             project: currentProject,
             ...(content && { content })
         };
@@ -1102,7 +1186,11 @@ async function saveTask() {
     }
 
     closeModal();
-    renderTasksFromDatabase();
+    if (isArch) {
+        renderArchBar();
+    } else {
+        renderTasksFromDatabase();
+    }
 }
 
 function canAddTaskToColumn(status) {
@@ -1896,6 +1984,7 @@ function createTaskCard(id, title, tags, owner, status) {
 // ============================================
 
 async function advanceTask(taskId) {
+    const advanceStartedAt = new Date().toISOString();
     try {
         const response = await fetch(`${API_BASE}/tasks/${taskId}/advance`, {
             method: 'POST',
@@ -1912,8 +2001,8 @@ async function advanceTask(taskId) {
         // Mark card as processing immediately
         setCardProcessing(taskId, true);
 
-        // Start polling for transition status
-        startTransitionPolling(taskId);
+        // Start polling for transition status, ignoring any results from before this click
+        startTransitionPolling(taskId, advanceStartedAt);
     } catch (error) {
         console.error('Error advancing task:', error);
     }
@@ -1949,7 +2038,7 @@ function setCardProcessing(taskId, processing) {
     }
 }
 
-function startTransitionPolling(taskId) {
+function startTransitionPolling(taskId, notBefore = null) {
     // Clear any existing poller for this task
     if (transitionPollers[taskId]) {
         clearInterval(transitionPollers[taskId]);
@@ -1965,6 +2054,11 @@ function startTransitionPolling(taskId) {
 
             // Still no result yet — keep polling
             if (data.status === 'no_transitions' || !data.outcome) {
+                return;
+            }
+
+            // Stale result from a previous run — keep polling until we see a fresh one
+            if (notBefore && data.created_at && data.created_at < notBefore) {
                 return;
             }
 
@@ -2565,21 +2659,22 @@ async function deleteTask(taskId) {
     const data = await response.json();
     const count = data.deactivated || 1;
 
+    const isArch = task && task.type === 'architecture';
+
     // Remove task and any descendants from local state
-    const idsToRemove = new Set(
-        allTasks.filter(t => t.id === taskId || (function walk(id) {
-            return allTasks.some(c => c.parent_task_id === id &&
-                (c.id === taskId || walk(c.id)));
-        })(t.id)).map(t => t.id)
-    );
-    // Simpler: just remove the clicked task from DOM immediately; reconcile will clean the rest
     delete taskData[taskId];
     allTasks = allTasks.filter(t => t.id !== taskId);
-    const card = document.querySelector(`.task-card[data-id="${taskId}"]`);
-    if (card) {
-        const container = card.closest('.tasks-container');
-        card.remove();
-        if (container) updateTaskCount(container.id.replace('tasks-', ''));
+
+    if (isArch) {
+        // Arch cards live in the arch bar, not the kanban columns
+        renderArchBar();
+    } else {
+        const card = document.querySelector(`.task-card[data-id="${taskId}"]`);
+        if (card) {
+            const container = card.closest('.tasks-container');
+            card.remove();
+            if (container) updateTaskCount(container.id.replace('tasks-', ''));
+        }
     }
     if (count > 1) showToast(`Hidden ${count} tasks (task + children).`, 'info');
     // Full reload so descendant cards disappear too
@@ -2740,14 +2835,8 @@ async function saveEditTask() {
 
     // Build content object for architecture tasks
     const content = currentTargetStatus === 'architecture' ? {
-        frontend: document.getElementById('arch-content-frontend').value,
-        backend: document.getElementById('arch-content-backend').value,
-        database: document.getElementById('arch-content-database').value,
-        style: document.getElementById('arch-content-style').value,
-        dags: document.getElementById('arch-content-dags').value,
-        config: document.getElementById('arch-content-config').value,
-        repl: document.getElementById('arch-content-repl').value,
-        tests: document.getElementById('arch-content-tests').value
+        category: document.getElementById('arch-category').value || 'General',
+        priority: document.getElementById('arch-priority').value || 'normal',
     } : null;
 
     const taskDataPayload = {
@@ -2781,27 +2870,19 @@ function editArchitectureTask(taskId) {
     if (!task) return;
 
     currentTaskId = taskId;
-    currentTargetStatus = task.type;
+    currentTargetStatus = 'architecture';
 
     document.getElementById('modal-title').textContent = `Edit Architecture: ${task.title}`;
-    document.getElementById('task-title').value = task.title;
+    document.getElementById('task-title').value = task.title || '';
+    document.getElementById('task-description').value = task.description || '';
 
-    if (task.content) {
-        const content = task.content;
-        if (content.frontend) document.getElementById('arch-content-frontend').value = content.frontend;
-        if (content.backend) document.getElementById('arch-content-backend').value = content.backend;
-        if (content.database) document.getElementById('arch-content-database').value = content.database;
-        if (content.style) document.getElementById('arch-content-style').value = content.style;
-        if (content.dags) document.getElementById('arch-content-dags').value = content.dags;
-        if (content.config) document.getElementById('arch-content-config').value = content.config;
-        if (content.repl) document.getElementById('arch-content-repl').value = content.repl;
-        if (content.tests) document.getElementById('arch-content-tests').value = content.tests;
-    }
+    const content = task.content || {};
+    const catEl  = document.getElementById('arch-category');
+    const prioEl = document.getElementById('arch-priority');
+    if (catEl)  catEl.value  = content.category || 'General';
+    if (prioEl) prioEl.value = content.priority  || 'normal';
+
     showArchContentFields('architecture');
-    document.getElementById('task-description').value = '';
-    document.getElementById('task-tags').value = '';
-    document.getElementById('task-owner').value = '';
-
     document.getElementById('task-modal').classList.add('active');
 }
 
@@ -3574,6 +3655,7 @@ function editComputeNodeEntry(id) {
     document.getElementById('cn-edit-name').value = node.name;
     document.getElementById('cn-edit-description').value = node.description || '';
     document.getElementById('cn-edit-max-sessions').value = node.max_parallel_sessions;
+    document.getElementById('cn-edit-max-loaded-models').value = node.max_loaded_models;
     document.getElementById('cn-edit-placeholder').style.display = 'none';
     document.getElementById('cn-edit-form').style.display = 'block';
     document.getElementById('cn-edit-error').style.display = 'none';
@@ -3587,12 +3669,13 @@ function renderComputeNodeList() {
         return;
     }
     let html = '<table style="width:100%;font-size:0.85rem;border-collapse:collapse">';
-    html += '<tr style="border-bottom:1px solid #dee2e6"><th style="text-align:left;padding:0.4rem">ID</th><th style="text-align:left;padding:0.4rem">Name</th><th style="text-align:left;padding:0.4rem">Max Sessions</th><th style="text-align:left;padding:0.4rem">Description</th><th></th></tr>';
+    html += '<tr style="border-bottom:1px solid #dee2e6"><th style="text-align:left;padding:0.4rem">ID</th><th style="text-align:left;padding:0.4rem">Name</th><th style="text-align:left;padding:0.4rem">Sessions</th><th style="text-align:left;padding:0.4rem">Models</th><th style="text-align:left;padding:0.4rem">Description</th><th></th></tr>';
     allComputeNodes.forEach(n => {
         html += `<tr style="border-bottom:1px solid #f0f0f0">
             <td style="padding:0.4rem">${n.id}</td>
             <td style="padding:0.4rem"><a href="#" onclick="editComputeNodeEntry(${n.id}); return false;" style="color:#0d6efd;text-decoration:none;cursor:pointer">${escapeHtml(n.name)}</a></td>
             <td style="padding:0.4rem">${n.max_parallel_sessions}</td>
+            <td style="padding:0.4rem">${n.max_loaded_models}</td>
             <td style="padding:0.4rem;color:#6c757d">${escapeHtml(n.description || '')}</td>
             <td style="padding:0.4rem"><button class="action-btn action-btn-danger" onclick="deleteComputeNodeEntry(${n.id})">Delete</button></td>
         </tr>`;
@@ -3605,13 +3688,15 @@ async function addComputeNode() {
     const name = document.getElementById('cn-name').value.trim();
     const description = document.getElementById('cn-description').value.trim();
     const mps = parseInt(document.getElementById('cn-max-sessions').value) || 1;
+    const mlm = parseInt(document.getElementById('cn-max-loaded-models').value) || 1;
     if (!name) { showInlineError('cn-error', 'Name is required.'); return; }
     if (mps < 1) { showInlineError('cn-error', 'Max sessions must be >= 1.'); return; }
+    if (mlm < 1) { showInlineError('cn-error', 'Max loaded models must be >= 1.'); return; }
 
     const res = await fetch(`${API_BASE}/compute-nodes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, description: description || null, max_parallel_sessions: mps })
+        body: JSON.stringify({ name, description: description || null, max_parallel_sessions: mps, max_loaded_models: mlm })
     });
     if (!res.ok) {
         const err = await res.json();
@@ -3621,6 +3706,7 @@ async function addComputeNode() {
     document.getElementById('cn-name').value = '';
     document.getElementById('cn-description').value = '';
     document.getElementById('cn-max-sessions').value = '1';
+    document.getElementById('cn-max-loaded-models').value = '1';
     await loadLlmsAndBudgets();
     renderComputeNodeList();
 }
@@ -3630,12 +3716,13 @@ async function saveComputeNodeEdit() {
     const name = document.getElementById('cn-edit-name').value.trim();
     const description = document.getElementById('cn-edit-description').value.trim();
     const mps = parseInt(document.getElementById('cn-edit-max-sessions').value) || 1;
+    const mlm = parseInt(document.getElementById('cn-edit-max-loaded-models').value) || 1;
     if (!name) { showInlineError('cn-edit-error', 'Name is required.'); return; }
 
     const res = await fetch(`${API_BASE}/compute-nodes/${_cnEditingId}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, description: description || null, max_parallel_sessions: mps })
+        body: JSON.stringify({ name, description: description || null, max_parallel_sessions: mps, max_loaded_models: mlm })
     });
     if (!res.ok) {
         const err = await res.json();
@@ -4097,15 +4184,22 @@ async function _mapSavePositions(toSave) {
 function renderColumnMap(colType) {
     const tasks = _mapGetTasksForColumn(colType);
 
-    const svg     = document.getElementById('column-map-svg');
-    const nodesEl = document.getElementById('column-map-nodes');
-    const canvas  = document.getElementById('column-map-canvas');
+    const svg       = document.getElementById('column-map-svg');
+    const nodesEl   = document.getElementById('column-map-nodes');
+    const canvas    = document.getElementById('column-map-canvas');
+    const scrollWrap = document.getElementById('column-map-scroll-wrap');
 
     svg.innerHTML     = '';
     nodesEl.innerHTML = '';
+    // Clear any previous empty-state message
+    const prevEmpty = scrollWrap.querySelector('.map-empty-msg');
+    if (prevEmpty) prevEmpty.remove();
 
     if (tasks.length === 0) {
-        nodesEl.innerHTML = '<div class="map-empty-msg">No tasks in this column</div>';
+        const emptyMsg = document.createElement('div');
+        emptyMsg.className = 'map-empty-msg';
+        emptyMsg.textContent = 'No tasks in this column';
+        scrollWrap.appendChild(emptyMsg);
         canvas.style.width  = '100%';
         canvas.style.height = '100%';
         applyMapTransform();

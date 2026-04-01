@@ -436,13 +436,19 @@ def append_file(path: str, content: str) -> str:
 
 
 def _get_cached_summary_for_listing(abs_path: str) -> "str | None":
-    """Sync DB lookup for a file's cached summary. Returns first 160 chars or None."""
+    """Sync DB lookup for a file's cached summary. Returns first 160 chars or None.
+
+    Prefers short_summary (2 sentences, purpose-built for listings) and falls
+    back to the first line of summary for rows that pre-date migration 0035.
+    """
     try:
         from app.database import get_file_summary_by_path
         row = get_file_summary_by_path(abs_path)
-        if row and row.summary:
-            first = row.summary.split("\n")[0].strip()
-            return (first[:160] + "…") if len(first) > 160 else first
+        if row:
+            text = (getattr(row, 'short_summary', None) or "").strip() \
+                or (row.summary or "").split("\n")[0].strip()
+            if text:
+                return (text[:160] + "…") if len(text) > 160 else text
     except Exception as exc:
         logger.debug("summary lookup failed for %s: %s", abs_path, exc)
     return None
@@ -2221,7 +2227,10 @@ async def async_dispatch_tool(
                 from app.database import get_file_summary_by_path
                 row = get_file_summary_by_path(p)
                 if row:
-                    old_summary = row.summary
+                    # Prefer short_summary as the change-context hint — it's
+                    # concise and purpose-built for this kind of diff prompt.
+                    old_summary = (getattr(row, 'short_summary', None) or "").strip() \
+                        or row.summary
         except Exception:
             pass
 

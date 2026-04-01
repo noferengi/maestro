@@ -184,11 +184,12 @@ def get_compute_node(node_id):
         db.close()
 
 
-def create_compute_node(name, description=None, max_parallel_sessions=1):
+def create_compute_node(name, description=None, max_parallel_sessions=1, max_loaded_models=1):
     db = SessionLocal()
     try:
         node = ComputeNode(name=name, description=description,
-                           max_parallel_sessions=max_parallel_sessions)
+                           max_parallel_sessions=max_parallel_sessions,
+                           max_loaded_models=max_loaded_models)
         db.add(node)
         db.commit()
         db.refresh(node)

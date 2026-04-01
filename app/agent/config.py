@@ -309,6 +309,16 @@ SCHEDULER_DISPATCHABLE_TYPES: list[str] = _getlist(
     "scheduler", "dispatchable_types",
     "idea, planning, indev, conceptual_review, optimization, full_review"
 )
+# How long to wait for a file_summary job to complete before falling back to
+# structural-only output.  Covers queue wait + total generation time across all
+# chunks.  3600s (1 hour) is the absolute safety net; actual stuck-model
+# detection is handled by FILE_SUMMARY_STREAM_IDLE_TIMEOUT.
+FILE_SUMMARY_WAIT_TIMEOUT: float = _getfloat("scheduler", "file_summary_wait_timeout", None, 3600.0)
+
+# Maximum silence (seconds) between consecutive SSE tokens before treating the
+# LLM as stuck and aborting the current file-summary call with ReadTimeout.
+# Only measures active generation — queue wait and backoff sleeps do not count.
+FILE_SUMMARY_STREAM_IDLE_TIMEOUT: float = _getfloat("scheduler", "file_summary_stream_idle_timeout", None, 60.0)
 
 # ===========================================================================
 # Verdict confidence ranges

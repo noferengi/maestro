@@ -56,6 +56,131 @@ def clear_snapshot_cache() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Architecture context — project-wide constraints injected into agent prompts
+# ---------------------------------------------------------------------------
+
+# Categories shown on architecture cards (must match the frontend select options).
+# Agents use this as documentation; the actual filtering is set-membership below.
+ARCH_CATEGORIES = [
+    'Platform', 'Design', 'Testing', 'Security', 'Performance', 'API',
+    'Tooling', 'Data', 'UX', 'Accessibility', 'Compliance', 'Deployment',
+    'Observability', 'General',
+]
+
+# Per-agent category relevance filter.
+# None  → include all categories (no filtering).
+# set   → include only cards whose category is in the set.
+#
+# Rationale:
+#   file_summary   — only needs to know Platform/Tooling/Data/General to contextualise
+#                    what kind of codebase/files it is summarising.
+#   subdivision    — needs Design/Testing/Performance/API/Data/Platform/Tooling/General
+#                    to decompose tasks that stay within architectural constraints.
+#   conceptual_review — audits design decisions, so Design/API/Data/Security/
+#                    Accessibility/Compliance/General matter most.
+#   security       — focused audit: Security/Compliance/API/Data/Platform/General.
+#   optimization   — focused audit: Performance/Platform/Data/Observability/Tooling/General.
+#   research/loop/intake/full_review → None (all categories, full context needed).
+ARCH_CATEGORY_RELEVANCE: dict[str, set[str] | None] = {
+    'file_summary':      {'Platform', 'Tooling', 'Data', 'General'},
+    'subdivision':       {'Platform', 'Design', 'Testing', 'Performance',
+                          'API', 'Data', 'Tooling', 'General'},
+    'conceptual_review': {'Design', 'API', 'Data', 'Security',
+                          'Accessibility', 'Compliance', 'General'},
+    'security':          {'Security', 'Compliance', 'API', 'Data', 'Platform', 'General'},
+    'optimization':      {'Performance', 'Platform', 'Data', 'Observability',
+                          'Tooling', 'General'},
+    # research, loop, intake, full_review → all categories (key absent = None)
+}
+
+# Priority sort order for injection (critical first)
+_ARCH_PRIORITY_ORDER = {'critical': 0, 'high': 1, 'normal': 2, 'low': 3}
+
+
+def build_architecture_context(
+    project_name: str,
+    agent_type: str | None = None,
+) -> str:
+    """Return a formatted block of architecture/constraint cards for agent context.
+
+    project_name — the Maestro project name (Task.project field).
+    agent_type   — when set, filters to categories relevant for that agent type
+                   using ARCH_CATEGORY_RELEVANCE.  None means include all cards.
+
+    Returns an empty string when no cards exist or are relevant.
+    project_name must be non-empty.
+    """
+    if not project_name:
+        return ""
+
+    try:
+        from app.database import get_tasks_by_project
+        all_tasks = get_tasks_by_project(project_name)
+    except Exception as exc:
+        logger.debug("build_architecture_context: DB fetch failed for '%s': %s", project_name, exc)
+        return ""
+
+    arch_tasks = [t for t in all_tasks if getattr(t, 'type', '') == 'architecture']
+    if not arch_tasks:
+        return ""
+
+    # Resolve category filter for this agent type
+    category_filter: set[str] | None = ARCH_CATEGORY_RELEVANCE.get(agent_type or '', None) \
+        if agent_type else None
+
+    def _category(t) -> str:
+        c = getattr(t, 'content', None) or {}
+        return (c.get('category', 'General') if isinstance(c, dict) else 'General') or 'General'
+
+    def _priority(t) -> str:
+        c = getattr(t, 'content', None) or {}
+        return (c.get('priority', 'normal') if isinstance(c, dict) else 'normal') or 'normal'
+
+    # Apply category filter
+    if category_filter is not None:
+        arch_tasks = [t for t in arch_tasks if _category(t) in category_filter]
+
+    if not arch_tasks:
+        return ""
+
+    # Sort: critical → high → normal → low, then by position
+    arch_tasks.sort(key=lambda t: (
+        _ARCH_PRIORITY_ORDER.get(_priority(t), 2),
+        getattr(t, 'position', 0) or 0,
+    ))
+
+    _PRIO_LABELS = {
+        'critical': ' [CRITICAL — hard constraint]',
+        'high':     ' [HIGH — strong preference]',
+        'normal':   '',
+        'low':      ' [low priority — soft suggestion]',
+    }
+
+    lines: list[str] = ["== PROJECT ARCHITECTURE & CONSTRAINTS =="]
+    if category_filter is not None and agent_type:
+        relevant = ', '.join(sorted(category_filter))
+        lines.append(
+            f"(Showing only categories relevant to {agent_type} work: {relevant})"
+        )
+    lines.append(
+        "These constraints apply to ALL work in this project. "
+        "Treat CRITICAL items as hard requirements."
+    )
+
+    for task in arch_tasks:
+        cat   = _category(task)
+        prio  = _priority(task)
+        label = _PRIO_LABELS.get(prio, '')
+        desc  = (getattr(task, 'description', '') or '').strip()
+        title = getattr(task, 'title', '') or ''
+        lines.append(f"\n### {title} [{cat}]{label}")
+        if desc:
+            lines.append(desc)
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Project snapshot
 # ---------------------------------------------------------------------------
 
@@ -313,11 +438,13 @@ async def async_build_file_summary(
         )
 
         if completion_key:
-            # Cache miss — wait for scheduler to dispatch and complete the job
+            # Cache miss — wait for scheduler to dispatch and complete the job.
+            # Timeout must exceed LLM_TIMEOUT_SECONDS + realistic queue wait.
             from app.agent.scheduler import wait_for_completion
+            from app.agent.config import FILE_SUMMARY_WAIT_TIMEOUT
             loop = _asyncio.get_event_loop()
             completed = await loop.run_in_executor(
-                None, wait_for_completion, completion_key, 120.0
+                None, wait_for_completion, completion_key, FILE_SUMMARY_WAIT_TIMEOUT
             )
             if not completed:
                 logger.warning("file_summary timed out for %s — using structural only", path)
@@ -325,7 +452,11 @@ async def async_build_file_summary(
 
         cached = get_file_summary(sha1, filesize)
         if cached:
-            result = f"## Summary\n{cached.summary}\n\n{structural}"
+            short = (getattr(cached, 'short_summary', None) or "").strip()
+            header = f"## Summary\n{cached.summary}"
+            if short:
+                header = f"## Short Summary\n{short}\n\n## Full Summary\n{cached.summary}"
+            result = f"{header}\n\n{structural}"
             try:
                 _file_summary_cache[session_key] = result
             except UnboundLocalError:
@@ -483,9 +614,11 @@ def build_snapshot_with_summaries(
             return ""
         try:
             row = _get_summary(abs_path)
-            if row and row.summary:
-                first = row.summary.split("\n")[0].strip()
-                return f" — {first}"
+            if row:
+                text = (getattr(row, 'short_summary', None) or "").strip() \
+                    or (row.summary or "").split("\n")[0].strip()
+                if text:
+                    return f" — {text}"
         except Exception:
             pass
         return ""

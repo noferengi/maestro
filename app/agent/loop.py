@@ -214,6 +214,9 @@ class MaestroLoop:
             try:
                 response = await self._call_llm(self._messages)
             except Exception as exc:
+                # Failed call does not count as a turn — roll back the increment.
+                self._turn -= 1
+                _LOOP_STATUS[self.task_id]["turns"] = self._turn
                 logger.error("LLM call failed on turn %d: %s", self._turn, exc)
                 self._consecutive_errors += 1
                 if self._check_failure_count():
@@ -317,12 +320,26 @@ class MaestroLoop:
             except Exception:
                 pass
 
+        # Inject architecture context — look up the task's project by task_id
+        arch_block = ""
+        try:
+            from app.database import get_task as _get_task
+            from app.agent.project_snapshot import build_architecture_context
+            _task_rec = _get_task(self.task_id)
+            if _task_rec and _task_rec.project:
+                _arch = build_architecture_context(_task_rec.project, agent_type='loop')
+                if _arch:
+                    arch_block = f"\n\n{_arch}"
+        except Exception:
+            pass
+
         return [
             {"role": "system", "content": MAESTRO_SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": (
-                    f"Your assigned task ID is: **{self.task_id}**{snapshot_block}\n\n"
+                    f"Your assigned task ID is: **{self.task_id}**"
+                    f"{snapshot_block}{arch_block}\n\n"
                     f"Begin by calling get_task('{self.task_id}') to load the full "
                     f"task definition, then follow the workflow in your system prompt.\n\n"
                     f"Your first action should be to create a safety branch: "

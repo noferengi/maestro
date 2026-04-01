@@ -83,6 +83,8 @@ Current schema migrations (0001–0032):
 - `0031` — `is_active BOOLEAN DEFAULT 1` on tasks (soft-delete support)
 - `0032` — `compute_nodes` table; `compute_node_id` FK on `llms`
 
+**Full schema reference:** See `CLAUDE_SCHEMA.md` in the project root. Read that file whenever you need to query or modify `data/kanban.db` directly — it contains every table, column, type, nullability, and default value.
+
 ## Debugging scheduler and card status
 
 Use `scripts/inspect_cards.py` to diagnose why cards aren't progressing. All output is ASCII-safe (Windows cp1252 terminal compatible).
@@ -113,17 +115,17 @@ Key diagnostics to check first when cards are stuck:
 - `migrations/runner.py` — standalone sqlite3 migration engine, no SQLAlchemy dependency.
 
 ### Agent system (`app/agent/`)
-- `loop.py` — `MaestroLoop` class. `_ACTIVE_LOOPS` / `_LOOP_STATUS` dicts power the status/stop API endpoints. Drives Design → Implement → Test → Verify cycles. Uses task's project path for snapshot injection — skips snapshot silently if no project path is set.
+- `loop.py` — `MaestroLoop` class. `_ACTIVE_LOOPS` / `_LOOP_STATUS` dicts power the status/stop API endpoints. Drives Design → Implement → Test → Verify cycles. `_build_messages()` injects both the file-structure snapshot and the full architecture context (all categories) derived from the task's project.
 - `intake.py` — Intake pipeline orchestrator for IDEA→PLANNING transitions. 4-stage voting: scope analysis, static analysis, feasibility, conflict detection. Passes `project_root` from task's project to `ResearchAgent` and `SubdivisionAgent`.
-- `research.py` — Research agent with a "lives" system (max 3 per session). Accepts `project_root` param; injects project snapshot into initial context when set. `WebSearchAgent` class (private to async `web_search` dispatch) — 10-turn agent that fetches pages and synthesizes findings; only tool available to it is `web_fetch`.
-- `subdivide.py` — Subdivision agent for decomposing oversized ideas. Accepts `project_root` param; injects project snapshot when set. Triggered by SUBDIVIDE_IDEA verdict.
+- `research.py` — Research agent with a "lives" system (max 3 per session). `_build_life_context()` on life 1 injects the file-structure snapshot followed by the full architecture context (all categories), then the investigation question. `WebSearchAgent` class (private to async `web_search` dispatch) — 10-turn agent that fetches pages and synthesizes findings; only tool available to it is `web_fetch`.
+- `subdivide.py` — Subdivision agent for decomposing oversized ideas. `_build_context()` injects snapshot then filtered architecture context (Platform/Design/Testing/Performance/API/Data/Tooling/General). Triggered by SUBDIVIDE_IDEA verdict.
 - `scheduler.py` — Push-first eager task scheduler. Dispatches DAG-ready tasks respecting per-endpoint capacity limits **and** per-compute-node capacity limits. Passes `project_root` to research jobs. `_dispatch_file_summary_jobs()` runs FIRST in `_tick()`. Completion registry: `get_or_create_completion_event()`, `signal_completion()`, `wait_for_completion()`. `_task_to_mini_dict` includes `parent_task_id` so `DAGResolver` can build the child index. `SCHEDULER_DISPATCHABLE_TYPES` default includes all pipeline stages (`idea, planning, indev, conceptual_review, optimization, full_review`) — orphaned mid-pipeline tasks are re-dispatched on restart; the `_active_sessions` alive-check prevents double-dispatch of running tasks. At the start of each `_tick()`, `node_active_counts` is built by summing `_llm_session_counts` grouped by `compute_node_id`; the node cap is checked before the per-LLM cap and the local count is incremented within the tick to prevent over-dispatch.
 - `llm_client.py` — Centralized HTTP client for all LLM calls. Requires both `llm_id` and `budget_id`. Logs every call to `budget_entries` + `expenses`.
 - `verdicts.py` — Verdict classification with confidence ranges. `Vote` and `TallyResult` dataclasses. `tally_votes()` aggregation logic.
 - `static_analysis.py` — Tree-sitter based deterministic Python code analysis for intake stage 2a.
 - `tools.py` — Agent tools with OpenAI JSON schemas + `dispatch_tool()`. **Relative paths are resolved against `effective_root` (the project path), not the process CWD** — critical for agents operating on non-Maestro projects. Categories: file I/O (read/write/append/list/count), search (`web_search` dispatches to DuckDuckGo or Brave based on `SEARCH_PROVIDER` config; `web_fetch` for direct URL retrieval), git, execution (run_shell with blocklist), deletion (archive_file — soft-delete only), task queries.
-- `project_snapshot.py` — `build_project_snapshot(project_root)` and `build_snapshot_with_summaries(project_root)` now **require an explicit `project_root`** — there is no default fallback to TheMaestro's own directory. `async_build_file_summary()` uses enqueue+wait pattern. Session cache uses `("llm", path, mtime, size)` prefix to avoid collision with structural entries.
-- `file_summary_agent.py` — `enqueue_file_summary()` + `execute_file_summary()`. Called by scheduler worker thread.
+- `project_snapshot.py` — `build_project_snapshot(project_root)` and `build_snapshot_with_summaries(project_root)` now **require an explicit `project_root`** — there is no default fallback to TheMaestro's own directory. `async_build_file_summary()` uses enqueue+wait pattern. Session cache uses `("llm", path, mtime, size)` prefix to avoid collision with structural entries. `build_architecture_context(project_name, agent_type=None)` fetches `type='architecture'` tasks for the project and formats them as a structured constraint block; `ARCH_CATEGORY_RELEVANCE` dict maps agent type → relevant category set (None = all) so each agent receives only the categories that matter to its work.
+- `file_summary_agent.py` — `enqueue_file_summary()` + `execute_file_summary()`. Called by scheduler worker thread. Injects a filtered architecture context preamble (Platform/Tooling/Data/General only) into all three prompt paths when a `task_id` is available.
 - `dag.py` — `DAGResolver`: Kahn's topological sort, ready-task finder, cycle detection. `_children_by_parent` index (built from `parent_task_id` fields) enables `_is_effectively_done()` — a Big Idea parent satisfies a prerequisite edge once all its active (non-cancelled) children are recursively done, without the parent itself reaching `completed`. Parents with children are skipped in `get_ready_tasks()` (not directly dispatchable). Mid-pipeline stages (`indev`, `conceptual_review`, `optimization`, `full_review`) are no longer excluded from `get_ready_tasks()` — they surface as ready when their thread dies, enabling restart recovery.
 - `config.py` — constants (endpoint, limits, archive path, branch prefix).
 - `system_prompt.py` — `MAESTRO_SYSTEM_PROMPT`.
@@ -134,6 +136,7 @@ Key diagnostics to check first when cards are stuck:
 Each project record has: `name` (PK), `path` (absolute filesystem root), `description`, `llm_id` (default LLM for maintenance), `budget_id` (default budget for maintenance).
 
 - **Agent isolation** — `IntakePipeline`, `ResearchAgent`, `SubdivisionAgent`, and `MaestroLoop` all receive `project_root` derived from `get_project_path(task.project)`. Snapshot injection is scoped to the task's project, never Maestro's own source tree.
+- **Architecture context injection** — `build_architecture_context(project_name, agent_type)` is called in `loop.py` (`_build_messages`), `research.py` (`_build_life_context` life 1), `subdivide.py` (`_build_context`), and `file_summary_agent.py` (`execute_file_summary`). Each agent type receives only the card categories relevant to its work, as defined by `ARCH_CATEGORY_RELEVANCE` in `project_snapshot.py`. Categories with `None` (research, loop, full_review) receive all cards; categories with a set receive only matching cards.
 - **Tool isolation** — `_assert_safe_path()` in `tools.py` resolves relative paths against `effective_root` so `read_file("src/main.py")` opens the correct file in the task's project, not in `D:/workspace/TheMaestro/`.
 - **LLM/budget inheritance** — When creating a new task, `openAddTaskModal()` pre-selects the current project's `llm_id` as the default LLM. Prewarm file-summary jobs use the project's `budget_id` when set; falls back to first infinite budget otherwise.
 - **`allProjects`** global in `kanban.js` — `[{name, path, description, llm_id, budget_id}]`, kept in sync by `loadProjects()`.
@@ -141,10 +144,12 @@ Each project record has: `name` (PK), `path` (absolute filesystem root), `descri
 ### Frontend (`app/web/`)
 
 #### Board (`index.html` + `kanban.js` + `style.css`)
-- `index.html` — board shell; project tabs, nine columns (ARCHITECTURE, IDEAS, PLANNING, INDEV, CONCEPTUAL_REVIEW, OPTIMIZATION, SECURITY, FULL_REVIEW, COMPLETED), the Column Map overlay (`#column-map-container`), nine modals (task create/edit, new project, edit project, transition, LLM endpoints, budgets, tools, **compute nodes**). New/Edit Project modals both have **Default LLM** and **Budget** dropdowns. The **LLM Endpoints** modal Add/Edit panes each have a **Compute Node** dropdown.
+- `index.html` — board shell; project tabs, **`#arch-bar`** (horizontal architecture bar spanning full width above the board), eight pipeline columns (IDEAS, PLANNING, INDEV, CONCEPTUAL_REVIEW, OPTIMIZATION, SECURITY, FULL_REVIEW, COMPLETED), the Column Map overlay (`#column-map-container`), nine modals (task create/edit, new project, edit project, transition, LLM endpoints, budgets, tools, **compute nodes**). New/Edit Project modals both have **Default LLM** and **Budget** dropdowns. The **LLM Endpoints** modal Add/Edit panes each have a **Compute Node** dropdown.
 - `kanban.js` — all board behaviour. Key globals:
   - `taskData`, `allTasks`, `currentProject` — task state
   - `allLlms`, `allBudgets`, `allComputeNodes`, `allProjects` — endpoint/budget/compute node/project caches
+  - `ARCH_CATEGORY_COLORS` — category name → hex colour for arch card badges (14 entries)
+  - `_archBarCollapsed` — boolean, persisted in `localStorage`; drives `#arch-bar.collapsed` CSS class
   - `transitionCache`, `transitionPollers` — intake pipeline polling
   - `columnMapActive`, `columnMapType` — Column Map View state flag
   - `_mapCurrentEdges`, `_mapCurrentNodePositions`, `_mapCurrentColor`, `_mapOffsetX/Y` — shared map render state
@@ -153,6 +158,16 @@ Each project record has: `name` (PK), `path` (absolute filesystem root), `descri
   - `currentBigIdeaFilter`, `breadcrumbStack`, `descendantIndex` — Big Idea zoom state
   - `_modalMousedownTarget` — drag-close fix (global mousedown listener, all modals)
   - `_stagePickerTaskId` — currently open stage-picker flyout task ID (null = closed)
+
+#### Architecture Bar (`#arch-bar`)
+A dark navy horizontal band rendered **above** the kanban pipeline columns (not inside them). Architecture tasks (`type='architecture'`) live here exclusively — they are not rendered in any pipeline column.
+
+- `renderArchBar()` — rebuilds all `.arch-card` elements from `taskData`; sorts by priority (`critical→high→normal→low`) then `position`. Called by `renderTasksFromDatabase()` and after any arch card create/edit/delete. Also called by `reconcile()` when any arch task fingerprint changes.
+- `toggleArchBar()` — flips `_archBarCollapsed`, saves to `localStorage`, toggles `#arch-bar.collapsed` class.
+- **Arch card schema** (`content` JSON): `category` (one of 14 fixed values: Platform/Design/Testing/Security/Performance/API/Tooling/Data/UX/Accessibility/Compliance/Deployment/Observability/General) and `priority` (critical/high/normal/low). The card body is the task's `description` field. LLM, budget, owner, tags are not used.
+- **Modal integration** — `openAddTaskModal('architecture')` and `editArchitectureTask(taskId)` both use the shared task modal but call `showArchContentFields('architecture')` which shows the `#arch-category` / `#arch-priority` selects, hides LLM/budget/owner/tags fields, and relabels the description field as "Body (the constraint or fact)".
+- **`reconcile()` handling** — arch tasks are explicitly skipped in the card-cache loop (no `.task-card` DOM element created); fingerprint changes set `archChanged = true` which triggers `renderArchBar()` at the end.
+- **`deleteTask()` handling** — detects `task.type === 'architecture'` and calls `renderArchBar()` instead of searching for a `.task-card` DOM node.
 
 **Card toolbar** — hover-revealed on every card (and map node), `flex-wrap` layout in three groups separated by `.toolbar-sep` dividers:
 - **Agents**: 🔍 Research · ✂ Subdivide · 📋 Planning pipeline · 👁 Conceptual Review · 🔒 Security pipeline · ⌨ Manual Session
@@ -204,7 +219,7 @@ INI file with sections: `[intake]`, `[subdivision]`, `[capacity]`, `[context_war
 - `[search]` — `provider` (duckduckgo | brave, default duckduckgo), `brave_api_key` (required only if provider=brave). Env overrides: `MAESTRO_SEARCH_PROVIDER`, `BRAVE_API_KEY`.
 
 ### Data flow
-Tasks are per-project. Switching projects calls `loadTasksFromDatabase()` which re-fetches `/api/projects/{name}/tasks` and fully rebuilds `taskData`. `renderTasksFromDatabase()` groups tasks by type, sorts each group by `position`, and appends cards to their column containers. Drag-and-drop reorder POSTs to `/api/tasks/{id}/reorder`, then re-fetches the full project task list to get authoritative positions before re-rendering. When `columnMapActive` is true, `reconcile()` only refreshes `taskData` and skips DOM reconciliation.
+Tasks are per-project. Switching projects calls `loadTasksFromDatabase()` which re-fetches `/api/projects/{name}/tasks` and fully rebuilds `taskData`. `renderTasksFromDatabase()` groups tasks by type, sorts each group by `position`, appends pipeline cards to their column containers, and calls `renderArchBar()` to rebuild the architecture bar. Architecture tasks (`type='architecture'`) are excluded from the pipeline columns array and rendered only in the arch bar. Drag-and-drop reorder POSTs to `/api/tasks/{id}/reorder`, then re-fetches the full project task list to get authoritative positions before re-rendering. When `columnMapActive` is true, `reconcile()` only refreshes `taskData` and skips DOM reconciliation.
 
 ### Key API routes
 ```

@@ -640,6 +640,46 @@ def _handle_self_healing_rejection(task, result, llm_base_url, llm_model, max_co
     logger.info("[intake] Self-healing: re-subdivided '%s' into %d sub-ideas (attempt %d).", parent_task.id, len(child_ids), attempt + 1)
 
 
+def _pipeline_session(func):
+    """Decorator for background pipeline functions.
+
+    Waits until the target LLM is the active model (or the router is idle) and
+    has a free slot, then registers the session with the scheduler before
+    running.  Releases the slot when the function exits.
+
+    This makes ALL API-triggered pipelines (intake, planning, review, loop, etc.)
+    subject to the same one-LLM-at-a-time and capacity limits as scheduler-
+    dispatched jobs, preventing the model-thrashing that occurs when a manual
+    action fires while the scheduler has a different model loaded.
+    """
+    import functools
+
+    @functools.wraps(func)
+    def wrapper(task_id: str, *args, **kwargs):
+        from app.agent.scheduler import (
+            wait_and_register_pipeline_session,
+            unregister_pipeline_session,
+        )
+        task = get_task(task_id)
+        if task and task.llm_id:
+            key = f"bg-{func.__name__}-{task_id}"
+            registered = wait_and_register_pipeline_session(key, task.llm_id)
+            if not registered:
+                logger.error(
+                    "[pipeline] %s for task '%s': timed out waiting for LLM %d slot — aborting.",
+                    func.__name__, task_id, task.llm_id,
+                )
+                return
+            try:
+                return func(task_id, *args, **kwargs)
+            finally:
+                unregister_pipeline_session(key, task.llm_id)
+        else:
+            return func(task_id, *args, **kwargs)
+    return wrapper
+
+
+@_pipeline_session
 def _run_regenerate_subdivision(task_id: str) -> None:
     """Background runner: re-runs the subdivision agent to produce a new set of children.
 
@@ -719,6 +759,7 @@ def _run_regenerate_subdivision(task_id: str) -> None:
         logger.exception("[regen] Regeneration for '%s' failed.", task_id)
 
 
+@_pipeline_session
 def _run_intake_pipeline(task_id: str) -> None:
     """Background runner for the intake pipeline."""
     try:
@@ -787,6 +828,7 @@ def _run_intake_pipeline(task_id: str) -> None:
         logger.exception("[intake] Pipeline for '%s' failed.", task_id)
 
 
+@_pipeline_session
 def _run_planning_pipeline_bg(task_id: str) -> None:
     """Background runner for the planning pipeline."""
     try:
@@ -852,6 +894,7 @@ def _run_planning_pipeline_bg(task_id: str) -> None:
         logger.exception("[planning] Pipeline for '%s' failed.", task_id)
 
 
+@_pipeline_session
 def _run_dev_orchestrator_bg(task_id: str) -> None:
     """Background runner for the development orchestrator."""
     try:
@@ -910,6 +953,7 @@ def _run_dev_orchestrator_bg(task_id: str) -> None:
         logger.exception("[indev] Orchestrator for '%s' failed.", task_id)
 
 
+@_pipeline_session
 def _advance_to_optimization(task_id: str) -> None:
     """Auto-advance from conceptual review to optimization."""
     try:
@@ -961,6 +1005,7 @@ def _advance_to_optimization(task_id: str) -> None:
         logger.exception("[review] Pipeline for '%s' failed.", task_id)
 
 
+@_pipeline_session
 def _run_optimization_only_bg(task_id: str) -> None:
     """On-demand: run only the optimization pipeline (no security)."""
     try:
@@ -994,6 +1039,7 @@ def _run_optimization_only_bg(task_id: str) -> None:
         logger.exception("[optimization-only] Pipeline for '%s' failed.", task_id)
 
 
+@_pipeline_session
 def _run_security_only_bg(task_id: str) -> None:
     """On-demand: run only the security review pipeline (no optimization)."""
     try:
@@ -1036,6 +1082,7 @@ def _run_security_only_bg(task_id: str) -> None:
         logger.exception("[security-only] Pipeline for '%s' failed.", task_id)
 
 
+@_pipeline_session
 def _run_security_pipeline_bg(task_id: str) -> None:
     """Background runner for security + optimization pipelines."""
     try:
@@ -1097,6 +1144,7 @@ def _run_security_pipeline_bg(task_id: str) -> None:
         logger.exception("[security] Pipeline for '%s' failed.", task_id)
 
 
+@_pipeline_session
 def _run_full_review_bg(task_id: str) -> None:
     """Background runner for full review pipeline."""
     try:
@@ -1639,6 +1687,7 @@ def get_task_research_jobs(task_id: str):
 _ADHOC_RESEARCH_JOBS: dict[int, dict] = {}  # job_id -> {status, findings, verdict, error}
 
 
+@_pipeline_session
 def _run_adhoc_research(task_id: str, question: str, job_id: int) -> None:
     """Background runner: executes a standalone research agent triggered from the card toolbar."""
     import asyncio
@@ -2052,6 +2101,7 @@ def compute_node_to_dict(node):
         "name": node.name,
         "description": node.description,
         "max_parallel_sessions": node.max_parallel_sessions,
+        "max_loaded_models": node.max_loaded_models,
     }
 
 
@@ -2363,10 +2413,14 @@ def create_new_compute_node(data: dict):
     mps = data.get('max_parallel_sessions', 1)
     if not isinstance(mps, int) or mps < 1:
         raise HTTPException(status_code=400, detail="max_parallel_sessions must be >= 1")
+    mlm = data.get('max_loaded_models', 1)
+    if not isinstance(mlm, int) or mlm < 1:
+        raise HTTPException(status_code=400, detail="max_loaded_models must be >= 1")
     node = create_compute_node(
         name=data['name'],
         description=data.get('description'),
         max_parallel_sessions=mps,
+        max_loaded_models=mlm,
     )
     if not node:
         raise HTTPException(status_code=409, detail="Compute node with this name already exists")
@@ -2375,7 +2429,7 @@ def create_new_compute_node(data: dict):
 
 @app.put("/api/compute-nodes/{node_id}", response_model=dict)
 def update_existing_compute_node(node_id: int, data: dict):
-    allowed = ['name', 'description', 'max_parallel_sessions']
+    allowed = ['name', 'description', 'max_parallel_sessions', 'max_loaded_models']
     updates = {k: v for k, v in data.items() if k in allowed}
     node = update_compute_node(node_id, **updates)
     if not node:
@@ -2690,6 +2744,7 @@ def get_agent_tools():
 # Agent API Endpoints
 # ============================================
 
+@_pipeline_session
 def _run_loop_in_background(task_id: str) -> None:
     """
     Fire-and-forget coroutine runner for MaestroLoop.

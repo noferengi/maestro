@@ -42,6 +42,8 @@ def create_file_summary(
     path: str,
     summary: str,
     static_analysis_json: "str | None" = None,
+    *,
+    short_summary: "str | None" = None,
 ) -> "FileSummary":
     """Insert a new FileSummary row.  Uses INSERT OR IGNORE semantics via
     try/except so concurrent agents summarising the same file don't crash.
@@ -54,6 +56,7 @@ def create_file_summary(
             file_size_bytes=filesize,
             file_path=path,
             summary=summary,
+            short_summary=short_summary,
             static_analysis_json=static_analysis_json,
         )
         db.add(row)

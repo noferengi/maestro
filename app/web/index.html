@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kanban Board - TheMaestro</title>
-    <link rel="stylesheet" href="/static/style.css?v=25">
-    <script src="/static/kanban.js?v=41"></script>
+    <link rel="stylesheet" href="/static/style.css?v=26">
+    <script src="/static/kanban.js?v=44"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -77,42 +77,21 @@
             <button class="breadcrumb-back" onclick="zoomToRoot()">Back to Board</button>
         </div>
 
-        <div class="kanban-board">
-            <!-- ARCHITECTURE Column (IMMUTABLE) -->
-            <div class="column" id="column-architecture">
-                <div class="column-header" onclick="openColumnMap('architecture')" title="Click to open Architecture Map">
-                    <span class="column-title">ARCHITECTURE</span>
-                    <span class="task-count" id="count-architecture">2</span>
-                </div>
-                <div class="tasks-container" id="tasks-architecture" onclick="handleTasksContainerClick(event,'architecture')">
-                    <div class="task-card architecture" data-id="arch-1">
-                        <div class="task-title">Project Stack</div>
-                        <div class="task-meta">
-                            <span class="tag">core</span>
-                        </div>
-                        <div class="task-arch-content">
-                            <strong>Frontend:</strong> HTML/CSS/JS<br>
-                            <strong>Backend:</strong> FastAPI + Uvicorn<br>
-                            <strong>Database:</strong> SQLite (development)<br>
-                            <strong>Style:</strong> Bootstrap CSS
-                        </div>
-                    </div>
-                    <div class="task-card architecture" data-id="arch-2">
-                        <div class="task-title">Code Structure</div>
-                        <div class="task-meta">
-                            <span class="tag">core</span>
-                        </div>
-                        <div class="task-arch-content">
-                            <strong>DAGs:</strong> dags.py<br>
-                            <strong>Config:</strong> config.py<br>
-                            <strong>REPL:</strong> repl.py<br>
-                            <strong>Tests:</strong> test_*.py
-                        </div>
-                    </div>
-                </div>
-                <button class="add-task-btn" onclick="openAddTaskModal('architecture')">+ Add Architecture Note</button>
+        <!-- PROJECT ARCHITECTURE horizontal bar — context injected into every agent -->
+        <div id="arch-bar">
+            <div id="arch-bar-header">
+                <span id="arch-bar-title">PROJECT ARCHITECTURE</span>
+                <span id="arch-bar-subtitle">Global constraints &amp; context &mdash; injected into all agents</span>
+                <span id="arch-bar-count"></span>
+                <button id="arch-bar-add" onclick="openAddTaskModal('architecture')" title="Add architecture card">+ Add</button>
+                <button id="arch-bar-toggle" onclick="toggleArchBar()" title="Collapse/expand">&#9650;</button>
             </div>
+            <div id="arch-cards">
+                <!-- Populated by renderArchBar() -->
+            </div>
+        </div>
 
+        <div class="kanban-board">
             <!-- IDEA Column -->
             <div class="column" id="column-idea">
                 <div class="column-header" onclick="openColumnMap('idea')" title="Click to open Ideas Map">
@@ -229,37 +208,36 @@
                     <input type="text" class="form-input" id="task-title" placeholder="Enter task title...">
                 </div>
                 <div class="form-group" id="modal-content-fields">
-                    <div id="architecture-content-frontend" class="arch-content-field">
-                        <label class="form-label" for="arch-content-frontend">Frontend</label>
-                        <input type="text" class="form-input" id="arch-content-frontend" placeholder="e.g., HTML/CSS/JS...">
-                    </div>
-                    <div id="architecture-content-backend" class="arch-content-field">
-                        <label class="form-label" for="arch-content-backend">Backend</label>
-                        <input type="text" class="form-input" id="arch-content-backend" placeholder="e.g., FastAPI + Uvicorn...">
-                    </div>
-                    <div id="architecture-content-database" class="arch-content-field">
-                        <label class="form-label" for="arch-content-database">Database</label>
-                        <input type="text" class="form-input" id="arch-content-database" placeholder="e.g., SQLite...">
-                    </div>
-                    <div id="architecture-content-style" class="arch-content-field">
-                        <label class="form-label" for="arch-content-style">Style</label>
-                        <input type="text" class="form-input" id="arch-content-style" placeholder="e.g., Bootstrap...">
-                    </div>
-                    <div id="architecture-content-dags" class="arch-content-field">
-                        <label class="form-label" for="arch-content-dags">DAGs</label>
-                        <input type="text" class="form-input" id="arch-content-dags" placeholder="e.g., dags.py...">
-                    </div>
-                    <div id="architecture-content-config" class="arch-content-field">
-                        <label class="form-label" for="arch-content-config">Config</label>
-                        <input type="text" class="form-input" id="arch-content-config" placeholder="e.g., config.py...">
-                    </div>
-                    <div id="architecture-content-repl" class="arch-content-field">
-                        <label class="form-label" for="arch-content-repl">REPL</label>
-                        <input type="text" class="form-input" id="arch-content-repl" placeholder="e.g., repl.py...">
-                    </div>
-                    <div id="architecture-content-tests" class="arch-content-field">
-                        <label class="form-label" for="arch-content-tests">Tests</label>
-                        <input type="text" class="form-input" id="arch-content-tests" placeholder="e.g., test_*.py...">
+                    <div style="display:flex;gap:1rem">
+                        <div class="form-group" style="flex:2;margin-bottom:0">
+                            <label class="form-label" for="arch-category">Category</label>
+                            <select class="form-input" id="arch-category">
+                                <option value="Platform">Platform — OS, hardware, device targets</option>
+                                <option value="Design">Design — architecture patterns, design philosophy</option>
+                                <option value="Testing">Testing — isolation, coverage, tooling constraints</option>
+                                <option value="Security">Security — security requirements and policies</option>
+                                <option value="Performance">Performance — latency, throughput, resource targets</option>
+                                <option value="API">API — interface contracts, REST/RPC conventions</option>
+                                <option value="Tooling">Tooling — build system, dependencies, CI/CD</option>
+                                <option value="Data">Data — models, storage, migration policies</option>
+                                <option value="UX">UX — UI/UX constraints and design guidelines</option>
+                                <option value="Accessibility">Accessibility — a11y requirements, WCAG compliance</option>
+                                <option value="Compliance">Compliance — legal, regulatory, privacy requirements</option>
+                                <option value="Deployment">Deployment — infra, environments, release process</option>
+                                <option value="Observability">Observability — logging, monitoring, tracing</option>
+                                <option value="General" selected>General — catch-all project context</option>
+                            </select>
+                        </div>
+                        <div class="form-group" style="flex:1;margin-bottom:0">
+                            <label class="form-label" for="arch-priority">Priority</label>
+                            <select class="form-input" id="arch-priority">
+                                <option value="critical">Critical</option>
+                                <option value="high">High</option>
+                                <option value="normal" selected>Normal</option>
+                                <option value="low">Low</option>
+                            </select>
+                            <div style="font-size:0.7rem;color:#6c757d;margin-top:0.2rem">Controls agent injection order.</div>
+                        </div>
                     </div>
                 </div>
                 <div class="form-group">
@@ -635,8 +613,12 @@
                         <input type="text" class="form-input" id="cn-description" placeholder="e.g. RTX 4090 x2, 128GB RAM">
                     </div>
                     <div class="form-group">
-                        <label class="form-label" for="cn-max-sessions">Max Parallel Sessions (node-level cap)</label>
+                        <label class="form-label" for="cn-max-sessions">Max Parallel Sessions (total request throughput cap)</label>
                         <input type="number" class="form-input" id="cn-max-sessions" value="1" min="1" max="1024">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="cn-max-loaded-models">Max Loaded Models (distinct models in VRAM simultaneously)</label>
+                        <input type="number" class="form-input" id="cn-max-loaded-models" value="1" min="1" max="1024">
                     </div>
                     <div id="cn-error" class="inline-error" style="display:none"></div>
                 </div>
@@ -655,8 +637,12 @@
                             <input type="text" class="form-input" id="cn-edit-description">
                         </div>
                         <div class="form-group">
-                            <label class="form-label" for="cn-edit-max-sessions">Max Parallel Sessions</label>
+                            <label class="form-label" for="cn-edit-max-sessions">Max Parallel Sessions (total request throughput cap)</label>
                             <input type="number" class="form-input" id="cn-edit-max-sessions" min="1" max="1024">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="cn-edit-max-loaded-models">Max Loaded Models (distinct models in VRAM simultaneously)</label>
+                            <input type="number" class="form-input" id="cn-edit-max-loaded-models" min="1" max="1024">
                         </div>
                         <div id="cn-edit-error" class="inline-error" style="display:none"></div>
                     </div>

@@ -41,7 +41,10 @@ Thumbs.db
 
 # Maestro agent artefacts
 .archive/
-.maestro/task_dag.json
+.maestro/
+
+# Qwen local config (private, not project-relevant)
+.qwen/
 
 # Claude Code internal worktrees (temp agent sandboxes)
 .claude/worktrees/

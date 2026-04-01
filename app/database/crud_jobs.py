@@ -134,6 +134,45 @@ def count_pending_research_jobs():
         db.close()
 
 
+def get_retriable_research_jobs(
+    failed_cooldown_seconds: float = 300.0,
+    limit: int = 10,
+) -> "list[ResearchJob]":
+    """Return research jobs that should be retried.
+
+    Includes:
+    - Jobs with status='failed' whose completed_at is older than failed_cooldown_seconds.
+      (Caller resets these to 'pending'.)
+    - Jobs with status='running' regardless of age.
+      (Caller checks _active_sessions; orphaned ones get reset to 'pending'.)
+    """
+    from datetime import timedelta, timezone
+    from sqlalchemy import or_, and_
+    db = SessionLocal()
+    try:
+        cutoff = datetime.utcnow() - timedelta(seconds=failed_cooldown_seconds)
+        return (
+            db.query(ResearchJob)
+            .filter(
+                or_(
+                    and_(
+                        ResearchJob.status == 'failed',
+                        ResearchJob.completed_at < cutoff,
+                    ),
+                    ResearchJob.status == 'running',
+                )
+            )
+            .order_by(ResearchJob.priority, ResearchJob.created_at)
+            .limit(limit)
+            .all()
+        )
+    except Exception as exc:
+        logger.error("Error getting retriable research jobs: %s", exc)
+        return []
+    finally:
+        db.close()
+
+
 # ---------------------------------------------------------------------------
 # FileSummaryJob CRUD
 # ---------------------------------------------------------------------------
@@ -233,6 +272,45 @@ def count_pending_file_summary_jobs() -> int:
     except Exception as exc:
         logger.error("Error counting pending file summary jobs: %s", exc)
         return 0
+    finally:
+        db.close()
+
+
+def get_retriable_file_summary_jobs(
+    failed_cooldown_seconds: float = 300.0,
+    limit: int = 20,
+) -> "list[FileSummaryJob]":
+    """Return file summary jobs that should be retried.
+
+    Includes:
+    - Jobs with status='failed' whose completed_at is older than failed_cooldown_seconds.
+      (Caller resets these to 'pending'.)
+    - Jobs with status='running' regardless of age.
+      (Caller checks _active_sessions; orphaned ones get reset to 'pending'.)
+    """
+    from datetime import timedelta
+    from sqlalchemy import or_, and_
+    db = SessionLocal()
+    try:
+        cutoff = datetime.utcnow() - timedelta(seconds=failed_cooldown_seconds)
+        return (
+            db.query(FileSummaryJob)
+            .filter(
+                or_(
+                    and_(
+                        FileSummaryJob.status == 'failed',
+                        FileSummaryJob.completed_at < cutoff,
+                    ),
+                    FileSummaryJob.status == 'running',
+                )
+            )
+            .order_by(FileSummaryJob.priority.asc(), FileSummaryJob.created_at.asc())
+            .limit(limit)
+            .all()
+        )
+    except Exception as exc:
+        logger.error("Error getting retriable file summary jobs: %s", exc)
+        return []
     finally:
         db.close()
 
