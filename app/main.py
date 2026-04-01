@@ -2248,6 +2248,63 @@ def remove_project(project_name: str):
     return {"deleted": project_name}
 
 
+_ARCH_CATEGORIES = [
+    "Platform", "Design", "Testing", "Security", "Performance",
+    "API", "Tooling", "Data", "UX", "Accessibility",
+    "Compliance", "Deployment", "Observability", "General",
+]
+
+
+@app.post("/api/projects/{project_name}/populate-arch")
+def populate_arch(project_name: str):
+    """Queue arch_gen_jobs for every architecture category not yet present in the project.
+
+    Existing cards are never modified.  Returns the count of jobs queued and the
+    list of categories that will be generated.
+    """
+    from app.database import get_project, get_tasks_by_project, create_arch_gen_job
+
+    project = get_project(project_name)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Collect categories that already have at least one arch card
+    tasks = get_tasks_by_project(project_name)
+    existing_categories: set[str] = set()
+    for t in tasks:
+        if t.type != 'architecture':
+            continue
+        try:
+            content = t.content if isinstance(t.content, dict) else (
+                json.loads(t.content) if t.content else {}
+            )
+            cat = content.get('category')
+            if cat:
+                existing_categories.add(cat)
+        except Exception:
+            pass
+
+    missing = [c for c in _ARCH_CATEGORIES if c not in existing_categories]
+    if not missing:
+        return {"queued": 0, "categories": [], "message": "All 14 categories already have cards"}
+
+    llm_id, budget_id = _pick_prewarm_resources(project.llm_id, project.budget_id)
+    if llm_id is None or budget_id is None:
+        raise HTTPException(
+            status_code=503,
+            detail="No LLM endpoint or budget available. Configure a default LLM and budget on the project.",
+        )
+
+    for category in missing:
+        create_arch_gen_job(project_name, category, llm_id=llm_id, budget_id=budget_id)
+
+    logger.info(
+        "populate-arch: queued %d arch_gen_jobs for project '%s': %s",
+        len(missing), project_name, missing,
+    )
+    return {"queued": len(missing), "categories": missing}
+
+
 # ============================================
 # LLM API Endpoints (global, not project-scoped)
 # ============================================
@@ -2617,6 +2674,11 @@ def list_diagnostic_tasks():
 @app.get("/diagnostics")
 def read_diagnostics():
     return FileResponse("app/web/diagnostics.html")
+
+
+@app.get("/scheduler")
+def read_scheduler():
+    return FileResponse("app/web/scheduler.html")
 
 
 # ============================================

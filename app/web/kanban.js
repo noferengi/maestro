@@ -525,6 +525,33 @@ function toggleArchBar() {
     if (btn) btn.textContent = _archBarCollapsed ? '\u25BC' : '\u25B2';
 }
 
+async function populateArchBar() {
+    if (!currentProject) return;
+    const btn = document.getElementById('arch-bar-populate');
+    if (!btn || btn.disabled) return;
+    btn.disabled = true;
+    const orig = btn.textContent;
+    btn.textContent = '…';
+    try {
+        const r = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/populate-arch`, { method: 'POST' });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || 'Error');
+        if (data.queued === 0) {
+            btn.textContent = 'All done';
+        } else {
+            btn.textContent = `Queued ${data.queued}`;
+        }
+    } catch (e) {
+        btn.textContent = 'Error';
+        console.error('populateArchBar:', e);
+    } finally {
+        setTimeout(() => {
+            btn.disabled = false;
+            btn.textContent = orig;
+        }, 3000);
+    }
+}
+
 function renderArchBar() {
     const container = document.getElementById('arch-cards');
     const countEl   = document.getElementById('arch-bar-count');

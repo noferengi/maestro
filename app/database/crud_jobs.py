@@ -16,7 +16,7 @@ import logging
 from datetime import datetime, timezone
 
 from .session import SessionLocal
-from .models import ResearchJob, FileSummaryJob, OptimizationBenchmark
+from .models import ResearchJob, FileSummaryJob, OptimizationBenchmark, ArchGenJob
 
 logger = logging.getLogger(__name__)
 
@@ -353,6 +353,111 @@ def get_optimization_benchmarks(parent_task_id):
         )
     except Exception as e:
         logger.error("Error getting benchmarks for task '%s': %s", parent_task_id, e)
+        return []
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# ArchGenJob CRUD
+# ---------------------------------------------------------------------------
+
+def create_arch_gen_job(
+    project: str,
+    category: str,
+    *,
+    llm_id: "int | None" = None,
+    budget_id: "int | None" = None,
+    priority: float = 1.0,
+) -> "ArchGenJob | None":
+    """Insert a new pending arch gen job."""
+    db = SessionLocal()
+    try:
+        job = ArchGenJob(
+            project=project,
+            category=category,
+            llm_id=llm_id,
+            budget_id=budget_id,
+            priority=priority,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        return job
+    except Exception as e:
+        db.rollback()
+        logger.error("Error creating arch_gen_job: %s", e)
+        return None
+    finally:
+        db.close()
+
+
+def get_pending_arch_gen_jobs(limit: int = 10) -> "list[ArchGenJob]":
+    """Return pending arch gen jobs ordered by priority ASC, created_at ASC."""
+    db = SessionLocal()
+    try:
+        return (
+            db.query(ArchGenJob)
+            .filter(ArchGenJob.status == 'pending')
+            .order_by(ArchGenJob.priority.asc(), ArchGenJob.created_at.asc())
+            .limit(limit)
+            .all()
+        )
+    finally:
+        db.close()
+
+
+def update_arch_gen_job(job_id: int, **kwargs) -> None:
+    """Update fields on an arch gen job; auto-sets completed_at on terminal status."""
+    db = SessionLocal()
+    try:
+        job = db.query(ArchGenJob).filter(ArchGenJob.id == job_id).first()
+        if not job:
+            return
+        for key, value in kwargs.items():
+            setattr(job, key, value)
+        if kwargs.get('status') in ('completed', 'failed') and job.completed_at is None:
+            job.completed_at = datetime.utcnow()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.error("Error updating arch_gen_job %d: %s", job_id, exc)
+    finally:
+        db.close()
+
+
+def get_retriable_arch_gen_jobs(
+    failed_cooldown_seconds: float = 300.0,
+    limit: int = 10,
+) -> "list[ArchGenJob]":
+    """Return arch gen jobs that should be retried.
+
+    Includes:
+    - Jobs with status='failed' whose completed_at is older than failed_cooldown_seconds.
+    - Jobs with status='running' regardless of age (orphaned by a crash).
+    """
+    from datetime import timedelta
+    from sqlalchemy import or_, and_
+    db = SessionLocal()
+    try:
+        cutoff = datetime.utcnow() - timedelta(seconds=failed_cooldown_seconds)
+        return (
+            db.query(ArchGenJob)
+            .filter(
+                or_(
+                    and_(
+                        ArchGenJob.status == 'failed',
+                        ArchGenJob.completed_at < cutoff,
+                    ),
+                    ArchGenJob.status == 'running',
+                )
+            )
+            .order_by(ArchGenJob.priority.asc(), ArchGenJob.created_at.asc())
+            .limit(limit)
+            .all()
+        )
+    except Exception as exc:
+        logger.error("Error getting retriable arch_gen_jobs: %s", exc)
         return []
     finally:
         db.close()

@@ -47,6 +47,9 @@
             <a href="/diagnostics" class="project-tab" style="text-decoration:none;color:inherit;display:block">
                 LLM Diagnostics &rarr;
             </a>
+            <a href="/scheduler" class="project-tab" style="text-decoration:none;color:inherit;display:block">
+                Scheduler &rarr;
+            </a>
         </div>
     </div>
 
@@ -84,6 +87,7 @@
                 <span id="arch-bar-subtitle">Global constraints &amp; context &mdash; injected into all agents</span>
                 <span id="arch-bar-count"></span>
                 <button id="arch-bar-add" onclick="openAddTaskModal('architecture')" title="Add architecture card">+ Add</button>
+                <button id="arch-bar-populate" onclick="populateArchBar()" title="Generate missing category cards from file summaries">&#9889; Populate</button>
                 <button id="arch-bar-toggle" onclick="toggleArchBar()" title="Collapse/expand">&#9650;</button>
             </div>
             <div id="arch-cards">

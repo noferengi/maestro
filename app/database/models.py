@@ -468,6 +468,27 @@ class OptimizationBenchmark(Base):
         return f"<OptimizationBenchmark(id={self.id}, task={self.task_id}, type={self.benchmark_type})>"
 
 
+class ArchGenJob(Base):
+    """Background job for scheduler-dispatched architecture card generation."""
+    __tablename__ = "arch_gen_jobs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    project = Column(String, nullable=False)
+    category = Column(String, nullable=False)
+    llm_id = Column(Integer, ForeignKey('llms.id'), nullable=True)
+    budget_id = Column(Integer, ForeignKey('budgets.id'), nullable=True)
+    status = Column(String, nullable=False, default='pending')
+    priority = Column(Float, nullable=False, default=1.0)
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+    def __repr__(self):
+        return f"<ArchGenJob(id={self.id}, project={self.project!r}, category={self.category!r}, status={self.status!r})>"
+
+
 # ---------------------------------------------------------------------------
 # Cache tables
 # ---------------------------------------------------------------------------

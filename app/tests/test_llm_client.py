@@ -25,9 +25,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
 def _run(coro):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    return loop.run_until_complete(coro)
+    return asyncio.run(coro)
+
+
+@pytest.fixture(autouse=True)
+def _reset_endpoint_states():
+    """Clear per-endpoint backoff state between tests so sleeps don't leak."""
+    import app.agent.llm_client as lc
+    lc._endpoint_states.clear()
+    yield
+    lc._endpoint_states.clear()
 
 
 def _mock_http_response(body: dict, status: int = 200) -> MagicMock:
@@ -252,10 +259,11 @@ class TestBudgetLogging:
 
 
 class TestHttpErrors:
-    def test_http_500_raises_http_status_error(self):
+    def test_http_4xx_raises_http_status_error(self):
+        """4xx errors propagate immediately — call_llm does NOT retry client errors."""
         from app.agent.llm_client import call_llm
 
-        mock_cls, _ = _make_mock_client(_mock_http_response({}, status=500))
+        mock_cls, _ = _make_mock_client(_mock_http_response({}, status=422))
 
         with patch("httpx.AsyncClient", mock_cls):
             with patch("app.database.create_budget_entry", MagicMock()):

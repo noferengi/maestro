@@ -59,7 +59,7 @@ Or directly: `venv/Scripts/python.exe app/migrations/runner.py <command>`
 
 Migrations live in `app/migrations/versions/` as `NNNN_description.py`. Never edit an existing migration — always add a new one. Each exposes `up(conn)`, `down(conn)`, and `description`.
 
-Current schema migrations (0001–0032):
+Current schema migrations (0001–0036):
 - `0001` — initial `tasks` table
 - `0002` — `prerequisites` column (JSON array of task IDs)
 - `0003` — `project` column (string, default `'TheMaestro'`)
@@ -82,6 +82,9 @@ Current schema migrations (0001–0032):
 - `0030` — `inbox_messages` table
 - `0031` — `is_active BOOLEAN DEFAULT 1` on tasks (soft-delete support)
 - `0032` — `compute_nodes` table; `compute_node_id` FK on `llms`
+- `0033–0034` — (reserved / applied)
+- `0035` — `short_summary` column on `file_summaries`
+- `0036` — `arch_gen_jobs` table; `project`, `category`, `llm_id`, `budget_id`, `status`, `priority` (1.0); index on `(status, priority, created_at)`
 
 **Full schema reference:** See `CLAUDE_SCHEMA.md` in the project root. Read that file whenever you need to query or modify `data/kanban.db` directly — it contains every table, column, type, nullability, and default value.
 

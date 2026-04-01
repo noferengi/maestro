@@ -221,6 +221,7 @@ _MAX_REJECTIONS_BEFORE_SUBDIVIDE = 3  # force subdivision after this many consec
 # 'Running' jobs with no live thread (orphaned by a crash) are reset immediately.
 _FILE_SUMMARY_RETRY_COOLDOWN = 300.0  # 5 min before re-queuing a failed file-summary job
 _RESEARCH_JOB_RETRY_COOLDOWN = 300.0  # 5 min before re-queuing a failed research job
+_ARCH_GEN_RETRY_COOLDOWN     = 300.0  # 5 min before re-queuing a failed arch-gen job
 
 # Background thread that drives the scheduler tick
 _scheduler_thread: threading.Thread | None = None
@@ -755,6 +756,11 @@ def _tick() -> None:
         allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
     )
 
+    # 5.5. Dispatch pending arch gen jobs (lower priority than research; no caller blocking)
+    _dispatch_arch_gen_jobs(
+        allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
+    )
+
     # 6. Recover stranded subdivision tasks (respects one-LLM policy + full capacity caps)
     _dispatch_stranded_subdivisions(
         allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
@@ -962,6 +968,100 @@ def _run_research_job(job: Any, llm: Any) -> None:
     except Exception:
         logger.exception("Research job %d failed in scheduler.", job.id)
         update_research_job(job.id, status="failed")
+    finally:
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
+        loop.close()
+        with _llm_counts_lock:
+            _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
+
+
+def _dispatch_arch_gen_jobs(
+    allowed_llm_id: "int | None",
+    node_active_counts: "dict[int, int]",
+    node_session_counts: "dict[int, int]",
+    node_obj_cache: "dict[int, Any]",
+    llm_node_cache: "dict[int, int | None]",
+) -> None:
+    """Dispatch pending arch gen jobs — fire-and-forget card generation from file summaries.
+
+    Lower priority than research (1.0 vs 0.0).  Respects the one-LLM-at-a-time
+    policy and full node/LLM capacity caps.
+    """
+    from app.database import get_pending_arch_gen_jobs, update_arch_gen_job, get_llm
+
+    pending = get_pending_arch_gen_jobs(limit=5)
+    for job in pending:
+        if not job.llm_id:
+            continue
+
+        job_key = f"arch-gen-{job.id}"
+        with _active_sessions_lock:
+            if job_key in _active_sessions and _active_sessions[job_key].is_alive():
+                continue
+
+        llm = get_llm(job.llm_id)
+        if not llm:
+            continue
+
+        # One-LLM-at-a-time gate
+        if allowed_llm_id is not None and llm.id != allowed_llm_id:
+            continue
+
+        if not _check_and_reserve_slot(
+            llm, node_active_counts, node_session_counts, node_obj_cache, llm_node_cache,
+            label=f"arch-gen-{job.id}",
+        ):
+            continue
+
+        update_arch_gen_job(job.id, status='running')
+
+        thread = threading.Thread(
+            target=_run_arch_gen_job,
+            args=(job, llm),
+            daemon=True,
+            name=f"maestro-arch-gen-{job.id}",
+        )
+        with _active_sessions_lock:
+            _active_sessions[job_key] = thread
+            _session_llm_ids[job_key] = llm.id
+        thread.start()
+
+
+def _run_arch_gen_job(job: Any, llm: Any) -> None:
+    """Execute a single arch gen job in its own thread + event loop."""
+    from app.database import update_arch_gen_job, get_project_path as _get_project_path
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        project_root = _get_project_path(job.project)
+        if not project_root:
+            raise RuntimeError(f"Project '{job.project}' has no path configured.")
+
+        from app.agent.arch_gen_agent import execute_arch_gen_job
+        llm_base_url = f"http://{llm.address}:{llm.port}/v1"
+        result = loop.run_until_complete(execute_arch_gen_job(
+            project=job.project,
+            category=job.category,
+            project_root=project_root,
+            llm_id=job.llm_id,
+            budget_id=job.budget_id,
+            llm_base_url=llm_base_url,
+            llm_model=llm.model,
+        ))
+        update_arch_gen_job(
+            job.id,
+            status='completed',
+            prompt_tokens=result.get('prompt_tokens', 0),
+            completion_tokens=result.get('completion_tokens', 0),
+        )
+        logger.debug("[arch_gen] job %d completed (project=%s category=%s).", job.id, job.project, job.category)
+    except Exception:
+        logger.exception("[arch_gen] job %d failed.", job.id)
+        update_arch_gen_job(job.id, status='failed')
     finally:
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
@@ -1631,8 +1731,10 @@ def _rescue_stale_jobs() -> None:
     from app.database import (
         get_retriable_file_summary_jobs,
         get_retriable_research_jobs,
+        get_retriable_arch_gen_jobs,
         update_file_summary_job,
         update_research_job,
+        update_arch_gen_job,
     )
 
     with _active_sessions_lock:
@@ -1675,6 +1777,25 @@ def _rescue_stale_jobs() -> None:
                 job.id,
             )
         update_research_job(job.id, status='pending', completed_at=None)
+
+    # --- Arch gen jobs ---
+    for job in get_retriable_arch_gen_jobs(
+        failed_cooldown_seconds=_ARCH_GEN_RETRY_COOLDOWN
+    ):
+        session_key = f"arch-gen-{job.id}"
+        if job.status == 'running':
+            if session_key in active_keys:
+                continue  # thread is alive — leave it alone
+            logger.warning(
+                "[rescue] arch_gen job %d stuck in 'running' with no thread — resetting.",
+                job.id,
+            )
+        else:
+            logger.info(
+                "[rescue] Retrying failed arch_gen job %d (was failed, cooldown elapsed).",
+                job.id,
+            )
+        update_arch_gen_job(job.id, status='pending', completed_at=None)
 
 
 def _task_to_mini_dict(task: Any) -> dict:

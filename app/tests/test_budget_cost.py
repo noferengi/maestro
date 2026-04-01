@@ -33,7 +33,7 @@ from app.database import (
 
 def _unique(prefix: str) -> str:
     import uuid
-    return f"{prefix}_{uuid.uuid4().hex[:8]}"
+    return f"{prefix}_{uuid.uuid4().hex}"
 
 
 # ---------------------------------------------------------------------------

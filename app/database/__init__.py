@@ -49,7 +49,7 @@ if globals().get('_initialized'):
         'app.database.crud_infra', 'app.database.crud_costs',
         'app.database.crud_pipeline', 'app.database.crud_jobs',
         'app.database.crud_files', 'app.database.crud_inbox',
-    ]:
+    ]:  # NOTE: keep this list in sync with the from-imports below
         if _sub in _sys.modules:
             _il.reload(_sys.modules[_sub])
 
@@ -85,6 +85,7 @@ from .models import (
     ResearchJob,
     FileSummaryJob,
     OptimizationBenchmark,
+    ArchGenJob,
     FileSummary,
     SearchCache,
     InboxMessage,
@@ -201,6 +202,10 @@ from .crud_jobs import (
     count_pending_file_summary_jobs,
     create_optimization_benchmark,
     get_optimization_benchmarks,
+    create_arch_gen_job,
+    get_pending_arch_gen_jobs,
+    update_arch_gen_job,
+    get_retriable_arch_gen_jobs,
 )
 
 # File + search caches
@@ -208,6 +213,7 @@ from .crud_files import (
     get_file_summary,
     create_file_summary,
     get_file_summary_by_path,
+    get_file_summaries_for_project_root,
     get_search_cache,
     create_search_cache,
 )
@@ -231,7 +237,7 @@ __all__ = [
     "TransitionVote", "TransitionResult", "SubdivisionRecord",
     "PlanningResult", "ComponentResult", "OptimizationResult",
     "SecurityReviewResult", "FullReviewResult", "MergeRecord",
-    "ResearchJob", "FileSummaryJob", "OptimizationBenchmark",
+    "ResearchJob", "FileSummaryJob", "OptimizationBenchmark", "ArchGenJob",
     "FileSummary", "SearchCache", "InboxMessage",
     # crud_tasks
     "init_db", "seed_sample_tasks", "seed_task", "seed_sample_tasks_raw",
@@ -269,8 +275,11 @@ __all__ = [
     "get_retriable_file_summary_jobs", "get_file_summary_job_by_sha1",
     "update_file_summary_job", "count_pending_file_summary_jobs",
     "create_optimization_benchmark", "get_optimization_benchmarks",
+    "create_arch_gen_job", "get_pending_arch_gen_jobs",
+    "update_arch_gen_job", "get_retriable_arch_gen_jobs",
     # crud_files
     "get_file_summary", "create_file_summary", "get_file_summary_by_path",
+    "get_file_summaries_for_project_root",
     "get_search_cache", "create_search_cache",
     # crud_inbox
     "create_inbox_message", "get_inbox_messages", "get_inbox_message",

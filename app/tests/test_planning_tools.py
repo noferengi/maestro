@@ -20,12 +20,14 @@ from app.agent.tools import (
 )
 
 
-@pytest.fixture(autouse=True)
-def isolated_project(tmp_path):
+@pytest.fixture(scope="module", autouse=True)
+def isolated_project(tmp_path_factory):
     """
     Redirect all tool file I/O to a temp git repo.
-    Each tool writes to .maestro/ under this root.
+    Runs once per module — git init is a subprocess and ~50ms per call,
+    so amortising it across all tests in the file saves ~400ms.
     """
+    tmp_path = tmp_path_factory.mktemp("planning_tools_project")
     subprocess.run(
         ["git", "init", str(tmp_path)],
         capture_output=True,
