@@ -1,5 +1,5 @@
 """
-Tests for P1 — Budget Dollar Limits + LLM Cost Tracking.
+Tests for P1 - Budget Dollar Limits + LLM Cost Tracking.
 
 Covers:
   - Budget dollar_amount default and storage
@@ -206,7 +206,7 @@ class TestMicrocentArithmetic:
         assert uc == 1_280_000
 
     def test_budget_250_dollars_in_microcents(self):
-        # $250 → 25,000,000,000 µ¢
+        # $250 -> 25,000,000,000 µ¢
         dollars = 250
         uc = int(dollars * 100 * 1_000_000)
         assert uc == 25_000_000_000

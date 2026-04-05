@@ -237,3 +237,31 @@ def delete_compute_node(node_id):
         return False
     finally:
         db.close()
+
+
+def llm_to_dict(llm):
+    """Convert SQLAlchemy LLM model to dictionary"""
+    return {
+        "id": llm.id,
+        "address": llm.address,
+        "port": llm.port,
+        "model": llm.model,
+        "label": getattr(llm, "label", None),
+        "settings": llm.settings,
+        "parallel_sessions": llm.parallel_sessions,
+        "max_context": llm.max_context,
+        "notes": llm.notes,
+        "cost_per_million_prompt_tokens": llm.cost_per_million_prompt_tokens,
+        "cost_per_million_completion_tokens": llm.cost_per_million_completion_tokens,
+        "compute_node_id": getattr(llm, "compute_node_id", None),
+    }
+
+
+def budget_to_dict(budget):
+    """Convert SQLAlchemy Budget model to dictionary"""
+    return {
+        "id": budget.id,
+        "name": budget.name,
+        "settings": budget.settings,
+        "dollar_amount": budget.dollar_amount,
+    }

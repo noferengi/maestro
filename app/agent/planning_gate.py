@@ -1,7 +1,7 @@
 """
 app/agent/planning_gate.py
 --------------------------
-7-check due diligence gate for PLANNING → IN DEV transition.
+7-check due diligence gate for PLANNING -> IN DEV transition.
 
 All checks are deterministic except #6 (LLM feasibility re-check).
 Results stored in transition_results with transition="planning_to_indev".
@@ -21,8 +21,10 @@ from app.agent.config import (
     PIPELINE_DONE_STATUSES,
     PROJECT_ROOT,
 )
+from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
 
 logger = logging.getLogger(__name__)
+AGENT_NAME = "Planning Gate"
 
 
 @dataclass(slots=True)
@@ -44,7 +46,7 @@ class GateResult:
 
 
 class PlanningGate:
-    """7-check due diligence for PLANNING → IN DEV transition."""
+    """7-check due diligence for PLANNING -> IN DEV transition."""
 
     def __init__(
         self,
@@ -354,6 +356,9 @@ class PlanningGate:
         last_error: Exception | None = None
 
         for attempt in range(1, max_attempts + 1):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
+
             try:
                 response = await call_llm(
                     messages,
@@ -364,6 +369,7 @@ class PlanningGate:
                     task_id=self.task_id,
                     llm_id=self.llm_id,
                     budget_id=self.budget_id,
+                    agent_name=AGENT_NAME,
                 )
                 usage = response.get("usage", {})
                 pt = usage.get("prompt_tokens", 0)
@@ -391,7 +397,7 @@ class PlanningGate:
                     await asyncio.sleep(2 ** attempt)  # 2s, 4s
 
         logger.warning(
-            "[planning_gate] Task '%s': feasibility_recheck unavailable after %d attempts — "
+            "[planning_gate] Task '%s': feasibility_recheck unavailable after %d attempts - "
             "proceeding with warning. Last error: %s",
             self.task_id, max_attempts, last_error,
         )

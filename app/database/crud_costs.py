@@ -72,6 +72,38 @@ def get_budget_entry(entry_id):
         db.close()
 
 
+def delete_budget_entry(entry_id: int) -> bool:
+    """
+    Delete a budget entry by ID.
+    
+    This will cascade delete the associated Expense record(s) due to
+    the ON DELETE CASCADE foreign key constraint on budget_entry_id.
+    
+    Args:
+        entry_id: The ID of the BudgetEntry to delete.
+    
+    Returns:
+        True if deletion was successful, False otherwise.
+    """
+    db = SessionLocal()
+    try:
+        entry = db.query(BudgetEntry).filter(BudgetEntry.id == entry_id).first()
+        if entry is None:
+            logger.warning("BudgetEntry not found: %s", entry_id)
+            return False
+        
+        db.delete(entry)
+        db.commit()
+        logger.info("Deleted BudgetEntry %s (and cascaded Expense)", entry_id)
+        return True
+    except Exception as e:
+        db.rollback()
+        logger.error("Error deleting budget entry %s: %s", entry_id, e)
+        return False
+    finally:
+        db.close()
+
+
 # ---------------------------------------------------------------------------
 # Expense CRUD
 # ---------------------------------------------------------------------------
@@ -100,6 +132,55 @@ def create_expense(budget_entry_id, budget_id, llm_id, task_id,
         db.rollback()
         logger.error("Error creating expense: %s", ex)
         return None
+    finally:
+        db.close()
+
+
+def get_expense(expense_id: int):
+    """
+    Get a single expense record by ID.
+    
+    Args:
+        expense_id: The ID of the Expense to retrieve.
+    
+    Returns:
+        The Expense record if found, None otherwise.
+    """
+    db = SessionLocal()
+    try:
+        return db.query(Expense).filter(Expense.id == expense_id).first()
+    finally:
+        db.close()
+
+
+def delete_expense(expense_id: int) -> bool:
+    """
+    Delete an expense record by ID.
+    
+    Note: This operation is independent of BudgetEntry deletion.
+    Deleting an Expense does not affect its associated BudgetEntry.
+    
+    Args:
+        expense_id: The ID of the Expense to delete.
+    
+    Returns:
+        True if deletion was successful, False otherwise.
+    """
+    db = SessionLocal()
+    try:
+        expense = db.query(Expense).filter(Expense.id == expense_id).first()
+        if expense is None:
+            logger.warning("Expense not found: %s", expense_id)
+            return False
+        
+        db.delete(expense)
+        db.commit()
+        logger.info("Deleted Expense %s", expense_id)
+        return True
+    except Exception as e:
+        db.rollback()
+        logger.error("Error deleting expense %s: %s", expense_id, e)
+        return False
     finally:
         db.close()
 

@@ -1,19 +1,19 @@
 """
 app/agent/conceptual_review.py
 -------------------------------
-Conceptual Review Pipeline — 10-voter read-only review.
+Conceptual Review Pipeline - 10-voter read-only review.
 
 Phase 1 (deterministic, parallel):
-  D1: Completeness — tree-sitter parse vs planned components
-  D2: Dependency Graph — cycle detection on actual imports
-  D3: Error Handling — functions with external calls lacking try/except
-  D4: Test Coverage — test files per implementation module ratio
+  D1: Completeness - tree-sitter parse vs planned components
+  D2: Dependency Graph - cycle detection on actual imports
+  D3: Error Handling - functions with external calls lacking try/except
+  D4: Test Coverage - test files per implementation module ratio
 
 Phase 2 (LLM, parallel, seeded with Phase 1):
-  L1: Architecture — SOLID, naming, module boundaries
-  L2: Security — input validation, injection, path traversal
-  L3: Performance — algorithmic complexity, N+1 queries, blocking I/O
-  L4: API/Interface — contract compliance, backward compat
+  L1: Architecture - SOLID, naming, module boundaries
+  L2: Security - input validation, injection, path traversal
+  L3: Performance - algorithmic complexity, N+1 queries, blocking I/O
+  L4: API/Interface - contract compliance, backward compat
 
 Plus D1-D4 = 4 deterministic + L1-L4 = 4 LLM = 8 voters,
 but plan says 10 (4 det + 4 LLM agentic with 15 turn loops = effectively 10 perspective votes).
@@ -39,12 +39,13 @@ from app.agent.config import (
     check_context_saturation,
 )
 from app.agent.json_utils import extract_json_block
-from app.agent.llm_client import call_llm
+from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
 from app.agent.research import run_research
 from app.agent.tools import dispatch_tool, build_tool_schemas
 from app.agent.verdicts import Vote, Verdict, tally_votes
 
 logger = logging.getLogger(__name__)
+AGENT_NAME = "Conceptual Review Pipeline"
 
 
 @dataclass(slots=True)
@@ -88,6 +89,9 @@ class ConceptualReviewPipeline:
 
     async def run(self) -> ConceptualReviewResult:
         """Execute all review phases and return the result."""
+        if is_shutting_down():
+            raise ShutdownError("Server is shutting down")
+
         logger.info("[conceptual_review] Starting for task '%s'", self.task_id)
 
         # Phase 1: Deterministic checks (parallel)
@@ -126,7 +130,7 @@ class ConceptualReviewPipeline:
             if raw_outcome in ("passed", "conditional_pass", "tie"):
                 outcome = "passed"
             elif raw_outcome == "needs_research":
-                # Research agent exhausted without resolution — reject conservatively
+                # Research agent exhausted without resolution - reject conservatively
                 outcome = "rejected"
                 summary = f"Research exhausted without resolution: {tally.summary}"
             else:
@@ -368,6 +372,9 @@ class ConceptualReviewPipeline:
         _ctx_warned: set[float] = set()
 
         for turn in range(max_turns):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
+
             response = await call_llm(
                 messages,
                 base_url=self.llm_base_url,
@@ -378,6 +385,7 @@ class ConceptualReviewPipeline:
                 task_id=self.task_id,
                 llm_id=self.llm_id,
                 budget_id=self.budget_id,
+                agent_name=AGENT_NAME,
             )
 
             usage = response.get("usage", {})
@@ -389,7 +397,7 @@ class ConceptualReviewPipeline:
             if check_context_saturation(
                 prompt_tokens_this_call, self.max_context, _ctx_warned, messages
             ):
-                logger.warning("[conceptual_review] Reviewer '%s' context saturation (turn %d) — terminating", name, turn + 1)
+                logger.warning("[conceptual_review] Reviewer '%s' context saturation (turn %d) - terminating", name, turn + 1)
                 break
 
             assistant_msg = response.get("choices", [{}])[0].get("message", {})
@@ -543,7 +551,7 @@ class ConceptualReviewPipeline:
     def _summarize_votes(self, votes: list[Vote]) -> str:
         lines = []
         for v in votes:
-            lines.append(f"{v.stage}: {v.verdict.value} ({v.confidence}) — {v.justification}")
+            lines.append(f"{v.stage}: {v.verdict.value} ({v.confidence}) - {v.justification}")
         return "\n".join(lines)
 
 

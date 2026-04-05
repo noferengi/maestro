@@ -3,9 +3,9 @@ Tests for the 9-stage pipeline routing layer.
 
 Covers:
   1. ADVANCE_HANDLERS map completeness
-  2. /api/tasks/{id}/advance endpoint — 404, 422 validation, 200 happy path
-  3. Scheduler _tick() — only auto-dispatches planning / indev
-  4. Direct column transition: _advance_to_optimization (conceptual_review → optimization)
+  2. /api/tasks/{id}/advance endpoint - 404, 422 validation, 200 happy path
+  3. Scheduler _tick() - only auto-dispatches planning / indev
+  4. Direct column transition: _advance_to_optimization (conceptual_review -> optimization)
   5. Mock LLM intake pipeline: pass, reject, subdivide, needs_research, tie scenarios
 """
 
@@ -153,7 +153,7 @@ class TestAdvanceHandlersMap:
 
 
 # ---------------------------------------------------------------------------
-# 2. /api/tasks/{id}/advance — endpoint validation
+# 2. /api/tasks/{id}/advance - endpoint validation
 # ---------------------------------------------------------------------------
 
 class TestAdvanceEndpointValidation:
@@ -488,7 +488,7 @@ class TestDirectTransitions:
 
 
 # ---------------------------------------------------------------------------
-# 5. Mock LLM — intake pipeline scenarios
+# 5. Mock LLM - intake pipeline scenarios
 # ---------------------------------------------------------------------------
 
 class TestIntakePipelineMockLLM:
@@ -525,7 +525,7 @@ class TestIntakePipelineMockLLM:
         return asyncio.run(_go())
 
     def test_all_pass_outcome_is_passed(self):
-        """intake_all_pass scenario → outcome == 'passed'."""
+        """intake_all_pass scenario -> outcome == 'passed'."""
         task_id = "test-intake-pass"
         budget_id = None
         try:
@@ -540,7 +540,7 @@ class TestIntakePipelineMockLLM:
                 _cleanup_budget(budget_id)
 
     def test_rejected_scope_outcome_is_rejected(self):
-        """intake_rejected scenario (scope votes REJECTED) → outcome == 'rejected'."""
+        """intake_rejected scenario (scope votes REJECTED) -> outcome == 'rejected'."""
         task_id = "test-intake-rej"
         budget_id = None
         try:
@@ -555,7 +555,7 @@ class TestIntakePipelineMockLLM:
                 _cleanup_budget(budget_id)
 
     def test_needs_research_triggers_research_then_passes(self):
-        """intake_needs_research scenario → research agent runs → outcome == 'passed'."""
+        """intake_needs_research scenario -> research agent runs -> outcome == 'passed'."""
         task_id = "test-intake-nr"
         budget_id = None
         try:
@@ -570,7 +570,7 @@ class TestIntakePipelineMockLLM:
                 _cleanup_budget(budget_id)
 
     def test_tie_triggers_tiebreaker_then_passes(self):
-        """intake_tie scenario → tie-breaker fires → outcome == 'passed'."""
+        """intake_tie scenario -> tie-breaker fires -> outcome == 'passed'."""
         task_id = "test-intake-tie"
         budget_id = None
         try:
@@ -621,13 +621,13 @@ class TestIntakePipelineMockLLM:
 
 
 # ---------------------------------------------------------------------------
-# 6. Mock LLM — tally rule edge cases
+# 6. Mock LLM - tally rule edge cases
 # ---------------------------------------------------------------------------
 
 class TestTallyRules:
     """
     Verify tally_votes() enforces the correct rule priority order.
-    These tests call tally_votes() directly — no HTTP required.
+    These tests call tally_votes() directly - no HTTP required.
     """
 
     def _vote(self, verdict, confidence=80):
@@ -658,7 +658,7 @@ class TestTallyRules:
         assert result.outcome == "rejected"
 
     def test_rule2_majority_not_suitable_rejects(self):
-        """Majority NOT_SUITABLE → rejected."""
+        """Majority NOT_SUITABLE -> rejected."""
         from app.agent.verdicts import tally_votes, Verdict
         votes = [
             self._vote(Verdict.NOT_SUITABLE, 55),
@@ -669,7 +669,7 @@ class TestTallyRules:
         assert result.outcome == "rejected"
 
     def test_rule3_needs_research_triggers_research(self):
-        """Any NEEDS_RESEARCH vote → outcome needs_research."""
+        """Any NEEDS_RESEARCH vote -> outcome needs_research."""
         from app.agent.verdicts import tally_votes, Verdict
         votes = [
             self._vote(Verdict.LIKELY, 92),
@@ -679,12 +679,12 @@ class TestTallyRules:
         assert result.outcome == "needs_research"
 
     def test_rule4_tie_triggers_tiebreaker(self):
-        """Equal pass/fail split with no REJECTED → tie.
+        """Equal pass/fail split with no REJECTED -> tie.
 
-        Rule 1 (any REJECTED → rejected) fires before Rule 4, so the tie
+        Rule 1 (any REJECTED -> rejected) fires before Rule 4, so the tie
         scenario must use only NOT_SUITABLE (fail-ish) against pass-ish votes.
         2 NOT_SUITABLE vs 2 LIKELY: majority threshold = (4//2)+1 = 3, so
-        Rule 2 doesn't fire; Rule 4 fires → tie.
+        Rule 2 doesn't fire; Rule 4 fires -> tie.
         """
         from app.agent.verdicts import tally_votes, Verdict
         votes = [
@@ -697,7 +697,7 @@ class TestTallyRules:
         assert result.outcome == "tie"
 
     def test_rule5_majority_pass(self):
-        """Clear majority of passing verdicts → passed."""
+        """Clear majority of passing verdicts -> passed."""
         from app.agent.verdicts import tally_votes, Verdict
         votes = [
             self._vote(Verdict.LIKELY, 95),
@@ -709,7 +709,7 @@ class TestTallyRules:
         assert result.outcome == "passed"
 
     def test_rule0_has_priority_over_rule1(self):
-        """SUBDIVIDE_IDEA + REJECTED → outcome is 'subdivide', not 'rejected'."""
+        """SUBDIVIDE_IDEA + REJECTED -> outcome is 'subdivide', not 'rejected'."""
         from app.agent.verdicts import tally_votes, Verdict
         votes = [
             self._vote(Verdict.SUBDIVIDE_IDEA, 60),
@@ -719,7 +719,7 @@ class TestTallyRules:
         assert result.outcome == "subdivide"
 
     def test_rule1_has_priority_over_rule3(self):
-        """REJECTED + NEEDS_RESEARCH → outcome is 'rejected', not 'needs_research'."""
+        """REJECTED + NEEDS_RESEARCH -> outcome is 'rejected', not 'needs_research'."""
         from app.agent.verdicts import tally_votes, Verdict
         votes = [
             self._vote(Verdict.REJECTED, 20),

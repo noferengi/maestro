@@ -264,6 +264,8 @@ class PlanningResult(Base):
     best_of_n_designs = Column(Text, nullable=True)
     selected_design_index = Column(Integer, nullable=True)
     selection_justification = Column(Text, nullable=True)
+    gate_checks = Column(Text, nullable=True)   # JSON: [{name, passed, hard_fail, detail}]
+    error_message = Column(Text, nullable=True)  # set on status='failed' rows
     confidence = Column(Integer, default=0)
     prompt_tokens = Column(Integer, default=0)
     completion_tokens = Column(Integer, default=0)
@@ -482,11 +484,12 @@ class ArchGenJob(Base):
     prompt_tokens = Column(Integer, default=0)
     completion_tokens = Column(Integer, default=0)
     error_message = Column(Text, nullable=True)
+    retry_count = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
 
     def __repr__(self):
-        return f"<ArchGenJob(id={self.id}, project={self.project!r}, category={self.category!r}, status={self.status!r})>"
+        return f"<ArchGenJob(id={self.id}, project={self.project!r}, category={self.category!r}, status={self.status!r}, retries={self.retry_count})>"
 
 
 # ---------------------------------------------------------------------------

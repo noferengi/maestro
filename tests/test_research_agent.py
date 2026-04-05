@@ -47,7 +47,7 @@ class TestToolRestrictions:
     def test_research_agent_tools_list(self):
         """RESEARCH_AGENT_TOOLS contains only read-only tools."""
         expected = {
-            "read_file", "read_file_lines", "count_lines",
+            "read_file", "read_file_harder", "count_lines",
             "search_files", "find_files", "list_directory",
             "git_status", "git_diff", "git_log", "git_blame", "git_show",
             "get_task", "list_tasks",

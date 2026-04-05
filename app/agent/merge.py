@@ -1,7 +1,7 @@
 """
 app/agent/merge.py
 ------------------
-Deterministic git merge workflow — NO LLM.
+Deterministic git merge workflow - NO LLM.
 
 Steps:
   1. Verify branch maestro/task-{id} exists
@@ -64,7 +64,7 @@ def _git(args: list[str], timeout: int = 60, cwd: str | None = None) -> tuple[in
 def execute_merge(task_id: str, project_path: str | None = None) -> MergeResult:
     """Execute the full deterministic merge workflow.
 
-    This function is synchronous — no LLM calls, just git + pytest.
+    This function is synchronous - no LLM calls, just git + pytest.
     """
     effective_cwd = project_path or PROJECT_ROOT
     logger.info("[merge] Using project directory: %s", effective_cwd)
@@ -108,7 +108,7 @@ def execute_merge(task_id: str, project_path: str | None = None) -> MergeResult:
                      f"Merge {branch} into main (Maestro task {task_id})"],
                     cwd=effective_cwd)
     if rc != 0:
-        # Conflict — abort
+        # Conflict - abort
         logger.warning("[merge] Merge conflict: %s", out)
         _git(["merge", "--abort"], cwd=effective_cwd)
         return MergeResult(
@@ -154,7 +154,7 @@ def execute_merge(task_id: str, project_path: str | None = None) -> MergeResult:
             branch_name=branch,
         )
 
-    # Step 5: Push (if configured) — with retry and exponential backoff
+    # Step 5: Push (if configured) - with retry and exponential backoff
     if MERGE_AUTO_PUSH:
         import time as _time
         push_success = False

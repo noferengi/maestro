@@ -24,7 +24,7 @@ from app.agent.config import (
     TOOL_LISTING_EXCLUDED_DIRS,
 )
 
-# Lazy imports for snapshot config — avoids circular import issues
+# Lazy imports for snapshot config - avoids circular import issues
 def _snapshot_max_depth() -> int:
     from app.agent.config import SNAPSHOT_MAX_DEPTH
     return SNAPSHOT_MAX_DEPTH
@@ -42,8 +42,9 @@ def _snapshot_cache_ttl() -> int:
 # Caching
 # ---------------------------------------------------------------------------
 
-# (project_root) -> (timestamp, snapshot_str)
-_snapshot_cache: dict[str, tuple[float, str]] = {}
+# (project_root, effective_max_tokens) -> (timestamp, snapshot_str)
+# The max_tokens dimension lets agents with different context windows cache independently.
+_snapshot_cache: dict[tuple[str, int], tuple[float, str]] = {}
 
 # (abs_path, mtime, size) -> summary_str
 _file_summary_cache: dict[tuple[str, float, int], str] = {}
@@ -56,7 +57,7 @@ def clear_snapshot_cache() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Architecture context — project-wide constraints injected into agent prompts
+# Architecture context - project-wide constraints injected into agent prompts
 # ---------------------------------------------------------------------------
 
 # Categories shown on architecture cards (must match the frontend select options).
@@ -72,14 +73,14 @@ ARCH_CATEGORIES = [
 # set   → include only cards whose category is in the set.
 #
 # Rationale:
-#   file_summary   — only needs to know Platform/Tooling/Data/General to contextualise
+#   file_summary   - only needs to know Platform/Tooling/Data/General to contextualise
 #                    what kind of codebase/files it is summarising.
-#   subdivision    — needs Design/Testing/Performance/API/Data/Platform/Tooling/General
+#   subdivision    - needs Design/Testing/Performance/API/Data/Platform/Tooling/General
 #                    to decompose tasks that stay within architectural constraints.
-#   conceptual_review — audits design decisions, so Design/API/Data/Security/
+#   conceptual_review - audits design decisions, so Design/API/Data/Security/
 #                    Accessibility/Compliance/General matter most.
-#   security       — focused audit: Security/Compliance/API/Data/Platform/General.
-#   optimization   — focused audit: Performance/Platform/Data/Observability/Tooling/General.
+#   security       - focused audit: Security/Compliance/API/Data/Platform/General.
+#   optimization   - focused audit: Performance/Platform/Data/Observability/Tooling/General.
 #   research/loop/intake/full_review → None (all categories, full context needed).
 ARCH_CATEGORY_RELEVANCE: dict[str, set[str] | None] = {
     'file_summary':      {'Platform', 'Tooling', 'Data', 'General'},
@@ -103,8 +104,8 @@ def build_architecture_context(
 ) -> str:
     """Return a formatted block of architecture/constraint cards for agent context.
 
-    project_name — the Maestro project name (Task.project field).
-    agent_type   — when set, filters to categories relevant for that agent type
+    project_name - the Maestro project name (Task.project field).
+    agent_type   - when set, filters to categories relevant for that agent type
                    using ARCH_CATEGORY_RELEVANCE.  None means include all cards.
 
     Returns an empty string when no cards exist or are relevant.
@@ -150,10 +151,10 @@ def build_architecture_context(
     ))
 
     _PRIO_LABELS = {
-        'critical': ' [CRITICAL — hard constraint]',
-        'high':     ' [HIGH — strong preference]',
+        'critical': ' [CRITICAL - hard constraint]',
+        'high':     ' [HIGH - strong preference]',
         'normal':   '',
-        'low':      ' [low priority — soft suggestion]',
+        'low':      ' [low priority - soft suggestion]',
     }
 
     lines: list[str] = ["== PROJECT ARCHITECTURE & CONSTRAINTS =="]
@@ -218,7 +219,11 @@ def _format_size(size_bytes: int) -> str:
         return f"{size_bytes / (1024 * 1024):.1f}MB"
 
 
-def build_project_snapshot(project_root: str, max_depth: int | None = None) -> str:
+def build_project_snapshot(
+    project_root: str,
+    max_depth: int | None = None,
+    max_tokens: int | None = None,
+) -> str:
     """Build an indented directory tree with file annotations.
 
     For .py files: shows line count, class count, function count.
@@ -227,16 +232,21 @@ def build_project_snapshot(project_root: str, max_depth: int | None = None) -> s
     Respects TOOL_LISTING_EXCLUDED_DIRS. Truncates if estimated
     token count exceeds the configured budget.
 
-    project_root must be an explicit path — there is no default fallback.
+    max_tokens overrides the config default; pass int(llm_max_context * SNAPSHOT_CONTEXT_RATIO)
+    from call sites that know the LLM's context window.
+
+    project_root must be an explicit path - there is no default fallback.
     """
     if max_depth is None:
         max_depth = _snapshot_max_depth()
+    effective_max_tokens = max_tokens if max_tokens is not None else _snapshot_max_tokens()
 
     project_root = os.path.normpath(os.path.abspath(project_root))
 
-    # Check cache
+    # Check cache - keyed by (project_root, effective_max_tokens)
     cache_ttl = _snapshot_cache_ttl()
-    cached = _snapshot_cache.get(project_root)
+    cache_key = (project_root, effective_max_tokens)
+    cached = _snapshot_cache.get(cache_key)
     if cached is not None:
         ts, snapshot = cached
         if time.time() - ts < cache_ttl:
@@ -244,7 +254,6 @@ def build_project_snapshot(project_root: str, max_depth: int | None = None) -> s
 
     excluded = TOOL_LISTING_EXCLUDED_DIRS
     lines: list[str] = ["== PROJECT STRUCTURE =="]
-    max_tokens = _snapshot_max_tokens()
 
     def _walk(dir_path: str, prefix: str, depth: int) -> None:
         if depth > max_depth:
@@ -272,13 +281,13 @@ def build_project_snapshot(project_root: str, max_depth: int | None = None) -> s
             if fname.endswith(".py"):
                 lc, cc, fc = _analyze_py_file(full)
                 if cc >= 0:
-                    lines.append(f"{prefix}{fname} — {lc} lines, {cc} classes, {fc} functions")
+                    lines.append(f"{prefix}{fname} - {lc} lines, {cc} classes, {fc} functions")
                 else:
-                    lines.append(f"{prefix}{fname} — {lc} lines")
+                    lines.append(f"{prefix}{fname} - {lc} lines")
             else:
                 try:
                     sz = os.path.getsize(full)
-                    lines.append(f"{prefix}{fname} — {_format_size(sz)}")
+                    lines.append(f"{prefix}{fname} - {_format_size(sz)}")
                 except OSError:
                     lines.append(f"{prefix}{fname}")
 
@@ -288,23 +297,23 @@ def build_project_snapshot(project_root: str, max_depth: int | None = None) -> s
 
     _walk(project_root, "  ", 0)
 
-    # Token budget enforcement — estimate tokens as len/4
+    # Token budget enforcement - estimate tokens as len/4
     result = "\n".join(lines)
     estimated_tokens = len(result) // 4
-    if estimated_tokens > max_tokens:
+    if estimated_tokens > effective_max_tokens:
         # Truncate: keep the header + app/ subtree lines preferentially
         truncated: list[str] = [lines[0]]
-        budget_chars = max_tokens * 4
+        budget_chars = effective_max_tokens * 4
         used = len(truncated[0])
         for line in lines[1:]:
             if used + len(line) + 1 > budget_chars:
-                truncated.append("  ... (truncated — project has more files)")
+                truncated.append("  ... (truncated - project has more files)")
                 break
             truncated.append(line)
             used += len(line) + 1
         result = "\n".join(truncated)
 
-    _snapshot_cache[project_root] = (time.time(), result)
+    _snapshot_cache[cache_key] = (time.time(), result)
     return result
 
 
@@ -356,7 +365,7 @@ def build_file_summary(path: str, summary_length: str = "none") -> str:
             else:
                 for cls in analysis.classes:
                     bases_str = f"({', '.join(cls.bases)})" if cls.bases else ""
-                    parts.append(f"  {cls.name}{bases_str} — lines {cls.line_start}-{cls.line_end}")
+                    parts.append(f"  {cls.name}{bases_str} - lines {cls.line_start}-{cls.line_end}")
                     for method in cls.methods:
                         parts.append(f"    .{method}()")
 
@@ -368,7 +377,7 @@ def build_file_summary(path: str, summary_length: str = "none") -> str:
                 for func in analysis.functions:
                     async_prefix = "async " if func.is_async else ""
                     params_str = ", ".join(func.params)
-                    parts.append(f"  {async_prefix}{func.name}({params_str}) — lines {func.line_start}-{func.line_end}")
+                    parts.append(f"  {async_prefix}{func.name}({params_str}) - lines {func.line_start}-{func.line_end}")
 
             # Imports
             if analysis.imports:
@@ -382,7 +391,7 @@ def build_file_summary(path: str, summary_length: str = "none") -> str:
 
         except (ImportError, Exception) as exc:
             logger.debug("tree-sitter unavailable for summary of %s: %s", path, exc)
-            parts.append("\n(tree-sitter analysis unavailable — showing metadata only)")
+            parts.append("\n(tree-sitter analysis unavailable - showing metadata only)")
 
     parts.append(f"\n--> Use read_file_harder(path, start=N, end=N) to read source code.")
 
@@ -438,7 +447,7 @@ async def async_build_file_summary(
         )
 
         if completion_key:
-            # Cache miss — wait for scheduler to dispatch and complete the job.
+            # Cache miss - wait for scheduler to dispatch and complete the job.
             # Timeout must exceed LLM_TIMEOUT_SECONDS + realistic queue wait.
             from app.agent.scheduler import wait_for_completion
             from app.agent.config import FILE_SUMMARY_WAIT_TIMEOUT
@@ -447,7 +456,7 @@ async def async_build_file_summary(
                 None, wait_for_completion, completion_key, FILE_SUMMARY_WAIT_TIMEOUT
             )
             if not completed:
-                logger.warning("file_summary timed out for %s — using structural only", path)
+                logger.warning("file_summary timed out for %s - using structural only", path)
                 return structural
 
         cached = get_file_summary(sha1, filesize)
@@ -579,22 +588,31 @@ def prewarm_project_summaries(
 def build_snapshot_with_summaries(
     project_root: str,
     max_depth: int | None = None,
+    max_tokens: int | None = None,
 ) -> str:
     """Like build_project_snapshot() but appends a cached summary to each file line.
 
-    Uses the same cache key as build_project_snapshot so they share TTL/invalidation.
-    Summary text is the first sentence from the DB cache (get_file_summary_by_path).
+    Summary text comes from the DB cache (get_file_summary_by_path): prefers
+    short_summary (2 sentences, purpose-built for listings), falls back to first
+    line of the full summary for older rows.
     Cache miss → file line emitted without summary (no placeholder noise for the LLM).
 
-    project_root must be an explicit path — there is no default fallback.
+    max_tokens overrides the config default; pass int(llm_max_context * SNAPSHOT_CONTEXT_RATIO)
+    from call sites that know the LLM's context window.  Different max_tokens values
+    cache independently so a 100k-context agent and a 200k-context agent each get
+    the right sized snapshot.
+
+    project_root must be an explicit path - there is no default fallback.
     """
     if max_depth is None:
         max_depth = _snapshot_max_depth()
+    effective_max_tokens = max_tokens if max_tokens is not None else _snapshot_max_tokens()
 
     project_root = os.path.normpath(os.path.abspath(project_root))
 
     cache_ttl = _snapshot_cache_ttl()
-    cached = _snapshot_cache.get(project_root)
+    cache_key = (project_root, effective_max_tokens)
+    cached = _snapshot_cache.get(cache_key)
     if cached is not None:
         ts, snapshot = cached
         if time.time() - ts < cache_ttl:
@@ -602,7 +620,6 @@ def build_snapshot_with_summaries(
 
     excluded = TOOL_LISTING_EXCLUDED_DIRS
     lines: list[str] = ["== PROJECT STRUCTURE =="]
-    max_tokens = _snapshot_max_tokens()
 
     try:
         from app.database import get_file_summary_by_path as _get_summary
@@ -618,7 +635,7 @@ def build_snapshot_with_summaries(
                 text = (getattr(row, 'short_summary', None) or "").strip() \
                     or (row.summary or "").split("\n")[0].strip()
                 if text:
-                    return f" — {text}"
+                    return f" - {text}"
         except Exception:
             pass
         return ""
@@ -650,13 +667,13 @@ def build_snapshot_with_summaries(
             if fname.endswith(".py"):
                 lc, cc, fc = _analyze_py_file(full)
                 if cc >= 0:
-                    lines.append(f"{prefix}{fname} — {lc} lines, {cc} classes, {fc} functions{summary_suffix}")
+                    lines.append(f"{prefix}{fname} - {lc} lines, {cc} classes, {fc} functions{summary_suffix}")
                 else:
-                    lines.append(f"{prefix}{fname} — {lc} lines{summary_suffix}")
+                    lines.append(f"{prefix}{fname} - {lc} lines{summary_suffix}")
             else:
                 try:
                     sz = os.path.getsize(full)
-                    lines.append(f"{prefix}{fname} — {_format_size(sz)}{summary_suffix}")
+                    lines.append(f"{prefix}{fname} - {_format_size(sz)}{summary_suffix}")
                 except OSError:
                     lines.append(f"{prefix}{fname}{summary_suffix}")
 
@@ -668,17 +685,17 @@ def build_snapshot_with_summaries(
 
     result = "\n".join(lines)
     estimated_tokens = len(result) // 4
-    if estimated_tokens > max_tokens:
+    if estimated_tokens > effective_max_tokens:
         truncated: list[str] = [lines[0]]
-        budget_chars = max_tokens * 4
+        budget_chars = effective_max_tokens * 4
         used = len(truncated[0])
         for line in lines[1:]:
             if used + len(line) + 1 > budget_chars:
-                truncated.append("  ... (truncated — project has more files)")
+                truncated.append("  ... (truncated - project has more files)")
                 break
             truncated.append(line)
             used += len(line) + 1
         result = "\n".join(truncated)
 
-    _snapshot_cache[project_root] = (time.time(), result)
+    _snapshot_cache[cache_key] = (time.time(), result)
     return result

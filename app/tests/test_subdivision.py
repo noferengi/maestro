@@ -35,11 +35,11 @@ class TestSubdivideVerdict:
 
 
 # ============================================================
-# tally_votes — Rule 0
+# tally_votes - Rule 0
 # ============================================================
 
 class TestTallyVotesSubdivide:
-    """Rule 0: any SUBDIVIDE_IDEA vote → outcome='subdivide'."""
+    """Rule 0: any SUBDIVIDE_IDEA vote -> outcome='subdivide'."""
 
     def test_single_subdivide_vote(self):
         votes = [
@@ -92,7 +92,7 @@ class TestTallyVotesSubdivide:
 
 
 # ============================================================
-# DAGResolver — cancelled/subdividing exclusions
+# DAGResolver - cancelled/subdividing exclusions
 # ============================================================
 
 class TestDAGResolverExclusions:
@@ -139,7 +139,7 @@ class TestDAGResolverExclusions:
 
 
 # ============================================================
-# DAGResolver — Big Idea parent / child delegation
+# DAGResolver - Big Idea parent / child delegation
 # ============================================================
 
 class TestBigIdeaParentDelegation:
@@ -207,7 +207,7 @@ class TestBigIdeaParentDelegation:
         assert "downstream" not in ids
 
     def test_all_cancelled_children_keeps_downstream_blocked(self):
-        """All-cancelled children → parent still blocked (conservative)."""
+        """All-cancelled children -> parent still blocked (conservative)."""
         from app.agent.dag import DAGResolver
         tasks = self._make_tasks("idea", ["cancelled", "cancelled"])
         dag = DAGResolver(tasks)
@@ -215,7 +215,7 @@ class TestBigIdeaParentDelegation:
         assert "downstream" not in ids
 
     def test_mixed_cancelled_and_completed_unblocks_downstream(self):
-        """Cancelled children are ignored; all remaining active children done → unblocks."""
+        """Cancelled children are ignored; all remaining active children done -> unblocks."""
         from app.agent.dag import DAGResolver
         tasks = self._make_tasks("idea", ["completed", "cancelled"])
         dag = DAGResolver(tasks)
@@ -223,7 +223,7 @@ class TestBigIdeaParentDelegation:
         assert "downstream" in ids
 
     def test_nested_big_idea_all_grandchildren_done_unblocks(self):
-        """Two levels of subdivision: grandchildren all done → outer downstream unblocks."""
+        """Two levels of subdivision: grandchildren all done -> outer downstream unblocks."""
         from app.agent.dag import DAGResolver
         tasks = [
             {"id": "grandparent", "type": "idea",      "position": 0, "prerequisites": [],              "parent_task_id": None},
@@ -354,7 +354,7 @@ class TestSubdivisionResultParsing:
 
 
 # ============================================================
-# Config — subdivision settings
+# Config - subdivision settings
 # ============================================================
 
 class TestSubdivisionConfig:
@@ -503,7 +503,7 @@ class TestSubdivisionStrategyGuidance:
 
 
 # ============================================================
-# Intake pipeline — _build_tally with SUBDIVIDE_IDEA
+# Intake pipeline - _build_tally with SUBDIVIDE_IDEA
 # ============================================================
 
 class TestIntakeBuildTallySubdivide:

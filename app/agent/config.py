@@ -8,7 +8,7 @@ Load order (highest priority wins):
   2. maestro.ini            (project root)
   3. Built-in defaults      (hardcoded below)
 
-All other modules import from here — never hard-code tuneable values.
+All other modules import from here - never hard-code tuneable values.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ _INI_PATH = os.path.join(
 _cfg = configparser.ConfigParser(
     # Allow : in values (URLs) without treating it as a delimiter
     delimiters=("=",),
-    # Keep percent signs literal — our warning messages use %%
+    # Keep percent signs literal - our warning messages use %%
     interpolation=None,
 )
 # Preserve case in keys
@@ -124,9 +124,9 @@ def _resolve_git_root(path: str) -> str | None:
     or None if *path* is not inside any git repository.
 
     Uses ``git rev-parse --show-toplevel`` so it handles submodules, worktrees,
-    and symbolic links correctly — no string-manipulation guessing.
+    and symbolic links correctly - no string-manipulation guessing.
     """
-    import subprocess as _sp  # local import — config.py has no subprocess dep yet
+    import subprocess as _sp  # local import - config.py has no subprocess dep yet
     try:
         result = _sp.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -148,7 +148,7 @@ def _resolve_git_root(path: str) -> str | None:
 MAESTRO_GIT_ROOT: str | None = _resolve_git_root(PROJECT_ROOT)
 
 # ===========================================================================
-# Agent status values (canonical — not user-tuneable)
+# Agent status values (canonical - not user-tuneable)
 # ===========================================================================
 
 STATUS_PENDING: str = "PENDING"
@@ -172,7 +172,7 @@ TIEBREAKER_ENABLED: bool = _getbool("intake", "tiebreaker_enabled", None, True)
 INTAKE_LLM_TEMPERATURE: float = _getfloat("intake", "llm_temperature", "MAESTRO_INTAKE_TEMP", 0.1)
 
 RESEARCH_AGENT_TOOLS: list[str] = _getlist("intake", "research_agent_tools",
-    "web_search, read_file, read_file_harder, read_file_lines, count_lines, "
+    "web_search, read_file, read_file_harder, count_lines, "
     "search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, "
     "get_task, list_tasks"
@@ -191,7 +191,7 @@ SUBDIVISION_CONTEXT_BUDGET_RATIO: float = _getfloat("subdivision", "context_budg
 SUBDIVISION_CONTEXT_AWARE_TOOLS: bool = _getbool("subdivision", "context_aware_tools", None, True)
 
 SUBDIVISION_AGENT_TOOLS: list[str] = _getlist("subdivision", "subdivision_agent_tools",
-    "read_file, read_file_harder, read_file_lines, count_lines, "
+    "read_file, read_file_harder, count_lines, "
     "search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, "
     "get_task, list_tasks"
@@ -285,11 +285,11 @@ def check_context_saturation(
 
     saturation = prompt_tokens / max_context
 
-    # Hard terminate check — evaluated before nudge injection
+    # Hard terminate check - evaluated before nudge injection
     if terminate_threshold > 0 and saturation >= terminate_threshold:
         return True
 
-    # Nudge threshold injection — fire each level at most once per life/session
+    # Nudge threshold injection - fire each level at most once per life/session
     for threshold_pct, threshold_msg in CONTEXT_WARNING_THRESHOLDS:
         if saturation >= threshold_pct and threshold_pct not in warned_set:
             warned_set.add(threshold_pct)
@@ -311,14 +311,13 @@ SCHEDULER_DISPATCHABLE_TYPES: list[str] = _getlist(
 )
 # How long to wait for a file_summary job to complete before falling back to
 # structural-only output.  Covers queue wait + total generation time across all
-# chunks.  3600s (1 hour) is the absolute safety net; actual stuck-model
-# detection is handled by FILE_SUMMARY_STREAM_IDLE_TIMEOUT.
-FILE_SUMMARY_WAIT_TIMEOUT: float = _getfloat("scheduler", "file_summary_wait_timeout", None, 3600.0)
+# chunks.  300s (5 minutes) is a reasonable middle ground.
+FILE_SUMMARY_WAIT_TIMEOUT: float = _getfloat("scheduler", "file_summary_wait_timeout", None, 300.0)
 
 # Maximum silence (seconds) between consecutive SSE tokens before treating the
 # LLM as stuck and aborting the current file-summary call with ReadTimeout.
-# Only measures active generation — queue wait and backoff sleeps do not count.
-FILE_SUMMARY_STREAM_IDLE_TIMEOUT: float = _getfloat("scheduler", "file_summary_stream_idle_timeout", None, 60.0)
+# Only measures active generation - queue wait and backoff sleeps do not count.
+FILE_SUMMARY_STREAM_IDLE_TIMEOUT: float = _getfloat("scheduler", "file_summary_stream_idle_timeout", None, 30.0)
 
 # ===========================================================================
 # Verdict confidence ranges
@@ -376,7 +375,7 @@ INDEV_ENFORCE_FILE_CONTAINMENT: bool = _getbool("indev", "enforce_file_containme
 # [indev]
 INDEV_AGENT_TOOLS: list[str] = _getlist(
     "indev", "agent_tools",
-    "read_file, read_file_harder, read_file_lines, count_lines, write_file, append_file, list_directory, "
+    "read_file, read_file_harder, count_lines, write_file, append_file, list_directory, "
     "search_files, find_files, archive_file, "
     "git_status, git_diff, git_log, git_blame, git_show, "
     "git_create_branch, git_commit, git_checkout, "
@@ -397,7 +396,7 @@ CONCEPTUAL_REVIEW_RESEARCH_LIVES: int = _getint("conceptual_review", "research_a
 # [conceptual_review]
 CONCEPTUAL_REVIEW_REVIEWER_TOOLS: list[str] = _getlist(
     "conceptual_review", "reviewer_tools",
-    "read_file, read_file_harder, read_file_lines, count_lines, search_files, find_files, list_directory, "
+    "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks"
 )
 
@@ -418,12 +417,12 @@ OPTIMIZATION_MAX_REGRESSION_PCT: float = _getfloat("optimization", "max_regressi
 OPTIMIZATION_MAX_REVIEWER_TURNS: int = _getint("optimization", "reviewer_max_turns", None, 50)
 OPTIMIZATION_REVIEWER_TOOLS: list[str] = _getlist(
     "optimization", "reviewer_tools",
-    "read_file, read_file_harder, read_file_lines, count_lines, search_files, find_files, list_directory, "
+    "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks"
 )
 
 # [optimization_weights]
-# Resource weights — higher value = more precious = improvements here count more
+# Resource weights - higher value = more precious = improvements here count more
 OPTIMIZATION_COMPUTE_WEIGHT: float = _getfloat("optimization_weights", "compute_weight", None, 1.0)
 OPTIMIZATION_MEMORY_WEIGHT: float = _getfloat("optimization_weights", "memory_weight", None, 0.6)
 OPTIMIZATION_STORAGE_WEIGHT: float = _getfloat("optimization_weights", "storage_weight", None, 0.3)
@@ -433,7 +432,7 @@ OPTIMIZATION_READABILITY_PENALTY_MAX: float = _getfloat("optimization_weights", 
 OPTIMIZATION_PREMATURE_MULTIPLIER: float = _getfloat("optimization_weights", "premature_multiplier", None, 2.0)
 OPTIMIZATION_TECH_DEBT_BONUS_PCT: float = _getfloat("optimization_weights", "tech_debt_bonus_pct", None, 1.0)
 
-# Big O ranking — lower rank = better complexity class
+# Big O ranking - lower rank = better complexity class
 BIG_O_RANKING: dict[str, int] = {
     "O(1)": 1, "O(log n)": 2, "O(n)": 3, "O(n log n)": 4,
     "O(n^2)": 5, "O(n^3)": 6, "O(2^n)": 7, "O(n!)": 8,
@@ -452,7 +451,7 @@ SECURITY_REVIEW_RESEARCH_LIVES: int = _getint("security_review", "research_agent
 SECURITY_REVIEW_MAX_REVIEWER_TURNS: int = _getint("security_review", "reviewer_max_turns", None, 50)
 SECURITY_REVIEWER_TOOLS: list[str] = _getlist(
     "security_review", "reviewer_tools",
-    "read_file, read_file_harder, read_file_lines, count_lines, search_files, find_files, list_directory, "
+    "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks, run_shell_security"
 )
 
@@ -471,12 +470,12 @@ FULL_REVIEW_RESEARCH_LIVES: int = _getint("full_review", "research_agent_max_liv
 FULL_REVIEW_MAX_REVIEWER_TURNS: int = _getint("full_review", "reviewer_max_turns", None, 50)
 FULL_REVIEW_CODE_QUALITY_TOOLS: list[str] = _getlist(
     "full_review", "code_quality_reviewer_tools",
-    "read_file, read_file_harder, read_file_lines, count_lines, search_files, find_files, list_directory, "
+    "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks, run_shell_review"
 )
 FULL_REVIEW_FUNCTIONAL_TOOLS: list[str] = _getlist(
     "full_review", "functional_reviewer_tools",
-    "read_file, read_file_harder, read_file_lines, count_lines, search_files, find_files, list_directory, "
+    "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks"
 )
 
@@ -520,9 +519,15 @@ TOOL_MAX_SEARCH_RESULTS: int = _getint("tools", "max_search_results", None, 200)
 TOOL_MAX_GIT_LOG_ENTRIES: int = _getint("tools", "max_git_log_entries", None, 100)
 GIT_TIMEOUT_SECONDS: int = _getint("tools", "git_timeout_seconds", None, 30)
 
-SNAPSHOT_MAX_DEPTH: int = _getint("snapshot", "max_depth", None, 3)
-SNAPSHOT_MAX_TOKENS: int = _getint("snapshot", "max_tokens", None, 1500)
+SNAPSHOT_MAX_DEPTH: int = _getint("snapshot", "max_depth", None, 4)
+SNAPSHOT_MAX_TOKENS: int = _getint("snapshot", "max_tokens", None, 12000)
 SNAPSHOT_CACHE_TTL: int = _getint("snapshot", "cache_ttl_seconds", None, 300)
+
+# Fraction of the LLM's context window to allocate to the project structure snapshot.
+# When the calling agent knows the LLM's max_context, it passes
+# max_tokens = int(max_context * SNAPSHOT_CONTEXT_RATIO) to build_snapshot_with_summaries.
+# This keeps the snapshot budget proportional across small and very large context windows.
+SNAPSHOT_CONTEXT_RATIO: float = _getfloat("snapshot", "context_ratio", None, 0.12)
 
 TOOL_LISTING_EXCLUDED_DIRS: set[str] = set(_getlist(
     "tools", "excluded_directories",

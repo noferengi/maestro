@@ -4,11 +4,11 @@ app/agent/planning.py
 Planning pipeline for the PLANNING stage.
 
 Sub-stages:
-  1. Codebase Survey — agentic loop (read-only tools, max N turns)
-  2. Best-of-N Design Generation — N parallel structured LLM calls
-  3. Design Review Panel — 3 parallel LLM reviewers
-  4. Pitfall Detection — deterministic + 1 LLM call
-  5. Plan Consolidation — 1 LLM call to merge winner + pitfall mitigations
+  1. Codebase Survey - agentic loop (read-only tools, max N turns)
+  2. Best-of-N Design Generation - N parallel structured LLM calls
+  3. Design Review Panel - 3 parallel LLM reviewers
+  4. Pitfall Detection - deterministic + 1 LLM call
+  5. Plan Consolidation - 1 LLM call to merge winner + pitfall mitigations
 
 Output: PlanningResult stored in planning_results table.
 """
@@ -32,10 +32,11 @@ from app.agent.config import (
     PROJECT_ROOT,
     check_context_saturation,
 )
-from app.agent.llm_client import call_llm
+from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
 from app.agent.verdicts import Vote, Verdict, tally_votes
 
 logger = logging.getLogger(__name__)
+AGENT_NAME = "Planning Pipeline"
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +101,7 @@ class PlanningResult:
 # ---------------------------------------------------------------------------
 
 SURVEY_TOOLS = [
-    "read_file", "read_file_lines", "count_lines",
+    "read_file", "read_file_harder", "count_lines",
     "search_files", "find_files", "list_directory",
     "git_log", "git_blame",
     "get_task", "list_tasks",
@@ -132,6 +133,7 @@ class PlanningPipeline:
         llm_id: int | None = None,
         budget_id: int | None = None,
         max_context: int | None = None,
+        run_row_id: int | None = None,
     ):
         self.task_id = task_id
         self.task_title = task_title
@@ -142,12 +144,13 @@ class PlanningPipeline:
         self.llm_id = llm_id
         self.budget_id = budget_id
         self.max_context = max_context
+        self.run_row_id = run_row_id
         self._total_prompt = 0
         self._total_completion = 0
 
     async def run(self) -> PlanningResult:
         """Execute all planning sub-stages and return the result."""
-        logger.info("[planning] Starting pipeline for task '%s'", self.task_id)
+        logger.info(f"[{AGENT_NAME}] Starting pipeline for task '%s'", self.task_id)
 
         # Stage 1: Codebase survey
         survey_summary = await self._stage_codebase_survey()
@@ -159,6 +162,9 @@ class PlanningPipeline:
         winning_design: dict = {}
 
         for attempt in range(PLANNING_MAX_DESIGN_RETRIES):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
+
             # Stage 2: Best-of-N design generation
             designs = await self._stage_design_generation(survey_summary)
             best_designs = designs
@@ -174,11 +180,11 @@ class PlanningPipeline:
 
             tally = tally_votes(votes)
             if tally.outcome in ("passed", "conditional_pass"):
-                logger.info("[planning] Design accepted on attempt %d", attempt + 1)
+                logger.info(f"[{AGENT_NAME}] Design accepted on attempt %d", attempt + 1)
                 break
             else:
                 logger.info(
-                    "[planning] Design rejected (attempt %d/%d): %s",
+                    f"[{AGENT_NAME}] Design rejected (attempt %d/%d): %s",
                     attempt + 1, PLANNING_MAX_DESIGN_RETRIES, tally.summary,
                 )
                 if attempt < PLANNING_MAX_DESIGN_RETRIES - 1:
@@ -237,6 +243,9 @@ class PlanningPipeline:
         _ctx_warned: set[float] = set()
 
         for turn in range(PLANNING_SURVEY_MAX_TURNS):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
+
             response = await call_llm(
                 messages,
                 base_url=self.llm_base_url,
@@ -246,6 +255,7 @@ class PlanningPipeline:
                 task_id=self.task_id,
                 llm_id=self.llm_id,
                 budget_id=self.budget_id,
+                agent_name=AGENT_NAME,
             )
 
             self._track_tokens(response)
@@ -257,7 +267,7 @@ class PlanningPipeline:
                 _ctx_warned,
                 messages,
             ):
-                logger.warning("[planning] Survey context saturation (turn %d) — terminating", turn + 1)
+                logger.warning(f"[{AGENT_NAME}] Survey context saturation (turn %d) - terminating", turn + 1)
                 break
             choice = response.get("choices", [{}])[0]
             msg = choice.get("message", {})
@@ -291,7 +301,7 @@ class PlanningPipeline:
         if not survey_result:
             survey_result = content or "Survey completed without explicit summary."
 
-        logger.info("[planning] Codebase survey completed (%d chars)", len(survey_result))
+        logger.info(f"[{AGENT_NAME}] Codebase survey completed (%d chars)", len(survey_result))
         return survey_result
 
     # ------------------------------------------------------------------
@@ -337,15 +347,19 @@ class PlanningPipeline:
                     task_id=self.task_id,
                     llm_id=self.llm_id,
                     budget_id=self.budget_id,
+                    agent_name=AGENT_NAME,
                 )
             )
+
+        if is_shutting_down():
+            raise ShutdownError("Server is shutting down")
 
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
         designs = []
         for i, resp in enumerate(responses):
             if isinstance(resp, Exception):
-                logger.warning("[planning] Design %d failed: %s", i, resp)
+                logger.warning(f"[{AGENT_NAME}] Design %d failed: %s", i, resp)
                 designs.append({"error": str(resp)})
                 continue
             self._track_tokens(resp)
@@ -356,7 +370,7 @@ class PlanningPipeline:
                 design = {"raw": content, "parse_error": True}
             designs.append(design)
 
-        logger.info("[planning] Generated %d designs", len(designs))
+        logger.info(f"[{AGENT_NAME}] Generated %d designs", len(designs))
         return designs
 
     async def _stage_judge_designs(
@@ -365,7 +379,7 @@ class PlanningPipeline:
         """Use a judge LLM call to select the best design."""
         valid = [(i, d) for i, d in enumerate(designs) if "error" not in d and "parse_error" not in d]
         if not valid:
-            logger.warning("[planning] No valid designs, using first")
+            logger.warning(f"[{AGENT_NAME}] No valid designs, using first")
             return 0, designs[0] if designs else {}
         if len(valid) == 1:
             return valid[0]
@@ -375,7 +389,7 @@ class PlanningPipeline:
             "Output JSON: {\"selected_index\": <0-based index>, \"justification\": \"...\"}\n\n"
         )
         for orig_idx, design in valid:
-            # Only send the rationale + file list — keeps the prompt small
+            # Only send the rationale + file list - keeps the prompt small
             summary = {
                 "rationale": str(design.get("design_rationale", ""))[:400],
                 "files": [f.get("path", "") for f in design.get("file_manifest", [])[:8]],
@@ -395,6 +409,7 @@ class PlanningPipeline:
                 task_id=self.task_id,
                 llm_id=self.llm_id,
                 budget_id=self.budget_id,
+                agent_name=AGENT_NAME,
             )
             self._track_tokens(response)
 
@@ -404,7 +419,7 @@ class PlanningPipeline:
             if idx < 0 or idx >= len(designs):
                 idx = valid[0][0]
         except Exception as exc:
-            logger.warning("[planning] Judge call failed (%s), using first valid design %d", exc, valid[0][0])
+            logger.warning(f"[{AGENT_NAME}] Judge call failed (%s), using first valid design %d", exc, valid[0][0])
             idx = valid[0][0]
 
         return idx, designs[idx]
@@ -489,6 +504,7 @@ class PlanningPipeline:
                     task_id=self.task_id,
                     llm_id=self.llm_id,
                     budget_id=self.budget_id,
+                    agent_name=AGENT_NAME,
                 )
             )
 
@@ -498,7 +514,9 @@ class PlanningPipeline:
         for i, resp in enumerate(responses):
             reviewer_name = reviewers[i]["name"]
             if isinstance(resp, Exception):
-                logger.warning("[planning] Reviewer '%s' failed: %s", reviewer_name, resp)
+                if isinstance(resp, ShutdownError):
+                    raise resp  # don't bake transient shutdown into a permanent vote record
+                logger.warning(f"[{AGENT_NAME}] Reviewer '%s' failed: %s", reviewer_name, resp)
                 votes.append(Vote(
                     stage=reviewer_name,
                     verdict=Verdict.NEEDS_RESEARCH,
@@ -592,13 +610,14 @@ class PlanningPipeline:
                 task_id=self.task_id,
                 llm_id=self.llm_id,
                 budget_id=self.budget_id,
+                agent_name=AGENT_NAME,
             )
             self._track_tokens(response)
             content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
             data = json.loads(content)
             pitfalls.extend(data.get("pitfalls", []))
         except Exception as e:
-            logger.warning("[planning] Pitfall LLM check failed: %s", e)
+            logger.warning(f"[{AGENT_NAME}] Pitfall LLM check failed: %s", e)
 
         return pitfalls
 
@@ -633,12 +652,13 @@ class PlanningPipeline:
                 task_id=self.task_id,
                 llm_id=self.llm_id,
                 budget_id=self.budget_id,
+                agent_name=AGENT_NAME,
             )
             self._track_tokens(response)
             content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
             return json.loads(content)
         except Exception as e:
-            logger.warning("[planning] Consolidation failed: %s. Using original design.", e)
+            logger.warning(f"[{AGENT_NAME}] Consolidation failed: %s. Using original design.", e)
             return design
 
     # ------------------------------------------------------------------
@@ -716,30 +736,45 @@ class PlanningPipeline:
         )
 
     def _store_result(self, result: PlanningResult) -> None:
-        """Persist PlanningResult to the database."""
+        """Persist PlanningResult to the database.
+
+        If ``self.run_row_id`` is set (i.e. the caller pre-created an
+        ``in_progress`` row), update that row in-place so the row ID stays
+        stable.  Otherwise fall back to creating a new row (scheduler path).
+        """
+        kwargs = dict(
+            file_manifest=json.dumps([asdict(f) for f in result.file_manifest]),
+            dependency_graph=json.dumps(result.dependency_graph),
+            interface_contracts=json.dumps([asdict(c) for c in result.interface_contracts]),
+            test_strategy=json.dumps([asdict(t) for t in result.test_strategy]),
+            implementation_steps=json.dumps([asdict(s) for s in result.implementation_steps]),
+            pitfalls_identified=json.dumps(result.pitfalls_identified),
+            review_votes=json.dumps([
+                {"stage": v.stage, "verdict": v.verdict.value, "confidence": v.confidence,
+                 "justification": v.justification}
+                for v in result.review_votes
+            ]),
+            best_of_n_designs=json.dumps(result.best_of_n_designs),
+            selected_design_index=result.selected_design_index,
+            confidence=result.confidence,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            status='active',
+        )
         try:
-            from app.database import create_planning_result
-            create_planning_result(
-                task_id=result.task_id,
-                file_manifest=json.dumps([asdict(f) for f in result.file_manifest]),
-                dependency_graph=json.dumps(result.dependency_graph),
-                interface_contracts=json.dumps([asdict(c) for c in result.interface_contracts]),
-                test_strategy=json.dumps([asdict(t) for t in result.test_strategy]),
-                implementation_steps=json.dumps([asdict(s) for s in result.implementation_steps]),
-                pitfalls_identified=json.dumps(result.pitfalls_identified),
-                review_votes=json.dumps([
-                    {"stage": v.stage, "verdict": v.verdict.value, "confidence": v.confidence,
-                     "justification": v.justification}
-                    for v in result.review_votes
-                ]),
-                best_of_n_designs=json.dumps(result.best_of_n_designs),
-                selected_design_index=result.selected_design_index,
-                confidence=result.confidence,
-                prompt_tokens=result.prompt_tokens,
-                completion_tokens=result.completion_tokens,
-            )
+            if self.run_row_id is not None:
+                from app.database import update_planning_result
+                from app.database.session import SessionLocal as _SL
+                _db = _SL()
+                try:
+                    update_planning_result(_db, self.run_row_id, **kwargs)
+                finally:
+                    _db.close()
+            else:
+                from app.database import create_planning_result
+                create_planning_result(task_id=result.task_id, **kwargs)
         except Exception as e:
-            logger.error("[planning] Failed to store result: %s", e)
+            logger.error(f"[{AGENT_NAME}] Failed to store result: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -758,6 +793,7 @@ async def run_planning_pipeline(
     budget_id: int | None = None,
     max_context: int | None = None,
     project_path: str | None = None,
+    run_row_id: int | None = None,
 ) -> dict:
     """Run the full planning pipeline and return a result dict."""
     if project_path is not None:
@@ -773,6 +809,7 @@ async def run_planning_pipeline(
         llm_id=llm_id,
         budget_id=budget_id,
         max_context=max_context,
+        run_row_id=run_row_id,
     )
     result = await pipeline.run()
     return {

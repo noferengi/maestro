@@ -1,14 +1,14 @@
 """
 app/agent/optimization.py
 --------------------------
-Optimization Pipeline — profile → propose → vote → implement → verify.
+Optimization Pipeline - profile -> propose -> vote -> implement -> verify.
 
 5-phase flow:
-  1. Profiling Agent → BaselineReport
-  2. 5x Proposers in parallel → Optimization Proposals
-  3. 3x Judges in parallel → Ranked proposals
-  4. Implementation Agent → Code changes
-  5. Profiling Agent again → Compare vs baseline
+  1. Profiling Agent -> BaselineReport
+  2. 5x Proposers in parallel -> Optimization Proposals
+  3. 3x Judges in parallel -> Ranked proposals
+  4. Implementation Agent -> Code changes
+  5. Profiling Agent again -> Compare vs baseline
 """
 
 from __future__ import annotations
@@ -39,9 +39,10 @@ from app.agent.config import (
 )
 from app.agent.json_utils import extract_json_block
 from app.agent.tools import dispatch_tool, build_tool_schemas
-from app.agent.llm_client import call_llm
+from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
 
 logger = logging.getLogger(__name__)
+AGENT_NAME = "Optimization Pipeline"
 
 
 @dataclass(slots=True)
@@ -89,24 +90,33 @@ class OptimizationPipeline:
 
     async def run(self) -> OptimizationPipelineResult:
         """Execute all 5 phases."""
-        logger.info("[optimization] Starting for task '%s'", self.task_id)
+        if is_shutting_down():
+            raise ShutdownError("Server is shutting down")
+
+        logger.info(f"[{AGENT_NAME}] Starting for task '%s'", self.task_id)
 
         # Phase 1: Baseline profiling
         baseline = await self._phase_profiling("baseline")
+        if is_shutting_down():
+            raise ShutdownError("Server is shutting down")
 
         # Phase 2: Parallel proposals
         proposals = await self._phase_proposals(baseline)
+        if is_shutting_down():
+            raise ShutdownError("Server is shutting down")
 
         # Phase 3: Judge proposals
         scores, winner_idx, winner_score, r1_tally, r2_tally, revote = await self._phase_judging(proposals)
+        if is_shutting_down():
+            raise ShutdownError("Server is shutting down")
 
-        # No majority after revote — reject and demote to indev
+        # No majority after revote - reject and demote to indev
         if winner_idx == -1:
             reason = (
                 f"No consensus on optimization approach after revote. "
                 f"Round 1: {r1_tally}, Round 2: {r2_tally}."
             )
-            logger.warning("[optimization] Rejecting task '%s': %s", self.task_id, reason)
+            logger.warning(f"[{AGENT_NAME}] Rejecting task '%s': %s", self.task_id, reason)
             result = OptimizationPipelineResult(
                 task_id=self.task_id,
                 outcome="rejected",
@@ -125,7 +135,7 @@ class OptimizationPipeline:
             return result
 
         if not proposals or winner_score < 0.3:
-            logger.info("[optimization] No viable proposals, skipping optimization.")
+            logger.info(f"[{AGENT_NAME}] No viable proposals, skipping optimization.")
             return OptimizationPipelineResult(
                 task_id=self.task_id,
                 outcome="skipped",
@@ -186,24 +196,27 @@ class OptimizationPipeline:
 
     async def _phase_profiling(self, phase_name: str) -> dict:
         """Run profiling analysis via LLM mini-loop."""
+        if is_shutting_down():
+            raise ShutdownError("Server is shutting down")
+
         prompt = (
             f"You are a performance profiler running {phase_name} analysis.\n"
             f"Task: {self.task_description}\n\n"
-            "Step 1 — Read the relevant source files to understand the code.\n"
-            "Step 2 — Determine the Big O class of the critical path by reading the code "
+            "Step 1 - Read the relevant source files to understand the code.\n"
+            "Step 2 - Determine the Big O class of the critical path by reading the code "
             "(do not guess; trace the actual algorithm).\n"
-            "Step 3 — Run a synthetic benchmark using run_shell with a Python one-liner. "
+            "Step 3 - Run a synthetic benchmark using run_shell with a Python one-liner. "
             "Choose scale_n based on operation type: N=10_000 for I/O-bound, "
             "N=100_000 for CPU-bound, N=1_000_000 for trivial ops. Example:\n"
             "  python -c \"import time; start=time.perf_counter(); [your_op() for _ in range(N)]; "
             "print((time.perf_counter()-start)*1000)\"\n"
-            "Step 4 — Estimate peak memory usage (RSS) during the benchmark if measurable.\n"
-            "Step 5 — Identify hotspots (function/line references).\n"
-            "Step 6 — Rate readability_cost from 0.0 (simple, clear) to 1.0 (requires deep "
+            "Step 4 - Estimate peak memory usage (RSS) during the benchmark if measurable.\n"
+            "Step 5 - Identify hotspots (function/line references).\n"
+            "Step 6 - Rate readability_cost from 0.0 (simple, clear) to 1.0 (requires deep "
             "expertise to understand or maintain).\n"
-            "Step 7 — Determine if this optimization targets a real measured bottleneck "
+            "Step 7 - Determine if this optimization targets a real measured bottleneck "
             "(is_premature=false) or an assumed one (is_premature=true).\n"
-            "Step 8 — Determine if this resolves known tech debt (tech_debt_resolved=true/false).\n\n"
+            "Step 8 - Determine if this resolves known tech debt (tech_debt_resolved=true/false).\n\n"
             "Output JSON:\n"
             "{\"test_duration_ms\": 0, \"memory_peak_mb\": 0, \"dep_count\": 0, \"hotspots\": [], "
             "\"complexity_score\": 0, \"big_o_class\": \"O(n)\", \"scale_n\": 10000, "
@@ -219,6 +232,8 @@ class OptimizationPipeline:
         max_turns = OPTIMIZATION_MAX_REVIEWER_TURNS
 
         for turn in range(max_turns):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
             try:
                 response = await call_llm(
                     messages,
@@ -230,9 +245,10 @@ class OptimizationPipeline:
                     task_id=self.task_id,
                     llm_id=self.llm_id,
                     budget_id=self.budget_id,
+                    agent_name=AGENT_NAME,
                 )
             except Exception as e:
-                logger.warning("[optimization] Profiling (%s) LLM call failed: %s", phase_name, e)
+                logger.warning(f"[{AGENT_NAME}] Profiling (%s) LLM call failed: %s", phase_name, e)
                 return {"error": str(e)}
 
             self._track_tokens(response)
@@ -301,6 +317,8 @@ class OptimizationPipeline:
         max_turns = OPTIMIZATION_MAX_REVIEWER_TURNS
 
         for turn in range(max_turns):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
             try:
                 response = await call_llm(
                     messages,
@@ -312,9 +330,10 @@ class OptimizationPipeline:
                     task_id=self.task_id,
                     llm_id=self.llm_id,
                     budget_id=self.budget_id,
+                    agent_name=AGENT_NAME,
                 )
             except Exception as e:
-                logger.warning("[optimization] Proposer (%s) LLM call failed: %s", lens_name, e)
+                logger.warning(f"[{AGENT_NAME}] Proposer (%s) LLM call failed: %s", lens_name, e)
                 return None
 
             self._track_tokens(response)
@@ -393,6 +412,8 @@ class OptimizationPipeline:
         max_turns = OPTIMIZATION_MAX_REVIEWER_TURNS
 
         for turn in range(max_turns):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
             try:
                 response = await call_llm(
                     messages,
@@ -404,9 +425,10 @@ class OptimizationPipeline:
                     task_id=self.task_id,
                     llm_id=self.llm_id,
                     budget_id=self.budget_id,
+                    agent_name=AGENT_NAME,
                 )
             except Exception as e:
-                logger.warning("[optimization] Judge LLM call failed: %s", e)
+                logger.warning(f"[{AGENT_NAME}] Judge LLM call failed: %s", e)
                 return None
 
             self._track_tokens(response)
@@ -496,8 +518,8 @@ class OptimizationPipeline:
             winner_score = r1_votes[best_r1] / OPTIMIZATION_JUDGE_COUNT
             return r1_scores, best_r1, winner_score, r1_tally, {}, False
 
-        # --- No majority — revote with context ---
-        logger.info("[optimization] No majority in round 1 (tally=%s). Running revote.", r1_tally)
+        # --- No majority - revote with context ---
+        logger.info(f"[{AGENT_NAME}] No majority in round 1 (tally=%s). Running revote.", r1_tally)
         vote_summary = ", ".join(
             f"Proposal {idx}: {count} vote(s)" for idx, count in sorted(r1_tally.items())
         )
@@ -513,7 +535,7 @@ class OptimizationPipeline:
             return r1_scores + r2_scores, best_r2, winner_score, r1_tally, r2_tally, True
 
         # --- Still no majority ---
-        logger.warning("[optimization] No majority after revote (r1=%s, r2=%s).", r1_tally, r2_tally)
+        logger.warning(f"[{AGENT_NAME}] No majority after revote (r1=%s, r2=%s).", r1_tally, r2_tally)
         return r1_scores + r2_scores, -1, 0.0, r1_tally, r2_tally, True
 
     # ------------------------------------------------------------------
@@ -523,14 +545,14 @@ class OptimizationPipeline:
     async def _phase_implementation(self, proposal: dict) -> bool:
         """
         Spawn Kanban sub-task cards for each winning optimization proposal so they
-        flow through the full pipeline (IDEA → PLANNING → INDEV → ...).
+        flow through the full pipeline (IDEA -> PLANNING -> INDEV -> ...).
         Returns True when all sub-tasks reach a terminal state, False on timeout.
         """
         from app.database import create_task, get_task, update_task
 
         parent = get_task(self.task_id)
         if not parent:
-            logger.warning("[optimization] Parent task '%s' not found.", self.task_id)
+            logger.warning(f"[{AGENT_NAME}] Parent task '%s' not found.", self.task_id)
             return False
 
         proposals_list = proposal.get("proposals", [proposal])
@@ -546,7 +568,7 @@ class OptimizationPipeline:
                 tags=["optimization", f"parent:{self.task_id}", f"risk:{opt.get('risk', 'unknown')}"],
                 llm_id=parent.llm_id,
                 budget_id=parent.budget_id,
-                # Inherit parent's prereqs (NOT parent's ID — avoids deadlock)
+                # Inherit parent's prereqs (NOT parent's ID - avoids deadlock)
                 prerequisites=list(parent.prerequisites or []),
                 project=parent.project or "TheMaestro",
             )
@@ -558,12 +580,12 @@ class OptimizationPipeline:
                 )
                 sub_task_ids.append(sub_task.id)
                 logger.info(
-                    "[optimization] Created sub-task '%s' for proposal: %s",
+                    f"[{AGENT_NAME}] Created sub-task '%s' for proposal: %s",
                     sub_task.id, opt.get("description", "?")[:60],
                 )
 
         if not sub_task_ids:
-            logger.warning("[optimization] No sub-tasks created for task '%s'.", self.task_id)
+            logger.warning(f"[{AGENT_NAME}] No sub-tasks created for task '%s'.", self.task_id)
             return False
 
         update_task(self.task_id, is_big_idea=True)
@@ -622,7 +644,7 @@ class OptimizationPipeline:
             "and call `record_benchmark` with `benchmark_type='after'` and updated metrics.",
             "",
             "**Readability cost:** Rate 0.0 (identical readability to before) to 1.0 (requires deep "
-            "expertise to maintain). Be honest — clever code has a carrying cost and will reduce your score.",
+            "expertise to maintain). Be honest - clever code has a carrying cost and will reduce your score.",
             "",
             f"Risk level: **{opt.get('risk', 'unknown')}**",
         ]
@@ -652,7 +674,7 @@ class OptimizationPipeline:
 
             done = [s in terminal for s in statuses]
             logger.debug(
-                "[optimization] Sub-task poll: %s",
+                f"[{AGENT_NAME}] Sub-task poll: %s",
                 dict(zip(sub_task_ids, statuses)),
             )
 
@@ -665,7 +687,7 @@ class OptimizationPipeline:
             await asyncio.sleep(poll_interval)
 
         logger.warning(
-            "[optimization] Sub-task wait timed out after %.0fs for task '%s'.",
+            f"[{AGENT_NAME}] Sub-task wait timed out after %.0fs for task '%s'.",
             timeout, self.task_id,
         )
         return False
@@ -692,7 +714,7 @@ class OptimizationPipeline:
                 if before_records and after_records:
                     return self._compare_benchmarks(before_records, after_records)
             except Exception as exc:
-                logger.warning("[optimization] Could not load benchmarks for '%s': %s", parent_task_id, exc)
+                logger.warning(f"[{AGENT_NAME}] Could not load benchmarks for '%s': %s", parent_task_id, exc)
 
         # Fallback: use complexity_score from profiling dicts
         b_score = baseline.get("complexity_score", 100)
@@ -715,7 +737,7 @@ class OptimizationPipeline:
                 if rank_delta > 0:
                     bonus = rank_delta * OPTIMIZATION_BIG_O_BONUS_PCT
                     improvement += bonus
-                    big_o_note = f", Big O {b_big_o}→{p_big_o} (+{bonus:.0f}%)"
+                    big_o_note = f", Big O {b_big_o}->{p_big_o} (+{bonus:.0f}%)"
 
         suffix = f"profiling data{big_o_note}"
 
@@ -763,7 +785,7 @@ class OptimizationPipeline:
             bm = before_by_task[tid]
             am = after_by_task[tid]
 
-            # --- Compute improvement (lower is better → (before - after) / before × 100) ---
+            # --- Compute improvement (lower is better -> (before - after) / before × 100) ---
             compute_imp = 0.0
             compute_weight_used = 0.0
             b_dur = bm.get("test_duration_ms")
@@ -783,7 +805,7 @@ class OptimizationPipeline:
             # Weighted aggregate (only include metrics we have data for)
             total_weight = compute_weight_used + memory_weight_used
             if total_weight == 0:
-                # No duration or memory data — fall back to complexity_score
+                # No duration or memory data - fall back to complexity_score
                 b_score = bm.get("complexity_score", 100)
                 a_score = am.get("complexity_score", 100)
                 weighted_imp = ((float(b_score) - float(a_score)) / float(b_score) * 100.0) if float(b_score) != 0 else 0.0
@@ -803,7 +825,7 @@ class OptimizationPipeline:
                     rank_delta = b_rank - a_rank  # positive = improvement
                     if rank_delta > 0:
                         big_o_bonus = rank_delta * OPTIMIZATION_BIG_O_BONUS_PCT
-                        big_o_transitions.append(f"{b_big_o}→{a_big_o} (+{big_o_bonus:.0f}%)")
+                        big_o_transitions.append(f"{b_big_o}->{a_big_o} (+{big_o_bonus:.0f}%)")
             weighted_imp += big_o_bonus
 
             # --- Readability penalty (from after record) ---
@@ -838,7 +860,7 @@ class OptimizationPipeline:
         if big_o_transitions:
             details.append("Big O: " + ", ".join(big_o_transitions))
         if is_premature_any:
-            details.append(f"premature (threshold ×{OPTIMIZATION_PREMATURE_MULTIPLIER:.0f}={effective_min:.1f}%)")
+            details.append(f"premature (threshold x{OPTIMIZATION_PREMATURE_MULTIPLIER:.0f}={effective_min:.1f}%)")
         if tech_debt_resolved_any:
             details.append(f"tech-debt bonus +{OPTIMIZATION_TECH_DEBT_BONUS_PCT:.1f}%")
         detail_str = "; ".join(details)
@@ -883,7 +905,7 @@ class OptimizationPipeline:
                 total_completion_tokens=result.completion_tokens,
             )
         except Exception as e:
-            logger.error("[optimization] Failed to store result: %s", e)
+            logger.error(f"[{AGENT_NAME}] Failed to store result: %s", e)
 
 
 # ---------------------------------------------------------------------------

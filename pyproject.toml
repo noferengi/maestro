@@ -22,8 +22,8 @@ dev = [
 
 [tool.pytest.ini_options]
 filterwarnings = [
-    "ignore::sqlalchemy.exc.MovedIn20Warning",
-    "ignore::DeprecationWarning:sqlalchemy",
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
 ]
 
 [build-system]

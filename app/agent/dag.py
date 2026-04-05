@@ -5,10 +5,10 @@ DAG Resolver for the Maestro Orchestrator.
 
 Consumes a flat list of task dicts (as returned by the Kanban DB / API)
 and provides:
-  • get_ready_tasks()       — tasks whose prerequisites are all done
-  • get_next_task()         — single highest-priority ready task
-  • build_execution_order() — topological sort producing parallelizable batches
-  • validate_dag()          — cycle detection + missing-prereq checks
+  • get_ready_tasks()       - tasks whose prerequisites are all done
+  • get_next_task()         - single highest-priority ready task
+  • build_execution_order() - topological sort producing parallelizable batches
+  • validate_dag()          - cycle detection + missing-prereq checks
 
 Tasks are expected to have at minimum:
   {
@@ -79,7 +79,7 @@ class DAGResolver:
             if _is_done(task):
                 continue
             task_type = (task.get("type") or "").lower()
-            # Permanently terminal states — never dispatch
+            # Permanently terminal states - never dispatch
             if task_type in ("security", "completed", "cancelled", "subdividing"):
                 continue
             # indev / conceptual_review / optimization / full_review are
@@ -88,7 +88,7 @@ class DAGResolver:
             # _active_sessions guard in scheduler._tick() re-dispatches them.
             # Excluding them here was the cause of orphaned-after-restart tasks
             # never being recovered.
-            # Skip Big Idea parents that have children — the scheduler works on
+            # Skip Big Idea parents that have children - the scheduler works on
             # the children directly.  The parent unblocks downstream dependents
             # via _is_effectively_done once all active children complete.
             if task.get("id") in self._children_by_parent:
@@ -158,7 +158,7 @@ class DAGResolver:
         # If any node still has in_degree > 0, there's a cycle
         if any(deg > 0 for deg in in_degree.values()):
             logger.error(
-                "DAG has cycle(s) — topological sort aborted for task set: %s",
+                "DAG has cycle(s) - topological sort aborted for task set: %s",
                 [t["id"] for t in self._tasks if "id" in t],
             )
             return []  # Caller should check validate_dag() for details
@@ -267,7 +267,7 @@ class DAGResolver:
             if (self._by_id.get(cid, {}).get("type") or "").lower() != "cancelled"
         ]
         if not active_children:
-            return False  # all children cancelled — keep parent blocked
+            return False  # all children cancelled - keep parent blocked
         return all(
             self._is_effectively_done(cid, _visited | {task_id})
             for cid in active_children

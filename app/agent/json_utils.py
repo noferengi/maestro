@@ -29,7 +29,7 @@ def extract_json_block(text: str) -> str | None:
     if not text:
         return None
 
-    # Fenced block — greedy match on the outermost braces inside the fence
+    # Fenced block - greedy match on the outermost braces inside the fence
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if fenced:
         return fenced.group(1)

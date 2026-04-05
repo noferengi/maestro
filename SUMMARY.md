@@ -14,7 +14,100 @@ agent prompts.
 
 ## Recent work (this session)
 
-### Arch Bar Populate feature (complete)
+### Graceful shutdown on Ctrl-C (`llm_client.py`, `research.py`, `main.py`)
+
+**Problem:** Pressing Ctrl-C flooded the terminal with hundreds of
+`RuntimeError: cannot schedule new futures after interpreter shutdown` errors
+before the process died, continuing for several seconds.
+
+**Root cause:** Python's interpreter teardown shuts down all `ThreadPoolExecutor`
+instances before daemon threads finish. Agent threads (research agents, up to 3 lives ×
+50 turns each) were still alive and retrying LLM calls. The research agent's `_run_life`
+caught *every* exception with a blanket `except Exception`, logged ERROR, appended a
+system message, and **`continue`d** to the next turn — a tight spin of ~12 errors/second
+per agent.
+
+**Fix (three-part):**
+- `llm_client.py` — Added `_shutdown_event = threading.Event()` with `signal_shutdown()`
+  and `is_shutting_down()` helpers. The `call_llm` retry loop checks the flag at the top
+  of every iteration and raises `RuntimeError("Server is shutting down")` immediately.
+- `research.py` — Added `if is_shutting_down(): raise` before the `continue` in
+  `_run_life`'s except block, and in `_post_mortem_call` and `_forced_verdict_call`.
+  Shutdown exceptions now propagate instead of being swallowed.
+- `main.py` — Lifespan shutdown calls `signal_shutdown()` **before** `stop_scheduler()`,
+  arming the flag while threads are still alive.
+
+---
+
+### llama.cpp 500 errors — PEG parser failure (`research.py`)
+
+**Problem:** The llama.cpp server at port 21982 returned intermittent
+`{"error": {"code": 500, "message": "Failed to parse input at pos ~1100-1135"}}`
+during normal operation.
+
+**Root cause:** The server runs Qwen3 with `chat_format: peg-native`. Qwen3 in thinking
+mode opens a `<think>...</think>` scratchpad before producing visible output. The PEG
+parser processes the raw token stream *after* generation and expects a properly closed
+`</think>`. When thinking consumes the full token budget before `</think>` is written, the
+parser hits end-of-stream mid-thought and fails at the character position where truncation
+occurred (~4.4 chars/token × token limit ≈ 1100–1135 chars).
+
+The GBNF grammar constraint (`grammar=_FORCED_VERDICT_GRAMMAR`) does **not** suppress
+Qwen3 thinking — it constrains only the visible output *after* `</think>`. The model still
+thinks first, potentially exhausting the budget before the JSON is ever reached.
+
+**Fix:**
+- Added `/no_think` at the start of the forced verdict epilogue system prompt. Qwen3
+  recognises this and skips the thinking block, producing short grammar-constrained JSON
+  that fits within any reasonable token budget.
+- Raised `max_tokens` for the forced verdict call 512 → 4096 so that once the underlying
+  token budget issue is resolved, the model has adequate headroom to reason before
+  synthesising its verdict.
+
+**Open:** Two hardcoded `max_tokens=256` calls were found in `planning.py` (planning
+judge) and `arch_gen_agent.py` (arch card generation). Both will fail identically with
+Qwen3 thinking mode — thinking consumes the full 256-token budget before the JSON output
+is reached. These need either `/no_think` in their system prompts or a raised budget.
+The root source of the 256-token cap on regular research agent calls (which send
+`max_tokens=4096`) remains unconfirmed; `n_predict=-1` on the llama.cpp server rules out
+a server-level cap. The proxy at port 8008 and Qwen3's chat template `thinking_budget`
+default are the remaining suspects.
+
+---
+
+### Thundering herd under concurrent jobs (`llm_client.py`)
+
+**Problem:** Running 3 simultaneous tasks produced noticeably more 500 errors than a
+single task — bursts of two or three 500s at the same timestamp, brief recovery, then
+another burst.
+
+**Two compounding effects:**
+
+**Statistical pile-up.** Each LLM call has some probability *P* of hitting the Qwen3
+thinking truncation condition. With N concurrent callers the probability that *at least
+one* fails in a given window is `1 − (1−P)^N`. At N=3 this is ~2.7× the single-caller
+failure rate — more errors simply because more calls happen in parallel.
+
+**Thundering herd amplifier.** The backoff state (`_endpoint_states`) is a global dict
+shared across all threads. When all three agents receive 500s at the same timestamp:
+1. Each increments `fail_count` and computes `wait = BACKOFF_BASE_DELAY = 3.0s`.
+2. Each calls `await asyncio.sleep(3.0)` — all three sleep for *exactly* the same
+   duration.
+3. All three wake up simultaneously and fire their next request together.
+4. The server receives another burst of 3 concurrent requests; the same ratio of
+   successes to failures repeats, producing another burst of errors.
+
+This is the textbook thundering herd: synchronised failure → synchronised retry →
+synchronised failure again.
+
+**Fix:** Added `random.uniform(0, wait * 0.5)` jitter to both retry sleep sites
+(ConnectError handler and 500 handler). For the 3-second base wait, agents now sleep
+3.0–4.5s independently. Three concurrent failures spread their retries across a 1.5s
+window, each hitting the server individually with a fresh slot assignment.
+
+---
+
+### Arch Bar Populate feature (previous session, complete)
 
 Added a `⚡ Populate` button to the architecture bar header. When clicked it queues
 scheduler jobs to generate one architecture card per missing category, using existing
@@ -25,141 +118,42 @@ file summaries as context. No existing cards are modified.
   `error_message`, `created_at`, `completed_at`
 - Index on `(status, priority, created_at)` for fast dispatch
 
-**`app/database/models.py`** — `ArchGenJob` SQLAlchemy model added after `OptimizationBenchmark`.
+**`app/agent/arch_gen_agent.py`** (new) — single-call agent: fetches file summaries,
+builds prompt (relative path + 2 sentences each), calls LLM with `temperature=0.4`,
+`max_tokens=256`, creates architecture task.
 
-**`app/database/crud_jobs.py`** — Four new functions: `create_arch_gen_job`,
-`get_pending_arch_gen_jobs`, `update_arch_gen_job`, `get_retriable_arch_gen_jobs`.
+**`app/agent/scheduler.py`** — `_dispatch_arch_gen_jobs()`, `_run_arch_gen_job()`, rescue
+block in `_rescue_stale_jobs()`, and `_tick()` step 5.5.
 
-**`app/database/crud_files.py`** — `get_file_summaries_for_project_root(project_root)`:
-returns all `FileSummary` rows whose `file_path` is under the given root (handles both
-`/` and `\` separators via LIKE).
+**`app/main.py`** — `POST /api/projects/{project_name}/populate-arch`.
 
-**`app/database/__init__.py`** — all new symbols re-exported; `ArchGenJob` in models
-block; reload cascade list unchanged (submodule list already covers `crud_jobs` and
-`crud_files`).
-
-**`app/agent/arch_gen_agent.py`** (new) — single-call agent (Option A):
-1. `get_file_summaries_for_project_root(project_root)` → list of `FileSummary` rows
-2. Builds prompt: each file → relative path + up to 2 sentences (short_summary preferred,
-   truncated with `_two_sentences()`)
-3. `call_llm()` with `temperature=0.4`, `max_tokens=256`
-4. `create_task(type='architecture', content={"category": cat, "priority": "normal"}, ...)`
-5. Raises on empty response or missing summaries so scheduler marks the job `failed`
-
-**`app/agent/scheduler.py`** additions:
-- `_ARCH_GEN_RETRY_COOLDOWN = 300.0` constant
-- `_dispatch_arch_gen_jobs()` — same pattern as `_dispatch_file_summary_jobs`: one-LLM
-  gate, node/LLM capacity check, spawns `_run_arch_gen_job` thread; returns void (no
-  blocked caller to propagate `allowed_llm_id` to)
-- `_run_arch_gen_job()` — new event loop per thread, calls `execute_arch_gen_job`,
-  marks completed/failed, decrements `_llm_session_counts`
-- `_rescue_stale_jobs()` extended with arch gen rescue block (orphaned `running` +
-  cooled-down `failed` → reset to `pending`)
-- `_tick()` step 5.5 added: `_dispatch_arch_gen_jobs(...)` between research and
-  subdivision recovery
-
-**`app/main.py`** — `POST /api/projects/{project_name}/populate-arch`:
-- Reads existing arch tasks for the project, collects used categories
-- For each of the 14 missing categories, calls `create_arch_gen_job`
-- Uses `_pick_prewarm_resources()` for LLM/budget selection
-- Returns `{"queued": N, "categories": [...]}` or 503 if no LLM/budget available
-
-**`app/web/index.html`** — `⚡ Populate` button added between `+ Add` and `▲` toggle.
-
-**`app/web/kanban.js`** — `populateArchBar()`: POSTs, shows "Queued N" or "All done",
-button disabled + label restored after 3 s.
-
-### Migration naming fix
-`0035_arch_gen_jobs.py` had a naming collision with the existing
-`0035_file_summary_short_summary.py`. Renamed to `0036_arch_gen_jobs.py` and re-migrated.
-Both tables correctly applied; 36 total migrations.
+**`app/web/`** — `⚡ Populate` button in arch bar header; `populateArchBar()` in
+`kanban.js`.
 
 ---
 
-## Next steps
+## Files changed this session
 
-### P0 — Nothing blocking; all features functional
+| File | Change |
+|---|---|
+| `app/agent/llm_client.py` | Shutdown flag + helpers; shutdown check in retry loop; jitter on both sleep sites; `import random` |
+| `app/agent/research.py` | Import `is_shutting_down`; re-raise on shutdown in `_run_life`, `_post_mortem_call`, `_forced_verdict_call`; `/no_think` in forced verdict system prompt; `max_tokens` 512 → 4096 |
+| `app/main.py` | `signal_shutdown()` before `stop_scheduler()` in lifespan shutdown |
 
-### P1 — Improvements
+---
 
-**Populate status feedback** — the button shows "Queued N" but the user has no visibility
-into when the jobs complete. Options: poll `GET /api/scheduler/status` or add a dedicated
-`GET /api/projects/{name}/arch-gen-jobs` endpoint returning counts by status. The
-`reconcile()` 5-second loop will surface new cards automatically once they land.
+## Open questions / next steps
 
-**Populate deduplication** — if the user clicks Populate twice quickly, duplicate jobs are
-created for the same category. The endpoint doesn't check for already-pending jobs. Add a
-check: skip categories that already have a pending/running `arch_gen_job`.
-
-**Short summary column usage** — migration 0035 added `short_summary` to `file_summaries`,
-but `file_summary_agent.py` needs to be verified to actually populate it. If it doesn't,
-arch gen falls back to the full summary and `_two_sentences()` truncation, which is fine
-but not ideal.
-
-**Populate with prewarm gate** — if no file summaries exist yet, `execute_arch_gen_job`
-raises. The endpoint could detect this and return a helpful 409 suggesting the user run a
-prewarm first, rather than silently creating jobs that will all fail.
-
-### P2 — Future
-
+- **`planning.py` and `arch_gen_agent.py` hardcoded `max_tokens=256`** — will fail with
+  Qwen3 thinking mode. Add `/no_think` to those system prompts or raise budget.
+- **Root cause of 256-token cap on research agent calls** — proxy at port 8008 config
+  or Qwen3 `thinking_budget` default. Check proxy configuration.
+- **Populate deduplication** — clicking Populate twice creates duplicate arch_gen_jobs.
+  Add a pending-job check before creating.
+- **Populate prewarm gate** — if no file summaries exist, jobs silently fail. Return 409
+  with a helpful message.
 - **Populate progress indicator** — arch bar subtitle showing "Generating N categories…"
-  while arch_gen_jobs are pending/running, cleared when all complete.
-- **Regenerate single card** — toolbar button on an arch card to re-queue an arch_gen_job
-  for just that category (replacing the existing card on completion).
-- **Per-category quality gate** — after generation, run a quick self-critique pass asking
-  the LLM to rate the note's specificity; retry if it scores poorly.
-
----
-
-## File structure (key files)
-
-```
-app/
-  main.py                    FastAPI app, all routes
-  agent/
-    arch_gen_agent.py        NEW: arch card generation from file summaries
-    config.py                INI-driven constants
-    dag.py                   DAGResolver (Kahn's topo sort)
-    file_summary_agent.py    File summary generation agent
-    intake.py                IDEA→PLANNING pipeline
-    llm_client.py            Centralized LLM HTTP client
-    loop.py                  MaestroLoop (Design→Implement→Test→Verify)
-    planning.py / planning_gate.py
-    conceptual_review.py / security_review.py / full_review.py / optimization.py
-    project_snapshot.py      build_project_snapshot, build_architecture_context
-    research.py              Research agent (lives system)
-    scheduler.py             Push-first eager scheduler (tick loop)
-    subdivide.py             Subdivision agent
-    tools.py                 Agent tool implementations
-    verdicts.py              Vote tally logic
-  database/
-    __init__.py              Re-exports everything
-    models.py                All 23 SQLAlchemy models (incl. ArchGenJob)
-    crud_tasks.py            Task CRUD + history
-    crud_projects.py         Project CRUD
-    crud_infra.py            LLM + Budget + ComputeNode CRUD
-    crud_costs.py            BudgetEntry + Expense
-    crud_pipeline.py         Pipeline audit tables
-    crud_jobs.py             ResearchJob + FileSummaryJob + OptimizationBenchmark + ArchGenJob
-    crud_files.py            FileSummary + SearchCache (+ get_file_summaries_for_project_root)
-    crud_inbox.py            InboxMessage
-    session.py               Engine, SessionLocal, Base
-  migrations/
-    runner.py                Standalone sqlite3 migration engine
-    versions/
-      0001–0036              Applied migrations (36 total)
-      0036_arch_gen_jobs.py  arch_gen_jobs table
-  web/
-    index.html               Board shell (arch bar + 8 pipeline columns + 9 modals)
-    kanban.js                All board behaviour
-    style.css                Board styles
-    scheduler.html / scheduler.js   Scheduler debug view
-    diagnostics.html + diag-*.js   LLM conversation viewer
-  tests/                     pytest suite
-data/
-  kanban.db                  SQLite database
-maestro.ini                  Runtime configuration
-```
+  while jobs are pending/running.
 
 ---
 
@@ -172,16 +166,6 @@ IDEA → PLANNING → INDEV → CONCEPTUAL_REVIEW → OPTIMIZATION → SECURITY 
 Special types: `architecture` (arch bar only, never dispatched), `subdividing` (Big Idea
 mid-subdivision).
 
-Handlers:
-- **IDEA**: `IntakePipeline` (4-stage vote: scope/static/feasibility/conflict) → PLANNING or SUBDIVIDE_IDEA
-- **PLANNING**: `PlanningPipeline` + `PlanningGate`
-- **INDEV**: `MaestroLoop` (Wiggum loop, dispatched by scheduler)
-- **CONCEPTUAL_REVIEW**: `ConceptualReviewPipeline`
-- **OPTIMIZATION**: `OptimizationPipeline`
-- **SECURITY**: `SecurityPipeline`
-- **FULL_REVIEW**: `FullReviewPipeline`
-- **COMPLETED**: terminal
-
 ---
 
 ## Scheduler job types and priorities
@@ -190,7 +174,7 @@ Handlers:
 |---|---|---|
 | `FileSummaryJob` | -1.0 | Highest — callers block on completion event |
 | `ResearchJob` | 0.0 | Background investigations |
-| `ArchGenJob` | 1.0 | NEW — fire-and-forget arch card generation |
+| `ArchGenJob` | 1.0 | Fire-and-forget arch card generation |
 | DAG tasks | computed | Based on pipeline stage + position |
 
 All jobs respect: one-LLM-at-a-time policy, per-LLM `parallel_sessions` cap,
@@ -199,41 +183,45 @@ failure, orphan rescue on restart.
 
 ---
 
-## Architecture Bar
+## File structure (key files)
 
-14 fixed categories: `Platform`, `Design`, `Testing`, `Security`, `Performance`, `API`,
-`Tooling`, `Data`, `UX`, `Accessibility`, `Compliance`, `Deployment`, `Observability`,
-`General`.
-
-Cards: `type='architecture'`, `content={"category": str, "priority": critical|high|normal|low}`,
-body in `description`. Never appear in pipeline columns. Injected into all agent prompts
-via `build_architecture_context(project_name, agent_type)` with per-agent category
-filtering (`ARCH_CATEGORY_RELEVANCE` in `project_snapshot.py`).
-
-Header buttons: `+ Add`, `⚡ Populate` (NEW), `▲` collapse.
-
----
-
-## Tool system
-
-`app/agent/tools.py` — all tools use `effective_root` for path resolution. Categories:
-- **File I/O**: `read_file`, `write_file`, `append_file`, `list_files`, `count_lines`
-- **Search**: `web_search` (DuckDuckGo or Brave via `SEARCH_PROVIDER`), `web_fetch` (private to WebSearchAgent)
-- **Git**: `git_status`, `git_diff`, `git_commit`, `git_checkout` (maestro/* branches only)
-- **Exec**: `run_shell` (blocklist enforced)
-- **Soft-delete**: `archive_file` (moves to `.archive/`, no hard delete)
-- **Task queries**: `get_task_info`, `list_tasks`
-
----
-
-## Test suite
-
-~200+ tests across `app/tests/`. Key patterns:
-- `conftest.py` sets `MAESTRO_TEST_DB` env var to a temp path; all tests use isolated DB
-- `importlib.reload(app.database)` cascade re-initializes the engine in each test that
-  patches the DB path via monkeypatch
-- Mock LLM via `app.agent.mock_llm` — dictionary-based response fixture
-- Scheduler tested via `test_scheduler_unit.py` (tick isolation, capacity caps, DAG dispatch)
+```
+app/
+  main.py                    FastAPI app, all routes
+  agent/
+    arch_gen_agent.py        Arch card generation from file summaries
+    config.py                INI-driven constants
+    dag.py                   DAGResolver (Kahn's topo sort)
+    file_summary_agent.py    File summary generation agent
+    intake.py                IDEA→PLANNING pipeline
+    llm_client.py            Centralised LLM HTTP client (shutdown flag, jitter)
+    loop.py                  MaestroLoop (Design→Implement→Test→Verify)
+    planning.py / planning_gate.py
+    conceptual_review.py / security_review.py / full_review.py / optimization.py
+    project_snapshot.py      build_project_snapshot, build_architecture_context
+    research.py              Research agent (lives system, shutdown-aware)
+    scheduler.py             Push-first eager scheduler (tick loop)
+    subdivide.py             Subdivision agent
+    tools.py                 Agent tool implementations
+    verdicts.py              Vote tally logic
+  database/
+    __init__.py              Re-exports everything
+    models.py                All SQLAlchemy models (incl. ArchGenJob)
+    crud_tasks.py / crud_projects.py / crud_infra.py / crud_costs.py
+    crud_pipeline.py / crud_jobs.py / crud_files.py / crud_inbox.py
+    session.py               Engine, SessionLocal, Base
+  migrations/
+    runner.py                Standalone sqlite3 migration engine
+    versions/0001–0036       36 applied migrations
+  web/
+    index.html               Board shell
+    kanban.js                All board behaviour
+    style.css                Board styles
+    diagnostics.html + diag-*.js   LLM conversation viewer
+data/
+  kanban.db                  SQLite database
+maestro.ini                  Runtime configuration
+```
 
 ---
 
@@ -254,26 +242,3 @@ venv/Scripts/python.exe app/migrations/runner.py migrate
 venv/Scripts/python.exe scripts/inspect_cards.py scheduler
 venv/Scripts/python.exe scripts/inspect_cards.py activity --hours 4
 ```
-
----
-
-## Key design decisions
-
-- **Arch gen is Option A (direct LLM call)** — not a full agent. The input (file summaries)
-  is already computed; the task is a single inference step. No tool use, no multi-turn.
-  Consistent with `file_summary_agent.py`. Full resilience via existing scheduler retry
-  machinery (no completion events needed since no caller is blocked waiting).
-
-- **Priority 1.0 for arch gen** — lower than research (0.0) since arch gen has no blocked
-  caller; higher number = lower priority in the scheduler.
-
-- **`CREATE TABLE IF NOT EXISTS` in migrations** — idempotent. Renaming `0035` → `0036`
-  re-ran the migration safely; the table already existed from the first (duplicate-ID) run.
-
-- **`_pick_prewarm_resources()` reused** — populate-arch uses the same LLM/budget
-  fallback logic as project prewarm. Project must have a default LLM+budget or a global
-  one must exist.
-
-- **No completion events for arch gen** — unlike file summaries (which block agent threads
-  and need `signal_completion()`), arch gen is purely fire-and-forget. Cards appear when
-  ready; `reconcile()` surfaces them within 5 seconds.

@@ -27,6 +27,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
+import app.database
 import app.agent.scheduler as sched_mod
 from app.agent.scheduler import (
     _active_sessions,
@@ -37,6 +38,7 @@ from app.agent.scheduler import (
     _llm_session_counts,
     _run_task,
     _task_to_mini_dict,
+    _rescue_stale_jobs,
     get_scheduler_status,
     start_scheduler,
     stop_scheduler,
@@ -94,7 +96,7 @@ def clean_scheduler_state():
     sched_mod._scheduler_thread = None
     sched_mod._scheduler_stop.clear()
     yield
-    # After — stop any running scheduler thread
+    # After - stop any running scheduler thread
     if sched_mod._scheduler_thread and sched_mod._scheduler_thread.is_alive():
         sched_mod._scheduler_stop.set()
         sched_mod._scheduler_thread.join(timeout=3)
@@ -195,7 +197,7 @@ class TestTaskToMiniDict:
         assert _task_to_mini_dict(task)["prerequisites"] == ["dep-1", "dep-2"]
 
     def test_none_prerequisites_becomes_empty_list(self):
-        """None prerequisites must become [] — DAGResolver does not handle None."""
+        """None prerequisites must become [] - DAGResolver does not handle None."""
         task = _fake_db_task()
         task.prerequisites = None
         result = _task_to_mini_dict(task)
@@ -274,7 +276,7 @@ class TestCleanupFinished:
 
 
 # ===========================================================================
-# _run_task — LLM slot lifecycle
+# _run_task - LLM slot lifecycle
 # ===========================================================================
 
 class TestRunTaskSlotLifecycle:
@@ -321,14 +323,15 @@ class TestRunTaskSlotLifecycle:
     def test_failed_task_added_to_cooldown(self):
         """A task that raises must be recorded in _failed_cooldowns."""
         llm = _fake_llm(llm_id=13)
-        db_task = _fake_db_task(task_type="planning", task_id="t-cool")
+        # Use a non-special task type to route to _run_maestro_loop
+        db_task = _fake_db_task(task_type="generic", task_id="t-cool")
         _failed_cooldowns.pop("t-cool", None)
         with _llm_counts_lock:
             _llm_session_counts[13] = 1
 
         with patch("app.agent.scheduler._run_maestro_loop",
                    side_effect=RuntimeError("failure")):
-            _run_task("t-cool", "planning", llm, db_task, None)
+            _run_task("t-cool", "generic", llm, db_task, None)
 
         assert "t-cool" in _failed_cooldowns
         assert _failed_cooldowns["t-cool"] <= time.time()
@@ -337,13 +340,13 @@ class TestRunTaskSlotLifecycle:
     def test_successful_task_not_added_to_cooldown(self):
         """A task that completes normally must NOT be recorded in _failed_cooldowns."""
         llm = _fake_llm(llm_id=14)
-        db_task = _fake_db_task(task_type="planning", task_id="t-no-cool")
+        db_task = _fake_db_task(task_type="generic", task_id="t-no-cool")
         _failed_cooldowns.pop("t-no-cool", None)
         with _llm_counts_lock:
             _llm_session_counts[14] = 1
 
         with patch("app.agent.scheduler._run_maestro_loop", return_value=None):
-            _run_task("t-no-cool", "planning", llm, db_task, None)
+            _run_task("t-no-cool", "generic", llm, db_task, None)
 
         assert "t-no-cool" not in _failed_cooldowns
 
@@ -361,23 +364,25 @@ class TestRunTaskSlotLifecycle:
         mock_dev.assert_called_once()
         mock_loop.assert_not_called()
 
-    def test_planning_task_routes_to_maestro_loop(self):
-        """task_type='planning' must call _run_maestro_loop, not dev orchestrator."""
+    def test_planning_task_routes_to_planning_task(self):
+        """task_type='planning' must call _run_planning_task, not maestro loop or dev orchestrator."""
         llm = _fake_llm(llm_id=16)
         db_task = _fake_db_task(task_type="planning", task_id="t-plan")
         with _llm_counts_lock:
             _llm_session_counts[16] = 1
 
-        with patch("app.agent.scheduler._run_maestro_loop") as mock_loop, \
+        with patch("app.agent.scheduler._run_planning_task") as mock_plan, \
+             patch("app.agent.scheduler._run_maestro_loop") as mock_loop, \
              patch("app.agent.scheduler._run_dev_orchestrator_task") as mock_dev:
             _run_task("t-plan", "planning", llm, db_task, None)
 
-        mock_loop.assert_called_once()
+        mock_plan.assert_called_once()
+        mock_loop.assert_not_called()
         mock_dev.assert_not_called()
 
 
 # ===========================================================================
-# _tick — dispatch filtering
+# _tick - dispatch filtering
 # ===========================================================================
 
 class TestTickFiltering:
@@ -935,3 +940,151 @@ class TestCheckCompletionRollupInline:
         update_ids = [c.args[0] for c in mock_update.call_args_list]
         assert "p1" in update_ids
         assert "gp1" in update_ids
+
+
+# ===========================================================================
+# _rescue_stale_jobs
+# ===========================================================================
+
+class TestJobRescue:
+    def test_rescue_orphaned_arch_gen_job(self):
+        """Orphaned 'running' arch_gen job should be marked as 'failed'."""
+        job = MagicMock()
+        job.id = 123
+        job.status = 'running'
+
+        # Mock database functions
+        with patch("app.database.get_retriable_arch_gen_jobs", return_value=[job]), \
+             patch("app.database.get_retriable_file_summary_jobs", return_value=[]), \
+             patch("app.database.get_retriable_research_jobs", return_value=[]), \
+             patch("app.database.update_arch_gen_job") as mock_update:
+
+            _rescue_stale_jobs()
+
+            mock_update.assert_called_once()
+            args, kwargs = mock_update.call_args
+            assert args[0] == 123
+            assert kwargs['status'] == 'failed'
+            assert "Orphaned" in kwargs['error_message']
+
+    def test_rescue_live_arch_gen_job(self):
+        """Live 'running' arch_gen job should NOT be rescued."""
+        job = MagicMock()
+        job.id = 123
+        job.status = 'running'
+
+        session_key = f"arch-gen-123"
+        with _active_sessions_lock:
+            _active_sessions[session_key] = MagicMock() # Represent a live thread
+
+        try:
+            # Mock database functions
+            with patch("app.database.get_retriable_arch_gen_jobs", return_value=[job]), \
+                 patch("app.database.get_retriable_file_summary_jobs", return_value=[]), \
+                 patch("app.database.get_retriable_research_jobs", return_value=[]), \
+                 patch("app.database.update_arch_gen_job") as mock_update:
+
+                _rescue_stale_jobs()
+
+                mock_update.assert_not_called()
+        finally:
+            with _active_sessions_lock:
+                _active_sessions.pop(session_key, None)
+
+    def test_rescue_failed_arch_gen_job_after_cooldown(self):
+        """Cooled down 'failed' arch_gen job should be reset to 'pending'."""
+        job = MagicMock()
+        job.id = 456
+        job.status = 'failed'
+        job.retry_count = 0
+
+        # Mock database functions
+        with patch("app.database.get_retriable_arch_gen_jobs", return_value=[job]), \
+             patch("app.database.get_retriable_file_summary_jobs", return_value=[]), \
+             patch("app.database.get_retriable_research_jobs", return_value=[]), \
+             patch("app.database.update_arch_gen_job") as mock_update:
+
+            _rescue_stale_jobs()
+
+            mock_update.assert_called_once_with(456, status='pending', completed_at=None, retry_count=1)
+
+    def test_rescue_orphaned_research_job(self):
+        """Orphaned 'running' research job should be marked as 'failed' with findings."""
+        job = MagicMock()
+        job.id = 789
+        job.status = 'running'
+
+        # Mock database functions
+        with patch("app.database.get_retriable_research_jobs", return_value=[job]), \
+             patch("app.database.get_retriable_file_summary_jobs", return_value=[]), \
+             patch("app.database.get_retriable_arch_gen_jobs", return_value=[]), \
+             patch("app.database.update_research_job") as mock_update:
+
+            _rescue_stale_jobs()
+
+            mock_update.assert_called_once()
+            args, kwargs = mock_update.call_args
+            assert args[0] == 789
+            assert kwargs['status'] == 'failed'
+            assert "Orphaned" in kwargs['findings']
+
+    def test_rescue_orphaned_file_summary_job(self):
+        """Orphaned 'running' file_summary job should be marked as 'failed'."""
+        job = MagicMock()
+        job.id = 111
+        job.status = 'running'
+
+        # Mock database functions
+        with patch("app.database.get_retriable_file_summary_jobs", return_value=[job]), \
+             patch("app.database.get_retriable_research_jobs", return_value=[]), \
+             patch("app.database.get_retriable_arch_gen_jobs", return_value=[]), \
+             patch("app.database.update_file_summary_job") as mock_update:
+
+            _rescue_stale_jobs()
+
+            mock_update.assert_called_once()
+            args, kwargs = mock_update.call_args
+            assert args[0] == 111
+            assert kwargs['status'] == 'failed'
+            assert "Orphaned" in kwargs['error_message']
+
+
+# ===========================================================================
+# Project Failure Throttling
+# ===========================================================================
+
+class TestProjectFailureThrottling:
+    def test_rescue_marks_project_as_failed(self):
+        job = MagicMock()
+        job.id = 1
+        job.status = 'running'
+        job.project = 'ProjectX'
+
+        from app.agent.scheduler import _project_failure_cooldowns
+        _project_failure_cooldowns.clear()
+
+        with patch("app.database.get_retriable_arch_gen_jobs", return_value=[job]), \
+             patch("app.database.get_retriable_file_summary_jobs", return_value=[]), \
+             patch("app.database.get_retriable_research_jobs", return_value=[]), \
+             patch("app.database.update_arch_gen_job"):
+            _rescue_stale_jobs()
+            assert 'ProjectX' in _project_failure_cooldowns
+
+    def test_dispatch_skips_throttled_project(self):
+        from app.agent.scheduler import _project_failure_cooldowns, _dispatch_arch_gen_jobs
+        _project_failure_cooldowns.clear()
+        _project_failure_cooldowns['ProjectX'] = time.time()
+
+        job = MagicMock()
+        job.id = 1
+        job.project = 'ProjectX'
+        job.llm_id = 1
+
+        with patch("app.database.get_pending_arch_gen_jobs", return_value=[job]), \
+             patch("app.database.get_llm"), \
+             patch("app.agent.scheduler.threading.Thread") as mock_thread:
+            _dispatch_arch_gen_jobs(None, {}, {}, {}, {})
+            mock_thread.assert_not_called()
+        
+        _project_failure_cooldowns.clear()
+

@@ -1,7 +1,7 @@
 """
 app/agent/full_review.py
 -------------------------
-Full/Final Review Pipeline — 4-agent final judgment.
+Full/Final Review Pipeline - 4-agent final judgment.
 
 4 Parallel Reviewer Agents (3 if no frontend changes):
   - Functional: requirements traceability, missing features, scope creep
@@ -36,10 +36,11 @@ from app.agent.config import (
 )
 from app.agent.json_utils import extract_json_block
 from app.agent.tools import _task_git_cwd, dispatch_tool, build_tool_schemas
-from app.agent.llm_client import call_llm
+from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
 from app.agent.verdicts import Vote, Verdict, tally_votes
 
 logger = logging.getLogger(__name__)
+AGENT_NAME = "Full Review Pipeline"
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +144,10 @@ class FullReviewPipeline:
 
     async def run(self) -> FullReviewPipelineResult:
         """Run all review agents in parallel."""
-        logger.info("[full_review] Starting for task '%s'", self.task_id)
+        if is_shutting_down():
+            raise ShutdownError("Server is shutting down")
+
+        logger.info(f"[{AGENT_NAME}] Starting for task '%s'", self.task_id)
 
         reviewers = [
             {
@@ -190,7 +194,7 @@ class FullReviewPipeline:
         for i, result in enumerate(results):
             reviewer_type = reviewers[i]["type"]
             if isinstance(result, Exception):
-                logger.warning("[full_review] Reviewer '%s' failed: %s", reviewer_type, result)
+                logger.warning(f"[{AGENT_NAME}] Reviewer '%s' failed: %s", reviewer_type, result)
                 votes.append(Vote(
                     stage=f"review_{reviewer_type}",
                     verdict=Verdict.NEEDS_RESEARCH,
@@ -222,7 +226,7 @@ class FullReviewPipeline:
             if not demotion_target:
                 demotion_target = "indev"
 
-        logger.info("[full_review] Task '%s': %s", self.task_id, outcome)
+        logger.info(f"[{AGENT_NAME}] Task '%s': %s", self.task_id, outcome)
 
         return FullReviewPipelineResult(
             task_id=self.task_id,
@@ -256,6 +260,9 @@ class FullReviewPipeline:
         _ctx_warned: set[float] = set()
 
         for turn in range(max_turns):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
+
             response = await call_llm(
                 messages,
                 base_url=self.llm_base_url,
@@ -266,6 +273,7 @@ class FullReviewPipeline:
                 task_id=self.task_id,
                 llm_id=self.llm_id,
                 budget_id=self.budget_id,
+                agent_name=AGENT_NAME,
             )
 
             usage = response.get("usage", {})
@@ -278,7 +286,7 @@ class FullReviewPipeline:
                 prompt_tokens_this_call, self.max_context, _ctx_warned, messages
             ):
                 logger.warning(
-                    "[full_review] Reviewer '%s' context saturation (turn %d) — terminating",
+                    f"[{AGENT_NAME}] Reviewer '%s' context saturation (turn %d) - terminating",
                     reviewer["type"], turn + 1,
                 )
                 break
@@ -366,7 +374,7 @@ class FullReviewPipeline:
                 completion_tokens=vote.completion_tokens,
             )
         except Exception as e:
-            logger.error("[full_review] Failed to store result: %s", e)
+            logger.error(f"[{AGENT_NAME}] Failed to store result: %s", e)
 
 
 # ---------------------------------------------------------------------------

@@ -129,7 +129,7 @@ def _run_pipeline(responses, *, mock_research=None, veto_power=True,
 
 
 class TestAllowlist:
-    """run_shell_security() uses an allowlist — only known scanners are permitted."""
+    """run_shell_security() uses an allowlist - only known scanners are permitted."""
 
     def _call(self, command: str) -> str:
         from app.agent.security_review import run_shell_security

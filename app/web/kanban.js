@@ -135,7 +135,7 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 
 // ============================================
-// Research Dialog Modal (replaces prompt())
+// Research / Investigation Dialog Modal
 // ============================================
 
 let _researchDialogTaskId = null;
@@ -148,21 +148,21 @@ function closeResearchDialog() {
 
 async function submitResearchDialog() {
     const question = document.getElementById('research-dialog-question').value.trim();
-    if (!question) { showToast('Enter a research question first.', 'warning'); return; }
+    if (!question) { showToast('Enter a question first.', 'warning'); return; }
     const taskId = _researchDialogTaskId;
     closeResearchDialog();
     try {
-        const resp = await fetch(`${API_BASE}/agent/research/${taskId}`, {
+        const resp = await fetch(`${API_BASE}/agent/investigate/${taskId}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ question }),
         });
         const data = await resp.json();
-        if (!resp.ok) { showToast(data.detail || 'Research failed to start', 'error'); return; }
-        _pollResearchJob(taskId, data.job_id);
-        showToast(`Research job #${data.job_id} queued.`, 'info');
+        if (!resp.ok) { showToast(data.detail || 'Agent failed to start', 'error'); return; }
+        _pollInvestigationJob(taskId, data.job_id);
+        showToast(`Investigation job #${data.job_id} queued.`, 'info');
     } catch (e) {
-        showToast('Error starting research: ' + e.message, 'error');
+        showToast('Error starting agent: ' + e.message, 'error');
     }
 }
 
@@ -496,6 +496,7 @@ function renderTasksFromDatabase() {
     // Update task counts and arch bar
     updateTaskCounts();
     renderArchBar();
+    _scheduleStageFooterBatch();
 }
 
 function updateTaskCounts() {
@@ -674,6 +675,9 @@ function reconcile(newTasks) {
             cardCache[task.id] = card;
             fingerprintCache[task.id] = newFp;
             columnsToSort.add(renderCol);
+            if (task.type !== 'idea' && task.type !== 'architecture' && task.type !== 'subdividing') {
+                setTimeout(() => _loadStageFooter(task.id), 200);
+            }
         } else if (fingerprintCache[task.id] !== newFp) {
             // Changed — rebuild the card element in-place
             const old = cardCache[task.id];
@@ -687,6 +691,11 @@ function reconcile(newTasks) {
             cardCache[task.id] = newCard;
             fingerprintCache[task.id] = newFp;
             columnsToSort.add(renderCol);
+            // Reload footer — stage or component status may have changed
+            if (task.type !== 'idea' && task.type !== 'architecture' && task.type !== 'subdividing') {
+                delete _stageSummaryCache[task.id];
+                setTimeout(() => _loadStageFooter(task.id), 200);
+            }
         }
     }
 
@@ -725,6 +734,429 @@ function refreshCard(taskId) {
     }
     cardCache[taskId] = newCard;
     fingerprintCache[taskId] = taskFingerprint(task);
+}
+
+// ============================================
+// Stage Footer + Stage Journal
+// ============================================
+
+const _stageSummaryCache = {};  // taskId -> summary object
+let _stageFooterBatchTimer = null;
+
+function _scheduleStageFooterBatch() {
+    if (_stageFooterBatchTimer) clearTimeout(_stageFooterBatchTimer);
+    _stageFooterBatchTimer = setTimeout(() => {
+        const stages = ['planning','indev','conceptual_review','optimization','security','full_review','completed'];
+        const ids = Object.values(taskData)
+            .filter(t => t && stages.includes(t.type))
+            .map(t => t.id);
+        // Load in chunks of 6 with 80ms spacing to avoid burst
+        let offset = 0;
+        const chunk = 6;
+        function loadChunk() {
+            const batch = ids.slice(offset, offset + chunk);
+            batch.forEach(id => _loadStageFooter(id));
+            offset += chunk;
+            if (offset < ids.length) setTimeout(loadChunk, 100);
+        }
+        loadChunk();
+    }, 300);
+}
+
+async function _loadStageFooter(taskId) {
+    const el = document.getElementById(`csf-${taskId}`);
+    if (!el) return;
+    try {
+        const resp = await fetch(`/api/tasks/${taskId}/stage-summary`);
+        if (!resp.ok) { el.className = 'card-stage-footer csf-empty'; return; }
+        const s = await resp.json();
+        _stageSummaryCache[taskId] = s;
+        _renderStageFooter(el, s);
+    } catch (_) {
+        el.className = 'card-stage-footer csf-empty';
+    }
+}
+
+function _renderStageFooter(el, s) {
+    const stage = s.current_stage;
+    const parts = [];
+
+    if (s.blocking_issue) {
+        parts.push(`<span class="csf-block">&#9888; ${escHtml(s.blocking_issue)}</span>`);
+    }
+
+    if (stage === 'planning' && s.planning.has_result) {
+        const fc = s.planning.file_count;
+        const sc = s.planning.step_count;
+        parts.push(`<span class="csf-chip csf-muted">&#128196; ${fc} file${fc===1?'':'s'} &middot; ${sc} step${sc===1?'':'s'}</span>`);
+        if (!s.blocking_issue) {
+            if (s.planning.gate_passed === true)  parts.push(`<span class="csf-chip csf-ok">&#10003; gate</span>`);
+            if (s.planning.gate_passed === false) parts.push(`<span class="csf-chip csf-warn">&#10007; gate</span>`);
+            if (s.planning.gate_passed === null)  parts.push(`<span class="csf-chip csf-muted">gate pending</span>`);
+        }
+    } else if (stage === 'indev') {
+        const c = s.components;
+        if (c.total > 0) {
+            parts.push(`<span class="csf-chip csf-muted">&#9881; ${c.done}/${c.total}</span>`);
+            if (c.files_changed > 0)
+                parts.push(`<span class="csf-chip csf-muted">${c.files_changed} file${c.files_changed===1?'':'s'}</span>`);
+        } else if (s.planning.has_result) {
+            parts.push(`<span class="csf-chip csf-muted">&#128196; ${s.planning.file_count} files planned</span>`);
+        }
+    } else if (stage === 'conceptual_review') {
+        if (s.planning.has_result)
+            parts.push(`<span class="csf-chip csf-muted">&#128196; ${s.planning.file_count} files</span>`);
+        if (s.components.total > 0)
+            parts.push(`<span class="csf-chip csf-muted">&#9881; ${s.components.done}/${s.components.total}</span>`);
+    } else if (stage === 'optimization') {
+        if (s.optimization.has_result) {
+            const oc = s.optimization.outcome || '?';
+            parts.push(`<span class="csf-chip ${oc==='improved'?'csf-ok':'csf-muted'}">&#9889; ${escHtml(oc)}</span>`);
+        }
+    } else if (stage === 'security') {
+        if (s.security.has_result) {
+            const v = s.security.worst_verdict || '';
+            const cls = (v==='REJECTED'||v==='NOT_SUITABLE') ? 'csf-warn' : (v==='LIKELY'?'csf-ok':'csf-muted');
+            parts.push(`<span class="csf-chip ${cls}">&#128274; ${escHtml(v)}</span>`);
+            const c = s.security.critical_count;
+            if (c > 0) parts.push(`<span class="csf-chip csf-warn">${c} critical</span>`);
+        }
+    } else if (stage === 'full_review') {
+        if (s.full_review.has_result) {
+            const v = s.full_review.worst_verdict || '';
+            const cls = (v==='REJECTED'||v==='NOT_SUITABLE') ? 'csf-warn' : (v==='LIKELY'?'csf-ok':'csf-muted');
+            parts.push(`<span class="csf-chip ${cls}">&#128065; ${escHtml(v)}</span>`);
+        }
+    } else if (stage === 'completed') {
+        const ms = s.merge.status;
+        if (ms === 'merged') parts.push(`<span class="csf-chip csf-ok">&#10003; merged</span>`);
+        else if (s.components.total > 0) parts.push(`<span class="csf-chip csf-ok">&#10003; ${s.components.done} components</span>`);
+        else parts.push(`<span class="csf-chip csf-ok">&#10003; complete</span>`);
+    }
+
+    if (parts.length === 0) {
+        el.className = 'card-stage-footer csf-empty';
+        return;
+    }
+    el.className = 'card-stage-footer';
+    el.innerHTML = parts.join('<span class="csf-sep">·</span>');
+}
+
+function escHtml(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ---- Stage Journal Modal ----
+
+window._sjTaskId = null;
+
+function openStageJournal(taskId, section) {
+    window._sjTaskId = taskId;
+    window._sjScrollTo = section || null;
+    const task = taskData[taskId];
+    const title = task ? task.title : taskId;
+    document.getElementById('sj-title').textContent = `Stage Journal — ${title}`;
+    document.getElementById('sj-body').innerHTML = '<div style="color:#6c757d;font-size:0.9rem">Loading…</div>';
+    document.getElementById('sj-diag-btn').style.display = 'inline-block';
+    document.getElementById('stage-journal-modal').style.display = 'flex';
+    _buildStageJournal(taskId);
+}
+
+function openStageDiff(taskId) {
+    openStageJournal(taskId, 'diff');
+}
+
+function closeStageJournal() {
+    document.getElementById('stage-journal-modal').style.display = 'none';
+    window._sjTaskId = null;
+}
+
+async function _buildStageJournal(taskId) {
+    const body = document.getElementById('sj-body');
+    try {
+        const [summaryResp, planResp, compResp, optResp, secResp, frResp, mrResp, diffResp] = await Promise.all([
+            fetch(`/api/tasks/${taskId}/stage-summary`),
+            fetch(`/api/tasks/${taskId}/planning-result`),
+            fetch(`/api/tasks/${taskId}/component-status`),
+            fetch(`/api/tasks/${taskId}/optimization-status`),
+            fetch(`/api/tasks/${taskId}/security-status`),
+            fetch(`/api/tasks/${taskId}/full-review-status`),
+            fetch(`/api/tasks/${taskId}/merge-status`),
+            fetch(`/api/tasks/${taskId}/diff`),
+        ]);
+
+        const summary  = summaryResp.ok  ? await summaryResp.json()  : null;
+        const plan     = planResp.ok     ? await planResp.json()     : null;
+        const comps    = compResp.ok     ? await compResp.json()     : [];
+        const opt      = optResp.ok      ? await optResp.json()      : null;
+        const secList  = secResp.ok      ? await secResp.json()      : [];
+        const frList   = frResp.ok       ? await frResp.json()       : [];
+        const merge    = mrResp.ok       ? await mrResp.json()       : null;
+        const diffData = diffResp.ok     ? await diffResp.json()     : null;
+
+        let html = '';
+
+        // ---- Planning section ----
+        if (plan) {
+            if (plan.status === 'in_progress') {
+                html += `<div class="sj-section">
+                    <div class="sj-section-title">&#128196; Planning</div>
+                    <div style="color:#fd7e14;font-size:0.85rem">Pipeline running&#8230;</div>
+                </div>`;
+            } else if (plan.status === 'failed') {
+                html += `<div class="sj-section">
+                    <div class="sj-section-title">&#128196; Planning <span class="sj-badge warn">run failed</span></div>
+                    <div style="color:#dc3545;font-size:0.85rem;margin-top:0.4rem">${escHtml(plan.error_message || 'Unknown error')}</div>
+                </div>`;
+            } else {
+            const gatePassed = plan.gate_passed;
+            const gateLabel  = gatePassed === true ? '<span class="sj-badge ok">gate ✓</span>'
+                             : gatePassed === false ? '<span class="sj-badge warn">gate ✗</span>'
+                             : '';
+            html += `<div class="sj-section">
+                <div class="sj-section-title">&#128196; Planning ${gateLabel}</div>`;
+
+            if (plan.design_rationale && typeof plan.design_rationale === 'string') {
+                html += `<div class="sj-rationale">${escHtml(plan.design_rationale)}</div>`;
+            }
+
+            if (plan.file_manifest && plan.file_manifest.length) {
+                html += `<table class="sj-table">
+                    <thead><tr><th>File</th><th>Action</th><th>Purpose</th><th>~Lines</th></tr></thead><tbody>`;
+                for (const f of plan.file_manifest) {
+                    const ac = f.action || '';
+                    const acCls = ac === 'create' ? 'action-create' : ac === 'modify' ? 'action-modify' : ac === 'delete' ? 'action-delete' : '';
+                    html += `<tr>
+                        <td><code style="font-size:0.75rem">${escHtml(f.path||'')}</code></td>
+                        <td class="col-action ${acCls}">${escHtml(ac)}</td>
+                        <td>${escHtml(f.purpose||'')}</td>
+                        <td>${f.estimated_lines||''}</td>
+                    </tr>`;
+                }
+                html += '</tbody></table>';
+            }
+
+            if (plan.implementation_steps && plan.implementation_steps.length) {
+                html += `<div style="font-size:0.75rem;font-weight:700;color:#6c757d;margin:0.6rem 0 0.3rem">Implementation Steps</div>
+                    <table class="sj-table"><thead><tr><th>#</th><th>Component</th><th>Description</th><th>Files</th></tr></thead><tbody>`;
+                for (const st of plan.implementation_steps) {
+                    html += `<tr>
+                        <td>${st.order}</td>
+                        <td><strong>${escHtml(st.component||'')}</strong></td>
+                        <td>${escHtml(st.description||'')}</td>
+                        <td style="font-size:0.72rem;color:#6c757d">${(st.files||[]).map(f=>escHtml(f)).join('<br>')}</td>
+                    </tr>`;
+                }
+                html += '</tbody></table>';
+            }
+
+            if (plan.gate_checks && plan.gate_checks.length) {
+                html += `<div style="font-size:0.75rem;font-weight:700;color:#6c757d;margin:0.6rem 0 0.3rem">Gate Checks</div>`;
+                for (const c of plan.gate_checks) {
+                    const icon = c.passed ? '&#10003;' : (c.hard_fail ? '&#10007;' : '&#9888;');
+                    const color = c.passed ? '#198754' : (c.hard_fail ? '#dc3545' : '#fd7e14');
+                    html += `<div class="sj-check-row">
+                        <span class="sj-check-icon" style="color:${color}">${icon}</span>
+                        <div><strong>${escHtml(c.name)}</strong><div class="sj-check-detail">${escHtml(c.detail||'')}</div></div>
+                    </div>`;
+                }
+            }
+
+            if (plan.review_votes && plan.review_votes.length) {
+                html += `<div style="font-size:0.75rem;font-weight:700;color:#6c757d;margin:0.6rem 0 0.3rem">Design Review Votes</div>`;
+                for (const v of plan.review_votes) {
+                    const vKey = (v.verdict||'').toUpperCase();
+                    html += `<div class="sj-vote-row">
+                        <span class="sj-vote-badge vote-${vKey}">${escHtml(vKey)}</span>
+                        <div><strong>${escHtml(v.stage||'')}</strong>
+                            <div class="sj-check-detail">${escHtml((v.justification||'').slice(0,300))}</div>
+                        </div>
+                    </div>`;
+                }
+            }
+
+            if (plan.pitfalls_identified && plan.pitfalls_identified.length) {
+                html += `<div style="font-size:0.75rem;font-weight:700;color:#6c757d;margin:0.6rem 0 0.3rem">Pitfalls</div>`;
+                for (const p of plan.pitfalls_identified) {
+                    html += `<div class="sj-pitfall pitfall-${p.severity||'low'}">
+                        <span style="font-weight:700;font-size:0.72rem;text-transform:uppercase;color:#6c757d">${escHtml(p.severity||'')}</span>
+                        <span>${escHtml(p.detail||p.type||'')}</span>
+                    </div>`;
+                }
+            }
+
+            html += '</div>';
+            } // end else (active/superseded plan)
+        }
+
+        // ---- Dev / Components section ----
+        if (comps && comps.length) {
+            const done = comps.filter(c=>c.status==='done').length;
+            const failed = comps.filter(c=>c.status==='failed').length;
+            const badge = failed > 0 ? `<span class="sj-badge warn">${failed} failed</span>`
+                        : done===comps.length ? `<span class="sj-badge ok">all done</span>`
+                        : `<span class="sj-badge info">${done}/${comps.length}</span>`;
+            html += `<div class="sj-section">
+                <div class="sj-section-title">&#9881; Development ${badge}</div>
+                <table class="sj-table"><thead><tr><th>#</th><th>Component</th><th>Status</th><th>Turns</th><th>Files changed</th></tr></thead><tbody>`;
+            for (const c of comps) {
+                const sc = `status-${c.status}`;
+                const files = (c.files_changed||[]).map(f=>`<code style="font-size:0.72rem">${escHtml(f)}</code>`).join('<br>');
+                html += `<tr>
+                    <td>${c.step_order}</td>
+                    <td><strong>${escHtml(c.component_name)}</strong>${c.error_detail?`<div style="font-size:0.72rem;color:#dc3545">${escHtml(c.error_detail.slice(0,120))}</div>`:''}</td>
+                    <td class="${sc}">${escHtml(c.status)}</td>
+                    <td>${c.turns_used||0}</td>
+                    <td>${files||'<span style="color:#adb5bd">—</span>'}</td>
+                </tr>`;
+            }
+            html += '</tbody></table></div>';
+        }
+
+        // ---- Optimization section ----
+        if (opt && opt.outcome && opt.outcome !== 'not_run') {
+            const ok = opt.outcome === 'improved';
+            html += `<div class="sj-section">
+                <div class="sj-section-title">&#9889; Optimization <span class="sj-badge ${ok?'ok':'muted'}">${escHtml(opt.outcome)}</span></div>`;
+            if (opt.improvement_summary)
+                html += `<div class="sj-rationale">${escHtml(opt.improvement_summary)}</div>`;
+            html += '</div>';
+        }
+
+        // ---- Security section ----
+        if (secList && secList.length) {
+            const hasCrit = secList.some(s=>(s.critical_count||0)>0||(s.verdict||'').includes('REJECT'));
+            html += `<div class="sj-section">
+                <div class="sj-section-title">&#128274; Security ${hasCrit?'<span class="sj-badge warn">issues</span>':'<span class="sj-badge ok">ok</span>'}</div>`;
+            for (const s of secList) {
+                const vKey = (s.verdict||'').toUpperCase();
+                html += `<div class="sj-vote-row">
+                    <span class="sj-vote-badge vote-${vKey}">${escHtml(vKey)}</span>
+                    <div>
+                        <strong>${escHtml(s.reviewer_type||'')}</strong>
+                        ${s.critical_count||s.high_count ? `<span style="font-size:0.72rem;color:#dc3545;margin-left:0.4rem">${s.critical_count||0} critical &middot; ${s.high_count||0} high</span>` : ''}
+                        <div class="sj-check-detail">${escHtml((s.justification||'').slice(0,300))}</div>
+                    </div>
+                </div>`;
+            }
+            html += '</div>';
+        }
+
+        // ---- Full Review section ----
+        if (frList && frList.length) {
+            const worst = frList.map(r=>r.verdict).sort((a,b)=>{
+                const o=['REJECTED','NOT_SUITABLE','NEEDS_RESEARCH','POSSIBLE','LIKELY'];
+                return o.indexOf(a)-o.indexOf(b);
+            })[0]||'';
+            const pass = (worst==='LIKELY'||worst==='POSSIBLE');
+            html += `<div class="sj-section">
+                <div class="sj-section-title">&#128065; Full Review <span class="sj-badge ${pass?'ok':'warn'}">${escHtml(worst)}</span></div>`;
+            for (const r of frList) {
+                const vKey = (r.verdict||'').toUpperCase();
+                html += `<div class="sj-vote-row">
+                    <span class="sj-vote-badge vote-${vKey}">${escHtml(vKey)}</span>
+                    <div><strong>${escHtml(r.reviewer_type||'')}</strong>
+                        <div class="sj-check-detail">${escHtml((r.justification||'').slice(0,300))}</div>
+                    </div>
+                </div>`;
+            }
+            html += '</div>';
+        }
+
+        // ---- Merge section ----
+        if (merge && merge.status && merge.status !== 'not_merged') {
+            const ok = merge.status === 'merged';
+            html += `<div class="sj-section">
+                <div class="sj-section-title">&#128256; Merge <span class="sj-badge ${ok?'ok':'warn'}">${escHtml(merge.status)}</span></div>
+                <table class="sj-table"><tbody>
+                    <tr><td><strong>Branch</strong></td><td><code>${escHtml(merge.branch_name||'—')}</code></td></tr>
+                    ${merge.merge_commit_sha?`<tr><td><strong>Commit</strong></td><td><code>${escHtml(merge.merge_commit_sha)}</code></td></tr>`:''}
+                </tbody></table>
+            </div>`;
+        }
+
+        // ---- Code Diff section ----
+        if (diffData && diffData.method) {
+            const branch = diffData.branch || '';
+            const method = diffData.method;
+            const hasDiff = diffData.diff && diffData.diff.trim().length > 0;
+            const methodLabel = method === 'merge_commit'
+                ? `<span class="sj-badge muted">merge commit ${escHtml((diffData.head_ref||'').slice(0,8))}</span>`
+                : `<span class="sj-badge info">${escHtml(branch)}</span>`;
+            html += `<div class="sj-section" id="sj-diff-section">
+                <div class="sj-section-title">&#9998; Code Diff ${methodLabel}</div>`;
+            if (diffData.stat) {
+                html += `<div class="diff-stat">${escHtml(diffData.stat)}</div>`;
+            }
+            if (hasDiff) {
+                html += `<div class="diff-viewer">${_renderDiff(diffData.diff)}</div>`;
+                if (diffData.truncated) {
+                    html += `<div class="diff-truncated-note">&#8230; diff truncated at 64 KiB — use git diff locally for the full output</div>`;
+                }
+            } else {
+                html += `<div style="color:#6c757d;font-size:0.82rem;padding:0.4rem 0">No changes recorded on this branch yet.</div>`;
+            }
+            html += '</div>';
+        } else if (diffData && diffData.error) {
+            html += `<div class="sj-section" id="sj-diff-section">
+                <div class="sj-section-title">&#9998; Code Diff</div>
+                <div style="color:#6c757d;font-size:0.82rem">${escHtml(diffData.error)}</div>
+            </div>`;
+        }
+
+        if (!html) {
+            html = '<div style="color:#6c757d;font-size:0.9rem;padding:1rem 0">No pipeline artifacts yet for this card.</div>';
+        }
+
+        body.innerHTML = html;
+
+        // Scroll to requested section
+        if (window._sjScrollTo === 'diff') {
+            const el = body.querySelector('#sj-diff-section');
+            if (el) setTimeout(() => el.scrollIntoView({behavior:'smooth', block:'start'}), 50);
+            window._sjScrollTo = null;
+        }
+
+        // Update cache
+        if (summaryResp.ok) _stageSummaryCache[taskId] = summary;
+    } catch (err) {
+        body.innerHTML = `<div style="color:#dc3545">Failed to load stage journal: ${escHtml(String(err))}</div>`;
+    }
+}
+
+function _renderDiff(diffText) {
+    // Parse unified diff into colored HTML
+    const lines = diffText.split('\n');
+    let html = '';
+    let lineNum = 0;
+
+    for (const line of lines) {
+        if (line.startsWith('diff --git') || line.startsWith('index ') ||
+            line.startsWith('--- ') || line.startsWith('+++ ')) {
+            if (line.startsWith('diff --git')) {
+                const fname = line.replace('diff --git ', '').split(' b/').pop() || line;
+                html += `<div class="diff-file-header">&#128196; ${escHtml(fname)}</div>`;
+            }
+            continue;
+        }
+        if (line.startsWith('@@')) {
+            // Parse hunk header for starting line number
+            const m = line.match(/@@ -\d+(?:,\d+)? \+(\d+)/);
+            lineNum = m ? parseInt(m[1], 10) - 1 : lineNum;
+            html += `<div class="diff-hunk-header">${escHtml(line)}</div>`;
+            continue;
+        }
+        if (line.startsWith('+') && !line.startsWith('+++')) {
+            lineNum++;
+            html += `<div class="diff-line diff-line-add"><span class="diff-gutter">${lineNum}</span><span class="diff-content">${escHtml(line)}</span></div>`;
+        } else if (line.startsWith('-') && !line.startsWith('---')) {
+            html += `<div class="diff-line diff-line-del"><span class="diff-gutter">-</span><span class="diff-content">${escHtml(line)}</span></div>`;
+        } else if (line.startsWith(' ') || line === '') {
+            lineNum++;
+            html += `<div class="diff-line diff-line-ctx"><span class="diff-gutter">${lineNum}</span><span class="diff-content">${escHtml(line)}</span></div>`;
+        }
+    }
+    return html;
 }
 
 // ============================================
@@ -924,6 +1356,10 @@ function initializeModals() {
 
     document.getElementById('scheduler-modal').addEventListener('click', function(e) {
         if (e.target === this && _modalMousedownTarget === this) closeSchedulerModal();
+    });
+
+    document.getElementById('stage-journal-modal').addEventListener('click', function(e) {
+        if (e.target === this && _modalMousedownTarget === this) closeStageJournal();
     });
 }
 
@@ -1728,6 +2164,24 @@ function openResearchDialog(taskId) {
     setTimeout(() => document.getElementById('research-dialog-question').focus(), 50);
 }
 
+function _pollInvestigationJob(taskId, jobId) {
+    const timer = setInterval(async () => {
+        try {
+            const resp = await fetch(`${API_BASE}/agent/investigate/${taskId}/status?job_id=${jobId}`);
+            if (!resp.ok) { clearInterval(timer); return; }
+            const data = await resp.json();
+            if (data.status === 'completed') {
+                clearInterval(timer);
+                const answer = data.report && data.report.answer ? ` — ${data.report.answer.slice(0, 80)}` : '';
+                showToast(`Investigation #${jobId} complete${answer}… Check inbox for full report.`, 'success', 8000);
+            } else if (data.status === 'failed') {
+                clearInterval(timer);
+                showToast(`Investigation #${jobId} failed: ${data.error || 'unknown error'}`, 'error');
+            }
+        } catch (_) { clearInterval(timer); }
+    }, 3000);
+}
+
 function _pollResearchJob(taskId, jobId) {
     const timer = setInterval(async () => {
         try {
@@ -1846,6 +2300,11 @@ function createTaskCard(id, title, tags, owner, status) {
         prereqHtml = buildPrereqLabels(id);
     }
 
+    const showFooter = (status !== 'idea' && status !== 'architecture' && status !== 'subdividing' && status !== 'cancelled');
+    const footerHtml = showFooter
+        ? `<div class="card-stage-footer csf-loading" id="csf-${id}" onclick="event.stopPropagation();openStageJournal('${id}')">…</div>`
+        : '';
+
     card.innerHTML = `
         <button class="card-highlight-btn" title="Highlight card" onclick="event.stopPropagation();toggleHighlight('${id}')">☆</button>
         ${parentLink}
@@ -1855,6 +2314,7 @@ function createTaskCard(id, title, tags, owner, status) {
             ${ownerHtml}
         </div>
         ${prereqHtml}
+        ${footerHtml}
         <div class="card-toolbar">
             <span class="toolbar-sep"></span>
             <button class="toolbar-btn" title="Research — run a research agent on this card" onclick="event.stopPropagation();openResearchDialog('${id}')">🔍</button>
@@ -1871,6 +2331,8 @@ function createTaskCard(id, title, tags, owner, status) {
             <button class="toolbar-btn" title="Set Stage — move to any pipeline stage" onclick="event.stopPropagation();toolbarStagePicker('${id}',this)">⚙</button>
             <span class="toolbar-sep"></span>
             <button class="toolbar-btn" title="Open in Diagnostics" onclick="event.stopPropagation();toolbarOpenDiagnostics('${id}')">📊</button>
+            <button class="toolbar-btn" title="Stage Journal — artifacts, gate checks, code diff" onclick="event.stopPropagation();openStageJournal('${id}')">📋</button>
+            ${['indev','conceptual_review','optimization','security','full_review','completed'].includes(status) ? `<button class="toolbar-btn" title="View code diff" onclick="event.stopPropagation();openStageDiff('${id}')">&#9998;</button>` : ''}
             <button class="toolbar-btn" title="Clone as new Idea" onclick="event.stopPropagation();toolbarClone('${id}')">⧉</button>
             <button class="toolbar-btn" title="Pin to top of column" onclick="event.stopPropagation();toolbarPin('${id}')">📌</button>
             <button class="toolbar-btn" title="Open in Column Map (DAG view)" onclick="event.stopPropagation();toolbarOpenMap('${id}')">🔗</button>

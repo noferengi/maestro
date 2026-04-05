@@ -1,5 +1,5 @@
 """
-Tests for app/agent/dag.py — DAGResolver.
+Tests for app/agent/dag.py - DAGResolver.
 
 Covers get_ready_tasks, build_execution_order, and validate_dag.
 """
@@ -90,7 +90,7 @@ class TestBuildExecutionOrder:
         ]
         resolver = DAGResolver(tasks)
         order = resolver.build_execution_order()
-        # Cycle should produce empty or raise — either is acceptable
+        # Cycle should produce empty or raise - either is acceptable
         assert order == [] or order is None or isinstance(order, list)
 
 

@@ -44,12 +44,12 @@ class TestExtractJsonBlock:
 
     def test_empty_string(self):
         result = extract_json_block("")
-        # Implementation returns None or "" for no-json input — both are acceptable
+        # Implementation returns None or "" for no-json input - both are acceptable
         assert result is None or result == ""
 
     def test_no_json(self):
         result = extract_json_block("no json here at all")
-        # Implementation returns None or "" for no-json input — both are acceptable
+        # Implementation returns None or "" for no-json input - both are acceptable
         assert result is None or result == ""
 
     def test_array(self):

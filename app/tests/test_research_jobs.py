@@ -23,7 +23,7 @@ def test_create_and_get_research_job(tmp_path, monkeypatch):
     import app.database as db_mod
     importlib.reload(db_mod)
 
-    # Need at least the tables — create them
+    # Need at least the tables - create them
     db_mod.Base.metadata.create_all(bind=db_mod.engine)
 
     # Create a minimal task row first (FK)

@@ -1,13 +1,13 @@
 """
 app/agent/loop.py
 -----------------
-The Wiggum Loop — core orchestration engine for a single Maestro task.
+The Wiggum Loop - core orchestration engine for a single Maestro task.
 
-MaestroLoop drives the LLM→tool-call→result→LLM cycle until one of:
-  • The agent emits an ACCEPTED signal.
-  • The agent emits a REVERT_TO_DESIGN signal.
-  • max_turns is exceeded.
-  • MAX_CONSECUTIVE_ERRORS consecutive tool errors occur.
+MaestroLoop drives the LLM -> tool-call -> result -> LLM cycle until one of:
+  * The agent emits an ACCEPTED signal.
+  * The agent emits a REVERT_TO_DESIGN signal.
+  * max_turns is exceeded.
+  * MAX_CONSECUTIVE_ERRORS consecutive tool errors occur.
 """
 
 from __future__ import annotations
@@ -33,13 +33,14 @@ from app.agent.config import (
     check_context_saturation,
 )
 from app.agent.json_utils import extract_json_block
-from app.agent.llm_client import call_llm
+from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
 from app.agent.system_prompt import MAESTRO_SYSTEM_PROMPT
 from app.agent.tools import TOOL_SCHEMAS, dispatch_tool, async_dispatch_tool, build_tool_schemas
 
 _INDEV_TOOL_SCHEMAS: list[dict] = build_tool_schemas(INDEV_AGENT_TOOLS)
 
 logger = logging.getLogger(__name__)
+AGENT_NAME = "Maestro Loop"
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +65,7 @@ class LoopResult:
 # ---------------------------------------------------------------------------
 
 _ACTIVE_LOOPS: dict[str, asyncio.Task] = {}
-_LOOP_STATUS: dict[str, dict] = {}  # task_id → {status, turns, ...}
+_LOOP_STATUS: dict[str, dict] = {}  # task_id -> {status, turns, ...}
 
 
 def get_loop_status(task_id: str) -> dict | None:
@@ -184,6 +185,9 @@ class MaestroLoop:
 
     async def _loop(self) -> LoopResult:
         """Core Do-While iteration."""
+        if is_shutting_down():
+            raise ShutdownError("Server is shutting down")
+
         # Pre-warm file summaries for the project (fire-and-forget)
         _project_root = getattr(self, 'project_path', None) or PROJECT_ROOT
         if getattr(self, 'llm_id', None) is not None:
@@ -208,13 +212,13 @@ class MaestroLoop:
         while self._turn < self.max_turns:
             self._turn += 1
             _LOOP_STATUS[self.task_id]["turns"] = self._turn
-            logger.debug("Task '%s' — turn %d/%d", self.task_id, self._turn, self.max_turns)
+            logger.debug("Task '%s' - turn %d/%d", self.task_id, self._turn, self.max_turns)
 
             # ── LLM call ──────────────────────────────────────────────
             try:
                 response = await self._call_llm(self._messages)
             except Exception as exc:
-                # Failed call does not count as a turn — roll back the increment.
+                # Failed call does not count as a turn - roll back the increment.
                 self._turn -= 1
                 _LOOP_STATUS[self.task_id]["turns"] = self._turn
                 logger.error("LLM call failed on turn %d: %s", self._turn, exc)
@@ -278,7 +282,7 @@ class MaestroLoop:
                         )
                 continue
 
-            # ── No tool calls and no signal — nudge the agent ─────────
+            # ── No tool calls and no signal - nudge the agent ─────────
             if not tool_calls and not signal:
                 self._messages.append({
                     "role": "user",
@@ -316,11 +320,16 @@ class MaestroLoop:
         if _project_path:
             try:
                 from app.agent.project_snapshot import build_snapshot_with_summaries
-                snapshot_block = f"\n\n{build_snapshot_with_summaries(_project_path)}"
+                from app.agent.config import SNAPSHOT_CONTEXT_RATIO
+                _snap_max = (
+                    int(self.max_context * SNAPSHOT_CONTEXT_RATIO)
+                    if self.max_context else None
+                )
+                snapshot_block = f"\n\n{build_snapshot_with_summaries(_project_path, max_tokens=_snap_max)}"
             except Exception:
                 pass
 
-        # Inject architecture context — look up the task's project by task_id
+        # Inject architecture context - look up the task's project by task_id
         arch_block = ""
         try:
             from app.database import get_task as _get_task
@@ -357,7 +366,7 @@ class MaestroLoop:
         """Inject a warning message if token usage crosses a threshold."""
         if not self.max_context:
             return
-        # terminate_threshold=0 disables hard termination — MaestroLoop uses its own signal system
+        # terminate_threshold=0 disables hard termination - MaestroLoop uses its own signal system
         check_context_saturation(
             self._last_prompt_tokens,
             self.max_context,
@@ -386,6 +395,7 @@ class MaestroLoop:
             task_id=self.task_id,
             llm_id=self.llm_id,
             budget_id=self.budget_id,
+            agent_name=AGENT_NAME,
         )
 
     # ------------------------------------------------------------------
@@ -428,7 +438,7 @@ class MaestroLoop:
                 if path and path not in self._files_changed:
                     self._files_changed.append(path)
 
-            # Dispatch (async — handles spawn_research_agent correctly)
+            # Dispatch (async - handles spawn_research_agent correctly)
             result_content = await async_dispatch_tool(
                 name, arguments,
                 task_id=self.task_id,
@@ -491,7 +501,7 @@ class MaestroLoop:
     async def _handle_needs_research(self, signal_dict: dict) -> dict:
         """
         Run a research agent inline, record the job, and return findings.
-        The loop continues after this — it is not a terminal action.
+        The loop continues after this - it is not a terminal action.
         """
         from app.agent.research import run_research
         from app.database import create_research_job, update_research_job

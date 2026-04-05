@@ -106,12 +106,22 @@ def upsert_project(
 
 
 def delete_project(name: str) -> bool:
-    """Delete a project record (does not affect tasks that reference it)."""
+    """Delete a project record and cancel any associated arch_gen jobs."""
     db = SessionLocal()
     try:
         project = db.query(Project).filter(Project.name == name).first()
         if not project:
             return False
+        
+        # Cancel any background arch_gen jobs for this project
+        from .models import ArchGenJob
+        from datetime import datetime, timezone
+        (db.query(ArchGenJob)
+           .filter(ArchGenJob.project == name,
+                   ArchGenJob.status.in_(['pending', 'running']))
+           .update({"status": "cancelled", "completed_at": datetime.now(timezone.utc)},
+                   synchronize_session=False))
+
         db.delete(project)
         db.commit()
         return True

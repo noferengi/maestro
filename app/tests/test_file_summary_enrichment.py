@@ -27,7 +27,7 @@ import pytest
 def _make_summary_row(summary: str, short_summary: str | None = None) -> MagicMock:
     row = MagicMock()
     row.summary = summary
-    row.short_summary = short_summary  # None → simulates pre-migration rows
+    row.short_summary = short_summary  # None -> simulates pre-migration rows
     return row
 
 
@@ -111,7 +111,7 @@ class TestListDirectoryEnrichment:
         assert ".env" in result
 
     def test_symlink_escaping_shown_as_protected(self, tmp_path):
-        # Create a regular file — we'll make the escape helper claim it's an escaping symlink
+        # Create a regular file - we'll make the escape helper claim it's an escaping symlink
         link = tmp_path / "outside_link"
         link.write_text("content")
 
@@ -367,7 +367,7 @@ class TestPrewarm:
             from app.agent.project_snapshot import prewarm_project_summaries
             count = prewarm_project_summaries(str(tmp_path), llm_id=1, budget_id=1)
 
-        assert count == 0  # cache hit → not counted
+        assert count == 0  # cache hit -> not counted
 
     def test_skips_excluded_dirs(self, tmp_path):
         (tmp_path / "venv").mkdir()
@@ -517,7 +517,7 @@ class TestBuildSnapshotWithSummaries:
             build_snapshot_with_summaries(str(tmp_path))
             after = call_count[0]
 
-        # Second call hit the in-memory cache — no new DB calls
+        # Second call hit the in-memory cache - no new DB calls
         assert after == before
 
     def test_token_budget_respected(self, tmp_path):
@@ -639,7 +639,7 @@ class TestExecuteFileSummaryPromptBranching:
             }
 
         # call_llm is imported lazily inside execute_file_summary via
-        # "from app.agent.llm_client import call_llm" — patch the source module
+        # "from app.agent.llm_client import call_llm" - patch the source module
         with (
             patch("app.agent.llm_client.call_llm", fake_call_llm),
             patch("app.database.create_file_summary"),

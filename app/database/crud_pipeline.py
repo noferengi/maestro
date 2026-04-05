@@ -201,6 +201,50 @@ def get_planning_result(task_id):
         db.close()
 
 
+def supersede_planning_results(task_id: str) -> int:
+    """Mark all active/in_progress planning results for a task as superseded.
+
+    Called at the start of every planning run so the new run's row becomes
+    the authoritative result regardless of what the old run produced.
+    Returns the number of rows updated.
+    """
+    db = SessionLocal()
+    try:
+        rows = (db.query(PlanningResult)
+                .filter(PlanningResult.task_id == task_id,
+                        PlanningResult.status.in_(['active', 'in_progress']))
+                .all())
+        for row in rows:
+            row.status = 'superseded'
+        db.commit()
+        return len(rows)
+    except Exception as e:
+        db.rollback()
+        logger.error("Error superseding planning results for '%s': %s", task_id, e)
+        return 0
+    finally:
+        db.close()
+
+
+def get_latest_planning_result(task_id: str):
+    """Return the most-recent planning result for a task, regardless of status.
+
+    Used by the ``/planning-result`` API endpoint so the Stage Journal can
+    display in_progress and failed states, not just completed ones.
+    The existing ``get_planning_result()`` (status='active' filter) is
+    unchanged — indev pipeline, conceptual review, and stage-summary
+    continue to use it.
+    """
+    db = SessionLocal()
+    try:
+        return (db.query(PlanningResult)
+                .filter(PlanningResult.task_id == task_id)
+                .order_by(PlanningResult.created_at.desc())
+                .first())
+    finally:
+        db.close()
+
+
 def update_planning_result(db, result_id, **kwargs):
     """Update a planning result by ID (caller-supplied session)."""
     try:

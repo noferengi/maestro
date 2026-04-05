@@ -1,7 +1,7 @@
 """
 app/agent/research.py
 ---------------------
-Research Agent — a lightweight agentic loop for investigating unknowns.
+Research Agent - a lightweight agentic loop for investigating unknowns.
 
 Used by the intake pipeline when:
   - A stage votes NEEDS_RESEARCH (insufficient info to assess)
@@ -40,11 +40,14 @@ from app.agent.config import (
     check_context_saturation,
 )
 from app.agent.json_utils import extract_json_block
-from app.agent.llm_client import call_llm
+from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
 from app.agent.tools import TOOL_SCHEMAS, TOOL_REGISTRY, dispatch_tool, LISTING_EXCLUDED_DIRS
 from app.database import get_llm
 
 logger = logging.getLogger(__name__)
+AGENT_NAME = "Research Agent"
+_INVESTIGATION_AGENT_NAME = "Investigation Agent"
+_WEB_SEARCH_AGENT_NAME = "Web Search Agent"
 
 
 # ---------------------------------------------------------------------------
@@ -71,12 +74,12 @@ def _has_meaningful_source_files(project_root: str = PROJECT_ROOT) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Grammar-constrained epilogue — GBNF for llama.cpp
+# Grammar-constrained epilogue - GBNF for llama.cpp
 # ---------------------------------------------------------------------------
 # Key order is fixed (grade → justification → verdict) so the sampler can
 # pre-fill tokens in order.  justification-text excludes double-quotes to
 # keep the grammar simple; truncation to 1024 chars is done in Python.
-# NEEDS_RESEARCH is intentionally allowed here — it means "investigation
+# NEEDS_RESEARCH is intentionally allowed here - it means "investigation
 # budget was insufficient" and is tagged so tally_votes() won't re-spawn.
 
 _FORCED_VERDICT_GRAMMAR = r"""
@@ -91,7 +94,7 @@ ws               ::= [ \t\n]*
 
 # grade is an integer 0-10000 representing investigation quality in hundredths
 # of a percent (e.g. 9258 = 92.58%).  confidence = grade // 100 (0-100 int).
-# Valid confidence range per verdict — used to clamp to a valid value so that
+# Valid confidence range per verdict - used to clamp to a valid value so that
 # Vote.__post_init__ validation never raises on epilogue results.
 _VERDICT_CONFIDENCE_RANGES: dict[str, tuple[int, int]] = {
     "REJECTED":       (0,  50),
@@ -103,7 +106,7 @@ _VERDICT_CONFIDENCE_RANGES: dict[str, tuple[int, int]] = {
 
 
 # ---------------------------------------------------------------------------
-# Post-mortem prompt — injected after turn exhaustion, before the next life
+# Post-mortem prompt - injected after turn exhaustion, before the next life
 # ---------------------------------------------------------------------------
 
 _POST_MORTEM_PROMPT = """\
@@ -142,7 +145,7 @@ def _extract_section(text: str, header: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Restricted tool schemas — only the tools a research agent is allowed to use
+# Restricted tool schemas - only the tools a research agent is allowed to use
 # ---------------------------------------------------------------------------
 
 def _build_restricted_schemas(has_source: bool = True) -> list[dict]:
@@ -225,23 +228,23 @@ When you are ready to render your verdict, output ONLY this JSON (no other text)
 ```
 
 Confidence ranges:
-- REJECTED: [0, 50] — fundamental blocker found
-- NOT_SUITABLE: [51, 60] — task is poorly scoped or inappropriate
-- NEEDS_RESEARCH: [61, 75] — still insufficient info (only use if you truly cannot determine)
-- POSSIBLE: [76, 91] — can probably be done
-- LIKELY: [92, 100] — high confidence it can be accomplished
+- REJECTED: [0, 50] - fundamental blocker found
+- NOT_SUITABLE: [51, 60] - task is poorly scoped or inappropriate
+- NEEDS_RESEARCH: [61, 75] - still insufficient info (only use if you truly cannot determine)
+- POSSIBLE: [76, 91] - can probably be done
+- LIKELY: [92, 100] - high confidence it can be accomplished
 
 == RULES ==
 - Be thorough but efficient. You have limited turns.
 - Do NOT attempt to write or modify any files.
-- Do NOT output free-form prose as your final action — always end with the JSON verdict.
+- Do NOT output free-form prose as your final action - always end with the JSON verdict.
 - If you cannot determine feasibility, say so honestly with NEEDS_RESEARCH.
 - Focus on evidence from the actual code, not assumptions.
 """
 
 _TIEBREAKER_SYSTEM_PROMPT = """You are a **Tie-Breaker Research Agent** inside the Maestro Orchestrator.
 
-A task advancement vote resulted in a tie — the voters are split on whether this task
+A task advancement vote resulted in a tie - the voters are split on whether this task
 should proceed. Your job is to investigate the SPECIFIC POINTS OF DISAGREEMENT between
 the voters, gather evidence from the codebase, and cast the deciding vote.
 
@@ -345,6 +348,9 @@ class ResearchAgent:
         total_turns = 0
 
         for life_num in range(1, self.max_lives + 1):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
+
             logger.info("Research agent life %d/%d for: %s", life_num, self.max_lives, self.question[:80])
 
             life_context = self._build_life_context(life_num)
@@ -358,9 +364,9 @@ class ResearchAgent:
                 self._accumulated_findings.append(f"[Life {life_num}] {life_result.findings}")
             self._accumulated_summaries.append(life_result.handoff_summary)
 
-            # Context overflow — surface immediately, no point spawning more lives
+            # Context overflow - surface immediately, no point spawning more lives
             if life_result.vote and life_result.vote.get("verdict") == "TOO_LARGE":
-                logger.info("Research agent TOO_LARGE — task scope exceeds context budget")
+                logger.info("Research agent TOO_LARGE - task scope exceeds context budget")
                 return ResearchResult(
                     vote=life_result.vote,
                     lives_used=life_num,
@@ -385,8 +391,8 @@ class ResearchAgent:
             if life_num < self.max_lives:
                 logger.info("Research agent life %d inconclusive, spawning life %d", life_num, life_num + 1)
 
-        # All lives exhausted — fire a forced verdict epilogue call
-        logger.info("Research agent all lives exhausted — firing forced verdict epilogue")
+        # All lives exhausted - fire a forced verdict epilogue call
+        logger.info("Research agent all lives exhausted - firing forced verdict epilogue")
         forced_vote = await self._forced_verdict_call()
 
         return ResearchResult(
@@ -408,7 +414,7 @@ class ResearchAgent:
         generation (GBNF) to force the LLM to emit a structured verdict JSON
         with a grade (0-9), justification, and verdict.
 
-        NEEDS_RESEARCH is now allowed — it means "investigation budget was
+        NEEDS_RESEARCH is now allowed - it means "investigation budget was
         insufficient."  The ``source`` tag prevents tally_votes() from
         re-spawning a research agent for this vote.
         """
@@ -425,13 +431,14 @@ class ResearchAgent:
         context_snippet = json.dumps(self.context, indent=1)[:2000]
 
         system_prompt = (
+            "/no_think\n"
             "You are a Research Agent. ALL research turns have been exhausted. "
             "You cannot use any tools. You MUST render a final verdict RIGHT NOW "
             "based solely on the accumulated findings below.\n\n"
-            "Output ONLY this JSON object — key order MUST be exactly: grade, justification, verdict.\n"
+            "Output ONLY this JSON object - key order MUST be exactly: grade, justification, verdict.\n"
             '{\n'
             '  "grade": <integer 0-10000 representing investigation quality in hundredths of a percent, e.g. 9258 = 92.58%>,\n'
-            '  "justification": "<your synthesis of the evidence — no double-quote characters>",\n'
+            '  "justification": "<your synthesis of the evidence - no double-quote characters>",\n'
             '  "verdict": "<REJECTED|NOT_SUITABLE|POSSIBLE|LIKELY|NEEDS_RESEARCH>"\n'
             '}\n\n'
             "Use NEEDS_RESEARCH only if the investigation budget was genuinely insufficient "
@@ -456,10 +463,11 @@ class ResearchAgent:
                     base_url=self.llm_base_url,
                     model=self.llm_model,
                     temperature=0.1,
-                    max_tokens=512,
+                    max_tokens=4096,  # headroom for thinking mode; /no_think in system prompt suppresses it if server is constrained
                     task_id=self.task_id,
                     llm_id=self.llm_id,
                     budget_id=self.budget_id,
+                    agent_name=AGENT_NAME,
                 )
                 if use_grammar:
                     kwargs["grammar"] = _FORCED_VERDICT_GRAMMAR
@@ -495,6 +503,8 @@ class ResearchAgent:
                         "source": "research_agent_epilogue",
                     }
             except Exception as exc:
+                if is_shutting_down():
+                    raise
                 logger.warning(
                     "Forced verdict epilogue attempt (grammar=%s) failed: %s", use_grammar, exc
                 )
@@ -503,7 +513,7 @@ class ResearchAgent:
         return {
             "verdict": "NOT_SUITABLE",
             "confidence": 40,
-            "grade": 4000,   # 40.00% — reflects that lives + epilogue all failed
+            "grade": 4000,   # 40.00% - reflects that lives + epilogue all failed
             "justification": (
                 f"Research agent exhausted {self.max_lives} lives and the forced-verdict "
                 f"epilogue also failed. Accumulated findings: "
@@ -529,14 +539,21 @@ class ResearchAgent:
         life_prompt_tokens = 0
         life_completion_tokens = 0
         _ctx_warned: set[float] = set()
+        _last_prompt_tokens = 0  # actual context size from the most recent LLM call
 
         for turn in range(self.max_turns_per_life):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
+
             turns_used += 1
 
-            # Hard budget check (Saturation)
-            # Calculated once per life based on max_context.
+            # Hard budget check: compare the CURRENT context window fill (from the
+            # previous call) against the budget.  life_prompt_tokens is a cumulative
+            # SUM across all calls (correct for cost accounting) but grows quadratically,
+            # so it fires far too early.  _last_prompt_tokens is the actual prompt size
+            # of the most recent call — the true measure of context fill.
             budget_tokens = int(self.max_context * RESEARCH_CONTEXT_BUDGET_RATIO) if self.max_context else 0
-            budget_exceeded = budget_tokens > 0 and life_prompt_tokens >= budget_tokens
+            budget_exceeded = budget_tokens > 0 and _last_prompt_tokens >= budget_tokens
 
             if budget_exceeded:
                 messages.append({
@@ -546,15 +563,15 @@ class ResearchAgent:
 
             # LLM call
             try:
-                response = await self._call_llm(messages)
+                response = await self._call_llm(messages, no_tools=budget_exceeded)
             except Exception as exc:
                 exc_str = str(exc)
                 if "400" in exc_str or "Bad Request" in exc_str:
-                    # Context window exceeded — terminate this life immediately.
+                    # Context window exceeded - terminate this life immediately.
                     # Continuing would only make the context larger and guarantee every
                     # subsequent call also fails.
                     logger.warning(
-                        "Research agent context overflow (life %d, turn %d) — emitting TOO_LARGE",
+                        "Research agent context overflow (life %d, turn %d) - emitting TOO_LARGE",
                         life_num, turns_used,
                     )
                     return LifeResult(
@@ -563,14 +580,17 @@ class ResearchAgent:
                             "verdict": "TOO_LARGE",
                             "confidence": 100,
                             "justification": (
-                                "Context window exceeded — task scope is too large "
+                                "Context window exceeded - task scope is too large "
                                 "for a single research life."
                             ),
                             "findings": f"Context overflowed at turn {turns_used} of life {life_num}.",
                         },
                         turns_used=turns_used,
                     )
-                # Failed call does not count as a turn — the LLM produced no work.
+                # Propagate shutdown immediately - don't retry on a dying interpreter.
+                if is_shutting_down():
+                    raise
+                # Failed call does not count as a turn - the LLM produced no work.
                 turns_used -= 1
                 logger.error("Research agent LLM call failed (life %d, turn %d): %s", life_num, turns_used, exc)
                 messages.append({
@@ -583,6 +603,7 @@ class ResearchAgent:
             prompt_tokens_this_call = usage.get("prompt_tokens", 0)
             life_prompt_tokens += prompt_tokens_this_call
             life_completion_tokens += usage.get("completion_tokens", 0)
+            _last_prompt_tokens = prompt_tokens_this_call  # track actual context fill for budget check
 
             assistant_message = response.get("choices", [{}])[0].get("message", {})
             messages.append(assistant_message)
@@ -601,23 +622,37 @@ class ResearchAgent:
                     completion_tokens=life_completion_tokens,
                 )
 
-            # Dispatch tool calls
+            # Dispatch tool calls (suppress if budget exceeded - force verdict path)
             if tool_calls:
-                tool_results = self._handle_tool_calls(tool_calls)
-                messages.extend(tool_results)
+                if budget_exceeded:
+                    # Return error results for each tool call so the conversation
+                    # stays structurally valid, but don't execute the tools.
+                    error_results = [
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.get("id", "unknown"),
+                            "name": tc.get("function", {}).get("name", "unknown"),
+                            "content": "ERROR: Token budget exceeded. No tool calls allowed. Render your verdict now.",
+                        }
+                        for tc in tool_calls
+                    ]
+                    messages.extend(error_results)
+                else:
+                    tool_results = self._handle_tool_calls(tool_calls)
+                    messages.extend(tool_results)
                 continue
 
-            # Context saturation check — only reached when no verdict and no tool calls
+            # Context saturation check - only reached when no verdict and no tool calls
             if check_context_saturation(
                 prompt_tokens_this_call, self.max_context, _ctx_warned, messages
             ):
                 logger.warning(
-                    "Research agent context saturation (life %d, turn %d) — terminating life gracefully",
+                    "Research agent context saturation (life %d, turn %d) - terminating life gracefully",
                     life_num, turns_used,
                 )
                 break  # falls through to _post_mortem_call()
 
-            # No tool calls and no verdict — nudge
+            # No tool calls and no verdict - nudge
             if not tool_calls and not vote:
                 remaining = self.max_turns_per_life - turns_used
                 if remaining <= 3:
@@ -637,11 +672,11 @@ class ResearchAgent:
                         ),
                     })
 
-        # Turn cap hit without verdict — fire a post-mortem call to capture a structured
+        # Turn cap hit without verdict - fire a post-mortem call to capture a structured
         # handoff summary for the next life.  Tokens are tracked inside the method.
         handoff_summary = await self._post_mortem_call(life_num, messages)
         return LifeResult(
-            findings=f"Life {life_num} exhausted {self.max_turns_per_life} turns without rendering a verdict.",
+            findings=f"Life {life_num} exhausted {turns_used} turns without rendering a verdict.",
             vote=None,
             turns_used=turns_used,
             prompt_tokens=life_prompt_tokens,
@@ -660,7 +695,7 @@ class ResearchAgent:
         context than "exhausted N turns without a verdict."
 
         Tokens are accumulated into the agent-level totals.  Returns an empty
-        string on failure — the caller always gets a LifeResult regardless.
+        string on failure - the caller always gets a LifeResult regardless.
         """
         post_mortem_messages = list(messages) + [
             {"role": "user", "content": _POST_MORTEM_PROMPT}
@@ -674,6 +709,7 @@ class ResearchAgent:
                 max_tokens=1024,
                 task_id=self.task_id,
                 llm_id=self.llm_id,
+                agent_name=AGENT_NAME,
                 budget_id=self.budget_id,
             )
             usage = response.get("usage", {})
@@ -683,6 +719,8 @@ class ResearchAgent:
             logger.debug("Research agent post-mortem (life %d): %s", life_num, content[:200])
             return content.strip()
         except Exception as exc:
+            if is_shutting_down():
+                raise
             logger.warning("Research agent post-mortem call failed (life %d): %s", life_num, exc)
             return ""
 
@@ -699,7 +737,12 @@ class ResearchAgent:
             if self.project_root:
                 try:
                     from app.agent.project_snapshot import build_snapshot_with_summaries
-                    parts.append(build_snapshot_with_summaries(self.project_root))
+                    from app.agent.config import SNAPSHOT_CONTEXT_RATIO
+                    _snap_max = (
+                        int(self.max_context * SNAPSHOT_CONTEXT_RATIO)
+                        if self.max_context else None
+                    )
+                    parts.append(build_snapshot_with_summaries(self.project_root, max_tokens=_snap_max))
                 except Exception:
                     pass
 
@@ -719,7 +762,7 @@ class ResearchAgent:
             parts.append(f"## Investigation Question\n{self.question}")
             parts.append(f"\n## Context\n```json\n{json.dumps(self.context, indent=2, default=str)}\n```")
         else:
-            parts = [f"## Investigation Question (continued — life {life_num}/{self.max_lives})\n{self.question}"]
+            parts = [f"## Investigation Question (continued - life {life_num}/{self.max_lives})\n{self.question}"]
             parts.append("\n## Previous Investigation Findings")
             for i, (findings, summary) in enumerate(
                 zip_longest(self._accumulated_findings, self._accumulated_summaries, fillvalue=""),
@@ -740,7 +783,7 @@ class ResearchAgent:
                 "\n## Instructions\n"
                 "Continue investigating based on the findings above. "
                 "Focus on resolving the outstanding questions. "
-                f"This is life {life_num} of {self.max_lives} — "
+                f"This is life {life_num} of {self.max_lives} - "
                 f"{'you MUST render a verdict this time.' if is_final else 'investigate further or render your verdict.'}"
             )
 
@@ -750,18 +793,19 @@ class ResearchAgent:
     # LLM call
     # ------------------------------------------------------------------
 
-    async def _call_llm(self, messages: list[dict]) -> dict:
+    async def _call_llm(self, messages: list[dict], no_tools: bool = False) -> dict:
         """POST to the LLM endpoint with restricted tool schemas."""
         return await call_llm(
             messages,
             base_url=self.llm_base_url,
             model=self.llm_model,
             temperature=INTAKE_LLM_TEMPERATURE,
-            tools=self._restricted_schemas,
-            tool_choice="auto",
+            tools=None if no_tools else self._restricted_schemas,
+            tool_choice=None if no_tools else "auto",
             task_id=self.task_id,
             llm_id=self.llm_id,
             budget_id=self.budget_id,
+            agent_name=AGENT_NAME,
         )
 
     # ------------------------------------------------------------------
@@ -815,7 +859,340 @@ class ResearchAgent:
 
 
 # ---------------------------------------------------------------------------
-# Web Search Agent — Synthesis and Fetching
+# Investigation Agent - open-ended research, no verdict required
+# ---------------------------------------------------------------------------
+
+_INVESTIGATION_SYSTEM_PROMPT = """You are an **Investigation Agent** inside the Maestro Orchestrator.
+
+Your job is to INVESTIGATE a question thoroughly and produce a detailed report. Unlike the
+Research Agent, you are NOT asked for a feasibility verdict — just comprehensive findings.
+
+== TOOLS AVAILABLE ==
+- read_file(path): Read a file's contents
+- search_files(pattern, directory): Regex search across file contents
+- find_files(glob_pattern, directory): Find files by name pattern
+- list_directory(path): List directory contents
+- git_status(): Show current git status
+- git_diff(path?): Show git diff (optionally scoped to a file)
+- git_log(path?, max_count?): Show recent git history (optionally scoped to a file)
+- git_blame(path): Show git blame for a file
+
+== YOUR WORKFLOW ==
+1. Read the investigation question carefully.
+2. Use tools to explore the codebase and gather concrete evidence.
+3. When you have enough information, produce a structured JSON report.
+
+== OUTPUT FORMAT ==
+When ready, output a JSON block with this exact structure:
+```json
+{
+  "answer": "<direct answer to the question in 1-3 sentences>",
+  "key_findings": ["<finding 1>", "<finding 2>", "..."],
+  "evidence": ["<file:line or quote 1>", "<evidence 2>", "..."],
+  "gaps": ["<unanswered question 1>", "..."],
+  "recommendation": "<what should be done next, if anything>"
+}
+```
+
+== RULES ==
+- Be specific: cite exact file paths, function names, and line numbers.
+- Do not pad the report with obvious filler. Quality over quantity.
+- If you cannot find enough information, say so explicitly in `gaps`.
+- Do NOT include a "verdict" field — this is an investigation, not a vote.
+"""
+
+
+@dataclass(slots=True)
+class InvestigationResult:
+    """Final outcome of an ad-hoc investigation run."""
+    report: dict          # {answer, key_findings, evidence, gaps, recommendation}
+    lives_used: int
+    total_turns: int
+    raw_findings: str     # accumulated free-text findings across lives
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
+class InvestigationAgent:
+    """
+    Open-ended investigation agent for ad-hoc research triggered from the card toolbar.
+
+    Unlike ResearchAgent, this agent produces a structured report rather than a
+    feasibility verdict.  It uses the same tool set and lives system.
+
+    Usage::
+
+        agent = InvestigationAgent(
+            question="How does the scheduler prioritise arch_gen_jobs?",
+            context={"task_id": "...", "task_title": "...", "task_description": "..."},
+        )
+        result = await agent.run()
+        # result.report = {"answer": "...", "key_findings": [...], ...}
+    """
+
+    def __init__(
+        self,
+        question: str,
+        context: dict[str, Any],
+        max_turns_per_life: int = RESEARCH_AGENT_MAX_TURNS_PER_LIFE,
+        max_lives: int | None = None,
+        llm_base_url: str | None = None,
+        llm_model: str | None = None,
+        task_id: str | None = None,
+        llm_id: int | None = None,
+        budget_id: int | None = None,
+        max_context: int = 0,
+        project_root: str | None = None,
+    ) -> None:
+        self.question = question
+        self.context = context
+        self.max_turns_per_life = max_turns_per_life
+        self.max_lives = max_lives or RESEARCH_AGENT_MAX_LIVES
+        self.llm_base_url = llm_base_url or LLM_BASE_URL
+        self.llm_model = llm_model or LLM_MODEL
+        self.task_id = task_id
+        self.llm_id = llm_id
+        self.budget_id = budget_id
+        self.max_context = max_context
+        self.project_root = project_root
+
+        self._has_source = _has_meaningful_source_files(self.project_root or PROJECT_ROOT)
+        self._restricted_schemas = _build_restricted_schemas(self._has_source)
+        self._allowed_tools = {s["function"]["name"] for s in self._restricted_schemas}
+
+        self._accumulated_findings: list[str] = []
+        self._total_prompt_tokens = 0
+        self._total_completion_tokens = 0
+
+    async def run(self) -> InvestigationResult:
+        """Execute investigation across up to max_lives. Returns InvestigationResult."""
+        total_turns = 0
+        final_report: dict = {}
+
+        for life_num in range(1, self.max_lives + 1):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
+
+            logger.info(
+                "Investigation agent life %d/%d for: %s",
+                life_num, self.max_lives, self.question[:80],
+            )
+
+            life_context = self._build_life_context(life_num)
+            report, turns, pt, ct, findings = await self._run_life(life_context, life_num)
+
+            total_turns += turns
+            self._total_prompt_tokens += pt
+            self._total_completion_tokens += ct
+            if findings:
+                self._accumulated_findings.append(f"[Life {life_num}] {findings}")
+
+            if report:
+                final_report = report
+                break
+
+        if not final_report:
+            # Synthesise a minimal report from accumulated findings
+            accumulated = "\n\n".join(self._accumulated_findings) or "No findings recorded."
+            final_report = {
+                "answer": "Investigation exhausted without producing a structured report.",
+                "key_findings": [accumulated[:2000]],
+                "evidence": [],
+                "gaps": ["Investigation budget was insufficient to reach a conclusion."],
+                "recommendation": "Retry with a more specific question or a higher turn budget.",
+            }
+
+        return InvestigationResult(
+            report=final_report,
+            lives_used=min(self.max_lives, life_num),
+            total_turns=total_turns,
+            raw_findings="\n\n".join(self._accumulated_findings),
+            prompt_tokens=self._total_prompt_tokens,
+            completion_tokens=self._total_completion_tokens,
+        )
+
+    def _build_life_context(self, life_num: int) -> str:
+        """Build the user-turn context injected at the start of each life."""
+        from app.agent.project_snapshot import build_architecture_context
+        parts: list[str] = []
+
+        # Architecture context on first life
+        if life_num == 1 and self.task_id:
+            task_project = self.context.get("task_project")
+            if task_project:
+                arch_ctx = build_architecture_context(task_project, agent_type="research")
+                if arch_ctx:
+                    parts.append(arch_ctx)
+
+        task_desc = self.context.get("task_description", "")
+        parts.append(
+            f"== TASK CONTEXT ==\n"
+            f"Task: {self.context.get('task_title', 'Unknown')}\n"
+            f"Description: {task_desc[:1000]}\n"
+            f"Stage: {self.context.get('task_type', 'unknown')}"
+        )
+
+        if life_num > 1 and self._accumulated_findings:
+            prev = "\n\n".join(self._accumulated_findings)
+            parts.append(
+                f"== FINDINGS FROM PREVIOUS LIVES ==\n{prev}\n\n"
+                f"Continue investigating. Focus on gaps not yet resolved."
+            )
+
+        parts.append(f"== INVESTIGATION QUESTION ==\n{self.question}")
+        return "\n\n".join(parts)
+
+    async def _run_life(
+        self, context: str, life_num: int
+    ) -> tuple[dict | None, int, int, int, str]:
+        """Run one investigation life. Returns (report, turns, prompt_tokens, completion_tokens, findings_text)."""
+        messages = [
+            {"role": "system", "content": _INVESTIGATION_SYSTEM_PROMPT},
+            {"role": "user", "content": context},
+        ]
+
+        turns_used = 0
+        life_prompt_tokens = 0
+        life_completion_tokens = 0
+        _ctx_warned: set[float] = set()
+        _last_prompt_tokens = 0  # actual context size from the most recent LLM call
+        findings_text = ""
+
+        for turn in range(self.max_turns_per_life):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
+
+            turns_used += 1
+            budget_tokens = int(self.max_context * RESEARCH_CONTEXT_BUDGET_RATIO) if self.max_context else 0
+            budget_exceeded = budget_tokens > 0 and _last_prompt_tokens >= budget_tokens
+
+            if budget_exceeded:
+                messages.append({
+                    "role": "user",
+                    "content": "[SYSTEM] TOKEN BUDGET EXCEEDED. Produce your JSON report now. No more tool calls.",
+                })
+
+            try:
+                response = await call_llm(
+                    messages,
+                    base_url=self.llm_base_url,
+                    model=self.llm_model,
+                    temperature=INTAKE_LLM_TEMPERATURE,
+                    tools=None if budget_exceeded else self._restricted_schemas,
+                    tool_choice=None if budget_exceeded else "auto",
+                    task_id=self.task_id,
+                    llm_id=self.llm_id,
+                    budget_id=self.budget_id,
+                    agent_name=_INVESTIGATION_AGENT_NAME,
+                )
+            except Exception as exc:
+                if is_shutting_down():
+                    raise
+                turns_used -= 1
+                logger.error("Investigation agent LLM call failed (life %d, turn %d): %s", life_num, turns_used, exc)
+                messages.append({
+                    "role": "user",
+                    "content": f"[SYSTEM] LLM call failed: {exc}. Try a different approach or produce your report.",
+                })
+                continue
+
+            usage = response.get("usage", {})
+            _last_prompt_tokens = usage.get("prompt_tokens", 0)
+            life_prompt_tokens += _last_prompt_tokens
+            life_completion_tokens += usage.get("completion_tokens", 0)
+
+            assistant_message = response.get("choices", [{}])[0].get("message", {})
+            messages.append(assistant_message)
+
+            tool_calls = assistant_message.get("tool_calls") or []
+            content = assistant_message.get("content") or ""
+
+            # Look for structured JSON report
+            report = self._extract_report(content)
+            if report:
+                findings_text = content
+                return report, turns_used, life_prompt_tokens, life_completion_tokens, findings_text
+
+            # Dispatch tool calls
+            if tool_calls:
+                if budget_exceeded:
+                    messages.extend([
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.get("id", "unknown"),
+                            "name": tc.get("function", {}).get("name", "unknown"),
+                            "content": "ERROR: Token budget exceeded. Produce your JSON report now.",
+                        }
+                        for tc in tool_calls
+                    ])
+                else:
+                    results = []
+                    for tc in tool_calls:
+                        tool_id = tc.get("id", "unknown")
+                        fn = tc.get("function", {})
+                        name = fn.get("name", "")
+                        raw_args = fn.get("arguments", "{}")
+                        try:
+                            arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                        except json.JSONDecodeError:
+                            arguments = {}
+                        if name not in self._allowed_tools:
+                            result_content = f"ERROR: Tool '{name}' is not available. Available: {sorted(self._allowed_tools)}"
+                        else:
+                            result_content = dispatch_tool(name, arguments)
+                        results.append({
+                            "role": "tool",
+                            "tool_call_id": tool_id,
+                            "name": name,
+                            "content": result_content,
+                        })
+                    messages.extend(results)
+                continue
+
+            # Saturation check
+            if check_context_saturation(_last_prompt_tokens, self.max_context, _ctx_warned, messages):
+                logger.warning("Investigation agent context saturation (life %d, turn %d)", life_num, turns_used)
+                break
+
+            # Nudge
+            remaining = self.max_turns_per_life - turns_used
+            if remaining <= 3:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"[SYSTEM] You have {remaining} turns remaining. "
+                        "You MUST output your JSON report now."
+                    ),
+                })
+            elif content:
+                findings_text = content
+            else:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "[SYSTEM] You did not call any tool and did not produce a report. "
+                        "Either call a tool to investigate further, or output your JSON report."
+                    ),
+                })
+
+        return None, turns_used, life_prompt_tokens, life_completion_tokens, findings_text
+
+    def _extract_report(self, content: str) -> dict | None:
+        """Try to extract an investigation report JSON from the assistant's content."""
+        raw = extract_json_block(content)
+        if raw is None:
+            return None
+        try:
+            parsed = json.loads(raw.strip())
+            if isinstance(parsed, dict) and "answer" in parsed:
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Web Search Agent - Synthesis and Fetching
 # ---------------------------------------------------------------------------
 
 _WEB_SEARCH_SYSTEM_PROMPT = """You are a **Web Search Synthesis Agent**.
@@ -876,6 +1253,9 @@ class WebSearchAgent:
         total_completion_tokens = 0
 
         for turn in range(max_turns):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
+
             response = await call_llm(
                 messages,
                 base_url=self.llm_base_url,
@@ -885,6 +1265,7 @@ class WebSearchAgent:
                 task_id=self.task_id,
                 llm_id=self.llm_id,
                 budget_id=self.budget_id,
+                agent_name=_WEB_SEARCH_AGENT_NAME,
             )
 
             usage = response.get("usage", {})
@@ -896,7 +1277,7 @@ class WebSearchAgent:
 
             tool_calls = assistant_msg.get("tool_calls") or []
             if not tool_calls:
-                # No more tools — this is the final synthesis
+                # No more tools - this is the final synthesis
                 return assistant_msg.get("content", "").strip()
 
             # Execute tool calls
@@ -954,6 +1335,41 @@ async def run_research(
             _max_context = _llm_record.max_context or 0
 
     agent = ResearchAgent(
+        question=question,
+        context=context,
+        max_turns_per_life=max_turns_per_life,
+        max_lives=max_lives,
+        llm_base_url=llm_base_url,
+        llm_model=llm_model,
+        task_id=task_id,
+        llm_id=llm_id,
+        budget_id=budget_id,
+        max_context=_max_context,
+        project_root=project_root,
+    )
+    return await agent.run()
+
+
+async def run_investigation(
+    question: str,
+    context: dict[str, Any],
+    max_turns_per_life: int = RESEARCH_AGENT_MAX_TURNS_PER_LIFE,
+    max_lives: int | None = None,
+    llm_base_url: str | None = None,
+    llm_model: str | None = None,
+    task_id: str | None = None,
+    llm_id: int | None = None,
+    budget_id: int | None = None,
+    project_root: str | None = None,
+) -> InvestigationResult:
+    """Run an investigation agent and return its structured report."""
+    _max_context = 0
+    if llm_id is not None:
+        _llm_record = get_llm(llm_id)
+        if _llm_record is not None:
+            _max_context = _llm_record.max_context or 0
+
+    agent = InvestigationAgent(
         question=question,
         context=context,
         max_turns_per_life=max_turns_per_life,

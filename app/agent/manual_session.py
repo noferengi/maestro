@@ -1,7 +1,7 @@
 """
 app/agent/manual_session.py
 -----------------------------
-ManualSession — a human-controlled tool execution session.
+ManualSession - a human-controlled tool execution session.
 
 The human acts as the reasoning layer: they pick tools, see results,
 add notes, and decide when to end.  No LLM is invoked.
@@ -58,5 +58,5 @@ class ManualSession:
         })
 
 
-# In-memory session registry — lost on server restart
+# In-memory session registry - lost on server restart
 _ACTIVE_MANUAL_SESSIONS: dict[str, ManualSession] = {}

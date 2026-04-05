@@ -45,13 +45,14 @@ from app.agent.config import (
     TOOL_LISTING_EXCLUDED_DIRS,
     MAESTRO_GIT_ROOT,
 )
+from app.agent.llm_client import is_shutting_down, ShutdownError
 
 # ---------------------------------------------------------------------------
 # Per-task git working directory
 # ---------------------------------------------------------------------------
 # Using a ContextVar so parallel agent sessions (each in their own thread or
 # asyncio task) each have an independent working directory. Never defaults to
-# TheMaestro's own source tree — always requires explicit configuration per task.
+# TheMaestro's own source tree - always requires explicit configuration per task.
 _task_git_cwd: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "_task_git_cwd", default=None
 )
@@ -59,12 +60,12 @@ _task_git_cwd: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 # ---------------------------------------------------------------------------
 # Per-task file read-range tracking
 # ---------------------------------------------------------------------------
-# Maps normalised abs-path → sorted, merged list of (start, end) inclusive
+# Maps normalised abs-path -> sorted, merged list of (start, end) inclusive
 # line intervals already delivered to the LLM in this session.
 # A path being present (even with an empty interval list) means read_file()
 # has been called on it at least once.
 #
-# Maximum lines served per call — shared by both read_file and read_file_harder.
+# Maximum lines served per call - shared by both read_file and read_file_harder.
 _READ_FILE_MAX_LINES = 250
 
 _prepped_files: contextvars.ContextVar[dict[str, list[tuple[int, int]]] | None] = (
@@ -141,7 +142,7 @@ def _serve_file_lines(safe_path: str, start: int, end: int) -> str:
     start = max(1, min(start, total))
     end   = max(start, min(end, total))
     _record_served_range(norm, start, end)
-    result = [f"== FILE: {safe_path} (lines {start}–{end} of {total}) =="]
+    result = [f"== FILE: {safe_path} (lines {start}-{end} of {total}) =="]
     for i in range(start, end + 1):
         result.append(f"{i}: {all_lines[i - 1].rstrip()}")
     return "\n".join(result)
@@ -149,7 +150,7 @@ def _serve_file_lines(safe_path: str, start: int, end: int) -> str:
 
 def _served_ranges_str(norm_path: str) -> str:
     served = _get_prepped_files().get(norm_path, [])
-    return ", ".join(f"{s}–{e}" for s, e in served) if served else "none"
+    return ", ".join(f"{s}-{e}" for s, e in served) if served else "none"
 
 
 # Paths where git init has already been attempted this process lifetime.
@@ -161,7 +162,7 @@ def ensure_git_repo(path: str) -> None:
     """If ``path`` has no .git directory, attempt ``git init`` once.
 
     Subsequent calls for the same path (including after failure) are no-ops.
-    Logs the outcome but never raises — callers should proceed and let the
+    Logs the outcome but never raises - callers should proceed and let the
     subsequent git command surface any real error.
     """
     if os.path.exists(os.path.join(path, ".git")):
@@ -214,7 +215,7 @@ def get_task_git_cwd() -> str | None:
 # Directory exclusions for listing tools
 # ---------------------------------------------------------------------------
 # Sourced from maestro.ini [tools] excluded_directories.
-# Add entries there to extend — no code change required.
+# Add entries there to extend - no code change required.
 # The root .archive folder and .git are always excluded by absolute path
 # regardless of this set.
 
@@ -281,7 +282,7 @@ def _assert_archivable(path: str) -> str:
 
     Rules (in priority order):
       1. Path must be inside PROJECT_ROOT (delegates to _assert_safe_path).
-      2. Path must NOT touch .git or anything inside it — git history is
+      2. Path must NOT touch .git or anything inside it - git history is
          permanently protected. Archiving git internals would destroy the repo.
       3. Path must NOT be inside the root archive directory (ARCHIVE_DIR).
          Re-archiving an already-archived file makes no sense and is rejected
@@ -364,7 +365,7 @@ def read_file(path: str) -> str:
         return f"ERROR: '{path}' is not a file or does not exist."
     norm = os.path.normpath(os.path.realpath(safe_path))
     from app.agent.project_snapshot import _count_file_lines, build_file_summary
-    # Subsequent call — serve next unserved source lines
+    # Subsequent call - serve next unserved source lines
     if norm in _get_prepped_files():
         total = _count_file_lines(safe_path)
         unserved = _next_unserved_range(norm, 1, total)
@@ -376,11 +377,11 @@ def read_file(path: str) -> str:
                 f"Call read_file_harder('{rel}', start=N) for a specific range."
             )
         return _serve_file_lines(safe_path, unserved[0], unserved[1])
-    # First call — structural summary
+    # First call - structural summary
     _mark_file_prepped(safe_path)
     if _count_file_lines(safe_path) <= 25:
         result = _inline_small_file(safe_path)
-        # Whole file shown inline — record all lines as served
+        # Whole file shown inline - record all lines as served
         try:
             with open(safe_path, "r", encoding="utf-8", errors="replace") as fh:
                 lc = sum(1 for _ in fh)
@@ -436,10 +437,12 @@ def append_file(path: str, content: str) -> str:
 
 
 def _get_cached_summary_for_listing(abs_path: str) -> "str | None":
-    """Sync DB lookup for a file's cached summary. Returns first 160 chars or None.
+    """Sync DB lookup for a file's cached summary.
 
-    Prefers short_summary (2 sentences, purpose-built for listings) and falls
-    back to the first line of summary for rows that pre-date migration 0035.
+    Prefers short_summary (exactly 2 sentences, purpose-built for listings) and
+    falls back to the first line of summary for rows that pre-date migration 0035.
+    Truncates at 500 chars to preserve both sentences without cutting mid-sentence
+    while still bounding output for pathologically long summaries.
     """
     try:
         from app.database import get_file_summary_by_path
@@ -448,7 +451,7 @@ def _get_cached_summary_for_listing(abs_path: str) -> "str | None":
             text = (getattr(row, 'short_summary', None) or "").strip() \
                 or (row.summary or "").split("\n")[0].strip()
             if text:
-                return (text[:160] + "…") if len(text) > 160 else text
+                return (text[:500] + "...") if len(text) > 500 else text
     except Exception as exc:
         logger.debug("summary lookup failed for %s: %s", abs_path, exc)
     return None
@@ -461,8 +464,8 @@ def list_directory(path: str = ".") -> str:
     Files are shown with their cached summary inline (or SUMMARY NOT AVAILABLE
     on a cache miss).  Special entries:
       - .git: shown as DIR with [PROTECTED]
-      - gitignored entries: shown with [PROTECTED — gitignored]
-      - symlinks escaping the project root: shown with [PROTECTED — symlink escapes project]
+      - gitignored entries: shown with [PROTECTED - gitignored]
+      - symlinks escaping the project root: shown with [PROTECTED - symlink escapes project]
       - .archive and LISTING_EXCLUDED_DIRS: hidden (counted in footer)
     """
     safe_path = _assert_safe_path(path)
@@ -488,7 +491,7 @@ def list_directory(path: str = ".") -> str:
     for entry, full in zip(entries, all_full_paths):
         full_real = os.path.realpath(full)
 
-        # Always hide: archive dir and excluded dirs (not .git — show it as PROTECTED)
+        # Always hide: archive dir and excluded dirs (not .git - show it as PROTECTED)
         if full_real == _archive_real:
             hidden += 1
             continue
@@ -499,7 +502,7 @@ def list_directory(path: str = ".") -> str:
         is_dir = os.path.isdir(full)
         kind = "DIR " if is_dir else "FILE"
 
-        # .git — show as PROTECTED
+        # .git - show as PROTECTED
         if full_real == git_dir:
             lines.append(f"{kind}  {entry}/  [PROTECTED]")
             continue
@@ -507,13 +510,13 @@ def list_directory(path: str = ".") -> str:
         # Gitignored
         if full in ignored_set:
             suffix = "/" if is_dir else ""
-            lines.append(f"{kind}  {entry}{suffix}  [PROTECTED — gitignored]")
+            lines.append(f"{kind}  {entry}{suffix}  [PROTECTED - gitignored]")
             continue
 
         # Symlink escaping project
         if _is_symlink_escaping(full, root_real):
             target = os.readlink(full) if os.path.islink(full) else "?"
-            lines.append(f"{kind}  {entry} → {target}  [PROTECTED — symlink escapes project]")
+            lines.append(f"{kind}  {entry} -> {target}  [PROTECTED - symlink escapes project]")
             continue
 
         # Normal directory
@@ -521,13 +524,13 @@ def list_directory(path: str = ".") -> str:
             lines.append(f"{kind}  {entry}/")
             continue
 
-        # Normal file — show with summary
+        # Normal file - show with summary
         summary = _get_cached_summary_for_listing(full)
         if summary is not None:
-            lines.append(f"{kind}  {entry}  — {summary}")
+            lines.append(f"{kind}  {entry}  - {summary}")
         else:
             logger.debug("list_directory: no cached summary for %s", full)
-            lines.append(f"{kind}  {entry}  — (SUMMARY NOT AVAILABLE)")
+            lines.append(f"{kind}  {entry}  - (SUMMARY NOT AVAILABLE)")
 
     result = "\n".join(lines) if lines else "(empty directory)"
     if hidden:
@@ -603,7 +606,7 @@ def read_file_harder(
     """Read up to 250 source-code lines per call, never repeating lines already in context.
 
     Omit start/end/count to get the next 250 unserved lines from line 1 forward.
-    Provide start (+ optionally end or count) to target a specific range — only the
+    Provide start (+ optionally end or count) to target a specific range - only the
     unserved portion of that range is returned, capped at 250 lines.
 
     If read_file() has not been called first, it is called automatically.
@@ -695,9 +698,9 @@ def archive_file(path: str, reason: str = "") -> str:
 
     Safety guarantees:
     - NEVER calls shutil.rmtree, os.remove, os.unlink, or any destructive primitive.
-    - HARD REJECTS paths inside .git — the repository must never be touched.
-    - HARD REJECTS paths already inside ARCHIVE_DIR — cannot re-archive.
-    - HARD REJECTS paths outside PROJECT_ROOT — no cross-project accidents.
+    - HARD REJECTS paths inside .git - the repository must never be touched.
+    - HARD REJECTS paths already inside ARCHIVE_DIR - cannot re-archive.
+    - HARD REJECTS paths outside PROJECT_ROOT - no cross-project accidents.
 
     Undelete support:
     - If the target path does not exist but was previously archived, returns
@@ -714,11 +717,11 @@ def archive_file(path: str, reason: str = "") -> str:
     rel_path = os.path.relpath(safe_path, root_real)
 
     if not os.path.exists(safe_path):
-        # Check if this path was previously archived — emit undelete guide
+        # Check if this path was previously archived - emit undelete guide
         archived = _find_archived_copies(rel_path)
         if archived:
             lines = [
-                f"ERROR: '{path}' does not exist — it was previously archived.",
+                f"ERROR: '{path}' does not exist - it was previously archived.",
                 "",
                 "Archived copies found (most recent first):",
             ]
@@ -735,7 +738,7 @@ def archive_file(path: str, reason: str = "") -> str:
                 f'shutil.copytree(r\\"{archived[0]}\\", r\\"{safe_path}\\")"\')',
             ]
             return "\n".join(lines)
-        return f"ERROR: '{path}' does not exist — nothing to archive."
+        return f"ERROR: '{path}' does not exist - nothing to archive."
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     dest = os.path.join(ARCHIVE_DIR, timestamp, rel_path)
@@ -744,9 +747,9 @@ def archive_file(path: str, reason: str = "") -> str:
     try:
         shutil.move(safe_path, dest)
     except OSError as exc:
-        logger.error("archive_file: failed to move %s → %s: %s", safe_path, dest, exc)
+        logger.error("archive_file: failed to move %s -> %s: %s", safe_path, dest, exc)
         return f"ERROR: could not archive '{path}': {exc}"
-    logger.info("Archived %s → %s", safe_path, dest)
+    logger.info("Archived %s -> %s", safe_path, dest)
 
     if reason:
         reason_file = dest + "._reason.txt"
@@ -757,7 +760,7 @@ def archive_file(path: str, reason: str = "") -> str:
         f'python -c "import shutil; shutil.copy(r\\"{dest}\\", r\\"{safe_path}\\")"'
     )
     return (
-        f"OK: archived '{path}' → '{dest}'.\n"
+        f"OK: archived '{path}' -> '{dest}'.\n"
         f"Restore with: run_shell('{restore_cmd}')"
     )
 
@@ -766,7 +769,7 @@ def archive_file(path: str, reason: str = "") -> str:
 # Restricted shell
 # ---------------------------------------------------------------------------
 
-# INTERNAL ONLY — not in TOOL_SCHEMAS. LLMs cannot call this.
+# INTERNAL ONLY - not in TOOL_SCHEMAS. LLMs cannot call this.
 def run_shell(command: str, working_dir: str = ".") -> str:
     """
     Execute a shell command with safety restrictions.
@@ -844,13 +847,13 @@ def _is_inside_maestro_repo(path: str) -> bool:
 
 def _git_run(args: list[str], cwd: str | None = None) -> tuple[int, str, str]:
     """
-    Internal helper — run a git command, return (returncode, stdout, stderr).
+    Internal helper - run a git command, return (returncode, stdout, stderr).
 
     Working directory resolution order:
-      1. Explicit ``cwd`` argument (rare — used by internal callers that already
+      1. Explicit ``cwd`` argument (rare - used by internal callers that already
          know the path, e.g. write_file staging).
       2. The per-task context set via ``set_task_git_cwd()``.
-      3. Hard error — no fallback to TheMaestro's own repo.
+      3. Hard error - no fallback to TheMaestro's own repo.
 
     Hard safety rail: any git operation whose resolved working directory falls
     inside TheMaestro's own git repository is unconditionally blocked.  The
@@ -919,7 +922,7 @@ def git_diff(path: str | None = None) -> str:
 def git_log(path: str | None = None, max_count: int = 20) -> str:
     """
     Return recent git log entries. Optionally scoped to a specific file path.
-    Read-only operation — safe for research agents.
+    Read-only operation - safe for research agents.
     """
     max_count = min(max(1, max_count), TOOL_MAX_GIT_LOG_ENTRIES)
     args = ["git", "log", f"--max-count={max_count}",
@@ -940,7 +943,7 @@ def git_log(path: str | None = None, max_count: int = 20) -> str:
 def git_blame(path: str) -> str:
     """
     Return git blame output for a file, showing last-modified info per line.
-    Read-only operation — safe for research agents.
+    Read-only operation - safe for research agents.
     """
     try:
         safe_path = _assert_safe_path(path)
@@ -958,7 +961,7 @@ def git_show(ref: str, path: str | None = None) -> str:
     """
     Show a file's content at a specific git commit/ref, or show full commit
     details (message + diffstat) when no path is given.
-    Read-only operation — safe for research agents.
+    Read-only operation - safe for research agents.
     """
     # Validate ref: only allow safe characters
     if not re.match(r'^[A-Za-z0-9\-_./~^@]+$', ref):
@@ -1003,7 +1006,7 @@ def git_commit(message: str) -> str:
     rc, out, err = _git_run(["git", "commit", "-m", message])
     if rc != 0:
         if "nothing to commit" in err or "nothing to commit" in out:
-            return "OK: nothing to commit — working tree clean."
+            return "OK: nothing to commit - working tree clean."
         return f"ERROR: git commit failed: {err}"
     return f"OK: committed.\n{out}"
 
@@ -1031,7 +1034,7 @@ def git_checkout(branch: str) -> str:
 
 def _import_db():
     """Lazy import of database functions to avoid circular import at load time."""
-    # The database module lives at app/database.py — add app dir to path if needed
+    # The database module lives at app/database.py - add app dir to path if needed
     app_dir = os.path.join(PROJECT_ROOT, "app")
     if app_dir not in sys.path:
         sys.path.insert(0, app_dir)
@@ -1040,7 +1043,7 @@ def _import_db():
 
 
 # ---------------------------------------------------------------------------
-# Planning tools (pure computation — no I/O, safe for any agent)
+# Planning tools (pure computation - no I/O, safe for any agent)
 # ---------------------------------------------------------------------------
 
 def generate_architecture_doc(title: str, components: list, relationships: list) -> str:
@@ -1213,6 +1216,9 @@ def web_search(query: str, count: int = 5) -> str:
     Returns a JSON string of results with titles, URLs, and snippets.
     Uses SearchCache to avoid redundant API calls for identical queries.
     """
+    if is_shutting_down():
+        raise ShutdownError("Server is shutting down")
+
     import json as _json
     from app.database import get_search_cache, create_search_cache
     from app.agent.config import BRAVE_API_KEY, SEARCH_PROVIDER
@@ -1224,18 +1230,18 @@ def web_search(query: str, count: int = 5) -> str:
         logger.info("Search Cache HIT for query: '%s'", q)
         return cached.result_json
 
-    # 2. Cache miss — call the selected search provider
+    # 2. Cache miss - call the selected search provider
     provider = SEARCH_PROVIDER.lower()
     search_results = []
 
     try:
         if provider == "duckduckgo":
-            logger.info("Search Cache MISS for query: '%s' — calling DuckDuckGo", q)
+            logger.info("Search Cache MISS for query: '%s' - calling DuckDuckGo", q)
             search_results = _ddg_search(q, count)
         elif provider == "brave":
             if not BRAVE_API_KEY:
                 return "ERROR: BRAVE_API_KEY not set but search_provider='brave'. Web search is unavailable."
-            logger.info("Search Cache MISS for query: '%s' — calling Brave Search API", q)
+            logger.info("Search Cache MISS for query: '%s' - calling Brave Search API", q)
             search_results = _brave_search(q, count, BRAVE_API_KEY)
         else:
             return f"ERROR: Unknown search_provider '{provider}'. Supported: duckduckgo, brave."
@@ -1292,6 +1298,9 @@ def web_fetch(url: str) -> str:
     Fetch the content of a URL and return a text-only summary.
     Strips HTML tags, scripts, and styles.
     """
+    if is_shutting_down():
+        raise ShutdownError("Server is shutting down")
+
     import httpx
     from bs4 import BeautifulSoup
 
@@ -1327,7 +1336,7 @@ def web_fetch(url: str) -> str:
 
 def spawn_research_agent(question: str, context: str = "") -> str:
     """
-    Placeholder for synchronous dispatch — the actual async version is in
+    Placeholder for synchronous dispatch - the actual async version is in
     async_dispatch_tool(). When called synchronously, returns an error
     directing the caller to use the async path.
     """
@@ -1397,7 +1406,7 @@ def list_tasks(project: str, column: str | None = None) -> str:
 def update_task_status(task_id: str, new_status: str) -> str:
     """
     Advance a task through the Kanban pipeline.
-    Valid transitions: PENDING→ACTIVE→VERIFYING→ACCEPTED / REJECTED.
+    Valid transitions: PENDING->ACTIVE->VERIFYING->ACCEPTED / REJECTED.
     Maps agent status names to Kanban column types.
     """
     STATUS_TO_TYPE = {
@@ -1564,8 +1573,8 @@ TOOL_SCHEMAS: list[dict] = [
             "description": (
                 "First call: returns a natural-language summary (LLM-generated, cached) plus "
                 "structural analysis: classes, functions, imports, and line ranges. "
-                "For tiny files (≤ 25 lines) embeds raw content directly. "
-                "Each subsequent call on the same file serves the next 250 unserved source lines — "
+                "For tiny files (<= 25 lines) embeds raw content directly. "
+                "Each subsequent call on the same file serves the next 250 unserved source lines - "
                 "never repeating lines already in context. "
                 "Call repeatedly to page through a file, or use read_file_harder() for a specific range."
             ),
@@ -1585,7 +1594,7 @@ TOOL_SCHEMAS: list[dict] = [
             "description": (
                 "Read up to 250 source-code lines per call, never repeating lines already in context. "
                 "Omit start/end/count to get the next 250 unserved lines from line 1 forward. "
-                "Provide start (+ optionally end or count) to target a specific range — only the "
+                "Provide start (+ optionally end or count) to target a specific range - only the "
                 "unserved portion of that range is returned. "
                 "If read_file() has not been called first, it is called automatically."
             ),
@@ -1907,7 +1916,7 @@ TOOL_SCHEMAS: list[dict] = [
             "name": "generate_architecture_doc",
             "description": (
                 "Produce a structured markdown architecture document from components and relationships. "
-                "Pure computation — stays in agent context, NOT written to disk."
+                "Pure computation - stays in agent context, NOT written to disk."
             ),
             "parameters": {
                 "type": "object",
@@ -2002,17 +2011,17 @@ TOOL_SCHEMAS: list[dict] = [
             "description": (
                 "Record a before/after profiling benchmark for an optimization sub-task. "
                 "Call with benchmark_type='before' before making changes, and 'after' when done. "
-                "Run actual timed benchmarks using run_shell before recording — do NOT estimate. "
+                "Run actual timed benchmarks using run_shell before recording - do NOT estimate. "
                 "metrics must be a JSON string with the following keys: "
-                "test_duration_ms (float, required) — measured wall time in ms for scale_n items; "
-                "memory_peak_mb (float, required) — peak RSS during benchmark in MB; "
-                "complexity_score (int, required) — subjective 0-100 code complexity estimate; "
-                "big_o_class (str) — Big O of the critical path: O(1), O(log n), O(n), O(n log n), O(n^2), O(n^3), O(2^n), O(n!); "
-                "scale_n (int) — N used in the synthetic benchmark run; "
-                "readability_cost (float) — 0.0 (no cost) to 1.0 (very hard to understand); "
-                "is_premature (bool) — true if optimizing a non-bottleneck; "
-                "tech_debt_resolved (bool) — true if this consolidates or resolves known tech debt; "
-                "notes (str) — qualitative notes (optional)."
+                "test_duration_ms (float, required) - measured wall time in ms for scale_n items; "
+                "memory_peak_mb (float, required) - peak RSS during benchmark in MB; "
+                "complexity_score (int, required) - subjective 0-100 code complexity estimate; "
+                "big_o_class (str) - Big O of the critical path: O(1), O(log n), O(n), O(n log n), O(n^2), O(n^3), O(2^n), O(n!); "
+                "scale_n (int) - N used in the synthetic benchmark run; "
+                "readability_cost (float) - 0.0 (no cost) to 1.0 (very hard to understand); "
+                "is_premature (bool) - true if optimizing a non-bottleneck; "
+                "tech_debt_resolved (bool) - true if this consolidates or resolves known tech debt; "
+                "notes (str) - qualitative notes (optional)."
             ),
             "parameters": {
                 "type": "object",
@@ -2187,7 +2196,7 @@ async def async_dispatch_tool(
             return f"ERROR: '{path}' is not a file or does not exist."
         norm_path = os.path.normpath(os.path.realpath(safe_path))
         from app.agent.project_snapshot import _count_file_lines, async_build_file_summary
-        # Subsequent call — serve the next unserved 250-line chunk
+        # Subsequent call - serve the next unserved 250-line chunk
         if norm_path in _get_prepped_files():
             total = _count_file_lines(safe_path)
             unserved = _next_unserved_range(norm_path, 1, total)
@@ -2199,7 +2208,7 @@ async def async_dispatch_tool(
                     f"Call read_file_harder('{rel}', start=N) for a specific range."
                 )
             return _serve_file_lines(safe_path, unserved[0], unserved[1])
-        # First call — LLM-enriched structural summary
+        # First call - LLM-enriched structural summary
         _mark_file_prepped(safe_path)
         if _count_file_lines(safe_path) <= 25:
             result = _inline_small_file(safe_path)
@@ -2227,7 +2236,7 @@ async def async_dispatch_tool(
                 from app.database import get_file_summary_by_path
                 row = get_file_summary_by_path(p)
                 if row:
-                    # Prefer short_summary as the change-context hint — it's
+                    # Prefer short_summary as the change-context hint - it's
                     # concise and purpose-built for this kind of diff prompt.
                     old_summary = (getattr(row, 'short_summary', None) or "").strip() \
                         or row.summary
@@ -2304,5 +2313,5 @@ async def async_dispatch_tool(
         except Exception as exc:
             return f"ERROR: agentic web_search failed: {exc}"
 
-    # All other tools — synchronous
+    # All other tools - synchronous
     return dispatch_tool(name, arguments)

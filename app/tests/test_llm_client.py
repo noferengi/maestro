@@ -3,7 +3,7 @@ Unit tests for app/agent/llm_client.py.
 
 Covers call_llm() argument enforcement, HTTP payload construction,
 token accounting, and the best-effort budget logging path.
-All tests mock httpx.AsyncClient — no real HTTP calls are made.
+All tests mock httpx.AsyncClient - no real HTTP calls are made.
 """
 
 import asyncio
@@ -260,7 +260,7 @@ class TestBudgetLogging:
 
 class TestHttpErrors:
     def test_http_4xx_raises_http_status_error(self):
-        """4xx errors propagate immediately — call_llm does NOT retry client errors."""
+        """4xx errors propagate immediately - call_llm does NOT retry client errors."""
         from app.agent.llm_client import call_llm
 
         mock_cls, _ = _make_mock_client(_mock_http_response({}, status=422))
@@ -303,5 +303,5 @@ class TestBudgetLoggingFailure:
             with patch("app.database.create_budget_entry", exploding_create):
                 result = _run(call_llm(_messages(), llm_id=1, budget_id=1))
 
-        # Budget entry failure must not surface — call_llm must still return result
+        # Budget entry failure must not surface - call_llm must still return result
         assert result == body

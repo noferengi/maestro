@@ -1,7 +1,7 @@
 """
 Tests for the merge pipeline (app/agent/merge.py).
 
-All git and subprocess calls are mocked — no real git operations.
+All git and subprocess calls are mocked - no real git operations.
 """
 
 import os

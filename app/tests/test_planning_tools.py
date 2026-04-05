@@ -24,7 +24,7 @@ from app.agent.tools import (
 def isolated_project(tmp_path_factory):
     """
     Redirect all tool file I/O to a temp git repo.
-    Runs once per module — git init is a subprocess and ~50ms per call,
+    Runs once per module - git init is a subprocess and ~50ms per call,
     so amortising it across all tests in the file saves ~400ms.
     """
     tmp_path = tmp_path_factory.mktemp("planning_tools_project")

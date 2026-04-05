@@ -114,6 +114,7 @@ from .crud_tasks import (
     get_active_child_tasks,
     count_total_sub_ideas,
     get_descendant_tree,
+    task_to_dict,
 )
 
 # Project CRUD
@@ -142,6 +143,8 @@ from .crud_infra import (
     create_compute_node,
     update_compute_node,
     delete_compute_node,
+    llm_to_dict,
+    budget_to_dict,
 )
 
 # BudgetEntry + Expense + budget math
@@ -167,6 +170,8 @@ from .crud_pipeline import (
     update_subdivision_record,
     create_planning_result,
     get_planning_result,
+    get_latest_planning_result,
+    supersede_planning_results,
     update_planning_result,
     create_component_result,
     get_component_results,
@@ -245,7 +250,7 @@ __all__ = [
     "get_all_tasks", "update_task", "batch_update_map_positions", "delete_task",
     "get_task_history", "append_task_history", "reorder_tasks", "batch_reorder_tasks",
     "set_big_idea_flag", "get_child_tasks", "get_active_child_tasks",
-    "count_total_sub_ideas", "get_descendant_tree",
+    "count_total_sub_ideas", "get_descendant_tree", "task_to_dict",
     # crud_projects
     "get_all_projects", "get_project", "get_project_path", "upsert_project", "delete_project",
     # crud_infra
@@ -253,6 +258,7 @@ __all__ = [
     "get_all_budgets", "get_budget", "create_budget", "update_budget", "delete_budget",
     "get_all_compute_nodes", "get_compute_node", "create_compute_node",
     "update_compute_node", "delete_compute_node",
+    "llm_to_dict", "budget_to_dict",
     # crud_costs
     "create_budget_entry", "get_budget_entries", "get_budget_entry",
     "create_expense", "get_budget_spent_microcents", "get_budget_remaining_microcents",
@@ -261,7 +267,8 @@ __all__ = [
     "create_transition_vote", "get_transition_votes",
     "create_transition_result", "get_transition_results",
     "create_subdivision_record", "get_subdivision_records", "update_subdivision_record",
-    "create_planning_result", "get_planning_result", "update_planning_result",
+    "create_planning_result", "get_planning_result", "get_latest_planning_result",
+    "supersede_planning_results", "update_planning_result",
     "create_component_result", "get_component_results", "update_component_result",
     "create_optimization_result", "get_optimization_result", "update_optimization_result",
     "create_security_review_result", "get_security_review_results", "update_security_review_result",

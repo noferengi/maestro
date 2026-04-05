@@ -80,10 +80,16 @@ async def lifespan(app: FastAPI):
     upsert_project("TheMaestro")
     from app.agent.scheduler import start_scheduler
     start_scheduler()
-    yield
-    # --- shutdown ---
-    from app.agent.scheduler import stop_scheduler
-    stop_scheduler()
+    try:
+        yield
+    finally:
+        # --- shutdown ---
+        # Use try/finally so this runs even when uvicorn cancels the lifespan
+        # task with CancelledError (e.g. Ctrl-C while a background task is active).
+        from app.agent.llm_client import signal_shutdown
+        signal_shutdown()
+        from app.agent.scheduler import stop_scheduler
+        stop_scheduler(timeout=60.0)
 
 
 app = FastAPI(title="Kanban Board API", lifespan=lifespan)
@@ -831,67 +837,100 @@ def _run_intake_pipeline(task_id: str) -> None:
 @_pipeline_session
 def _run_planning_pipeline_bg(task_id: str) -> None:
     """Background runner for the planning pipeline."""
+    import asyncio
+    from app.agent.planning import run_planning_pipeline
+    from app.agent.planning_gate import run_planning_gate
+    from app.database import (
+        supersede_planning_results, create_planning_result, update_planning_result,
+    )
+    from app.database.session import SessionLocal as _SL
+
+    task = get_task(task_id)
+    if not task:
+        return
+    project_path = _setup_thread_context(task)
+
+    llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
+    all_tasks = [task_to_dict(t) for t in get_all_tasks()]
+
+    # Lifecycle: supersede any stale active/in_progress rows, then create a
+    # fresh in_progress row so the Stage Journal can show "Pipeline running…"
+    # immediately rather than displaying the old stale result.
+    supersede_planning_results(task_id)
+    in_prog = create_planning_result(task_id, status='in_progress')
+    run_row_id = in_prog.id if in_prog else None
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        import asyncio
-        from app.agent.planning import run_planning_pipeline
-        from app.agent.planning_gate import run_planning_gate
+        # Run planning pipeline — _store_result inside will update run_row_id
+        # row to status='active' on success.
+        result = loop.run_until_complete(
+            run_planning_pipeline(
+                task_id=task_id,
+                task_title=task.title,
+                task_description=task.description or "",
+                all_tasks=all_tasks,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                llm_id=task.llm_id,
+                budget_id=task.budget_id,
+                max_context=max_context,
+                project_path=project_path,
+                run_row_id=run_row_id,
+            )
+        )
 
-        task = get_task(task_id)
-        if not task:
-            return
-        project_path = _setup_thread_context(task)
+        # Store transition result
+        _store_pipeline_result_generic(task_id, result, task.budget_id, "planning_to_indev")
 
-        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
-        all_tasks = [task_to_dict(t) for t in get_all_tasks()]
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            # Run planning pipeline
-            result = loop.run_until_complete(
-                run_planning_pipeline(
+        if result.get("outcome") == "passed":
+            # Run planning gate
+            gate_result = loop.run_until_complete(
+                run_planning_gate(
                     task_id=task_id,
-                    task_title=task.title,
-                    task_description=task.description or "",
+                    planning_result=result,
                     all_tasks=all_tasks,
+                    max_context=max_context,
                     llm_base_url=llm_base_url,
                     llm_model=llm_model,
                     llm_id=task.llm_id,
                     budget_id=task.budget_id,
-                    max_context=max_context,
                     project_path=project_path,
                 )
             )
-
-            # Store transition result
-            _store_pipeline_result_generic(task_id, result, task.budget_id, "planning_to_indev")
-
-            if result.get("outcome") == "passed":
-                # Run planning gate
-                gate_result = loop.run_until_complete(
-                    run_planning_gate(
-                        task_id=task_id,
-                        planning_result=result,
-                        all_tasks=all_tasks,
-                        max_context=max_context,
-                        llm_base_url=llm_base_url,
-                        llm_model=llm_model,
-                        llm_id=task.llm_id,
-                        budget_id=task.budget_id,
-                        project_path=project_path,
-                    )
-                )
-                if gate_result.get("passed"):
-                    update_task(task_id, type="indev")
-                    logger.info("[planning] Task '%s' advanced to IN DEV.", task_id)
-                else:
-                    logger.warning("[planning] Task '%s' failed planning gate.", task_id)
+            # Persist gate check details so the UI can surface why a gate failed
+            pr_row = get_planning_result(task_id)
+            if pr_row:
+                _db = _SL()
+                try:
+                    update_planning_result(_db, pr_row.id,
+                                           gate_checks=json.dumps(gate_result.get("checks", [])))
+                finally:
+                    _db.close()
+            if gate_result.get("passed"):
+                update_task(task_id, type="indev")
+                logger.info("[planning] Task '%s' advanced to IN DEV.", task_id)
             else:
-                logger.info("[planning] Task '%s' planning result: %s", task_id, result.get('outcome'))
-        finally:
-            loop.close()
+                logger.warning("[planning] Task '%s' failed planning gate.", task_id)
+        else:
+            logger.info("[planning] Task '%s' planning result: %s", task_id, result.get('outcome'))
     except Exception as exc:
+        # Write the failure reason into the in_progress row so the Stage Journal
+        # shows "run failed: <reason>" instead of the old stale result.
+        if run_row_id is not None:
+            _db = _SL()
+            try:
+                update_planning_result(
+                    _db, run_row_id,
+                    status='failed',
+                    error_message=str(exc)[:1000],
+                )
+            finally:
+                _db.close()
         logger.exception("[planning] Pipeline for '%s' failed.", task_id)
+    finally:
+        loop.close()
 
 
 @_pipeline_session
@@ -920,6 +959,9 @@ def _run_dev_orchestrator_bg(task_id: str) -> None:
             "dependency_graph": json.loads(planning_result_obj.dependency_graph or "{}"),
             "interface_contracts": json.loads(planning_result_obj.interface_contracts or "[]"),
             "test_strategy": json.loads(planning_result_obj.test_strategy or "[]"),
+            "design_rationale": planning_result_obj.codebase_survey or "",
+            "pitfalls_identified": json.loads(planning_result_obj.pitfalls_identified or "[]"),
+            "review_votes": json.loads(planning_result_obj.review_votes or "[]"),
         }
 
         llm_record = get_llm(task.llm_id) if task.llm_id else None
@@ -1380,19 +1422,252 @@ def get_transition_status(task_id: str):
 
 @app.get("/api/tasks/{task_id}/planning-result", response_model=dict)
 def get_task_planning_result(task_id: str):
-    """Get the planning result for a task."""
-    result = get_planning_result(task_id)
+    """Get the planning result for a task.
+
+    Returns the most-recent row regardless of status so the Stage Journal
+    can display in_progress and failed states, not just completed ones.
+    """
+    from app.database import get_latest_planning_result
+    result = get_latest_planning_result(task_id)
     if not result:
         raise HTTPException(status_code=404, detail="No planning result found")
+    # Short-circuit for non-terminal states
+    if result.status == 'in_progress':
+        return {"status": "in_progress", "task_id": task_id}
+    if result.status == 'failed':
+        return {
+            "status": "failed",
+            "task_id": task_id,
+            "error_message": result.error_message or "Unknown error",
+        }
+    gate_checks = json.loads(result.gate_checks) if result.gate_checks else None
     return {
         "id": result.id, "task_id": result.task_id,
-        "file_manifest": json.loads(result.file_manifest) if result.file_manifest else None,
-        "dependency_graph": json.loads(result.dependency_graph) if result.dependency_graph else None,
-        "implementation_steps": json.loads(result.implementation_steps) if result.implementation_steps else None,
+        "design_rationale": json.loads(result.codebase_survey)
+            if result.codebase_survey and result.codebase_survey.startswith('[') else result.codebase_survey,
+        "file_manifest": json.loads(result.file_manifest) if result.file_manifest else [],
+        "dependency_graph": json.loads(result.dependency_graph) if result.dependency_graph else {},
+        "interface_contracts": json.loads(result.interface_contracts) if result.interface_contracts else [],
+        "test_strategy": json.loads(result.test_strategy) if result.test_strategy else [],
+        "implementation_steps": json.loads(result.implementation_steps) if result.implementation_steps else [],
+        "pitfalls_identified": json.loads(result.pitfalls_identified) if result.pitfalls_identified else [],
+        "review_votes": json.loads(result.review_votes) if result.review_votes else [],
+        "gate_checks": gate_checks,
+        "gate_passed": (len([c for c in gate_checks if not c.get("passed") and c.get("hard_fail")]) == 0)
+                       if gate_checks is not None else None,
         "confidence": result.confidence,
         "selected_design_index": result.selected_design_index,
         "status": result.status,
         "created_at": result.created_at.isoformat() if result.created_at else None,
+    }
+
+
+@app.get("/api/tasks/{task_id}/stage-summary", response_model=dict)
+def get_task_stage_summary(task_id: str):
+    """Compact per-stage status summary for the card footer."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    _verdict_order = ["REJECTED", "NOT_SUITABLE", "NEEDS_RESEARCH", "POSSIBLE", "LIKELY"]
+
+    summary = {
+        "task_id": task_id,
+        "current_stage": task.type,
+        "planning": {"has_result": False},
+        "components": {"total": 0, "done": 0, "pending": 0, "failed": 0, "failing": [], "files_changed": 0},
+        "optimization": {"has_result": False, "outcome": None, "improvement_summary": None},
+        "security": {"has_result": False, "worst_verdict": None, "critical_count": 0, "high_count": 0},
+        "full_review": {"has_result": False, "worst_verdict": None},
+        "merge": {"status": None, "branch_name": None},
+        "blocking_issue": None,
+    }
+
+    # Planning result
+    pr = get_planning_result(task_id)
+    if pr:
+        fm = json.loads(pr.file_manifest or "[]")
+        steps = json.loads(pr.implementation_steps or "[]")
+        gate_checks = json.loads(pr.gate_checks) if pr.gate_checks else None
+        gate_passed = None
+        gate_failing = []
+        if gate_checks is not None:
+            gate_failing = [c["name"] for c in gate_checks if not c.get("passed") and c.get("hard_fail")]
+            gate_passed = len(gate_failing) == 0
+        summary["planning"] = {
+            "has_result": True,
+            "file_count": len(fm),
+            "step_count": len(steps),
+            "confidence": pr.confidence or 0,
+            "gate_passed": gate_passed,
+            "gate_failing_checks": gate_failing,
+        }
+
+    # Component results
+    comps = get_component_results(task_id)
+    if comps:
+        done = sum(1 for c in comps if c.status == "done")
+        failed = sum(1 for c in comps if c.status == "failed")
+        pending = sum(1 for c in comps if c.status in ("pending", "running"))
+        failing_names = [c.component_name for c in comps if c.status == "failed"][:3]
+        files_changed = sum(len(json.loads(c.files_changed or "[]")) for c in comps)
+        summary["components"] = {
+            "total": len(comps),
+            "done": done,
+            "pending": pending,
+            "failed": failed,
+            "failing": failing_names,
+            "files_changed": files_changed,
+        }
+
+    # Optimization result
+    opt = get_optimization_result(task_id)
+    if opt:
+        summary["optimization"] = {
+            "has_result": True,
+            "outcome": opt.outcome,
+            "improvement_summary": opt.improvement_summary,
+        }
+
+    # Security reviews
+    sec = get_security_review_results(task_id)
+    if sec:
+        verdicts = [s.verdict for s in sec]
+        worst = next((v for v in _verdict_order if v in verdicts), None)
+        summary["security"] = {
+            "has_result": True,
+            "worst_verdict": worst,
+            "critical_count": sum(s.critical_count or 0 for s in sec),
+            "high_count": sum(s.high_count or 0 for s in sec),
+        }
+
+    # Full review
+    fr = get_full_review_results(task_id)
+    if fr:
+        verdicts = [r.verdict for r in fr]
+        worst = next((v for v in _verdict_order if v in verdicts), None)
+        summary["full_review"] = {"has_result": True, "worst_verdict": worst}
+
+    # Merge record
+    mr = get_merge_record(task_id)
+    if mr:
+        summary["merge"] = {"status": mr.status, "branch_name": mr.branch_name}
+
+    # Compute blocking_issue
+    stage = task.type
+    if stage == "planning" and summary["planning"].get("has_result"):
+        if summary["planning"].get("gate_passed") is False:
+            failing = summary["planning"].get("gate_failing_checks", [])
+            summary["blocking_issue"] = f"gate: {', '.join(failing)}" if failing else "gate failed"
+    elif stage == "indev" and summary["components"]["failed"] > 0:
+        failing = summary["components"]["failing"]
+        summary["blocking_issue"] = f"failed: {failing[0]}" if failing else "component failed"
+    elif stage == "security" and summary["security"]["has_result"]:
+        if summary["security"]["worst_verdict"] in ("REJECTED", "NOT_SUITABLE"):
+            c = summary["security"]["critical_count"]
+            summary["blocking_issue"] = f"security {summary['security']['worst_verdict']}" + (f" · {c} critical" if c else "")
+    elif stage == "full_review" and summary["full_review"]["has_result"]:
+        if summary["full_review"]["worst_verdict"] in ("REJECTED", "NOT_SUITABLE"):
+            summary["blocking_issue"] = f"review {summary['full_review']['worst_verdict']}"
+
+    return summary
+
+
+@app.get("/api/tasks/{task_id}/diff", response_model=dict)
+def get_task_diff(task_id: str, max_bytes: int = 65536):
+    """Return the git diff for all changes made on the task's branch.
+
+    For in-progress tasks (INDEV → FULL_REVIEW): diffs the task branch
+    against the project's main/master.
+    For completed/merged tasks: diffs the merge commit against its parent.
+
+    max_bytes caps the returned diff to avoid huge payloads (default 64 KiB).
+    """
+    import subprocess
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    from app.database import get_project_path
+    project_path = get_project_path(task.project) if task.project else None
+    if not project_path:
+        raise HTTPException(status_code=422, detail="Task has no associated project path")
+
+    from app.agent.config import GIT_SAFETY_BRANCH_PREFIX
+    branch = f"{GIT_SAFETY_BRANCH_PREFIX}{task_id}"
+
+    def _run(*args, cwd=None):
+        result = subprocess.run(
+            args, cwd=cwd or project_path,
+            capture_output=True, text=True, timeout=15
+        )
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+    # Determine base branch (main or master)
+    rc, out, _ = _run("git", "rev-parse", "--verify", "main")
+    base_branch = "main" if rc == 0 else "master"
+
+    # Check if the task branch exists locally
+    rc_branch, _, _ = _run("git", "rev-parse", "--verify", branch)
+    branch_exists = rc_branch == 0
+
+    # Check for a merge commit in merge_records
+    mr = get_merge_record(task_id)
+    merge_sha = mr.merge_commit_sha if mr else None
+
+    method = None
+    diff_text = ""
+    stat_text = ""
+    base_ref = None
+    head_ref = None
+
+    if branch_exists:
+        # Branch still exists — diff it against base
+        method = "branch"
+        base_ref = base_branch
+        head_ref = branch
+        rc, diff_text, err = _run("git", "diff", f"{base_branch}...{branch}")
+        if rc != 0:
+            # Fallback: try two-dot diff
+            rc, diff_text, err = _run("git", "diff", f"{base_branch}..{branch}")
+        rc2, stat_text, _ = _run("git", "diff", "--stat", f"{base_branch}...{branch}")
+    elif merge_sha:
+        # Branch was merged — show the merge commit
+        method = "merge_commit"
+        base_ref = f"{merge_sha}^1"
+        head_ref = merge_sha
+        rc, diff_text, err = _run("git", "diff", f"{merge_sha}^1", merge_sha)
+        rc2, stat_text, _ = _run("git", "diff", "--stat", f"{merge_sha}^1", merge_sha)
+    else:
+        return {
+            "task_id": task_id,
+            "branch": branch,
+            "method": None,
+            "diff": "",
+            "stat": "",
+            "error": "No task branch found and no merge commit recorded. INDEV may not have started yet.",
+        }
+
+    # Truncate large diffs
+    truncated = False
+    if len(diff_text) > max_bytes:
+        diff_text = diff_text[:max_bytes]
+        # Cut at last complete line
+        last_nl = diff_text.rfind("\n")
+        if last_nl > 0:
+            diff_text = diff_text[:last_nl]
+        truncated = True
+
+    return {
+        "task_id": task_id,
+        "branch": branch,
+        "base_ref": base_ref,
+        "head_ref": head_ref,
+        "method": method,
+        "stat": stat_text,
+        "diff": diff_text,
+        "truncated": truncated,
+        "error": None,
     }
 
 
@@ -1646,6 +1921,32 @@ def activate_subdivision_record_endpoint(task_id: str, record_id: int):
 
 
 # ============================================
+# Git Diff & Branch View API Endpoints
+# ============================================
+
+@app.get("/api/tasks/{task_id}/branch", response_model=dict)
+def get_task_branch(task_id: str):
+    """Get the git branch name associated with a task.
+
+    Returns the branch name if the task has a git branch created for it,
+    otherwise returns None. This is useful for tasks in development, review,
+    or completed stages where code changes have been made.
+    """
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    from app.agent.config import GIT_SAFETY_BRANCH_PREFIX
+    branch_name = f"{GIT_SAFETY_BRANCH_PREFIX}{task_id}"
+
+    return {
+        "task_id": task_id,
+        "branch_name": branch_name,
+        "exists": branch_name  # The agent tools will validate if it exists
+    }
+
+
+# ============================================
 # Research Jobs API
 # ============================================
 
@@ -1796,6 +2097,148 @@ def get_adhoc_research_status(task_id: str, job_id: int):
         "status": job.status,
         "findings": job.findings or "",
         "verdict": job.verdict or "",
+    }
+
+
+@_pipeline_session
+def _run_adhoc_investigation(task_id: str, question: str, job_id: int) -> None:
+    """Background runner: executes an InvestigationAgent triggered from the card toolbar."""
+    import asyncio
+    from app.agent.research import run_investigation
+    from app.database import get_project_path as _get_project_path
+
+    _ADHOC_RESEARCH_JOBS[job_id] = {"status": "running"}
+    try:
+        task = get_task(task_id)
+        if not task:
+            _ADHOC_RESEARCH_JOBS[job_id] = {"status": "failed", "error": "Task not found"}
+            update_research_job(job_id, status="failed")
+            return
+
+        _setup_thread_context(task)
+        llm_base_url, llm_model, _ = _resolve_llm_endpoint(task)
+        project_root = _get_project_path(task.project) if task.project else None
+
+        context = {
+            "task_id": task.id,
+            "task_title": task.title,
+            "task_description": task.description or "",
+            "task_type": task.type,
+            "task_project": task.project or "",
+        }
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                run_investigation(
+                    question=question,
+                    context=context,
+                    llm_base_url=llm_base_url,
+                    llm_model=llm_model,
+                    task_id=task_id,
+                    llm_id=task.llm_id,
+                    budget_id=task.budget_id,
+                    project_root=project_root,
+                )
+            )
+        finally:
+            loop.close()
+
+        report = result.report or {}
+        report_json = json.dumps(report)
+        update_research_job(
+            job_id,
+            status="completed",
+            findings=result.raw_findings or "",
+            verdict=report_json,   # store report JSON in verdict column
+            lives_used=getattr(result, "lives_used", 1),
+            prompt_tokens=getattr(result, "prompt_tokens", 0),
+            completion_tokens=getattr(result, "completion_tokens", 0),
+        )
+        _ADHOC_RESEARCH_JOBS[job_id] = {
+            "status": "completed",
+            "report": report,
+            "findings": result.raw_findings or "",
+        }
+
+        # Send inbox notification
+        answer_snippet = (report.get("answer") or "")[:200]
+        create_inbox_message(
+            subject=f"Investigation: {question[:80]}",
+            source_type="investigation",
+            task_id=task_id,
+            task_title=task.title,
+            outcome="completed",
+            data_json=json.dumps({
+                "job_id": job_id,
+                "question": question,
+                "answer": answer_snippet,
+                "key_findings": report.get("key_findings", [])[:3],
+                "recommendation": (report.get("recommendation") or "")[:200],
+            }),
+        )
+
+    except Exception as exc:
+        logger.exception("[toolbar] Ad-hoc investigation for task '%s' failed.", task_id)
+        err = str(exc)
+        update_research_job(job_id, status="failed")
+        _ADHOC_RESEARCH_JOBS[job_id] = {"status": "failed", "error": err}
+
+
+@app.post("/api/agent/investigate/{task_id}", response_model=dict)
+def start_adhoc_investigation(task_id: str, body: dict, background_tasks: BackgroundTasks):
+    """Start an ad-hoc investigation agent on a task from the card toolbar."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not task.llm_id:
+        raise HTTPException(status_code=422, detail="Task must have an LLM assigned")
+    if not task.budget_id:
+        raise HTTPException(status_code=422, detail="Task must have a budget assigned")
+
+    question = (body.get("question") or "").strip()
+    if not question:
+        raise HTTPException(status_code=422, detail="'question' is required")
+
+    job = create_research_job(
+        task_id=task_id,
+        question=question,
+        llm_id=task.llm_id,
+        budget_id=task.budget_id,
+    )
+    if not job:
+        raise HTTPException(status_code=500, detail="Failed to create investigation job")
+
+    background_tasks.add_task(_run_adhoc_investigation, task_id, question, job.id)
+    return {"job_id": job.id, "status": "queued"}
+
+
+@app.get("/api/agent/investigate/{task_id}/status", response_model=dict)
+def get_adhoc_investigation_status(task_id: str, job_id: int):
+    """Poll the status of a toolbar-triggered investigation job."""
+    in_mem = _ADHOC_RESEARCH_JOBS.get(job_id)
+    if in_mem:
+        return in_mem
+
+    job = get_research_job(job_id)
+    if not job or job.task_id != task_id:
+        raise HTTPException(status_code=404, detail="Investigation job not found")
+
+    # Attempt to parse verdict column as JSON report
+    report = {}
+    if job.verdict:
+        try:
+            parsed = json.loads(job.verdict)
+            if isinstance(parsed, dict) and "answer" in parsed:
+                report = parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    return {
+        "status": job.status,
+        "report": report,
+        "findings": job.findings or "",
     }
 
 
@@ -2716,7 +3159,7 @@ AGENT_TOOL_ACCESS: dict = {
     "ResearchAgent": {
         "description": "Lightweight read-only investigator spawned by the intake pipeline when votes need clarification. Limited lives, restricted tools.",
         "tools": [
-            "read_file", "read_file_lines", "count_lines",
+            "read_file", "read_file_harder", "count_lines",
             "search_files", "find_files", "list_directory",
             "git_status", "git_diff", "git_log", "git_blame", "git_show",
             "get_task", "list_tasks",
@@ -2733,7 +3176,7 @@ AGENT_TOOL_ACCESS: dict = {
     "SubdivisionAgent": {
         "description": "Decomposes oversized ideas into smaller sub-ideas when intake votes SUBDIVIDE_IDEA. Read-only tools, structured decomposition output.",
         "tools": [
-            "read_file", "read_file_lines", "count_lines",
+            "read_file", "read_file_harder", "count_lines",
             "search_files", "find_files", "list_directory",
             "git_status", "git_diff", "git_log", "git_blame", "git_show",
             "get_task", "list_tasks",
@@ -2761,11 +3204,11 @@ AGENT_TOOL_ACCESS: dict = {
     },
     "SecurityPipeline": {
         "description": "3 parallel security reviewer agents with veto power. Uses allowlisted security scanner shell.",
-        "tools": ["run_shell_security", "read_file", "read_file_lines", "search_files", "find_files", "list_directory"],
+        "tools": ["run_shell_security", "read_file", "read_file_harder", "search_files", "find_files", "list_directory"],
     },
     "FullReviewPipeline": {
         "description": "4-agent final review (functional, code quality, integration, UX). Uses allowlisted review runner shell.",
-        "tools": ["run_shell_review", "read_file", "read_file_lines", "search_files", "find_files", "list_directory"],
+        "tools": ["run_shell_review", "read_file", "read_file_harder", "search_files", "find_files", "list_directory"],
     },
     "MergeWorker": {
         "description": "Deterministic git merge workflow (no LLM). Verifies branch, merges --no-ff, runs test suite, pushes if configured.",

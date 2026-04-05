@@ -6,10 +6,10 @@ Intake pipeline orchestrator for the IDEA -> PLANNING task transition.
 When a task is requested to move from IDEA to PLANNING, this module coordinates
 four analysis stages to determine whether the transition should proceed:
 
-  1. Scope Analysis (LLM) — determines task scope, complexity, and decomposition.
-  2a. Static Analysis (deterministic) — tree-sitter code structure analysis.
-  2b. Feasibility Analysis (LLM) — informed by stage 2a output.
-  3. Conflict Detection (LLM) — checks against existing tasks for overlaps.
+  1. Scope Analysis (LLM) - determines task scope, complexity, and decomposition.
+  2a. Static Analysis (deterministic) - tree-sitter code structure analysis.
+  2b. Feasibility Analysis (LLM) - informed by stage 2a output.
+  3. Conflict Detection (LLM) - checks against existing tasks for overlaps.
 
 Execution order: 1 -> {2a, 3} in parallel -> 2b -> Tally.
 
@@ -41,14 +41,15 @@ from app.agent.config import (
     LLM_BASE_URL,
     LLM_MODEL,
 )
-from app.agent.llm_client import call_llm
+from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
 from app.database import get_project_path
 from app.agent.verdicts import Verdict
 
 logger = logging.getLogger(__name__)
+AGENT_NAME = "Intake Pipeline"
 
 # ---------------------------------------------------------------------------
-# Verdict constants — derived from the canonical Verdict enum so that any
+# Verdict constants - derived from the canonical Verdict enum so that any
 # future rename in verdicts.py propagates here automatically.
 # ---------------------------------------------------------------------------
 
@@ -94,10 +95,10 @@ You MUST respond with a JSON object matching this exact schema:
 Verdict guidelines:
 - LIKELY: Task is well-defined, reasonable scope, clearly feasible.
 - POSSIBLE: Task is feasible but has some ambiguity or moderate complexity.
-- NEEDS_RESEARCH: Task is too vague to assess — needs clarification before proceeding.
+- NEEDS_RESEARCH: Task is too vague to assess - needs clarification before proceeding.
 - NOT_SUITABLE: Task is poorly scoped, too large without decomposition, or architecturally questionable.
 - REJECTED: Task is fundamentally unfeasible, contradictory, or harmful to the project.
-- SUBDIVIDE_IDEA: Task is fundamentally sound but too large to implement in a single context window. Should be decomposed into smaller pieces. Only use when the task is good but genuinely too big — not vague (NEEDS_RESEARCH) or bad (REJECTED).
+- SUBDIVIDE_IDEA: Task is fundamentally sound but too large to implement in a single context window. Should be decomposed into smaller pieces. Only use when the task is good but genuinely too big - not vague (NEEDS_RESEARCH) or bad (REJECTED).
 
 Respond ONLY with the JSON object. No markdown fences, no extra text.\
 """
@@ -133,10 +134,10 @@ You MUST respond with a JSON object matching this exact schema:
 Verdict guidelines:
 - LIKELY: Codebase is ready, no major blockers, dependencies are available.
 - POSSIBLE: Feasible but some refactoring or dependency resolution needed.
-- NEEDS_RESEARCH: Cannot determine feasibility — too many unknowns.
+- NEEDS_RESEARCH: Cannot determine feasibility - too many unknowns.
 - NOT_SUITABLE: Significant architectural incompatibilities or missing foundations.
 - REJECTED: Fundamentally impossible given the current system.
-- SUBDIVIDE_IDEA: Task is fundamentally sound but too large to implement in a single context window. Should be decomposed into smaller pieces. Only use when the task is good but genuinely too big — not vague (NEEDS_RESEARCH) or bad (REJECTED).
+- SUBDIVIDE_IDEA: Task is fundamentally sound but too large to implement in a single context window. Should be decomposed into smaller pieces. Only use when the task is good but genuinely too big - not vague (NEEDS_RESEARCH) or bad (REJECTED).
 
 Respond ONLY with the JSON object. No markdown fences, no extra text.\
 """
@@ -181,7 +182,7 @@ Verdict guidelines:
 - NEEDS_RESEARCH: Potential conflicts detected but need human review to resolve.
 - NOT_SUITABLE: High-severity conflicts that would cause integration problems.
 - REJECTED: Direct contradictions with active tasks that cannot be reconciled.
-- SUBDIVIDE_IDEA: Task is fundamentally sound but too large to implement in a single context window. Should be decomposed into smaller pieces. Only use when the task is good but genuinely too big — not vague (NEEDS_RESEARCH) or bad (REJECTED).
+- SUBDIVIDE_IDEA: Task is fundamentally sound but too large to implement in a single context window. Should be decomposed into smaller pieces. Only use when the task is good but genuinely too big - not vague (NEEDS_RESEARCH) or bad (REJECTED).
 
 Respond ONLY with the JSON object. No markdown fences, no extra text.\
 """
@@ -233,6 +234,9 @@ class IntakePipeline:
 
     async def run(self) -> dict:
         """Execute the full pipeline. Returns tally result dict."""
+        if is_shutting_down():
+            raise ShutdownError("Server is shutting down")
+
         # Stage 1: Scope Analysis
         scope_vote = await self._stage_scope_analysis()
         self.votes.append(scope_vote)
@@ -256,15 +260,15 @@ class IntakePipeline:
         # Initial tally
         tally = self._build_tally()
 
-        # Handle NEEDS_RESEARCH — spawn research agents for those stages
+        # Handle NEEDS_RESEARCH - spawn research agents for those stages
         if tally["outcome"] == "needs_research":
             tally = await self._handle_needs_research(tally)
 
-        # Handle SUBDIVIDE — delegate to subdivision agent
+        # Handle SUBDIVIDE - delegate to subdivision agent
         if tally["outcome"] == "subdivide":
             tally = await self._handle_subdivide(tally)
 
-        # Handle TIE — spawn tie-breaker research agent
+        # Handle TIE - spawn tie-breaker research agent
         if tally["outcome"] == "tie":
             tally = await self._handle_tie(tally)
 
@@ -282,6 +286,9 @@ class IntakePipeline:
         logger.info("Spawning research agents for stages: %s", stages_needing_research)
 
         for stage_name in stages_needing_research:
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
+
             # Find the original vote for context
             original_vote = next(
                 (v for v in self.votes if v["stage"] == stage_name), None
@@ -312,11 +319,11 @@ class IntakePipeline:
                     project_root=get_project_path(self.project),
                 )
                 raw_verdict = research_result.vote.get("verdict", VERDICT_NOT_SUITABLE)
-                # TOO_LARGE means the task overflowed the research agent's context window —
+                # TOO_LARGE means the task overflowed the research agent's context window -
                 # treat it as SUBDIVIDE_IDEA so the pipeline routes to subdivision.
                 if raw_verdict == "TOO_LARGE":
                     logger.info(
-                        "Research agent returned TOO_LARGE for stage '%s' — routing to subdivision",
+                        "Research agent returned TOO_LARGE for stage '%s' - routing to subdivision",
                         stage_name,
                     )
                     effective_verdict = VERDICT_SUBDIVIDE_IDEA
@@ -464,13 +471,14 @@ class IntakePipeline:
             task_id=self.task_id,
             llm_id=self.llm_id,
             budget_id=self.budget_id,
+            agent_name=AGENT_NAME,
         )
 
         # Extract usage stats
         usage = data.get("usage", {})
         raw_content = data["choices"][0]["message"]["content"]
 
-        # Parse the JSON content — strip markdown fences if the model added them
+        # Parse the JSON content - strip markdown fences if the model added them
         cleaned = raw_content.strip()
         if cleaned.startswith("```"):
             # Remove ```json ... ``` wrapping
@@ -660,7 +668,7 @@ class IntakePipeline:
                 "verdict": VERDICT_POSSIBLE,
                 "confidence": 0.3,
                 "justification": "Static analysis unavailable (tree-sitter not installed). "
-                                 "Defaulting to POSSIBLE — no structural objections raised.",
+                                 "Defaulting to POSSIBLE - no structural objections raised.",
                 "raw_response": None,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
@@ -790,14 +798,14 @@ class IntakePipeline:
             "total_completion_tokens": sum(v.get("completion_tokens", 0) for v in self.votes),
         }
 
-        # Check for SUBDIVIDE_IDEA — immediate subdivision (Rule 0)
+        # Check for SUBDIVIDE_IDEA - immediate subdivision (Rule 0)
         subdivide_votes = [v for v in self.votes if v["verdict"] == VERDICT_SUBDIVIDE_IDEA]
         if subdivide_votes:
             result["outcome"] = "subdivide"
             result["summary"] = f"{len(subdivide_votes)} stage(s) voted SUBDIVIDE_IDEA."
             return result
 
-        # Check for REJECTED — immediate rejection
+        # Check for REJECTED - immediate rejection
         for v in self.votes:
             if v["verdict"] == VERDICT_REJECTED:
                 result["outcome"] = "rejected"

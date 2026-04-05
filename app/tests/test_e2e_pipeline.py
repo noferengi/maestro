@@ -2,7 +2,7 @@
 End-to-end pipeline tests.
 
 Patches at the httpx.AsyncClient layer (via MockLLM) rather than at call_llm,
-so that the full HTTP → token-tracking → budget-entry chain is exercised.
+so that the full HTTP -> token-tracking -> budget-entry chain is exercised.
 All real DB writes and subprocess calls are mocked out.
 """
 
@@ -177,7 +177,7 @@ class TestIntakeBudgetEntries:
             with patch("app.database.create_budget_entry", mock_create):
                 _run(_go())
 
-        # scope + conflict + feasibility = 3 LLM calls → 3 budget entries
+        # scope + conflict + feasibility = 3 LLM calls -> 3 budget entries
         assert mock_create.call_count >= 3
 
 
@@ -310,13 +310,13 @@ class TestBudgetIdEnforcement:
                 all_tasks=[],
                 project="TheMaestro",
                 llm_id=1,
-                budget_id=None,  # Missing — should be enforced
+                budget_id=None,  # Missing - should be enforced
             )
             _patch_static(pipeline)
             return await pipeline.run()
 
         # call_llm raises ValueError for missing budget_id.
-        # IntakePipeline catches stage exceptions internally → outcome is not "passed".
+        # IntakePipeline catches stage exceptions internally -> outcome is not "passed".
         result = _run(_go())
         assert result["outcome"] != "passed"
 
@@ -498,7 +498,7 @@ class TestFullReviewPipelineE2E:
             return await run_full_review_pipeline(
                 task_id=task_id,
                 task_description="Add authentication endpoint",
-                files_changed=[],  # no frontend → 3 reviewers only
+                files_changed=[],  # no frontend -> 3 reviewers only
                 llm_id=1,
                 budget_id=1,
             )
@@ -514,7 +514,7 @@ class TestFullReviewPipelineE2E:
         assert result["outcome"] == "passed"
 
     def test_full_review_rejected(self):
-        # 3rd reviewer (integration) rejects → demotion_target="indev"
+        # 3rd reviewer (integration) rejects -> demotion_target="indev"
         mock_llm = _make_full_review_mock_llm("LIKELY", "LIKELY", "REJECTED")
         result = self._run_full_review(mock_llm)
         assert result["outcome"] == "rejected"

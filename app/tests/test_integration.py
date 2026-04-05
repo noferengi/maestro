@@ -1,6 +1,6 @@
 """Integration tests for Maestro REPL.
 
-Git is mocked at the CheckpointManager level — we verify that the REPL
+Git is mocked at the CheckpointManager level - we verify that the REPL
 calls checkpoint with the right arguments, not that git actually ran.
 """
 
@@ -23,7 +23,7 @@ def _mock_cm():
 class TestIntegration(unittest.TestCase):
 
     def test_dag_task_flow(self):
-        """Complete DAG task flow from PENDING to ACCEPTED — no git involved."""
+        """Complete DAG task flow from PENDING to ACCEPTED - no git involved."""
         dag = repl.create_sample_dag()
         self.assertEqual(len(dag.tasks), 4)
 

@@ -1,7 +1,7 @@
 """
 Test database isolation.
 
-All tests run against  data/test.db  — a named file that is:
+All tests run against  data/test.db  - a named file that is:
   • completely separate from the production  data/kanban.db
   • listed in .gitignore so it is never committed
   • left on disk after the run so failures can be inspected
@@ -80,4 +80,4 @@ def _test_schema():
         conn2.close()
 
     yield
-    # Leave test.db on disk — useful for post-mortem inspection of failures.
+    # Leave test.db on disk - useful for post-mortem inspection of failures.

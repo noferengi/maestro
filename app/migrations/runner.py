@@ -248,8 +248,8 @@ def _inline_seed(conn: sqlite3.Connection) -> None:
         conn.execute(
             """
             INSERT OR REPLACE INTO tasks
-                (id, title, type, description, owner, tags, content, history, position,
-                 created_at, updated_at, prerequisites)
+            (id, title, type, description, owner, tags, content, history, position,
+             created_at, updated_at, prerequisites)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (*t, now, now, json.dumps([])),

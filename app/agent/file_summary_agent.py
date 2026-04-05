@@ -1,7 +1,7 @@
 """
 app/agent/file_summary_agent.py
 --------------------------------
-FILE SUMMARY Agent — generates and DB-caches natural-language summaries
+FILE SUMMARY Agent - generates and DB-caches natural-language summaries
 for source files, routed through the scheduler's job queue.
 
 Cache key: SHA1(file bytes) + file size in bytes.
@@ -25,7 +25,7 @@ Public API
 
 Summarization strategy
 ----------------------
-Files are chunked by character count (~32 k chars ≈ 8 k tokens per chunk).
+Files are chunked by character count (~32 k chars ~= 8 k tokens per chunk).
 Each chunk produces a 1-2 sentence section summary.  A final rollup call
 combines all section summaries (plus verbatim content when the file is small
 enough) and returns two outputs in a structured format:
@@ -34,7 +34,7 @@ enough) and returns two outputs in a structured format:
     <comprehensive description, length scaled to file size>
 
     SHORT_SUMMARY:
-    <exactly 2 sentences — used in directory listings and agent snapshots>
+    <exactly 2 sentences - used in directory listings and agent snapshots>
 
 Small files that fit in a single chunk skip straight to the rollup call.
 Update calls (previous_summary set) also use a single call.
@@ -47,7 +47,10 @@ import logging
 import os
 from typing import Any
 
+from app.agent.llm_client import is_shutting_down, ShutdownError
+
 logger = logging.getLogger(__name__)
+AGENT_NAME = "File Summary Agent"
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -166,7 +169,7 @@ def enqueue_file_summary(
 
     Returns (completion_key, sha1, filesize).
 
-    completion_key == "" means the result is already in the DB cache — the
+    completion_key == "" means the result is already in the DB cache - the
     caller should read it immediately without waiting.
 
     When completion_key is non-empty, the caller should block on
@@ -184,13 +187,13 @@ def enqueue_file_summary(
     sha1, filesize = _sha1_and_size(raw)
     completion_key = f"file_summary:{sha1}:{filesize}"
 
-    # 1. DB cache hit — already summarised
+    # 1. DB cache hit - already summarised
     from app.database import get_file_summary
     if get_file_summary(sha1, filesize) is not None:
-        logger.debug("file_summary cache hit (enqueue): %s (sha1=%s…)", abs_path, sha1[:8])
+        logger.debug("file_summary cache hit (enqueue): %s (sha1=%s)", abs_path, sha1[:8])
         return "", sha1, filesize
 
-    # 2. Dedup — existing pending/running job
+    # 2. Dedup - existing pending/running job
     from app.database import get_file_summary_job_by_sha1
     existing_job = get_file_summary_job_by_sha1(sha1, filesize)
 
@@ -199,7 +202,7 @@ def enqueue_file_summary(
     _event, created = get_or_create_completion_event(completion_key)
 
     # 4. Create DB job only if no existing job and we just created the event.
-    #    Store a small content snapshot as a fallback only — the scheduler
+    #    Store a small content snapshot as a fallback only - the scheduler
     #    always re-reads the full file from disk at execute time.
     if created and existing_job is None:
         content_preview = raw.decode("utf-8", errors="replace")[:_MAX_CONTENT_CHARS]
@@ -214,7 +217,7 @@ def enqueue_file_summary(
             priority=priority,
             previous_summary=previous_summary,
         )
-        logger.debug("file_summary job created: %s (sha1=%s…)", abs_path, sha1[:8])
+        logger.debug("file_summary job created: %s (sha1=%s)", abs_path, sha1[:8])
 
     return completion_key, sha1, filesize
 
@@ -241,18 +244,21 @@ async def execute_file_summary(
     """Perform LLM call(s), store result in file_summaries, return token counts.
 
     Produces two outputs per file:
-      summary       — comprehensive description (length scaled to file size)
-      short_summary — exactly 2 sentences for directory listings / snapshots
+      summary       - comprehensive description (length scaled to file size)
+      short_summary - exactly 2 sentences for directory listings / snapshots
 
     Three execution paths:
-      1. Update   — previous_summary provided: single call with change context
-      2. Small    — file fits in one chunk (≤ _CHUNK_CHARS): single call
-      3. Large    — multiple chunks: one call per chunk for section summaries,
+      1. Update   - previous_summary provided: single call with change context
+      2. Small    - file fits in one chunk (<= _CHUNK_CHARS): single call
+      3. Large    - multiple chunks: one call per chunk for section summaries,
                     then one rollup call combining all sections
 
     All paths use a structured FULL_SUMMARY / SHORT_SUMMARY response format.
     Called by _run_file_summary_job() in the scheduler worker thread.
     """
+    if is_shutting_down():
+        raise ShutdownError("Server is shutting down")
+
     from app.agent.llm_client import call_llm
     from app.database import create_file_summary
 
@@ -292,6 +298,7 @@ async def execute_file_summary(
             model=llm_model,
             stream=stream_idle_timeout is not None,
             stream_idle_timeout=stream_idle_timeout,
+            agent_name=AGENT_NAME,
         )
         text = _extract_text(response)
         usage = response.get("usage", {})
@@ -300,12 +307,12 @@ async def execute_file_summary(
     _DUAL_FORMAT = (
         "Respond with exactly this format (no extra text before or after):\n\n"
         "FULL_SUMMARY:\n"
-        "<{length_desc} summary — overall purpose, main responsibilities, key patterns>\n\n"
+        "<{length_desc} summary - overall purpose, main responsibilities, key patterns>\n\n"
         "SHORT_SUMMARY:\n"
         "<exactly 2 sentences suitable for a file directory listing>"
     ).format(length_desc=length_desc)
 
-    # ── Path 1: update call — single call with change context ────────────
+    # ── Path 1: update call - single call with change context ────────────
     if previous_summary:
         content_snippet = file_content[:_ROLLUP_MAX_CHARS]
         prompt = (
@@ -321,10 +328,12 @@ async def execute_file_summary(
         total_prompt += pp
         total_completion += cp
         if not raw_text:
-            raise ValueError("LLM returned empty response for update call")
-        full_summary, short_summary = _parse_dual_summary(raw_text)
+            logger.warning(f"[{AGENT_NAME}] LLM returned empty response for update call. Falling back to previous.")
+            full_summary, short_summary = previous_summary, "(summary unchanged)"
+        else:
+            full_summary, short_summary = _parse_dual_summary(raw_text)
 
-    # ── Path 2: small file — fits in one chunk ───────────────────────────
+    # ── Path 2: small file - fits in one chunk ───────────────────────────
     elif len(file_content) <= _CHUNK_CHARS:
         prompt = (
             f"{_arch_preamble}"
@@ -336,15 +345,17 @@ async def execute_file_summary(
         total_prompt += pp
         total_completion += cp
         if not raw_text:
-            raise ValueError("LLM returned empty response for small-file call")
-        full_summary, short_summary = _parse_dual_summary(raw_text)
+            logger.warning(f"[{AGENT_NAME}] LLM returned empty response for small-file call. Falling back to default.")
+            full_summary, short_summary = "[Source file]", "[Source file]"
+        else:
+            full_summary, short_summary = _parse_dual_summary(raw_text)
 
-    # ── Path 3: large file — chunked section summaries + rollup ──────────
+    # ── Path 3: large file - chunked section summaries + rollup ──────────
     else:
         chunks = _split_chunks(file_content, _CHUNK_CHARS)
         chunk_count = len(chunks)
         logger.debug(
-            "file_summary chunked: %s — %d chars → %d chunks",
+            "file_summary chunked: %s - %d chars -> %d chunks",
             basename, len(file_content), chunk_count,
         )
 
@@ -352,13 +363,16 @@ async def execute_file_summary(
         section_summaries: list[str] = []
         char_offset = 0
         for idx, chunk_text in enumerate(chunks):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
+
             chunk_start = char_offset + 1          # 1-based char position
             chunk_end = char_offset + len(chunk_text)
             char_offset = chunk_end
 
             prompt = (
                 f"Summarize the following section of {basename} "
-                f"(chars {chunk_start}–{chunk_end} of {len(file_content)}) "
+                f"(chars {chunk_start}-{chunk_end} of {len(file_content)}) "
                 f"in 1-2 sentences. Focus on what this section does.\n\n"
                 f"```\n{chunk_text}\n```"
             )
@@ -367,11 +381,11 @@ async def execute_file_summary(
             total_completion += cp
             section_summaries.append(
                 f"Section {idx + 1}/{chunk_count} "
-                f"(chars {chunk_start}–{chunk_end}): "
+                f"(chars {chunk_start}-{chunk_end}): "
                 f"{section_text or '(no summary)'}"
             )
 
-        # Rollup — combine all section summaries into full + short summaries
+        # Rollup - combine all section summaries into full + short summaries
         summaries_block = "\n".join(section_summaries)
         rollup_prompt = (
             f"{_arch_preamble}"
@@ -387,14 +401,16 @@ async def execute_file_summary(
         total_prompt += pp
         total_completion += cp
         if not raw_text:
-            raise ValueError("LLM returned empty response for rollup call")
-        full_summary, short_summary = _parse_dual_summary(raw_text)
+            logger.warning(f"[{AGENT_NAME}] LLM returned empty response for rollup call. Falling back to default.")
+            full_summary, short_summary = "[Large source file]", "[Large source file]"
+        else:
+            full_summary, short_summary = _parse_dual_summary(raw_text)
 
     create_file_summary(
         sha1, filesize, file_path, full_summary,
         static_analysis_json,
         short_summary=short_summary,
     )
-    logger.debug("file_summary stored: %s (sha1=%s…)", file_path, sha1[:8])
+    logger.debug("file_summary stored: %s (sha1=%s)", file_path, sha1[:8])
 
     return {"prompt_tokens": total_prompt, "completion_tokens": total_completion}

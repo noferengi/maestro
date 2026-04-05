@@ -32,7 +32,7 @@ class Verdict(Enum):
     LIKELY = "LIKELY"
     SUBDIVIDE_IDEA = "SUBDIVIDE_IDEA"
     CONDITIONAL_PASS = "CONDITIONAL_PASS"
-    TOO_LARGE = "TOO_LARGE"  # context window exceeded — synthesised internally, triggers subdivision
+    TOO_LARGE = "TOO_LARGE"  # context window exceeded - synthesised internally, triggers subdivision
 
     @property
     def confidence_range(self) -> tuple[int, int]:
@@ -48,7 +48,7 @@ _VERDICT_RANGES: dict[Verdict, tuple[int, int]] = {
     Verdict.LIKELY: (92, 100),
     Verdict.SUBDIVIDE_IDEA: (0, 100),  # categorical signal, accepts any confidence
     Verdict.CONDITIONAL_PASS: (76, 100),  # passes with noted concerns
-    Verdict.TOO_LARGE: (100, 100),  # always 100% — synthesised on context overflow, never LLM-emitted
+    Verdict.TOO_LARGE: (100, 100),  # always 100% - synthesised on context overflow, never LLM-emitted
 }
 
 

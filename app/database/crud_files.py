@@ -118,6 +118,27 @@ def get_file_summaries_for_project_root(project_root: str) -> "list[FileSummary]
         db.close()
 
 
+def delete_file_summary(sha1: str, filesize: int) -> int:
+    """Delete a FileSummary row by sha1+filesize.
+    
+    Returns the number of rows deleted (0 or 1).
+    """
+    db = SessionLocal()
+    try:
+        result = (
+            db.query(FileSummary)
+            .filter(FileSummary.sha1_hash == sha1, FileSummary.file_size_bytes == filesize)
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        return result
+    except Exception:
+        db.rollback()
+        return 0
+    finally:
+        db.close()
+
+
 # ---------------------------------------------------------------------------
 # SearchCache CRUD
 # ---------------------------------------------------------------------------
@@ -154,5 +175,27 @@ def create_search_cache(query: str, result_json: str, provider: str = 'brave') -
         db.rollback()
         # Race/Duplicate: return existing
         return db.query(SearchCache).filter(SearchCache.query == q, SearchCache.provider == provider).first()
+    finally:
+        db.close()
+
+
+def delete_search_cache(query: str, provider: str = 'brave') -> int:
+    """Delete a SearchCache row by query+provider.
+    
+    Returns the number of rows deleted (0 or 1).
+    """
+    db = SessionLocal()
+    try:
+        q = query.strip()
+        result = (
+            db.query(SearchCache)
+            .filter(SearchCache.query == q, SearchCache.provider == provider)
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        return result
+    except Exception:
+        db.rollback()
+        return 0
     finally:
         db.close()

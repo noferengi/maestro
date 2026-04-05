@@ -37,7 +37,7 @@ from app.agent.config import RESEARCH_AGENT_TOOLS, PROJECT_ROOT, check_context_s
 
 
 # ---------------------------------------------------------------------------
-# Async helper — consistent with the rest of the test suite
+# Async helper - consistent with the rest of the test suite
 # ---------------------------------------------------------------------------
 
 def _run(coro):
@@ -232,7 +232,7 @@ class TestHandleToolCalls:
         assert "not available" in results[0]["content"] or "ERROR" in results[0]["content"]
 
     def test_allowed_tool_dispatched(self):
-        """list_directory is in RESEARCH_AGENT_TOOLS — it should be dispatched."""
+        """list_directory is in RESEARCH_AGENT_TOOLS - it should be dispatched."""
         tool_calls = [{
             "id": "tc3",
             "function": {
@@ -245,7 +245,7 @@ class TestHandleToolCalls:
         assert "not available" not in results[0]["content"]
 
     def test_bad_json_arguments_handled_gracefully(self):
-        """Malformed JSON args must not raise — tool call should still return a string."""
+        """Malformed JSON args must not raise - tool call should still return a string."""
         tool_calls = [{"id": "tc4", "function": {"name": "read_file", "arguments": "{not json"}}]
         results = self.agent._handle_tool_calls(tool_calls)
         assert len(results) == 1
@@ -271,7 +271,7 @@ class TestHandleToolCalls:
 
 
 # ===========================================================================
-# ResearchAgent.run() — full async flow with patched call_llm
+# ResearchAgent.run() - full async flow with patched call_llm
 # ===========================================================================
 
 class TestResearchAgentRun:
@@ -350,7 +350,7 @@ class TestResearchAgentRun:
         assert result.lives_used == 2
 
     def test_needs_research_verdict_continues_to_next_life(self):
-        """A NEEDS_RESEARCH verdict does not terminate — the next life is spawned."""
+        """A NEEDS_RESEARCH verdict does not terminate - the next life is spawned."""
         agent = ResearchAgent(
             question="q?",
             context={},
@@ -408,7 +408,7 @@ class TestResearchAgentRun:
             llm_id=1,
             budget_id=1,
         )
-        # First life hits turn cap (no verdict), second life also hits cap → exhaustion fallback
+        # First life hits turn cap (no verdict), second life also hits cap -> exhaustion fallback
         no_verdict = _llm_resp("Still looking.")
         with patch("app.agent.research.call_llm", _sequential_llm(no_verdict)):
             result = _run(agent.run())
@@ -418,7 +418,7 @@ class TestResearchAgentRun:
         assert isinstance(result.findings, str)
 
     def test_llm_exception_is_caught_and_agent_continues(self):
-        """An LLM call failure must not crash run() — the agent nudges itself."""
+        """An LLM call failure must not crash run() - the agent nudges itself."""
         call_count = [0]
 
         async def flaky_llm(*args, **kwargs):
@@ -444,7 +444,7 @@ class TestResearchAgentRun:
 
 
 # ===========================================================================
-# run_tiebreaker — question and context construction
+# run_tiebreaker - question and context construction
 # ===========================================================================
 
 class TestRunTiebreaker:
@@ -515,12 +515,12 @@ class TestRunTiebreaker:
 
 
 # ===========================================================================
-# _forced_verdict_call — grammar-constrained epilogue
+# _forced_verdict_call - grammar-constrained epilogue
 # ===========================================================================
 
 class TestForcedVerdictEpilogue:
     def _make_epilogue_resp(self, grade: int, verdict: str, justification: str = "test synthesis") -> dict:
-        """Build a grammar-constrained epilogue response (no JSON block fences — raw JSON)."""
+        """Build a grammar-constrained epilogue response (no JSON block fences - raw JSON)."""
         payload = f'{{"grade": {grade}, "justification": "{justification}", "verdict": "{verdict}"}}'
         return _llm_resp(payload)
 
@@ -537,7 +537,7 @@ class TestForcedVerdictEpilogue:
         no_verdict = _llm_resp("I need to investigate more.")
         epilogue = self._make_epilogue_resp(grade=6800, verdict="NEEDS_RESEARCH",
                                            justification="budget was insufficient to conclude")
-        # post-mortem adds 1 extra call per exhausted life (max_lives=2 → +2 calls)
+        # post-mortem adds 1 extra call per exhausted life (max_lives=2 -> +2 calls)
         with patch("app.agent.research.call_llm",
                    _sequential_llm(no_verdict, no_verdict, no_verdict, no_verdict, epilogue)):
             result = _run(agent.run())
@@ -557,7 +557,7 @@ class TestForcedVerdictEpilogue:
         )
         no_verdict = _llm_resp("Still looking.")
         epilogue = self._make_epilogue_resp(grade=7258, verdict="NEEDS_RESEARCH")
-        # post-mortem adds 1 extra call per exhausted life (max_lives=2 → +2 calls)
+        # post-mortem adds 1 extra call per exhausted life (max_lives=2 -> +2 calls)
         with patch("app.agent.research.call_llm",
                    _sequential_llm(no_verdict, no_verdict, no_verdict, no_verdict, epilogue)):
             result = _run(agent.run())
@@ -579,7 +579,7 @@ class TestForcedVerdictEpilogue:
         # grade=8000 (80.00%) -> confidence 80, POSSIBLE range [76-91] ✓
         epilogue = self._make_epilogue_resp(grade=8000, verdict="POSSIBLE",
                                            justification="synthesised from findings")
-        # post-mortem adds 1 extra call per exhausted life (max_lives=2 → +2 calls)
+        # post-mortem adds 1 extra call per exhausted life (max_lives=2 -> +2 calls)
         with patch("app.agent.research.call_llm",
                    _sequential_llm(no_verdict, no_verdict, no_verdict, no_verdict, epilogue)):
             result = _run(agent.run())
@@ -650,7 +650,7 @@ class TestForcedVerdictEpilogue:
 
         async def mock_llm(*args, **kwargs):
             call_count[0] += 1
-            # First two calls: life1 turn + post-mortem — succeed with no-verdict content
+            # First two calls: life1 turn + post-mortem - succeed with no-verdict content
             if call_count[0] <= 2:
                 return no_verdict
             # Remaining calls (epilogue attempts): always raise
@@ -672,12 +672,12 @@ class TestPostMortem:
         """When a life exhausts its turns, one extra post-mortem call is made."""
         call_count = [0]
         responses = [
-            _llm_resp("Still investigating."),   # turn 1 — no verdict
+            _llm_resp("Still investigating."),   # turn 1 - no verdict
             _llm_resp("WHAT I INVESTIGATED: read main.py\nWHAT I FOUND: nothing\n"
                       "WHAT I AM SATISFIED WITH: file structure\n"
                       "WHAT I AM UNSATISFIED WITH: auth flow unclear\n"
                       "WHAT THE NEXT INVESTIGATOR SHOULD FOCUS ON: app/auth.py"),  # post-mortem
-            _llm_resp(_verdict_json("POSSIBLE", 80)),  # life 2, turn 1 — verdict
+            _llm_resp(_verdict_json("POSSIBLE", 80)),  # life 2, turn 1 - verdict
         ]
 
         async def mock_llm(*args, **kwargs):
@@ -739,7 +739,7 @@ class TestPostMortem:
         assert "migration strategy unknown" in agent._accumulated_summaries[0]
 
     def test_post_mortem_failure_does_not_crash_run(self):
-        """A post-mortem LLM call failure must not propagate — run() returns normally."""
+        """A post-mortem LLM call failure must not propagate - run() returns normally."""
         call_count = [0]
 
         async def mock_llm(*args, **kwargs):
@@ -762,7 +762,7 @@ class TestPostMortem:
             result = _run(agent.run())
 
         assert result.vote is not None
-        # handoff_summary is empty on failure — life 2 context uses findings fallback
+        # handoff_summary is empty on failure - life 2 context uses findings fallback
         assert agent._accumulated_summaries[0] == ""
 
     def test_post_mortem_not_fired_when_verdict_rendered(self):
@@ -842,7 +842,7 @@ class TestBuildLifeContextWithSummaries:
 
 
 # ===========================================================================
-# Context overflow (P0-A) — TOO_LARGE verdict on 400 errors
+# Context overflow (P0-A) - TOO_LARGE verdict on 400 errors
 # ===========================================================================
 
 class TestContextOverflow:
@@ -866,7 +866,7 @@ class TestContextOverflow:
         assert result.vote["confidence"] == 100
 
     def test_too_large_terminates_without_more_lives(self):
-        """run() must return immediately on TOO_LARGE — subsequent lives must not be spawned."""
+        """run() must return immediately on TOO_LARGE - subsequent lives must not be spawned."""
         call_count = [0]
 
         async def _400_first_call(*args, **kwargs):
@@ -886,7 +886,7 @@ class TestContextOverflow:
 
         assert result.lives_used == 1
         assert result.vote["verdict"] == "TOO_LARGE"
-        # Only 1 LLM call (the overflowing turn) — no post-mortem, no further lives
+        # Only 1 LLM call (the overflowing turn) - no post-mortem, no further lives
         assert call_count[0] == 1
 
     def test_non_400_error_still_nudges(self):
@@ -910,19 +910,19 @@ class TestContextOverflow:
         with patch("app.agent.research.call_llm", _timeout_then_verdict):
             result = _run(agent.run())
 
-        # The timeout must NOT trigger TOO_LARGE — agent continues and gets a real verdict
+        # The timeout must NOT trigger TOO_LARGE - agent continues and gets a real verdict
         assert result.vote["verdict"] != "TOO_LARGE"
         assert result.vote["verdict"] == "POSSIBLE"
         assert call_count[0] == 2  # failure + successful retry
 
 
 # ===========================================================================
-# check_context_saturation() — shared utility unit tests
+# check_context_saturation() - shared utility unit tests
 # ===========================================================================
 
 class TestContextSaturationUtility:
     def test_returns_false_when_max_context_zero(self):
-        """Disabled when max_context=0 — must never inject nudges or terminate."""
+        """Disabled when max_context=0 - must never inject nudges or terminate."""
         warned: set[float] = set()
         messages: list[dict] = []
         result = check_context_saturation(
@@ -939,7 +939,7 @@ class TestContextSaturationUtility:
         """Crossing 55% saturation appends a nudge (50% threshold) into the conversation."""
         warned: set[float] = set()
         messages: list[dict] = []
-        # 55_000 / 100_000 = 55% — above 50% threshold only
+        # 55_000 / 100_000 = 55% - above 50% threshold only
         check_context_saturation(
             prompt_tokens=55_000,
             max_context=100_000,
@@ -966,7 +966,7 @@ class TestContextSaturationUtility:
         assert len(messages) == 1
 
     def test_returns_true_at_terminate_threshold(self):
-        """Saturation >= terminate_threshold (0.95 by default) returns True — no nudge injected."""
+        """Saturation >= terminate_threshold (0.95 by default) returns True - no nudge injected."""
         warned: set[float] = set()
         messages: list[dict] = []
         result = check_context_saturation(
@@ -981,7 +981,7 @@ class TestContextSaturationUtility:
 
 
 # ===========================================================================
-# ResearchAgent — proactive context saturation (new _run_life() behaviour)
+# ResearchAgent - proactive context saturation (new _run_life() behaviour)
 # ===========================================================================
 
 class TestContextSaturation:
@@ -1054,11 +1054,11 @@ class TestContextSaturation:
         """
         When saturation >= terminate_threshold (0.95), the life breaks cleanly
         and falls through to _post_mortem_call(), then the next life continues.
-        No TOO_LARGE verdict — this is a graceful break, not a 400 error path.
+        No TOO_LARGE verdict - this is a graceful break, not a 400 error path.
         """
         call_count = [0]
         responses = [
-            # Life 1, turn 1: 96% saturation, no verdict, no tool calls → triggers terminate
+            # Life 1, turn 1: 96% saturation, no verdict, no tool calls -> triggers terminate
             _llm_resp("Still investigating.", prompt_tokens=96_000),
             # Life 1 post-mortem call
             _llm_resp("WHAT I INVESTIGATED: nothing\nWHAT I FOUND: little"),
@@ -1083,7 +1083,7 @@ class TestContextSaturation:
         with patch("app.agent.research.call_llm", mock_llm):
             result = _run(agent.run())
 
-        # Must NOT return TOO_LARGE — that's the 400-error path
+        # Must NOT return TOO_LARGE - that's the 400-error path
         assert result.vote["verdict"] != "TOO_LARGE"
         assert result.vote["verdict"] == "POSSIBLE"
         assert result.lives_used == 2
@@ -1096,7 +1096,7 @@ class TestContextSaturation:
         async def mock_llm(*args, **kwargs):
             call_count[0] += 1
             if call_count[0] == 1:
-                # Very high token count — would terminate if saturation were enabled
+                # Very high token count - would terminate if saturation were enabled
                 return _llm_resp("Still investigating.", prompt_tokens=999_999)
             return _llm_resp(_verdict_json("LIKELY", 93), prompt_tokens=10)
 
@@ -1112,6 +1112,6 @@ class TestContextSaturation:
         with patch("app.agent.research.call_llm", mock_llm):
             result = _run(agent.run())
 
-        # No saturation termination — agent reaches verdict normally
+        # No saturation termination - agent reaches verdict normally
         assert result.vote["verdict"] == "LIKELY"
         assert call_count[0] == 2

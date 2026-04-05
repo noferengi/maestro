@@ -1,7 +1,7 @@
 """
 app/agent/security_review.py
 ------------------------------
-Security Pipeline — 3-agent veto-power security gate.
+Security Pipeline - 3-agent veto-power security gate.
 
 SECURITY GETS VETO POWER. A single security reviewer can block advancement.
 
@@ -33,11 +33,12 @@ from app.agent.config import (
 )
 from app.agent.json_utils import extract_json_block
 from app.agent.tools import _task_git_cwd, dispatch_tool, build_tool_schemas, set_task_git_cwd
-from app.agent.llm_client import call_llm
+from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
 from app.agent.research import run_research
 from app.agent.verdicts import Vote, Verdict
 
 logger = logging.getLogger(__name__)
+AGENT_NAME = "Security Pipeline"
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +172,10 @@ class SecurityPipeline:
 
     async def run(self) -> SecurityReviewPipelineResult:
         """Run pre-scan + 3 security reviewers, then research any uncertainties."""
-        logger.info("[security] Starting for task '%s'", self.task_id)
+        if is_shutting_down():
+            raise ShutdownError("Server is shutting down")
+
+        logger.info(f"[{AGENT_NAME}] Starting for task '%s'", self.task_id)
 
         # Phase 0: Deterministic pre-scan (bandit, detect-secrets)
         scan_context = await self._run_pre_scan()
@@ -185,7 +189,7 @@ class SecurityPipeline:
         for i, result in enumerate(results):
             reviewer_type = self._REVIEWERS[i]["type"]
             if isinstance(result, Exception):
-                logger.warning("[security] Reviewer '%s' failed: %s", reviewer_type, result)
+                logger.warning(f"[{AGENT_NAME}] Reviewer '%s' failed: %s", reviewer_type, result)
                 votes.append(Vote(
                     stage=f"security_{reviewer_type}",
                     verdict=Verdict.NEEDS_RESEARCH,
@@ -208,7 +212,7 @@ class SecurityPipeline:
         # Tally with veto rules
         outcome, summary, demotion_target = self._tally_security(votes, findings)
 
-        logger.info("[security] Task '%s': %s", self.task_id, outcome)
+        logger.info(f"[{AGENT_NAME}] Task '%s': %s", self.task_id, outcome)
 
         return SecurityReviewPipelineResult(
             task_id=self.task_id,
@@ -240,9 +244,9 @@ class SecurityPipeline:
                     scanner_name = cmd.split()[2]
                     scan_outputs.append(f"[{scanner_name}]\n{result[:2000]}")
                 else:
-                    logger.debug("[security] Pre-scan '%s': %s", cmd, result[:200])
+                    logger.debug(f"[{AGENT_NAME}] Pre-scan '%s': %s", cmd, result[:200])
             except Exception as e:
-                logger.warning("[security] Pre-scan '%s' failed: %s", cmd, e)
+                logger.warning(f"[{AGENT_NAME}] Pre-scan '%s' failed: %s", cmd, e)
 
         if not scan_outputs:
             return ""
@@ -257,20 +261,23 @@ class SecurityPipeline:
         self, votes: list[Vote], scan_context: str
     ) -> tuple[list[Vote], list[dict]]:
         """Spawn research agent for NEEDS_RESEARCH votes, then re-vote affected reviewers."""
+        if is_shutting_down():
+            raise ShutdownError("Server is shutting down")
+
         research_votes = [v for v in votes if v.verdict == Verdict.NEEDS_RESEARCH]
         questions = [f"[{v.stage}] {v.justification}" for v in research_votes]
         question = (
             f"Security review of task {self.task_id} found uncertain areas:\n"
             + "\n".join(questions)
             + "\n\nInvestigate these security concerns. Determine if they represent:\n"
-            "1. Fundamental architectural security flaws → recommend demotion to planning\n"
-            "2. Implementation-level issues → recommend demotion to indev\n"
-            "3. Data handling issues → recommend demotion to optimization\n"
+            "1. Fundamental architectural security flaws -> recommend demotion to planning\n"
+            "2. Implementation-level issues -> recommend demotion to indev\n"
+            "3. Data handling issues -> recommend demotion to optimization\n"
             "4. False positives or minor concerns that can pass"
         )
 
         logger.info(
-            "[security] NEEDS_RESEARCH from %d reviewer(s), spawning research agent.",
+            f"[{AGENT_NAME}] NEEDS_RESEARCH from %d reviewer(s), spawning research agent.",
             len(research_votes),
         )
         try:
@@ -288,7 +295,7 @@ class SecurityPipeline:
             self._total_completion += research_result.completion_tokens
             findings_text = research_result.findings or "No specific findings."
         except Exception as e:
-            logger.warning("[security] Research agent failed: %s", e)
+            logger.warning(f"[{AGENT_NAME}] Research agent failed: %s", e)
             return votes, []
 
         # Re-vote affected reviewers with research context appended
@@ -351,6 +358,9 @@ class SecurityPipeline:
         _ctx_warned: set[float] = set()
 
         for turn in range(max_turns):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
+
             response = await call_llm(
                 messages,
                 base_url=self.llm_base_url,
@@ -361,6 +371,7 @@ class SecurityPipeline:
                 task_id=self.task_id,
                 llm_id=self.llm_id,
                 budget_id=self.budget_id,
+                agent_name=AGENT_NAME,
             )
 
             usage = response.get("usage", {})
@@ -373,7 +384,7 @@ class SecurityPipeline:
                 prompt_tokens_this_call, self.max_context, _ctx_warned, messages
             ):
                 logger.warning(
-                    "[security] Reviewer '%s' context saturation (turn %d) — terminating",
+                    f"[{AGENT_NAME}] Reviewer '%s' context saturation (turn %d) - terminating",
                     reviewer["type"], turn + 1,
                 )
                 break
@@ -442,10 +453,10 @@ class SecurityPipeline:
     ) -> tuple[str, str, str | None]:
         """Tally with strict security rules.
 
-        1. Any REJECTED → immediate rejection
-        2. Any NOT_SUITABLE → rejection (veto power)
-        3. NEEDS_RESEARCH → security research agent (conservative default)
-        4. All POSSIBLE or LIKELY → passed
+        1. Any REJECTED -> immediate rejection
+        2. Any NOT_SUITABLE -> rejection (veto power)
+        3. NEEDS_RESEARCH -> security research agent (conservative default)
+        4. All POSSIBLE or LIKELY -> passed
         """
         demotion_target = None
 
@@ -508,7 +519,7 @@ class SecurityPipeline:
                 completion_tokens=vote.completion_tokens,
             )
         except Exception as e:
-            logger.error("[security] Failed to store reviewer result: %s", e)
+            logger.error(f"[{AGENT_NAME}] Failed to store reviewer result: %s", e)
 
 
 # ---------------------------------------------------------------------------

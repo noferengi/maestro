@@ -2,14 +2,6 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Session start checklist
-
-Read `SUMMARY.md` in the project root. It contains recent work and prioritized next steps written by the previous session. After reading it, ask yourself: **what should be done next?** If the user hasn't given a specific instruction, surface the top item from the next-steps list and confirm before proceeding.
-
-## After major accomplishments
-
-Run `/update-full-plan` automatically after completing any significant body of work (feature complete, bug fixed, tests passing), or whenever the user asks. There is an older skill that only updates one file — always use `/update-full-plan`.
-
 ## What this is
 
 Project Maestro — a Kanban board with an agentic LLM orchestration backend. The board is the UI face of a "Wiggum Loop": a Do-While that drives a local LLM through Design → Implement → Test → Verify cycles until all DAG task nodes reach ACCEPTED. Tasks transition IDEA → PLANNING → INDEV → CONCEPTUAL_REVIEW → OPTIMIZATION → SECURITY → FULL_REVIEW → COMPLETED, gated by a multi-stage intake pipeline with LLM voting.
@@ -59,24 +51,8 @@ Or directly: `venv/Scripts/python.exe app/migrations/runner.py <command>`
 
 Migrations live in `app/migrations/versions/` as `NNNN_description.py`. Never edit an existing migration — always add a new one. Each exposes `up(conn)`, `down(conn)`, and `description`.
 
-Current schema migrations (0001–0036):
-- `0001` — initial `tasks` table
-- `0002` — `prerequisites` column (JSON array of task IDs)
-- `0003` — `project` column (string, default `'TheMaestro'`)
-- `0004` — `llm_id` and `budget_id` columns on tasks
-- `0005` — `llms` and `budgets` tables with foreign keys
-- `0006` — `transition_votes` and `transition_results` tables
-- `0007` — `parallel_sessions`, `max_context` columns on `llms`
-- `0008` — `notes` column on `llms`
-- `0009` — `budget_entries` table for per-call LLM usage tracking
-- `0010` — `parent_task_id`, `subdivision_generation` on tasks; `subdivision_records` table
-- `0011–0021` — big-idea flag, interface contracts, planning/review stages, demotion, file summaries, expenses
-- `0022` — `file_summary_jobs` table (scheduler-dispatched summaries, priority -1.0)
-- `0023` — `previous_summary` column on `file_summary_jobs`
-- `0024` — `map_x`, `map_y` on tasks (Column Map View positions)
-- `0025` — `llm_id` on `projects` (default LLM for project-level maintenance jobs)
-- `0026` — `budget_id` on `projects` (default budget for project-level maintenance jobs)
-- `0027` — search result cache table
+Current schema migrations (0001–0037, showing last 10):
+- `0001–0027` — (earlier migrations; see migration files for history)
 - `0028` — fix subdivision positions (data repair)
 - `0029` — repair phantom `-subN` prerequisite IDs left by old subdivision code (data repair)
 - `0030` — `inbox_messages` table
@@ -85,6 +61,7 @@ Current schema migrations (0001–0036):
 - `0033–0034` — (reserved / applied)
 - `0035` — `short_summary` column on `file_summaries`
 - `0036` — `arch_gen_jobs` table; `project`, `category`, `llm_id`, `budget_id`, `status`, `priority` (1.0); index on `(status, priority, created_at)`
+- `0037` — `retry_count INTEGER DEFAULT 0` on `arch_gen_jobs` (cap retries at 3; inbox notification on abandon)
 
 **Full schema reference:** See `CLAUDE_SCHEMA.md` in the project root. Read that file whenever you need to query or modify `data/kanban.db` directly — it contains every table, column, type, nullability, and default value.
 

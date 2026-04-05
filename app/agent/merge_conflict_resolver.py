@@ -1,7 +1,7 @@
 """
 app/agent/merge_conflict_resolver.py
 -------------------------------------
-MergeConflictResolver — LLM-assisted merger for parallel component file conflicts.
+MergeConflictResolver - LLM-assisted merger for parallel component file conflicts.
 
 Used when two components in the same batch (after serialization failed to separate them,
 or when manual conflict resolution is triggered) produce conflicting changes to the same file.
@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import re
 
-from app.agent.llm_client import call_llm
+from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ Component B was implementing: {component_b_context}
 
 {version_b}
 
-Output ONLY the complete merged file contents — no explanation, no markdown fences, \
+Output ONLY the complete merged file contents - no explanation, no markdown fences, \
 no commentary. The merged file must include everything both components added or changed.\
 """
 
@@ -83,6 +83,8 @@ class MergeConflictResolver:
         base_len = len(base_content.strip())
 
         for attempt in range(_MAX_RETRIES + 1):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
             try:
                 response = await call_llm(
                     messages,
@@ -125,7 +127,7 @@ class MergeConflictResolver:
 
             logger.warning(
                 "[merge_resolver] Attempt %d produced malformed merge for '%s' "
-                "(len=%d, base_len=%d) — retrying",
+                "(len=%d, base_len=%d) - retrying",
                 attempt + 1, file_path, len(merged), base_len,
             )
 

@@ -1,8 +1,8 @@
 """
 app/agent/component_loop.py
 ----------------------------
-ComponentLoop — focused agent for implementing a single component.
-ComponentToolDispatcher — restricts writes to assigned file manifest.
+ComponentLoop - focused agent for implementing a single component.
+ComponentToolDispatcher - restricts writes to assigned file manifest.
 
 A stripped-down MaestroLoop with:
   - File write containment (only assigned files)
@@ -27,20 +27,21 @@ from app.agent.config import (
     PROJECT_ROOT,
     check_context_saturation,
 )
-from app.agent.llm_client import call_llm
+from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
 from app.agent.tools import dispatch_tool, TOOL_SCHEMAS, _assert_safe_path, build_tool_schemas
 
 _INDEV_TOOL_SCHEMAS: list[dict] = build_tool_schemas(INDEV_AGENT_TOOLS)
 
 logger = logging.getLogger(__name__)
+AGENT_NAME = "Component Loop"
 
 
 # ---------------------------------------------------------------------------
-# ComponentToolDispatcher — file write containment
+# ComponentToolDispatcher - file write containment
 # ---------------------------------------------------------------------------
 
 class ComponentToolDispatcher:
-    """Wraps dispatch_tool() — restricts write_file/append_file to assigned files only."""
+    """Wraps dispatch_tool() - restricts write_file/append_file to assigned files only."""
 
     def __init__(self, allowed_write_paths: list[str]):
         self._allowed = set(
@@ -171,6 +172,9 @@ class ComponentLoop:
 
     async def run(self) -> ComponentLoopResult:
         """Run the component implementation loop."""
+        if is_shutting_down():
+            raise ShutdownError("Server is shutting down")
+
         logger.info(
             "[component] Starting '%s' for task '%s' (max %d turns)",
             self.component_name, self.task_id, self.max_turns,
@@ -187,6 +191,8 @@ class ComponentLoop:
         _ctx_warned: set[float] = set()
 
         for turn in range(self.max_turns):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
             try:
                 response = await call_llm(
                     messages,
@@ -197,10 +203,11 @@ class ComponentLoop:
                     task_id=self.task_id,
                     llm_id=self.llm_id,
                     budget_id=self.budget_id,
+                    agent_name=AGENT_NAME,
                 )
             except Exception as e:
                 consecutive_errors += 1
-                logger.warning("[component] LLM call failed (error %d): %s", consecutive_errors, e)
+                logger.warning("[%s] LLM call failed (error %d): %s", AGENT_NAME, consecutive_errors, e)
                 if consecutive_errors >= 3:
                     return ComponentLoopResult(
                         component_name=self.component_name,
@@ -223,7 +230,7 @@ class ComponentLoop:
                 prompt_tokens_this_call, self.max_context, _ctx_warned, messages
             ):
                 logger.warning(
-                    "[component] '%s' context saturation (turn %d) — terminating",
+                    "[component] '%s' context saturation (turn %d) - terminating",
                     self.component_name, turn + 1,
                 )
                 return ComponentLoopResult(
@@ -231,7 +238,7 @@ class ComponentLoop:
                     status="REVERT_TO_DESIGN",
                     turns=turn + 1,
                     files_changed=sorted(files_changed),
-                    error_detail="Context saturation limit reached — terminating component loop.",
+                    error_detail="Context saturation limit reached - terminating component loop.",
                     prompt_tokens=self._total_prompt,
                     completion_tokens=self._total_completion,
                 )
@@ -249,7 +256,7 @@ class ComponentLoop:
                     component_files = self.step.get("files", [])
                     if not self._tests_passed and _is_testable_component(component_files):
                         logger.info(
-                            "[component] '%s' signaled ACCEPTED without passing tests — requesting test run",
+                            "[component] '%s' signaled ACCEPTED without passing tests - requesting test run",
                             self.component_name,
                         )
                         messages.append({

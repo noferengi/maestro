@@ -272,7 +272,7 @@ def test_compute_priority_shallow_first():
 
 
 # ---------------------------------------------------------------------------
-# _compare_reports — benchmark data path
+# _compare_reports - benchmark data path
 # ---------------------------------------------------------------------------
 
 def _make_benchmark_record(task_id, parent_task_id, benchmark_type, metrics_dict):
@@ -381,9 +381,9 @@ class TestWeightedBenchmarkComparison:
     """Tests for the weighted multi-metric _compare_benchmarks algorithm."""
 
     def test_compute_weighted_higher_than_memory(self, monkeypatch):
-        """Large compute improvement + small memory regression → still 'optimized'."""
-        # compute: 1000→500ms = 50% improvement × weight 1.0
-        # memory: 100→120mb = -20% (regression) × weight 0.6
+        """Large compute improvement + small memory regression -> still 'optimized'."""
+        # compute: 1000->500ms = 50% improvement × weight 1.0
+        # memory: 100->120mb = -20% (regression) × weight 0.6
         # weighted = (50*1.0 + -20*0.6) / (1.0+0.6) = (50-12)/1.6 = 38/1.6 = 23.75%
         before = _make_benchmark_record("c1", "p", "before", {
             "test_duration_ms": 1000, "memory_peak_mb": 100,
@@ -403,10 +403,10 @@ class TestWeightedBenchmarkComparison:
         assert outcome == "optimized"
 
     def test_big_o_bonus_applied(self, monkeypatch):
-        """Modest time improvement + Big O rank improvement → bonus pushes over threshold."""
-        # compute: 1000→980ms = 2% improvement → normally just at threshold
-        # Big O: O(n^2) rank=5 → O(n) rank=3 = 2 ranks × 10% = 20% bonus
-        # weighted ≈ 2% + 20% = 22% → optimized
+        """Modest time improvement + Big O rank improvement -> bonus pushes over threshold."""
+        # compute: 1000->980ms = 2% improvement -> normally just at threshold
+        # Big O: O(n^2) rank=5 -> O(n) rank=3 = 2 ranks × 10% = 20% bonus
+        # weighted ≈ 2% + 20% = 22% -> optimized
         before = _make_benchmark_record("c1", "p", "before", {
             "test_duration_ms": 1000, "complexity_score": 50,
             "big_o_class": "O(n^2)", "readability_cost": 0.0,
@@ -424,12 +424,12 @@ class TestWeightedBenchmarkComparison:
         assert "Big O" in summary
 
     def test_readability_penalty_applied(self, monkeypatch):
-        """Good improvement + high readability_cost (0.9) → penalty pulls below threshold → skipped."""
-        # compute: 1000→900ms = 10% improvement
-        # readability_cost=0.9 → penalty = 0.9 * 0.5 = 0.45 → 10% * (1-0.45) = 5.5%
-        # 5.5% > 2% threshold → still optimized … let's use readability_cost=1.0
-        # readability_cost=1.0 → penalty = 1.0 * 0.5 = 0.5 → 10% * 0.5 = 5% → still > 2%
-        # Use small improvement: 1000→975ms = 2.5% → * 0.5 = 1.25% → below 2% → skipped
+        """Good improvement + high readability_cost (0.9) -> penalty pulls below threshold -> skipped."""
+        # compute: 1000->900ms = 10% improvement
+        # readability_cost=0.9 -> penalty = 0.9 * 0.5 = 0.45 -> 10% * (1-0.45) = 5.5%
+        # 5.5% > 2% threshold -> still optimized … let's use readability_cost=1.0
+        # readability_cost=1.0 -> penalty = 1.0 * 0.5 = 0.5 -> 10% * 0.5 = 5% -> still > 2%
+        # Use small improvement: 1000->975ms = 2.5% -> * 0.5 = 1.25% -> below 2% -> skipped
         before = _make_benchmark_record("c1", "p", "before", {
             "test_duration_ms": 1000, "complexity_score": 50,
             "big_o_class": "O(n)", "readability_cost": 0.0,
@@ -446,7 +446,7 @@ class TestWeightedBenchmarkComparison:
         assert outcome == "skipped"
 
     def test_premature_optimization_requires_double_threshold(self, monkeypatch):
-        """3% improvement + is_premature=True → below 2×2%=4% threshold → skipped."""
+        """3% improvement + is_premature=True -> below 2×2%=4% threshold -> skipped."""
         before = _make_benchmark_record("c1", "p", "before", {
             "test_duration_ms": 1000, "complexity_score": 50,
             "big_o_class": "O(n)", "readability_cost": 0.0,
@@ -464,9 +464,9 @@ class TestWeightedBenchmarkComparison:
         assert "premature" in summary
 
     def test_tech_debt_bonus_applied(self, monkeypatch):
-        """Borderline improvement + tech_debt_resolved=True → bonus pushes over threshold → optimized."""
-        # compute: 1000→982ms = 1.8% → below 2% threshold alone
-        # tech_debt bonus = 1.0% → 1.8% + 1.0% = 2.8% → above 2% threshold
+        """Borderline improvement + tech_debt_resolved=True -> bonus pushes over threshold -> optimized."""
+        # compute: 1000->982ms = 1.8% -> below 2% threshold alone
+        # tech_debt bonus = 1.0% -> 1.8% + 1.0% = 2.8% -> above 2% threshold
         before = _make_benchmark_record("c1", "p", "before", {
             "test_duration_ms": 1000, "complexity_score": 50,
             "big_o_class": "O(n)", "readability_cost": 0.0,
@@ -503,13 +503,13 @@ class TestBigOFallback:
     """Tests for Big O bonus applied in the profiling-dict fallback path."""
 
     def test_compare_reports_big_o_bonus_in_fallback(self, monkeypatch):
-        """No benchmarks; profiling dicts have big_o_class → bonus applied, outcome changes."""
+        """No benchmarks; profiling dicts have big_o_class -> bonus applied, outcome changes."""
         monkeypatch.setattr("app.database.get_optimization_benchmarks", lambda pid: [])
 
         pipeline = _make_pipeline()
-        # complexity_score alone: 100→99 = 1% → below 2% threshold → would be skipped
-        # Big O: O(n^2) rank=5 → O(n log n) rank=4 = 1 rank × 10% = 10% bonus
-        # total = 1% + 10% = 11% → optimized
+        # complexity_score alone: 100->99 = 1% -> below 2% threshold -> would be skipped
+        # Big O: O(n^2) rank=5 -> O(n log n) rank=4 = 1 rank × 10% = 10% bonus
+        # total = 1% + 10% = 11% -> optimized
         baseline = {"complexity_score": 100, "big_o_class": "O(n^2)"}
         post = {"complexity_score": 99, "big_o_class": "O(n log n)"}
         outcome, summary = pipeline._compare_reports(baseline, post, parent_task_id="p")
@@ -517,12 +517,12 @@ class TestBigOFallback:
         assert "Big O" in summary
 
     def test_compare_reports_no_big_o_no_bonus(self, monkeypatch):
-        """No benchmarks, no big_o_class in dicts → no bonus, below-threshold stays skipped."""
+        """No benchmarks, no big_o_class in dicts -> no bonus, below-threshold stays skipped."""
         monkeypatch.setattr("app.database.get_optimization_benchmarks", lambda pid: [])
 
         pipeline = _make_pipeline()
         baseline = {"complexity_score": 100}
-        post = {"complexity_score": 99}  # 1% → below 2% → skipped
+        post = {"complexity_score": 99}  # 1% -> below 2% -> skipped
         outcome, summary = pipeline._compare_reports(baseline, post, parent_task_id="p")
         assert outcome == "skipped"
         assert "Big O" not in summary

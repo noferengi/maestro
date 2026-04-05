@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 import threading
 from collections import defaultdict
@@ -42,8 +43,10 @@ from app.agent.config import (
     PIPELINE_DONE_STATUSES,
     MAX_TOKENS_PER_TURN,
 )
+from app.agent.llm_client import is_shutting_down, signal_shutdown, ShutdownError
 
 logger = logging.getLogger(__name__)
+AGENT_NAME = "Scheduler"
 
 # ---------------------------------------------------------------------------
 # Scheduler state
@@ -57,6 +60,10 @@ _active_sessions_lock = threading.Lock()
 # Protected by _active_sessions_lock.  Used to enforce the one-LLM-at-a-time policy.
 _session_llm_ids: dict[str, int] = {}
 
+# session key -> display title for background jobs (arch-gen, research, etc.)
+# Protected by _active_sessions_lock.
+_session_titles: dict[str, str] = {}
+
 # Per-LLM active session count: llm_id -> count
 _llm_session_counts: dict[int, int] = defaultdict(int)
 _llm_counts_lock = threading.Lock()
@@ -65,7 +72,7 @@ _llm_counts_lock = threading.Lock()
 # External pipeline session registry
 # ---------------------------------------------------------------------------
 # API-triggered pipelines (intake, planning, review, etc.) run as FastAPI
-# BackgroundTasks threads — they are NOT dispatched by the scheduler and are
+# BackgroundTasks threads - they are NOT dispatched by the scheduler and are
 # therefore invisible to the one-LLM-at-a-time policy by default.  They
 # register here so the scheduler sees them and won't dispatch conflicting work
 # to a different model while they are running.
@@ -121,17 +128,17 @@ def wait_and_register_pipeline_session(
         with _external_sessions_lock:
             active_llm_ids.update(_external_sessions.values())
 
-        # Gate 1 — one-model-at-a-time: only proceed if no OTHER model is active
+        # Gate 1 - one-model-at-a-time: only proceed if no OTHER model is active
         conflicting = active_llm_ids - {llm_id}
         if conflicting:
             logger.debug(
-                "wait_and_register: LLM %d waiting — conflicting active LLMs: %s",
+                "wait_and_register: LLM %d waiting - conflicting active LLMs: %s",
                 llm_id, conflicting,
             )
             time.sleep(poll_interval)
             continue
 
-        # Gate 2 — per-LLM capacity: only proceed if a slot is free
+        # Gate 2 - per-LLM capacity: only proceed if a slot is free
         with _llm_counts_lock:
             current = _llm_session_counts[llm_id]
             if current >= max_slots:
@@ -194,13 +201,13 @@ def wait_for_completion(key: str, timeout: float = 120.0) -> bool:
     """Block until the job identified by key completes or timeout expires.
 
     Returns True if the job completed (or was already cleaned up from the
-    registry — meaning it finished before we started waiting). Returns False
+    registry - meaning it finished before we started waiting). Returns False
     on timeout.
     """
     with _pending_completions_lock:
         ev = _pending_completions.get(key)
     if ev is None:
-        # Key already removed — job completed before we reached this call.
+        # Key already removed - job completed before we reached this call.
         return True
     return ev.wait(timeout=timeout)
 
@@ -210,7 +217,7 @@ _failed_cooldowns: dict[str, float] = {}
 _FAIL_COOLDOWN_SECONDS = 60.0  # Wait 60s before retrying a failed task
 
 # task_id -> timestamp of last rejected intake run (longer inter-retry backoff)
-# Rejection means "not ready yet", not "permanently blocked" — always retry.
+# Rejection means "not ready yet", not "permanently blocked" - always retry.
 _rejection_cooldowns: dict[str, float] = {}
 _REJECTION_RETRY_COOLDOWN = 300.0   # 5 min between retries
 _MAX_REJECTIONS_BEFORE_SUBDIVIDE = 3  # force subdivision after this many consecutive rejections
@@ -222,6 +229,28 @@ _MAX_REJECTIONS_BEFORE_SUBDIVIDE = 3  # force subdivision after this many consec
 _FILE_SUMMARY_RETRY_COOLDOWN = 300.0  # 5 min before re-queuing a failed file-summary job
 _RESEARCH_JOB_RETRY_COOLDOWN = 300.0  # 5 min before re-queuing a failed research job
 _ARCH_GEN_RETRY_COOLDOWN     = 300.0  # 5 min before re-queuing a failed arch-gen job
+_ARCH_GEN_MAX_RETRIES        = 3      # abandon + inbox notification after this many failures
+
+# Project-level failure throttling: project_name -> time.time() of most recent failure/rescue.
+# Prevents a "retry storm" for background jobs (arch_gen, etc.) if a project is in a bad state.
+_project_failure_cooldowns: dict[str, float] = {}
+_PROJECT_FAILURE_COOLDOWN_SECONDS = 300.0  # 5 minutes
+
+
+def _record_project_failure(project_name: str | None) -> None:
+    """Mark a project as recently failed to throttle its background job queue."""
+    if not project_name:
+        return
+    _project_failure_cooldowns[project_name] = time.time()
+
+
+def _is_project_in_failure_cooldown(project_name: str | None) -> bool:
+    """Return True if the project has a recent failure/rescue and should be throttled."""
+    if not project_name:
+        return False
+    last_failure = _project_failure_cooldowns.get(project_name, 0)
+    return (time.time() - last_failure) < _PROJECT_FAILURE_COOLDOWN_SECONDS
+
 
 # Background thread that drives the scheduler tick
 _scheduler_thread: threading.Thread | None = None
@@ -249,7 +278,7 @@ def start_scheduler() -> None:
     logger.info("Scheduler started (tick every %.1fs).", SCHEDULER_TICK_INTERVAL)
 
 
-def stop_scheduler() -> None:
+def stop_scheduler(wait_for_sessions: bool = True, timeout: float = 60.0) -> None:
     """Signal the scheduler to stop and wait for it."""
     global _scheduler_thread
     if _scheduler_thread is None:
@@ -257,6 +286,33 @@ def stop_scheduler() -> None:
     _scheduler_stop.set()
     _scheduler_thread.join(timeout=SCHEDULER_TICK_INTERVAL + 2)
     _scheduler_thread = None
+
+    if wait_for_sessions:
+        with _active_sessions_lock:
+            threads = [(key, t) for key, t in _active_sessions.items() if t.is_alive()]
+        if threads:
+            logger.info(
+                "Waiting up to %.0fs for %d active session thread(s) to finish: %s",
+                timeout,
+                len(threads),
+                ", ".join(k for k, _ in threads),
+            )
+            deadline = time.monotonic() + timeout
+            for _key, t in threads:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                t.join(timeout=remaining)
+
+        # Report any threads that didn't finish in time
+        with _active_sessions_lock:
+            still_alive = [key for key, t in _active_sessions.items() if t.is_alive()]
+        if still_alive:
+            logger.warning(
+                "Scheduler shutdown: %d thread(s) still alive after %.0fs timeout: %s",
+                len(still_alive), timeout, ", ".join(still_alive),
+            )
+
     logger.info("Scheduler stopped.")
 
 
@@ -277,6 +333,13 @@ def get_scheduler_status() -> dict:
         }
         if active_llm_set:
             pinned_llm_id = next(iter(active_llm_set))
+    
+    with _external_sessions_lock:
+        external_sessions_snapshot = dict(_external_sessions)
+        for lid in external_sessions_snapshot.values():
+            if pinned_llm_id is None:
+                pinned_llm_id = lid
+
     with _llm_counts_lock:
         llm_counts = dict(_llm_session_counts)
 
@@ -312,7 +375,7 @@ def get_scheduler_status() -> dict:
     ready_tasks = resolver.get_ready_tasks()
     ready_ids: set[str] = {t["id"] for t in ready_tasks}
 
-    # Big-idea parents (have children — skipped by DAG as non-dispatchable)
+    # Big-idea parents (have children - skipped by DAG as non-dispatchable)
     children_by_parent: set[str] = {
         t.get("parent_task_id")
         for t in task_dicts
@@ -329,9 +392,52 @@ def get_scheduler_status() -> dict:
 
     task_by_id = {t.id: t for t in all_tasks}
 
+    # 1. Add scheduler-managed active tasks
+    for tid in active_session_ids:
+        task = task_by_id.get(tid)
+        if task:
+            info = _llm_info(task.llm_id)
+            active_list.append({
+                "id": tid,
+                "title": (task.title or tid)[:80],
+                "type": (task.type or "").lower(),
+                "project": task.project or "",
+                "llm_id": task.llm_id,
+                "llm_name": info["name"] if info else "(no LLM)",
+            })
+        else:
+            # Might be a background job (file summary, research)
+            # These are identified by keys like "file-summary-123"
+            llm_id = _session_llm_ids.get(tid)
+            info = _llm_info(llm_id)
+            active_list.append({
+                "id": tid,
+                "title": _session_titles.get(tid, tid),
+                "type": "background",
+                "project": "",
+                "llm_id": llm_id,
+                "llm_name": info["name"] if info else "(no LLM)",
+            })
+
+    # 2. Add external pipeline sessions
+    for key, llm_id in external_sessions_snapshot.items():
+        info = _llm_info(llm_id)
+        active_list.append({
+            "id": f"ext:{key}",
+            "title": f"External: {key}",
+            "type": "external",
+            "project": "",
+            "llm_id": llm_id,
+            "llm_name": info["name"] if info else "(no LLM)",
+        })
+
     for task in all_tasks:
         tid = task.id
         task_type = (task.type or "").lower()
+
+        # Already in active_list?
+        if tid in active_session_ids:
+            continue
 
         # Only care about dispatchable types that aren't terminal
         if task_type not in dispatchable_set:
@@ -349,10 +455,8 @@ def get_scheduler_status() -> dict:
             "llm_name": info["name"] if info else "(no LLM)",
         }
 
-        if tid in active_session_ids:
-            active_list.append(entry)
-        elif tid in ready_ids:
-            # Ready but not dispatched — determine why
+        if tid in ready_ids:
+            # Ready but not dispatched - determine why
             if not task.llm_id:
                 reason = "no_llm"
             elif tid in _failed_cooldowns and (now - _failed_cooldowns[tid]) < _FAIL_COOLDOWN_SECONDS:
@@ -365,14 +469,14 @@ def get_scheduler_status() -> dict:
             entry["reason"] = reason
             queued_list.append(entry)
         else:
-            # Not ready — find blocking prerequisites
+            # Not ready - find blocking prerequisites
             blocking = [
                 p for p in (task.prerequisites or [])
                 if not resolver._is_effectively_done(p)  # noqa: SLF001
             ]
             # Also note if it's a parent-is-working case
             if tid in children_by_parent:
-                continue  # Big Idea parent with children — not directly dispatchable
+                continue  # Big Idea parent with children - not directly dispatchable
             entry["blocking_prereqs"] = blocking[:6]
             # Include titles for blocking prereqs where available
             entry["blocking_titles"] = [
@@ -434,7 +538,7 @@ def get_scheduler_status() -> dict:
 # ---------------------------------------------------------------------------
 
 def _scheduler_loop() -> None:
-    """Main scheduler loop — runs in a background thread."""
+    """Main scheduler loop - runs in a background thread."""
     logger.info("Scheduler loop started.")
     while not _scheduler_stop.is_set():
         try:
@@ -498,7 +602,7 @@ def _check_and_reserve_slot(
     """Check LLM and compute-node capacity and atomically reserve a slot if available.
 
     Mutates *node_active_counts* and *node_session_counts* in-place on success so that
-    subsequent dispatches within the same tick see the updated counts — this is what
+    subsequent dispatches within the same tick see the updated counts - this is what
     prevents over-dispatch when multiple jobs are dispatched in one tick.
 
     Returns True if a slot was reserved, False if either cap is already reached.
@@ -565,8 +669,8 @@ def _tick() -> None:
     """
     Single scheduler tick:
       0. Clean up finished sessions.
-      1. Determine which LLM (if any) is already active — one-LLM-at-a-time policy.
-      2. Dispatch file summary jobs (highest priority — agents are blocked waiting).
+      1. Determine which LLM (if any) is already active - one-LLM-at-a-time policy.
+      2. Dispatch file summary jobs (highest priority - agents are blocked waiting).
       3. Discover DAG-ready tasks and sort by priority.
       4. For each ready task, check LLM capacity and dispatch if possible.
       5. Dispatch pending research jobs.
@@ -579,6 +683,11 @@ def _tick() -> None:
     more work to that same LLM until ALL its sessions finish, then pick the next LLM.
     File summary jobs respect the same constraint (they use the same LLM as their task).
     """
+    # Do not dispatch new work once shutdown has been signalled.
+    from app.agent.llm_client import is_shutting_down
+    if is_shutting_down():
+        return
+
     # Lazy imports to avoid circular deps at module load
     from app.agent.dag import DAGResolver
     from app.database import get_all_tasks, get_task, get_llm, get_compute_node
@@ -595,8 +704,8 @@ def _tick() -> None:
     #     Two separate caps are enforced on a ComputeNode:
     #       node_loaded_counts[node_id]  = distinct LLMs currently active (for max_loaded_models)
     #       node_session_counts[node_id] = total sessions across all LLMs  (for max_parallel_sessions)
-    #     max_loaded_models  — how many different model weights can reside in VRAM simultaneously
-    #     max_parallel_sessions — total concurrent request slots across all loaded models
+    #     max_loaded_models  - how many different model weights can reside in VRAM simultaneously
+    #     max_parallel_sessions - total concurrent request slots across all loaded models
     _llm_node_cache: dict[int, int | None] = {}   # llm_id -> compute_node_id (or None)
     _node_obj_cache: dict[int, object] = {}        # node_id -> ComputeNode object
     _node_active_llms: dict[int, set[int]] = defaultdict(set)  # node_id -> {llm_ids with active sessions}
@@ -632,9 +741,9 @@ def _tick() -> None:
         active_llm_ids.update(_external_sessions.values())
     allowed_llm_id: int | None = next(iter(active_llm_ids)) if active_llm_ids else None
     if allowed_llm_id is not None:
-        logger.debug("[scheduler] One-LLM policy: pinned to LLM %d.", allowed_llm_id)
+        logger.debug(f"[{AGENT_NAME}] One-LLM policy: pinned to LLM %d.", allowed_llm_id)
 
-    # 2. File summary jobs first — blocked agents are waiting on these.
+    # 2. File summary jobs first - blocked agents are waiting on these.
     #    Pass allowed_llm_id and node-state dicts so they respect all capacity caps.
     allowed_llm_id = _dispatch_file_summary_jobs(
         allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
@@ -667,7 +776,7 @@ def _tick() -> None:
             if existing:
                 latest_outcome = existing[0].outcome
                 if latest_outcome in ("passed", "subdivide"):
-                    continue  # already handled — don't re-run intake
+                    continue  # already handled - don't re-run intake
                 # Rejected / needs_research / etc.: retry after cooldown
                 if task_id in _rejection_cooldowns:
                     if time.time() - _rejection_cooldowns[task_id] < _REJECTION_RETRY_COOLDOWN:
@@ -678,7 +787,7 @@ def _tick() -> None:
             if task_id in _active_sessions and _active_sessions[task_id].is_alive():
                 continue
 
-        # Cooldown after failure — don't retry for 60s
+        # Cooldown after failure - don't retry for 60s
         if task_id in _failed_cooldowns:
             if time.time() - _failed_cooldowns[task_id] < _FAIL_COOLDOWN_SECONDS:
                 continue
@@ -698,14 +807,14 @@ def _tick() -> None:
         # Pin to this LLM for the rest of this tick.
         if allowed_llm_id is None:
             allowed_llm_id = llm.id
-            logger.info("[scheduler] One-LLM policy: pinning to LLM %d (%s).", llm.id, llm.model)
+            logger.info(f"[{AGENT_NAME}] One-LLM policy: pinning to LLM %d (%s).", llm.id, llm.model)
 
         # Budget pre-flight: skip if worst-case cost exceeds remaining budget
         from app.database import budget_has_capacity
         worst = _estimate_worst_case_microcents(db_task.llm_id, db_task.budget_id)
         if worst > 0 and not budget_has_capacity(db_task.budget_id, worst):
             logger.info(
-                "[scheduler] Skipping task '%s' — budget %s insufficient (%d µ¢ worst-case).",
+                f"[{AGENT_NAME}] Skipping task '%s' - budget %s insufficient (%d µ¢ worst-case).",
                 task_id, db_task.budget_id, worst,
             )
             from app.database import append_task_history
@@ -722,7 +831,7 @@ def _tick() -> None:
             project_path = _get_project_path(db_task.project)
             if project_path is None:
                 logger.warning(
-                    "Task '%s' project '%s' has no path — git tools use PROJECT_ROOT.",
+                    "Task '%s' project '%s' has no path - git tools use PROJECT_ROOT.",
                     task_id, db_task.project,
                 )
 
@@ -749,7 +858,17 @@ def _tick() -> None:
         with _active_sessions_lock:
             _active_sessions[task_id] = thread
             _session_llm_ids[task_id] = llm.id
-        thread.start()
+        try:
+            thread.start()
+        except Exception:
+            logger.exception("Failed to start thread for task '%s'.", task_id)
+            with _active_sessions_lock:
+                _active_sessions.pop(task_id, None)
+                _session_llm_ids.pop(task_id, None)
+            with _llm_counts_lock:
+                _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
+            # local tick counters (node_active_counts, _node_session_counts) aren't
+            # corrected here, but they only affect the remainder of this tick.
 
     # 5. Dispatch pending research jobs (respects one-LLM policy + full capacity caps)
     _dispatch_research_jobs(
@@ -774,18 +893,28 @@ def _dispatch_file_summary_jobs(
     node_obj_cache: "dict[int, Any]",
     llm_node_cache: "dict[int, int | None]",
 ) -> "int | None":
-    """Dispatch pending file summary jobs — top priority, agents are blocked waiting.
+    """Dispatch pending file summary jobs - top priority, agents are blocked waiting.
 
     Respects the one-LLM-at-a-time policy and full node/LLM capacity caps.
     Returns the (possibly updated) allowed_llm_id so the caller can propagate
     the pin to subsequent dispatch phases.
     """
-    from app.database import get_pending_file_summary_jobs, update_file_summary_job, get_llm
+    from app.database import get_pending_file_summary_jobs, update_file_summary_job, get_llm, get_task as _get_task
 
     pending = get_pending_file_summary_jobs(limit=20)
     for job in pending:
         if not job.llm_id:
             continue
+
+        # Throttling: Skip projects with recent failures/rescues
+        if job.task_id:
+            task = _get_task(job.task_id)
+            if task and task.project and _is_project_in_failure_cooldown(task.project):
+                logger.debug(
+                    "Skipping file_summary job %d - project '%s' is in failure cooldown.",
+                    job.id, task.project,
+                )
+                continue
 
         job_key = f"file-summary-{job.id}"
         with _active_sessions_lock:
@@ -819,6 +948,7 @@ def _dispatch_file_summary_jobs(
         with _active_sessions_lock:
             _active_sessions[job_key] = thread
             _session_llm_ids[job_key] = llm.id
+            _session_titles[job_key] = f"File Summary: {os.path.basename(job.file_path)}"
         thread.start()
 
     return allowed_llm_id
@@ -864,19 +994,32 @@ def _run_file_summary_job(job: Any, llm: Any) -> None:
             completion_tokens=result.get('completion_tokens', 0),
         )
         logger.debug("file_summary job %d completed (sha1=%s…)", job.id, job.sha1_hash[:8])
+    except ShutdownError:
+        logger.info("File summary job %d aborted due to server shutdown.", job.id)
+        update_file_summary_job(job.id, status='failed')
     except Exception:
         logger.exception("File summary job %d failed.", job.id)
         update_file_summary_job(job.id, status='failed')
+        if job.task_id:
+            from app.database import get_task as _get_task
+            task = _get_task(job.task_id)
+            if task and task.project:
+                _record_project_failure(task.project)
     finally:
+        # Release slot and signal BEFORE loop cleanup - shutdown_asyncgens() can
+        # hang indefinitely on unclosed streaming generators, which would leave
+        # _llm_session_counts permanently incremented and starve the scheduler.
+        with _llm_counts_lock:
+            _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
+        signal_completion(completion_key)
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
         except Exception:
             pass
-        loop.close()
-        with _llm_counts_lock:
-            _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
-        # Always signal — even on failure — so waiters never hang
-        signal_completion(completion_key)
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 def _dispatch_research_jobs(
@@ -890,11 +1033,20 @@ def _dispatch_research_jobs(
 
     Respects the one-LLM-at-a-time policy and full node/LLM capacity caps.
     """
-    from app.database import get_pending_research_jobs, update_research_job, get_llm
+    from app.database import get_pending_research_jobs, update_research_job, get_llm, get_task as _get_task
 
     pending = get_pending_research_jobs(limit=10)
     for job in pending:
         if not job.llm_id:
+            continue
+
+        # Throttling: Skip projects with recent failures/rescues
+        task = _get_task(job.task_id)
+        if task and task.project and _is_project_in_failure_cooldown(task.project):
+            logger.debug(
+                "Skipping research job %d - project '%s' is in failure cooldown.",
+                job.id, task.project,
+            )
             continue
 
         job_key = f"research-{job.id}"
@@ -925,6 +1077,7 @@ def _dispatch_research_jobs(
         with _active_sessions_lock:
             _active_sessions[job_key] = thread
             _session_llm_ids[job_key] = llm.id
+            _session_titles[job_key] = f"Research: {job.question[:60]}..." if len(job.question) > 60 else f"Research: {job.question}"
         thread.start()
 
 
@@ -965,17 +1118,25 @@ def _run_research_job(job: Any, llm: Any) -> None:
             prompt_tokens=result.prompt_tokens,
             completion_tokens=result.completion_tokens,
         )
+    except ShutdownError:
+        logger.info("Research job %d aborted due to server shutdown.", job.id)
+        update_research_job(job.id, status="failed")
     except Exception:
         logger.exception("Research job %d failed in scheduler.", job.id)
         update_research_job(job.id, status="failed")
+        if task and task.project:
+            _record_project_failure(task.project)
     finally:
+        with _llm_counts_lock:
+            _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
         except Exception:
             pass
-        loop.close()
-        with _llm_counts_lock:
-            _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 def _dispatch_arch_gen_jobs(
@@ -985,7 +1146,7 @@ def _dispatch_arch_gen_jobs(
     node_obj_cache: "dict[int, Any]",
     llm_node_cache: "dict[int, int | None]",
 ) -> None:
-    """Dispatch pending arch gen jobs — fire-and-forget card generation from file summaries.
+    """Dispatch pending arch gen jobs - fire-and-forget card generation from file summaries.
 
     Lower priority than research (1.0 vs 0.0).  Respects the one-LLM-at-a-time
     policy and full node/LLM capacity caps.
@@ -995,6 +1156,14 @@ def _dispatch_arch_gen_jobs(
     pending = get_pending_arch_gen_jobs(limit=5)
     for job in pending:
         if not job.llm_id:
+            continue
+
+        # Throttling: Skip projects with recent failures/rescues
+        if _is_project_in_failure_cooldown(job.project):
+            logger.debug(
+                "Skipping arch_gen job %d - project '%s' is in failure cooldown.",
+                job.id, job.project,
+            )
             continue
 
         job_key = f"arch-gen-{job.id}"
@@ -1027,6 +1196,7 @@ def _dispatch_arch_gen_jobs(
         with _active_sessions_lock:
             _active_sessions[job_key] = thread
             _session_llm_ids[job_key] = llm.id
+            _session_titles[job_key] = f"Arch Gen: {job.project} ({job.category})"
         thread.start()
 
 
@@ -1059,17 +1229,24 @@ def _run_arch_gen_job(job: Any, llm: Any) -> None:
             completion_tokens=result.get('completion_tokens', 0),
         )
         logger.debug("[arch_gen] job %d completed (project=%s category=%s).", job.id, job.project, job.category)
+    except ShutdownError:
+        logger.info("[arch_gen] job %d aborted due to server shutdown.", job.id)
+        update_arch_gen_job(job.id, status='failed')
     except Exception:
         logger.exception("[arch_gen] job %d failed.", job.id)
         update_arch_gen_job(job.id, status='failed')
+        _record_project_failure(job.project)
     finally:
+        with _llm_counts_lock:
+            _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
         except Exception:
             pass
-        loop.close()
-        with _llm_counts_lock:
-            _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 def _dispatch_stranded_subdivisions(
@@ -1106,7 +1283,7 @@ def _dispatch_stranded_subdivisions(
         if ttype not in ("idea", "subdividing"):
             continue
         if child_counts.get(tid, 0) > 0:
-            continue  # Has children — not stranded
+            continue  # Has children - not stranded
 
         stored_result_str: str | None = None
 
@@ -1157,7 +1334,7 @@ def _dispatch_stranded_subdivisions(
             stored_result = {"outcome": "subdivide", "votes": []}
 
         logger.info(
-            "[scheduler] Dispatching subdivision recovery for stranded task '%s' (type=%s).",
+            f"[{AGENT_NAME}] Dispatching subdivision recovery for stranded task '%s' (type=%s).",
             tid, ttype,
         )
 
@@ -1170,6 +1347,7 @@ def _dispatch_stranded_subdivisions(
         with _active_sessions_lock:
             _active_sessions[recovery_key] = thread
             _session_llm_ids[recovery_key] = llm.id
+            _session_titles[recovery_key] = f"Subdivision Recovery: {tid}"
         thread.start()
 
 
@@ -1183,27 +1361,32 @@ def _run_subdivision_recovery(task_id: str, llm: Any, stored_result: dict) -> No
     try:
         task = get_task(task_id)
         if not task:
-            logger.warning("[scheduler] Subdivision recovery: task '%s' not found.", task_id)
+            logger.warning(f"[{AGENT_NAME}] Subdivision recovery: task '%s' not found.", task_id)
             return
         llm_base_url = f"http://{llm.address}:{llm.port}/v1"
         _handle_subdivision_outcome(
             task, stored_result, llm_base_url, llm.model, llm.max_context, loop
         )
-        logger.info("[scheduler] Subdivision recovery complete for task '%s'.", task_id)
+        logger.info(f"[{AGENT_NAME}] Subdivision recovery complete for task '%s'.", task_id)
+    except ShutdownError:
+        logger.info(f"[{AGENT_NAME}] Subdivision recovery for task '%s' aborted due to server shutdown.", task_id)
     except Exception:
         _failed_cooldowns[task_id] = time.time()
         logger.exception(
-            "[scheduler] Subdivision recovery failed for task '%s' (cooldown %ds).",
+            f"[{AGENT_NAME}] Subdivision recovery failed for task '%s' (cooldown %ds).",
             task_id, int(_FAIL_COOLDOWN_SECONDS),
         )
     finally:
+        with _llm_counts_lock:
+            _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
         except Exception:
             pass
-        loop.close()
-        with _llm_counts_lock:
-            _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, project_path: str | None = None) -> None:
@@ -1220,6 +1403,8 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
 
         if task_type == "idea":
             _run_intake(task_id, llm_base_url, llm_model, max_context, project_path)
+        elif task_type == "planning":
+            _run_planning_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
         elif task_type == "indev":
             _run_dev_orchestrator_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
         elif task_type == "conceptual_review":
@@ -1230,6 +1415,8 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
             _run_full_review_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
         else:
             _run_maestro_loop(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
+    except ShutdownError:
+        logger.info("Task '%s' dispatch aborted due to server shutdown.", task_id)
     except Exception:
         _failed_cooldowns[task_id] = time.time()
         logger.exception("Task '%s' failed in scheduler dispatch (cooldown %ds).", task_id, int(_FAIL_COOLDOWN_SECONDS))
@@ -1278,7 +1465,14 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
                 project=task.project or None,  # Must be configured or pipeline will fail
             )
         )
+    except ShutdownError:
+        logger.info("[intake] Task '%s' aborted due to server shutdown.", task_id)
+        return
+    except Exception:
+        logger.exception("[intake] Pipeline for '%s' failed.", task_id)
+        return
 
+    try:
         # Persist results
         create_transition_result(
             task_id=task_id,
@@ -1312,7 +1506,7 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
             _handle_subdivision_outcome(task, result, llm_base_url, llm_model, max_context, loop)
             logger.info("Task '%s' intake result: subdivide (subdivision dispatched via scheduler).", task_id)
         else:
-            # Rejected — count how many consecutive non-passing results this task has.
+            # Rejected - count how many consecutive non-passing results this task has.
             # After _MAX_REJECTIONS_BEFORE_SUBDIVIDE attempts, force subdivision so the
             # idea is broken into smaller pieces that can each be researched independently.
             # Otherwise, schedule a retry after _REJECTION_RETRY_COOLDOWN seconds.
@@ -1324,7 +1518,7 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
             )
             if rejection_count >= _MAX_REJECTIONS_BEFORE_SUBDIVIDE:
                 logger.info(
-                    "Task '%s' rejected %d time(s) — forcing subdivision.",
+                    "Task '%s' rejected %d time(s) - forcing subdivision.",
                     task_id, rejection_count,
                 )
                 # Write a subdivide transition result so _dispatch_stranded_subdivisions
@@ -1347,16 +1541,101 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
             else:
                 _rejection_cooldowns[task_id] = time.time()
                 logger.info(
-                    "Task '%s' rejected (attempt %d/%d) — retry in %ds.",
+                    "Task '%s' rejected (attempt %d/%d) - retry in %ds.",
                     task_id, rejection_count, _MAX_REJECTIONS_BEFORE_SUBDIVIDE,
                     int(_REJECTION_RETRY_COOLDOWN),
                 )
     finally:
         try:
-            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
         except Exception:
             pass
-        loop.close()
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
+                       max_context: int | None = None,
+                       llm_id: int | None = None,
+                       budget_id: int | None = None,
+                       project_path: str | None = None) -> None:
+    """Run the planning pipeline for a PLANNING task."""
+    from app.agent.planning import run_planning_pipeline
+    from app.agent.planning_gate import run_planning_gate
+    from app.database import update_task, get_task, get_all_tasks, create_transition_result, task_to_dict
+
+    task = get_task(task_id)
+    if not task:
+        return
+    all_tasks = [task_to_dict(t) for t in get_all_tasks()]
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        # 1. Run planning pipeline
+        result = loop.run_until_complete(
+            run_planning_pipeline(
+                task_id=task_id,
+                task_title=task.title,
+                task_description=task.description or "",
+                all_tasks=all_tasks,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                max_context=max_context,
+                project_path=project_path,
+            )
+        )
+
+        # 2. Store transition result
+        create_transition_result(
+            task_id=task_id,
+            transition="planning_to_indev",
+            outcome=result.get("outcome", "unknown"),
+            vote_summary=result,
+            total_prompt_tokens=result.get("total_prompt_tokens", 0),
+            total_completion_tokens=result.get("total_completion_tokens", 0),
+        )
+
+        if result.get("outcome") == "passed":
+            # 3. Run planning gate
+            gate_result = loop.run_until_complete(
+                run_planning_gate(
+                    task_id=task_id,
+                    planning_result=result,
+                    all_tasks=all_tasks,
+                    max_context=max_context,
+                    llm_base_url=llm_base_url,
+                    llm_model=llm_model,
+                    llm_id=llm_id,
+                    budget_id=budget_id,
+                    project_path=project_path,
+                )
+            )
+            if gate_result.get("passed"):
+                update_task(task_id, type="indev")
+                logger.info("[planning] Task '%s' advanced to IN DEV.", task_id)
+            else:
+                logger.warning("[planning] Task '%s' failed planning gate.", task_id)
+        else:
+            logger.info("[planning] Task '%s' planning result: %s", task_id, result.get('outcome'))
+
+    except ShutdownError:
+        logger.info("[planning] Pipeline for '%s' aborted due to server shutdown.", task_id)
+    except Exception:
+        logger.exception("[planning] Pipeline for '%s' failed.", task_id)
+    finally:
+        try:
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
@@ -1366,6 +1645,7 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
                       project_path: str | None = None) -> None:
     """Run the MaestroLoop for a PLANNING/DEVELOPMENT task."""
     from app.agent.loop import MaestroLoop
+    from app.database import update_task, get_task
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -1379,13 +1659,69 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
             budget_id=budget_id,
             project_path=project_path,
         )
-        loop.run_until_complete(maestro.run())
+        result = loop.run_until_complete(maestro.run())
+
+        # Handle terminal transition
+        if result.status == "ACCEPTED":
+            task = get_task(task_id)
+            if not task:
+                return
+
+            current_type = (task.type or "").lower()
+            if current_type == "planning":
+                update_task(task_id, type="indev")
+                logger.info("Task '%s' advanced from PLANNING to INDEV via scheduler.", task_id)
+            elif current_type == "indev":
+                # MaestroLoop sometimes runs for indev too if called directly or via fallback
+                update_task(task_id, type="conceptual_review")
+                logger.info("Task '%s' advanced from INDEV to CONCEPTUAL REVIEW via scheduler.", task_id)
+            else:
+                logger.info("Task '%s' reached ACCEPTED but current type '%s' has no auto-transition.", task_id, current_type)
+
+        elif result.status == "REVERT_TO_DESIGN":
+            update_task(task_id, type="planning")
+            _record_demotion_inline(task_id, "indev", "planning", result.final_message or "Agent requested revert")
+            logger.warning("Task '%s' reverted to PLANNING via scheduler: %s", task_id, result.final_message)
+
+        elif result.status in ("MAX_TURNS", "ERROR"):
+            # Agent exhausted turns or encountered error - still advance task to prevent infinite loops
+            task = get_task(task_id)
+            if not task:
+                return
+
+            current_type = (task.type or "").lower()
+            if current_type == "planning":
+                update_task(task_id, type="indev")
+                logger.warning("Task '%s' advanced from PLANNING to INDEV (max_turns/error: %s).", task_id, result.status)
+            elif current_type == "indev":
+                update_task(task_id, type="conceptual_review")
+                logger.warning("Task '%s' advanced from INDEV to CONCEPTUAL REVIEW (max_turns/error: %s).", task_id, result.status)
+            else:
+                logger.warning("Task '%s' reached terminal state (%s) but current type '%s' has no auto-transition.", task_id, result.status, current_type)
+
+    except ShutdownError:
+        logger.info(f"[{AGENT_NAME}] MaestroLoop for task '%s' aborted due to server shutdown.", task_id)
+    except Exception as exc:
+        logger.exception("MaestroLoop failed for task '%s': %s", task_id, exc)
+        # Even on exception, try to advance the task to prevent infinite loops
+        task = get_task(task_id)
+        if task:
+            current_type = (task.type or "").lower()
+            if current_type == "planning":
+                update_task(task_id, type="indev")
+                logger.warning("Task '%s' advanced from PLANNING to INDEV (exception).", task_id)
+            elif current_type == "indev":
+                update_task(task_id, type="conceptual_review")
+                logger.warning("Task '%s' advanced from INDEV to CONCEPTUAL REVIEW (exception).", task_id)
     finally:
         try:
-            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
         except Exception:
             pass
-        loop.close()
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
@@ -1403,7 +1739,9 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
 
     planning_result_obj = get_planning_result(task_id)
     if not planning_result_obj:
-        logger.warning("No planning result for task '%s', skipping.", task_id)
+        logger.warning("No planning result for task '%s', demoting to planning.", task_id)
+        update_task(task_id, type="planning")
+        _record_demotion_inline(task_id, "indev", "planning", "Missing planning results")
         return
 
     planning_result = {
@@ -1433,12 +1771,21 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
         else:
             update_task(task_id, type="planning")
             logger.info("Task '%s' reverted to PLANNING: %s", task_id, result.get("error_detail"))
+    except ShutdownError:
+        logger.info(f"[{AGENT_NAME}] Dev orchestrator for task '%s' aborted due to server shutdown.", task_id)
+    except Exception:
+        logger.exception(f"[{AGENT_NAME}] Dev orchestrator for task '%s' failed.", task_id)
+        update_task(task_id, type="planning")
+        _record_demotion_inline(task_id, "indev", "planning", "Exception in dev orchestrator")
     finally:
         try:
-            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
         except Exception:
             pass
-        loop.close()
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
@@ -1463,14 +1810,18 @@ def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
         return
 
     planning_result_obj = get_planning_result(task_id)
-    planning_result = {}
-    if planning_result_obj:
-        planning_result = {
-            "file_manifest": _json.loads(planning_result_obj.file_manifest or "[]"),
-            "dependency_graph": _json.loads(planning_result_obj.dependency_graph or "{}"),
-            "implementation_steps": _json.loads(planning_result_obj.implementation_steps or "[]"),
-            "test_strategy": _json.loads(planning_result_obj.test_strategy or "[]"),
-        }
+    if not planning_result_obj:
+        logger.warning("No planning result for task '%s' in conceptual review. Demoting to indev.", task_id)
+        update_task(task_id, type="indev")
+        _record_demotion_inline(task_id, "conceptual_review", "indev", "Missing planning results")
+        return
+
+    planning_result = {
+        "file_manifest": _json.loads(planning_result_obj.file_manifest or "[]"),
+        "dependency_graph": _json.loads(planning_result_obj.dependency_graph or "{}"),
+        "implementation_steps": _json.loads(planning_result_obj.implementation_steps or "[]"),
+        "test_strategy": _json.loads(planning_result_obj.test_strategy or "[]"),
+    }
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -1502,12 +1853,21 @@ def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
             update_task(task_id, type="indev")
             _record_demotion_inline(task_id, "conceptual_review", "indev", result.get("summary", ""))
             logger.info("Task '%s' demoted to INDEV from conceptual review via scheduler.", task_id)
+    except ShutdownError:
+        logger.info(f"[{AGENT_NAME}] Conceptual review for task '%s' aborted due to server shutdown.", task_id)
+    except Exception:
+        logger.exception(f"[{AGENT_NAME}] Conceptual review for task '%s' failed.", task_id)
+        update_task(task_id, type="indev")
+        _record_demotion_inline(task_id, "conceptual_review", "indev", "Exception in conceptual review")
     finally:
         try:
-            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
         except Exception:
             pass
-        loop.close()
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 def _run_optimization_security_task(task_id: str, llm_base_url: str, llm_model: str,
@@ -1577,12 +1937,21 @@ def _run_optimization_security_task(task_id: str, llm_base_url: str, llm_model: 
             update_task(task_id, type=demotion)
             _record_demotion_inline(task_id, "security", demotion, sec_result.get("summary", ""))
             logger.warning("[security] Task '%s' demoted to %s via scheduler.", task_id, demotion)
+    except ShutdownError:
+        logger.info(f"[{AGENT_NAME}] Optimization/Security for task '%s' aborted due to server shutdown.", task_id)
+    except Exception:
+        logger.exception(f"[{AGENT_NAME}] Optimization/Security for task '%s' failed.", task_id)
+        update_task(task_id, type="indev")
+        _record_demotion_inline(task_id, "optimization", "indev", "Exception in optimization/security")
     finally:
         try:
-            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
         except Exception:
             pass
-        loop.close()
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 def _run_full_review_task(task_id: str, llm_base_url: str, llm_model: str,
@@ -1657,16 +2026,25 @@ def _run_full_review_task(task_id: str, llm_base_url: str, llm_model: str,
             update_task(task_id, type=demotion)
             _record_demotion_inline(task_id, "full_review", demotion, result.get("summary", ""))
             logger.warning("[full_review] Task '%s' demoted to %s via scheduler.", task_id, demotion)
+    except ShutdownError:
+        logger.info(f"[{AGENT_NAME}] Full review for task '%s' aborted due to server shutdown.", task_id)
+    except Exception:
+        logger.exception(f"[{AGENT_NAME}] Full review for task '%s' failed.", task_id)
+        update_task(task_id, type="indev")
+        _record_demotion_inline(task_id, "full_review", "indev", "Exception in full review")
     finally:
         try:
-            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
         except Exception:
             pass
-        loop.close()
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 def _record_demotion_inline(task_id: str, from_stage: str, to_stage: str, reason: str) -> None:
-    """Record a demotion event — scheduler-local version (avoids importing from main.py)."""
+    """Record a demotion event - scheduler-local version (avoids importing from main.py)."""
     from datetime import datetime, timezone
     from app.database import get_task, update_task
     task = get_task(task_id)
@@ -1683,7 +2061,7 @@ def _record_demotion_inline(task_id: str, from_stage: str, to_stage: str, reason
 
 
 def _check_completion_rollup_inline(task_id: str) -> None:
-    """Mirror of main._check_completion_rollup — avoids circular import."""
+    """Mirror of main._check_completion_rollup - avoids circular import."""
     import app.database as db
     task = db.get_task(task_id)
     if not task or not task.parent_task_id:
@@ -1706,12 +2084,31 @@ def _check_completion_rollup_inline(task_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _cleanup_finished() -> None:
-    """Remove sessions whose threads have completed."""
+    """Remove sessions whose threads have completed and re-sync capacity counts."""
     with _active_sessions_lock:
         finished = [tid for tid, t in _active_sessions.items() if not t.is_alive()]
         for tid in finished:
             del _active_sessions[tid]
             _session_llm_ids.pop(tid, None)
+            _session_titles.pop(tid, None)
+
+    # Re-sync _llm_session_counts from the ground truth (live threads + external registry)
+    new_counts: dict[int, int] = defaultdict(int)
+
+    with _active_sessions_lock:
+        for tid, llm_id in _session_llm_ids.items():
+            # If the thread is in _active_sessions and is_alive, it counts.
+            # (Dead threads were just removed from _session_llm_ids above).
+            if tid in _active_sessions and _active_sessions[tid].is_alive():
+                new_counts[llm_id] += 1
+
+    with _external_sessions_lock:
+        for llm_id in _external_sessions.values():
+            new_counts[llm_id] += 1
+
+    with _llm_counts_lock:
+        _llm_session_counts.clear()
+        _llm_session_counts.update(new_counts)
 
 
 def _rescue_stale_jobs() -> None:
@@ -1719,11 +2116,11 @@ def _rescue_stale_jobs() -> None:
 
     Two categories rescued each tick:
 
-    1. Orphaned running jobs — status='running' but no live thread in _active_sessions.
+    1. Orphaned running jobs - status='running' but no live thread in _active_sessions.
        Happens when the server process crashed mid-job. Reset immediately to 'pending'
        so they are picked up in the same tick's dispatch phase.
 
-    2. Failed jobs past cooldown — status='failed' with completed_at older than the
+    2. Failed jobs past cooldown - status='failed' with completed_at older than the
        per-type retry cooldown. Reset to 'pending' so they get another attempt.
        completed_at is cleared so the auto-set logic in update_*_job fires correctly
        on the next terminal transition.
@@ -1741,23 +2138,34 @@ def _rescue_stale_jobs() -> None:
         active_keys = set(_active_sessions.keys())
 
     # --- File summary jobs ---
+    from app.database import get_task as _get_task
     for job in get_retriable_file_summary_jobs(
         failed_cooldown_seconds=_FILE_SUMMARY_RETRY_COOLDOWN
     ):
         session_key = f"file-summary-{job.id}"
         if job.status == 'running':
             if session_key in active_keys:
-                continue  # thread is alive — leave it alone
+                continue  # thread is alive - leave it alone
             logger.warning(
-                "[rescue] file_summary job %d stuck in 'running' with no thread — resetting.",
+                "[rescue] file_summary job %d stuck in 'running' with no thread - marking as failed.",
                 job.id,
             )
+            update_file_summary_job(
+                job.id, 
+                status='failed', 
+                error_message="Orphaned job rescued from 'running' status (process crash?)"
+            )
+            # Record failure for the project if possible
+            if job.task_id:
+                task = _get_task(job.task_id)
+                if task and task.project:
+                    _record_project_failure(task.project)
         else:
             logger.info(
                 "[rescue] Retrying failed file_summary job %d (was failed, cooldown elapsed).",
                 job.id,
             )
-        update_file_summary_job(job.id, status='pending', completed_at=None)
+            update_file_summary_job(job.id, status='pending', completed_at=None)
 
     # --- Research jobs ---
     for job in get_retriable_research_jobs(
@@ -1766,17 +2174,26 @@ def _rescue_stale_jobs() -> None:
         session_key = f"research-{job.id}"
         if job.status == 'running':
             if session_key in active_keys:
-                continue  # thread is alive — leave it alone
+                continue  # thread is alive - leave it alone
             logger.warning(
-                "[rescue] research job %d stuck in 'running' with no thread — resetting.",
+                "[rescue] research job %d stuck in 'running' with no thread - marking as failed.",
                 job.id,
             )
+            update_research_job(
+                job.id, 
+                status='failed', 
+                findings="Orphaned job rescued from 'running' status (process crash?)"
+            )
+            # Record failure for the project
+            task = _get_task(job.task_id)
+            if task and task.project:
+                _record_project_failure(task.project)
         else:
             logger.info(
                 "[rescue] Retrying failed research job %d (was failed, cooldown elapsed).",
                 job.id,
             )
-        update_research_job(job.id, status='pending', completed_at=None)
+            update_research_job(job.id, status='pending', completed_at=None)
 
     # --- Arch gen jobs ---
     for job in get_retriable_arch_gen_jobs(
@@ -1785,21 +2202,63 @@ def _rescue_stale_jobs() -> None:
         session_key = f"arch-gen-{job.id}"
         if job.status == 'running':
             if session_key in active_keys:
-                continue  # thread is alive — leave it alone
+                continue  # thread is alive - leave it alone
             logger.warning(
-                "[rescue] arch_gen job %d stuck in 'running' with no thread — resetting.",
+                "[rescue] arch_gen job %d stuck in 'running' with no thread - marking as failed.",
                 job.id,
             )
+            update_arch_gen_job(
+                job.id, 
+                status='failed', 
+                error_message="Orphaned job rescued from 'running' status (process crash?)"
+            )
+            _record_project_failure(job.project)
         else:
-            logger.info(
-                "[rescue] Retrying failed arch_gen job %d (was failed, cooldown elapsed).",
-                job.id,
-            )
-        update_arch_gen_job(job.id, status='pending', completed_at=None)
+            retry_count = getattr(job, 'retry_count', 0) or 0
+            if retry_count >= _ARCH_GEN_MAX_RETRIES:
+                logger.warning(
+                    "[rescue] arch_gen job %d (%s / %s) exhausted %d retries — abandoning.",
+                    job.id, job.project, job.category, _ARCH_GEN_MAX_RETRIES,
+                )
+                update_arch_gen_job(
+                    job.id,
+                    status='abandoned',
+                    error_message=(
+                        f"Abandoned after {_ARCH_GEN_MAX_RETRIES} failed attempts. "
+                        f"Last error: {job.error_message or 'unknown'}"
+                    ),
+                )
+                from app.database import create_inbox_message
+                create_inbox_message(
+                    subject=f"Arch Gen failed: {job.project} / {job.category}",
+                    source_type="arch_gen_failure",
+                    task_id=None,
+                    task_title=f"{job.category} Architecture ({job.project})",
+                    outcome="abandoned",
+                    data_json=json.dumps({
+                        "job_id": job.id,
+                        "project": job.project,
+                        "category": job.category,
+                        "retry_count": retry_count,
+                        "last_error": job.error_message or "unknown",
+                    }),
+                )
+            else:
+                logger.info(
+                    "[rescue] Retrying arch_gen job %d (%s / %s) — attempt %d/%d.",
+                    job.id, job.project, job.category,
+                    retry_count + 1, _ARCH_GEN_MAX_RETRIES,
+                )
+                update_arch_gen_job(
+                    job.id,
+                    status='pending',
+                    completed_at=None,
+                    retry_count=retry_count + 1,
+                )
 
 
 def _task_to_mini_dict(task: Any) -> dict:
-    """Minimal dict for DAGResolver — avoids importing task_to_dict."""
+    """Minimal dict for DAGResolver - avoids importing task_to_dict."""
     return {
         "id": task.id,
         "type": task.type,

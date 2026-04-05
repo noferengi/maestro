@@ -423,7 +423,7 @@ class MockLLM:
         return response
 
     # ------------------------------------------------------------------
-    # httpx integration — mock POST handler
+    # httpx integration - mock POST handler
     # ------------------------------------------------------------------
 
     async def handle_post(self, url: str, **kwargs) -> MagicMock:

@@ -3,7 +3,7 @@ app/agent/arch_gen_agent.py
 ---------------------------
 Generates a single architecture card for a given category by making one
 LLM call whose context is the project's existing file summaries (2 sentences
-each).  No tool use, no multi-turn — just prompt → card.
+each).  No tool use, no multi-turn - just prompt -> card.
 
 Called by the scheduler's _run_arch_gen_job() worker thread.
 """
@@ -14,9 +14,12 @@ import logging
 import os
 import re
 
-logger = logging.getLogger(__name__)
+from app.agent.llm_client import is_shutting_down, ShutdownError
 
-# Canonical list — must match ARCH_CATEGORY_COLORS keys in kanban.js
+logger = logging.getLogger(__name__)
+AGENT_NAME = "Arch Gen Agent"
+
+# Canonical list - must match ARCH_CATEGORY_COLORS keys in kanban.js
 ARCH_CATEGORIES: list[str] = [
     "Platform", "Design", "Testing", "Security", "Performance",
     "API", "Tooling", "Data", "UX", "Accessibility",
@@ -26,12 +29,12 @@ ARCH_CATEGORIES: list[str] = [
 _SYSTEM_PROMPT = (
     "You are an architecture advisor documenting a software project. "
     "Your notes are injected verbatim into AI agents as authoritative project constraints. "
-    "Be specific, concrete, and accurate — your note will be used by agents to make "
+    "Be specific, concrete, and accurate - your note will be used by agents to make "
     "implementation decisions. "
     "Write only the note text. No preamble, no title, no headings, no bullet points."
 )
 
-_USER_TEMPLATE = """\
+_USER_TEMPLATE = """
 Project: {project}
 Category: {category}
 
@@ -39,9 +42,9 @@ Below are short summaries of source files in this project (one line each):
 
 {summaries}
 
-Write a concise 2–3 sentence architecture note about the **{category}** aspects of \
-this project. The note will be injected as a constraint into all AI agents working \
-on the codebase. Focus only on {category} — be specific and actionable.\
+Write a concise 2-3 sentence architecture note about the **{category}** aspects of
+this project. The note will be injected as a constraint into all AI agents working
+on the codebase. Focus only on {category} - be specific and actionable.
 """
 
 
@@ -60,13 +63,16 @@ async def execute_arch_gen_job(
     Returns ``{"prompt_tokens": int, "completion_tokens": int}``.
     Raises on LLM error or empty response so the scheduler can mark the job failed.
     """
+    if is_shutting_down():
+        raise ShutdownError("Server is shutting down")
+
     from app.database import get_file_summaries_for_project_root, create_task
     from app.agent.llm_client import call_llm
 
     summaries = get_file_summaries_for_project_root(project_root)
     if not summaries:
         logger.warning(
-            "[arch_gen] No file summaries found for project '%s' (root=%s). "
+            f"[{AGENT_NAME}] No file summaries found for project '%s' (root=%s). "
             "Run a prewarm first.",
             project, project_root,
         )
@@ -75,9 +81,27 @@ async def execute_arch_gen_job(
             "Run a prewarm/file-summary pass first."
         )
 
+    # Filter out noise paths (venv, __pycache__, .git, node_modules, etc.)
+    # These inflate the prompt without adding architectural signal.
+    _NOISE_SEGMENTS = (
+        "/venv/", "\\venv\\",
+        "/__pycache__/", "\\__pycache__\\",
+        "/.git/", "\\.git\\",
+        "/node_modules/", "\\node_modules\\",
+        "/site-packages/", "\\site-packages\\",
+        "/dist-packages/", "\\dist-packages\\",
+        "/build/", "\\build\\",
+        "/dist/", "\\dist\\",
+        "/.tox/", "\\.tox\\",
+        "/eggs/", "\\eggs\\",
+    )
+
     lines: list[str] = []
     for row in summaries:
-        rel = _rel_path(row.file_path, project_root)
+        fp = row.file_path
+        if any(seg in fp for seg in _NOISE_SEGMENTS):
+            continue
+        rel = _rel_path(fp, project_root)
         text = _two_sentences(
             (getattr(row, 'short_summary', None) or row.summary or "").strip()
         )
@@ -85,9 +109,23 @@ async def execute_arch_gen_job(
             lines.append(f"- {rel}: {text}")
 
     if not lines:
-        raise RuntimeError("All file summaries were empty — nothing to synthesise.")
+        raise RuntimeError("All file summaries were empty - nothing to synthesise.")
 
+    # Cap the summary block to avoid overwhelming the LLM's context window.
+    # At ~4 chars/token, 40 000 chars ≈ 10 000 tokens — well within any slot budget.
+    _MAX_SUMMARY_CHARS = 40_000
     summary_block = "\n".join(lines)
+    if len(summary_block) > _MAX_SUMMARY_CHARS:
+        # Truncate to the last complete line within the cap.
+        truncated = summary_block[:_MAX_SUMMARY_CHARS]
+        last_nl = truncated.rfind("\n")
+        summary_block = truncated[:last_nl] if last_nl != -1 else truncated
+        kept = summary_block.count("\n") + 1
+        logger.warning(
+            "[%s] Summary block truncated to %d lines (%d chars) — "
+            "%d lines omitted. Increase _MAX_SUMMARY_CHARS if coverage is too low.",
+            AGENT_NAME, kept, len(summary_block), len(lines) - kept,
+        )
 
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
@@ -107,6 +145,7 @@ async def execute_arch_gen_job(
         task_id=None,
         llm_id=llm_id,
         budget_id=budget_id,
+        agent_name=AGENT_NAME,
     )
 
     body = (
@@ -130,7 +169,7 @@ async def execute_arch_gen_job(
         project=project,
     )
     logger.info(
-        "[arch_gen] Created '%s' arch card for project '%s' (%d prompt / %d completion tokens).",
+        f"[{AGENT_NAME}] Created '%s' arch card for project '%s' (%d prompt / %d completion tokens).",
         category, project, prompt_tokens, completion_tokens,
     )
 

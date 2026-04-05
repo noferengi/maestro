@@ -92,7 +92,7 @@ def test_read_file_marks_prepped(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# read_file_harder without prep — returns summary, not source
+# read_file_harder without prep - returns summary, not source
 # ---------------------------------------------------------------------------
 
 def test_read_file_harder_without_prep(tmp_path):
@@ -111,11 +111,11 @@ def test_read_file_harder_with_prep_using_end(tmp_path):
     from app.agent.tools import read_file, read_file_harder
 
     # Use a large file (>25 lines) so read_file() returns structural summary,
-    # not inline content — lines are NOT pre-served on the first call.
+    # not inline content - lines are NOT pre-served on the first call.
     content = "\n".join(f"line{i}" for i in range(1, 40)) + "\n"
     path = _make_file(tmp_path, content, name="data.txt")
 
-    read_file(path)  # prep step — structural summary only, no lines served
+    read_file(path)  # prep step - structural summary only, no lines served
     result = read_file_harder(path, start=2, end=4)
 
     assert "2: line2" in result
@@ -148,7 +148,7 @@ def test_read_file_harder_no_args_serves_next_chunk(tmp_path):
     path = _make_file(tmp_path, content, name="data.txt")
 
     read_file(path)  # structural summary only
-    result = read_file_harder(path)  # no args → serve lines 1..N
+    result = read_file_harder(path)  # no args -> serve lines 1..N
 
     assert "1: line1" in result
     assert "ERROR" not in result
@@ -181,7 +181,7 @@ def test_read_file_harder_rejects_both_end_and_count(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# ContextVar isolation — separate prepped sets per async task
+# ContextVar isolation - separate prepped sets per async task
 # ---------------------------------------------------------------------------
 
 def test_prepped_files_context_isolation(tmp_path):
@@ -310,7 +310,7 @@ def clean_session_cache():
 
 
 def test_abfs_summary_length_none_skips_enqueue(tmp_path, monkeypatch, clean_session_cache):
-    """summary_length='none' returns structural immediately — enqueue never called."""
+    """summary_length='none' returns structural immediately - enqueue never called."""
     import asyncio
     called = []
 
@@ -337,7 +337,7 @@ def test_abfs_session_cache_hit(tmp_path, clean_session_cache):
     path = _make_py_file(tmp_path)
     abs_path = __import__("os").path.normpath(__import__("os").path.abspath(path))
     stat = __import__("os").stat(abs_path)
-    # Must use the "llm" prefix — async_build_file_summary uses ("llm", path, mtime, size)
+    # Must use the "llm" prefix - async_build_file_summary uses ("llm", path, mtime, size)
     # to avoid colliding with structural entries written by build_file_summary.
     session_key = ("llm", abs_path, stat.st_mtime, stat.st_size)
 
@@ -365,7 +365,7 @@ def test_abfs_session_cache_hit(tmp_path, clean_session_cache):
 
 
 def test_abfs_db_cache_hit(tmp_path, monkeypatch, clean_session_cache):
-    """DB cache hit: enqueue returns '' → reads from DB, prepends '## Summary'."""
+    """DB cache hit: enqueue returns '' -> reads from DB, prepends '## Summary'."""
     import asyncio
     import hashlib
 
@@ -440,7 +440,7 @@ def test_abfs_cache_miss_waits_and_reads(tmp_path, monkeypatch, clean_session_ca
     )
     # No need to patch wait_for_completion: the real implementation returns True
     # immediately when the key isn't in the registry (our fake enqueue doesn't
-    # register an event, so _pending_completions.get(key) is None → True).
+    # register an event, so _pending_completions.get(key) is None -> True).
 
     class FakeSummary:
         summary = "LLM-generated summary."
@@ -520,7 +520,7 @@ def test_completion_registry_basic():
 
 
 def test_completion_registry_timeout():
-    """No signal — wait returns False."""
+    """No signal - wait returns False."""
     from app.agent.scheduler import get_or_create_completion_event, wait_for_completion, signal_completion
 
     key = "test:registry:timeout"
@@ -532,7 +532,7 @@ def test_completion_registry_timeout():
 
 
 def test_completion_registry_dedup():
-    """Same key twice — same Event, created=False on second call."""
+    """Same key twice - same Event, created=False on second call."""
     from app.agent.scheduler import get_or_create_completion_event, signal_completion
 
     key = "test:registry:dedup"
@@ -563,7 +563,7 @@ def _make_db_patch(monkeypatch, tmp_path):
 
 
 def test_enqueue_cache_hit(tmp_path, monkeypatch):
-    """File already in file_summaries — enqueue returns empty completion_key."""
+    """File already in file_summaries - enqueue returns empty completion_key."""
     db_mod = _make_db_patch(monkeypatch, tmp_path)
 
     # Write file and pre-populate cache
@@ -583,7 +583,7 @@ def test_enqueue_cache_hit(tmp_path, monkeypatch):
 
 
 def test_enqueue_creates_job(tmp_path, monkeypatch):
-    """Uncached file — creates a DB job, returns completion_key."""
+    """Uncached file - creates a DB job, returns completion_key."""
     db_mod = _make_db_patch(monkeypatch, tmp_path)
 
     p = tmp_path / "new_file.py"
@@ -613,7 +613,7 @@ def test_enqueue_creates_job(tmp_path, monkeypatch):
 
 
 def test_enqueue_dedup_shared_event(tmp_path, monkeypatch):
-    """Two calls for same uncached file — one job, shared completion event."""
+    """Two calls for same uncached file - one job, shared completion event."""
     db_mod = _make_db_patch(monkeypatch, tmp_path)
 
     p = tmp_path / "dup_file.py"
@@ -644,7 +644,7 @@ def test_enqueue_dedup_shared_event(tmp_path, monkeypatch):
 
 
 def test_execute_stores_result(tmp_path, monkeypatch):
-    """Mock call_llm — execute_file_summary stores result in file_summaries."""
+    """Mock call_llm - execute_file_summary stores result in file_summaries."""
     import asyncio
     db_mod = _make_db_patch(monkeypatch, tmp_path)
 
@@ -662,7 +662,7 @@ def test_execute_stores_result(tmp_path, monkeypatch):
     async def mock_call_llm(*args, **kwargs):
         return mock_response
 
-    # Patch call_llm on its home module — the lazy import in execute_file_summary
+    # Patch call_llm on its home module - the lazy import in execute_file_summary
     # resolves the attribute at call time, so this intercepts it.
     import app.agent.llm_client as lc
     monkeypatch.setattr(lc, "call_llm", mock_call_llm)

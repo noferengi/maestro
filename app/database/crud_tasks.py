@@ -13,6 +13,7 @@ Covers:
 """
 
 from datetime import datetime, timezone
+import json
 import logging
 
 from .session import SessionLocal, init_db_tables
@@ -402,6 +403,20 @@ def delete_task(task_id):
         (db.query(Task)
            .filter(Task.id.in_(ids_to_deactivate))
            .update({"is_active": False}, synchronize_session=False))
+
+        # Also cancel any background jobs associated with these tasks
+        from .models import ResearchJob, FileSummaryJob
+        (db.query(ResearchJob)
+           .filter(ResearchJob.task_id.in_(ids_to_deactivate),
+                   ResearchJob.status.in_(['pending', 'running']))
+           .update({"status": "cancelled", "completed_at": datetime.now(timezone.utc)},
+                   synchronize_session=False))
+        (db.query(FileSummaryJob)
+           .filter(FileSummaryJob.task_id.in_(ids_to_deactivate),
+                   FileSummaryJob.status.in_(['pending', 'running']))
+           .update({"status": "cancelled", "completed_at": datetime.now(timezone.utc)},
+                   synchronize_session=False))
+
         db.commit()
         return len(ids_to_deactivate)
     except Exception as e:
@@ -635,3 +650,38 @@ def get_descendant_tree(root_task_id):
         return results
     finally:
         db.close()
+
+
+def task_to_dict(task):
+    """Convert SQLAlchemy Task model to dictionary"""
+    llm_obj = getattr(task, 'llm_ref', None)
+    budget_obj = getattr(task, 'budget_ref', None)
+    return {
+        "id": task.id,
+        "title": task.title,
+        "type": task.type,
+        "description": task.description,
+        "owner": task.owner,
+        "tags": task.tags,
+        "content": task.content,
+        "llm_id": task.llm_id,
+        "llm_label": llm_obj.label if llm_obj else None,
+        "budget_id": task.budget_id,
+        "budget_name": budget_obj.name if budget_obj else None,
+        "history": task.history,
+        "prerequisites": getattr(task, "prerequisites", None) or [],
+        "position": task.position,
+        "project": getattr(task, "project", None) or "TheMaestro",
+        "parent_task_id": getattr(task, "parent_task_id", None),
+        "subdivision_generation": getattr(task, "subdivision_generation", 0) or 0,
+        "is_big_idea": bool(getattr(task, "is_big_idea", False)),
+        "interface_contracts": json.loads(task.interface_contracts) if getattr(task, "interface_contracts", None) else None,
+        "review_notes": getattr(task, "review_notes", None),
+        "demotion_count": getattr(task, "demotion_count", 0) or 0,
+        "demotion_history": getattr(task, "demotion_history", None),
+        "map_x": getattr(task, "map_x", None),
+        "map_y": getattr(task, "map_y", None),
+        "is_active": bool(getattr(task, "is_active", True)),
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "updated_at": task.updated_at.isoformat() if task.updated_at else None
+    }

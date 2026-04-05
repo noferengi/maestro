@@ -152,13 +152,13 @@ class TestArchiveFile:
 
 class TestGitCheckoutAllowlist:
     def test_main_branch_allowed(self, tmp_path):
-        """Checking out 'main' is in the allowlist — should not hit the branch
+        """Checking out 'main' is in the allowlist - should not hit the branch
         guard (it may still fail due to no git repo, but the error is not a
         'not permitted' guard error)."""
         token = _task_git_cwd.set(str(tmp_path))
         try:
             result = git_checkout("main")
-            # Either it succeeded or failed due to git not being initialised —
+            # Either it succeeded or failed due to git not being initialised -
             # but must NOT be a 'not permitted' guard rejection.
             assert "not permitted" not in result.lower()
         finally:

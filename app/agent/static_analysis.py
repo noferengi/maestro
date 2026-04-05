@@ -3,7 +3,7 @@ app/agent/static_analysis.py
 -----------------------------
 Deterministic static analysis of Python source files using tree-sitter.
 
-This is Stage 2a of the intake pipeline — it runs BEFORE any LLM call so
+This is Stage 2a of the intake pipeline - it runs BEFORE any LLM call so
 the LLM has ground-truth structural data (classes, functions, imports,
 dependency graph) to reason about.
 
@@ -76,7 +76,7 @@ class ProjectAnalysis:
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers — tree-sitter node walking
+# Internal helpers - tree-sitter node walking
 # ---------------------------------------------------------------------------
 
 def _child_by_type(node: Any, type_name: str) -> Any | None:
@@ -215,7 +215,7 @@ def analyze_file(file_path: str) -> FileAnalysis:
         return analysis
 
     if not file_path.endswith(".py"):
-        # Non-Python file — just acknowledge it exists.
+        # Non-Python file - just acknowledge it exists.
         return analysis
 
     try:
@@ -494,7 +494,7 @@ def _detect_cycles(graph: dict[str, list[str]]) -> list[list[str]]:
                 if neighbour not in colour:
                     continue
                 if colour[neighbour] == GREY:
-                    # Found a cycle — reconstruct it.
+                    # Found a cycle - reconstruct it.
                     cycle = [neighbour, node]
                     p = parent.get(node)
                     while p is not None and p != neighbour:
@@ -546,7 +546,7 @@ def generate_vote(analysis: ProjectAnalysis, task_description: str) -> dict[str,
                 and not fa.imports
                 and not fa.global_variables
             ):
-                # Could be an empty __init__.py — only flag if file is > 0 bytes
+                # Could be an empty __init__.py - only flag if file is > 0 bytes
                 try:
                     if os.path.getsize(fpath) > 10:
                         parse_errors.append(fpath)

@@ -14,6 +14,7 @@ wait time.
 
 import logging
 from datetime import datetime, timezone
+from sqlalchemy import or_, and_
 
 from .session import SessionLocal
 from .models import ResearchJob, FileSummaryJob, OptimizationBenchmark, ArchGenJob
@@ -65,12 +66,16 @@ def get_research_job(job_id):
 
 
 def get_pending_research_jobs(limit=10):
-    """Return pending research jobs ordered by priority ASC, created_at ASC."""
+    """Return pending research jobs ordered by priority ASC, created_at ASC.
+    Only returns jobs for active tasks.
+    """
+    from .models import Task
     db = SessionLocal()
     try:
         return (
             db.query(ResearchJob)
-            .filter(ResearchJob.status == 'pending')
+            .join(Task, ResearchJob.task_id == Task.id)
+            .filter(ResearchJob.status == 'pending', Task.is_active == True)
             .order_by(ResearchJob.priority, ResearchJob.created_at)
             .limit(limit)
             .all()
@@ -123,10 +128,16 @@ def get_research_jobs_for_task(task_id):
 
 
 def count_pending_research_jobs():
-    """Return the number of pending research jobs."""
+    """Return the number of pending research jobs for active tasks."""
+    from .models import Task
     db = SessionLocal()
     try:
-        return db.query(ResearchJob).filter(ResearchJob.status == 'pending').count()
+        return (
+            db.query(ResearchJob)
+            .join(Task, ResearchJob.task_id == Task.id)
+            .filter(ResearchJob.status == 'pending', Task.is_active == True)
+            .count()
+        )
     except Exception as e:
         logger.error("Error counting pending research jobs: %s", e)
         return 0
@@ -139,6 +150,7 @@ def get_retriable_research_jobs(
     limit: int = 10,
 ) -> "list[ResearchJob]":
     """Return research jobs that should be retried.
+    Only returns jobs for active tasks.
 
     Includes:
     - Jobs with status='failed' whose completed_at is older than failed_cooldown_seconds.
@@ -147,13 +159,15 @@ def get_retriable_research_jobs(
       (Caller checks _active_sessions; orphaned ones get reset to 'pending'.)
     """
     from datetime import timedelta, timezone
-    from sqlalchemy import or_, and_
+    from .models import Task
     db = SessionLocal()
     try:
         cutoff = datetime.utcnow() - timedelta(seconds=failed_cooldown_seconds)
         return (
             db.query(ResearchJob)
+            .join(Task, ResearchJob.task_id == Task.id)
             .filter(
+                Task.is_active == True,
                 or_(
                     and_(
                         ResearchJob.status == 'failed',
@@ -214,12 +228,19 @@ def create_file_summary_job(
 
 
 def get_pending_file_summary_jobs(limit: int = 20) -> "list[FileSummaryJob]":
-    """Return pending file summary jobs ordered by priority ASC, created_at ASC."""
+    """Return pending file summary jobs ordered by priority ASC, created_at ASC.
+    Only returns jobs for active tasks (or jobs not linked to a task).
+    """
+    from .models import Task
     db = SessionLocal()
     try:
         return (
             db.query(FileSummaryJob)
-            .filter(FileSummaryJob.status == 'pending')
+            .outerjoin(Task, FileSummaryJob.task_id == Task.id)
+            .filter(
+                FileSummaryJob.status == 'pending',
+                or_(FileSummaryJob.task_id == None, Task.is_active == True)
+            )
             .order_by(FileSummaryJob.priority.asc(), FileSummaryJob.created_at.asc())
             .limit(limit)
             .all()
@@ -265,10 +286,19 @@ def update_file_summary_job(job_id: int, **kwargs) -> None:
 
 
 def count_pending_file_summary_jobs() -> int:
-    """Return the number of pending file summary jobs."""
+    """Return the number of pending file summary jobs for active tasks."""
+    from .models import Task
     db = SessionLocal()
     try:
-        return db.query(FileSummaryJob).filter(FileSummaryJob.status == 'pending').count()
+        return (
+            db.query(FileSummaryJob)
+            .outerjoin(Task, FileSummaryJob.task_id == Task.id)
+            .filter(
+                FileSummaryJob.status == 'pending',
+                or_(FileSummaryJob.task_id == None, Task.is_active == True)
+            )
+            .count()
+        )
     except Exception as exc:
         logger.error("Error counting pending file summary jobs: %s", exc)
         return 0
@@ -281,6 +311,7 @@ def get_retriable_file_summary_jobs(
     limit: int = 20,
 ) -> "list[FileSummaryJob]":
     """Return file summary jobs that should be retried.
+    Only returns jobs for active tasks (or jobs not linked to a task).
 
     Includes:
     - Jobs with status='failed' whose completed_at is older than failed_cooldown_seconds.
@@ -289,13 +320,15 @@ def get_retriable_file_summary_jobs(
       (Caller checks _active_sessions; orphaned ones get reset to 'pending'.)
     """
     from datetime import timedelta
-    from sqlalchemy import or_, and_
+    from .models import Task
     db = SessionLocal()
     try:
         cutoff = datetime.utcnow() - timedelta(seconds=failed_cooldown_seconds)
         return (
             db.query(FileSummaryJob)
+            .outerjoin(Task, FileSummaryJob.task_id == Task.id)
             .filter(
+                or_(FileSummaryJob.task_id == None, Task.is_active == True),
                 or_(
                     and_(
                         FileSummaryJob.status == 'failed',
@@ -393,11 +426,15 @@ def create_arch_gen_job(
 
 
 def get_pending_arch_gen_jobs(limit: int = 10) -> "list[ArchGenJob]":
-    """Return pending arch gen jobs ordered by priority ASC, created_at ASC."""
+    """Return pending arch gen jobs ordered by priority ASC, created_at ASC.
+    Only returns jobs for projects that still exist in the registry.
+    """
+    from .models import Project
     db = SessionLocal()
     try:
         return (
             db.query(ArchGenJob)
+            .join(Project, ArchGenJob.project == Project.name)
             .filter(ArchGenJob.status == 'pending')
             .order_by(ArchGenJob.priority.asc(), ArchGenJob.created_at.asc())
             .limit(limit)
@@ -431,18 +468,20 @@ def get_retriable_arch_gen_jobs(
     limit: int = 10,
 ) -> "list[ArchGenJob]":
     """Return arch gen jobs that should be retried.
+    Only returns jobs for projects that still exist in the registry.
 
     Includes:
     - Jobs with status='failed' whose completed_at is older than failed_cooldown_seconds.
     - Jobs with status='running' regardless of age (orphaned by a crash).
     """
     from datetime import timedelta
-    from sqlalchemy import or_, and_
+    from .models import Project
     db = SessionLocal()
     try:
         cutoff = datetime.utcnow() - timedelta(seconds=failed_cooldown_seconds)
         return (
             db.query(ArchGenJob)
+            .join(Project, ArchGenJob.project == Project.name)
             .filter(
                 or_(
                     and_(

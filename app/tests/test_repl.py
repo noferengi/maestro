@@ -29,7 +29,7 @@ def _make_git_stub(*responses):
     Return a side_effect callable for patch.object on _run_git_command.
 
     Each call consumes the next response; the last response repeats.
-    Default (no args) → always returns _git_ok().
+    Default (no args) -> always returns _git_ok().
     """
     queue = list(responses) if responses else [_git_ok()]
 
@@ -260,7 +260,7 @@ class TestTaskDAG(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# CheckpointManager — git calls are stubbed, we verify logic and call args
+# CheckpointManager - git calls are stubbed, we verify logic and call args
 # ---------------------------------------------------------------------------
 
 class TestCheckpointManager(unittest.TestCase):
@@ -444,7 +444,7 @@ class TestCheckpointManager(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# MaestroREPL — CheckpointManager is always mocked
+# MaestroREPL - CheckpointManager is always mocked
 # ---------------------------------------------------------------------------
 
 def _make_repl(dag: dags.TaskDAG) -> repl.MaestroREPL:

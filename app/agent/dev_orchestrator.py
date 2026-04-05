@@ -1,7 +1,7 @@
 """
 app/agent/dev_orchestrator.py
 -----------------------------
-DevOrchestrator — batch execution of component agents.
+DevOrchestrator - batch execution of component agents.
 
 Reads PlanningResult.implementation_steps, groups into dependency-resolved
 batches, and runs ComponentLoops in parallel (up to LLM parallel_sessions).
@@ -207,7 +207,7 @@ class DevOrchestrator:
                     if conflict_file is not None:
                         logger.warning(
                             "[dev_orch] Components '%s' and '%s' both claim '%s' "
-                            "— serializing to avoid write conflict",
+                            "- serializing to avoid write conflict",
                             seen_files[conflict_file], comp, conflict_file,
                         )
                         deferred.append(step)

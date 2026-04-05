@@ -1,5 +1,5 @@
 """
-Tests for app/agent/verdicts.py — tally_votes() rules and Vote validation.
+Tests for app/agent/verdicts.py - tally_votes() rules and Vote validation.
 Pure unit tests: no DB, no LLM, no mocking.
 """
 
@@ -25,7 +25,7 @@ def _vote(verdict: Verdict, stage: str = "test", justification: str = "ok") -> V
 
 
 # ---------------------------------------------------------------------------
-# Rule 0 — SUBDIVIDE_IDEA
+# Rule 0 - SUBDIVIDE_IDEA
 # ---------------------------------------------------------------------------
 
 class TestRule0:
@@ -53,7 +53,7 @@ class TestRule0:
 
 
 # ---------------------------------------------------------------------------
-# Rule 1 — REJECTED
+# Rule 1 - REJECTED
 # ---------------------------------------------------------------------------
 
 class TestRule1:
@@ -75,7 +75,7 @@ class TestRule1:
 
 
 # ---------------------------------------------------------------------------
-# Rule 2 — Majority NOT_SUITABLE
+# Rule 2 - Majority NOT_SUITABLE
 # ---------------------------------------------------------------------------
 
 class TestRule2:
@@ -113,7 +113,7 @@ class TestRule2:
 
 
 # ---------------------------------------------------------------------------
-# Rule 3 — NEEDS_RESEARCH
+# Rule 3 - NEEDS_RESEARCH
 # ---------------------------------------------------------------------------
 
 class TestRule3:
@@ -139,7 +139,7 @@ class TestRule3:
 
 
 # ---------------------------------------------------------------------------
-# Rule 4 — Tie
+# Rule 4 - Tie
 # ---------------------------------------------------------------------------
 
 class TestRule4:
@@ -164,7 +164,7 @@ class TestRule4:
 
 
 # ---------------------------------------------------------------------------
-# Rule 5 — Passed / Conditional pass
+# Rule 5 - Passed / Conditional pass
 # ---------------------------------------------------------------------------
 
 class TestRule5:
@@ -193,7 +193,7 @@ class TestRule5:
 
 class TestEdgeCases:
     def test_empty_votes(self):
-        """No votes → rejected (degenerate base case)."""
+        """No votes -> rejected (degenerate base case)."""
         result = tally_votes([])
         assert result.outcome == "rejected"
         assert "No votes cast" in result.rejection_reasons
@@ -238,7 +238,7 @@ class TestVoteConfidenceValidation:
 
 
 # ---------------------------------------------------------------------------
-# Rule 3 — source guard: research_agent_epilogue votes skip research spawn
+# Rule 3 - source guard: research_agent_epilogue votes skip research spawn
 # ---------------------------------------------------------------------------
 
 class TestRule3EpilogueSourceGuard:

@@ -35,7 +35,7 @@ from app.agent.config import PROJECT_ROOT, MAESTRO_GIT_ROOT
 
 
 # ===========================================================================
-# _is_inside_maestro_repo — recognition logic
+# _is_inside_maestro_repo - recognition logic
 # ===========================================================================
 
 class TestIsInsideMaestroRepo:
@@ -59,7 +59,7 @@ class TestIsInsideMaestroRepo:
 
 
 # ===========================================================================
-# _git_run — safety rail (the innermost guard)
+# _git_run - safety rail (the innermost guard)
 # ===========================================================================
 
 class TestGitRunSafetyRail:
@@ -112,7 +112,7 @@ class TestGitRunSafetyRail:
 
 
 # ===========================================================================
-# High-level git tools — must all refuse when cwd is TheMaestro's repo
+# High-level git tools - must all refuse when cwd is TheMaestro's repo
 # ===========================================================================
 
 @pytest.fixture()
@@ -161,7 +161,7 @@ class TestGitToolsBlockedOnMaestroRepo:
 
 
 # ===========================================================================
-# archive_file — .git hard rejection
+# archive_file - .git hard rejection
 # ===========================================================================
 
 class TestArchiveFileGitRejection:
@@ -272,7 +272,7 @@ class TestNoActualGitMutationOnMaestroRepo:
             text=True,
             timeout=10,
         )
-        assert result.returncode == 0, "git status failed — git itself is broken"
+        assert result.returncode == 0, "git status failed - git itself is broken"
         newly_staged = [
             ln for ln in result.stdout.splitlines()
             # First char is index status; ' ' or '?' means unstaged/untracked (fine)
@@ -281,7 +281,7 @@ class TestNoActualGitMutationOnMaestroRepo:
         # Pre-existing staged files are OK (they existed before this test ran).
         # We verify the count did not INCREASE beyond what we started with.
         # Since we can't snapshot "before", we check for the commit message we
-        # tried to make — it must never appear in git log.
+        # tried to make - it must never appear in git log.
         log_result = subprocess.run(
             ["git", "log", "--oneline", "-5"],
             cwd=PROJECT_ROOT,

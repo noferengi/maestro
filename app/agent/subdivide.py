@@ -1,7 +1,7 @@
 """
 app/agent/subdivide.py
 ----------------------
-Subdivision Agent — decomposes oversized ideas into smaller sub-ideas.
+Subdivision Agent - decomposes oversized ideas into smaller sub-ideas.
 
 Invoked by the intake pipeline when any stage votes SUBDIVIDE_IDEA.
 Follows the ResearchAgent pattern: restricted tools, structured output,
@@ -36,10 +36,11 @@ from app.agent.config import (
     SUBDIVISION_CONTEXT_AWARE_TOOLS,
     check_context_saturation,
 )
-from app.agent.llm_client import call_llm
-from app.agent.tools import TOOL_SCHEMAS, async_dispatch_tool, LISTING_EXCLUDED_DIRS
+from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
+from app.agent.tools import TOOL_SCHEMAS, async_dispatch_tool, LISTING_EXCLUDED_DIRS, set_task_git_cwd
 
 logger = logging.getLogger(__name__)
+AGENT_NAME = "Subdivision Agent"
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +90,7 @@ def _build_context_aware_schemas(
         # Add all codebase read tools
         allowed.update(SUBDIVISION_AGENT_TOOLS)
     elif not SUBDIVISION_CONTEXT_AWARE_TOOLS:
-        # Context-aware disabled — always include all tools
+        # Context-aware disabled - always include all tools
         allowed.update(SUBDIVISION_AGENT_TOOLS)
 
     allowed_list = sorted(allowed)
@@ -166,12 +167,12 @@ Use `spawn_research_agent` when you need domain knowledge about unfamiliar techn
    the first sub-idea in your list must be completed first).
 3. Each sub-idea should fit within a single LLM context window for implementation.
 4. Every sub-idea must have a clear "done" condition.
-5. The union of all sub-ideas must cover the original task completely — nothing lost.
+5. The union of all sub-ideas must cover the original task completely - nothing lost.
 6. For greenfield projects, begin with foundational horizontal slices (project scaffolding,
    data model, SDK/API integration, build system), then decompose remaining work into
    vertical feature slices. For existing codebases, prefer vertical slices that cut
    across layers. Document your reasoning in decomposition_rationale.
-7. Estimated scope should be "small" or "medium" — if you'd estimate "large",
+7. Estimated scope should be "small" or "medium" - if you'd estimate "large",
    the sub-idea itself may need further decomposition.
 
 == OUTPUT FORMAT ==
@@ -214,7 +215,7 @@ Plan tool calls efficiently.
 
 _CODEBASE_TOOLS_AVAILABLE = """\
 **Codebase tools** (project has existing source code):
-- `read_file`, `read_file_lines`, `count_lines`, `search_files`
+- `read_file`, `read_file_harder`, `count_lines`, `search_files`
 - `git_status`, `git_diff`, `git_log`, `git_blame`, `git_show`
 Use these to understand the current code structure before deciding how to split the task."""
 
@@ -302,6 +303,11 @@ class SubdivisionAgent:
     async def run(self) -> SubdivisionResult:
         """Execute the subdivision agent and return decomposed sub-ideas."""
         logger.info("Subdivision agent starting for task '%s' (%s).", self.parent_task_id, self.parent_title)
+        
+        # Ensure tool isolation for this task's project
+        if self.project_root:
+            set_task_git_cwd(self.project_root)
+
         system_prompt = self._build_system_prompt()
         context = self._build_context()
         messages = [
@@ -314,6 +320,9 @@ class SubdivisionAgent:
         consecutive_failures = 0
 
         for turn in range(self.max_turns):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
+
             # Hard budget enforcement
             if self._budget_exceeded:
                 messages.append({
@@ -322,7 +331,7 @@ class SubdivisionAgent:
                 })
 
             try:
-                response = await self._call_llm(messages)
+                response = await self._call_llm(messages, no_tools=self._budget_exceeded)
                 consecutive_failures = 0  # Reset on success
             except asyncio.CancelledError:
                 logger.warning("Subdivision agent cancelled (task '%s').", self.parent_task_id)
@@ -358,7 +367,7 @@ class SubdivisionAgent:
                 prompt_tokens_this_call, self.max_context or 0, _ctx_warned, messages
             ):
                 logger.warning(
-                    "SubdivisionAgent context saturation (turn %d) — terminating", turn + 1
+                    "SubdivisionAgent context saturation (turn %d) - terminating", turn + 1
                 )
                 break
 
@@ -404,7 +413,7 @@ class SubdivisionAgent:
                                "Either call a tool to investigate, or output your JSON decomposition.",
                 })
 
-        # Exhausted turns — return a low-confidence empty result
+        # Exhausted turns - return a low-confidence empty result
         logger.warning("Subdivision agent exhausted %d turns for task '%s'.", self.max_turns, self.parent_task_id)
         return SubdivisionResult(
             sub_ideas=[],
@@ -446,7 +455,12 @@ class SubdivisionAgent:
         if self.project_root:
             try:
                 from app.agent.project_snapshot import build_snapshot_with_summaries
-                parts.append(build_snapshot_with_summaries(self.project_root))
+                from app.agent.config import SNAPSHOT_CONTEXT_RATIO
+                _snap_max = (
+                    int(self.max_context * SNAPSHOT_CONTEXT_RATIO)
+                    if self.max_context else None
+                )
+                parts.append(build_snapshot_with_summaries(self.project_root, max_tokens=_snap_max))
             except Exception:
                 pass
 
@@ -503,18 +517,19 @@ class SubdivisionAgent:
     # LLM call
     # ------------------------------------------------------------------
 
-    async def _call_llm(self, messages: list[dict]) -> dict:
+    async def _call_llm(self, messages: list[dict], no_tools: bool = False) -> dict:
         return await call_llm(
             messages,
             base_url=self.llm_base_url,
             model=self.llm_model,
             temperature=SUBDIVISION_LLM_TEMPERATURE,
-            tools=self._tool_schemas,
-            tool_choice="auto",
+            tools=None if no_tools else self._tool_schemas,
+            tool_choice=None if no_tools else "auto",
             task_id=self.parent_task_id,
             llm_id=self.llm_id,
             budget_id=self.budget_id,
             timeout=300,
+            agent_name=AGENT_NAME,
         )
 
     # ------------------------------------------------------------------

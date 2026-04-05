@@ -49,7 +49,7 @@ _SCOPE_SUBDIVIDE = {
     "scope": "epic", "complexity": 9, "decomposition_needed": True,
     "subtasks": [], "affected_areas": [], "effort": "major",
     "vote": {"verdict": "SUBDIVIDE_IDEA", "confidence": 0.85,
-             "justification": "Too large — decompose first."},
+             "justification": "Too large - decompose first."},
 }
 _SCOPE_NEEDS_RESEARCH = {
     "scope": "large", "complexity": 7, "decomposition_needed": False,
@@ -209,7 +209,7 @@ class TestFullReject:
             _run_pipeline_direct([_llm_response(_SCOPE_REJECTED)])
         )
         assert result["outcome"] == "rejected"
-        # Scope vote only — pipeline exits early after REJECTED
+        # Scope vote only - pipeline exits early after REJECTED
         assert len(result["votes"]) == 1
 
 
