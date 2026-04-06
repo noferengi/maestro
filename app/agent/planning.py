@@ -359,6 +359,8 @@ class PlanningPipeline:
         designs = []
         for i, resp in enumerate(responses):
             if isinstance(resp, Exception):
+                if isinstance(resp, ShutdownError):
+                    raise resp
                 logger.warning(f"[{AGENT_NAME}] Design %d failed: %s", i, resp)
                 designs.append({"error": str(resp)})
                 continue
@@ -418,6 +420,8 @@ class PlanningPipeline:
             idx = int(result.get("selected_index", valid[0][0]))
             if idx < 0 or idx >= len(designs):
                 idx = valid[0][0]
+        except ShutdownError:
+            raise
         except Exception as exc:
             logger.warning(f"[{AGENT_NAME}] Judge call failed (%s), using first valid design %d", exc, valid[0][0])
             idx = valid[0][0]

@@ -81,14 +81,66 @@ _endpoint_states: dict[str, _EndpointState] = {}
 _ep_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
-# Graceful shutdown flag
+# Per-endpoint concurrency semaphores
 #
-# Set via signal_shutdown() from the FastAPI lifespan before stop_scheduler().
-# call_llm() checks this at the top of every retry iteration so in-flight
-# backoff loops exit cleanly instead of spinning through interpreter teardown.
+# Each LLM server has a fixed number of KV-cache slots (parallel_sessions).
+# _endpoint_semaphores gates concurrent in-flight HTTP requests so we never
+# send more requests than the server can service simultaneously.  The semaphore
+# is a threading.Semaphore (not asyncio) so it works across the multiple
+# independent event loops created by scheduler worker threads.  Callers acquire
+# via run_in_executor so the waiting coroutine yields the event loop instead of
+# blocking its OS thread.
+#
+# Capacity is read from llm.parallel_sessions on first use and cached.  Restart
+# the server to pick up changes to LLM configuration.
+# ---------------------------------------------------------------------------
+
+_endpoint_semaphores: dict[str, threading.Semaphore] = {}
+_llm_capacity_cache: dict[int, int] = {}
+
+
+def _get_or_create_semaphore(base_url: str, llm_id: int) -> threading.Semaphore:
+    """Return the concurrency semaphore for *base_url*, creating it if needed."""
+    with _ep_lock:
+        if base_url in _endpoint_semaphores:
+            return _endpoint_semaphores[base_url]
+        if llm_id not in _llm_capacity_cache:
+            try:
+                from app.database import get_llm
+                llm_obj = get_llm(llm_id)
+                cap = int(llm_obj.parallel_sessions) if llm_obj and llm_obj.parallel_sessions else 1
+            except Exception:
+                cap = 1
+            _llm_capacity_cache[llm_id] = cap
+        capacity = _llm_capacity_cache[llm_id]
+        sem = threading.Semaphore(capacity)
+        _endpoint_semaphores[base_url] = sem
+        logger.info(
+            "LLM endpoint %s: concurrency semaphore created (%d slot(s), LLM %d).",
+            base_url, capacity, llm_id,
+        )
+        return sem
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown flags
+#
+# Two-phase shutdown:
+#   Phase 1 — signal_shutdown(): sets _shutdown_event.  In-flight calls exit at
+#     their next between-chunk check (effectively within one token interval for
+#     streaming calls).  No new work is dispatched.
+#   Phase 2 — signal_force_shutdown(): sets _force_shutdown_event.  The streaming
+#     poll loop checks this flag every _SHUTDOWN_POLL_SLICE seconds even while
+#     waiting for the first token, providing a hard-deadline interrupt for calls
+#     that are still in the prompt-processing (first-token latency) window.
 # ---------------------------------------------------------------------------
 
 _shutdown_event = threading.Event()
+_force_shutdown_event = threading.Event()
+
+# Maximum seconds between shutdown-flag checks while waiting for the next SSE
+# chunk.  Applies only when _shutdown_event or _force_shutdown_event is set and
+# the LLM has not yet produced a token.
+_SHUTDOWN_POLL_SLICE: float = 1.0
 
 
 class ShutdownError(Exception):
@@ -97,13 +149,23 @@ class ShutdownError(Exception):
 
 
 def signal_shutdown() -> None:
-    """Signal all in-flight LLM calls to abort on their next retry check."""
+    """Phase-1 shutdown: signal in-flight calls to abort at their next check."""
     _shutdown_event.set()
+
+
+def signal_force_shutdown() -> None:
+    """Phase-2 shutdown: interrupt streaming waits within _SHUTDOWN_POLL_SLICE seconds."""
+    _force_shutdown_event.set()
 
 
 def is_shutting_down() -> bool:
     """Return True once signal_shutdown() has been called."""
     return _shutdown_event.is_set()
+
+
+def is_force_shutdown() -> bool:
+    """Return True once signal_force_shutdown() has been called."""
+    return _force_shutdown_event.is_set()
 
 
 async def _stream_llm_response(
@@ -156,20 +218,37 @@ async def _stream_llm_response(
             lines_aiter = response.aiter_lines()
             try:
                 while True:
-                    if _shutdown_event.is_set():
+                    if _shutdown_event.is_set() or _force_shutdown_event.is_set():
                         raise ShutdownError("Server is shutting down")
 
-                    try:
-                        line = await asyncio.wait_for(
-                            lines_aiter.__anext__(),
-                            timeout=idle_timeout,
-                        )
-                    except StopAsyncIteration:
-                        break
-                    except asyncio.TimeoutError:
+                    # Slice the idle-timeout wait into _SHUTDOWN_POLL_SLICE-second
+                    # windows so the shutdown flag is checked even during first-token
+                    # latency (prompt-processing window).  The else-branch of the
+                    # inner while fires when elapsed >= idle_timeout (no break).
+                    elapsed = 0.0
+                    got_stop = False
+                    line = ""
+                    while elapsed < idle_timeout:
+                        if _shutdown_event.is_set() or _force_shutdown_event.is_set():
+                            raise ShutdownError("Server is shutting down")
+                        try:
+                            line = await asyncio.wait_for(
+                                lines_aiter.__anext__(),
+                                timeout=min(_SHUTDOWN_POLL_SLICE, idle_timeout - elapsed),
+                            )
+                            break  # got a chunk
+                        except StopAsyncIteration:
+                            got_stop = True
+                            break
+                        except asyncio.TimeoutError:
+                            elapsed += _SHUTDOWN_POLL_SLICE
+                    else:
                         raise httpx.ReadTimeout(
                             f"No token from {url} for {idle_timeout:.0f}s - LLM may be stuck"
                         )
+
+                    if got_stop:
+                        break
 
                     if not line or not line.startswith("data:"):
                         continue
@@ -506,6 +585,12 @@ async def call_llm(
     # immediately see which agent triggered the failure without digging into payloads.
     _agent_label = f"[{agent_name}]" if agent_name else "[unknown agent]"
 
+    # Concurrency semaphore for this endpoint.  Acquired once per HTTP attempt,
+    # released in the finally block below — the slot is always free during backoff
+    # sleeps so other callers can proceed without waiting.
+    _sem = _get_or_create_semaphore(resolved_url, llm_id)
+    _loop = asyncio.get_running_loop()
+
     while True:
         # Exit immediately if shutdown has been signalled.
         if _shutdown_event.is_set():
@@ -524,7 +609,16 @@ async def call_llm(
             await asyncio.sleep(remaining)
             continue  # re-check after sleep
 
+        # Acquire a concurrency slot.  Suspends this coroutine (without blocking
+        # the event-loop thread) until the server has capacity for one more request.
+        # The slot is held only for a single HTTP attempt and released in `finally`.
+        await _loop.run_in_executor(None, _sem.acquire)
+
+        _retry_wait: "float | None" = None
         try:
+            if _shutdown_event.is_set():
+                raise ShutdownError("Server is shutting down")
+
             if stream:
                 # Streaming: per-chunk idle timeout; clock runs only during generation.
                 result = await _stream_llm_response(url, payload, _idle_timeout)
@@ -547,7 +641,7 @@ async def call_llm(
                             "LLM endpoint %s is back online (was down for %d attempt(s)).",
                             resolved_url, prev.fail_count,
                         )
-            break  # exit retry loop
+            # _retry_wait stays None → break after finally
 
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             # Infrastructure problem: server not running.  Log at WARNING, not ERROR.
@@ -569,8 +663,7 @@ async def call_llm(
                     )
                     st.next_allowed = time.monotonic() + wait
                     st.delay = min(st.delay * 2.0, _BACKOFF_MAX_DELAY)
-            await asyncio.sleep(wait + random.uniform(0, wait * 0.5))
-            # loop continues → retry after sleep
+            _retry_wait = wait + random.uniform(0, wait * 0.5)
 
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code >= 500:
@@ -588,7 +681,8 @@ async def call_llm(
                 #
                 # 2. Batch-slot / KV-cache contention — a transient capacity issue
                 #    when concurrent requests fill the server's batch or context
-                #    budget.  Retrying after backoff usually succeeds.
+                #    budget.  With the semaphore in place this should no longer occur;
+                #    if it does, retrying after backoff usually succeeds.
                 #
                 # Distinguish by checking whether the payload description flags any
                 # suspicious content.  If clean → retry normally.
@@ -627,8 +721,7 @@ async def call_llm(
                         )
                         st.next_allowed = time.monotonic() + wait
                         st.delay = min(st.delay * 2.0, _BACKOFF_MAX_DELAY)
-                await asyncio.sleep(wait + random.uniform(0, wait * 0.5))
-                # loop continues → retry after sleep
+                _retry_wait = wait + random.uniform(0, wait * 0.5)
             else:
                 # 4xx: genuine request error - propagate immediately.
                 logger.error(
@@ -661,8 +754,7 @@ async def call_llm(
                     )
                     st.next_allowed = time.monotonic() + wait
                     st.delay = min(st.delay * 2.0, _BACKOFF_MAX_DELAY)
-            await asyncio.sleep(wait + random.uniform(0, wait * 0.5))
-            # loop continues → retry after sleep
+            _retry_wait = wait + random.uniform(0, wait * 0.5)
 
         except Exception as exc:
             # RuntimeError("cannot schedule new futures after shutdown/interpreter shutdown")
@@ -673,6 +765,16 @@ async def call_llm(
                 raise ShutdownError(f"Interpreter shutting down: {exc}") from exc
             logger.error("LLM call failed to %s: %r (str: '%s')", url, exc, exc)
             raise  # JSON decode errors, etc. propagate to caller
+
+        finally:
+            # Always release the slot — even on raise — so other waiters can proceed.
+            _sem.release()
+
+        # Slot released.  Break on success (_retry_wait is None) or sleep before retry.
+        if _retry_wait is None:
+            break
+        await asyncio.sleep(_retry_wait)
+        # loop continues → retry
 
     # Log every call to budget_entries
     _log_budget_entry(

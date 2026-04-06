@@ -69,6 +69,7 @@ from database import (
 )
 
 from app.agent.config import PIPELINE_COLUMN_ORDER, PIPELINE_DONE_STATUSES
+from app.agent.llm_client import ShutdownError
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -86,10 +87,13 @@ async def lifespan(app: FastAPI):
         # --- shutdown ---
         # Use try/finally so this runs even when uvicorn cancels the lifespan
         # task with CancelledError (e.g. Ctrl-C while a background task is active).
-        from app.agent.llm_client import signal_shutdown
-        signal_shutdown()
-        from app.agent.scheduler import stop_scheduler
-        stop_scheduler(timeout=60.0)
+        try:
+            from app.agent.llm_client import signal_shutdown
+            signal_shutdown()
+            from app.agent.scheduler import stop_scheduler
+            stop_scheduler(timeout=60.0)
+        except KeyboardInterrupt:
+            logger.info("Shutdown sequence interrupted by user. Exiting immediately.")
 
 
 app = FastAPI(title="Kanban Board API", lifespan=lifespan)
@@ -880,7 +884,14 @@ def _run_planning_pipeline_bg(task_id: str) -> None:
                 run_row_id=run_row_id,
             )
         )
+    except ShutdownError:
+        logger.info("[planning] Pipeline for '%s' aborted due to server shutdown.", task_id)
+        return
+    except Exception:
+        logger.exception("[planning] Pipeline for '%s' failed.", task_id)
+        return
 
+    try:
         # Store transition result
         _store_pipeline_result_generic(task_id, result, task.budget_id, "planning_to_indev")
 
@@ -982,7 +993,14 @@ def _run_dev_orchestrator_bg(task_id: str) -> None:
                     project_path=project_path,
                 )
             )
+        except ShutdownError:
+            logger.info("[indev] Orchestrator for '%s' aborted due to server shutdown.", task_id)
+            return
+        except Exception:
+            logger.exception("[indev] Orchestrator for '%s' failed.", task_id)
+            return
 
+        try:
             if result.get("status") == "ACCEPTED":
                 update_task(task_id, type="conceptual_review")
                 logger.info("[indev] Task '%s' advanced to CONCEPTUAL REVIEW.", task_id)
@@ -1033,6 +1051,14 @@ def _advance_to_optimization(task_id: str) -> None:
                     project_path=project_path,
                 )
             )
+        except ShutdownError:
+            logger.info("[review] Pipeline for '%s' aborted due to server shutdown.", task_id)
+            return
+        except Exception:
+            logger.exception("[review] Pipeline for '%s' failed.", task_id)
+            return
+
+        try:
             _store_pipeline_result_generic(task_id, result, task.budget_id, "conceptual_to_optimization")
 
             if result.get("outcome") == "passed":
@@ -1075,6 +1101,10 @@ def _run_optimization_only_bg(task_id: str) -> None:
                 )
             )
             logger.info("[optimization-only] Task '%s': %s", task_id, result.get('outcome'))
+        except ShutdownError:
+            logger.info("[optimization-only] Pipeline for '%s' aborted due to server shutdown.", task_id)
+        except Exception:
+            logger.exception("[optimization-only] Pipeline for '%s' failed.", task_id)
         finally:
             loop.close()
     except Exception as exc:
@@ -1118,6 +1148,10 @@ def _run_security_only_bg(task_id: str) -> None:
                 update_task(task_id, type=demotion)
                 _record_demotion(task_id, "security", demotion, sec_result.get("summary", ""))
                 logger.warning("[security-only] Task '%s' demoted to %s.", task_id, demotion)
+        except ShutdownError:
+            logger.info("[security-only] Pipeline for '%s' aborted due to server shutdown.", task_id)
+        except Exception:
+            logger.exception("[security-only] Pipeline for '%s' failed.", task_id)
         finally:
             loop.close()
     except Exception as exc:
@@ -1180,6 +1214,10 @@ def _run_security_pipeline_bg(task_id: str) -> None:
                 update_task(task_id, type=demotion)
                 _record_demotion(task_id, "security", demotion, sec_result.get("summary", ""))
                 logger.warning("[security] Task '%s' demoted to %s.", task_id, demotion)
+        except ShutdownError:
+            logger.info("[security] Pipeline for '%s' aborted due to server shutdown.", task_id)
+        except Exception:
+            logger.exception("[security] Pipeline for '%s' failed.", task_id)
         finally:
             loop.close()
     except Exception as exc:
@@ -1224,6 +1262,10 @@ def _run_full_review_bg(task_id: str) -> None:
                 update_task(task_id, type=demotion)
                 _record_demotion(task_id, "full_review", demotion, result.get("summary", ""))
                 logger.warning("[full_review] Task '%s' demoted to %s.", task_id, demotion)
+        except ShutdownError:
+            logger.info("[full_review] Pipeline for '%s' aborted due to server shutdown.", task_id)
+        except Exception:
+            logger.exception("[full_review] Pipeline for '%s' failed.", task_id)
         finally:
             loop.close()
     except Exception as exc:
@@ -2029,6 +2071,14 @@ def _run_adhoc_research(task_id: str, question: str, job_id: int) -> None:
                     project_root=project_root,
                 )
             )
+        except ShutdownError:
+            logger.info("[adhoc-research] Aborted for task '%s' due to server shutdown.", task_id)
+            _ADHOC_RESEARCH_JOBS[job_id] = {"status": "failed", "error": "Server is shutting down"}
+            update_research_job(job_id, status="failed")
+            return
+        except Exception:
+            logger.exception("[toolbar] Ad-hoc research for task '%s' failed.", task_id)
+            return
         finally:
             loop.close()
 
@@ -2142,6 +2192,14 @@ def _run_adhoc_investigation(task_id: str, question: str, job_id: int) -> None:
                     project_root=project_root,
                 )
             )
+        except ShutdownError:
+            logger.info("[adhoc-investigation] Aborted for task '%s' due to server shutdown.", task_id)
+            _ADHOC_RESEARCH_JOBS[job_id] = {"status": "failed", "error": "Server is shutting down"}
+            update_research_job(job_id, status="failed")
+            return
+        except Exception:
+            logger.exception("[toolbar] Ad-hoc investigation for task '%s' failed.", task_id)
+            return
         finally:
             loop.close()
 

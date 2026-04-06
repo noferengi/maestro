@@ -43,7 +43,7 @@ from app.agent.config import (
     PIPELINE_DONE_STATUSES,
     MAX_TOKENS_PER_TURN,
 )
-from app.agent.llm_client import is_shutting_down, signal_shutdown, ShutdownError
+from app.agent.llm_client import is_shutting_down, signal_shutdown, signal_force_shutdown, ShutdownError
 
 logger = logging.getLogger(__name__)
 AGENT_NAME = "Scheduler"
@@ -119,6 +119,11 @@ def wait_and_register_pipeline_session(
     max_slots = llm.parallel_sessions if llm else 1
 
     while time.monotonic() < deadline:
+        if is_shutting_down():
+            logger.info(
+                "wait_and_register: aborting - server is shutting down (key='%s').", key
+            )
+            return False
         # Collect all active LLM IDs (scheduler threads + external pipelines)
         with _active_sessions_lock:
             active_llm_ids: set[int] = {
@@ -279,7 +284,20 @@ def start_scheduler() -> None:
 
 
 def stop_scheduler(wait_for_sessions: bool = True, timeout: float = 60.0) -> None:
-    """Signal the scheduler to stop and wait for it."""
+    """Signal the scheduler to stop and wait for it.
+
+    Shutdown runs in two phases within the total *timeout* budget:
+
+      Phase 1 (timeout − 5 s): graceful drain.  The shutdown flag is already set
+        before this call, so streaming calls exit at their next between-chunk check
+        and the poll loop exits within _SHUTDOWN_POLL_SLICE seconds.  Worker
+        threads are given time to wrap up naturally.
+
+      Phase 2 (5 s): forced exit.  Any thread still alive after phase 1 receives
+        signal_force_shutdown(), which interrupts the streaming poll loop
+        immediately.  Threads blocked in non-LLM work (DB writes, git, etc.) are
+        not interruptible and are logged as survivors.
+    """
     global _scheduler_thread
     if _scheduler_thread is None:
         return
@@ -287,30 +305,53 @@ def stop_scheduler(wait_for_sessions: bool = True, timeout: float = 60.0) -> Non
     _scheduler_thread.join(timeout=SCHEDULER_TICK_INTERVAL + 2)
     _scheduler_thread = None
 
-    if wait_for_sessions:
-        with _active_sessions_lock:
-            threads = [(key, t) for key, t in _active_sessions.items() if t.is_alive()]
-        if threads:
-            logger.info(
-                "Waiting up to %.0fs for %d active session thread(s) to finish: %s",
-                timeout,
-                len(threads),
-                ", ".join(k for k, _ in threads),
-            )
-            deadline = time.monotonic() + timeout
-            for _key, t in threads:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                t.join(timeout=remaining)
+    if not wait_for_sessions:
+        logger.info("Scheduler stopped.")
+        return
 
-        # Report any threads that didn't finish in time
+    with _active_sessions_lock:
+        threads = [(key, t) for key, t in _active_sessions.items() if t.is_alive()]
+
+    if not threads:
+        logger.info("Scheduler stopped.")
+        return
+
+    # --- Phase 1: graceful drain ---
+    phase1_secs = max(timeout - 5.0, 5.0)
+    logger.info(
+        "Shutdown phase 1: waiting up to %.0fs for %d session thread(s): %s",
+        phase1_secs, len(threads), ", ".join(k for k, _ in threads),
+    )
+    deadline = time.monotonic() + phase1_secs
+    try:
+        for _key, t in threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            t.join(timeout=remaining)
+    except KeyboardInterrupt:
+        logger.warning("Shutdown interrupted during phase 1. Proceeding to phase 2.")
+
+    # --- Phase 2: forced exit ---
+    with _active_sessions_lock:
+        still_alive = [(key, t) for key, t in _active_sessions.items() if t.is_alive()]
+
+    if still_alive:
+        logger.warning(
+            "Shutdown phase 2: %d thread(s) still alive after %.0fs graceful window,"
+            " signalling force shutdown: %s",
+            len(still_alive), phase1_secs, ", ".join(k for k, _ in still_alive),
+        )
+        signal_force_shutdown()
+        for _key, t in still_alive:
+            t.join(timeout=5.0)
+
         with _active_sessions_lock:
-            still_alive = [key for key, t in _active_sessions.items() if t.is_alive()]
-        if still_alive:
+            survivors = [key for key, t in _active_sessions.items() if t.is_alive()]
+        if survivors:
             logger.warning(
-                "Scheduler shutdown: %d thread(s) still alive after %.0fs timeout: %s",
-                len(still_alive), timeout, ", ".join(still_alive),
+                "Scheduler shutdown: %d thread(s) did not exit after force shutdown: %s",
+                len(survivors), ", ".join(survivors),
             )
 
     logger.info("Scheduler stopped.")
@@ -543,6 +584,9 @@ def _scheduler_loop() -> None:
     while not _scheduler_stop.is_set():
         try:
             _tick()
+        except ShutdownError:
+            logger.info("Scheduler loop aborted due to server shutdown.")
+            break
         except Exception:
             logger.exception("Scheduler tick failed.")
         _scheduler_stop.wait(timeout=SCHEDULER_TICK_INTERVAL)
