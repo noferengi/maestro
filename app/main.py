@@ -21,7 +21,7 @@ configure_logging(
 logger = logging.getLogger(__name__)
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Body, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
@@ -331,6 +331,28 @@ def _store_pipeline_result(task_id, result, budget_id):
             model=vote.get("model", ""),
             budget_id=budget_id,
         )
+
+
+def _count_recent_failed_planning_runs(task_id: str, limit: int = 3) -> int:
+    """Return the count of the most-recent `limit` planning_results rows for this task.
+
+    Used as a safety valve: if there are already `limit` completed rows and the task
+    is still in planning (never advanced to indev), the caller can demote to IDEA.
+    """
+    from app.database.session import SessionLocal as _SL
+    from app.database.models import PlanningResult as _PlanningResult
+    db = _SL()
+    try:
+        rows = (
+            db.query(_PlanningResult)
+            .filter(_PlanningResult.task_id == task_id)
+            .order_by(_PlanningResult.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return len(rows)
+    finally:
+        db.close()
 
 
 def _execute_subdivision(task, llm_base_url, llm_model, max_context, scope_vote, rejection_context, loop):
@@ -689,6 +711,19 @@ def _pipeline_session(func):
     return wrapper
 
 
+def _start_bg(fn, *args) -> None:
+    """Start a pipeline function in a daemon thread.
+
+    Replaces Starlette BackgroundTasks for pipeline work so that the thread is
+    decoupled from the ASGI event loop.  When uvicorn handles Ctrl-C it cancels
+    the event loop coroutines, and BackgroundTasks' run_in_threadpool receives
+    CancelledError — producing noisy tracebacks.  A plain daemon thread is not
+    affected by event-loop cancellation; the scheduler's _pipeline_session
+    decorator still registers/tracks sessions for graceful shutdown.
+    """
+    threading.Thread(target=fn, args=args, daemon=True).start()
+
+
 @_pipeline_session
 def _run_regenerate_subdivision(task_id: str) -> None:
     """Background runner: re-runs the subdivision agent to produce a new set of children.
@@ -881,6 +916,7 @@ def _run_planning_pipeline_bg(task_id: str) -> None:
                 budget_id=task.budget_id,
                 max_context=max_context,
                 project_path=project_path,
+                project_name=task.project,
                 run_row_id=run_row_id,
             )
         )
@@ -895,7 +931,35 @@ def _run_planning_pipeline_bg(task_id: str) -> None:
         # Store transition result
         _store_pipeline_result_generic(task_id, result, task.budget_id, "planning_to_indev")
 
-        if result.get("outcome") == "passed":
+        if result.get("outcome") == "subdivide":
+            # Scope too large — demote to IDEA and trigger subdivision immediately
+            scope_reason = result.get("scope_reason", "Design scope too large.")
+            logger.info(
+                "[planning] Task '%s' scope too large — demoting to IDEA for subdivision. %s",
+                task_id, scope_reason,
+            )
+            _rejection_ctx = {
+                "reason": "planning_scope_too_large",
+                "scope_reason": scope_reason,
+                "design_rationale": result.get("design_rationale", ""),
+                "file_manifest": result.get("file_manifest", []),
+                "survey_summary": result.get("survey_summary", ""),
+            }
+            update_task(task_id, type="subdividing")
+            try:
+                _execute_subdivision(
+                    task,
+                    llm_base_url=llm_base_url,
+                    llm_model=llm_model,
+                    max_context=max_context,
+                    scope_vote=None,
+                    rejection_context=_rejection_ctx,
+                    loop=loop,
+                )
+            except Exception:
+                logger.exception("[planning] Subdivision after scope-fail failed for '%s'.", task_id)
+                update_task(task_id, type="idea")
+        elif result.get("outcome") == "passed":
             # Run planning gate
             gate_result = loop.run_until_complete(
                 run_planning_gate(
@@ -924,8 +988,26 @@ def _run_planning_pipeline_bg(task_id: str) -> None:
                 logger.info("[planning] Task '%s' advanced to IN DEV.", task_id)
             else:
                 logger.warning("[planning] Task '%s' failed planning gate.", task_id)
+                # Consecutive-failure safety valve: demote after too many failed runs
+                from app.agent.config import PLANNING_MAX_CONSECUTIVE_FAILURES
+                _total = _count_recent_failed_planning_runs(task_id, PLANNING_MAX_CONSECUTIVE_FAILURES)
+                if _total >= PLANNING_MAX_CONSECUTIVE_FAILURES:
+                    logger.warning(
+                        "[planning] Task '%s' has failed planning %d time(s) — demoting to IDEA.",
+                        task_id, _total,
+                    )
+                    update_task(task_id, type="idea")
         else:
             logger.info("[planning] Task '%s' planning result: %s", task_id, result.get('outcome'))
+            # Consecutive-failure safety valve for non-passed outcomes (rejected etc.)
+            from app.agent.config import PLANNING_MAX_CONSECUTIVE_FAILURES
+            _total = _count_recent_failed_planning_runs(task_id, PLANNING_MAX_CONSECUTIVE_FAILURES)
+            if _total >= PLANNING_MAX_CONSECUTIVE_FAILURES:
+                logger.warning(
+                    "[planning] Task '%s' has failed planning %d time(s) — demoting to IDEA.",
+                    task_id, _total,
+                )
+                update_task(task_id, type="idea")
     except Exception as exc:
         # Write the failure reason into the in_progress row so the Stage Journal
         # shows "run failed: <reason>" instead of the old stale result.
@@ -1255,8 +1337,18 @@ def _run_full_review_bg(task_id: str) -> None:
             _store_pipeline_result_generic(task_id, result, task.budget_id, "full_review")
 
             if result.get("outcome") == "passed":
-                # Auto-merge
-                _execute_merge_bg(task_id)
+                # Pushed to FINAL REVIEW (full_review column) - do a virtual merge test.
+                from app.agent.merge import execute_merge
+                
+                logger.info("[full_review] Task '%s' passed. Running virtual merge test.", task_id)
+                merge_test = execute_merge(task_id, project_path=project_path, dry_run=True)
+                
+                if merge_test.status == "virtual_passed":
+                    append_task_history(task_id, "ready_for_review", message="Full review passed. Virtual merge/test SUCCEEDED. Ready for final manual review and merge.")
+                    logger.info("[full_review] Task '%s' virtual merge SUCCEEDED.", task_id)
+                else:
+                    append_task_history(task_id, "merge_test_failed", message=f"Full review passed, but VIRTUAL MERGE FAILED: {merge_test.status}. Detail: {merge_test.error_detail}")
+                    logger.warning("[full_review] Task '%s' virtual merge FAILED: %s", task_id, merge_test.status)
             else:
                 demotion = result.get("demotion_target", "indev")
                 update_task(task_id, type=demotion)
@@ -1363,7 +1455,7 @@ ADVANCE_HANDLERS = {
 
 
 @app.post("/api/tasks/{task_id}/advance", response_model=dict)
-def advance_task(task_id: str, background_tasks: BackgroundTasks):
+def advance_task(task_id: str):
     """
     Request advancement of a task to the next column.
     Detects current column and dispatches the appropriate pipeline.
@@ -1391,19 +1483,19 @@ def advance_task(task_id: str, background_tasks: BackgroundTasks):
 
     # Dispatch to appropriate handler
     if handler_name == "_run_intake_pipeline":
-        background_tasks.add_task(_run_intake_pipeline, task_id)
+        _start_bg(_run_intake_pipeline, task_id)
     elif handler_name == "_run_planning_pipeline_bg":
-        background_tasks.add_task(_run_planning_pipeline_bg, task_id)
+        _start_bg(_run_planning_pipeline_bg, task_id)
     elif handler_name == "_run_dev_orchestrator_bg":
-        background_tasks.add_task(_run_dev_orchestrator_bg, task_id)
+        _start_bg(_run_dev_orchestrator_bg, task_id)
     elif handler_name == "_advance_to_optimization":
-        background_tasks.add_task(_advance_to_optimization, task_id)
+        _start_bg(_advance_to_optimization, task_id)
     elif handler_name == "_run_security_pipeline_bg":
-        background_tasks.add_task(_run_security_pipeline_bg, task_id)
+        _start_bg(_run_security_pipeline_bg, task_id)
     elif handler_name == "_run_full_review_bg":
-        background_tasks.add_task(_run_full_review_bg, task_id)
+        _start_bg(_run_full_review_bg, task_id)
     elif handler_name == "_execute_merge_bg":
-        background_tasks.add_task(_execute_merge_bg, task_id)
+        _start_bg(_execute_merge_bg, task_id)
 
     return {
         "task_id": task_id,
@@ -1908,7 +2000,7 @@ def get_task_subdivision_records(task_id: str):
 
 
 @app.post("/api/tasks/{task_id}/regenerate-subdivision", status_code=202)
-def regenerate_subdivision_endpoint(task_id: str, background_tasks: BackgroundTasks):
+def regenerate_subdivision_endpoint(task_id: str):
     """Queue a new subdivision agent run for a Big Idea task.
 
     Cancels the current active children, supersedes their record, then re-runs
@@ -1923,7 +2015,7 @@ def regenerate_subdivision_endpoint(task_id: str, background_tasks: BackgroundTa
         raise HTTPException(status_code=422, detail="Task must have an LLM assigned before regenerating")
     if not task.budget_id:
         raise HTTPException(status_code=422, detail="Task must have a budget assigned before regenerating")
-    background_tasks.add_task(_run_regenerate_subdivision, task_id)
+    _start_bg(_run_regenerate_subdivision, task_id)
     return {"status": "queued"}
 
 
@@ -2105,7 +2197,7 @@ def _run_adhoc_research(task_id: str, question: str, job_id: int) -> None:
 
 
 @app.post("/api/agent/research/{task_id}", response_model=dict)
-def start_adhoc_research(task_id: str, body: dict, background_tasks: BackgroundTasks):
+def start_adhoc_research(task_id: str, body: dict):
     """Start an ad-hoc research agent on a task from the card toolbar."""
     task = get_task(task_id)
     if not task:
@@ -2128,7 +2220,7 @@ def start_adhoc_research(task_id: str, body: dict, background_tasks: BackgroundT
     if not job:
         raise HTTPException(status_code=500, detail="Failed to create research job")
 
-    background_tasks.add_task(_run_adhoc_research, task_id, question, job.id)
+    _start_bg(_run_adhoc_research, task_id, question, job.id)
     return {"job_id": job.id, "status": "queued"}
 
 
@@ -2245,7 +2337,7 @@ def _run_adhoc_investigation(task_id: str, question: str, job_id: int) -> None:
 
 
 @app.post("/api/agent/investigate/{task_id}", response_model=dict)
-def start_adhoc_investigation(task_id: str, body: dict, background_tasks: BackgroundTasks):
+def start_adhoc_investigation(task_id: str, body: dict):
     """Start an ad-hoc investigation agent on a task from the card toolbar."""
     task = get_task(task_id)
     if not task:
@@ -2268,7 +2360,7 @@ def start_adhoc_investigation(task_id: str, body: dict, background_tasks: Backgr
     if not job:
         raise HTTPException(status_code=500, detail="Failed to create investigation job")
 
-    background_tasks.add_task(_run_adhoc_investigation, task_id, question, job.id)
+    _start_bg(_run_adhoc_investigation, task_id, question, job.id)
     return {"job_id": job.id, "status": "queued"}
 
 
@@ -2301,7 +2393,7 @@ def get_adhoc_investigation_status(task_id: str, job_id: int):
 
 
 @app.post("/api/agent/subdivide/{task_id}", status_code=202)
-def adhoc_subdivide(task_id: str, background_tasks: BackgroundTasks):
+def adhoc_subdivide(task_id: str):
     """Trigger the subdivision agent on any task (toolbar shortcut, no is_big_idea guard)."""
     task = get_task(task_id)
     if not task:
@@ -2310,7 +2402,7 @@ def adhoc_subdivide(task_id: str, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=422, detail="Task must have an LLM assigned")
     if not task.budget_id:
         raise HTTPException(status_code=422, detail="Task must have a budget assigned")
-    background_tasks.add_task(_run_regenerate_subdivision, task_id)
+    _start_bg(_run_regenerate_subdivision, task_id)
     return {"status": "queued"}
 
 
@@ -2764,6 +2856,8 @@ def populate_arch(project_name: str):
     list of categories that will be generated.
     """
     from app.database import get_project, get_tasks_by_project, create_arch_gen_job
+    from app.database import SessionLocal as _SL
+    from app.database.models import ArchGenJob as _ArchGenJob
 
     project = get_project(project_name)
     if not project:
@@ -2789,6 +2883,36 @@ def populate_arch(project_name: str):
     if not missing:
         return {"queued": 0, "categories": [], "message": "All 14 categories already have cards"}
 
+    # Skip categories that already have an active (pending/running) job
+    _db = _SL()
+    try:
+        active_cats: set[str] = set(
+            row.category for row in
+            _db.query(_ArchGenJob.category)
+               .filter(
+                   _ArchGenJob.project == project_name,
+                   _ArchGenJob.status.in_(('pending', 'running')),
+               )
+               .all()
+        )
+    finally:
+        _db.close()
+
+    to_queue = [c for c in missing if c not in active_cats]
+    already_queued = [c for c in missing if c in active_cats]
+    if already_queued:
+        logger.info(
+            "populate-arch: skipping %d categories already queued for '%s': %s",
+            len(already_queued), project_name, already_queued,
+        )
+
+    if not to_queue:
+        return {
+            "queued": 0,
+            "categories": [],
+            "message": f"All missing categories already have active jobs ({len(already_queued)} pending/running)",
+        }
+
     llm_id, budget_id = _pick_prewarm_resources(project.llm_id, project.budget_id)
     if llm_id is None or budget_id is None:
         raise HTTPException(
@@ -2796,14 +2920,14 @@ def populate_arch(project_name: str):
             detail="No LLM endpoint or budget available. Configure a default LLM and budget on the project.",
         )
 
-    for category in missing:
+    for category in to_queue:
         create_arch_gen_job(project_name, category, llm_id=llm_id, budget_id=budget_id)
 
     logger.info(
         "populate-arch: queued %d arch_gen_jobs for project '%s': %s",
-        len(missing), project_name, missing,
+        len(to_queue), project_name, to_queue,
     )
-    return {"queued": len(missing), "categories": missing}
+    return {"queued": len(to_queue), "categories": to_queue}
 
 
 # ============================================
@@ -3355,7 +3479,7 @@ def _run_loop_in_background(task_id: str) -> None:
 
 
 @app.post("/api/agent/run/{task_id}", response_model=dict)
-def start_agent_loop(task_id: str, background_tasks: BackgroundTasks):
+def start_agent_loop(task_id: str):
     """
     Start a MaestroLoop for the given task ID as a background task.
     The loop runs asynchronously; poll /api/agent/status/{task_id} for progress.
@@ -3368,7 +3492,7 @@ def start_agent_loop(task_id: str, background_tasks: BackgroundTasks):
     if task_id in _ACTIVE_LOOPS and not _ACTIVE_LOOPS[task_id].done():
         raise HTTPException(status_code=409, detail=f"A loop is already running for task '{task_id}'.")
 
-    background_tasks.add_task(_run_loop_in_background, task_id)
+    _start_bg(_run_loop_in_background, task_id)
     return {
         "task_id": task_id,
         "status": "STARTED",
@@ -3492,63 +3616,73 @@ def pin_task(task_id: str):
 
 
 @app.post("/api/tasks/{task_id}/run-planning", response_model=dict)
-def run_planning_on_demand(task_id: str, background_tasks: BackgroundTasks):
+def run_planning_on_demand(task_id: str):
     """Manually trigger the planning pipeline for a task (any stage)."""
     task = get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     if not task.llm_id or not task.budget_id:
         raise HTTPException(status_code=400, detail="Task needs an LLM endpoint and budget assigned.")
-    background_tasks.add_task(_run_planning_pipeline_bg, task_id)
+    _start_bg(_run_planning_pipeline_bg, task_id)
     return {"task_id": task_id, "status": "STARTED", "pipeline": "planning"}
 
 
 @app.post("/api/tasks/{task_id}/run-review", response_model=dict)
-def run_conceptual_review_on_demand(task_id: str, background_tasks: BackgroundTasks):
+def run_conceptual_review_on_demand(task_id: str):
     """Manually trigger the conceptual review pipeline for a task."""
     task = get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     if not task.llm_id or not task.budget_id:
         raise HTTPException(status_code=400, detail="Task needs an LLM endpoint and budget assigned.")
-    background_tasks.add_task(_advance_to_optimization, task_id)
+    _start_bg(_advance_to_optimization, task_id)
     return {"task_id": task_id, "status": "STARTED", "pipeline": "conceptual_review"}
 
 
 @app.post("/api/tasks/{task_id}/run-optimization", response_model=dict)
-def run_optimization_on_demand(task_id: str, background_tasks: BackgroundTasks):
+def run_optimization_on_demand(task_id: str):
     """Manually trigger the optimization pipeline only (no security)."""
     task = get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     if not task.llm_id or not task.budget_id:
         raise HTTPException(status_code=400, detail="Task needs an LLM endpoint and budget assigned.")
-    background_tasks.add_task(_run_optimization_only_bg, task_id)
+    _start_bg(_run_optimization_only_bg, task_id)
     return {"task_id": task_id, "status": "STARTED", "pipeline": "optimization"}
 
 
 @app.post("/api/tasks/{task_id}/run-security", response_model=dict)
-def run_security_on_demand(task_id: str, background_tasks: BackgroundTasks):
+def run_security_on_demand(task_id: str):
     """Manually trigger the security review pipeline only (no optimization)."""
     task = get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     if not task.llm_id or not task.budget_id:
         raise HTTPException(status_code=400, detail="Task needs an LLM endpoint and budget assigned.")
-    background_tasks.add_task(_run_security_only_bg, task_id)
+    _start_bg(_run_security_only_bg, task_id)
     return {"task_id": task_id, "status": "STARTED", "pipeline": "security"}
 
 
 @app.post("/api/tasks/{task_id}/run-full-review", response_model=dict)
-def run_full_review_on_demand(task_id: str, background_tasks: BackgroundTasks):
+def run_full_review_on_demand(task_id: str):
     """Manually trigger the full review pipeline for a task."""
     task = get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     if not task.llm_id or not task.budget_id:
         raise HTTPException(status_code=400, detail="Task needs an LLM endpoint and budget assigned.")
-    background_tasks.add_task(_run_full_review_bg, task_id)
+    _start_bg(_run_full_review_bg, task_id)
     return {"task_id": task_id, "status": "STARTED", "pipeline": "full_review"}
+
+
+@app.post("/api/tasks/{task_id}/merge", response_model=dict)
+def run_merge_manually(task_id: str):
+    """Manually trigger the final merge to main for a task in FINAL REVIEW."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    _start_bg(_execute_merge_bg, task_id)
+    return {"task_id": task_id, "status": "STARTED", "pipeline": "merge"}
 
 
 @app.get("/api/agent/tasks/ready", response_model=List[dict])

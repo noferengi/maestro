@@ -346,6 +346,9 @@ VERDICT_RANGES: dict[str, tuple[int, int]] = _build_verdict_ranges()
 # ===========================================================================
 
 PLANNING_BEST_OF_N: int = _getint("planning", "best_of_n", None, 5)
+PLANNING_MAX_FILES: int = _getint("planning", "max_files", None, 8)
+PLANNING_MAX_STEPS: int = _getint("planning", "max_steps", None, 6)
+PLANNING_MAX_CONSECUTIVE_FAILURES: int = _getint("planning", "max_consecutive_failures", None, 3)
 PLANNING_TEMPERATURE_SPREAD: list[float] = [
     float(x.strip())
     for x in _get("planning", "temperature_spread", None, "0.3, 0.4, 0.5, 0.6, 0.7").split(",")

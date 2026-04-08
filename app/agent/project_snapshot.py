@@ -91,6 +91,7 @@ ARCH_CATEGORY_RELEVANCE: dict[str, set[str] | None] = {
     'security':          {'Security', 'Compliance', 'API', 'Data', 'Platform', 'General'},
     'optimization':      {'Performance', 'Platform', 'Data', 'Observability',
                           'Tooling', 'General'},
+    'planning':         None,  # all categories — needs full platform/design context
     # research, loop, intake, full_review → all categories (key absent = None)
 }
 

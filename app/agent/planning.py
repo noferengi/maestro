@@ -29,6 +29,8 @@ from app.agent.config import (
     PLANNING_MAX_DESIGN_RETRIES,
     PLANNING_SURVEY_MAX_TURNS,
     PLANNING_LLM_TEMPERATURE,
+    PLANNING_MAX_FILES,
+    PLANNING_MAX_STEPS,
     PROJECT_ROOT,
     check_context_saturation,
 )
@@ -94,6 +96,8 @@ class PlanningResult:
     confidence: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    scope_verdict: str = ""      # non-empty when design scope is too large
+    survey_summary: str = ""     # codebase survey result, passed to subdivision
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +138,7 @@ class PlanningPipeline:
         budget_id: int | None = None,
         max_context: int | None = None,
         run_row_id: int | None = None,
+        project_name: str | None = None,
     ):
         self.task_id = task_id
         self.task_title = task_title
@@ -145,8 +150,26 @@ class PlanningPipeline:
         self.budget_id = budget_id
         self.max_context = max_context
         self.run_row_id = run_row_id
+        self.project_name = project_name
         self._total_prompt = 0
         self._total_completion = 0
+        # Lazily computed architecture context (cached on first access)
+        self.__arch_ctx: str | None = None
+
+    @property
+    def _arch_ctx(self) -> str:
+        if self.__arch_ctx is None:
+            if not self.project_name:
+                self.__arch_ctx = ""
+            else:
+                try:
+                    from app.agent.project_snapshot import build_architecture_context
+                    self.__arch_ctx = build_architecture_context(
+                        self.project_name, agent_type="planning"
+                    ) or ""
+                except Exception:
+                    self.__arch_ctx = ""
+        return self.__arch_ctx
 
     async def run(self) -> PlanningResult:
         """Execute all planning sub-stages and return the result."""
@@ -160,6 +183,7 @@ class PlanningPipeline:
         selected_index = 0
         review_votes: list[Vote] = []
         winning_design: dict = {}
+        scope_verdict = ""
 
         for attempt in range(PLANNING_MAX_DESIGN_RETRIES):
             if is_shutting_down():
@@ -174,13 +198,30 @@ class PlanningPipeline:
                 designs, survey_summary
             )
 
+            # Scope guard: if design is too broad, signal subdivision immediately
+            scope_reason = self._check_scope(winning_design)
+            if scope_reason:
+                logger.info(
+                    f"[{AGENT_NAME}] Scope too large on attempt %d — %s",
+                    attempt + 1, scope_reason,
+                )
+                review_votes = [Vote(
+                    stage="scope_checker",
+                    verdict=Verdict.SUBDIVIDE_IDEA,
+                    confidence=95,
+                    justification=scope_reason,
+                )]
+                tally_votes(review_votes)  # noqa: F841 — called for side-effect logging
+                scope_verdict = scope_reason
+                break  # No retry — redesigning won't shrink the task
+
             # Stage 3: Design review panel
             votes = await self._stage_design_review(winning_design, survey_summary)
             review_votes = votes
 
             tally = tally_votes(votes)
-            if tally.outcome in ("passed", "conditional_pass"):
-                logger.info(f"[{AGENT_NAME}] Design accepted on attempt %d", attempt + 1)
+            if tally.outcome in ("passed", "conditional_pass", "subdivide"):
+                logger.info(f"[{AGENT_NAME}] Design review finished on attempt %d: %s", attempt + 1, tally.outcome)
                 break
             else:
                 logger.info(
@@ -192,19 +233,26 @@ class PlanningPipeline:
                     rejection_feedback = "; ".join(tally.rejection_reasons)
                     survey_summary += f"\n\n[REVIEWER FEEDBACK from attempt {attempt+1}]: {rejection_feedback}"
 
-        # Stage 4: Pitfall detection
-        pitfalls = await self._stage_pitfall_detection(winning_design, survey_summary)
+        if scope_verdict:
+            # Skip stages 4-5 — no point polishing a design that will be split
+            pitfalls: list[dict] = []
+            consolidated = winning_design
+        else:
+            # Stage 4: Pitfall detection
+            pitfalls = await self._stage_pitfall_detection(winning_design, survey_summary)
 
-        # Stage 5: Plan consolidation
-        consolidated = await self._stage_consolidation(
-            winning_design, pitfalls, survey_summary
-        )
+            # Stage 5: Plan consolidation
+            consolidated = await self._stage_consolidation(
+                winning_design, pitfalls, survey_summary
+            )
 
         # Build result
         result = self._build_result(
             consolidated, best_designs, selected_index,
             review_votes, pitfalls, survey_summary
         )
+        result.scope_verdict = scope_verdict
+        result.survey_summary = survey_summary
 
         # Persist to database
         self._store_result(result)
@@ -219,32 +267,55 @@ class PlanningPipeline:
         """Run an agentic loop with read-only tools to survey the codebase."""
         from app.agent.tools import dispatch_tool
 
+        _arch = self._arch_ctx
         system_prompt = (
             "You are a codebase surveyor. Your job is to understand the existing code "
-            "structure relevant to the following task. Use the provided tools to read files, "
-            "search for patterns, and understand the architecture. When done, output a "
-            "comprehensive summary of your findings in a single message starting with "
-            "'SURVEY_COMPLETE:' followed by your summary.\n\n"
+            "structure relevant to the following task.\n\n"
+            "WORKFLOW:\n"
+            "1. Use tools to read 3-8 key files most relevant to the task.\n"
+            "2. Once you have a clear picture of the existing structure, STOP reading "
+            "and synthesize your findings.\n"
+            "3. Output a single message starting with 'SURVEY_COMPLETE:' followed by "
+            "your summary. Do NOT keep reading once you understand the key structure.\n\n"
+            "SYNTHESIS TRIGGERS — emit SURVEY_COMPLETE when ANY of these are true:\n"
+            "- You have read 5+ files and understand the relevant interfaces.\n"
+            "- You have confirmed the relevant modules and their responsibilities.\n"
+            "- You have identified what needs to change and what can be reused.\n\n"
             f"Task: {self.task_title}\n"
             f"Description: {self.task_description}"
+            + (f"\n\n{_arch}" if _arch else "")
         )
 
         messages: list[dict] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": (
-                "Survey the codebase to understand what exists and what needs to change "
-                "for this task. Focus on: existing file structure, relevant modules, "
-                "interfaces that will be affected, and test patterns."
+                "Survey the codebase. Focus only on files most relevant to this task. "
+                "Read 3-8 key files, then immediately emit SURVEY_COMPLETE: with your summary. "
+                "Do not exhaustively read every file — stop once you understand the key structure."
             )},
         ]
 
         tool_schemas = _get_survey_tool_schemas()
         survey_result = ""
         _ctx_warned: set[float] = set()
+        _turn_nudge_threshold = max(3, int(PLANNING_SURVEY_MAX_TURNS * 0.6))
+        _turn_nudge_sent = False
 
         for turn in range(PLANNING_SURVEY_MAX_TURNS):
             if is_shutting_down():
                 raise ShutdownError("Server is shutting down")
+
+            # Inject a turn-budget nudge when approaching the limit (once only).
+            if not _turn_nudge_sent and turn >= _turn_nudge_threshold:
+                _turn_nudge_sent = True
+                remaining = PLANNING_SURVEY_MAX_TURNS - turn
+                messages.append({"role": "user", "content": (
+                    f"You have {remaining} tool-call turns remaining. "
+                    "Stop reading files now and immediately emit SURVEY_COMPLETE: "
+                    "followed by a summary of everything you have learned so far."
+                )})
+                logger.info(f"[{AGENT_NAME}] Survey turn-budget nudge injected at turn %d/%d",
+                            turn + 1, PLANNING_SURVEY_MAX_TURNS)
 
             response = await call_llm(
                 messages,
@@ -279,6 +350,8 @@ class PlanningPipeline:
             # Check for completion signal
             if content and "SURVEY_COMPLETE:" in content:
                 survey_result = content.split("SURVEY_COMPLETE:", 1)[1].strip()
+                logger.info(f"[{AGENT_NAME}] Survey completed at turn %d/%d",
+                            turn + 1, PLANNING_SURVEY_MAX_TURNS)
                 break
 
             # Dispatch tool calls
@@ -290,15 +363,25 @@ class PlanningPipeline:
                         result = dispatch_tool(fn_name, fn_args)
                     except Exception as e:
                         result = f"Error: {e}"
+                    result_str = str(result)[:4000]
+                    logger.debug(f"[{AGENT_NAME}] Survey turn %d: %s(%s) → %d chars",
+                                 turn + 1, fn_name,
+                                 ", ".join(f"{k}={v!r}" for k, v in fn_args.items()),
+                                 len(result_str))
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
-                        "content": str(result)[:4000],
+                        "content": result_str,
                     })
             elif not content:
                 break
 
         if not survey_result:
+            logger.warning(
+                f"[{AGENT_NAME}] Survey exhausted %d turns without SURVEY_COMPLETE signal. "
+                "Using last LLM response (%d chars) as fallback — design quality may be reduced.",
+                PLANNING_SURVEY_MAX_TURNS, len(content),
+            )
             survey_result = content or "Survey completed without explicit summary."
 
         logger.info(f"[{AGENT_NAME}] Codebase survey completed (%d chars)", len(survey_result))
@@ -310,6 +393,7 @@ class PlanningPipeline:
 
     async def _stage_design_generation(self, survey: str) -> list[dict]:
         """Generate N design proposals in parallel with temperature spread."""
+        _arch = self._arch_ctx
         system_prompt = (
             "You are a software architect. Based on the codebase survey and task description, "
             "produce a detailed implementation design. Output valid JSON with these keys:\n"
@@ -320,6 +404,7 @@ class PlanningPipeline:
             "- test_strategy: list of {component, test_file, test_cases, fixtures}\n"
             "- implementation_steps: list of {order, component, files, description, depends_on, estimated_context_tokens}\n"
             "\nOutput ONLY the JSON object, no markdown fences."
+            + (f"\n\n{_arch}" if _arch else "")
         )
 
         user_msg = (
@@ -387,16 +472,29 @@ class PlanningPipeline:
             return valid[0]
 
         judge_prompt = (
-            "You are a design judge. Compare these design proposals and select the best one. "
-            "Output JSON: {\"selected_index\": <0-based index>, \"justification\": \"...\"}\n\n"
+            "You are a design judge. Compare these design proposals and select the best one.\n"
+            "Output JSON with two keys: selected_index (integer, 0-based) and justification (string).\n\n"
         )
         for orig_idx, design in valid:
-            # Only send the rationale + file list - keeps the prompt small
-            summary = {
-                "rationale": str(design.get("design_rationale", ""))[:400],
-                "files": [f.get("path", "") for f in design.get("file_manifest", [])[:8]],
-            }
-            judge_prompt += f"\n--- Design {orig_idx} ---\n{json.dumps(summary)}\n"
+            # Format as readable text — avoid embedding raw JSON braces in the prompt,
+            # which can confuse llama.cpp's Jinja2 chat-template renderer.
+            # Also sanitize LLM-generated text to printable ASCII to prevent
+            # any generated character from triggering a template parse error.
+            rationale_raw = str(design.get("design_rationale", ""))[:300]
+            rationale = "".join(
+                c for c in rationale_raw
+                if (0x20 <= ord(c) <= 0x7E or c == "\n") and c not in "{}"
+            )
+            files = [f.get("path", "") for f in design.get("file_manifest", [])[:6]]
+            files_str = ", ".join(
+                "".join(c for c in p if 0x20 <= ord(c) <= 0x7E and c not in "{}")
+                for p in files
+            ) if files else "(none)"
+            judge_prompt += (
+                f"\nDesign {orig_idx}:\n"
+                f"  {rationale}\n"
+                f"  Files: {files_str}\n"
+            )
 
         try:
             response = await call_llm(
@@ -486,11 +584,14 @@ class PlanningPipeline:
             },
         ]
 
-        design_summary = json.dumps(design, indent=1)[:6000]
+        design_summary = json.dumps(design, indent=1, ensure_ascii=True)[:6000]
+        _arch = self._arch_ctx
+        _arch_prefix = f"Task: {self.task_title}\n{_arch}\n\n" if _arch else f"Task: {self.task_title}\n\n"
 
         tasks = []
         for reviewer in reviewers:
             prompt = (
+                f"{_arch_prefix}"
                 f"You are reviewing a software design from the perspective of: {reviewer['focus']}\n\n"
                 f"Design:\n{design_summary}\n\n"
                 "Output JSON with: {\"verdict\": \"LIKELY|POSSIBLE|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED\", "
@@ -505,6 +606,7 @@ class PlanningPipeline:
                     base_url=self.llm_base_url,
                     model=self.llm_model,
                     temperature=PLANNING_LLM_TEMPERATURE,
+                    total_timeout_secs=90,
                     task_id=self.task_id,
                     llm_id=self.llm_id,
                     budget_id=self.budget_id,
@@ -594,9 +696,11 @@ class PlanningPipeline:
                     })
 
         # LLM: edge case detection
+        _arch = self._arch_ctx
         prompt = (
-            "Analyze this design for potential pitfalls:\n"
-            f"{json.dumps(design, indent=1)[:4000]}\n\n"
+            (f"{_arch}\n\n" if _arch else "")
+            + "Analyze this design for potential pitfalls:\n"
+            f"{json.dumps(design, indent=1, ensure_ascii=True)[:4000]}\n\n"
             "Look for: edge cases, implicit dependencies, race conditions, "
             "state management issues, migration risks.\n"
             "Output JSON: {\"pitfalls\": [{\"type\": \"...\", \"severity\": \"low|medium|high|critical\", \"detail\": \"...\"}]}"
@@ -636,12 +740,14 @@ class PlanningPipeline:
         if not pitfalls:
             return design
 
+        _arch = self._arch_ctx
         prompt = (
-            "You have a winning design and identified pitfalls. "
+            (f"{_arch}\n\n" if _arch else "")
+            + "You have a winning design and identified pitfalls. "
             "Produce a consolidated final design that incorporates mitigations "
             "for the identified pitfalls. Output the same JSON structure as the original design.\n\n"
-            f"Original design:\n{json.dumps(design, indent=1)[:4000]}\n\n"
-            f"Pitfalls:\n{json.dumps(pitfalls, indent=1)[:2000]}"
+            f"Original design:\n{json.dumps(design, indent=1, ensure_ascii=True)[:4000]}\n\n"
+            f"Pitfalls:\n{json.dumps(pitfalls, indent=1, ensure_ascii=True)[:2000]}"
         )
 
         try:
@@ -668,6 +774,22 @@ class PlanningPipeline:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _check_scope(self, design: dict) -> str | None:
+        """Return a reason string if the design is too large, else None."""
+        files = design.get("file_manifest", [])
+        steps = design.get("implementation_steps", [])
+        if len(files) > PLANNING_MAX_FILES:
+            return (
+                f"Design spans {len(files)} files (limit {PLANNING_MAX_FILES}). "
+                "Too broad for a single implementation task — should be subdivided."
+            )
+        if len(steps) > PLANNING_MAX_STEPS:
+            return (
+                f"Design has {len(steps)} implementation steps (limit {PLANNING_MAX_STEPS}). "
+                "Too complex for a single task — should be subdivided."
+            )
+        return None
 
     def _track_tokens(self, response: dict) -> None:
         usage = response.get("usage", {})
@@ -797,6 +919,7 @@ async def run_planning_pipeline(
     budget_id: int | None = None,
     max_context: int | None = None,
     project_path: str | None = None,
+    project_name: str | None = None,
     run_row_id: int | None = None,
 ) -> dict:
     """Run the full planning pipeline and return a result dict."""
@@ -814,8 +937,27 @@ async def run_planning_pipeline(
         budget_id=budget_id,
         max_context=max_context,
         run_row_id=run_row_id,
+        project_name=project_name,
     )
     result = await pipeline.run()
+    votes_list = [
+        {"stage": v.stage, "verdict": v.verdict.value, "confidence": v.confidence,
+         "justification": v.justification}
+        for v in result.review_votes
+    ]
+    # Scope-too-large: signal subdivision before confidence check
+    if result.scope_verdict:
+        return {
+            "task_id": result.task_id,
+            "outcome": "subdivide",
+            "scope_reason": result.scope_verdict,
+            "design_rationale": result.design_rationale,
+            "file_manifest": [asdict(f) for f in result.file_manifest],
+            "survey_summary": result.survey_summary,
+            "total_prompt_tokens": result.prompt_tokens,
+            "total_completion_tokens": result.completion_tokens,
+            "votes": votes_list,
+        }
     return {
         "task_id": result.task_id,
         "outcome": "passed" if result.confidence >= 60 else "rejected",
@@ -830,9 +972,5 @@ async def run_planning_pipeline(
         "confidence": result.confidence,
         "total_prompt_tokens": result.prompt_tokens,
         "total_completion_tokens": result.completion_tokens,
-        "votes": [
-            {"stage": v.stage, "verdict": v.verdict.value, "confidence": v.confidence,
-             "justification": v.justification}
-            for v in result.review_votes
-        ],
+        "votes": votes_list,
     }

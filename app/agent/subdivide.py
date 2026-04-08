@@ -497,19 +497,43 @@ class SubdivisionAgent:
 
         if self.rejection_context:
             rc = self.rejection_context
-            prev_decomp = json.dumps(rc.get("previous_decomposition", []), indent=2, default=str)
-            rejected = json.dumps(rc.get("rejected_sub_ideas", []), indent=2, default=str)
-            passed = json.dumps(rc.get("passed_sub_ideas", []), indent=2, default=str)
-            guidance = rc.get("guidance", "Try a different decomposition strategy.")
+            if rc.get("reason") == "planning_scope_too_large":
+                # Context from a planning pipeline that determined the task is too large
+                # to implement as a single card. Feed the planning analysis to the
+                # subdivision agent so it can decompose intelligently.
+                _manifest_str = json.dumps(rc.get("file_manifest", []), indent=2, default=str)
+                _rationale = rc.get("design_rationale", "")
+                _scope_reason = rc.get("scope_reason", "")
+                _survey = rc.get("survey_summary", "")
+                planning_ctx = "\n## Prior Planning Analysis\n"
+                planning_ctx += f"The planning pipeline attempted to design this task but determined it is too broad:\n\n"
+                if _scope_reason:
+                    planning_ctx += f"**Scope verdict:** {_scope_reason}\n\n"
+                if _rationale:
+                    planning_ctx += f"**Design rationale attempted:** {_rationale[:500]}\n\n"
+                if _manifest_str and _manifest_str != "[]":
+                    planning_ctx += f"**File manifest from attempted design:**\n```json\n{_manifest_str[:2000]}\n```\n\n"
+                if _survey:
+                    planning_ctx += f"**Codebase survey summary:**\n{_survey[:1500]}\n\n"
+                planning_ctx += (
+                    "Use this information to decompose the task into smaller, focused sub-ideas "
+                    "that each touch fewer files and have a single clear responsibility."
+                )
+                parts.append(planning_ctx)
+            else:
+                prev_decomp = json.dumps(rc.get("previous_decomposition", []), indent=2, default=str)
+                rejected = json.dumps(rc.get("rejected_sub_ideas", []), indent=2, default=str)
+                passed = json.dumps(rc.get("passed_sub_ideas", []), indent=2, default=str)
+                guidance = rc.get("guidance", "Try a different decomposition strategy.")
 
-            retry_text = _SUBDIVISION_RETRY_CONTEXT.format(
-                attempt_number=rc.get("attempt_number", "?"),
-                previous_decomposition=prev_decomp,
-                rejected_details=rejected,
-                passed_details=passed,
-                guidance=guidance,
-            )
-            parts.append(retry_text)
+                retry_text = _SUBDIVISION_RETRY_CONTEXT.format(
+                    attempt_number=rc.get("attempt_number", "?"),
+                    previous_decomposition=prev_decomp,
+                    rejected_details=rejected,
+                    passed_details=passed,
+                    guidance=guidance,
+                )
+                parts.append(retry_text)
 
         return "\n\n".join(parts)
 
