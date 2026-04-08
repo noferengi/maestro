@@ -80,7 +80,7 @@ class DAGResolver:
                 continue
             task_type = (task.get("type") or "").lower()
             # Permanently terminal states - never dispatch
-            if task_type in ("security", "completed", "cancelled", "subdividing"):
+            if task_type in ("completed", "cancelled", "subdividing"):
                 continue
             # indev / conceptual_review / optimization / full_review are
             # mid-pipeline stages.  They are NOT excluded here: if there is no

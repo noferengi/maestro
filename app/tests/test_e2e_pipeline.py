@@ -569,8 +569,14 @@ class TestSchedulerFullChainE2E:
 
         fake_task = _fake_db_task_e2e(task_id="chain-t", task_type="conceptual_review")
 
+        fake_plan = MagicMock()
+        fake_plan.file_manifest = "[]"
+        fake_plan.implementation_steps = "[]"
+        fake_plan.dependency_graph = "{}"
+        fake_plan.test_strategy = "[]"
+
         with patch("app.database.get_task", return_value=fake_task), \
-             patch("app.database.get_planning_result", return_value=None), \
+             patch("app.database.get_planning_result", return_value=fake_plan), \
              patch("app.database.update_task", side_effect=_capture), \
              patch("app.database.create_transition_result", MagicMock()), \
              patch("app.agent.tools.set_task_git_cwd", MagicMock()), \
@@ -590,28 +596,31 @@ class TestSchedulerFullChainE2E:
         assert "optimization" in updated_types
         assert "full_review" in updated_types
 
-    def test_full_chain_merge_success_calls_rollup(self):
+    def test_full_chain_merge_virtual_passed_records_ready_for_review(self):
+        """After full_review passes and virtual merge succeeds, task history is updated."""
         from app.agent.scheduler import _run_full_review_task
         from app.agent.merge import MergeResult
 
-        mock_rollup = MagicMock()
+        mock_append = MagicMock()
         fake_task = _fake_db_task_e2e(task_id="merge-t", task_type="full_review")
 
         with patch("app.database.get_task", return_value=fake_task), \
              patch("app.database.update_task", MagicMock()), \
              patch("app.database.create_transition_result", MagicMock()), \
              patch("app.database.get_project_path", return_value=None), \
+             patch("app.database.append_task_history", mock_append), \
              patch("app.agent.tools.set_task_git_cwd", MagicMock()), \
              patch("app.agent.full_review.run_full_review_pipeline",
                    return_value={"outcome": "passed", "demotion_target": None, "summary": "",
                                  "total_prompt_tokens": 0, "total_completion_tokens": 0, "votes": []}), \
              patch("app.agent.merge.execute_merge",
-                   return_value=MergeResult(task_id="merge-t", status="merged")), \
-             patch("app.agent.scheduler._check_completion_rollup_inline", mock_rollup), \
+                   return_value=MergeResult(task_id="merge-t", status="virtual_passed")), \
              patch("app.agent.scheduler._record_demotion_inline", MagicMock()):
             _run_full_review_task("merge-t", "http://localhost:8008/v1", "model")
 
-        mock_rollup.assert_called_once_with("merge-t")
+        mock_append.assert_called_once()
+        assert mock_append.call_args[0][0] == "merge-t"
+        assert mock_append.call_args[0][1] == "ready_for_review"
 
     def test_full_chain_security_failure_stops_chain(self):
         from app.agent.scheduler import _run_optimization_security_task

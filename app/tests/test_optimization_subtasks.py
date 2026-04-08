@@ -228,7 +228,7 @@ def test_phase_implementation_prereq_deadlock_avoidance(tmp_path, monkeypatch):
         with mock.patch.object(pipeline, "_wait_for_subtasks", side_effect=mock_wait):
             await pipeline._phase_implementation(proposal)
 
-    asyncio.get_event_loop().run_until_complete(run())
+    asyncio.run(run())
 
     all_tasks = db_mod.get_all_tasks()
     subtasks = [t for t in all_tasks if t.parent_task_id == "task-dl-parent"]

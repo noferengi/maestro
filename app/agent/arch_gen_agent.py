@@ -27,6 +27,7 @@ ARCH_CATEGORIES: list[str] = [
 ]
 
 _SYSTEM_PROMPT = (
+    "/no_think\n"
     "You are an architecture advisor documenting a software project. "
     "Your notes are injected verbatim into AI agents as authoritative project constraints. "
     "Be specific, concrete, and accurate - your note will be used by agents to make "
@@ -94,9 +95,16 @@ async def execute_arch_gen_job(
         "/dist/", "\\dist\\",
         "/.tox/", "\\.tox\\",
         "/eggs/", "\\eggs\\",
+        # .maestro/ is Maestro's own generated metadata (contracts, architecture snapshots).
+        # Including it in arch gen prompts is circular and its JSON content can contain
+        # sequences that confuse llama.cpp's Jinja2 template renderer.
+        "/.maestro/", "\\.maestro\\",
     )
 
-    lines: list[str] = []
+    # Deduplicate: multiple summary rows may exist per file (re-runs, stale cache).
+    # Keep only the most recent row per file path (summaries are ordered by path,
+    # but may have multiple rows; pick the one with the best content).
+    seen_paths: dict[str, str] = {}  # rel_path -> best text so far
     for row in summaries:
         fp = row.file_path
         if any(seg in fp for seg in _NOISE_SEGMENTS):
@@ -105,15 +113,20 @@ async def execute_arch_gen_job(
         text = _two_sentences(
             (getattr(row, 'short_summary', None) or row.summary or "").strip()
         )
-        if text:
-            lines.append(f"- {rel}: {text}")
+        if text and (rel not in seen_paths or len(text) > len(seen_paths[rel])):
+            seen_paths[rel] = text
+
+    lines: list[str] = [f"- {rel}: {text}" for rel, text in seen_paths.items()]
 
     if not lines:
         raise RuntimeError("All file summaries were empty - nothing to synthesise.")
 
     # Cap the summary block to avoid overwhelming the LLM's context window.
-    # At ~4 chars/token, 40 000 chars ≈ 10 000 tokens — well within any slot budget.
-    _MAX_SUMMARY_CHARS = 40_000
+    # Errors at pos ~2050–2316 indicate per-slot context overflow (~2048 tok/slot).
+    # Reducing from 40 000 → 6 000 chars as a diagnostic step: if errors still cluster
+    # at pos ~2050, the problem is content before the summary block; if they disappear,
+    # increase toward the largest value that succeeds.
+    _MAX_SUMMARY_CHARS = 6_000
     summary_block = "\n".join(lines)
     if len(summary_block) > _MAX_SUMMARY_CHARS:
         # Truncate to the last complete line within the cap.
@@ -141,14 +154,15 @@ async def execute_arch_gen_job(
         base_url=llm_base_url,
         model=llm_model,
         temperature=0.4,
-        max_tokens=256,
+        max_tokens=512,
+        max_retries=5,
         task_id=None,
         llm_id=llm_id,
         budget_id=budget_id,
         agent_name=AGENT_NAME,
     )
 
-    body = (
+    raw_body = (
         response.get("choices", [{}])[0]
         .get("message", {})
         .get("content", "")
@@ -158,8 +172,12 @@ async def execute_arch_gen_job(
     prompt_tokens = usage.get("prompt_tokens", 0)
     completion_tokens = usage.get("completion_tokens", 0)
 
+    # Strip Qwen3 <think>...</think> blocks in case /no_think was ignored.
+    body = re.sub(r"<think>.*?</think>", "", raw_body, flags=re.DOTALL).strip()
+
     if not body:
-        raise ValueError("LLM returned empty content for arch gen job")
+        detail = "contained only <think> block" if raw_body else "was empty"
+        raise ValueError(f"LLM returned no usable content for arch gen job (response {detail})")
 
     create_task(
         title=f"{category} Architecture",

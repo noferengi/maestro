@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 @dataclass(slots=True)
 class MergeResult:
     task_id: str
-    status: str  # "merged" | "conflict" | "test_failure" | "error"
+    status: str  # "merged" | "conflict" | "test_failure" | "error" | "virtual_passed"
     merge_commit_sha: str | None = None
     test_output: str | None = None
     error_detail: str | None = None
@@ -61,13 +61,18 @@ def _git(args: list[str], timeout: int = 60, cwd: str | None = None) -> tuple[in
     return result.returncode, (result.stdout + result.stderr).strip()
 
 
-def execute_merge(task_id: str, project_path: str | None = None) -> MergeResult:
+def execute_merge(task_id: str, project_path: str | None = None, dry_run: bool = False) -> MergeResult:
     """Execute the full deterministic merge workflow.
 
-    This function is synchronous - no LLM calls, just git + pytest.
+    If dry_run=True:
+      - Merges into main/master
+      - Runs tests
+      - ALWAYS reverts the merge (reset --hard)
+      - Returns status 'virtual_passed' on success or 'test_failure' / 'conflict' on failure.
+      - Does NOT push, does NOT tag, does NOT update task status.
     """
     effective_cwd = project_path or PROJECT_ROOT
-    logger.info("[merge] Using project directory: %s", effective_cwd)
+    logger.info("[merge] Using project directory: %s (dry_run=%s)", effective_cwd, dry_run)
     ensure_git_repo(effective_cwd)
 
     branch = f"{GIT_SAFETY_BRANCH_PREFIX}{task_id}"
@@ -151,6 +156,17 @@ def execute_merge(task_id: str, project_path: str | None = None) -> MergeResult:
             merge_commit_sha=merge_sha,
             test_output=test_output,
             error_detail="Tests failed after merge. Merge reverted.",
+            branch_name=branch,
+        )
+
+    if dry_run:
+        logger.info("[merge] Dry run successful, reverting merge.")
+        _git(["reset", "--hard", "HEAD~1"], cwd=effective_cwd)
+        return MergeResult(
+            task_id=task_id,
+            status="virtual_passed",
+            merge_commit_sha=merge_sha,
+            test_output=test_output,
             branch_name=branch,
         )
 

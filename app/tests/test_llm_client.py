@@ -162,7 +162,9 @@ class TestToolsPayload:
             with patch("app.database.create_budget_entry", MagicMock()):
                 _run(call_llm(_messages(), llm_id=1, budget_id=1, tools=tools))
 
-        payload = mock_instance.post.call_args.kwargs["json"]
+        # call_llm sends content=bytes (ascii JSON), not json=dict
+        raw = mock_instance.post.call_args.kwargs["content"]
+        payload = json.loads(raw.decode("ascii"))
         assert "tools" in payload
         assert payload["tools"] == tools
 
@@ -175,7 +177,8 @@ class TestToolsPayload:
             with patch("app.database.create_budget_entry", MagicMock()):
                 _run(call_llm(_messages(), llm_id=1, budget_id=1, tools=None))
 
-        payload = mock_instance.post.call_args.kwargs["json"]
+        raw = mock_instance.post.call_args.kwargs["content"]
+        payload = json.loads(raw.decode("ascii"))
         assert "tools" not in payload
 
 
@@ -195,7 +198,8 @@ class TestResponseFormat:
             with patch("app.database.create_budget_entry", MagicMock()):
                 _run(call_llm(_messages(), llm_id=1, budget_id=1, response_format=fmt))
 
-        payload = mock_instance.post.call_args.kwargs["json"]
+        raw = mock_instance.post.call_args.kwargs["content"]
+        payload = json.loads(raw.decode("ascii"))
         assert payload.get("response_format") == fmt
 
 
@@ -270,7 +274,8 @@ class TestHttpErrors:
                 with pytest.raises(httpx.HTTPStatusError):
                     _run(call_llm(_messages(), llm_id=1, budget_id=1))
 
-    def test_http_timeout_raises_timeout_exception(self):
+    def test_http_timeout_retries_then_raises_runtime_error(self):
+        """call_llm retries on ReadTimeout; after max_retries it raises RuntimeError."""
         from app.agent.llm_client import call_llm
 
         mock_instance = AsyncMock()
@@ -281,9 +286,11 @@ class TestHttpErrors:
         mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_instance)
         mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
+        # max_retries=1 caps the loop; asyncio.sleep is mocked to skip real waits
         with patch("httpx.AsyncClient", mock_cls):
-            with pytest.raises(httpx.TimeoutException):
-                _run(call_llm(_messages(), llm_id=1, budget_id=1))
+            with patch("app.agent.llm_client.asyncio.sleep", AsyncMock()):
+                with pytest.raises(RuntimeError, match="timed out"):
+                    _run(call_llm(_messages(), llm_id=1, budget_id=1, max_retries=1))
 
 
 # ---------------------------------------------------------------------------
@@ -305,3 +312,71 @@ class TestBudgetLoggingFailure:
 
         # Budget entry failure must not surface - call_llm must still return result
         assert result == body
+
+
+# ---------------------------------------------------------------------------
+# 14. _sanitize_messages — single-brace identifier escaping
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizeSingleBraces:
+    def _sanitize(self, messages):
+        from app.agent.llm_client import _sanitize_messages
+        return _sanitize_messages(messages)
+
+    def test_url_path_param_replaced(self):
+        """URL path parameters like {task_id} are replaced with [task_id]."""
+        msgs = [{"role": "user", "content": "Call /api/tasks/{task_id}/diff for details."}]
+        result = self._sanitize(msgs)
+        assert result[0]["content"] == "Call /api/tasks/[task_id]/diff for details."
+
+    def test_attribute_access_replaced(self):
+        """{response.status} style attribute-access patterns are replaced."""
+        msgs = [{"role": "user", "content": "Check {response.status} for the code."}]
+        result = self._sanitize(msgs)
+        assert result[0]["content"] == "Check [response.status] for the code."
+
+    def test_json_object_unchanged(self):
+        """JSON objects like {"key": "val"} are NOT matched — key starts with quote."""
+        content = 'Send {"key": "value"} as the body.'
+        msgs = [{"role": "user", "content": content}]
+        result = self._sanitize(msgs)
+        assert result[0]["content"] == content
+
+    def test_double_braces_safe_after_both_passes(self):
+        """{{var}} is broken by _JINJA2_PAIRS into { {var} }, then {var} → [var] by the
+        single-brace pass. The final output { [var] } contains no Jinja2-special sequences."""
+        msgs = [{"role": "user", "content": "Template: {{var}} is safe."}]
+        result = self._sanitize(msgs)
+        content = result[0]["content"]
+        # Both passes ran: no double braces remain, no raw {var} remains.
+        assert "{{" not in content
+        assert "{var}" not in content
+        # The final form is fully safe for llama.cpp's Jinja2 renderer.
+        assert "{ [var] }" in content
+
+    def test_warning_logged_on_substitution(self):
+        """A WARNING is emitted when single-brace identifiers are escaped."""
+        import logging
+        msgs = [{"role": "user", "content": "See /api/tasks/{task_id}/status."}]
+        with patch("app.agent.llm_client.logger") as mock_logger:
+            self._sanitize(msgs)
+            assert mock_logger.warning.called
+            call_args = mock_logger.warning.call_args[0]
+            assert "single-brace identifier" in call_args[0].lower() or "single-brace" in call_args[0]
+
+    def test_no_substitution_when_no_single_braces(self):
+        """Messages without single-brace identifiers are returned unchanged."""
+        content = "No braces here at all."
+        msgs = [{"role": "user", "content": content}]
+        result = self._sanitize(msgs)
+        assert result[0]["content"] == content
+        # Should be the same dict object (no copy made)
+        assert result[0] is msgs[0]
+
+    def test_positional_format_strings_unchanged(self):
+        """{0}, {1} positional format strings are NOT matched — digit is not [A-Za-z_]."""
+        content = "Format: {0} and {1} should be untouched."
+        msgs = [{"role": "user", "content": content}]
+        result = self._sanitize(msgs)
+        assert result[0]["content"] == content

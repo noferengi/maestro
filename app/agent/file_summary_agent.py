@@ -61,12 +61,20 @@ AGENT_NAME = "File Summary Agent"
 # time; the scheduler always tries to read the full file from disk first.
 _MAX_CONTENT_CHARS = 32_000
 
-# Characters per read window for large-file chunking (~8 k tokens at 4 c/tok).
-_CHUNK_CHARS = 32_000
+# Fallback window size when max_context is unknown (~8 k tokens at 4 c/tok).
+_CHUNK_CHARS_DEFAULT = 32_000
 
 # If the full file fits within this many chars the verbatim content is
 # appended to the rollup prompt alongside the section summaries.
 _ROLLUP_MAX_CHARS = 400_000
+
+# Chars-per-token estimate for code content (conservative: short identifiers,
+# brackets, and keywords each burn a token → denser than prose).
+_CHARS_PER_TOKEN = 3
+
+# Window = 30% of LLM context in chars; step = 50% of window (50% overlap).
+_WINDOW_FRACTION = 0.30
+_STEP_FRACTION = 0.15
 
 
 # ---------------------------------------------------------------------------
@@ -87,21 +95,52 @@ def _length_target(content: str) -> str:
     return "2 concise paragraphs"
 
 
-def _split_chunks(content: str, chunk_size: int = _CHUNK_CHARS) -> list[str]:
-    """Split content into ~chunk_size char pieces, breaking at newlines."""
-    chunks: list[str] = []
-    start = 0
+def _compute_window_step(max_context: int) -> tuple[int, int]:
+    """Return (window_chars, step_chars) from the LLM's max context length.
+
+    Window = 30% of context in chars (at 3 chars/token for code).
+    Step   = 15% of context → 50% overlap between consecutive windows.
+    Falls back to _CHUNK_CHARS_DEFAULT when max_context is 0 or unknown.
+    """
+    if max_context > 0:
+        window = max(
+            _CHUNK_CHARS_DEFAULT,
+            int(max_context * _WINDOW_FRACTION * _CHARS_PER_TOKEN),
+        )
+        step = max(
+            _CHUNK_CHARS_DEFAULT // 2,
+            int(max_context * _STEP_FRACTION * _CHARS_PER_TOKEN),
+        )
+    else:
+        window = _CHUNK_CHARS_DEFAULT
+        step = _CHUNK_CHARS_DEFAULT
+    return window, step
+
+
+def _sliding_windows(content: str, window: int, step: int) -> list[tuple[int, int, str]]:
+    """Return (start, end, text) windows over content with 50% overlap.
+
+    Breaks at newline boundaries near each edge so windows align with complete
+    lines rather than splitting in the middle of a statement.
+    """
+    windows: list[tuple[int, int, str]] = []
     n = len(content)
+    start = 0
     while start < n:
-        end = min(start + chunk_size, n)
+        end = min(start + window, n)
+        # Snap end to nearest newline (unless we're at EOF)
         if end < n:
-            # Prefer breaking at a newline near the chunk boundary
             nl = content.rfind('\n', start, end)
             if nl > start:
                 end = nl + 1
-        chunks.append(content[start:end])
-        start = end
-    return chunks
+        windows.append((start, end, content[start:end]))
+        if end >= n:
+            break
+        # Next window starts 'step' chars after current start, snapped to newline
+        next_start = start + step
+        nl2 = content.find('\n', next_start)
+        start = (nl2 + 1) if (0 < nl2 < next_start + 200) else next_start
+    return windows
 
 
 def _parse_dual_summary(text: str) -> tuple[str, str]:
@@ -240,6 +279,7 @@ async def execute_file_summary(
     llm_model: "str | None" = None,
     previous_summary: "str | None" = None,
     stream_idle_timeout: "float | None" = None,
+    max_context: int = 0,
 ) -> dict:
     """Perform LLM call(s), store result in file_summaries, return token counts.
 
@@ -333,8 +373,8 @@ async def execute_file_summary(
         else:
             full_summary, short_summary = _parse_dual_summary(raw_text)
 
-    # ── Path 2: small file - fits in one chunk ───────────────────────────
-    elif len(file_content) <= _CHUNK_CHARS:
+    # ── Path 2: small file - fits in one window ─────────────────────────
+    elif len(file_content) <= _compute_window_step(max_context)[0]:
         prompt = (
             f"{_arch_preamble}"
             f"Analyze this source file.\n\n"
@@ -350,47 +390,49 @@ async def execute_file_summary(
         else:
             full_summary, short_summary = _parse_dual_summary(raw_text)
 
-    # ── Path 3: large file - chunked section summaries + rollup ──────────
+    # ── Path 3: large file - sliding-window summaries + rollup ───────────
+    # Window = 30% of LLM context (at 3 chars/token for code); step = 15% so
+    # consecutive windows overlap by 50%.  This ensures code that straddles a
+    # boundary always appears in full in at least one window.
     else:
-        chunks = _split_chunks(file_content, _CHUNK_CHARS)
-        chunk_count = len(chunks)
+        window_chars, step_chars = _compute_window_step(max_context)
+        windows = _sliding_windows(file_content, window_chars, step_chars)
+        window_count = len(windows)
         logger.debug(
-            "file_summary chunked: %s - %d chars -> %d chunks",
-            basename, len(file_content), chunk_count,
+            "file_summary sliding-window: %s - %d chars -> %d windows "
+            "(window=%d, step=%d, ctx=%d)",
+            basename, len(file_content), window_count,
+            window_chars, step_chars, max_context,
         )
 
-        # One concise summary per chunk
+        # One concise summary per window
         section_summaries: list[str] = []
-        char_offset = 0
-        for idx, chunk_text in enumerate(chunks):
+        for idx, (w_start, w_end, window_text) in enumerate(windows):
             if is_shutting_down():
                 raise ShutdownError("Server is shutting down")
 
-            chunk_start = char_offset + 1          # 1-based char position
-            chunk_end = char_offset + len(chunk_text)
-            char_offset = chunk_end
-
             prompt = (
                 f"Summarize the following section of {basename} "
-                f"(chars {chunk_start}-{chunk_end} of {len(file_content)}) "
-                f"in 1-2 sentences. Focus on what this section does.\n\n"
-                f"```\n{chunk_text}\n```"
+                f"(chars {w_start + 1}-{w_end} of {len(file_content)}) "
+                f"in 2-3 sentences. Focus on the critical information flow: "
+                f"what enters, what is decided or transformed, and what exits.\n\n"
+                f"```\n{window_text}\n```"
             )
             section_text, pp, cp = await _call(prompt)
             total_prompt += pp
             total_completion += cp
             section_summaries.append(
-                f"Section {idx + 1}/{chunk_count} "
-                f"(chars {chunk_start}-{chunk_end}): "
+                f"Window {idx + 1}/{window_count} "
+                f"(chars {w_start + 1}-{w_end}): "
                 f"{section_text or '(no summary)'}"
             )
 
-        # Rollup - combine all section summaries into full + short summaries
+        # Rollup - combine all window summaries into full + short summaries
         summaries_block = "\n".join(section_summaries)
         rollup_prompt = (
             f"{_arch_preamble}"
             f"You have read {basename} ({len(file_content):,} chars) in "
-            f"{chunk_count} sections. Section summaries:\n\n"
+            f"{window_count} overlapping windows. Window summaries:\n\n"
             f"{summaries_block}\n\n"
         )
         if len(file_content) <= _ROLLUP_MAX_CHARS:

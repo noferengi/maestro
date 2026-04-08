@@ -425,7 +425,7 @@ def get_scheduler_status() -> dict:
 
     dispatchable_set = set(SCHEDULER_DISPATCHABLE_TYPES)
     done_set = {s.lower() for s in PIPELINE_DONE_STATUSES}
-    never_dispatch = {"security", "completed", "cancelled", "subdividing", "accepted"}
+    never_dispatch = {"completed", "cancelled", "subdividing", "accepted"}
 
     active_list: list[dict] = []
     queued_list: list[dict] = []
@@ -1030,6 +1030,7 @@ def _run_file_summary_job(job: Any, llm: Any) -> None:
             llm_model=llm.model,
             previous_summary=getattr(job, 'previous_summary', None),
             stream_idle_timeout=FILE_SUMMARY_STREAM_IDLE_TIMEOUT,
+            max_context=getattr(llm, 'max_context', 0),
         ))
         update_file_summary_job(
             job.id,
@@ -1275,10 +1276,10 @@ def _run_arch_gen_job(job: Any, llm: Any) -> None:
         logger.debug("[arch_gen] job %d completed (project=%s category=%s).", job.id, job.project, job.category)
     except ShutdownError:
         logger.info("[arch_gen] job %d aborted due to server shutdown.", job.id)
-        update_arch_gen_job(job.id, status='failed')
-    except Exception:
+        update_arch_gen_job(job.id, status='failed', error_message="Server shutdown")
+    except Exception as e:
         logger.exception("[arch_gen] job %d failed.", job.id)
-        update_arch_gen_job(job.id, status='failed')
+        update_arch_gen_job(job.id, status='failed', error_message=str(e))
         _record_project_failure(job.project)
     finally:
         with _llm_counts_lock:
@@ -2041,30 +2042,23 @@ def _run_full_review_task(task_id: str, llm_base_url: str, llm_model: str,
         )
 
         if result.get("outcome") == "passed":
-            # Auto-merge: run execute_merge inline
+            # Pushed to FINAL REVIEW (full_review column) - do a virtual merge test.
             from app.agent.merge import execute_merge
             from app.database import get_project_path as _get_project_path
             pp = project_path
             if not pp and task.project:
                 pp = _get_project_path(task.project)
-            merge_result = execute_merge(task_id, project_path=pp)
-            if merge_result.status == "merged":
-                logger.info("[merge] Task '%s' merged to main via scheduler.", task_id)
-                _check_completion_rollup_inline(task_id)
-            elif merge_result.status == "conflict":
-                update_task(task_id, type="indev")
-                _record_demotion_inline(task_id, "merge", "indev", merge_result.error_detail or "Merge conflict")
-                logger.warning("[merge] Task '%s' merge conflict via scheduler.", task_id)
-            elif merge_result.status == "test_failure":
-                update_task(task_id, type="indev")
-                _record_demotion_inline(task_id, "merge", "indev", merge_result.error_detail or "Tests failed")
-                logger.warning("[merge] Task '%s' tests failed after merge via scheduler.", task_id)
-            elif merge_result.status == "push_failure":
-                update_task(task_id, type="full_review")
-                _record_demotion_inline(task_id, "merge", "full_review", merge_result.error_detail or "Push failed")
-                logger.error("[merge] Task '%s' push failed via scheduler.", task_id)
+            
+            logger.info("[full_review] Task '%s' passed. Running virtual merge test.", task_id)
+            merge_test = execute_merge(task_id, project_path=pp, dry_run=True)
+            
+            from app.database import append_task_history
+            if merge_test.status == "virtual_passed":
+                append_task_history(task_id, "ready_for_review", message="Full review passed. Virtual merge/test SUCCEEDED. Ready for final manual review and merge.")
+                logger.info("[full_review] Task '%s' virtual merge SUCCEEDED.", task_id)
             else:
-                logger.error("[merge] Task '%s' merge error via scheduler: %s", task_id, merge_result.error_detail)
+                append_task_history(task_id, "merge_test_failed", message=f"Full review passed, but VIRTUAL MERGE FAILED: {merge_test.status}. Detail: {merge_test.error_detail}")
+                logger.warning("[full_review] Task '%s' virtual merge FAILED: %s", task_id, merge_test.status)
         else:
             demotion = result.get("demotion_target", "indev")
             update_task(task_id, type=demotion)

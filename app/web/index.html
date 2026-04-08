@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kanban Board - TheMaestro</title>
-    <link rel="stylesheet" href="/static/style.css?v=27">
-    <script src="/static/kanban.js?v=47"></script>
+    <link rel="stylesheet" href="/static/style.css?v=28">
+    <script src="/static/kanban.js?v=48"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -567,6 +567,22 @@
             </div>
             <div class="modal-footer">
                 <button class="btn btn-secondary" onclick="closeInboxModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Inbox Detail Modal -->
+    <div class="modal-overlay" id="inbox-detail-modal">
+        <div class="modal" style="width:800px; max-height:85vh; display:flex; flex-direction:column; overflow:hidden">
+            <div class="modal-header">
+                <h2 class="modal-title" id="inbox-detail-title">Message Details</h2>
+                <button class="close-btn" onclick="closeInboxDetailModal()">&times;</button>
+            </div>
+            <div class="modal-body" id="inbox-detail-body" style="flex:1; overflow-y:auto; padding:0.5rem 0">
+                <!-- Populated dynamically -->
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeInboxDetailModal()">Close</button>
             </div>
         </div>
     </div>

@@ -413,19 +413,29 @@ const COLUMN_DISPLAY = {
 
 // Returns the label for an advance button given a task's current type.
 function _advanceBtnLabel(taskType, hasRejections) {
-    if (hasRejections) return 'Retry Advance';
-    const nextCol = COLUMN_NEXT[taskType];
-    const nextName = nextCol ? (COLUMN_DISPLAY[nextCol] || nextCol) : null;
-    return nextName ? `Advance to ${nextName}` : 'Advance';
+    if (hasRejections) return 'Retry Pipeline';
+    if (taskType === 'full_review') return 'Merge to Completed';
+    return 'Run Pipeline';
 }
 
 function isValidDropTarget(sourceContainer, targetContainer) {
     const sourceCol = sourceContainer.id.replace('tasks-', '');
     const targetCol = targetContainer.id.replace('tasks-', '');
+    
     // Always allow reorder within the same column
     if (sourceCol === targetCol) return true;
-    // Allow moving to the next column only if the task can advance
-    if (COLUMN_NEXT[sourceCol] === targetCol && canTaskAdvance(draggedTaskId)) return true;
+
+    // The user shouldn't really be able to move the card on the Kanban board unless they are demoting it themselves.
+    // They can't really promote through tasks that need to be completed.
+    const sourceIdx = PIPELINE_COLUMN_ORDER.indexOf(sourceCol);
+    const targetIdx = PIPELINE_COLUMN_ORDER.indexOf(targetCol);
+    
+    // If target index is less than source index, it's a demotion - ALLOW.
+    if (targetIdx !== -1 && sourceIdx !== -1 && targetIdx < sourceIdx) {
+        return true;
+    }
+
+    // Deny all other cross-column moves (no manual promotion).
     return false;
 }
 
@@ -874,7 +884,7 @@ function closeStageJournal() {
 async function _buildStageJournal(taskId) {
     const body = document.getElementById('sj-body');
     try {
-        const [summaryResp, planResp, compResp, optResp, secResp, frResp, mrResp, diffResp] = await Promise.all([
+        const [summaryResp, planResp, compResp, optResp, secResp, frResp, mrResp, diffResp, rjResp] = await Promise.all([
             fetch(`/api/tasks/${taskId}/stage-summary`),
             fetch(`/api/tasks/${taskId}/planning-result`),
             fetch(`/api/tasks/${taskId}/component-status`),
@@ -883,6 +893,7 @@ async function _buildStageJournal(taskId) {
             fetch(`/api/tasks/${taskId}/full-review-status`),
             fetch(`/api/tasks/${taskId}/merge-status`),
             fetch(`/api/tasks/${taskId}/diff`),
+            fetch(`/api/tasks/${taskId}/research-jobs`),
         ]);
 
         const summary  = summaryResp.ok  ? await summaryResp.json()  : null;
@@ -893,6 +904,7 @@ async function _buildStageJournal(taskId) {
         const frList   = frResp.ok       ? await frResp.json()       : [];
         const merge    = mrResp.ok       ? await mrResp.json()       : null;
         const diffData = diffResp.ok     ? await diffResp.json()     : null;
+        const rjList   = rjResp.ok       ? await rjResp.json()       : [];
 
         let html = '';
 
@@ -1102,6 +1114,25 @@ async function _buildStageJournal(taskId) {
                 <div class="sj-section-title">&#9998; Code Diff</div>
                 <div style="color:#6c757d;font-size:0.82rem">${escHtml(diffData.error)}</div>
             </div>`;
+        }
+
+        // ---- Research Jobs section ----
+        {
+            const completed = rjList.filter(j=>j.status==='completed').length;
+            const failed    = rjList.filter(j=>j.status==='failed').length;
+            const pending   = rjList.filter(j=>j.status==='pending'||j.status==='running').length;
+            let chips = '';
+            if (completed) chips += `<span class="sj-rj-chip chip-completed">${completed} completed</span>`;
+            if (pending)   chips += `<span class="sj-rj-chip chip-pending">${pending} pending</span>`;
+            if (failed)    chips += `<span class="sj-rj-chip chip-failed">${failed} failed</span>`;
+            html += `<details class="sj-section sj-rj-details">
+                <summary class="sj-section-title">&#128202; Research Jobs (${rjList.length}) ${chips}</summary>`;
+            if (rjList.length === 0) {
+                html += `<div class="sj-rj-empty">No research jobs recorded for this task.</div>`;
+            } else {
+                for (const j of rjList) { html += _renderResearchJobCard(j); }
+            }
+            html += '</details>';
         }
 
         if (!html) {
@@ -1360,6 +1391,10 @@ function initializeModals() {
 
     document.getElementById('stage-journal-modal').addEventListener('click', function(e) {
         if (e.target === this && _modalMousedownTarget === this) closeStageJournal();
+    });
+
+    document.getElementById('inbox-detail-modal').addEventListener('click', function(e) {
+        if (e.target === this && _modalMousedownTarget === this) closeInboxDetailModal();
     });
 }
 
@@ -2035,6 +2070,28 @@ function _stopChildrenPoller() {
     }
 }
 
+function _renderResearchJobCard(j) {
+    const statusColor = j.status === 'completed' ? '#198754' :
+                        j.status === 'failed'    ? '#dc3545' :
+                        j.status === 'cancelled' ? '#fd7e14' : '#6c757d';
+    const findings = j.findings
+        ? (j.findings.length > 300 ? escHtml(j.findings.slice(0, 300)) + '…' : escHtml(j.findings))
+        : '<em style="color:#6c757d">No findings yet.</em>';
+    return `<div class="sj-rj-card" style="border-left-color:${statusColor}">
+        <div class="sj-rj-header">
+            <span class="sj-rj-status" style="color:${statusColor}">${escHtml(j.status)}</span>
+            <span class="transition-timestamp">${j.created_at || ''}</span>
+        </div>
+        <div class="sj-rj-question">${escHtml(j.question || '')}</div>
+        <div class="sj-rj-findings">${findings}</div>
+        <div class="sj-rj-meta">
+            Lives used: ${j.lives_used ?? '—'} &nbsp;|&nbsp;
+            Tokens: ${j.prompt_tokens ?? 0} prompt / ${j.completion_tokens ?? 0} completion
+            ${j.completed_at ? `&nbsp;|&nbsp; Completed: ${escHtml(j.completed_at)}` : ''}
+        </div>
+    </div>`;
+}
+
 async function viewResearchJobs(taskId) {
     try {
         const resp = await fetch(`${API_BASE}/tasks/${taskId}/research-jobs`);
@@ -2044,33 +2101,11 @@ async function viewResearchJobs(taskId) {
         const task = taskData[taskId] || {};
         const title = task.title || taskId;
 
-        let html = `<h3 style="margin-bottom:1rem">Research Jobs: ${title}</h3>`;
+        let html = `<h3 style="margin-bottom:1rem">Research Jobs: ${escHtml(title)}</h3>`;
         if (jobs.length === 0) {
             html += '<p style="color:#6c757d">No research jobs for this task.</p>';
         } else {
-            jobs.forEach(j => {
-                const statusColor = j.status === 'completed' ? '#198754' :
-                                    j.status === 'failed'    ? '#dc3545' :
-                                    j.status === 'cancelled' ? '#fd7e14' : '#6c757d';
-                const findings = j.findings
-                    ? (j.findings.length > 300 ? j.findings.slice(0, 300) + '…' : j.findings)
-                    : '<em style="color:#6c757d">No findings yet.</em>';
-                html += `
-                    <div style="border:1px solid #dee2e6;border-radius:6px;padding:0.75rem;margin-bottom:0.5rem;border-left:4px solid ${statusColor}">
-                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.35rem">
-                            <span style="font-size:0.75rem;text-transform:uppercase;color:${statusColor};font-weight:600">${j.status}</span>
-                            <span class="transition-timestamp">${j.created_at || ''}</span>
-                        </div>
-                        <div style="font-weight:600;margin-bottom:0.25rem">${j.question || ''}</div>
-                        <div style="font-size:0.85rem;color:#495057;margin-bottom:0.35rem">${findings}</div>
-                        <div style="font-size:0.75rem;color:#6c757d">
-                            Lives used: ${j.lives_used ?? '—'} &nbsp;|&nbsp;
-                            Tokens: ${j.prompt_tokens ?? 0} prompt / ${j.completion_tokens ?? 0} completion
-                            ${j.completed_at ? `&nbsp;|&nbsp; Completed: ${j.completed_at}` : ''}
-                        </div>
-                    </div>
-                `;
-            });
+            jobs.forEach(j => { html += _renderResearchJobCard(j); });
         }
 
         document.getElementById('transition-modal-title').textContent = 'Research Jobs';
@@ -2332,6 +2367,7 @@ function createTaskCard(id, title, tags, owner, status) {
             <span class="toolbar-sep"></span>
             <button class="toolbar-btn" title="Open in Diagnostics" onclick="event.stopPropagation();toolbarOpenDiagnostics('${id}')">📊</button>
             <button class="toolbar-btn" title="Stage Journal — artifacts, gate checks, code diff" onclick="event.stopPropagation();openStageJournal('${id}')">📋</button>
+            <button class="toolbar-btn" title="Research Jobs — view research agents run for this card" onclick="event.stopPropagation();viewResearchJobs('${id}')">🗂</button>
             ${['indev','conceptual_review','optimization','security','full_review','completed'].includes(status) ? `<button class="toolbar-btn" title="View code diff" onclick="event.stopPropagation();openStageDiff('${id}')">&#9998;</button>` : ''}
             <button class="toolbar-btn" title="Clone as new Idea" onclick="event.stopPropagation();toolbarClone('${id}')">⧉</button>
             <button class="toolbar-btn" title="Pin to top of column" onclick="event.stopPropagation();toolbarPin('${id}')">📌</button>
@@ -2402,36 +2438,21 @@ function createTaskCard(id, title, tags, owner, status) {
             childBtn.onclick = (e) => { e.stopPropagation(); viewChildren(id); };
             actionsDiv.appendChild(childBtn);
         }
-    } else if (status === 'planning') {
-        if (ready) {
-            const moveBtn = card.querySelector('.task-actions');
-            moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'indev')">Move to IN DEVELOPMENT</button>`;
+    } else if (status === 'planning' || status === 'indev' || status === 'conceptual_review' || status === 'optimization' || status === 'security' || status === 'full_review') {
+        const actionsDiv = card.querySelector('.task-actions');
+        const advanceBtn = document.createElement('button');
+        advanceBtn.className = 'action-btn action-btn-advance';
+        if (transitionPollers[id]) {
+            advanceBtn.textContent = 'Processing...';
+            advanceBtn.disabled = true;
+        } else {
+            advanceBtn.textContent = _advanceBtnLabel(status, rejectionCount > 0);
         }
-    } else if (status === 'indev') {
-        if (ready) {
-            const moveBtn = card.querySelector('.task-actions');
-            moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'conceptual_review')">Move to CONCEPTUAL REVIEW</button>`;
-        }
-    } else if (status === 'conceptual_review') {
-        if (ready) {
-            const moveBtn = card.querySelector('.task-actions');
-            moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'optimization')">Move to OPTIMIZATION</button>`;
-        }
-    } else if (status === 'optimization') {
-        if (ready) {
-            const moveBtn = card.querySelector('.task-actions');
-            moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'security')">Move to SECURITY</button>`;
-        }
-    } else if (status === 'security') {
-        if (ready) {
-            const moveBtn = card.querySelector('.task-actions');
-            moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'full_review')">Move to FINAL REVIEW</button>`;
-        }
-    } else if (status === 'full_review') {
-        if (ready) {
-            const moveBtn = card.querySelector('.task-actions');
-            moveBtn.innerHTML += `<button class="action-btn" onclick="moveTask('${id}', 'completed')">Move to COMPLETED</button>`;
-        }
+        advanceBtn.onclick = (e) => {
+            e.stopPropagation();
+            advanceTask(id);
+        };
+        actionsDiv.appendChild(advanceBtn);
     } else if (status === 'completed') {
         const viewBtn = card.querySelector('.task-actions');
         viewBtn.innerHTML = `<button class="action-btn" onclick="viewTaskHistory('${id}')">View Proof</button>
@@ -2469,23 +2490,41 @@ function createTaskCard(id, title, tags, owner, status) {
 }
 
 // ============================================
-// Advance Task (Idea -> Planning pipeline)
+// Advance Task (Initiate Pipeline stages)
 // ============================================
 
 async function advanceTask(taskId) {
+    const task = taskData[taskId];
+    if (!task) return;
+
     const advanceStartedAt = new Date().toISOString();
+    
+    // Map status to specific API endpoints
+    const endpointMap = {
+        'idea': 'advance',
+        'subdividing': 'advance',
+        'planning': 'run-planning',
+        'indev': 'run-review', // after indev we want conceptual review
+        'conceptual_review': 'run-review',
+        'optimization': 'run-security',
+        'security': 'run-full-review',
+        'full_review': 'merge'
+    };
+
+    const action = endpointMap[task.type] || 'advance';
+    
     try {
-        const response = await fetch(`${API_BASE}/tasks/${taskId}/advance`, {
+        const response = await fetch(`${API_BASE}/tasks/${taskId}/${action}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' }
         });
         if (!response.ok) {
             const err = await response.json();
-            showToast('Advance failed: ' + (err.detail || 'Unknown error'), 'error');
+            showToast('Pipeline start failed: ' + (err.detail || 'Unknown error'), 'error');
             return;
         }
         const result = await response.json();
-        console.log('Advance initiated:', result);
+        console.log(`Pipeline ${action} initiated:`, result);
 
         // Mark card as processing immediately
         setCardProcessing(taskId, true);
@@ -2966,13 +3005,57 @@ function _updateInboxBadge() {
     }
 }
 
-function openInboxModal() {
+async function openInboxModal() {
+    await loadInbox();
     _renderInboxList();
     document.getElementById('inbox-modal').classList.add('active');
 }
 
 function closeInboxModal() {
     document.getElementById('inbox-modal').classList.remove('active');
+}
+
+function openInboxDetailModal(msgId) {
+    const msg = inboxMessages.find(m => m.id === msgId);
+    if (!msg) return;
+
+    document.getElementById('inbox-detail-title').textContent = msg.subject;
+    const body = document.getElementById('inbox-detail-body');
+
+    let html = `<div style="padding:1rem">`;
+    if (msg.task_title) {
+        html += `<div style="margin-bottom:0.5rem;font-size:0.85rem;color:#6c757d">Task: <strong>${msg.task_title}</strong></div>`;
+    }
+    html += `<div style="margin-bottom:1rem;font-size:0.8rem;color:#adb5bd">${new Date(msg.created_at).toLocaleString()}</div>`;
+
+    if (msg.data_json) {
+        try {
+            const data = JSON.parse(msg.data_json);
+            if (data.report && data.report.findings) {
+                html += `<h3 style="font-size:1rem;margin-bottom:0.5rem">Report Findings</h3>`;
+                html += `<div style="background:#f8f9fa;padding:1rem;border-radius:6px;font-size:0.9rem;white-space:pre-wrap;line-height:1.5">${data.report.findings}</div>`;
+                if (data.report.answer) {
+                    html += `<h3 style="font-size:1rem;margin:1rem 0 0.5rem">Answer</h3>`;
+                    html += `<div style="background:#e7f3ff;padding:1rem;border-radius:6px;font-size:0.95rem;font-weight:500;white-space:pre-wrap">${data.report.answer}</div>`;
+                }
+            } else {
+                html += `<h3 style="font-size:1rem;margin-bottom:0.5rem">Data Details</h3>`;
+                html += `<pre style="background:#f8f9fa;padding:1rem;border-radius:6px;font-size:0.8rem;overflow-x:auto">${JSON.stringify(data, null, 2)}</pre>`;
+            }
+        } catch (e) {
+            html += `<p style="color:#6c757d">Raw data: ${msg.data_json}</p>`;
+        }
+    } else {
+        html += `<p style="color:#6c757d">No additional details available.</p>`;
+    }
+
+    html += `</div>`;
+    body.innerHTML = html;
+    document.getElementById('inbox-detail-modal').classList.add('active');
+}
+
+function closeInboxDetailModal() {
+    document.getElementById('inbox-detail-modal').classList.remove('active');
 }
 
 function _inboxOutcomeClass(outcome) {
@@ -3075,6 +3158,8 @@ async function inboxOpenMessage(msgId) {
     if (msg.task_id && transitionCache[msg.task_id]) {
         closeInboxModal();
         openTransitionModal(msg.task_id);
+    } else {
+        openInboxDetailModal(msgId);
     }
 }
 

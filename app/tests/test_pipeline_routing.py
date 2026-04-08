@@ -10,6 +10,7 @@ Covers:
 """
 
 import asyncio
+import json
 import os
 import sys
 import pytest
@@ -524,16 +525,82 @@ class TestIntakePipelineMockLLM:
 
         return asyncio.run(_go())
 
-    def test_all_pass_outcome_is_passed(self):
-        """intake_all_pass scenario -> outcome == 'passed'."""
+    def test_all_pass_outcome_and_votes(self):
+        """intake_all_pass: outcome == 'passed' with votes from all stages.
+
+        Patches app.agent.intake.call_llm (Level 1) for the three LLM stages.
+        Also patches _stage_static_analysis directly: that stage runs real
+        tree-sitter on the project filesystem (the original source of the 5s
+        slowness) and is orthogonally tested in test_static_analysis.py.
+        Without the static analysis mock, generate_vote can return NEEDS_RESEARCH
+        non-deterministically, which triggers the research handler — a different
+        module that has its own call_llm import site not covered by this patch.
+        """
+        from app.agent.mock_llm import (
+            _SCOPE_RESPONSE_PASS,
+            _CONFLICT_RESPONSE_PASS,
+            _FEASIBILITY_RESPONSE_PASS,
+        )
+        from app.agent.intake import IntakePipeline, run_intake_pipeline
+
+        def _resp(content_dict):
+            return {
+                "choices": [{"message": {"content": json.dumps(content_dict),
+                                         "tool_calls": None},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 100,
+                          "total_tokens": 150},
+            }
+
+        responses = [
+            _resp(_SCOPE_RESPONSE_PASS),
+            _resp(_CONFLICT_RESPONSE_PASS),
+            _resp(_FEASIBILITY_RESPONSE_PASS),
+        ]
+
+        async def _sequential(*a, **kw):
+            return responses.pop(0) if len(responses) > 1 else responses[0]
+
+        async def _mock_static_analysis(self, scope_vote):
+            return {
+                "stage": "static_analysis",
+                "verdict": "POSSIBLE",
+                "confidence": 0.75,
+                "justification": "Static analysis mocked in test.",
+                "raw_response": {},
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "model": "static_analysis",
+            }
+
         task_id = "test-intake-pass"
         budget_id = None
         try:
             budget_id = _make_budget("test-intake-pass-budget")
             _make_task(task_id, "idea", description="User auth")
-            result = self._run_intake("intake_all_pass", task_id, budget_id)
+
+            async def _go():
+                with patch("app.agent.intake.call_llm", _sequential), \
+                     patch.object(IntakePipeline, "_stage_static_analysis",
+                                  _mock_static_analysis):
+                    return await run_intake_pipeline(
+                        task_id=task_id,
+                        task_description="Add user authentication to the app",
+                        task_title="User Auth",
+                        all_tasks=[],
+                        budget_id=budget_id,
+                        llm_id=1,
+                        llm_base_url="http://localhost:8008/v1",
+                        llm_model="mock-model",
+                        project=None,
+                    )
+
+            result = asyncio.run(_go())
             assert result["outcome"] == "passed", \
                 f"Expected 'passed', got {result['outcome']!r}. Votes: {result.get('votes')}"
+            assert len(result["votes"]) >= 3, \
+                f"Expected at least 3 votes, got {len(result['votes'])}"
+            assert "scope_analysis" in {v["stage"] for v in result["votes"]}
         finally:
             _delete_task(task_id)
             if budget_id is not None:
@@ -584,23 +651,6 @@ class TestIntakePipelineMockLLM:
             if budget_id is not None:
                 _cleanup_budget(budget_id)
 
-    def test_pass_result_contains_votes(self):
-        """Passed intake result must include vote records from all stages."""
-        task_id = "test-intake-votes"
-        budget_id = None
-        try:
-            budget_id = _make_budget("test-intake-votes-budget")
-            _make_task(task_id, "idea", description="User auth")
-            result = self._run_intake("intake_all_pass", task_id, budget_id)
-            assert "votes" in result
-            assert len(result["votes"]) >= 3, \
-                f"Expected at least 3 votes, got {len(result['votes'])}"
-            stages = {v["stage"] for v in result["votes"]}
-            assert "scope_analysis" in stages
-        finally:
-            _delete_task(task_id)
-            if budget_id is not None:
-                _cleanup_budget(budget_id)
 
     def test_rejected_result_contains_justification(self):
         """Rejected intake result must carry a justification in the vote."""

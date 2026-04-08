@@ -435,7 +435,12 @@ class MockLLM:
         - .json() returns the mock response dict
         - .raise_for_status() is a no-op
         """
-        payload = kwargs.get("json", {})
+        # call_llm sends content=bytes (ascii-encoded JSON), not json=dict
+        raw = kwargs.get("content")
+        if raw is not None:
+            payload = json.loads(raw.decode("ascii") if isinstance(raw, bytes) else raw)
+        else:
+            payload = kwargs.get("json", {})
         messages = payload.get("messages", [])
         tools = payload.get("tools", None)
 
