@@ -399,6 +399,48 @@ class MergeRecord(Base):
         return f"<MergeRecord(id={self.id}, task={self.task_id}, status={self.status})>"
 
 
+class PerformanceImprovementPlan(Base):
+    """Quality gate requirements generated after a task demotion."""
+    __tablename__ = "performance_improvement_plans"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String, ForeignKey('tasks.id'), nullable=False)
+    origin_stage = Column(String, nullable=False)
+    requirements = Column(Text, nullable=False)        # JSON bullet points
+    status = Column(String, nullable=False, default='active')  # deprecated — use pip_verifications
+    verified_at = Column(DateTime, nullable=True)
+    llm_id = Column(Integer, ForeignKey('llms.id'), nullable=True)
+    budget_id = Column(Integer, ForeignKey('budgets.id'), nullable=True)
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    created_at_commit = Column(String, nullable=False, default='none')  # git SHA at creation time
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<PerformanceImprovementPlan(id={self.id}, task={self.task_id}, status={self.status})>"
+
+
+class PipVerification(Base):
+    """Audit trail for pre-flight PIP gate checks — one row per (pip, stage, run)."""
+    __tablename__ = "pip_verifications"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    pip_id = Column(Integer, ForeignKey("performance_improvement_plans.id"), nullable=False)
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=False)
+    checked_at_stage = Column(String, nullable=False)
+    outcome = Column(String, nullable=False)   # 'passed' | 'failed' | 'pending'
+    summary = Column(Text, nullable=True)
+    findings = Column(Text, nullable=True)     # JSON: [{requirement, status, detail}]
+    agent_session_id = Column(String, nullable=True)
+    created_at = Column(String, nullable=False)
+
+    def __repr__(self):
+        return (
+            f"<PipVerification(id={self.id}, pip={self.pip_id}, "
+            f"stage={self.checked_at_stage!r}, outcome={self.outcome!r})>"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Background job tables
 # ---------------------------------------------------------------------------
@@ -468,6 +510,30 @@ class OptimizationBenchmark(Base):
 
     def __repr__(self):
         return f"<OptimizationBenchmark(id={self.id}, task={self.task_id}, type={self.benchmark_type})>"
+
+
+class PipResolutionJob(Base):
+    """Background job for scheduler-dispatched PIP resolution agents.
+
+    Lifecycle: pending → researching → resolving → done | failed
+    One row per (task, pip) blocking event.  A new row is created each time a
+    pre-flight gate blocks a stage transition for a given PIP.
+    """
+    __tablename__ = "pip_resolution_jobs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=False)
+    pip_id = Column(Integer, ForeignKey("performance_improvement_plans.id"), nullable=False)
+    stage_blocked_at = Column(String, nullable=False)
+    research_findings = Column(Text, nullable=True)
+    status = Column(String, nullable=False, default="pending")
+    created_at = Column(String, nullable=False)
+
+    def __repr__(self):
+        return (
+            f"<PipResolutionJob(id={self.id}, task={self.task_id!r}, "
+            f"pip={self.pip_id}, stage={self.stage_blocked_at!r}, status={self.status!r})>"
+        )
 
 
 class ArchGenJob(Base):

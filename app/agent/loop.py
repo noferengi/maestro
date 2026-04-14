@@ -331,14 +331,26 @@ class MaestroLoop:
 
         # Inject architecture context - look up the task's project by task_id
         arch_block = ""
+        pip_block = ""
         try:
-            from app.database import get_task as _get_task
+            from app.database import get_task as _get_task, get_pips_for_task as _get_pips
             from app.agent.project_snapshot import build_architecture_context
             _task_rec = _get_task(self.task_id)
             if _task_rec and _task_rec.project:
                 _arch = build_architecture_context(_task_rec.project, agent_type='loop')
                 if _arch:
                     arch_block = f"\n\n{_arch}"
+                
+                # Fetch PIPs for this task
+                pips = _get_pips(self.task_id)
+                if pips:
+                    pip_block = "\n\n### HISTORICAL PERFORMANCE IMPROVEMENT PLANS (PIPs)\n"
+                    pip_block += "This task has previously failed review/optimization. You MUST satisfy ALL requirements below:\n"
+                    for i, pip in enumerate(pips):
+                        reqs = json.loads(pip.requirements)
+                        pip_block += f"\nPIP {i+1} (from {pip.origin_stage}, status: {pip.status}):\n"
+                        for req in reqs:
+                            pip_block += f"- {req}\n"
         except Exception:
             pass
 
@@ -348,7 +360,7 @@ class MaestroLoop:
                 "role": "user",
                 "content": (
                     f"Your assigned task ID is: **{self.task_id}**"
-                    f"{snapshot_block}{arch_block}\n\n"
+                    f"{snapshot_block}{arch_block}{pip_block}\n\n"
                     f"Begin by calling get_task('{self.task_id}') to load the full "
                     f"task definition, then follow the workflow in your system prompt.\n\n"
                     f"Your first action should be to create a safety branch: "

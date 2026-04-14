@@ -1207,6 +1207,146 @@ body {
     vertical-align: middle;
 }
 
+/* ============================================================
+   PIP Card Stack
+   ============================================================ */
+
+/* Wrapper that groups a .task-card with its .pip-card segments */
+.task-card-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+}
+
+/* Small inline badge in the card title — kept as a quick visual indicator */
+.pip-badge {
+    display: inline-block;
+    background: #9b59b6;
+    color: #fff;
+    font-size: 0.62rem;
+    font-weight: 700;
+    padding: 0.1rem 0.35rem;
+    border-radius: 8px;
+    margin-left: 0.4rem;
+    vertical-align: middle;
+    cursor: help;
+    border: 1px solid rgba(0,0,0,0.1);
+}
+
+/* PIP card — one per PIP, stacked directly below the main task card */
+.pip-card {
+    background: #f6f3fa;
+    border: 1px solid #d8cfe8;
+    border-top: 2px dashed #c4b8da;   /* dashed connector to card above */
+    border-left: 3px solid #9b59b6;   /* overridden by status variable below */
+    border-radius: 0 0 6px 6px;
+    padding: 0.45rem 0.6rem 0.4rem;
+    font-size: 0.78rem;
+    position: relative;
+}
+
+.pip-card.pip-satisfied {
+    opacity: 0.8;
+    border-left-color: #198754;
+}
+.pip-card.pip-unsatisfied {
+    border-left-color: #dc3545;
+}
+.pip-card.pip-unverified {
+    border-left-color: #fd7e14;
+}
+.pip-card.pip-checking {
+    border-left-color: #0d6efd;
+}
+
+/* Header row: label · origin · status badge */
+.pip-card-header {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin-bottom: 0.25rem;
+}
+
+.pip-label {
+    font-size: 0.65rem;
+    font-weight: 800;
+    color: #6f42c1;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+}
+
+.pip-origin {
+    font-size: 0.65rem;
+    color: #888;
+    font-style: italic;
+    flex: 1;
+}
+
+.pip-status {
+    font-size: 0.65rem;
+    font-weight: 700;
+    border-radius: 4px;
+    padding: 0.05rem 0.3rem;
+    white-space: nowrap;
+}
+.pip-status--satisfied   { background: #d1e7dd; color: #0a3622; }
+.pip-status--unsatisfied { background: #f8d7da; color: #58151c; }
+.pip-status--unverified  { background: #fff3cd; color: #664d03; }
+.pip-status--checking    { background: #cfe2ff; color: #084298; }
+
+/* Body — first requirement truncated, +N more count */
+.pip-card-body {
+    font-size: 0.73rem;
+    color: #444;
+    line-height: 1.4;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+.pip-req-count {
+    font-size: 0.65rem;
+    color: #888;
+    margin-left: 0.3rem;
+}
+
+/* Toolbar — hidden by default, revealed on group hover */
+.pip-card-toolbar {
+    display: none;
+    gap: 0.3rem;
+    margin-top: 0.3rem;
+}
+.task-card-group:hover .pip-card-toolbar {
+    display: flex;
+}
+
+.pip-toolbar-btn {
+    font-size: 0.7rem;
+    padding: 0.15rem 0.4rem;
+    border: 1px solid #c4b8da;
+    border-radius: 4px;
+    background: #fff;
+    color: #6f42c1;
+    cursor: pointer;
+    transition: background 0.1s;
+}
+.pip-toolbar-btn:hover {
+    background: #ece8f5;
+}
+
+/* PIP detail modal history table */
+.pip-hist-cell {
+    padding: 4px 8px;
+    border-bottom: 1px solid #f0f0f0;
+    vertical-align: top;
+}
+.pip-hist-when {
+    white-space: nowrap;
+    color: #888;
+    font-size: 0.78rem;
+}
+
 /* LLM Modal Tabs */
 .llm-tabs {
     display: flex;
@@ -1683,6 +1823,54 @@ body {
     font-size: 1.1rem;
     text-align: center;
     pointer-events: none;
+}
+
+/* PIP chip segments in the Column Map View — stacked below their parent node */
+.map-pip-chip {
+    position: absolute;
+    width: 230px;
+    height: 40px;
+    background: #f8f9fa;
+    border: 1px solid #dee2e6;
+    border-top: 2px dashed #ced4da;   /* dashed "staple" line connecting to card above */
+    border-radius: 0 0 6px 6px;
+    border-left: 3px solid #adb5bd;
+    padding: 0 0.5rem;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.7rem;
+    cursor: pointer;
+    box-sizing: border-box;
+    overflow: hidden;
+    transition: background 0.15s, border-left-color 0.15s;
+}
+.map-pip-chip:hover { background: #e9ecef; }
+
+.map-pip-chip--satisfied   { border-left-color: #198754; }
+.map-pip-chip--unsatisfied { border-left-color: #dc3545; }
+.map-pip-chip--unverified  { border-left-color: #ffc107; }
+.map-pip-chip--checking    { border-left-color: #0d6efd; }
+
+.map-pip-chip-label {
+    font-weight: 700;
+    white-space: nowrap;
+    color: #495057;
+    flex-shrink: 0;
+}
+.map-pip-chip-status {
+    font-size: 0.65rem;
+    padding: 1px 4px;
+    border-radius: 3px;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+.map-pip-chip-req {
+    color: #6c757d;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
 }
 
 
@@ -2164,6 +2352,112 @@ body {
 .arch-card-prio-badge.prio-high     { background: rgba(253,126,20,0.18); color: #f90; }
 .arch-card-prio-badge.prio-normal   { display: none; }
 .arch-card-prio-badge.prio-low      { background: rgba(73,80,87,0.25);   color: #6c757d; }
+
+/* =========================================================
+   Arch Bar — Ghost Cards (pending/running arch gen jobs)
+   ========================================================= */
+
+.arch-card.ghost {
+    opacity: 0.7;
+    background: rgba(14, 25, 41, 0.55);
+    border: 1px dashed rgba(96, 148, 200, 0.35);
+    cursor: default;
+    pointer-events: none;
+    animation: arch-ghost-breathe 2.4s ease-in-out infinite;
+}
+.arch-card.ghost::before { background: transparent !important; }
+.arch-card.ghost:hover {
+    border-color: rgba(96, 148, 200, 0.35);
+    box-shadow: none;
+}
+@keyframes arch-ghost-breathe {
+    0%, 100% { border-color: rgba(96,148,200,0.25); opacity: 0.65; }
+    50%       { border-color: rgba(96,148,200,0.60); opacity: 0.80; }
+}
+
+.arch-ghost-label {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    margin-top: 0.5rem;
+    font-size: 0.64rem;
+    color: #3d5a7a;
+    font-style: italic;
+    letter-spacing: 0.02em;
+}
+
+.arch-ghost-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #2d4a6a;
+    flex-shrink: 0;
+    animation: arch-ghost-dot-pulse 2.4s ease-in-out infinite;
+}
+.arch-ghost-dot.running {
+    background: #3b82f6;
+    animation: arch-ghost-dot-running 1.2s ease-in-out infinite;
+}
+@keyframes arch-ghost-dot-pulse {
+    0%, 100% { opacity: 0.4; }
+    50%       { opacity: 1.0; }
+}
+@keyframes arch-ghost-dot-running {
+    0%, 100% { opacity: 1.0; transform: scale(1); }
+    50%       { opacity: 0.5; transform: scale(0.7); }
+}
+
+/* =========================================================
+   Card Job Indicator (scheduler running / queued state)
+   ========================================================= */
+
+.card-job-indicator {
+    display: none;
+    align-items: center;
+    gap: 0.3rem;
+    margin-top: 0.35rem;
+    padding: 0.2rem 0.5rem;
+    border-radius: 3px;
+    font-size: 0.61rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    line-height: 1.4;
+}
+.card-job-indicator.ji-running,
+.card-job-indicator.ji-queued {
+    display: flex;
+}
+.card-job-indicator.ji-running {
+    background: rgba(59,130,246,0.10);
+    color: #93c5fd;
+    border: 1px solid rgba(59,130,246,0.20);
+}
+.card-job-indicator.ji-queued {
+    background: rgba(245,158,11,0.10);
+    color: #fcd34d;
+    border: 1px solid rgba(245,158,11,0.18);
+}
+.ji-dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: currentColor;
+    flex-shrink: 0;
+    animation: ji-dot-pulse 1.5s ease-in-out infinite;
+}
+.card-job-indicator.ji-queued .ji-dot {
+    animation-duration: 2.4s;
+}
+@keyframes ji-dot-pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.25; }
+}
+.ji-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 160px;
+}
 
 /* =========================================================
    Card Stage Footer

@@ -270,6 +270,7 @@ function taskFingerprint(task) {
         task.is_big_idea ? '1' : '0',
         task.interface_contracts ? '1' : '0',
         (task.tags || []).join(','),
+        (task.pips || []).map(p => `${p.id}:${p.status}:${p.last_checked||''}`).join(','),
     ].join('|');
 }
 
@@ -440,6 +441,249 @@ function isValidDropTarget(sourceContainer, targetContainer) {
 }
 
 // ============================================
+// PIP Card Helpers
+// ============================================
+
+// Status label map for pip-card badges
+const PIP_STATUS_LABELS = {
+    satisfied:   '✓ Satisfied',
+    unsatisfied: '✗ Unsatisfied',
+    unverified:  '◌ Unverified',
+    checking:    '⟳ Checking',
+};
+
+/**
+ * Build a single .pip-card DOM element for one PIP at the given pipeline stage.
+ * @param {object} pip  — pip object from task.pips (id, origin_stage, requirements, status, last_summary)
+ * @param {string} taskId
+ * @param {number} index  — 1-based ordinal shown on the label
+ */
+function buildPipCard(pip, taskId, index) {
+    const el = document.createElement('div');
+    const status = pip.status || 'unverified';
+    el.className = `pip-card pip-${status}`;
+    el.dataset.pipId = pip.id;
+    el.dataset.taskId = taskId;
+
+    const statusLabel = PIP_STATUS_LABELS[status] || '◌ Unverified';
+    const statusClass = `pip-status--${status}`;
+
+    // Body: first requirement truncated; "+N more" if multiple
+    const reqs = pip.requirements || [];
+    const firstReq = reqs[0] ? reqs[0].slice(0, 80) : '(no requirements)';
+    const moreCount = reqs.length - 1;
+    const moreHtml = moreCount > 0
+        ? `<span class="pip-req-count">+${moreCount} more</span>`
+        : '';
+
+    el.innerHTML = `
+        <div class="pip-card-header">
+            <span class="pip-label">PIP ${index}</span>
+            <span class="pip-origin">demoted from ${pip.origin_stage}</span>
+            <span class="pip-status ${statusClass}">${statusLabel}</span>
+        </div>
+        <div class="pip-card-body">${firstReq}${moreHtml}</div>
+        <div class="pip-card-toolbar">
+            <button class="pip-toolbar-btn" title="Run pre-flight verification" onclick="event.stopPropagation();pipVerify('${taskId}',${pip.id})">🔍 Verify</button>
+            <button class="pip-toolbar-btn" title="Run Resolution Agent" onclick="event.stopPropagation();pipResolve('${taskId}',${pip.id})">🔧 Resolve</button>
+            <button class="pip-toolbar-btn" title="Verification history" onclick="event.stopPropagation();pipHistory('${taskId}',${pip.id})">📋 History</button>
+        </div>
+    `;
+    return el;
+}
+
+/**
+ * Wrap a bare .task-card in a .task-card-group with pip-card segments if the
+ * task has PIPs.  If the task has no PIPs, returns the bare card unchanged.
+ * @param {HTMLElement} card   — a .task-card element
+ * @param {object}      task   — full task object including task.pips array
+ * @returns {HTMLElement}      — .task-card-group or the original .task-card
+ */
+function wrapWithPipGroup(card, task) {
+    const pips = (task && task.pips) || [];
+    if (pips.length === 0) return card;
+
+    const group = document.createElement('div');
+    group.className = 'task-card-group';
+    group.dataset.taskId = task.id;
+
+    // Move draggable + drag listeners from the inner card to the group so the
+    // browser's native ghost captures the full card+pip stack, not just the card.
+    card.removeAttribute('draggable');
+    card.removeEventListener('dragstart', handleDragStart);
+    card.removeEventListener('dragend', handleDragEnd);
+    group.setAttribute('draggable', 'true');
+    group.addEventListener('dragstart', handleDragStart);
+    group.addEventListener('dragend', handleDragEnd);
+
+    group.appendChild(card);
+    pips.forEach((pip, i) => {
+        group.appendChild(buildPipCard(pip, task.id, i + 1));
+    });
+    return group;
+}
+
+// ============================================
+// PIP toolbar actions (card-level)
+// ============================================
+
+async function pipVerify(taskId, pipId) {
+    if (!confirm('Run pre-flight verification for this PIP now?')) return;
+    try {
+        const resp = await fetch(`${API_BASE}/tasks/${taskId}/pips/${pipId}/verify`, { method: 'POST' });
+        if (!resp.ok) { alert('Verification request failed: ' + resp.status); return; }
+        const result = await resp.json();
+        const icon = result.outcome === 'passed' ? '✓' : '✗';
+        alert(`${icon} ${result.outcome.toUpperCase()}\n\n${result.summary || ''}`);
+        await refreshTasks();
+    } catch (err) {
+        console.error('[PIP] verify failed:', err);
+        alert('Verification failed — check the console.');
+    }
+}
+
+async function pipResolve(taskId, pipId) {
+    if (!confirm('Queue a PIP Resolution Agent for this PIP?')) return;
+    try {
+        const resp = await fetch(`${API_BASE}/tasks/${taskId}/run-pip-resolution/${pipId}`, { method: 'POST' });
+        if (resp.status === 202) {
+            alert('Resolution agent queued. The scheduler will dispatch it shortly.');
+        } else {
+            const data = await resp.json().catch(() => ({}));
+            alert('Failed to queue resolution: ' + JSON.stringify(data));
+        }
+    } catch (err) {
+        console.error('[PIP] resolve failed:', err);
+    }
+}
+
+function pipHistory(taskId, pipId) {
+    openPipDetailModal(taskId, pipId);
+}
+
+// ============================================
+// PIP detail modal
+// ============================================
+
+let _pipDetailCtx = { taskId: null, pipId: null };
+
+function _escHtml(str) {
+    return String(str || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+async function openPipDetailModal(taskId, pipId) {
+    _pipDetailCtx = { taskId, pipId };
+    const modal = document.getElementById('pip-detail-modal');
+    if (!modal) { console.error('pip-detail-modal not found'); return; }
+
+    document.getElementById('pip-detail-title').textContent = 'Loading…';
+    document.getElementById('pip-detail-meta').textContent = '';
+    document.getElementById('pip-detail-requirements').innerHTML = '';
+    document.getElementById('pip-detail-history-body').innerHTML = '';
+    document.getElementById('pip-detail-history-empty').style.display = 'none';
+    modal.style.display = 'flex';
+
+    try {
+        const [pipsResp, verifResp] = await Promise.all([
+            fetch(`${API_BASE}/tasks/${taskId}/pips`),
+            fetch(`${API_BASE}/tasks/${taskId}/pips/${pipId}/verifications`),
+        ]);
+        const pips = await pipsResp.json();
+        const verifications = await verifResp.json();
+
+        const pip = pips.find(p => p.id === pipId);
+        if (!pip) { alert('PIP not found'); closePipDetailModal(); return; }
+
+        const idx = pips.indexOf(pip) + 1;
+        document.getElementById('pip-detail-title').textContent =
+            `PIP ${idx} — demoted from ${pip.origin_stage}`;
+        document.getElementById('pip-detail-meta').textContent =
+            `Created: ${pip.created_at || '—'}  |  Current status: ${pip.status}`;
+
+        // Requirements
+        const ul = document.getElementById('pip-detail-requirements');
+        (pip.requirements || []).forEach(req => {
+            const li = document.createElement('li');
+            li.textContent = req;
+            ul.appendChild(li);
+        });
+
+        // Verification history
+        const tbody = document.getElementById('pip-detail-history-body');
+        const empty = document.getElementById('pip-detail-history-empty');
+        if (!verifications.length) {
+            empty.style.display = 'block';
+        } else {
+            verifications.forEach(v => {
+                const outcomeColor = v.outcome === 'passed' ? '#198754'
+                    : v.outcome === 'failed' ? '#dc3545' : '#fd7e14';
+                const tr = document.createElement('tr');
+                tr.innerHTML =
+                    `<td class="pip-hist-cell">${_escHtml(v.checked_at_stage)}</td>` +
+                    `<td class="pip-hist-cell" style="color:${outcomeColor};font-weight:700">${_escHtml(v.outcome)}</td>` +
+                    `<td class="pip-hist-cell">${_escHtml(v.summary)}</td>` +
+                    `<td class="pip-hist-cell pip-hist-when">${_escHtml(v.created_at)}</td>`;
+                tbody.appendChild(tr);
+            });
+        }
+    } catch (err) {
+        console.error('[PIP] modal load failed:', err);
+        document.getElementById('pip-detail-title').textContent = 'Error loading PIP';
+    }
+}
+
+function closePipDetailModal() {
+    const modal = document.getElementById('pip-detail-modal');
+    if (modal) modal.style.display = 'none';
+    _pipDetailCtx = { taskId: null, pipId: null };
+}
+
+async function pipDetailVerify() {
+    const { taskId, pipId } = _pipDetailCtx;
+    if (!taskId || !pipId) return;
+    const btn = document.getElementById('pip-detail-verify-btn');
+    btn.disabled = true;
+    btn.textContent = '⏳ Verifying…';
+    try {
+        const resp = await fetch(`${API_BASE}/tasks/${taskId}/pips/${pipId}/verify`, { method: 'POST' });
+        if (!resp.ok) { alert('Verification failed: ' + resp.status); return; }
+        const result = await resp.json();
+        alert(`${result.outcome === 'passed' ? '✓' : '✗'} ${result.outcome.toUpperCase()}\n\n${result.summary || ''}`);
+        await openPipDetailModal(taskId, pipId);  // reload with fresh data
+        await refreshTasks();
+    } catch (err) {
+        console.error('[PIP] detail verify failed:', err);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '🔍 Run Verification';
+    }
+}
+
+async function pipDetailResolve() {
+    const { taskId, pipId } = _pipDetailCtx;
+    if (!taskId || !pipId) return;
+    const btn = document.getElementById('pip-detail-resolve-btn');
+    btn.disabled = true;
+    try {
+        const resp = await fetch(`${API_BASE}/tasks/${taskId}/run-pip-resolution/${pipId}`, { method: 'POST' });
+        if (resp.status === 202) {
+            alert('Resolution agent queued. The scheduler will dispatch it shortly.');
+        } else {
+            const data = await resp.json().catch(() => ({}));
+            alert('Failed to queue: ' + JSON.stringify(data));
+        }
+    } catch (err) {
+        console.error('[PIP] detail resolve failed:', err);
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+// ============================================
 // Task Rendering Functions
 // ============================================
 
@@ -493,9 +737,10 @@ function renderTasksFromDatabase() {
         tasks.forEach(task => {
             const container = document.getElementById(`tasks-${colType}`);
             if (container) {
-                const card = createTaskCard(task.id, task.title, task.tags, task.owner, task.type);
-                container.appendChild(card);
-                cardCache[task.id] = card;
+                const rawCard = createTaskCard(task.id, task.title, task.tags, task.owner, task.type);
+                const element = wrapWithPipGroup(rawCard, task);
+                container.appendChild(element);
+                cardCache[task.id] = element;
                 fingerprintCache[task.id] = taskFingerprint(task);
             }
         });
@@ -579,8 +824,18 @@ function renderArchBar() {
             return (a.position ?? 0) - (b.position ?? 0);
         });
 
-    // Update count badge
+    // Update count badge and subtitle progress
     if (countEl) countEl.textContent = archTasks.length > 0 ? `${archTasks.length} card${archTasks.length !== 1 ? 's' : ''}` : '';
+    const subtitleEl = document.getElementById('arch-bar-subtitle');
+    if (subtitleEl) {
+        const running = _archGenJobs.filter(j => j.status === 'running').length;
+        const pending = _archGenJobs.filter(j => j.status === 'pending').length;
+        if (running > 0 || pending > 0) {
+            subtitleEl.innerHTML = `<span style="color:#ffc107;font-weight:bold">Generating architecture cards\u2026</span> (${running} running, ${pending} queued)`;
+        } else {
+            subtitleEl.textContent = 'Global constraints \u0026 context \u2014 injected into all agents';
+        }
+    }
 
     // Rebuild cards
     container.innerHTML = '';
@@ -605,6 +860,25 @@ function renderArchBar() {
             </div>`;
         card.addEventListener('click', () => editArchitectureTask(task.id));
         container.appendChild(card);
+    });
+
+    // Render ghost cards for pending/running arch gen jobs where the category
+    // doesn't already have a real card.
+    const existingCategories = new Set(archTasks.map(t => (t.content || {}).category || 'General'));
+    _archGenJobs.forEach(job => {
+        if (existingCategories.has(job.category)) return;
+        const color   = ARCH_CATEGORY_COLORS[job.category] || ARCH_CATEGORY_COLORS.General;
+        const isRunning = job.status === 'running';
+        const ghost = document.createElement('div');
+        ghost.className = 'arch-card ghost';
+        ghost.dataset.archGenId = job.id;
+        ghost.innerHTML = `
+            <div class="arch-card-category" style="color:${color}">${escapeHtml(job.category)}</div>
+            <div class="arch-ghost-label">
+                <span class="arch-ghost-dot${isRunning ? ' running' : ''}"></span>
+                ${isRunning ? 'Generating\u2026' : 'Queued\u2026'}
+            </div>`;
+        container.appendChild(ghost);
     });
 
     // Apply collapsed state
@@ -680,9 +954,10 @@ function reconcile(newTasks) {
 
         if (!cardCache[task.id]) {
             // New task — create and insert
-            const card = createTaskCard(task.id, task.title, task.tags, task.owner, task.type);
-            _applyHighlightState(card, task.id);
-            cardCache[task.id] = card;
+            const rawCard = createTaskCard(task.id, task.title, task.tags, task.owner, task.type);
+            _applyHighlightState(rawCard, task.id);
+            const element = wrapWithPipGroup(rawCard, task);
+            cardCache[task.id] = element;
             fingerprintCache[task.id] = newFp;
             columnsToSort.add(renderCol);
             if (task.type !== 'idea' && task.type !== 'architecture' && task.type !== 'subdividing') {
@@ -695,10 +970,11 @@ function reconcile(newTasks) {
             if (oldTask) {
                 columnsToSort.add(oldTask.type === 'subdividing' ? 'idea' : oldTask.type);
             }
-            const newCard = createTaskCard(task.id, task.title, task.tags, task.owner, task.type);
-            _applyHighlightState(newCard, task.id);
-            if (old.parentNode) old.parentNode.replaceChild(newCard, old);
-            cardCache[task.id] = newCard;
+            const rawCard = createTaskCard(task.id, task.title, task.tags, task.owner, task.type);
+            _applyHighlightState(rawCard, task.id);
+            const newElement = wrapWithPipGroup(rawCard, task);
+            if (old.parentNode) old.parentNode.replaceChild(newElement, old);
+            cardCache[task.id] = newElement;
             fingerprintCache[task.id] = newFp;
             columnsToSort.add(renderCol);
             // Reload footer — stage or component status may have changed
@@ -732,17 +1008,18 @@ function reconcile(newTasks) {
 function refreshCard(taskId) {
     const task = taskData[taskId];
     if (!task) return;
-    const newCard = createTaskCard(task.id, task.title, task.tags, task.owner, task.type);
-    _applyHighlightState(newCard, taskId);
+    const rawCard = createTaskCard(task.id, task.title, task.tags, task.owner, task.type);
+    _applyHighlightState(rawCard, taskId);
+    const newElement = wrapWithPipGroup(rawCard, task);
     const old = cardCache[taskId];
     if (old && old.parentNode) {
-        old.parentNode.replaceChild(newCard, old);
+        old.parentNode.replaceChild(newElement, old);
     } else {
         const renderCol = task.type === 'subdividing' ? 'idea' : task.type;
         const container = document.getElementById(`tasks-${renderCol}`);
-        if (container) container.appendChild(newCard);
+        if (container) container.appendChild(newElement);
     }
-    cardCache[taskId] = newCard;
+    cardCache[taskId] = newElement;
     fingerprintCache[taskId] = taskFingerprint(task);
 }
 
@@ -1196,6 +1473,11 @@ function _renderDiff(diffText) {
 
 let autoRefreshInterval = null;
 
+// Arch gen jobs for the current project (pending/running) — used to render ghost cards
+let _archGenJobs = [];
+// Last known scheduler state — used to render per-card job indicators
+let _schedulerState = { active: [], queued: [] };
+
 document.addEventListener('DOMContentLoaded', async function() {
     // Load projects first so the sidebar is populated before tasks load
     await loadProjects();
@@ -1232,7 +1514,10 @@ function startAutoRefresh() {
         } catch (error) {
             console.error('Auto-refresh error:', error);
         }
-        // Update queue button label (fire-and-forget, no render when modal is closed)
+        // Refresh arch gen ghost cards (fire-and-forget)
+        loadArchGenJobs().catch(() => {});
+
+        // Update queue button label + card job indicators (fire-and-forget)
         if (!_schedulerModalPoller) {
             fetch(`${API_BASE}/scheduler/status`).then(r => r.ok ? r.json() : null).then(data => {
                 if (!data) return;
@@ -1241,9 +1526,60 @@ function startAutoRefresh() {
                     const total = (data.active || []).length + (data.queued || []).length;
                     queueBtn.textContent = total > 0 ? `⚙ Queue (${total})` : '⚙ Queue';
                 }
+                _refreshJobIndicators(data);
             }).catch(() => {});
         }
     }, 5000);
+}
+
+// Fetch pending/running arch gen jobs for the current project and re-render ghost cards.
+async function loadArchGenJobs() {
+    if (!currentProject) return;
+    try {
+        const r = await fetch(`${API_BASE}/projects/${encodeURIComponent(currentProject)}/arch-gen-jobs`);
+        if (r.ok) {
+            const data = await r.json();
+            // Handle both legacy (array) and new (object with .jobs) formats
+            _archGenJobs = data.jobs || data;
+            renderArchBar();
+        }
+    } catch (err) {
+        console.error("Failed to load arch gen jobs:", err);
+    }
+}
+
+// Update the per-card job indicator strips based on the latest scheduler state.
+function _refreshJobIndicators(schedulerData) {
+    _schedulerState = {
+        active: schedulerData.active || [],
+        queued: schedulerData.queued || [],
+    };
+
+    // Build fast lookup maps: taskId → entry
+    const activeMap = {};
+    (_schedulerState.active || []).forEach(item => { activeMap[item.id] = item; });
+    const queuedMap = {};
+    (_schedulerState.queued || []).forEach(item => { queuedMap[item.id] = item; });
+
+    // Walk all cached cards and update their indicator element.
+    Object.keys(cardCache).forEach(taskId => {
+        const el = document.getElementById(`ji-${taskId}`);
+        if (!el) return;
+
+        let html = '';
+        if (activeMap[taskId]) {
+            const llm = activeMap[taskId].llm_name || '';
+            html = `<span class="ji-dot"></span><span class="ji-label">Running${llm ? ' \u00b7 ' + escapeHtml(llm) : ''}</span>`;
+            el.className = 'card-job-indicator ji-running';
+        } else if (queuedMap[taskId]) {
+            const reason = queuedMap[taskId].reason || 'pending';
+            html = `<span class="ji-dot"></span><span class="ji-label">Queued \u00b7 ${escapeHtml(reason)}</span>`;
+            el.className = 'card-job-indicator ji-queued';
+        } else {
+            el.className = 'card-job-indicator';
+        }
+        el.innerHTML = html;
+    });
 }
 
 // Switch to a different project: update state, fetch its tasks, and re-render
@@ -1264,7 +1600,9 @@ async function switchProject(projectName) {
     Object.values(transitionPollers).forEach(id => clearInterval(id));
     transitionPollers = {};
 
-    await loadTasksFromDatabase();
+    _archGenJobs = [];
+    _schedulerState = { active: [], queued: [] };
+    await Promise.all([loadTasksFromDatabase(), loadArchGenJobs()]);
     await loadTransitionStatuses();
     renderTasksFromDatabase();
 
@@ -2286,11 +2624,19 @@ function createTaskCard(id, title, tags, owner, status) {
 
     const tagsHtml = tags.map(tag => `<span class="tag">${tag}</span>`).join('') || '<span class="tag">general</span>';
     const ownerHtml = owner ? `<span>${owner}</span>` : '';
+
+    const taskObj = taskData[id] || {};
     const rejBadge = rejectionCount > 0 ? `<span class="rejection-badge" title="${rejectionCount} rejection(s)">${rejectionCount}x</span>` : '';
     const processingSpinner = transitionPollers[id] ? '<span class="processing-indicator">\u25E0</span>' : '';
 
+    // PIP badge — small inline indicator; the full pip-card stack is built by wrapWithPipGroup()
+    const pips = taskObj.pips || [];
+    const pipBadge = pips.length > 0
+        ? `<span class="pip-badge" title="${pips.length} Performance Improvement Plan(s)">PIP</span>`
+        : '';
+    const pipRequirementsHtml = '';  // requirements now live in .pip-card segments below the card
+
     // Subdivision badges
-    const taskObj = taskData[id] || {};
     const parentId = taskObj.parent_task_id;
     const generation = taskObj.subdivision_generation || 0;
     const isSubdividing = status === 'subdividing';
@@ -2343,13 +2689,15 @@ function createTaskCard(id, title, tags, owner, status) {
     card.innerHTML = `
         <button class="card-highlight-btn" title="Highlight card" onclick="event.stopPropagation();toggleHighlight('${id}')">☆</button>
         ${parentLink}
-        <div class="task-title"${isBigIdea ? ` onclick="zoomIntoBigIdea('${id}')" style="cursor:pointer"` : ''}>${title}${rejBadge}${processingSpinner}${subdivBadge}${bigIdeaBadge}${contractIndicator}</div>
+        <div class="task-title"${isBigIdea ? ` onclick="zoomIntoBigIdea('${id}')" style="cursor:pointer"` : ''}>${title}${rejBadge}${processingSpinner}${subdivBadge}${bigIdeaBadge}${contractIndicator}${pipBadge}</div>
         <div class="task-meta">
             ${tagsHtml}
             ${ownerHtml}
         </div>
+        ${pipRequirementsHtml}
         ${prereqHtml}
         ${footerHtml}
+        <div class="card-job-indicator" id="ji-${id}"></div>
         <div class="card-toolbar">
             <span class="toolbar-sep"></span>
             <button class="toolbar-btn" title="Research — run a research agent on this card" onclick="event.stopPropagation();openResearchDialog('${id}')">🔍</button>
@@ -3519,13 +3867,29 @@ function updateTaskCount(status) {
 // Drag and Drop — Ghost placeholder UX
 // ============================================
 
-function handleDragStart(e) {
-    draggedElement = this;
-    draggedTaskId = this.getAttribute('data-id');
-    dragSourceContainer = this.closest('.tasks-container');
+/**
+ * Return the direct droppable children of a .tasks-container: bare .task-card
+ * elements and .task-card-group wrappers, excluding ghost placeholders.
+ * Used by drag-start and drag-over to keep groups as atomic drag units.
+ */
+function _draggableChildren(container) {
+    return [...container.children].filter(
+        el => !el.classList.contains('drop-ghost') &&
+              (el.classList.contains('task-card') || el.classList.contains('task-card-group'))
+    );
+}
 
-    // Capture original index among non-ghost siblings
-    const siblings = [...dragSourceContainer.querySelectorAll('.task-card:not(.drop-ghost)')];
+function handleDragStart(e) {
+    // If this .task-card lives inside a .task-card-group, drag the whole group
+    // as a single unit so pip-card segments move with it.
+    const group = this.closest('.task-card-group');
+    draggedElement = group || this;
+    // this may be a .task-card (data-id) or a .task-card-group (data-task-id)
+    draggedTaskId = this.dataset.id || this.dataset.taskId;
+    dragSourceContainer = draggedElement.closest('.tasks-container');
+
+    // Capture original index among direct droppable children of the container
+    const siblings = _draggableChildren(dragSourceContainer);
     draggedOriginalIndex = siblings.indexOf(draggedElement);
 
     e.dataTransfer.effectAllowed = 'move';
@@ -3536,20 +3900,20 @@ function handleDragStart(e) {
     // dragstart causes some browsers to treat the element as gone and cancel the
     // drag session immediately (symptom: dragend fires right after dragstart with
     // no dragover/drop events in between).
-    const _draggedEl = this;
+    const _dragTarget = draggedElement;
     setTimeout(() => {
         if (draggedElement) {
-            _draggedEl.classList.add('dragging');
-            // Collapse the card from layout so it doesn't skew sibling
+            _dragTarget.classList.add('dragging');
+            // Collapse the element from layout so it doesn't skew sibling
             // midpoint calculations during dragover.  Done in JS too so
             // it works even if the CSS is cached.
-            _draggedEl.style.height = '1px';
-            _draggedEl.style.minHeight = '0';
-            _draggedEl.style.padding = '0';
-            _draggedEl.style.margin = '0';
-            _draggedEl.style.border = 'none';
-            _draggedEl.style.overflow = 'hidden';
-            _draggedEl.style.opacity = '0';
+            _dragTarget.style.height = '1px';
+            _dragTarget.style.minHeight = '0';
+            _dragTarget.style.padding = '0';
+            _dragTarget.style.margin = '0';
+            _dragTarget.style.border = 'none';
+            _dragTarget.style.overflow = 'hidden';
+            _dragTarget.style.opacity = '0';
         }
     }, 0);
 
@@ -3586,15 +3950,17 @@ function handleDragStart(e) {
 }
 
 function handleDragEnd(e) {
-    this.classList.remove('dragging');
+    // draggedElement may be a .task-card or a .task-card-group
+    const dragTarget = draggedElement || this;
+    dragTarget.classList.remove('dragging');
     // Clear inline styles set during dragstart collapse
-    this.style.height = '';
-    this.style.minHeight = '';
-    this.style.padding = '';
-    this.style.margin = '';
-    this.style.border = '';
-    this.style.overflow = '';
-    this.style.opacity = '';
+    dragTarget.style.height = '';
+    dragTarget.style.minHeight = '';
+    dragTarget.style.padding = '';
+    dragTarget.style.margin = '';
+    dragTarget.style.border = '';
+    dragTarget.style.overflow = '';
+    dragTarget.style.opacity = '';
 
     if (insertIndicator && insertIndicator.parentNode) {
         insertIndicator.parentNode.removeChild(insertIndicator);
@@ -3630,8 +3996,11 @@ function handleContainerDragOver(e) {
 
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
-    // Exclude both the dragging card and the ghost itself from midpoint geometry
-    const cards = [...container.querySelectorAll('.task-card:not(.dragging):not(.drop-ghost)')];
+    // Exclude the dragging element and the ghost from midpoint geometry.
+    // Use _draggableChildren so .task-card-group elements are treated as single units.
+    const cards = _draggableChildren(container).filter(
+        el => !el.classList.contains('dragging')
+    );
 
     // Find insertion point: first card whose vertical midpoint is below the cursor
     let insertIndex = cards.length; // default: append at end
@@ -3777,7 +4146,9 @@ async function handleContainerDrop(e) {
 // ============================================
 
 function initializeDragAndDrop() {
+    // Cards inside a .task-card-group have draggable on the group, not the card.
     document.querySelectorAll('.task-card').forEach(card => {
+        if (card.closest('.task-card-group')) return;
         card.setAttribute('draggable', 'true');
         card.addEventListener('dragstart', handleDragStart);
         card.addEventListener('dragend', handleDragEnd);
@@ -4506,6 +4877,7 @@ let _mapOffsetX = 0;   // canvas = layout + offset
 let _mapOffsetY = 0;
 const _MAP_CARD_W = 230;
 const _MAP_CARD_H = 130;
+const _MAP_PIP_CHIP_H = 44;  // height of each PIP chip below a map node
 
 // Node-drag state
 let _mapNodeDrag = {
@@ -4790,7 +5162,11 @@ function renderColumnMap(colType) {
     const minX = Math.min(...xs);
     const minY = Math.min(...ys);
     const maxX = Math.max(...xs) + _MAP_CARD_W;
-    const maxY = Math.max(...ys) + _MAP_CARD_H;
+    // Account for PIP chip stacks that extend below the base card height
+    const maxY = nodes.reduce((acc, n) => {
+        const pipCount = (n.task && n.task.pips) ? n.task.pips.length : 0;
+        return Math.max(acc, n.y + _MAP_CARD_H + pipCount * _MAP_PIP_CHIP_H);
+    }, Math.max(...ys) + _MAP_CARD_H);
 
     const W  = maxX - minX + PAD * 2;
     const H  = maxY - minY + PAD * 2;
@@ -4881,6 +5257,31 @@ function renderColumnMap(colType) {
         node.addEventListener('mousedown', (e) => _mapStartNodeDrag(e, id));
 
         nodesEl.appendChild(node);
+
+        // PIP chips — stacked vertically below the main node card
+        const pips = (task && task.pips) || [];
+        pips.forEach((pip, pipIdx) => {
+            const status = pip.status || 'unverified';
+            const statusLabel = PIP_STATUS_LABELS[status] || status;
+            const firstReq = (pip.requirements && pip.requirements[0])
+                ? pip.requirements[0].substring(0, 60) + (pip.requirements[0].length > 60 ? '…' : '')
+                : '(no requirements)';
+
+            const chip = document.createElement('div');
+            chip.className = `map-pip-chip map-pip-chip--${status}`;
+            chip.style.left = (x + OX) + 'px';
+            chip.style.top  = (y + OY + _MAP_CARD_H + pipIdx * _MAP_PIP_CHIP_H) + 'px';
+            chip.innerHTML = `
+                <span class="map-pip-chip-label">PIP ${pipIdx + 1}</span>
+                <span class="map-pip-chip-status pip-status--${status}">${statusLabel}</span>
+                <span class="map-pip-chip-req">${_escHtml(firstReq)}</span>`;
+            chip.title = `PIP ${pipIdx + 1} — demoted from ${pip.origin_stage}\nClick to view details`;
+            chip.addEventListener('click', (e) => {
+                e.stopPropagation();
+                openPipDetailModal(id, pip.id);
+            });
+            nodesEl.appendChild(chip);
+        });
     });
 
     // Center the layout in the viewport on first open

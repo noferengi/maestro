@@ -40,7 +40,7 @@ from app.agent.config import (
     check_context_saturation,
 )
 from app.agent.json_utils import extract_json_block
-from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
+from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError, ContextTooLargeError
 from app.agent.tools import TOOL_SCHEMAS, TOOL_REGISTRY, dispatch_tool, LISTING_EXCLUDED_DIRS
 from app.database import get_llm
 
@@ -436,11 +436,11 @@ class ResearchAgent:
             "You cannot use any tools. You MUST render a final verdict RIGHT NOW "
             "based solely on the accumulated findings below.\n\n"
             "Output ONLY this JSON object - key order MUST be exactly: grade, justification, verdict.\n"
-            '{\n'
+            "{ \n"
             '  "grade": <integer 0-10000 representing investigation quality in hundredths of a percent, e.g. 9258 = 92.58%>,\n'
             '  "justification": "<your synthesis of the evidence - no double-quote characters>",\n'
             '  "verdict": "<REJECTED|NOT_SUITABLE|POSSIBLE|LIKELY|NEEDS_RESEARCH>"\n'
-            '}\n\n'
+            "} \n\n"
             "Use NEEDS_RESEARCH only if the investigation budget was genuinely insufficient "
             "to reach a conclusion.  Use a lower grade for lower-quality investigations."
         )
@@ -564,10 +564,27 @@ class ResearchAgent:
             # LLM call
             try:
                 response = await self._call_llm(messages, no_tools=budget_exceeded)
+            except ContextTooLargeError as exc:
+                # Pre-flight check caught the oversized prompt — abort immediately.
+                # This is a normal outcome: do not retry, do not accumulate more messages.
+                logger.warning(
+                    "Research agent pre-flight context check (life %d, turn %d): %s — emitting TOO_LARGE",
+                    life_num, turns_used, exc,
+                )
+                return LifeResult(
+                    findings=f"Life {life_num} prompt exceeded context window before being sent to LLM.",
+                    vote={
+                        "verdict": "TOO_LARGE",
+                        "confidence": 100,
+                        "justification": str(exc),
+                        "findings": f"Context too large at turn {turns_used} of life {life_num}.",
+                    },
+                    turns_used=turns_used,
+                )
             except Exception as exc:
                 exc_str = str(exc)
                 if "400" in exc_str or "Bad Request" in exc_str:
-                    # Context window exceeded - terminate this life immediately.
+                    # HTTP 400 context overflow — terminate this life immediately.
                     # Continuing would only make the context larger and guarantee every
                     # subsequent call also fails.
                     logger.warning(

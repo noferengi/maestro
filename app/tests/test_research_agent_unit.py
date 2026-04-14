@@ -46,7 +46,7 @@ def _run(coro):
     try:
         return loop.run_until_complete(coro)
     finally:
-        pass  # keep loop alive; matches pattern used across the test suite
+        loop.close()
 
 
 # ---------------------------------------------------------------------------

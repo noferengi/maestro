@@ -831,6 +831,18 @@ def _tick() -> None:
             if task_id in _active_sessions and _active_sessions[task_id].is_alive():
                 continue
 
+        # PIP resolution guard: don't re-dispatch a review stage while resolution
+        # agents are still working on its PIPs.  The stage will re-enter naturally
+        # on the next tick after all jobs reach 'done'.
+        if task_type in {"conceptual_review", "optimization", "security", "full_review"}:
+            from app.database import get_active_pip_resolution_jobs_for_task
+            if get_active_pip_resolution_jobs_for_task(task_id):
+                logger.debug(
+                    "[pip] Skipping dispatch of '%s' (%s) — pip_resolution_jobs active.",
+                    task_id, task_type,
+                )
+                continue
+
         # Cooldown after failure - don't retry for 60s
         if task_id in _failed_cooldowns:
             if time.time() - _failed_cooldowns[task_id] < _FAIL_COOLDOWN_SECONDS:
@@ -924,6 +936,11 @@ def _tick() -> None:
         allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
     )
 
+    # 5.6. Dispatch pending PIP resolution jobs (research + resolution agents for blocked PIPs)
+    _dispatch_pip_resolution_jobs(
+        allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
+    )
+
     # 6. Recover stranded subdivision tasks (respects one-LLM policy + full capacity caps)
     _dispatch_stranded_subdivisions(
         allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
@@ -1007,6 +1024,22 @@ def _run_file_summary_job(job: Any, llm: Any) -> None:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
+        # Reject binary files before doing any LLM work — binary data cannot be
+        # summarised as text and would produce garbage or overflow the context.
+        try:
+            with open(job.file_path, "rb") as _bin_fh:
+                _header = _bin_fh.read(512)
+            if b"\x00" in _header:
+                logger.info(
+                    "[file_summary] Skipping binary file '%s' — null bytes detected.",
+                    job.file_path,
+                )
+                update_file_summary_job(job.id, status="completed")
+                signal_completion(completion_key)
+                return
+        except OSError:
+            pass  # File gone — fall through to existing content
+
         # Re-read the full file from disk so chunked processing sees complete content.
         # The stored job.file_content is capped at 32k; fall back to it if file is gone.
         try:
@@ -1294,6 +1327,350 @@ def _run_arch_gen_job(job: Any, llm: Any) -> None:
             pass
 
 
+# ===========================================================================
+# PIP Pre-flight Gate + Resolution Job Dispatch
+# ===========================================================================
+
+def _run_pip_preflight_and_gate(
+    task_id: str,
+    stage: str,
+    llm_id: int,
+    budget_id: int,
+    project_path: "str | None",
+    loop: "asyncio.AbstractEventLoop",
+) -> bool:
+    """Run pre-flight PIP verification for all PIPs on the task at the given stage.
+
+    Returns True  — all PIPs passed (or no PIPs); the stage pipeline may proceed.
+    Returns False — one or more PIPs failed; pip_resolution_jobs were created and
+                    the stage pipeline must NOT run.
+    """
+    from app.database import get_pips_for_task
+    from app.agent.pip_agent import run_pip_preflight
+
+    pips = get_pips_for_task(task_id)
+    if not pips:
+        return True
+
+    logger.info(
+        "[pip_preflight] Task '%s' has %d PIP(s) — running pre-flight for stage '%s'.",
+        task_id, len(pips), stage,
+    )
+
+    preflight = loop.run_until_complete(
+        run_pip_preflight(task_id, stage, llm_id, budget_id, project_path)
+    )
+
+    if preflight["all_passed"]:
+        logger.info(
+            "[pip_preflight] Task '%s' — all PIPs passed at stage '%s'. Proceeding.",
+            task_id, stage,
+        )
+        return True
+
+    failed = [r for r in preflight["results"] if r["outcome"] != "passed"]
+    logger.warning(
+        "[pip_preflight] Task '%s' — %d PIP(s) failed at stage '%s'. Scheduling resolution.",
+        task_id, len(failed), stage,
+    )
+    _schedule_pip_resolution_jobs(task_id, failed, stage)
+    return False
+
+
+def _schedule_pip_resolution_jobs(task_id: str, failed_results: list, stage: str) -> None:
+    """Create pip_resolution_job rows for each failed PIP (idempotent)."""
+    from app.database import create_pip_resolution_job
+    for result in failed_results:
+        job = create_pip_resolution_job(task_id, result["pip_id"], stage)
+        if job:
+            logger.info(
+                "[pip_preflight] Created pip_resolution_job %s for task '%s' pip %d blocked at '%s'.",
+                job.id, task_id, result["pip_id"], stage,
+            )
+
+
+def _dispatch_pip_resolution_jobs(
+    allowed_llm_id: "int | None",
+    node_active_counts: "dict[int, int]",
+    node_session_counts: "dict[int, int]",
+    node_obj_cache: "dict[int, Any]",
+    llm_node_cache: "dict[int, int | None]",
+) -> None:
+    """Dispatch pending PIP resolution jobs through research → resolution pipeline.
+
+    Job lifecycle:
+      pending     — create research thread (direct LLM call, finds what work is needed)
+      researching — wait for research completion signal, then dispatch PIPResolutionAgent
+      resolving   — wait for resolution completion signal, then mark done
+      done/failed — terminal; no further action
+    """
+    from app.database import (
+        get_pending_pip_resolution_jobs, update_pip_resolution_job,
+        get_task, get_pips_for_task, get_llm,
+    )
+
+    jobs = get_pending_pip_resolution_jobs(limit=10)
+    for job in jobs:
+        task = get_task(job.task_id)
+        if not task or not task.llm_id:
+            continue
+
+        llm = get_llm(task.llm_id)
+        if not llm:
+            continue
+
+        if allowed_llm_id is not None and llm.id != allowed_llm_id:
+            continue
+
+        if job.status == "pending":
+            job_key = f"pip-research-{job.pip_id}"
+            with _active_sessions_lock:
+                if job_key in _active_sessions and _active_sessions[job_key].is_alive():
+                    continue
+
+            if not _check_and_reserve_slot(
+                llm, node_active_counts, node_session_counts, node_obj_cache, llm_node_cache,
+                label=f"pip-research-{job.pip_id}",
+            ):
+                continue
+
+            update_pip_resolution_job(job.id, status="researching")
+            thread = threading.Thread(
+                target=_run_pip_resolution_research,
+                args=(job, task, llm),
+                daemon=True,
+                name=f"maestro-pip-research-{job.pip_id}",
+            )
+            with _active_sessions_lock:
+                _active_sessions[job_key] = thread
+                _session_llm_ids[job_key] = llm.id
+                _session_titles[job_key] = f"PIP Research: task {job.task_id} pip {job.pip_id}"
+            thread.start()
+
+        elif job.status == "researching":
+            # Check whether the research thread signalled completion
+            research_key = f"pip_research_{job.pip_id}"
+            event, existed = get_or_create_completion_event(research_key)
+            if not (existed and event.is_set()):
+                continue  # still running
+
+            # Research done — dispatch the PIPResolutionAgent
+            resolve_key = f"pip-resolve-{job.pip_id}"
+            with _active_sessions_lock:
+                if resolve_key in _active_sessions and _active_sessions[resolve_key].is_alive():
+                    continue  # already dispatched
+
+            if not _check_and_reserve_slot(
+                llm, node_active_counts, node_session_counts, node_obj_cache, llm_node_cache,
+                label=resolve_key,
+            ):
+                continue  # no capacity this tick
+
+            update_pip_resolution_job(job.id, status="resolving")
+            thread = threading.Thread(
+                target=_run_pip_resolution_agent,
+                args=(job, task, llm),
+                daemon=True,
+                name=f"maestro-pip-resolve-{job.pip_id}",
+            )
+            with _active_sessions_lock:
+                _active_sessions[resolve_key] = thread
+                _session_llm_ids[resolve_key] = llm.id
+                _session_titles[resolve_key] = (
+                    f"PIP Resolution: task {job.task_id} pip {job.pip_id}"
+                )
+            thread.start()
+            logger.info(
+                "[pip_resolution] Dispatched resolution agent for pip %d (task '%s').",
+                job.pip_id, job.task_id,
+            )
+
+        elif job.status == "resolving":
+            resolve_key = f"pip_resolution_{job.pip_id}"
+            event, existed = get_or_create_completion_event(resolve_key)
+            if not (existed and event.is_set()):
+                continue
+            update_pip_resolution_job(job.id, status="done")
+            logger.info(
+                "[pip_resolution] Resolution agent complete for pip %d (task '%s').",
+                job.pip_id, job.task_id,
+            )
+
+
+def _run_pip_resolution_research(job: Any, task: Any, llm: Any) -> None:
+    """Research what concrete work is needed to satisfy a failed PIP.
+
+    Runs a single focused LLM call (no full ResearchAgent to keep it lightweight).
+    Stores findings in the pip_resolution_job row and signals completion.
+    """
+    from app.database import (
+        update_pip_resolution_job, get_pips_for_task,
+        get_latest_pip_verification, get_project_path as _get_project_path,
+    )
+    from app.agent.project_snapshot import build_project_snapshot
+
+    research_key = f"pip_research_{job.pip_id}"
+    job_key = f"pip-research-{job.pip_id}"
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        pips = get_pips_for_task(job.task_id)
+        pip = next((p for p in pips if p.id == job.pip_id), None)
+        if not pip:
+            logger.warning("[pip_resolution] pip %d not found for task '%s'.", job.pip_id, job.task_id)
+            update_pip_resolution_job(job.id, status="failed")
+            return
+
+        project_root = _get_project_path(task.project) if task.project else None
+        snapshot = build_project_snapshot(project_root) if project_root else ""
+        last_v = get_latest_pip_verification(pip.id, job.stage_blocked_at)
+        last_findings = last_v.findings if last_v else "[]"
+
+        import json as _json
+        reqs = _json.loads(pip.requirements) if isinstance(pip.requirements, str) else pip.requirements
+        req_text = "\n".join(f"- {r}" for r in reqs)
+
+        prompt = (
+            "Investigate what concrete work needs to be done to satisfy the following requirement. "
+            "Do not implement anything — produce a findings report only.\n\n"
+            f"PIP REQUIREMENT:\n{req_text}\n\n"
+            f"WHAT FAILED IN LAST VERIFICATION:\n{last_findings}\n\n"
+            f"PROJECT SNAPSHOT:\n{snapshot}"
+        )
+
+        llm_base_url = f"http://{llm.address}:{llm.port}/v1"
+        from app.agent.llm_client import call_llm as _call_llm
+        response_text, _ = loop.run_until_complete(
+            _call_llm(
+                messages=[{"role": "user", "content": prompt}],
+                llm_id=task.llm_id,
+                budget_id=task.budget_id,
+            )
+        )
+        update_pip_resolution_job(job.id, research_findings=response_text)
+        logger.info("[pip_resolution] Research complete for pip %d.", job.pip_id)
+
+    except ShutdownError:
+        logger.info("[pip_resolution] Research for pip %d aborted (shutdown).", job.pip_id)
+        update_pip_resolution_job(job.id, status="failed")
+    except Exception:
+        logger.exception("[pip_resolution] Research for pip %d failed.", job.pip_id)
+        update_pip_resolution_job(job.id, status="failed")
+    finally:
+        signal_completion(research_key)
+        with _active_sessions_lock:
+            _active_sessions.pop(job_key, None)
+            _session_llm_ids.pop(job_key, None)
+        with _llm_counts_lock:
+            _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+def _run_pip_resolution_agent(job: Any, task: Any, llm: Any) -> None:
+    """Run the PIPResolutionAgent for a single failed PIP.
+
+    Dispatched as a daemon thread by _dispatch_pip_resolution_jobs() once
+    research findings are available.  Signals pip_resolution_{pip_id} on
+    every exit path so the scheduler can re-dispatch the parent stage.
+    """
+    from app.database import (
+        update_pip_resolution_job, get_pips_for_task,
+        get_latest_pip_verification, get_project_path as _get_project_path,
+        get_llm,
+    )
+    from app.agent.pip_resolution import PIPResolutionAgent
+
+    resolve_key = f"pip-resolve-{job.pip_id}"
+    completion_key = f"pip_resolution_{job.pip_id}"
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        pips = get_pips_for_task(job.task_id)
+        pip = next((p for p in pips if p.id == job.pip_id), None)
+        if not pip:
+            logger.warning(
+                "[pip_resolution] pip %d not found for task '%s'.",
+                job.pip_id, job.task_id,
+            )
+            update_pip_resolution_job(job.id, status="failed")
+            return
+
+        project_root = _get_project_path(task.project) if task.project else None
+
+        import json as _json
+        reqs = _json.loads(pip.requirements) if isinstance(pip.requirements, str) else pip.requirements
+
+        last_v = get_latest_pip_verification(pip.id, job.stage_blocked_at)
+        last_findings: list[dict] = []
+        if last_v and last_v.findings:
+            try:
+                last_findings = _json.loads(last_v.findings)
+            except Exception:
+                pass
+
+        llm_obj = get_llm(task.llm_id) if task.llm_id else llm
+        llm_base_url = f"http://{llm.address}:{llm.port}/v1"
+        max_context = getattr(llm, "max_context", None)
+
+        agent = PIPResolutionAgent(
+            task_id=job.task_id,
+            pip_id=job.pip_id,
+            requirements=reqs,
+            research_findings=job.research_findings or "",
+            last_verification_findings=last_findings,
+            project_root=project_root,
+            llm_id=task.llm_id,
+            budget_id=task.budget_id,
+            llm_base_url=llm_base_url,
+            llm_model=getattr(llm, "model", None),
+            max_context=max_context,
+            task_title=getattr(task, "title", ""),
+            origin_stage=pip.origin_stage,
+        )
+
+        result = loop.run_until_complete(agent.run())
+        status = result.get("status", "done")
+        turns = result.get("turns", 0)
+        logger.info(
+            "[pip_resolution] pip %d task '%s' — agent finished status=%s turns=%d.",
+            job.pip_id, job.task_id, status, turns,
+        )
+        db_status = "failed" if status in ("stalled", "error") else "done"
+        update_pip_resolution_job(job.id, status=db_status)
+
+    except ShutdownError:
+        logger.info("[pip_resolution] pip %d — shutdown.", job.pip_id)
+        update_pip_resolution_job(job.id, status="failed")
+    except Exception:
+        logger.exception("[pip_resolution] pip %d — unexpected error.", job.pip_id)
+        update_pip_resolution_job(job.id, status="failed")
+    finally:
+        signal_completion(completion_key)
+        with _active_sessions_lock:
+            _active_sessions.pop(resolve_key, None)
+            _session_llm_ids.pop(resolve_key, None)
+            _session_titles.pop(resolve_key, None)
+        with _llm_counts_lock:
+            _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
 def _dispatch_stranded_subdivisions(
     allowed_llm_id: "int | None",
     node_active_counts: "dict[int, int]",
@@ -1403,6 +1780,7 @@ def _run_subdivision_recovery(task_id: str, llm: Any, stored_result: dict) -> No
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    _apply_cooldown = True  # Set False on clean server shutdown so the task retries at next start
     try:
         task = get_task(task_id)
         if not task:
@@ -1415,13 +1793,20 @@ def _run_subdivision_recovery(task_id: str, llm: Any, stored_result: dict) -> No
         logger.info(f"[{AGENT_NAME}] Subdivision recovery complete for task '%s'.", task_id)
     except ShutdownError:
         logger.info(f"[{AGENT_NAME}] Subdivision recovery for task '%s' aborted due to server shutdown.", task_id)
+        _apply_cooldown = False
     except Exception:
-        _failed_cooldowns[task_id] = time.time()
         logger.exception(
             f"[{AGENT_NAME}] Subdivision recovery failed for task '%s' (cooldown %ds).",
             task_id, int(_FAIL_COOLDOWN_SECONDS),
         )
     finally:
+        # Apply cooldown after every recovery attempt except clean server shutdown.
+        # Previously this was only set in the except branch, so a quiet failure
+        # (subdivision agent aborts with 3× LLM errors → low confidence → task reverts
+        # to idea without raising) would leave _failed_cooldowns unset, causing the
+        # scheduler to re-dispatch on the very next tick indefinitely.
+        if _apply_cooldown:
+            _failed_cooldowns[task_id] = time.time()
         with _llm_counts_lock:
             _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
         try:
@@ -1456,6 +1841,8 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
             _run_conceptual_review_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
         elif task_type == "optimization":
             _run_optimization_security_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
+        elif task_type == "security":
+            _run_security_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
         elif task_type == "full_review":
             _run_full_review_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
         else:
@@ -1690,7 +2077,7 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
                       project_path: str | None = None) -> None:
     """Run the MaestroLoop for a PLANNING/DEVELOPMENT task."""
     from app.agent.loop import MaestroLoop
-    from app.database import update_task, get_task
+    from app.database import update_task, get_task, get_pips_for_task
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -1717,7 +2104,6 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
                 update_task(task_id, type="indev")
                 logger.info("Task '%s' advanced from PLANNING to INDEV via scheduler.", task_id)
             elif current_type == "indev":
-                # MaestroLoop sometimes runs for indev too if called directly or via fallback
                 update_task(task_id, type="conceptual_review")
                 logger.info("Task '%s' advanced from INDEV to CONCEPTUAL REVIEW via scheduler.", task_id)
             else:
@@ -1813,6 +2199,7 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
         if result.get("status") == "ACCEPTED":
             update_task(task_id, type="conceptual_review")
             logger.info("Task '%s' advanced to CONCEPTUAL REVIEW via scheduler.", task_id)
+            # Pre-flight PIP gate runs at conceptual_review entry — no separate stage needed.
         else:
             update_task(task_id, type="planning")
             logger.info("Task '%s' reverted to PLANNING: %s", task_id, result.get("error_detail"))
@@ -1871,6 +2258,10 @@ def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
+        # Pre-flight PIP gate — blocks stage entry if any PIP has unmet requirements
+        if not _run_pip_preflight_and_gate(task_id, "conceptual_review", llm_id, budget_id, project_path, loop):
+            return  # card stays in conceptual_review; resolution jobs dispatched
+
         result = loop.run_until_complete(
             run_conceptual_review(
                 task_id=task_id,
@@ -1938,6 +2329,10 @@ def _run_optimization_security_task(task_id: str, llm_base_url: str, llm_model: 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
+        # Pre-flight PIP gate — runs at optimization stage entry
+        if not _run_pip_preflight_and_gate(task_id, "optimization", llm_id, budget_id, project_path, loop):
+            return  # card stays in optimization; resolution jobs dispatched
+
         # Run optimization first
         opt_result = loop.run_until_complete(
             run_optimization_pipeline(
@@ -1951,6 +2346,14 @@ def _run_optimization_security_task(task_id: str, llm_base_url: str, llm_model: 
             )
         )
         logger.info("[optimization] Task '%s' via scheduler: %s", task_id, opt_result.get("outcome"))
+
+        # Advance to security stage so the card reflects progress and pre-flight
+        # can check requirements at the correct stage.
+        update_task(task_id, type="security")
+
+        # Pre-flight PIP gate — blocks security entry if any PIP has unmet requirements
+        if not _run_pip_preflight_and_gate(task_id, "security", llm_id, budget_id, project_path, loop):
+            return  # card stays in security; resolution jobs dispatched
 
         # Run security review
         sec_result = loop.run_until_complete(
@@ -1974,7 +2377,6 @@ def _run_optimization_security_task(task_id: str, llm_base_url: str, llm_model: 
         )
 
         if sec_result.get("outcome") == "passed":
-            update_task(task_id, type="security")
             update_task(task_id, type="full_review")
             logger.info("[security] Task '%s' advanced to FULL REVIEW via scheduler.", task_id)
         else:
@@ -1988,6 +2390,80 @@ def _run_optimization_security_task(task_id: str, llm_base_url: str, llm_model: 
         logger.exception(f"[{AGENT_NAME}] Optimization/Security for task '%s' failed.", task_id)
         update_task(task_id, type="indev")
         _record_demotion_inline(task_id, "optimization", "indev", "Exception in optimization/security")
+    finally:
+        try:
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+def _run_security_task(task_id: str, llm_base_url: str, llm_model: str,
+                        max_context: int | None = None,
+                        llm_id: int | None = None,
+                        budget_id: int | None = None,
+                        project_path: str | None = None) -> None:
+    """Run security pipeline for a task already in the 'security' stage.
+
+    Called when a task re-enters the security column after PIP resolution.
+    Optimization has already passed; this function runs the security pre-flight
+    gate and the security pipeline only.
+    """
+    from app.agent.security_review import run_security_pipeline
+    from app.agent.tools import set_task_git_cwd
+    from app.database import get_task, update_task
+    from app.database import create_transition_result
+
+    set_task_git_cwd(project_path)
+
+    task = get_task(task_id)
+    if not task:
+        return
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        # Pre-flight PIP gate — blocks security pipeline if any PIP is unmet
+        if not _run_pip_preflight_and_gate(task_id, "security", llm_id, budget_id, project_path, loop):
+            return  # card stays in security; resolution jobs dispatched
+
+        sec_result = loop.run_until_complete(
+            run_security_pipeline(
+                task_id=task_id,
+                task_description=task.description or "",
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                project_path=project_path,
+            )
+        )
+        create_transition_result(
+            task_id=task_id,
+            transition="security_review",
+            outcome=sec_result.get("outcome", "unknown"),
+            vote_summary=sec_result,
+            total_prompt_tokens=sec_result.get("total_prompt_tokens", 0),
+            total_completion_tokens=sec_result.get("total_completion_tokens", 0),
+        )
+
+        if sec_result.get("outcome") == "passed":
+            update_task(task_id, type="full_review")
+            logger.info("[security] Task '%s' advanced to FULL REVIEW via scheduler.", task_id)
+        else:
+            demotion = sec_result.get("demotion_target", "indev")
+            update_task(task_id, type=demotion)
+            _record_demotion_inline(task_id, "security", demotion, sec_result.get("summary", ""))
+            logger.warning("[security] Task '%s' demoted to %s via scheduler.", task_id, demotion)
+    except ShutdownError:
+        logger.info(f"[{AGENT_NAME}] Security for task '%s' aborted due to server shutdown.", task_id)
+    except Exception:
+        logger.exception(f"[{AGENT_NAME}] Security for task '%s' failed.", task_id)
+        update_task(task_id, type="indev")
+        _record_demotion_inline(task_id, "security", "indev", "Exception in security pipeline")
     finally:
         try:
             loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
@@ -2021,6 +2497,10 @@ def _run_full_review_task(task_id: str, llm_base_url: str, llm_model: str,
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
+        # Pre-flight PIP gate — blocks full_review entry if any PIP is unmet
+        if not _run_pip_preflight_and_gate(task_id, "full_review", llm_id, budget_id, project_path, loop):
+            return  # card stays in full_review; resolution jobs dispatched
+
         result = loop.run_until_complete(
             run_full_review_pipeline(
                 task_id=task_id,
@@ -2085,6 +2565,7 @@ def _record_demotion_inline(task_id: str, from_stage: str, to_stage: str, reason
     """Record a demotion event - scheduler-local version (avoids importing from main.py)."""
     from datetime import datetime, timezone
     from app.database import get_task, update_task
+    from app.agent.pip_agent import generate_pip
     task = get_task(task_id)
     if not task:
         return
@@ -2096,6 +2577,17 @@ def _record_demotion_inline(task_id: str, from_stage: str, to_stage: str, reason
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
     update_task(task_id, demotion_count=(task.demotion_count or 0) + 1, demotion_history=history)
+
+    # Trigger PIP generation if demoted from a review stage
+    review_stages = {"conceptual_review", "optimization", "security", "full_review"}
+    if from_stage in review_stages:
+        logger.info("[pip] Triggering PIP generation for task '%s' demoted from '%s'.", task_id, from_stage)
+        # We're in a daemon thread, but we can still use the loop if one exists
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(generate_pip(task_id, from_stage, reason))
+        except RuntimeError:
+            asyncio.run(generate_pip(task_id, from_stage, reason))
 
 
 def _check_completion_rollup_inline(task_id: str) -> None:

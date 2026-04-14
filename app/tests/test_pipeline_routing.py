@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # ---------------------------------------------------------------------------
 
 def _delete_task(task_id):
-    from database import (
+    from app.database import (
         SessionLocal, Task, TransitionVote, TransitionResult, BudgetEntry,
         SubdivisionRecord, PlanningResult, ComponentResult,
         OptimizationResult, SecurityReviewResult, FullReviewResult,
@@ -54,7 +54,7 @@ def _delete_task(task_id):
 
 
 def _cleanup_llm(llm_id):
-    from database import SessionLocal, LLM
+    from app.database import SessionLocal, LLM
     db = SessionLocal()
     try:
         db.query(LLM).filter(LLM.id == llm_id).delete(synchronize_session=False)
@@ -64,7 +64,7 @@ def _cleanup_llm(llm_id):
 
 
 def _cleanup_budget(budget_id):
-    from database import SessionLocal, Budget
+    from app.database import SessionLocal, Budget
     db = SessionLocal()
     try:
         db.query(Budget).filter(Budget.id == budget_id).delete(synchronize_session=False)
@@ -74,7 +74,7 @@ def _cleanup_budget(budget_id):
 
 
 def _make_task(task_id, task_type, description="desc", llm_id=None, budget_id=None):
-    from database import SessionLocal, Task
+    from app.database import SessionLocal, Task
     db = SessionLocal()
     try:
         t = Task(id=task_id, title="T", type=task_type, position=0,
@@ -88,7 +88,7 @@ def _make_task(task_id, task_type, description="desc", llm_id=None, budget_id=No
 
 def _make_budget(name):
     """Create a Budget row and return its id."""
-    from database import SessionLocal, Budget
+    from app.database import SessionLocal, Budget
     db = SessionLocal()
     try:
         b = Budget(name=name)
@@ -102,7 +102,7 @@ def _make_budget(name):
 
 def _make_llm(address, port, model):
     """Create an LLM row and return its id."""
-    from database import SessionLocal, LLM
+    from app.database import SessionLocal, LLM
     db = SessionLocal()
     try:
         llm = LLM(address=address, port=port, model=model)
@@ -451,7 +451,7 @@ class TestDirectTransitions:
             _make_task(task_id, "conceptual_review", description="desc",
                        budget_id=budget_id)
             import main
-            from database import get_task
+            from app.database import get_task
             with patch("app.agent.conceptual_review.run_conceptual_review",
                        return_value={"outcome": "passed", "votes": []}), \
                  patch("main._store_pipeline_result_generic"), \
@@ -473,7 +473,7 @@ class TestDirectTransitions:
             _make_task(task_id, "conceptual_review", description="desc",
                        budget_id=budget_id)
             import main
-            from database import get_task
+            from app.database import get_task
             with patch("app.agent.conceptual_review.run_conceptual_review",
                        return_value={"outcome": "rejected", "votes": []}), \
                  patch("main._store_pipeline_result_generic"), \
@@ -489,185 +489,117 @@ class TestDirectTransitions:
 
 
 # ---------------------------------------------------------------------------
-# 5. Mock LLM - intake pipeline scenarios
+# 5. IntakePipeline routing unit tests
 # ---------------------------------------------------------------------------
 
 class TestIntakePipelineMockLLM:
     """
-    Run run_intake_pipeline() end-to-end with a mocked LLM.
+    Unit tests for IntakePipeline.run() routing logic.
 
-    The mock patches httpx.AsyncClient so call_llm() returns canned responses
-    without hitting any real server. The full pipeline logic (tally, rule
-    evaluation, stage sequencing) executes for real.
+    All four stage methods are mocked on the pipeline instance with AsyncMock,
+    so run() only exercises vote routing and tally logic.  No call_llm, no
+    httpx, no DB, no filesystem, no network.  Each test completes in < 100ms.
     """
 
-    def _run_intake(self, scenario, task_id, budget_id):
-        """Helper: run intake pipeline with a given MockLLM scenario."""
-        from app.agent.intake import run_intake_pipeline
-        from app.agent.mock_llm import MockLLM
+    def _make_vote(self, stage, verdict, confidence=0.80):
+        return {
+            "stage": stage,
+            "verdict": verdict,
+            "confidence": confidence,
+            "justification": f"mocked {stage} verdict",
+            "raw_response": {},
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "model": "mock",
+        }
 
-        mock = MockLLM(scenario=scenario)
+    def _make_canned_research(self, verdict="LIKELY"):
+        from app.agent.research import ResearchResult
+        return ResearchResult(
+            vote={"verdict": verdict, "confidence": 0.90,
+                  "justification": "Research mocked in test."},
+            lives_used=1, total_turns=1, findings="Mocked findings.",
+        )
+
+    def _run_pipeline(self, scope="LIKELY", static="POSSIBLE",
+                      conflict="LIKELY", feasibility="LIKELY"):
+        """
+        Run IntakePipeline.run() with all four stage methods replaced by
+        AsyncMock instances returning the specified verdicts.  run_research
+        and run_tiebreaker are also patched so no real I/O can escape.
+        """
+        from app.agent.intake import IntakePipeline
+
+        pipeline = IntakePipeline(
+            task_id="test-intk-unit",
+            task_description="Add user authentication to the app",
+            task_title="User Auth",
+            all_tasks=[],
+            budget_id=1,
+            llm_id=1,
+            llm_base_url="http://localhost:8008/v1",
+            llm_model="mock-model",
+            project=None,
+        )
+
+        canned = self._make_canned_research()
 
         async def _go():
-            with patch("httpx.AsyncClient") as cls:
-                cls.return_value = mock.get_async_client_mock()
-                return await run_intake_pipeline(
-                    task_id=task_id,
-                    task_description="Add user authentication to the app",
-                    task_title="User Auth",
-                    all_tasks=[],
-                    budget_id=budget_id,
-                    llm_id=1,
-                    llm_base_url="http://localhost:8008/v1",
-                    llm_model="mock-model",
-                    project=None,  # Pipeline will fail unless project is configured
-                )
+            with patch.object(pipeline, "_stage_scope_analysis",
+                              AsyncMock(return_value=self._make_vote("scope_analysis", scope))), \
+                 patch.object(pipeline, "_stage_static_analysis",
+                              AsyncMock(return_value=self._make_vote("static_analysis", static))), \
+                 patch.object(pipeline, "_stage_conflict_detection",
+                              AsyncMock(return_value=self._make_vote("conflict_detection", conflict))), \
+                 patch.object(pipeline, "_stage_feasibility",
+                              AsyncMock(return_value=self._make_vote("feasibility", feasibility))), \
+                 patch("app.agent.research.run_research", AsyncMock(return_value=canned)), \
+                 patch("app.agent.research.run_tiebreaker", AsyncMock(return_value=canned)):
+                return await pipeline.run()
 
         return asyncio.run(_go())
 
     def test_all_pass_outcome_and_votes(self):
-        """intake_all_pass: outcome == 'passed' with votes from all stages.
+        """All four stages return passing verdicts → outcome 'passed', ≥4 votes."""
+        result = self._run_pipeline()
+        assert result["outcome"] == "passed", \
+            f"Expected 'passed', got {result['outcome']!r}. Votes: {result.get('votes')}"
+        assert len(result["votes"]) >= 4, \
+            f"Expected at least 4 votes, got {len(result['votes'])}"
+        stages = {v["stage"] for v in result["votes"]}
+        assert "scope_analysis" in stages
 
-        Patches app.agent.intake.call_llm (Level 1) for the three LLM stages.
-        Also patches _stage_static_analysis directly: that stage runs real
-        tree-sitter on the project filesystem (the original source of the 5s
-        slowness) and is orthogonally tested in test_static_analysis.py.
-        Without the static analysis mock, generate_vote can return NEEDS_RESEARCH
-        non-deterministically, which triggers the research handler — a different
-        module that has its own call_llm import site not covered by this patch.
-        """
-        from app.agent.mock_llm import (
-            _SCOPE_RESPONSE_PASS,
-            _CONFLICT_RESPONSE_PASS,
-            _FEASIBILITY_RESPONSE_PASS,
-        )
-        from app.agent.intake import IntakePipeline, run_intake_pipeline
-
-        def _resp(content_dict):
-            return {
-                "choices": [{"message": {"content": json.dumps(content_dict),
-                                         "tool_calls": None},
-                             "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 50, "completion_tokens": 100,
-                          "total_tokens": 150},
-            }
-
-        responses = [
-            _resp(_SCOPE_RESPONSE_PASS),
-            _resp(_CONFLICT_RESPONSE_PASS),
-            _resp(_FEASIBILITY_RESPONSE_PASS),
-        ]
-
-        async def _sequential(*a, **kw):
-            return responses.pop(0) if len(responses) > 1 else responses[0]
-
-        async def _mock_static_analysis(self, scope_vote):
-            return {
-                "stage": "static_analysis",
-                "verdict": "POSSIBLE",
-                "confidence": 0.75,
-                "justification": "Static analysis mocked in test.",
-                "raw_response": {},
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "model": "static_analysis",
-            }
-
-        task_id = "test-intake-pass"
-        budget_id = None
-        try:
-            budget_id = _make_budget("test-intake-pass-budget")
-            _make_task(task_id, "idea", description="User auth")
-
-            async def _go():
-                with patch("app.agent.intake.call_llm", _sequential), \
-                     patch.object(IntakePipeline, "_stage_static_analysis",
-                                  _mock_static_analysis):
-                    return await run_intake_pipeline(
-                        task_id=task_id,
-                        task_description="Add user authentication to the app",
-                        task_title="User Auth",
-                        all_tasks=[],
-                        budget_id=budget_id,
-                        llm_id=1,
-                        llm_base_url="http://localhost:8008/v1",
-                        llm_model="mock-model",
-                        project=None,
-                    )
-
-            result = asyncio.run(_go())
-            assert result["outcome"] == "passed", \
-                f"Expected 'passed', got {result['outcome']!r}. Votes: {result.get('votes')}"
-            assert len(result["votes"]) >= 3, \
-                f"Expected at least 3 votes, got {len(result['votes'])}"
-            assert "scope_analysis" in {v["stage"] for v in result["votes"]}
-        finally:
-            _delete_task(task_id)
-            if budget_id is not None:
-                _cleanup_budget(budget_id)
-
-    def test_rejected_scope_outcome_is_rejected(self):
-        """intake_rejected scenario (scope votes REJECTED) -> outcome == 'rejected'."""
-        task_id = "test-intake-rej"
-        budget_id = None
-        try:
-            budget_id = _make_budget("test-intake-rej-budget")
-            _make_task(task_id, "idea", description="User auth")
-            result = self._run_intake("intake_rejected", task_id, budget_id)
-            assert result["outcome"] == "rejected", \
-                f"Expected 'rejected', got {result['outcome']!r}"
-        finally:
-            _delete_task(task_id)
-            if budget_id is not None:
-                _cleanup_budget(budget_id)
+    def test_rejected_scope_short_circuits(self):
+        """REJECTED scope vote → pipeline returns 'rejected' without running other stages."""
+        result = self._run_pipeline(scope="REJECTED")
+        assert result["outcome"] == "rejected", \
+            f"Expected 'rejected', got {result['outcome']!r}"
+        # Only scope_analysis should be in votes (early exit)
+        assert len(result["votes"]) == 1
+        assert result["votes"][0]["stage"] == "scope_analysis"
 
     def test_needs_research_triggers_research_then_passes(self):
-        """intake_needs_research scenario -> research agent runs -> outcome == 'passed'."""
-        task_id = "test-intake-nr"
-        budget_id = None
-        try:
-            budget_id = _make_budget("test-intake-nr-budget")
-            _make_task(task_id, "idea", description="User auth")
-            result = self._run_intake("intake_needs_research", task_id, budget_id)
-            assert result["outcome"] == "passed", \
-                f"Expected 'passed' after research, got {result['outcome']!r}"
-        finally:
-            _delete_task(task_id)
-            if budget_id is not None:
-                _cleanup_budget(budget_id)
+        """NEEDS_RESEARCH scope → run_research called (mocked LIKELY) → outcome 'passed'."""
+        result = self._run_pipeline(scope="NEEDS_RESEARCH")
+        assert result["outcome"] == "passed", \
+            f"Expected 'passed' after research, got {result['outcome']!r}"
 
     def test_tie_triggers_tiebreaker_then_passes(self):
-        """intake_tie scenario -> tie-breaker fires -> outcome == 'passed'."""
-        task_id = "test-intake-tie"
-        budget_id = None
-        try:
-            budget_id = _make_budget("test-intake-tie-budget")
-            _make_task(task_id, "idea", description="User auth")
-            result = self._run_intake("intake_tie", task_id, budget_id)
-            assert result["outcome"] == "passed", \
-                f"Expected 'passed' after tiebreak, got {result['outcome']!r}"
-        finally:
-            _delete_task(task_id)
-            if budget_id is not None:
-                _cleanup_budget(budget_id)
-
+        """2 LIKELY vs 2 NOT_SUITABLE → tie → run_tiebreaker (mocked LIKELY) → 'passed'."""
+        result = self._run_pipeline(
+            scope="LIKELY", static="NOT_SUITABLE",
+            conflict="LIKELY", feasibility="NOT_SUITABLE",
+        )
+        assert result["outcome"] == "passed", \
+            f"Expected 'passed' after tiebreak, got {result['outcome']!r}"
 
     def test_rejected_result_contains_justification(self):
-        """Rejected intake result must carry a justification in the vote."""
-        task_id = "test-intake-rej-just"
-        budget_id = None
-        try:
-            budget_id = _make_budget("test-intake-rej-just-budget")
-            _make_task(task_id, "idea", description="User auth")
-            result = self._run_intake("intake_rejected", task_id, budget_id)
-            assert result["outcome"] == "rejected"
-            votes = result.get("votes", [])
-            assert any(v.get("justification") for v in votes), \
-                "At least one vote must carry a justification string"
-        finally:
-            _delete_task(task_id)
-            if budget_id is not None:
-                _cleanup_budget(budget_id)
+        """Rejected result carries a justification string in at least one vote."""
+        result = self._run_pipeline(scope="REJECTED")
+        assert result["outcome"] == "rejected"
+        votes = result.get("votes", [])
+        assert any(v.get("justification") for v in votes), \
+            "At least one vote must carry a justification string"
 
 
 # ---------------------------------------------------------------------------

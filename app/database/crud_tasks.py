@@ -17,9 +17,255 @@ import json
 import logging
 
 from .session import SessionLocal, init_db_tables
-from .models import Task, LLM, Budget
+from .models import Task, LLM, Budget, PerformanceImprovementPlan, PipVerification, PipResolutionJob
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# PIP CRUD
+# ---------------------------------------------------------------------------
+
+def create_pip(task_id, origin_stage, requirements, llm_id=None, budget_id=None,
+               prompt_tokens=0, completion_tokens=0, created_at_commit="none"):
+    """Create a new Performance Improvement Plan for a task."""
+    db = SessionLocal()
+    try:
+        pip = PerformanceImprovementPlan(
+            task_id=task_id,
+            origin_stage=origin_stage,
+            requirements=requirements,
+            llm_id=llm_id,
+            budget_id=budget_id,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            created_at_commit=created_at_commit,
+            status='active',
+        )
+        db.add(pip)
+        db.commit()
+        db.refresh(pip)
+        return pip
+    except Exception as e:
+        db.rollback()
+        logger.error("Error creating PIP: %s", e)
+        return None
+    finally:
+        db.close()
+
+
+def get_pips_for_task(task_id):
+    """Get all PIPs for a specific task, newest first."""
+    db = SessionLocal()
+    try:
+        return (db.query(PerformanceImprovementPlan)
+                  .filter(PerformanceImprovementPlan.task_id == task_id)
+                  .order_by(PerformanceImprovementPlan.created_at.desc())
+                  .all())
+    except Exception as e:
+        logger.error("Error getting PIPs for task %s: %s", task_id, e)
+        return []
+    finally:
+        db.close()
+
+
+def satisfy_pips(task_id):
+    """Mark all active PIPs for a task as satisfied (legacy — prefer verification rows)."""
+    db = SessionLocal()
+    try:
+        (db.query(PerformanceImprovementPlan)
+           .filter(PerformanceImprovementPlan.task_id == task_id,
+                   PerformanceImprovementPlan.status == 'active')
+           .update({"status": "satisfied", "verified_at": datetime.utcnow()},
+                   synchronize_session=False))
+        db.commit()
+        return True
+    except Exception as e:
+        db.rollback()
+        logger.error("Error satisfying PIPs for task %s: %s", task_id, e)
+        return False
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# PipVerification CRUD
+# ---------------------------------------------------------------------------
+
+def create_pip_verification(pip_id, task_id, stage, outcome, summary,
+                             findings=None, agent_session_id=None):
+    """Record one pre-flight gate result for a PIP at a given pipeline stage."""
+    db = SessionLocal()
+    try:
+        v = PipVerification(
+            pip_id=pip_id,
+            task_id=task_id,
+            checked_at_stage=stage,
+            outcome=outcome,
+            summary=summary,
+            findings=findings,
+            agent_session_id=agent_session_id,
+            created_at=datetime.utcnow().isoformat(),
+        )
+        db.add(v)
+        db.commit()
+        db.refresh(v)
+        return v
+    except Exception as e:
+        db.rollback()
+        logger.error("Error creating PipVerification pip=%s stage=%s: %s", pip_id, stage, e)
+        return None
+    finally:
+        db.close()
+
+
+def get_latest_pip_verification(pip_id, stage):
+    """Return the most recent verification row for a PIP at a specific stage, or None."""
+    db = SessionLocal()
+    try:
+        return (db.query(PipVerification)
+                  .filter(PipVerification.pip_id == pip_id,
+                          PipVerification.checked_at_stage == stage)
+                  .order_by(PipVerification.created_at.desc())
+                  .first())
+    except Exception as e:
+        logger.error("Error fetching latest PipVerification pip=%s stage=%s: %s", pip_id, stage, e)
+        return None
+    finally:
+        db.close()
+
+
+def get_pip_verification_map(task_id, stage):
+    """Return {pip_id: outcome} for the most recent verification of each PIP at stage."""
+    pips = get_pips_for_task(task_id)
+    result = {}
+    for pip in pips:
+        v = get_latest_pip_verification(pip.id, stage)
+        result[pip.id] = v.outcome if v else None
+    return result
+
+
+def get_pip_verifications_for_pip(pip_id):
+    """Return full verification history for one PIP across all stages, newest first."""
+    db = SessionLocal()
+    try:
+        return (db.query(PipVerification)
+                  .filter(PipVerification.pip_id == pip_id)
+                  .order_by(PipVerification.created_at.desc())
+                  .all())
+    except Exception as e:
+        logger.error("Error fetching PipVerifications for pip=%s: %s", pip_id, e)
+        return []
+    finally:
+        db.close()
+
+
+def pip_status_at_stage(pip_id, stage):
+    """Derive the display status of a PIP at a given pipeline stage.
+
+    Status is derived at read time from the latest verification row — there is
+    no stored status column that needs manual updating.
+
+    Returns one of: 'unverified' | 'satisfied' | 'unsatisfied' | 'checking'
+    """
+    v = get_latest_pip_verification(pip_id, stage)
+    if v is None:
+        return "unverified"
+    if v.outcome == "passed":
+        return "satisfied"
+    if v.outcome == "failed":
+        return "unsatisfied"
+    if v.outcome == "pending":
+        return "checking"
+    return "unverified"
+
+
+# ---------------------------------------------------------------------------
+# PipResolutionJob CRUD
+# ---------------------------------------------------------------------------
+
+_PIP_RESOLUTION_ACTIVE_STATUSES = frozenset({"pending", "researching", "resolving"})
+
+
+def create_pip_resolution_job(task_id, pip_id, stage_blocked_at):
+    """Create a new PIP resolution job record. Returns None if an active job already
+    exists for this pip (idempotent — prevents duplicates on consecutive pre-flight failures)."""
+    db = SessionLocal()
+    try:
+        existing = (db.query(PipResolutionJob)
+                      .filter(PipResolutionJob.pip_id == pip_id,
+                              PipResolutionJob.status.in_(list(_PIP_RESOLUTION_ACTIVE_STATUSES)))
+                      .first())
+        if existing:
+            return existing
+        job = PipResolutionJob(
+            task_id=task_id,
+            pip_id=pip_id,
+            stage_blocked_at=stage_blocked_at,
+            status="pending",
+            created_at=datetime.utcnow().isoformat(),
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        return job
+    except Exception as e:
+        db.rollback()
+        logger.error("Error creating PipResolutionJob pip=%s: %s", pip_id, e)
+        return None
+    finally:
+        db.close()
+
+
+def get_pending_pip_resolution_jobs(limit=20):
+    """Return active (pending/researching/resolving) resolution jobs, oldest first."""
+    db = SessionLocal()
+    try:
+        return (db.query(PipResolutionJob)
+                  .filter(PipResolutionJob.status.in_(list(_PIP_RESOLUTION_ACTIVE_STATUSES)))
+                  .order_by(PipResolutionJob.created_at)
+                  .limit(limit)
+                  .all())
+    except Exception as e:
+        logger.error("Error fetching pending PipResolutionJobs: %s", e)
+        return []
+    finally:
+        db.close()
+
+
+def get_active_pip_resolution_jobs_for_task(task_id):
+    """Return any active (not done/failed) resolution jobs for a task.
+
+    Used by the scheduler to block stage re-dispatch while resolution is in progress.
+    """
+    db = SessionLocal()
+    try:
+        return (db.query(PipResolutionJob)
+                  .filter(PipResolutionJob.task_id == task_id,
+                          PipResolutionJob.status.in_(list(_PIP_RESOLUTION_ACTIVE_STATUSES)))
+                  .all())
+    except Exception as e:
+        logger.error("Error fetching active PipResolutionJobs for task %s: %s", task_id, e)
+        return []
+    finally:
+        db.close()
+
+
+def update_pip_resolution_job(job_id, **kwargs):
+    """Update fields on a PipResolutionJob row."""
+    db = SessionLocal()
+    try:
+        (db.query(PipResolutionJob)
+           .filter(PipResolutionJob.id == job_id)
+           .update(kwargs, synchronize_session=False))
+        db.commit()
+        return True
+    except Exception as e:
+        db.rollback()
+        logger.error("Error updating PipResolutionJob %s: %s", job_id, e)
+        return False
+    finally:
+        db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -652,6 +898,31 @@ def get_descendant_tree(root_task_id):
         db.close()
 
 
+def _pip_to_dict(pip, stage):
+    """Serialize one PIP with its derived verification status for the given stage."""
+    v = get_latest_pip_verification(pip.id, stage)
+    if v is None:
+        status = "unverified"
+    elif v.outcome == "passed":
+        status = "satisfied"
+    elif v.outcome == "failed":
+        status = "unsatisfied"
+    elif v.outcome == "pending":
+        status = "checking"
+    else:
+        status = "unverified"
+    return {
+        "id": pip.id,
+        "origin_stage": pip.origin_stage,
+        "requirements": json.loads(pip.requirements),
+        "created_at": pip.created_at.isoformat() if pip.created_at else None,
+        "created_at_commit": getattr(pip, "created_at_commit", "none"),
+        "status": status,
+        "last_summary": v.summary if v else None,
+        "last_checked": v.created_at if v else None,
+    }
+
+
 def task_to_dict(task):
     """Convert SQLAlchemy Task model to dictionary"""
     llm_obj = getattr(task, 'llm_ref', None)
@@ -683,5 +954,9 @@ def task_to_dict(task):
         "map_y": getattr(task, "map_y", None),
         "is_active": bool(getattr(task, "is_active", True)),
         "created_at": task.created_at.isoformat() if task.created_at else None,
-        "updated_at": task.updated_at.isoformat() if task.updated_at else None
+        "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+        "pips": [
+            _pip_to_dict(p, task.type)
+            for p in (get_pips_for_task(task.id) if hasattr(task, "id") else [])
+        ]
     }

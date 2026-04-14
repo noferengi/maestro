@@ -23,7 +23,20 @@
       "Bash(venv/Scripts/python.exe -m pytest app/tests/test_file_summary_enrichment.py::TestWriteInterception::test_write_file_enqueues_at_high_priority -v)",
       "Bash(venv/Scripts/python.exe -m pytest app/tests/test_research_agent_unit.py app/tests/test_subdivision.py app/tests/test_project_snapshot.py app/tests/test_file_summary_enrichment.py -q)",
       "Bash(venv/Scripts/python.exe -m pytest app/tests/test_planning_tools.py -v)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/ -v --tb=short)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_pipeline_routing.py::TestAdvanceEndpointValidation::test_422_empty_description -v --tb=long)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_merge_pipeline.py app/tests/test_pipeline_routing.py -v --tb=short)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_e2e_pipeline.py app/tests/test_llm_client_resilience.py app/tests/test_merge_pipeline.py app/tests/test_pip_agent_unit.py app/tests/test_pipeline_routing.py::TestAdvanceEndpointValidation::test_422_empty_description -v --tb=short)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_pip_agent_unit.py -v)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_pip_resolution_unit.py -v)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_pip_workflow.py -v)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_pip_workflow.py app/tests/test_pip_resolution_unit.py app/tests/test_pip_agent_unit.py -v)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_pip_workflow.py::TestRunPipPreflight app/tests/test_pipeline_routing.py::TestSchedulerDispatch::test_planning_task_spawns_thread -v)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_pipeline_routing.py::TestSchedulerDispatch::test_planning_task_spawns_thread -v)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_pip_agent_unit.py app/tests/test_pip_resolution_unit.py app/tests/test_pip_workflow.py -v --tb=short)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/ -v --tb=short -q)",
+      "Bash(venv/Scripts/python.exe app/migrations/runner.py status)"
     ]
   }
 }

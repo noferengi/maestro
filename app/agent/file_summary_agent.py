@@ -216,12 +216,18 @@ def enqueue_file_summary(
     get_file_summary(sha1, filesize).
 
     Raises ValueError if the file cannot be read.
+    Returns ("", "", 0) silently for binary files — they cannot be summarised as text.
     """
     try:
         with open(abs_path, "rb") as fh:
             raw = fh.read()
     except OSError as exc:
         raise ValueError(f"Cannot read '{abs_path}': {exc}") from exc
+
+    # Binary files cannot be summarised as text — skip silently.
+    if b"\x00" in raw[:512]:
+        logger.debug("enqueue_file_summary: skipping binary file '%s'", abs_path)
+        return "", "", 0
 
     sha1, filesize = _sha1_and_size(raw)
     completion_key = f"file_summary:{sha1}:{filesize}"

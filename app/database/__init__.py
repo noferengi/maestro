@@ -82,6 +82,9 @@ from .models import (
     SecurityReviewResult,
     FullReviewResult,
     MergeRecord,
+    PerformanceImprovementPlan,
+    PipVerification,
+    PipResolutionJob,
     ResearchJob,
     FileSummaryJob,
     OptimizationBenchmark,
@@ -115,6 +118,18 @@ from .crud_tasks import (
     count_total_sub_ideas,
     get_descendant_tree,
     task_to_dict,
+    create_pip,
+    get_pips_for_task,
+    satisfy_pips,
+    create_pip_verification,
+    get_latest_pip_verification,
+    get_pip_verification_map,
+    get_pip_verifications_for_pip,
+    pip_status_at_stage,
+    create_pip_resolution_job,
+    get_pending_pip_resolution_jobs,
+    get_active_pip_resolution_jobs_for_task,
+    update_pip_resolution_job,
 )
 
 # Project CRUD
@@ -241,7 +256,9 @@ __all__ = [
     "ComputeNode", "LLM", "Budget", "Project", "Task", "BudgetEntry", "Expense",
     "TransitionVote", "TransitionResult", "SubdivisionRecord",
     "PlanningResult", "ComponentResult", "OptimizationResult",
-    "SecurityReviewResult", "FullReviewResult", "MergeRecord",
+    "SecurityReviewResult", "FullReviewResult", "MergeRecord", "PerformanceImprovementPlan",
+    "PipVerification",
+    "PipResolutionJob",
     "ResearchJob", "FileSummaryJob", "OptimizationBenchmark", "ArchGenJob",
     "FileSummary", "SearchCache", "InboxMessage",
     # crud_tasks
@@ -251,6 +268,11 @@ __all__ = [
     "get_task_history", "append_task_history", "reorder_tasks", "batch_reorder_tasks",
     "set_big_idea_flag", "get_child_tasks", "get_active_child_tasks",
     "count_total_sub_ideas", "get_descendant_tree", "task_to_dict",
+    "create_pip", "get_pips_for_task", "satisfy_pips",
+    "create_pip_verification", "get_latest_pip_verification",
+    "get_pip_verification_map", "get_pip_verifications_for_pip", "pip_status_at_stage",
+    "create_pip_resolution_job", "get_pending_pip_resolution_jobs",
+    "get_active_pip_resolution_jobs_for_task", "update_pip_resolution_job",
     # crud_projects
     "get_all_projects", "get_project", "get_project_path", "upsert_project", "delete_project",
     # crud_infra

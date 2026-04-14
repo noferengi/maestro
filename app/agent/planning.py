@@ -476,20 +476,9 @@ class PlanningPipeline:
             "Output JSON with two keys: selected_index (integer, 0-based) and justification (string).\n\n"
         )
         for orig_idx, design in valid:
-            # Format as readable text — avoid embedding raw JSON braces in the prompt,
-            # which can confuse llama.cpp's Jinja2 chat-template renderer.
-            # Also sanitize LLM-generated text to printable ASCII to prevent
-            # any generated character from triggering a template parse error.
-            rationale_raw = str(design.get("design_rationale", ""))[:300]
-            rationale = "".join(
-                c for c in rationale_raw
-                if (0x20 <= ord(c) <= 0x7E or c == "\n") and c not in "{}"
-            )
+            rationale = str(design.get("design_rationale", ""))[:300]
             files = [f.get("path", "") for f in design.get("file_manifest", [])[:6]]
-            files_str = ", ".join(
-                "".join(c for c in p if 0x20 <= ord(c) <= 0x7E and c not in "{}")
-                for p in files
-            ) if files else "(none)"
+            files_str = ", ".join(files) if files else "(none)"
             judge_prompt += (
                 f"\nDesign {orig_idx}:\n"
                 f"  {rationale}\n"

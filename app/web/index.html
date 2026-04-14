@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kanban Board - TheMaestro</title>
-    <link rel="stylesheet" href="/static/style.css?v=28">
-    <script src="/static/kanban.js?v=48"></script>
+    <link rel="stylesheet" href="/static/style.css?v=30">
+    <script src="/static/kanban.js?v=50"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -707,6 +707,41 @@
             </div>
             <div class="modal-footer">
                 <button class="btn btn-primary" onclick="closeHistoryModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- PIP Detail Modal -->
+    <div class="modal-overlay" id="pip-detail-modal" style="display:none" onclick="if(event.target===this)closePipDetailModal()">
+        <div class="modal" style="width:700px;max-height:85vh;display:flex;flex-direction:column;overflow:hidden">
+            <div class="modal-header">
+                <h2 class="modal-title" id="pip-detail-title">PIP Detail</h2>
+                <button class="close-btn" onclick="closePipDetailModal()">&times;</button>
+            </div>
+            <div class="modal-body" style="overflow-y:auto;flex:1">
+                <p id="pip-detail-meta" style="color:#666;font-size:0.85rem;margin:0 0 1rem"></p>
+                <h4 style="margin:0 0 0.4rem;font-size:0.9rem">Requirements</h4>
+                <ul id="pip-detail-requirements" style="margin:0 0 1.2rem;padding-left:1.5rem;font-size:0.85rem;line-height:1.6"></ul>
+                <h4 style="margin:0 0 0.4rem;font-size:0.9rem">Verification History</h4>
+                <div style="overflow-x:auto">
+                    <table style="width:100%;border-collapse:collapse;font-size:0.82rem">
+                        <thead>
+                            <tr style="background:#f8f9fa">
+                                <th style="text-align:left;padding:5px 8px;border-bottom:2px solid #dee2e6">Stage</th>
+                                <th style="text-align:left;padding:5px 8px;border-bottom:2px solid #dee2e6">Outcome</th>
+                                <th style="text-align:left;padding:5px 8px;border-bottom:2px solid #dee2e6">Summary</th>
+                                <th style="text-align:left;padding:5px 8px;border-bottom:2px solid #dee2e6;white-space:nowrap">When</th>
+                            </tr>
+                        </thead>
+                        <tbody id="pip-detail-history-body"></tbody>
+                    </table>
+                    <p id="pip-detail-history-empty" style="display:none;color:#888;padding:8px 0;font-size:0.85rem">No verifications yet.</p>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="pip-detail-verify-btn" onclick="pipDetailVerify()">🔍 Run Verification</button>
+                <button class="btn btn-secondary" id="pip-detail-resolve-btn" onclick="pipDetailResolve()">🔧 Run Resolution</button>
+                <button class="btn btn-secondary" onclick="closePipDetailModal()">Close</button>
             </div>
         </div>
     </div>

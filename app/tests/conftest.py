@@ -30,6 +30,12 @@ _TEST_DB = _PROJECT_ROOT / "data" / "test.db"
 
 os.environ["MAESTRO_TEST_DB"] = str(_TEST_DB)
 
+# Eagerly import app.database so that SQLAlchemy (a large library) is
+# warmed up here during session setup rather than inside the first test
+# that needs it.  On Windows with AV scanning enabled the cold import can
+# take 30+ seconds, which makes individual tests appear to hang forever.
+import app.database  # noqa: F401
+
 
 # ---------------------------------------------------------------------------
 # Session fixture: apply migrations then wipe all data rows.

@@ -36,7 +36,7 @@ from app.agent.config import (
     SUBDIVISION_CONTEXT_AWARE_TOOLS,
     check_context_saturation,
 )
-from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
+from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError, ContextTooLargeError
 from app.agent.tools import TOOL_SCHEMAS, async_dispatch_tool, LISTING_EXCLUDED_DIRS, set_task_git_cwd
 
 logger = logging.getLogger(__name__)
@@ -186,15 +186,15 @@ When you are ready, output ONLY this JSON object (no markdown fences, no extra t
       "prerequisites": ["sub-0"],
       "estimated_scope": "small" | "medium",
       "rationale": "Why this is a coherent, independent unit of work",
-      "provides": [{{"name": "...", "type": "...", "description": "..."}}],
-      "consumes": [{{"name": "...", "type": "...", "source": "sub-N"}}]
+      "provides": [ { "name": "...", "type": "...", "description": "..." } ],
+      "consumes": [ { "name": "...", "type": "...", "source": "sub-N" } ]
     }}
   ],
   "interface_contracts": [
     {{
       "component": "sub-0 title",
-      "provides": [{{"name": "...", "type": "..."}}],
-      "consumes": [{{"name": "...", "type": "...", "source": "sub-N"}}]
+      "provides": [ { "name": "...", "type": "..." } ],
+      "consumes": [ { "name": "...", "type": "...", "source": "sub-N" } ]
     }}
   ],
   "decomposition_rationale": "Why you chose this particular decomposition strategy",
@@ -336,12 +336,21 @@ class SubdivisionAgent:
             except asyncio.CancelledError:
                 logger.warning("Subdivision agent cancelled (task '%s').", self.parent_task_id)
                 raise
+            except ContextTooLargeError as exc:
+                # Pre-flight check: prompt is already larger than the context window.
+                # This is a normal outcome — do not retry (adding more messages makes it
+                # worse). Break immediately so the task can be handled upstream.
+                logger.error(
+                    "Subdivision agent context too large for task '%s' (turn %d): %s — aborting immediately.",
+                    self.parent_task_id, turn + 1, exc,
+                )
+                break
             except Exception as exc:
                 consecutive_failures += 1
                 exc_type = type(exc).__name__
-                logger.error("Subdivision agent LLM call failed for task '%s' (turn %d) [consecutive=%d]: %s (%s)", 
+                logger.error("Subdivision agent LLM call failed for task '%s' (turn %d) [consecutive=%d]: %s (%s)",
                              self.parent_task_id, turn + 1, consecutive_failures, exc, exc_type)
-                
+
                 if consecutive_failures >= 3:
                     logger.error("Subdivision agent aborting after 3 consecutive LLM failures.")
                     break

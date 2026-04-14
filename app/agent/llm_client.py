@@ -37,6 +37,46 @@ from app.agent.config import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Context-size guard
+# ---------------------------------------------------------------------------
+
+class ContextTooLargeError(Exception):
+    """Raised when the prompt is estimated to exceed the model's context window.
+
+    This is a **normal outcome**, not an infrastructure error.  Callers must
+    treat it as a clean abort signal — do not retry, do not add more messages.
+    The only sensible responses are: break the task into smaller pieces, or
+    report the task as too large to process.
+    """
+    def __init__(self, estimated_tokens: int, max_context: int):
+        self.estimated_tokens = estimated_tokens
+        self.max_context = max_context
+        super().__init__(
+            f"Prompt estimated at {estimated_tokens:,} tokens exceeds context window "
+            f"of {max_context:,} tokens — aborting before sending to LLM."
+        )
+
+
+# Cache max_context by llm_id so we don't hit the DB on every call.
+# LLM configs are static during a server run; no TTL needed.
+_llm_context_cache: dict[int, int] = {}
+
+def _get_llm_max_context(llm_id: int) -> int | None:
+    """Return the max_context for an LLM endpoint (DB-cached)."""
+    if llm_id in _llm_context_cache:
+        return _llm_context_cache[llm_id]
+    try:
+        from app.database import get_llm as _get_llm_rec
+        rec = _get_llm_rec(llm_id)
+        if rec and rec.max_context:
+            _llm_context_cache[llm_id] = rec.max_context
+            return rec.max_context
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Per-endpoint connection backoff
 #
 # ConnectError / ConnectTimeout are infrastructure problems (LLM server not
@@ -63,18 +103,25 @@ logger = logging.getLogger(__name__)
 
 _BACKOFF_FREE_TRIES: int = 10        # attempts logged at WARNING with no delay
 _BACKOFF_BASE_DELAY: float = 3.0     # first backoff duration (seconds)
-_BACKOFF_MAX_DELAY: float = 900.0    # cap: 15 minutes
+_BACKOFF_MAX_DELAY: float = 900.0    # cap for connection errors: 15 minutes
+_BACKOFF_RESPONSE_MAX_DELAY: float = 60.0  # cap for response/timeout errors: 1 minute
 _MIN_DISPATCH_GAP: float = 0.15      # seconds between consecutive dispatches to same endpoint
 _MODEL_LOAD_DELAY: float = 10.0      # seconds to gate subsequent requests after a model switch
 
 
 @dataclass
 class _EndpointState:
-    fail_count: int = 0
-    next_allowed: float = 0.0       # monotonic timestamp; 0 = not in cooldown
+    fail_count_connect: int = 0      # ConnectError / ConnectTimeout (Server DOWN)
+    fail_count_response: int = 0     # ReadTimeout / 5xx / Parse Error (Server OVERLOADED / BAD PROMPT)
+    next_allowed: float = 0.0        # monotonic timestamp; 0 = not in cooldown
     delay: float = field(default=_BACKOFF_BASE_DELAY)
-    next_dispatch_at: float = 0.0   # earliest slot available for next dispatch
+    next_dispatch_at: float = 0.0    # earliest slot available for next dispatch
     last_llm_id: "int | None" = None  # llm_id of the most recently dispatched request
+
+    @property
+    def fail_count(self) -> int:
+        """Total failure count for backward compatibility in logs."""
+        return self.fail_count_connect + self.fail_count_response
 
 
 _endpoint_states: dict[str, _EndpointState] = {}
@@ -96,8 +143,6 @@ _ep_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 
 _endpoint_semaphores: dict[str, threading.Semaphore] = {}
-_llm_capacity_cache: dict[int, int] = {}
-
 
 def _get_or_create_semaphore(base_url: str, llm_id: int) -> threading.Semaphore:
     """Return the concurrency semaphore for *base_url*, creating it if needed."""
@@ -120,6 +165,33 @@ def _get_or_create_semaphore(base_url: str, llm_id: int) -> threading.Semaphore:
             base_url, capacity, llm_id,
         )
         return sem
+
+_llm_capacity_cache: dict[int, int] = {}
+
+def invalidate_llm_cache(llm_id: int | None = None):
+    """Clear the context cache, capacity cache, and semaphores for an LLM (or all)."""
+    with _ep_lock:
+        if llm_id is not None:
+            _llm_context_cache.pop(llm_id, None)
+            _llm_capacity_cache.pop(llm_id, None)
+            # Semaphores are indexed by base_url. Since multiple LLM IDs can share a URL,
+            # and we don't want to hit the DB here to find the URL, we clear all
+            # semaphores. In-flight calls continue using their existing semaphore
+            # objects; new calls will create fresh ones with updated capacity.
+            _endpoint_semaphores.clear()
+        else:
+            _llm_context_cache.clear()
+            _llm_capacity_cache.clear()
+            _endpoint_semaphores.clear()
+
+
+def update_llm_context_cache(llm_id: int, max_context: int | None):
+    """Update or remove an LLM's max_context in the cache directly."""
+    if max_context is None:
+        _llm_context_cache.pop(llm_id, None)
+    else:
+        _llm_context_cache[llm_id] = max_context
+
 
 # ---------------------------------------------------------------------------
 # Graceful shutdown flags
@@ -305,44 +377,15 @@ async def _stream_llm_response(
 def _sanitize_messages(messages: list[dict]) -> list[dict]:
     """Return a copy of *messages* with problematic bytes/sequences removed or escaped.
 
-    llama.cpp's chat-template engine fails with "Failed to parse input at pos N"
-    for two distinct content issues:
-
-    1. **Null bytes** (``\\x00``) — file-read tool results are the most common source;
-       binary or mixed-encoding files can contain null bytes that survive Python's
-       ``errors='replace'`` round-trip, which ``json.dumps`` serialises as ``\\u0000``.
-       Fix: strip them entirely.
-
-    2. **Jinja2 template delimiters** (``{{``, ``}}``, ``{%``, ``{#``) — LLM-generated
-       content (e.g. design rationale containing Python f-string examples, template
-       code, or dict comprehensions) can contain these sequences.  When they appear
-       inside a chat-template variable expansion the Jinja2 parser chokes at the
-       position of the delimiter.  Fix: insert a zero-width space between the two
-       characters so the sequence is no longer a valid Jinja2 token.
-
-    Only ``content`` fields that are plain strings are touched; tool_call objects,
-    lists, and other types are left unchanged.
+    Sanitization is ALWAYS performed to prevent llama.cpp Jinja2 parse errors.
+    - system/user roles: Log a WARNING to help debug prompt/brief issues.
+    - assistant/tool roles: Silent (corrects legacy or "garbage" data).
     """
-    # Jinja2 two-character delimiters that must be broken up.
     _JINJA2_PAIRS = [("{{", "{ {"), ("}}", "} }"), ("{%", "{ %"), ("{#", "{ #")]
-
-    # Non-ASCII Unicode characters that commonly appear in LLM-generated summaries and
-    # can confuse llama.cpp's Jinja2/tokenizer with "Failed to parse input at pos N".
-    # Map to close ASCII equivalents so the semantic meaning is preserved.
     _UNICODE_REPLACEMENTS = [
-        ("\u2014", " -- "),   # em dash  —
-        ("\u2013", " - "),    # en dash  –
-        ("\u2192", " -> "),   # right arrow →
-        ("\u2190", " <- "),   # left arrow ←
-        ("\u2018", "'"),      # left single quote '
-        ("\u2019", "'"),      # right single quote '
-        ("\u201c", '"'),      # left double quote "
-        ("\u201d", '"'),      # right double quote "
-        ("\u2026", "..."),    # ellipsis …
-        ("\u00b7", "."),      # middle dot ·
-        ("\u2022", "-"),      # bullet •
-        ("\u2605", "*"),      # star ★
-        ("\u2192", "->"),     # right arrow (dup guard)
+        ("\u2014", " -- "), ("\u2013", " - "), ("\u2192", " -> "), ("\u2190", " <- "),
+        ("\u2018", "'"), ("\u2019", "'"), ("\u201c", '"'), ("\u201d", '"'),
+        ("\u2026", "..."), ("\u00b7", "."), ("\u2022", "-"), ("\u2605", "*"),
     ]
 
     result = []
@@ -353,29 +396,19 @@ def _sanitize_messages(messages: list[dict]) -> list[dict]:
             continue
 
         role = msg.get("role", "?")
-        tool_call_id = msg.get("tool_call_id", "")
-        id_hint = f" tool_call_id={tool_call_id!r}" if tool_call_id else ""
         changed = False
+        log_warn = role in ("system", "user")
 
         if "\x00" in content:
-            count = content.count("\x00")
-            logger.warning(
-                "Stripping %d null byte(s) from message[%d] (role=%s%s, len=%d) "
-                "before sending to LLM — source likely a binary/mixed-encoding file.",
-                count, i, role, id_hint, len(content),
-            )
+            if log_warn:
+                logger.warning("msg[%d] (%s): Stripping null bytes", i, role)
             content = content.replace("\x00", "")
             changed = True
 
         for raw, safe in _JINJA2_PAIRS:
             if raw in content:
-                count = content.count(raw)
-                logger.warning(
-                    "Escaping %d Jinja2 delimiter(s) %r in message[%d] (role=%s%s, len=%d) "
-                    "before sending to LLM — source likely LLM-generated content with "
-                    "template syntax (f-strings, dict comprehensions, Jinja templates).",
-                    count, raw, i, role, id_hint, len(content),
-                )
+                if log_warn:
+                    logger.warning("msg[%d] (%s): Escaping Jinja2 delimiter %r", i, role, raw)
                 content = content.replace(raw, safe)
                 changed = True
 
@@ -384,22 +417,20 @@ def _sanitize_messages(messages: list[dict]) -> list[dict]:
                 content = content.replace(raw, safe)
                 changed = True
 
-        # Single-brace identifiers like {task_id}, {user_id}, {response.status_code} —
-        # URL path parameters and Python format-string placeholders generated by LLMs
-        # when describing API endpoints or code patterns. llama.cpp's Jinja2 template
-        # renderer attempts to evaluate these as template variables, causing
-        # "Failed to parse input at pos N". Replace { } with [ ] to preserve meaning.
-        # Runs AFTER _JINJA2_PAIRS so {{ }} are already broken up and won't interfere.
         import re as _re
         _SINGLE_BRACE_RE = _re.compile(r'\{([A-Za-z_][\w.]*)\}')
-        _sb_matches = _SINGLE_BRACE_RE.findall(content)
-        if _sb_matches:
-            logger.warning(
-                "Escaping %d single-brace identifier(s) in message[%d] (role=%s%s, len=%d) "
-                "— e.g. %r — replacing {name} with [name] to avoid Jinja2 parse errors.",
-                len(_sb_matches), i, role, id_hint, len(content), _sb_matches[0],
-            )
+        if _SINGLE_BRACE_RE.search(content):
+            if log_warn:
+                logger.warning("msg[%d] (%s): Escaping single-brace identifiers", i, role)
             content = _SINGLE_BRACE_RE.sub(r'[\1]', content)
+            changed = True
+
+        _non_ascii = sum(1 for c in content if ord(c) > 127)
+        if _non_ascii:
+            import unicodedata as _ud
+            if log_warn:
+                logger.warning("msg[%d] (%s): Stripping %d residual non-ASCII chars", i, role, _non_ascii)
+            content = _ud.normalize("NFKD", content).encode("ascii", "ignore").decode("ascii")
             changed = True
 
         if changed:
@@ -416,7 +447,7 @@ def _describe_payload(payload: dict) -> str:
 
     Example output::
 
-        model=Qwen3p5-Omnicoder  messages=5  tools=8
+        model=Qwen3p5-Omnicoder  messages=5  tools=8  total_chars=12400 (~4133 tokens)
           [0] system       312 chars
           [1] user         208 chars
           [2] assistant    (tool_calls=1)
@@ -427,16 +458,31 @@ def _describe_payload(payload: dict) -> str:
     model = payload.get("model", "?")
     messages = payload.get("messages", [])
     tools = payload.get("tools") or []
-    lines.append(f"model={model}  messages={len(messages)}  tools={len(tools)}")
+
+    total_chars = sum(
+        len(m["content"]) if isinstance(m.get("content"), str) else 0
+        for m in messages
+    )
+    if tools:
+        import json as _json
+        total_chars += sum(len(_json.dumps(t)) for t in tools)
+
+    # estimation matching pre-flight (3 chars/token)
+    est_tokens = total_chars // 3
+
+    lines.append(
+        f"model={model}  messages={len(messages)}  tools={len(tools)}  "
+        f"total_chars={total_chars} (~{est_tokens} tokens)"
+    )
 
     for i, msg in enumerate(messages):
         role = msg.get("role", "?")
         content = msg.get("content")
         tool_calls = msg.get("tool_calls") or []
 
-        if content is None and tool_calls:
-            lines.append(f"  [{i}] {role:<12} (tool_calls={len(tool_calls)})")
-        elif isinstance(content, str):
+        tc_str = f" (tool_calls={len(tool_calls)})" if tool_calls else ""
+        
+        if isinstance(content, str):
             flags: list[str] = []
             null_count = content.count("\x00")
             if null_count:
@@ -456,9 +502,9 @@ def _describe_payload(payload: dict) -> str:
             if _sb_count:
                 flags.append(f"SINGLE_BRACES:{_sb_count}")
             flag_str = f"  [{' '.join(flags)}]" if flags else ""
-            lines.append(f"  [{i}] {role:<12} {len(content)} chars{flag_str}")
+            lines.append(f"  [{i}] {role:<12} {len(content):5} chars{tc_str}{flag_str}")
         else:
-            lines.append(f"  [{i}] {role:<12} (content type={type(content).__name__})")
+            lines.append(f"  [{i}] {role:<12} {tc_str or '(no content)'}")
 
     return "\n".join(lines)
 
@@ -557,6 +603,38 @@ async def call_llm(
     # Null bytes in tool-result or file-content messages cause llama.cpp's
     # chat-template engine to fail with "Failed to parse input at pos N".
     messages = _sanitize_messages(messages)
+
+    # ── Pre-flight context size check ────────────────────────────────────────
+    # Estimate the prompt token count from total message character count.
+    # We use 3 chars/token (conservative — overestimates tokens, so we reject
+    # earlier rather than later, which is the safe direction).
+    # Raise *before* any HTTP call so callers can handle it as a clean abort
+    # rather than burning a retry budget on a guaranteed-to-fail request.
+    _resolved_max_context = _get_llm_max_context(llm_id) if llm_id else None
+    if _resolved_max_context:
+        _total_chars = sum(
+            len(m["content"]) if isinstance(m.get("content"), str) else 0
+            for m in messages
+        )
+
+        if tools:
+            import json as _json
+            _total_chars += sum(len(_json.dumps(t)) for t in tools)
+
+        _max_output = (max_tokens or MAX_TOKENS_PER_TURN)
+        _available = _resolved_max_context - _max_output
+        # using 3 chars per token to more accurately reflect code
+        _estimated = _total_chars // 3
+        if _estimated > _available:
+            _agent_label = f"[{agent_name}]" if agent_name else "[Agent]"
+            logger.error(
+                "%s Pre-flight context check failed: estimated %d tokens > available %d "
+                "(max_context=%d minus max_tokens=%d). Refusing to send %d chars to LLM.",
+                _agent_label, _estimated, _available,
+                _resolved_max_context, _max_output, _total_chars,
+            )
+            raise ContextTooLargeError(_estimated, _resolved_max_context)
+    # ────────────────────────────────────────────────────────────────────────
 
     payload: dict[str, Any] = {
         "model": resolved_model,
@@ -704,33 +782,34 @@ async def call_llm(
                             "LLM endpoint %s is back online (was down for %d attempt(s)).",
                             resolved_url, prev.fail_count,
                         )
-            # _retry_wait stays None → break after finally
+            # _retry_wait stays None -> break after finally
 
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             # Infrastructure problem: server not running.  Log at WARNING, not ERROR.
             # Update shared backoff state so all concurrent callers cooperate.
-            _total_retry_count += 1
-            if max_retries is not None and _total_retry_count >= max_retries:
-                raise RuntimeError(
-                    f"LLM endpoint {resolved_url} unreachable after {_total_retry_count} attempt(s)."
-                ) from exc
             with _ep_lock:
                 st = _endpoint_states.setdefault(resolved_url, _EndpointState())
-                st.fail_count += 1
-                if st.fail_count <= _BACKOFF_FREE_TRIES:
+                st.fail_count_connect += 1
+                if st.fail_count_connect <= _BACKOFF_FREE_TRIES:
                     wait = _BACKOFF_BASE_DELAY
                     logger.warning(
                         "%s LLM endpoint %s unreachable (attempt %d/%d), retrying in %.0fs: %s",
-                        _agent_label, resolved_url, st.fail_count, _BACKOFF_FREE_TRIES, wait, exc,
+                        _agent_label, resolved_url, st.fail_count_connect, _BACKOFF_FREE_TRIES, wait, exc,
                     )
                 else:
                     wait = st.delay
                     logger.warning(
                         "%s LLM endpoint %s unreachable (attempt %d), backing off %.0fs.",
-                        _agent_label, resolved_url, st.fail_count, wait,
+                        _agent_label, resolved_url, st.fail_count_connect, wait,
                     )
                     st.next_allowed = time.monotonic() + wait
                     st.delay = min(st.delay * 2.0, _BACKOFF_MAX_DELAY)
+
+            _total_retry_count += 1
+            if max_retries is not None and _total_retry_count >= max_retries:
+                raise RuntimeError(
+                    f"LLM endpoint {resolved_url} unreachable after {_total_retry_count} attempt(s)."
+                ) from exc
             _retry_wait = wait + random.uniform(0, wait * 0.5)
 
         except httpx.HTTPStatusError as exc:
@@ -837,7 +916,7 @@ async def call_llm(
                         f"  Total raw content: {_total_content_chars} chars"
                         f"  |  estimated template span: 0..{_running}"
                         f"  |  threshold: {_threshold}"
-                        f"  |  → {'CONTENT ERROR' if _is_content_error else 'transient contention'}"
+                        f"  |  -> {'CONTENT ERROR' if _is_content_error else 'transient contention'}"
                     )
 
                     # Snippet around the estimated error position
@@ -851,19 +930,19 @@ async def call_llm(
                             f"\n  Error in msg[{_error_msg_idx}]"
                             f" ({_msgs[_error_msg_idx].get('role', '?')})"
                             f" at content offset {_error_msg_offset}"
-                            f" (chars {_snip_start}–{_snip_end} shown):\n"
+                            f" (chars {_snip_start}-{_snip_end} shown):\n"
                             f"  {_snip_ascii}\n"
                             f"  {' ' * _cursor}^"
                         )
                     elif not _is_content_error:
                         _detail_lines.append(
                             f"\n  pos {pos} is beyond all message content"
-                            f" — KV/batch-space position, this is transient contention."
+                            f" - KV/batch-space position, this is transient contention."
                         )
                     else:
                         _detail_lines.append(
                             f"\n  pos {pos} couldn't be mapped to a specific message"
-                            f" — check template overhead estimate."
+                            f" - check template overhead estimate."
                         )
 
                     logger.warning(
@@ -881,7 +960,7 @@ async def call_llm(
                         raise
                     logger.warning(
                         "%s LLM endpoint %s returned %d"
-                        " (parse error at pos >> content — transient batch contention, will retry).\n"
+                        " (parse error at pos >> content - transient batch contention, will retry).\n"
                         "Error: %s\nPayload:\n%s",
                         _agent_label, url, exc.response.status_code, body_text[:300], payload_desc,
                     )
@@ -890,14 +969,14 @@ async def call_llm(
                 # Back off and retry; log at WARNING so it's visible but not alarming.
                 with _ep_lock:
                     st = _endpoint_states.setdefault(resolved_url, _EndpointState())
-                    st.fail_count += 1
-                    if st.fail_count <= _BACKOFF_FREE_TRIES:
+                    st.fail_count_response += 1
+                    if st.fail_count_response <= _BACKOFF_FREE_TRIES:
                         wait = _BACKOFF_BASE_DELAY
                         logger.warning(
                             "%s LLM endpoint %s returned %d (attempt %d/%d), retrying in "
                             "%.0fs.\nPayload:\n%s\nResponse: %s",
                             _agent_label, resolved_url, exc.response.status_code,
-                            st.fail_count, _BACKOFF_FREE_TRIES, wait,
+                            st.fail_count_response, _BACKOFF_FREE_TRIES, wait,
                             payload_desc, body_text[:300],
                         )
                     else:
@@ -905,11 +984,11 @@ async def call_llm(
                         logger.warning(
                             "%s LLM endpoint %s returned %d (attempt %d), backing off "
                             "%.0fs.\nPayload:\n%s\nResponse: %s",
-                            _agent_label, resolved_url, exc.response.status_code, st.fail_count, wait,
+                            _agent_label, resolved_url, exc.response.status_code, st.fail_count_response, wait,
                             payload_desc, body_text[:300],
                         )
                         st.next_allowed = time.monotonic() + wait
-                        st.delay = min(st.delay * 2.0, _BACKOFF_MAX_DELAY)
+                        st.delay = min(st.delay * 2.0, _BACKOFF_RESPONSE_MAX_DELAY)
                 _total_retry_count += 1
                 if max_retries is not None and _total_retry_count >= max_retries:
                     raise RuntimeError(
@@ -930,30 +1009,34 @@ async def call_llm(
             # Server alive but too slow to respond within the timeout window.
             # Treat identically to a 5xx: back off and retry rather than
             # propagating immediately to the job scheduler.
-            # (ConnectError/ConnectTimeout are caught above; ReadTimeout means
-            # the connection was established but the server went silent.)
+            payload_desc = _describe_payload(payload)
+            with _ep_lock:
+                st = _endpoint_states.setdefault(resolved_url, _EndpointState())
+                st.fail_count_response += 1
+                if st.fail_count_response <= _BACKOFF_FREE_TRIES:
+                    wait = _BACKOFF_BASE_DELAY
+                    logger.warning(
+                        "%s LLM endpoint %s timed out (attempt %d/%d), retrying in %.0fs.\n"
+                        "Payload:\n%s",
+                        _agent_label, resolved_url, st.fail_count_response, _BACKOFF_FREE_TRIES, wait,
+                        payload_desc
+                    )
+                else:
+                    wait = st.delay
+                    logger.warning(
+                        "%s LLM endpoint %s timed out (attempt %d), backing off %.0fs.\n"
+                        "Payload:\n%s",
+                        _agent_label, resolved_url, st.fail_count_response, wait,
+                        payload_desc
+                    )
+                    st.next_allowed = time.monotonic() + wait
+                    st.delay = min(st.delay * 2.0, _BACKOFF_RESPONSE_MAX_DELAY)
+
             _total_retry_count += 1
             if max_retries is not None and _total_retry_count >= max_retries:
                 raise RuntimeError(
                     f"LLM endpoint {resolved_url} timed out after {_total_retry_count} attempt(s)."
                 ) from exc
-            with _ep_lock:
-                st = _endpoint_states.setdefault(resolved_url, _EndpointState())
-                st.fail_count += 1
-                if st.fail_count <= _BACKOFF_FREE_TRIES:
-                    wait = _BACKOFF_BASE_DELAY
-                    logger.warning(
-                        "%s LLM endpoint %s timed out (attempt %d/%d), retrying in %.0fs.",
-                        _agent_label, resolved_url, st.fail_count, _BACKOFF_FREE_TRIES, wait,
-                    )
-                else:
-                    wait = st.delay
-                    logger.warning(
-                        "%s LLM endpoint %s timed out (attempt %d), backing off %.0fs.",
-                        _agent_label, resolved_url, st.fail_count, wait,
-                    )
-                    st.next_allowed = time.monotonic() + wait
-                    st.delay = min(st.delay * 2.0, _BACKOFF_MAX_DELAY)
             _retry_wait = wait + random.uniform(0, wait * 0.5)
 
         except Exception as exc:

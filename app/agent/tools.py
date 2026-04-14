@@ -132,6 +132,8 @@ def _serve_file_lines(safe_path: str, start: int, end: int) -> str:
 
     Lines are 1-indexed inclusive.  Clamps to actual file length.
     """
+    if _is_binary_path(safe_path):
+        return f"ERROR: '{safe_path}' is a binary file and cannot be read as text."
     norm = os.path.normpath(os.path.realpath(safe_path))
     try:
         with open(safe_path, "r", encoding="utf-8", errors="replace") as fh:
@@ -347,6 +349,70 @@ def _is_command_blocked(command: str) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
+# Gitignore guard
+# ---------------------------------------------------------------------------
+#
+# list_directory() already labels gitignored entries as [PROTECTED - gitignored]
+# but read_file / read_file_harder / read_file_lines only checked the project-root
+# boundary, not gitignore status.  An LLM that sees the PROTECTED label can still
+# call read_file("data/kanban.db") directly — which is how 20 MB of binary SQLite
+# content ended up in a tool-result message.
+#
+# Fix: refuse any read on a gitignored path, exactly as the directory listing does.
+# Cache the git check-ignore result per-path (stable for a server process lifetime —
+# .gitignore changes don't invalidate, but that's acceptable here).
+
+_gitignore_cache: dict[str, bool] = {}  # abs_path -> is_ignored
+
+
+def _is_gitignored(abs_path: str) -> bool:
+    """Return True if abs_path is git-ignored. Result cached for process lifetime."""
+    if abs_path in _gitignore_cache:
+        return _gitignore_cache[abs_path]
+    try:
+        from app.agent.project_snapshot import _is_git_ignored
+        ignored = bool(_is_git_ignored([abs_path], os.path.dirname(abs_path)))
+    except Exception:
+        ignored = False
+    _gitignore_cache[abs_path] = ignored
+    return ignored
+
+
+# ---------------------------------------------------------------------------
+# Tool result safety guards
+# ---------------------------------------------------------------------------
+
+# Maximum characters allowed in a single tool result.  Anything larger is
+# almost certainly a binary file, a huge directory listing, or a runaway
+# recursive glob — all of which would overflow the LLM's context window.
+_MAX_TOOL_RESULT_CHARS = 200_000
+
+
+def _cap_tool_result(name: str, result: str) -> str:
+    """Truncate oversized tool results to prevent context-window overflow."""
+    if len(result) <= _MAX_TOOL_RESULT_CHARS:
+        return result
+    truncated = result[:_MAX_TOOL_RESULT_CHARS]
+    cut = truncated.rfind("\n")
+    if cut > _MAX_TOOL_RESULT_CHARS // 2:
+        truncated = truncated[:cut]
+    logger.warning(
+        "Tool '%s' returned %d chars — truncating to %d to prevent context overflow.",
+        name, len(result), len(truncated),
+    )
+    return truncated + f"\n\n[TRUNCATED: result was {len(result):,} chars total; only first {len(truncated):,} shown]"
+
+
+def _is_binary_path(abs_path: str) -> bool:
+    """Return True if the file appears to be binary (null bytes in first 512 bytes)."""
+    try:
+        with open(abs_path, "rb") as fh:
+            return b"\x00" in fh.read(512)
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # File tools
 # ---------------------------------------------------------------------------
 
@@ -363,6 +429,18 @@ def read_file(path: str) -> str:
     safe_path = _assert_safe_path(path)
     if not os.path.isfile(safe_path):
         return f"ERROR: '{path}' is not a file or does not exist."
+    if _is_binary_path(safe_path):
+        return (
+            f"ERROR: '{path}' is a binary file (contains null bytes) and cannot be read as text. "
+            "Binary files (databases, compiled bytecode, archives) must be inspected with "
+            "appropriate non-text tools."
+        )
+    if _is_gitignored(safe_path):
+        return (
+            f"ERROR: '{path}' is listed in .gitignore and is not accessible to agents. "
+            "Gitignored files (data files, build artefacts, secrets) are protected — "
+            "they appear as [PROTECTED - gitignored] in directory listings for this reason."
+        )
     norm = os.path.normpath(os.path.realpath(safe_path))
     from app.agent.project_snapshot import _count_file_lines, build_file_summary
     # Subsequent call - serve next unserved source lines
@@ -397,6 +475,8 @@ _SMALL_FILE_HEADER = "== FILE (full content): {path} =="
 
 def _inline_small_file(abs_path: str) -> str:
     """Return raw content for tiny files (≤ 25 lines), with a header."""
+    if _is_binary_path(abs_path):
+        return f"ERROR: '{abs_path}' is a binary file and cannot be inlined as text."
     try:
         with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
             content = fh.read()
@@ -412,6 +492,10 @@ def write_file(path: str, content: str) -> str:
     Auto-stages the file for git tracking after writing.
     """
     safe_path = _assert_safe_path(path)
+    if os.path.exists(safe_path) and _is_binary_path(safe_path):
+        return f"ERROR: '{path}' is a binary file; refusing to overwrite with text content."
+    if _is_gitignored(safe_path):
+        return f"ERROR: '{path}' is listed in .gitignore; refusing to write to a protected path."
     try:
         os.makedirs(os.path.dirname(safe_path), exist_ok=True)
         with open(safe_path, "w", encoding="utf-8") as fh:
@@ -426,6 +510,10 @@ def write_file(path: str, content: str) -> str:
 def append_file(path: str, content: str) -> str:
     """Append content to the end of a file (creates the file if absent)."""
     safe_path = _assert_safe_path(path)
+    if os.path.exists(safe_path) and _is_binary_path(safe_path):
+        return f"ERROR: '{path}' is a binary file; refusing to append text content."
+    if _is_gitignored(safe_path):
+        return f"ERROR: '{path}' is listed in .gitignore; refusing to write to a protected path."
     try:
         os.makedirs(os.path.dirname(safe_path), exist_ok=True)
         with open(safe_path, "a", encoding="utf-8") as fh:
@@ -485,7 +573,7 @@ def list_directory(path: str = ".") -> str:
     entries = sorted(os.listdir(safe_path))
     all_full_paths = [os.path.join(safe_path, e) for e in entries]
     ignored_set = _is_git_ignored(all_full_paths, safe_path)
-
+    
     lines: list[str] = []
     hidden = 0
     for entry, full in zip(entries, all_full_paths):
@@ -562,6 +650,10 @@ def search_files(pattern: str, directory: str = ".") -> str:
         ]
         for fname in files:
             fpath = os.path.join(root, fname)
+            if _is_binary_path(fpath):
+                continue
+            if _is_gitignored(fpath):
+                continue
             try:
                 with open(fpath, "r", encoding="utf-8", errors="ignore") as fh:
                     for lineno, line in enumerate(fh, 1):
@@ -582,6 +674,10 @@ def read_file_lines(path: str, start: int, end: int) -> str:
     safe_path = _assert_safe_path(path)
     if not os.path.isfile(safe_path):
         return f"ERROR: '{path}' is not a file or does not exist."
+    if _is_binary_path(safe_path):
+        return f"ERROR: '{path}' is a binary file and cannot be read as text."
+    if _is_gitignored(safe_path):
+        return f"ERROR: '{path}' is gitignored and not accessible to agents."
     try:
         with open(safe_path, "r", encoding="utf-8", errors="replace") as fh:
             lines = fh.readlines()
@@ -614,6 +710,10 @@ def read_file_harder(
     safe_path = _assert_safe_path(path)
     if not os.path.isfile(safe_path):
         return f"ERROR: '{path}' is not a file or does not exist."
+    if _is_binary_path(safe_path):
+        return f"ERROR: '{path}' is a binary file and cannot be read as text."
+    if _is_gitignored(safe_path):
+        return f"ERROR: '{path}' is gitignored and not accessible to agents."
 
     # Auto-prep: show structural summary first if not yet done
     if not _is_file_prepped(safe_path):
@@ -656,6 +756,10 @@ def count_lines(path: str) -> str:
     safe_path = _assert_safe_path(path)
     if not os.path.isfile(safe_path):
         return f"ERROR: '{path}' is not a file or does not exist."
+    if _is_binary_path(safe_path):
+        return f"ERROR: '{path}' is a binary file; cannot count lines meaningfully."
+    if _is_gitignored(safe_path):
+        return f"ERROR: '{path}' is gitignored and not accessible to agents."
     try:
         byte_size = os.path.getsize(safe_path)
         with open(safe_path, "r", encoding="utf-8", errors="replace") as fh:
@@ -681,6 +785,7 @@ def find_files(glob_pattern: str, directory: str = ".") -> str:
         and not os.path.realpath(m).startswith(_archive_real + os.sep)
         and os.path.realpath(m) != _archive_real
     ]
+    filtered = [m for m in filtered if not _is_gitignored(os.path.realpath(m))]
     if not filtered:
         return "No files found matching the pattern."
     lines = [os.path.relpath(m, safe_dir) for m in sorted(filtered)[:TOOL_MAX_SEARCH_RESULTS]]
@@ -2162,7 +2267,7 @@ def dispatch_tool(name: str, arguments: dict) -> str:
         if not isinstance(result, str):
             import json
             result = json.dumps(result, default=str)
-        return result
+        return _cap_tool_result(name, result)
     except TypeError as exc:
         logger.warning("Tool error [%s]: %s", name, exc)
         return f"ERROR: Bad arguments for tool '{name}': {exc}"
@@ -2194,6 +2299,19 @@ async def async_dispatch_tool(
         safe_path = _assert_safe_path(path)
         if not os.path.isfile(safe_path):
             return f"ERROR: '{path}' is not a file or does not exist."
+        if _is_binary_path(safe_path):
+            return (
+                f"ERROR: '{path}' is a binary file (contains null bytes) and cannot be read as text. "
+                "Binary files (databases, compiled bytecode, archives) must be inspected with "
+                "appropriate non-text tools."
+            )
+        if _is_gitignored(safe_path):
+            return (
+                f"ERROR: '{path}' is in .gitignore and should not have been traversed. "
+                "Files which have been designated to be untracked should not be modified by the system,"
+                "and will be ignored by tools."
+            )
+
         norm_path = os.path.normpath(os.path.realpath(safe_path))
         from app.agent.project_snapshot import _count_file_lines, async_build_file_summary
         # Subsequent call - serve the next unserved 250-line chunk
@@ -2219,13 +2337,14 @@ async def async_dispatch_tool(
             except OSError:
                 pass
             return result
-        return await async_build_file_summary(
+        result = await async_build_file_summary(
             safe_path,
             summary_length="brief",
             task_id=task_id,
             llm_id=llm_id,
             budget_id=budget_id,
         )
+        return _cap_tool_result("read_file", result)
 
     if name in ("write_file", "append_file"):
         # Capture old summary BEFORE the write (file still has old content)

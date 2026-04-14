@@ -69,7 +69,7 @@ from database import (
 )
 
 from app.agent.config import PIPELINE_COLUMN_ORDER, PIPELINE_DONE_STATUSES
-from app.agent.llm_client import ShutdownError
+from app.agent.llm_client import ShutdownError, invalidate_llm_cache
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1429,6 +1429,7 @@ def _store_pipeline_result_generic(task_id: str, result: dict, budget_id: int | 
 def _record_demotion(task_id: str, from_stage: str, to_stage: str, reason: str) -> None:
     """Record a demotion event on a task."""
     from datetime import datetime, timezone
+    from app.agent.pip_agent import generate_pip
     task = get_task(task_id)
     if not task:
         return
@@ -1441,6 +1442,17 @@ def _record_demotion(task_id: str, from_stage: str, to_stage: str, reason: str) 
     })
     update_task(task_id, demotion_count=(task.demotion_count or 0) + 1, demotion_history=history)
 
+    # Trigger PIP generation if demoted from a review stage
+    review_stages = {"conceptual_review", "optimization", "security", "full_review"}
+    if from_stage in review_stages:
+        logger.info("[pip] Triggering PIP generation for task '%s' demoted from '%s'.", task_id, from_stage)
+        # Create a task in the running loop
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(generate_pip(task_id, from_stage, reason))
+        except RuntimeError:
+            # Fallback if no loop is running (shouldn't happen in FastAPI context but for safety)
+            asyncio.run(generate_pip(task_id, from_stage, reason))
 
 # Pipeline handler dispatch table
 ADVANCE_HANDLERS = {
@@ -2638,6 +2650,30 @@ def task_to_dict(task):
     """Convert SQLAlchemy Task model to dictionary"""
     llm_obj = getattr(task, 'llm_ref', None)
     budget_obj = getattr(task, 'budget_ref', None)
+
+    # PIPs — derived status per current pipeline stage
+    pips_data = []
+    try:
+        from app.database import get_pips_for_task, pip_status_at_stage, get_latest_pip_verification
+        for pip in get_pips_for_task(task.id):
+            reqs = json.loads(pip.requirements) if pip.requirements else []
+            latest_v = get_latest_pip_verification(pip.id, task.type)
+            created_str = (
+                pip.created_at.isoformat() if hasattr(pip.created_at, "isoformat")
+                else str(pip.created_at)
+            )
+            pips_data.append({
+                "id": pip.id,
+                "origin_stage": pip.origin_stage,
+                "requirements": reqs,
+                "created_at": created_str,
+                "status": pip_status_at_stage(pip, task.type),
+                "last_summary": latest_v.summary if latest_v else None,
+                "last_checked": latest_v.created_at if latest_v else None,
+            })
+    except Exception:
+        pass
+
     return {
         "id": task.id,
         "title": task.title,
@@ -2665,7 +2701,8 @@ def task_to_dict(task):
         "map_y": getattr(task, "map_y", None),
         "is_active": bool(getattr(task, "is_active", True)),
         "created_at": task.created_at.isoformat() if task.created_at else None,
-        "updated_at": task.updated_at.isoformat() if task.updated_at else None
+        "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+        "pips": pips_data,
     }
 
 
@@ -2883,6 +2920,17 @@ def populate_arch(project_name: str):
     if not missing:
         return {"queued": 0, "categories": [], "message": "All 14 categories already have cards"}
 
+    # Prewarm gate: ensure file summaries exist so arch_gen_agent has context
+    from app.database import get_file_summaries_for_project_root
+    summaries = get_file_summaries_for_project_root(project.path or "")
+    if not summaries:
+        raise HTTPException(
+            status_code=409,
+            detail=f"No file summaries found for project '{project_name}'. "
+                   "Architecture generation requires file summaries for context. "
+                   "Please set a project path and run a prewarm/file-summary pass first."
+        )
+
     # Skip categories that already have an active (pending/running) job
     _db = _SL()
     try:
@@ -2928,6 +2976,50 @@ def populate_arch(project_name: str):
         len(to_queue), project_name, to_queue,
     )
     return {"queued": len(to_queue), "categories": to_queue}
+
+
+@app.get("/api/projects/{project_name}/arch-gen-jobs")
+def get_project_arch_gen_jobs(project_name: str):
+    """Return active jobs and a summary of all arch gen jobs for a project."""
+    if not get_project(project_name):
+        raise HTTPException(status_code=404, detail=f"Project '{project_name}' not found")
+    from app.database import SessionLocal as _SL
+    from app.database.models import ArchGenJob as _AGJ
+    from sqlalchemy import func
+    with _SL() as db:
+        # Get pending/running for the ghost cards
+        active_jobs = (
+            db.query(_AGJ)
+            .filter(_AGJ.project == project_name, _AGJ.status.in_(["pending", "running"]))
+            .order_by(_AGJ.created_at)
+            .all()
+        )
+        
+        # Get counts for the summary
+        counts = (
+            db.query(_AGJ.status, func.count(_AGJ.id))
+            .filter(_AGJ.project == project_name)
+            .group_by(_AGJ.status)
+            .all()
+        )
+        summary = {s: c for s, c in counts}
+        for status in ["pending", "running", "completed", "failed"]:
+            if status not in summary:
+                summary[status] = 0
+
+        return {
+            "jobs": [
+                {
+                    "id": j.id,
+                    "category": j.category,
+                    "status": j.status,
+                    "created_at": j.created_at.isoformat() if j.created_at else None,
+                    "retry_count": j.retry_count,
+                }
+                for j in active_jobs
+            ],
+            "summary": summary
+        }
 
 
 # ============================================
@@ -2979,6 +3071,40 @@ def create_new_llm(data: dict):
     return llm_to_dict(llm)
 
 
+def sync_update_llm_with_cache(llm_id: int, **kwargs):
+    """Update LLM record in DB and propagate cache changes.
+
+    - max_context change  → updates context-window cache in-place (no semaphore impact).
+    - parallel_sessions change → clears capacity cache AND all endpoint semaphores so
+      the next incoming request rebuilds the semaphore with the new slot count.
+      In-flight callers hold a reference to the old semaphore object and release it
+      normally when done; new callers get the fresh semaphore.  This is safe because
+      threading.Semaphore cannot be resized in-place, but replacing it in the registry
+      is atomic under _ep_lock.
+    """
+    from app.agent.llm_client import update_llm_context_cache, invalidate_llm_cache
+    result = update_llm(llm_id, **kwargs)
+    if result is None:
+        return result
+    if 'parallel_sessions' in kwargs:
+        # Capacity changed: blow away the stale semaphore so it rebuilds with new count.
+        invalidate_llm_cache(llm_id)
+        # Re-seed context cache if max_context was also updated in the same request.
+        if 'max_context' in kwargs:
+            update_llm_context_cache(llm_id, kwargs['max_context'])
+    elif 'max_context' in kwargs:
+        update_llm_context_cache(llm_id, kwargs['max_context'])
+    return result
+
+
+def sync_delete_llm_with_cache(llm_id: int):
+    """Delete LLM record from DB and clear all caches for this LLM ID."""
+    from app.agent.llm_client import invalidate_llm_cache
+    result = delete_llm(llm_id)
+    invalidate_llm_cache(llm_id)
+    return result
+
+
 @app.put("/api/llms/{llm_id}", response_model=dict)
 def update_existing_llm(llm_id: int, data: dict):
     allowed = ['address', 'port', 'model', 'settings', 'parallel_sessions', 'max_context', 'notes',
@@ -2989,7 +3115,8 @@ def update_existing_llm(llm_id: int, data: dict):
     if 'compute_node_id' in updates:
         raw = updates['compute_node_id']
         updates['compute_node_id'] = int(raw) if raw else None
-    llm = update_llm(llm_id, **updates)
+    llm = sync_update_llm_with_cache(llm_id, **updates)
+
     if not llm:
         raise HTTPException(status_code=404, detail="LLM not found")
     return llm_to_dict(llm)
@@ -2997,7 +3124,7 @@ def update_existing_llm(llm_id: int, data: dict):
 
 @app.delete("/api/llms/{llm_id}", response_model=bool)
 def delete_llm_endpoint(llm_id: int):
-    if not delete_llm(llm_id):
+    if not sync_delete_llm_with_cache(llm_id):
         raise HTTPException(status_code=404, detail="LLM not found")
     return True
 
@@ -3673,6 +3800,132 @@ def run_full_review_on_demand(task_id: str):
         raise HTTPException(status_code=400, detail="Task needs an LLM endpoint and budget assigned.")
     _start_bg(_run_full_review_bg, task_id)
     return {"task_id": task_id, "status": "STARTED", "pipeline": "full_review"}
+
+
+# ===========================================================================
+# PIP (Performance Improvement Plan) endpoints
+# ===========================================================================
+
+@app.get("/api/tasks/{task_id}/pips", response_model=List[dict])
+def get_task_pips(task_id: str):
+    """Return all PIPs for a task with full verification history per PIP."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    from app.database import get_pips_for_task, get_pip_verifications_for_pip, pip_status_at_stage
+    result = []
+    for pip in get_pips_for_task(task_id):
+        reqs = json.loads(pip.requirements) if pip.requirements else []
+        verifications = get_pip_verifications_for_pip(pip.id)
+        created_str = (
+            pip.created_at.isoformat() if hasattr(pip.created_at, "isoformat")
+            else str(pip.created_at)
+        )
+        result.append({
+            "id": pip.id,
+            "origin_stage": pip.origin_stage,
+            "requirements": reqs,
+            "created_at": created_str,
+            "status": pip_status_at_stage(pip, task.type),
+            "verifications": [
+                {
+                    "id": v.id,
+                    "checked_at_stage": v.checked_at_stage,
+                    "outcome": v.outcome,
+                    "summary": v.summary,
+                    "findings": json.loads(v.findings) if v.findings else [],
+                    "created_at": v.created_at,
+                }
+                for v in verifications
+            ],
+        })
+    return result
+
+
+@app.get("/api/tasks/{task_id}/pips/{pip_id}/verifications", response_model=List[dict])
+def get_pip_verifications(task_id: str, pip_id: int):
+    """Return verification history for one PIP across all stages."""
+    if not get_task(task_id):
+        raise HTTPException(status_code=404, detail="Task not found")
+    from app.database import get_pip_verifications_for_pip
+    return [
+        {
+            "id": v.id,
+            "checked_at_stage": v.checked_at_stage,
+            "outcome": v.outcome,
+            "summary": v.summary,
+            "findings": json.loads(v.findings) if v.findings else [],
+            "created_at": v.created_at,
+        }
+        for v in get_pip_verifications_for_pip(pip_id)
+    ]
+
+
+@app.post("/api/tasks/{task_id}/pips/{pip_id}/verify", response_model=dict)
+def run_pip_verify(task_id: str, pip_id: int, body: dict = Body(default={})):
+    """Manually trigger pre-flight for one PIP at the task's current stage.
+
+    Runs synchronously and returns {outcome, summary, findings}.
+    Also persists a pip_verification row.
+    """
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    from app.database import get_pips_for_task, create_pip_verification, get_project_path
+    from app.agent.pip_agent import _check_single_pip
+    from app.agent.project_snapshot import build_project_snapshot
+
+    pips = get_pips_for_task(task_id)
+    pip = next((p for p in pips if p.id == pip_id), None)
+    if not pip:
+        raise HTTPException(status_code=404, detail="PIP not found for this task")
+
+    llm_id = body.get("llm_id") or task.llm_id
+    budget_id = body.get("budget_id") or task.budget_id
+    if not llm_id or not budget_id:
+        raise HTTPException(status_code=400, detail="Task has no LLM or budget configured")
+
+    project_path = get_project_path(task.project) if task.project else None
+    try:
+        snapshot = build_project_snapshot(project_path) if project_path else ""
+    except Exception:
+        snapshot = ""
+
+    _loop = asyncio.new_event_loop()
+    try:
+        result = _loop.run_until_complete(
+            _check_single_pip(pip, task, task.type, snapshot, llm_id, budget_id, project_path)
+        )
+    finally:
+        _loop.close()
+
+    create_pip_verification(
+        pip_id=pip_id,
+        task_id=task_id,
+        stage=task.type,
+        outcome=result["outcome"],
+        summary=result["summary"],
+        findings=json.dumps(result["findings"]),
+    )
+    return result
+
+
+@app.post("/api/tasks/{task_id}/run-pip-resolution/{pip_id}", status_code=202)
+def trigger_pip_resolution(task_id: str, pip_id: int, body: dict = Body(default={})):
+    """Queue a PIP Resolution Agent for one PIP. Returns 202 Accepted.
+
+    Creates (or returns existing) pip_resolution_job row; the scheduler
+    dispatches the research + resolution agent on the next tick.
+    """
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    from app.database import get_pips_for_task, create_pip_resolution_job
+    pips = get_pips_for_task(task_id)
+    if not any(p.id == pip_id for p in pips):
+        raise HTTPException(status_code=404, detail="PIP not found for this task")
+    job = create_pip_resolution_job(task_id, pip_id, task.type)
+    return {"status": "accepted", "job_id": job.id if job else None}
 
 
 @app.post("/api/tasks/{task_id}/merge", response_model=dict)

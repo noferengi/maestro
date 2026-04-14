@@ -8,6 +8,23 @@ import json
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _restore_database_module():
+    """Reload app.database after each test to undo any importlib.reload() side-effects.
+
+    Tests in this file redirect app.database to a tmp_path DB via
+    monkeypatch.setenv + importlib.reload.  When monkeypatch teardown runs
+    (before this fixture teardown, because LIFO), it restores MAESTRO_TEST_DB
+    to the session test.db path.  We then reload the module so that
+    app.database.SessionLocal points at test.db again — preventing DB-path
+    pollution for every test file that runs afterwards.
+    """
+    yield
+    import importlib
+    import app.database as db_mod
+    importlib.reload(db_mod)
+
+
 # ---------------------------------------------------------------------------
 # OptimizationBenchmark CRUD
 # ---------------------------------------------------------------------------

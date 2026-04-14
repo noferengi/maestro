@@ -122,11 +122,8 @@ def _resolve_git_root(path: str) -> str | None:
     """
     Return the absolute, normalised git repository root that contains *path*,
     or None if *path* is not inside any git repository.
-
-    Uses ``git rev-parse --show-toplevel`` so it handles submodules, worktrees,
-    and symbolic links correctly - no string-manipulation guessing.
     """
-    import subprocess as _sp  # local import - config.py has no subprocess dep yet
+    import subprocess as _sp
     try:
         result = _sp.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -143,12 +140,10 @@ def _resolve_git_root(path: str) -> str | None:
     return None
 
 
-# The git root of TheMaestro's own source tree.  Any agent git operation
-# whose working directory resolves to this repo is unconditionally blocked.
 MAESTRO_GIT_ROOT: str | None = _resolve_git_root(PROJECT_ROOT)
 
 # ===========================================================================
-# Agent status values (canonical - not user-tuneable)
+# Agent status values
 # ===========================================================================
 
 STATUS_PENDING: str = "PENDING"
@@ -219,42 +214,20 @@ MAX_CONTEXT_SIZE: int = _getint("capacity", "max_context_size", None, 2 * 1024 *
 CONTEXT_WARNING_ENABLED: bool = _getbool("context_warnings", "enabled", None, True)
 
 def _build_context_thresholds() -> list[tuple[float, str]]:
-    """Build the thresholds list from INI entries."""
     _defaults = [
-        (0.50, "warn_at_50", (
-            "[SYSTEM WARNING] You have used approximately 50% of your available "
-            "context window.  Begin planning to conclude your current line of work "
-            "within the remaining capacity."
-        )),
-        (0.75, "warn_at_75", (
-            "[SYSTEM WARNING] You have used approximately 75% of your available "
-            "context window.  Prioritise completing your current task.  Avoid "
-            "starting new exploratory work.  Wrap up tool calls and summarise "
-            "findings."
-        )),
-        (0.90, "warn_at_90", (
-            "[SYSTEM CRITICAL] You have used approximately 90% of your available "
-            "context window.  Immediately produce your final output in the required "
-            "format.  Do not make additional tool calls unless absolutely necessary. "
-            "Your generation will be terminated shortly."
-        )),
+        (0.50, "warn_at_50", "[SYSTEM WARNING] Used 50% context."),
+        (0.75, "warn_at_75", "[SYSTEM WARNING] Used 75% context."),
+        (0.90, "warn_at_90", "[SYSTEM CRITICAL] Used 90% context."),
     ]
     thresholds: list[tuple[float, str]] = []
     for pct, prefix, default_msg in _defaults:
-        enabled = _getbool("context_warnings", f"{prefix}_enabled", None, True)
-        if not enabled:
-            continue
-        msg = _get("context_warnings", f"{prefix}_message", None, default_msg)
-        if msg:
+        if _getbool("context_warnings", f"{prefix}_enabled", None, True):
+            msg = _get("context_warnings", f"{prefix}_message", None, default_msg)
             thresholds.append((pct, msg))
     return thresholds
 
 CONTEXT_WARNING_THRESHOLDS: list[tuple[float, str]] = _build_context_thresholds()
-
-CONTEXT_TERMINATE_THRESHOLD: float = _getfloat(
-    "context_warnings", "terminate_threshold", None, 0.95
-)
-
+CONTEXT_TERMINATE_THRESHOLD: float = _getfloat("context_warnings", "terminate_threshold", None, 0.95)
 
 def check_context_saturation(
     prompt_tokens: int,
@@ -264,67 +237,25 @@ def check_context_saturation(
     *,
     terminate_threshold: float | None = None,
 ) -> bool:
-    """
-    Check per-call context saturation, inject nudge messages, and signal hard termination.
-
-    Args:
-        prompt_tokens:       prompt_tokens from the current LLM response (= full context size)
-        max_context:         LLM max_context in tokens (0 → disabled)
-        warned_set:          mutable set[float]; tracks which thresholds have fired this life/session
-        messages:            conversation list to append nudge messages to
-        terminate_threshold: if saturation >= this, return True (caller should break/terminate).
-                             Defaults to CONTEXT_TERMINATE_THRESHOLD when None.
-
-    Returns True if the caller should terminate immediately.
-    """
     if not CONTEXT_WARNING_ENABLED or max_context <= 0 or prompt_tokens <= 0:
         return False
-
     if terminate_threshold is None:
         terminate_threshold = CONTEXT_TERMINATE_THRESHOLD
-
     saturation = prompt_tokens / max_context
-
-    # Hard terminate check - evaluated before nudge injection
     if terminate_threshold > 0 and saturation >= terminate_threshold:
         return True
-
-    # Nudge threshold injection - fire each level at most once per life/session
     for threshold_pct, threshold_msg in CONTEXT_WARNING_THRESHOLDS:
         if saturation >= threshold_pct and threshold_pct not in warned_set:
             warned_set.add(threshold_pct)
             messages.append({"role": "user", "content": threshold_msg})
-            break  # inject at most one nudge per turn
-
+            break
     return False
-
-
-# ===========================================================================
-# Scheduler
-# ===========================================================================
-
-SCHEDULER_TICK_INTERVAL: float = _getfloat("scheduler", "tick_interval", None, 5.0)
-SCHEDULER_ENABLED: bool = _getbool("scheduler", "enabled", None, True)
-SCHEDULER_DISPATCHABLE_TYPES: list[str] = _getlist(
-    "scheduler", "dispatchable_types",
-    "idea, planning, indev, conceptual_review, optimization, full_review"
-)
-# How long to wait for a file_summary job to complete before falling back to
-# structural-only output.  Covers queue wait + total generation time across all
-# chunks.  300s (5 minutes) is a reasonable middle ground.
-FILE_SUMMARY_WAIT_TIMEOUT: float = _getfloat("scheduler", "file_summary_wait_timeout", None, 300.0)
-
-# Maximum silence (seconds) between consecutive SSE tokens before treating the
-# LLM as stuck and aborting the current file-summary call with ReadTimeout.
-# Only measures active generation - queue wait and backoff sleeps do not count.
-FILE_SUMMARY_STREAM_IDLE_TIMEOUT: float = _getfloat("scheduler", "file_summary_stream_idle_timeout", None, 30.0)
 
 # ===========================================================================
 # Verdict confidence ranges
 # ===========================================================================
 
 def _build_verdict_ranges() -> dict[str, tuple[int, int]]:
-    """Parse verdict ranges from INI or use defaults."""
     _defaults = {
         "rejected":       (0, 50),
         "not_suitable":   (51, 60),
@@ -350,18 +281,12 @@ PLANNING_MAX_FILES: int = _getint("planning", "max_files", None, 8)
 PLANNING_MAX_STEPS: int = _getint("planning", "max_steps", None, 6)
 PLANNING_MAX_CONSECUTIVE_FAILURES: int = _getint("planning", "max_consecutive_failures", None, 3)
 PLANNING_TEMPERATURE_SPREAD: list[float] = [
-    float(x.strip())
-    for x in _get("planning", "temperature_spread", None, "0.3, 0.4, 0.5, 0.6, 0.7").split(",")
-    if x.strip()
+    float(x.strip()) for x in _get("planning", "temperature_spread", None, "0.3, 0.4, 0.5, 0.6, 0.7").split(",") if x.strip()
 ]
 PLANNING_JUDGE_TEMPERATURE: float = _getfloat("planning", "judge_temperature", None, 0.1)
 PLANNING_MAX_DESIGN_RETRIES: int = _getint("planning", "max_design_retries", None, 3)
 PLANNING_SURVEY_MAX_TURNS: int = _getint("planning", "survey_max_turns", None, 50)
 PLANNING_LLM_TEMPERATURE: float = _getfloat("planning", "llm_temperature", None, 0.2)
-
-# ===========================================================================
-# Planning gate
-# ===========================================================================
 
 PLANNING_GATE_FEASIBILITY_RECHECK: bool = _getbool("planning_gate", "feasibility_recheck_enabled", None, True)
 PLANNING_GATE_CONTEXT_SAFETY_MARGIN: float = _getfloat("planning_gate", "context_safety_margin", None, 0.15)
@@ -375,9 +300,7 @@ INDEV_COMPONENT_MAX_RETRIES: int = _getint("indev", "component_max_retries", Non
 INDEV_LLM_TEMPERATURE: float = _getfloat("indev", "llm_temperature", None, 0.2)
 INDEV_ENFORCE_FILE_CONTAINMENT: bool = _getbool("indev", "enforce_file_containment", None, True)
 
-# [indev]
-INDEV_AGENT_TOOLS: list[str] = _getlist(
-    "indev", "agent_tools",
+INDEV_AGENT_TOOLS: list[str] = _getlist("indev", "agent_tools",
     "read_file, read_file_harder, count_lines, write_file, append_file, list_directory, "
     "search_files, find_files, archive_file, "
     "git_status, git_diff, git_log, git_blame, git_show, "
@@ -396,9 +319,7 @@ CONCEPTUAL_REVIEW_LLM_TEMPERATURE: float = _getfloat("conceptual_review", "llm_t
 CONCEPTUAL_REVIEW_HIGH_SEVERITY_BLOCKS: bool = _getbool("conceptual_review", "high_severity_blocks_advance", None, True)
 CONCEPTUAL_REVIEW_RESEARCH_LIVES: int = _getint("conceptual_review", "research_agent_max_lives", None, 3)
 
-# [conceptual_review]
-CONCEPTUAL_REVIEW_REVIEWER_TOOLS: list[str] = _getlist(
-    "conceptual_review", "reviewer_tools",
+CONCEPTUAL_REVIEW_REVIEWER_TOOLS: list[str] = _getlist("conceptual_review", "reviewer_tools",
     "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks"
 )
@@ -415,27 +336,20 @@ OPTIMIZATION_JUDGE_TEMPERATURE: float = _getfloat("optimization", "judge_tempera
 OPTIMIZATION_IMPL_TEMPERATURE: float = _getfloat("optimization", "implementation_temperature", None, 0.2)
 OPTIMIZATION_MIN_IMPROVEMENT_PCT: float = _getfloat("optimization", "min_improvement_pct", None, 2.0)
 OPTIMIZATION_MAX_REGRESSION_PCT: float = _getfloat("optimization", "max_regression_pct", None, 5.0)
-
-# [optimization]
 OPTIMIZATION_MAX_REVIEWER_TURNS: int = _getint("optimization", "reviewer_max_turns", None, 50)
-OPTIMIZATION_REVIEWER_TOOLS: list[str] = _getlist(
-    "optimization", "reviewer_tools",
+
+OPTIMIZATION_REVIEWER_TOOLS: list[str] = _getlist("optimization", "reviewer_tools",
     "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks"
 )
 
-# [optimization_weights]
-# Resource weights - higher value = more precious = improvements here count more
 OPTIMIZATION_COMPUTE_WEIGHT: float = _getfloat("optimization_weights", "compute_weight", None, 1.0)
 OPTIMIZATION_MEMORY_WEIGHT: float = _getfloat("optimization_weights", "memory_weight", None, 0.6)
 OPTIMIZATION_STORAGE_WEIGHT: float = _getfloat("optimization_weights", "storage_weight", None, 0.3)
-
-# Qualitative gates
 OPTIMIZATION_READABILITY_PENALTY_MAX: float = _getfloat("optimization_weights", "readability_penalty_max", None, 0.5)
 OPTIMIZATION_PREMATURE_MULTIPLIER: float = _getfloat("optimization_weights", "premature_multiplier", None, 2.0)
 OPTIMIZATION_TECH_DEBT_BONUS_PCT: float = _getfloat("optimization_weights", "tech_debt_bonus_pct", None, 1.0)
 
-# Big O ranking - lower rank = better complexity class
 BIG_O_RANKING: dict[str, int] = {
     "O(1)": 1, "O(log n)": 2, "O(n)": 3, "O(n log n)": 4,
     "O(n^2)": 5, "O(n^3)": 6, "O(2^n)": 7, "O(n!)": 8,
@@ -449,11 +363,9 @@ OPTIMIZATION_BIG_O_BONUS_PCT: float = _getfloat("optimization_weights", "big_o_b
 SECURITY_REVIEW_LLM_TEMPERATURE: float = _getfloat("security_review", "llm_temperature", None, 0.1)
 SECURITY_REVIEW_VETO_POWER: bool = _getbool("security_review", "veto_power", None, True)
 SECURITY_REVIEW_RESEARCH_LIVES: int = _getint("security_review", "research_agent_max_lives", None, 2)
-
-# [security_review]
 SECURITY_REVIEW_MAX_REVIEWER_TURNS: int = _getint("security_review", "reviewer_max_turns", None, 50)
-SECURITY_REVIEWER_TOOLS: list[str] = _getlist(
-    "security_review", "reviewer_tools",
+
+SECURITY_REVIEWER_TOOLS: list[str] = _getlist("security_review", "reviewer_tools",
     "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks, run_shell_security"
 )
@@ -464,33 +376,28 @@ SECURITY_REVIEWER_TOOLS: list[str] = _getlist(
 
 FULL_REVIEW_LLM_TEMPERATURE: float = _getfloat("full_review", "llm_temperature", None, 0.1)
 FULL_REVIEW_AUTO_UX: bool = _getbool("full_review", "auto_ux_review", None, True)
-FULL_REVIEW_FRONTEND_PATTERNS: list[str] = _getlist("full_review", "frontend_patterns",
-    "app/web/*.html, app/web/*.js, app/web/*.css"
-)
+FULL_REVIEW_FRONTEND_PATTERNS: list[str] = _getlist("full_review", "frontend_patterns", "app/web/*.html, app/web/*.js, app/web/*.css")
 FULL_REVIEW_RESEARCH_LIVES: int = _getint("full_review", "research_agent_max_lives", None, 2)
-
-# [full_review]
 FULL_REVIEW_MAX_REVIEWER_TURNS: int = _getint("full_review", "reviewer_max_turns", None, 50)
-FULL_REVIEW_CODE_QUALITY_TOOLS: list[str] = _getlist(
-    "full_review", "code_quality_reviewer_tools",
+
+FULL_REVIEW_CODE_QUALITY_TOOLS: list[str] = _getlist("full_review", "code_quality_reviewer_tools",
     "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks, run_shell_review"
 )
-FULL_REVIEW_FUNCTIONAL_TOOLS: list[str] = _getlist(
-    "full_review", "functional_reviewer_tools",
+FULL_REVIEW_FUNCTIONAL_TOOLS: list[str] = _getlist("full_review", "functional_reviewer_tools",
     "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks"
 )
 
 # ===========================================================================
-# Merge
+# Merge pipeline (COMPLETED stage — deterministic git merge to main)
 # ===========================================================================
 
-MERGE_TEST_TIMEOUT: int = _getint("merge", "test_timeout", None, 300)
-MERGE_AUTO_PUSH: bool = _getbool("merge", "auto_push", None, True)
-MERGE_TAG_BRANCHES: bool = _getbool("merge", "tag_merged_branches", None, True)
-MERGE_DELETE_BRANCHES: bool = _getbool("merge", "delete_merged_branches", None, False)
-MERGE_PUSH_RETRIES: int = _getint("merge", "push_retries", None, 3)
+MERGE_TEST_TIMEOUT: int  = _getint("merge", "test_timeout",        "MAESTRO_MERGE_TEST_TIMEOUT", 300)
+MERGE_AUTO_PUSH: bool    = _getbool("merge", "auto_push",          "MAESTRO_MERGE_AUTO_PUSH",    True)
+MERGE_TAG_BRANCHES: bool = _getbool("merge", "tag_merged_branches", None,                        True)
+MERGE_DELETE_BRANCHES: bool = _getbool("merge", "delete_merged_branches", None,                  False)
+MERGE_PUSH_RETRIES: int  = _getint("merge", "push_retries",        None,                         3)
 
 # ===========================================================================
 # Pipeline stage order and completion detection
@@ -525,17 +432,11 @@ GIT_TIMEOUT_SECONDS: int = _getint("tools", "git_timeout_seconds", None, 30)
 SNAPSHOT_MAX_DEPTH: int = _getint("snapshot", "max_depth", None, 4)
 SNAPSHOT_MAX_TOKENS: int = _getint("snapshot", "max_tokens", None, 12000)
 SNAPSHOT_CACHE_TTL: int = _getint("snapshot", "cache_ttl_seconds", None, 300)
-
-# Fraction of the LLM's context window to allocate to the project structure snapshot.
-# When the calling agent knows the LLM's max_context, it passes
-# max_tokens = int(max_context * SNAPSHOT_CONTEXT_RATIO) to build_snapshot_with_summaries.
-# This keeps the snapshot budget proportional across small and very large context windows.
 SNAPSHOT_CONTEXT_RATIO: float = _getfloat("snapshot", "context_ratio", None, 0.12)
 
 TOOL_LISTING_EXCLUDED_DIRS: set[str] = set(_getlist(
     "tools", "excluded_directories",
-    ".archive, .git, venv, .venv, __pycache__, node_modules, "
-    ".mypy_cache, .pytest_cache, .ruff_cache, dist, build, .eggs",
+    ".archive, .git, venv, .venv, __pycache__, node_modules, .mypy_cache, .pytest_cache, .ruff_cache, dist, build, .eggs",
 ))
 
 # ===========================================================================
@@ -546,3 +447,22 @@ LOG_LEVEL: str = _get("logging", "level", "MAESTRO_LOG_LEVEL", "INFO")
 LOG_FILE: str = _get("logging", "log_file", "MAESTRO_LOG_FILE", "")
 LOG_MAX_BYTES: int = _getint("logging", "max_bytes", None, 10 * 1024 * 1024)
 LOG_BACKUP_COUNT: int = _getint("logging", "backup_count", None, 5)
+
+# ===========================================================================
+# Scheduler
+# ===========================================================================
+
+SCHEDULER_TICK_INTERVAL: float = _getfloat("scheduler", "tick_interval", None, 5.0)
+SCHEDULER_ENABLED: bool = _getbool("scheduler", "enabled", None, True)
+SCHEDULER_DISPATCHABLE_TYPES: list[str] = _getlist(
+    "scheduler", "dispatchable_types",
+    "idea, planning, indev, conceptual_review, optimization, security, full_review"
+)
+FILE_SUMMARY_WAIT_TIMEOUT: float = _getfloat("scheduler", "file_summary_wait_timeout", None, 300.0)
+FILE_SUMMARY_STREAM_IDLE_TIMEOUT: float = _getfloat("scheduler", "file_summary_stream_idle_timeout", None, 30.0)
+
+# ===========================================================================
+# PIP (Performance Improvement Plan) settings
+# ===========================================================================
+
+PIP_RESOLUTION_MAX_TURNS: int = _getint("pip", "resolution_max_turns", None, 20)

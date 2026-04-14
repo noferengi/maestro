@@ -42,9 +42,16 @@ def _snapshot_cache_ttl() -> int:
 # Caching
 # ---------------------------------------------------------------------------
 
-# (project_root, effective_max_tokens) -> (timestamp, snapshot_str)
+# ("basic"|"summaries", project_root, effective_max_tokens) -> (timestamp, snapshot_str)
 # The max_tokens dimension lets agents with different context windows cache independently.
-_snapshot_cache: dict[tuple[str, int], tuple[float, str]] = {}
+_snapshot_cache: dict[tuple[str, str, int], tuple[float, str]] = {}
+
+# BUG: TODO: we use this _file_summary_cache inconsistently, sometimes with 3 params, sometimes 4!
+
+# (abs_path, mtime, size) OR ("llm", abs_path, mtime, size) -> summary_str
+# Structural summaries use a 3-tuple; LLM-enriched session summaries use a "llm" prefix.
+# _file_summary_cache: dict[tuple[Any, ...], str] = {}
+# DO NOT DO IT THIS WAY, FIX THE INCONSISTENCIES! /TODO
 
 # (abs_path, mtime, size) -> summary_str
 _file_summary_cache: dict[tuple[str, float, int], str] = {}
@@ -186,8 +193,20 @@ def build_architecture_context(
 # Project snapshot
 # ---------------------------------------------------------------------------
 
+def _is_binary_file(path: str) -> bool:
+    """Return True if the file appears to be binary (null bytes in first 512 bytes)."""
+    try:
+        with open(path, "rb") as fh:
+            return b"\x00" in fh.read(512)
+    except OSError:
+        return False
+
+
 def _count_file_lines(path: str) -> int:
-    """Count lines in a file without reading entire content into memory."""
+    """Count lines in a file without reading entire content into memory.
+
+    Returns 0 for binary files (callers should call _is_binary_file first).
+    """
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             return sum(1 for _ in fh)
@@ -220,6 +239,89 @@ def _format_size(size_bytes: int) -> str:
         return f"{size_bytes / (1024 * 1024):.1f}MB"
 
 
+def _build_snapshot_lines(
+    project_root: str,
+    max_depth: int,
+    file_formatter,
+) -> list[str]:
+    """Walk project_root and return annotated tree lines.
+
+    Shared by build_project_snapshot and build_snapshot_with_summaries so
+    gitignore filtering, .archive/.git exclusion, and hidden-entry suppression
+    are applied identically in both callers.
+
+    file_formatter(prefix, fname, abs_path) -> str
+        Called for each non-ignored file.  Return None to skip the line.
+    """
+    excluded = TOOL_LISTING_EXCLUDED_DIRS
+    lines: list[str] = ["== PROJECT STRUCTURE =="]
+
+    root_real = os.path.realpath(project_root)
+    _archive_real = os.path.realpath(os.path.join(root_real, ".archive"))
+    git_dir = os.path.join(root_real, ".git")
+
+    def _walk(dir_path: str, prefix: str, depth: int) -> None:
+        if depth > max_depth:
+            return
+
+        try:
+            entries = sorted(os.listdir(dir_path))
+        except OSError:
+            return
+
+        candidate_dirs: list[str] = []
+        candidate_files: list[str] = []
+        for entry in entries:
+            if entry.startswith(".") and entry not in (".env.example",):
+                continue
+            full = os.path.join(dir_path, entry)
+            full_real = os.path.realpath(full)
+            if os.path.isdir(full):
+                if entry not in excluded and full_real not in (_archive_real, git_dir):
+                    candidate_dirs.append(entry)
+            elif os.path.isfile(full):
+                candidate_files.append(entry)
+
+        # Batch gitignore check for all candidates at this level.
+        abs_dirs  = [os.path.join(dir_path, d) for d in candidate_dirs]
+        abs_files = [os.path.join(dir_path, f) for f in candidate_files]
+        ignored   = _is_git_ignored(abs_dirs + abs_files, root_real)
+
+        dirs  = [d for d, p in zip(candidate_dirs,  abs_dirs)  if p not in ignored]
+        files = [f for f, p in zip(candidate_files, abs_files) if p not in ignored]
+
+        for fname in files:
+            abs_path = os.path.join(dir_path, fname)
+            line = file_formatter(prefix, fname, abs_path)
+            if line is not None:
+                lines.append(line)
+
+        for dname in dirs:
+            lines.append(f"{prefix}{dname}/")
+            _walk(os.path.join(dir_path, dname), prefix + "  ", depth + 1)
+
+    _walk(project_root, "  ", 0)
+    return lines
+
+
+def _apply_token_budget(lines: list[str], effective_max_tokens: int) -> str:
+    """Join lines; truncate with a notice if the estimate exceeds the token budget."""
+    result = "\n".join(lines)
+    # using 3 chars per token to more accurately reflect code
+    if len(result) // 3 <= effective_max_tokens:
+        return result
+    truncated: list[str] = [lines[0]]
+    budget_chars = effective_max_tokens * 3  # consistent with // 3 estimation above
+    used = len(truncated[0])
+    for line in lines[1:]:
+        if used + len(line) + 1 > budget_chars:
+            truncated.append("  ... (truncated - project has more files)")
+            break
+        truncated.append(line)
+        used += len(line) + 1
+    return "\n".join(truncated)
+
+
 def build_project_snapshot(
     project_root: str,
     max_depth: int | None = None,
@@ -230,8 +332,8 @@ def build_project_snapshot(
     For .py files: shows line count, class count, function count.
     For other files: shows file size.
 
-    Respects TOOL_LISTING_EXCLUDED_DIRS. Truncates if estimated
-    token count exceeds the configured budget.
+    Respects .gitignore, TOOL_LISTING_EXCLUDED_DIRS, and skips hidden entries.
+    Truncates if estimated token count exceeds the configured budget.
 
     max_tokens overrides the config default; pass int(llm_max_context * SNAPSHOT_CONTEXT_RATIO)
     from call sites that know the LLM's context window.
@@ -244,76 +346,28 @@ def build_project_snapshot(
 
     project_root = os.path.normpath(os.path.abspath(project_root))
 
-    # Check cache - keyed by (project_root, effective_max_tokens)
     cache_ttl = _snapshot_cache_ttl()
-    cache_key = (project_root, effective_max_tokens)
+    cache_key = ("basic", project_root, effective_max_tokens)
     cached = _snapshot_cache.get(cache_key)
     if cached is not None:
         ts, snapshot = cached
         if time.time() - ts < cache_ttl:
             return snapshot
 
-    excluded = TOOL_LISTING_EXCLUDED_DIRS
-    lines: list[str] = ["== PROJECT STRUCTURE =="]
-
-    def _walk(dir_path: str, prefix: str, depth: int) -> None:
-        if depth > max_depth:
-            return
-
+    def _fmt(prefix: str, fname: str, abs_path: str) -> str:
+        if fname.endswith(".py"):
+            lc, cc, fc = _analyze_py_file(abs_path)
+            if cc >= 0:
+                return f"{prefix}{fname} - {lc} lines, {cc} classes, {fc} functions"
+            return f"{prefix}{fname} - {lc} lines"
         try:
-            entries = sorted(os.listdir(dir_path))
+            sz = os.path.getsize(abs_path)
+            return f"{prefix}{fname} - {_format_size(sz)}"
         except OSError:
-            return
+            return f"{prefix}{fname}"
 
-        dirs: list[str] = []
-        files: list[str] = []
-        for entry in entries:
-            if entry.startswith(".") and entry not in (".env.example",):
-                continue
-            full = os.path.join(dir_path, entry)
-            if os.path.isdir(full):
-                if entry not in excluded:
-                    dirs.append(entry)
-            elif os.path.isfile(full):
-                files.append(entry)
-
-        for fname in files:
-            full = os.path.join(dir_path, fname)
-            if fname.endswith(".py"):
-                lc, cc, fc = _analyze_py_file(full)
-                if cc >= 0:
-                    lines.append(f"{prefix}{fname} - {lc} lines, {cc} classes, {fc} functions")
-                else:
-                    lines.append(f"{prefix}{fname} - {lc} lines")
-            else:
-                try:
-                    sz = os.path.getsize(full)
-                    lines.append(f"{prefix}{fname} - {_format_size(sz)}")
-                except OSError:
-                    lines.append(f"{prefix}{fname}")
-
-        for dname in dirs:
-            lines.append(f"{prefix}{dname}/")
-            _walk(os.path.join(dir_path, dname), prefix + "  ", depth + 1)
-
-    _walk(project_root, "  ", 0)
-
-    # Token budget enforcement - estimate tokens as len/4
-    result = "\n".join(lines)
-    estimated_tokens = len(result) // 4
-    if estimated_tokens > effective_max_tokens:
-        # Truncate: keep the header + app/ subtree lines preferentially
-        truncated: list[str] = [lines[0]]
-        budget_chars = effective_max_tokens * 4
-        used = len(truncated[0])
-        for line in lines[1:]:
-            if used + len(line) + 1 > budget_chars:
-                truncated.append("  ... (truncated - project has more files)")
-                break
-            truncated.append(line)
-            used += len(line) + 1
-        result = "\n".join(truncated)
-
+    lines = _build_snapshot_lines(project_root, max_depth, _fmt)
+    result = _apply_token_budget(lines, effective_max_tokens)
     _snapshot_cache[cache_key] = (time.time(), result)
     return result
 
@@ -336,6 +390,16 @@ def build_file_summary(path: str, summary_length: str = "none") -> str:
 
     if not os.path.isfile(abs_path):
         return f"ERROR: '{path}' is not a file or does not exist."
+
+    # Reject binary files before any further processing.  Binary data cannot
+    # be meaningfully summarised as text — callers must treat this as a hard
+    # no-op, not an error to retry.
+    if _is_binary_file(abs_path):
+        return (
+            f"BINARY: '{path}' is a binary file (contains null bytes). "
+            "Binary files cannot be summarised as text. "
+            "Skipping — no summary available."
+        )
 
     try:
         stat = os.stat(abs_path)
@@ -415,6 +479,13 @@ async def async_build_file_summary(
     SHA1 + filesize via FileSummaryAgent) unless summary_length is "none".
     Falls back to structural-only on any error.
     """
+    abs_path_early = os.path.normpath(os.path.abspath(path))
+    if _is_binary_file(abs_path_early):
+        return (
+            f"BINARY: '{path}' is a binary file. "
+            "Binary files cannot be summarised as text — skipping."
+        )
+
     # Always start with the structural summary
     structural = build_file_summary(path, summary_length="none")
 
@@ -598,6 +669,10 @@ def build_snapshot_with_summaries(
     line of the full summary for older rows.
     Cache miss → file line emitted without summary (no placeholder noise for the LLM).
 
+    Respects .gitignore, TOOL_LISTING_EXCLUDED_DIRS, and skips hidden entries —
+    identical filtering to build_project_snapshot via the shared _build_snapshot_lines
+    helper.
+
     max_tokens overrides the config default; pass int(llm_max_context * SNAPSHOT_CONTEXT_RATIO)
     from call sites that know the LLM's context window.  Different max_tokens values
     cache independently so a 100k-context agent and a 200k-context agent each get
@@ -612,15 +687,12 @@ def build_snapshot_with_summaries(
     project_root = os.path.normpath(os.path.abspath(project_root))
 
     cache_ttl = _snapshot_cache_ttl()
-    cache_key = (project_root, effective_max_tokens)
+    cache_key = ("summaries", project_root, effective_max_tokens)
     cached = _snapshot_cache.get(cache_key)
     if cached is not None:
         ts, snapshot = cached
         if time.time() - ts < cache_ttl:
             return snapshot
-
-    excluded = TOOL_LISTING_EXCLUDED_DIRS
-    lines: list[str] = ["== PROJECT STRUCTURE =="]
 
     try:
         from app.database import get_file_summary_by_path as _get_summary
@@ -641,62 +713,20 @@ def build_snapshot_with_summaries(
             pass
         return ""
 
-    def _walk(dir_path: str, prefix: str, depth: int) -> None:
-        if depth > max_depth:
-            return
-
+    def _fmt(prefix: str, fname: str, abs_path: str) -> str:
+        summary_suffix = _inline_summary(abs_path)
+        if fname.endswith(".py"):
+            lc, cc, fc = _analyze_py_file(abs_path)
+            if cc >= 0:
+                return f"{prefix}{fname} - {lc} lines, {cc} classes, {fc} functions{summary_suffix}"
+            return f"{prefix}{fname} - {lc} lines{summary_suffix}"
         try:
-            entries = sorted(os.listdir(dir_path))
+            sz = os.path.getsize(abs_path)
+            return f"{prefix}{fname} - {_format_size(sz)}{summary_suffix}"
         except OSError:
-            return
+            return f"{prefix}{fname}{summary_suffix}"
 
-        dirs: list[str] = []
-        files: list[str] = []
-        for entry in entries:
-            if entry.startswith(".") and entry not in (".env.example",):
-                continue
-            full = os.path.join(dir_path, entry)
-            if os.path.isdir(full):
-                if entry not in excluded:
-                    dirs.append(entry)
-            elif os.path.isfile(full):
-                files.append(entry)
-
-        for fname in files:
-            full = os.path.join(dir_path, fname)
-            summary_suffix = _inline_summary(full)
-            if fname.endswith(".py"):
-                lc, cc, fc = _analyze_py_file(full)
-                if cc >= 0:
-                    lines.append(f"{prefix}{fname} - {lc} lines, {cc} classes, {fc} functions{summary_suffix}")
-                else:
-                    lines.append(f"{prefix}{fname} - {lc} lines{summary_suffix}")
-            else:
-                try:
-                    sz = os.path.getsize(full)
-                    lines.append(f"{prefix}{fname} - {_format_size(sz)}{summary_suffix}")
-                except OSError:
-                    lines.append(f"{prefix}{fname}{summary_suffix}")
-
-        for dname in dirs:
-            lines.append(f"{prefix}{dname}/")
-            _walk(os.path.join(dir_path, dname), prefix + "  ", depth + 1)
-
-    _walk(project_root, "  ", 0)
-
-    result = "\n".join(lines)
-    estimated_tokens = len(result) // 4
-    if estimated_tokens > effective_max_tokens:
-        truncated: list[str] = [lines[0]]
-        budget_chars = effective_max_tokens * 4
-        used = len(truncated[0])
-        for line in lines[1:]:
-            if used + len(line) + 1 > budget_chars:
-                truncated.append("  ... (truncated - project has more files)")
-                break
-            truncated.append(line)
-            used += len(line) + 1
-        result = "\n".join(truncated)
-
+    lines = _build_snapshot_lines(project_root, max_depth, _fmt)
+    result = _apply_token_budget(lines, effective_max_tokens)
     _snapshot_cache[cache_key] = (time.time(), result)
     return result
