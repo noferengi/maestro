@@ -176,9 +176,11 @@ class ConceptualReviewPipeline:
         existing = 0
         total = len(manifest)
 
+        from app.agent.tools import get_task_git_cwd
+        _effective_root = get_task_git_cwd() or PROJECT_ROOT
         for entry in manifest:
             path = entry.get("path", "")
-            full_path = os.path.join(PROJECT_ROOT, path)
+            full_path = os.path.join(_effective_root, path)
             if os.path.exists(full_path):
                 existing += 1
 

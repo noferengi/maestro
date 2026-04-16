@@ -186,15 +186,15 @@ When you are ready, output ONLY this JSON object (no markdown fences, no extra t
       "prerequisites": ["sub-0"],
       "estimated_scope": "small" | "medium",
       "rationale": "Why this is a coherent, independent unit of work",
-      "provides": [ { "name": "...", "type": "...", "description": "..." } ],
-      "consumes": [ { "name": "...", "type": "...", "source": "sub-N" } ]
+      "provides": [ {{ "name": "...", "type": "...", "description": "..." }} ],
+      "consumes": [ {{ "name": "...", "type": "...", "source": "sub-N" }} ]
     }}
   ],
   "interface_contracts": [
     {{
       "component": "sub-0 title",
-      "provides": [ { "name": "...", "type": "..." } ],
-      "consumes": [ { "name": "...", "type": "...", "source": "sub-N" } ]
+      "provides": [ {{ "name": "...", "type": "..." }} ],
+      "consumes": [ {{ "name": "...", "type": "...", "source": "sub-N" }} ]
     }}
   ],
   "decomposition_rationale": "Why you chose this particular decomposition strategy",

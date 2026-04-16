@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kanban Board - TheMaestro</title>
-    <link rel="stylesheet" href="/static/style.css?v=30">
-    <script src="/static/kanban.js?v=50"></script>
+    <link rel="stylesheet" href="/static/style.css?v=32">
+    <script src="/static/kanban.js?v=53"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -28,7 +28,24 @@
             + New Project
         </button>
 
-        <h2 style="margin-top:1.5rem">Global Config</h2>
+        <!-- Project actions: selected label + board action buttons -->
+        <div id="sidebar-project-actions">
+            <div id="current-project-display">Selected: TheMaestro</div>
+            <div class="sidebar-action-buttons">
+                <button class="sidebar-action-btn" id="inbox-btn" onclick="openInboxModal()" title="Inbox">
+                    ✉
+                    <span class="inbox-badge" id="inbox-badge" style="display:none">0</span>
+                </button>
+                <button class="sidebar-action-btn" onclick="openSchedulerModal()" title="Scheduler queue" id="scheduler-queue-btn">
+                    ⚙
+                </button>
+                <button class="sidebar-action-btn" onclick="refreshTasks()" title="Refresh from database">
+                    &#x1F504;
+                </button>
+            </div>
+        </div>
+
+        <h2 style="margin-top:1rem">Global Config</h2>
         <div class="project-tabs">
             <div class="project-tab" id="manage-llms-btn" style="cursor:pointer">
                 LLM Endpoints
@@ -55,22 +72,6 @@
 
     <!-- Main Content -->
     <div class="main-content">
-        <div class="board-header">
-            <h1 class="board-title">TheMaestro</h1>
-            <div id="current-project-display">
-                Selected: TheMaestro
-            </div>
-            <button class="inbox-btn" id="inbox-btn" onclick="openInboxModal()" title="Inbox">
-                ✉
-                <span class="inbox-badge" id="inbox-badge" style="display:none">0</span>
-            </button>
-            <button class="refresh-btn" onclick="openSchedulerModal()" title="Scheduler queue" id="scheduler-queue-btn">
-                ⚙ Queue
-            </button>
-            <button class="refresh-btn" onclick="refreshTasks()" title="Refresh from database">
-                🔄 Refresh
-            </button>
-        </div>
 
         <!-- Breadcrumb bar for Big Idea zoom view -->
         <div id="breadcrumb-bar" class="breadcrumb-bar" style="display:none">
@@ -286,8 +287,17 @@
                 </div>
                 <div class="form-group">
                     <label class="form-label" for="new-project-path">Root Path</label>
-                    <input type="text" class="form-input" id="new-project-path" placeholder="e.g. D:\workspace\MyApp">
+                    <div style="display:flex;gap:0.4rem">
+                        <input type="text" class="form-input" id="new-project-path" placeholder="e.g. D:\workspace\MyApp" style="flex:1">
+                        <button type="button" class="btn btn-secondary" style="white-space:nowrap;padding:0.4rem 0.75rem" onclick="browseFolder('new-project-path')">Browse&hellip;</button>
+                    </div>
                     <div style="font-size:0.78rem;color:#6c757d;margin-top:0.25rem">Absolute path to the project's git repository root. Used for all agent git operations.</div>
+                    <div id="new-project-path-warn" style="display:none;margin-top:0.4rem;color:#dc3545;font-size:0.82rem">
+                        Path does not exist.
+                        <label style="margin-left:0.5rem;cursor:pointer">
+                            <input type="checkbox" id="new-project-create-path"> Create it?
+                        </label>
+                    </div>
                 </div>
                 <div class="form-group">
                     <label class="form-label" for="new-project-llm-select">Default LLM</label>
@@ -327,8 +337,17 @@
                 </div>
                 <div class="form-group">
                     <label class="form-label" for="edit-project-path">Root Path</label>
-                    <input type="text" class="form-input" id="edit-project-path" placeholder="e.g. D:\workspace\MyApp">
+                    <div style="display:flex;gap:0.4rem">
+                        <input type="text" class="form-input" id="edit-project-path" placeholder="e.g. D:\workspace\MyApp" style="flex:1">
+                        <button type="button" class="btn btn-secondary" style="white-space:nowrap;padding:0.4rem 0.75rem" onclick="browseFolder('edit-project-path')">Browse&hellip;</button>
+                    </div>
                     <div style="font-size:0.78rem;color:#6c757d;margin-top:0.25rem">Absolute path to the project's git repository root. Used for all agent git operations.</div>
+                    <div id="edit-project-path-warn" style="display:none;margin-top:0.4rem;color:#dc3545;font-size:0.82rem">
+                        Path does not exist.
+                        <label style="margin-left:0.5rem;cursor:pointer">
+                            <input type="checkbox" id="edit-project-create-path"> Create it?
+                        </label>
+                    </div>
                 </div>
                 <div class="form-group">
                     <label class="form-label" for="edit-project-llm-select">Default LLM</label>

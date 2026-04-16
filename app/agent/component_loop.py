@@ -28,7 +28,7 @@ from app.agent.config import (
     check_context_saturation,
 )
 from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
-from app.agent.tools import dispatch_tool, TOOL_SCHEMAS, _assert_safe_path, build_tool_schemas
+from app.agent.tools import dispatch_tool, TOOL_SCHEMAS, _assert_safe_path, build_tool_schemas, get_task_git_cwd
 
 _INDEV_TOOL_SCHEMAS: list[dict] = build_tool_schemas(INDEV_AGENT_TOOLS)
 
@@ -51,8 +51,9 @@ class ComponentToolDispatcher:
     def dispatch(self, name: str, arguments: dict) -> str:
         if INDEV_ENFORCE_FILE_CONTAINMENT and name in ("write_file", "append_file"):
             path = arguments.get("path", "")
+            _effective_root = get_task_git_cwd() or PROJECT_ROOT
             resolved = os.path.realpath(os.path.abspath(
-                os.path.join(PROJECT_ROOT, path) if not os.path.isabs(path) else path
+                os.path.join(_effective_root, path) if not os.path.isabs(path) else path
             ))
             if resolved not in self._allowed:
                 return (
@@ -287,6 +288,22 @@ class ComponentLoop:
                         prompt_tokens=self._total_prompt,
                         completion_tokens=self._total_completion,
                     )
+
+            # No content and no tool calls — nudge the model rather than
+            # silently looping with an empty assistant message at the tail.
+            # (An empty trailing assistant turn looks like a prefill request
+            # to thinking models and causes HTTP 400 on the next call.)
+            if not tool_calls and not content:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "[SYSTEM] Your last response was empty. "
+                        "Please call a tool to make progress, or emit your "
+                        "final signal: {\"signal\": \"ACCEPTED\"} or "
+                        "{\"signal\": \"REVERT_TO_DESIGN\"}."
+                    ),
+                })
+                continue
 
             # Dispatch tool calls
             if tool_calls:

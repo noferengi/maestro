@@ -119,7 +119,7 @@ def tally_votes(votes: list[Vote]) -> TallyResult:
     """Aggregate stage votes into a single pipeline outcome.
 
     Rules (evaluated in order):
-        0. Any SUBDIVIDE_IDEA vote -> "subdivide" immediately.
+        0. Majority of LLM stages vote SUBDIVIDE_IDEA (>=2 of 3) -> "subdivide".
         1. Any REJECTED vote -> "rejected" immediately.
         2. Majority NOT_SUITABLE (>= ceil(n/2)+1 when n>=3, or >=2 when n<=3)
            -> "rejected".
@@ -145,14 +145,23 @@ def tally_votes(votes: list[Vote]) -> TallyResult:
     total_completion = sum(v.completion_tokens for v in votes)
     n = len(votes)
 
-    # --- Rule 0: any SUBDIVIDE_IDEA -> subdivide immediately ---
+    # --- Rule 0: SUBDIVIDE_IDEA requires majority of LLM stages (>=2 of 3) ---
+    # Static analysis never emits SUBDIVIDE_IDEA; only LLM stages can.
     subdivide_votes = [v for v in votes if v.verdict is Verdict.SUBDIVIDE_IDEA]
-    if subdivide_votes:
-        logger.debug("Tally: %d votes → outcome=subdivide", n)
+    llm_stage_count = sum(1 for v in votes if v.stage != "static_analysis")
+    subdivide_threshold = max(2, (llm_stage_count // 2) + 1)
+    if len(subdivide_votes) >= subdivide_threshold:
+        logger.debug(
+            "Tally: %d/%d LLM-stage subdivide_votes >= threshold %d → outcome=subdivide",
+            len(subdivide_votes), llm_stage_count, subdivide_threshold,
+        )
         return TallyResult(
             outcome="subdivide",
             votes=votes,
-            summary=f"{len(subdivide_votes)} stage(s) voted SUBDIVIDE_IDEA.",
+            summary=(
+                f"{len(subdivide_votes)}/{llm_stage_count} LLM stages voted SUBDIVIDE_IDEA "
+                f"(threshold: {subdivide_threshold})."
+            ),
             total_prompt_tokens=total_prompt,
             total_completion_tokens=total_completion,
         )

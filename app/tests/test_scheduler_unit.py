@@ -81,6 +81,7 @@ def _fake_db_task(
     task.description = description
     task.title = "Test Task"
     task.parent_task_id = parent_task_id
+    task.intake_exhausted_at = None  # not exhausted by default
     return task
 
 

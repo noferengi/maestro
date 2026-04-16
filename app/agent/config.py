@@ -434,6 +434,12 @@ SNAPSHOT_MAX_TOKENS: int = _getint("snapshot", "max_tokens", None, 12000)
 SNAPSHOT_CACHE_TTL: int = _getint("snapshot", "cache_ttl_seconds", None, 300)
 SNAPSHOT_CONTEXT_RATIO: float = _getfloat("snapshot", "context_ratio", None, 0.12)
 
+# ===========================================================================
+# Survey / Summary settings
+# ===========================================================================
+
+SUMMARY_CONTEXT_RATIO: float = _getfloat("survey", "summary_context_ratio", None, 0.10)
+
 TOOL_LISTING_EXCLUDED_DIRS: set[str] = set(_getlist(
     "tools", "excluded_directories",
     ".archive, .git, venv, .venv, __pycache__, node_modules, .mypy_cache, .pytest_cache, .ruff_cache, dist, build, .eggs",
@@ -466,3 +472,13 @@ FILE_SUMMARY_STREAM_IDLE_TIMEOUT: float = _getfloat("scheduler", "file_summary_s
 # ===========================================================================
 
 PIP_RESOLUTION_MAX_TURNS: int = _getint("pip", "resolution_max_turns", None, 20)
+
+# ===========================================================================
+# Dreamer — autonomous project resurrection agent
+# ===========================================================================
+
+DREAMER_ENABLED: bool        = _getbool("dreamer", "enabled",              "MAESTRO_DREAMER_ENABLED", False)
+DREAMER_STALL_TICKS: int     = _getint ("dreamer", "stall_ticks",          None,                      60)
+DREAMER_MAX_RESURRECTIONS: int = _getint("dreamer", "max_cards_to_resurrect", None,                   3)
+DREAMER_MAX_NEW_CARDS: int   = _getint ("dreamer", "max_new_cards",        None,                      2)
+DREAMER_DECIDE_MAX_TOKENS: int = _getint("dreamer", "decide_max_tokens",   None,                      4096)

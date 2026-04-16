@@ -49,6 +49,7 @@ if globals().get('_initialized'):
         'app.database.crud_infra', 'app.database.crud_costs',
         'app.database.crud_pipeline', 'app.database.crud_jobs',
         'app.database.crud_files', 'app.database.crud_inbox',
+        'app.database.crud_sessions', 'app.database.crud_dreamer',
     ]:  # NOTE: keep this list in sync with the from-imports below
         if _sub in _sys.modules:
             _il.reload(_sys.modules[_sub])
@@ -89,9 +90,11 @@ from .models import (
     FileSummaryJob,
     OptimizationBenchmark,
     ArchGenJob,
+    AgentSession,
     FileSummary,
     SearchCache,
     InboxMessage,
+    DreamerRun,
 )
 
 # Task CRUD + seeding + helpers
@@ -104,6 +107,7 @@ from .crud_tasks import (
     get_task,
     get_tasks_by_type,
     get_tasks_by_project,
+    get_deleted_tasks_by_project,
     get_all_tasks,
     update_task,
     batch_update_map_positions,
@@ -180,6 +184,7 @@ from .crud_pipeline import (
     get_transition_votes,
     create_transition_result,
     get_transition_results,
+    get_transition_votes_for_result,
     create_subdivision_record,
     get_subdivision_records,
     update_subdivision_record,
@@ -249,6 +254,21 @@ from .crud_inbox import (
     count_unread_inbox,
 )
 
+# Agent session tracking
+from .crud_sessions import (
+    create_agent_session,
+    close_agent_session,
+    get_agent_sessions_for_task,
+)
+
+# Dreamer run tracking
+from .crud_dreamer import (
+    create_dreamer_run,
+    update_dreamer_run,
+    get_dreamer_runs,
+    get_dreamer_run,
+)
+
 __all__ = [
     # session
     "DATABASE_PATH", "engine", "SessionLocal", "Base", "get_db", "init_db_tables",
@@ -260,6 +280,7 @@ __all__ = [
     "PipVerification",
     "PipResolutionJob",
     "ResearchJob", "FileSummaryJob", "OptimizationBenchmark", "ArchGenJob",
+    "AgentSession",
     "FileSummary", "SearchCache", "InboxMessage",
     # crud_tasks
     "init_db", "seed_sample_tasks", "seed_task", "seed_sample_tasks_raw",
@@ -287,7 +308,7 @@ __all__ = [
     "budget_has_capacity", "get_budget_summary",
     # crud_pipeline
     "create_transition_vote", "get_transition_votes",
-    "create_transition_result", "get_transition_results",
+    "create_transition_result", "get_transition_results", "get_transition_votes_for_result",
     "create_subdivision_record", "get_subdivision_records", "update_subdivision_record",
     "create_planning_result", "get_planning_result", "get_latest_planning_result",
     "supersede_planning_results", "update_planning_result",
@@ -313,6 +334,11 @@ __all__ = [
     # crud_inbox
     "create_inbox_message", "get_inbox_messages", "get_inbox_message",
     "mark_inbox_read", "mark_all_inbox_read", "delete_inbox_message", "count_unread_inbox",
+    # crud_sessions
+    "create_agent_session", "close_agent_session", "get_agent_sessions_for_task",
+    # crud_dreamer
+    "DreamerRun",
+    "create_dreamer_run", "update_dreamer_run", "get_dreamer_runs", "get_dreamer_run",
 ]
 
 # Sentinel — presence of this flag on a subsequent execution means we're

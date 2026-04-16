@@ -101,6 +101,27 @@ def get_transition_results(task_id, transition=None):
         db.close()
 
 
+def get_transition_votes_for_result(task_id, from_dt=None, to_dt=None):
+    """Return votes for a task created in the window (from_dt, to_dt].
+
+    Use to match votes to a specific transition result when there is no direct
+    FK.  Pass the previous result's created_at as from_dt and the current
+    result's created_at as to_dt.  Either bound may be None (open interval).
+    """
+    db = SessionLocal()
+    try:
+        q = (db.query(TransitionVote)
+             .filter(TransitionVote.task_id == task_id)
+             .filter(TransitionVote.transition == "idea_to_planning"))
+        if from_dt is not None:
+            q = q.filter(TransitionVote.created_at > from_dt)
+        if to_dt is not None:
+            q = q.filter(TransitionVote.created_at <= to_dt)
+        return q.order_by(TransitionVote.created_at).all()
+    finally:
+        db.close()
+
+
 # ---------------------------------------------------------------------------
 # SubdivisionRecord
 # ---------------------------------------------------------------------------

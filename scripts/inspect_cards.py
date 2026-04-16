@@ -13,6 +13,7 @@ Commands:
     votes         Transition vote detail for all Meshtastic tasks    [--task TASK_ID]
     budget        LLM capacity and budget spending summary
     children      Parent->child tree with stage progress             [--task TASK_ID]
+    gate          Planning gate check outcomes                       [--task TASK_ID]
     all           Run all sections in sequence
 """
 
@@ -664,6 +665,66 @@ def cmd_children(cur, task_id=None):
 
 
 # =============================================================================
+# COMMAND: gate
+# =============================================================================
+def cmd_gate(cur, task_id=None):
+    """Show planning gate check outcomes stored in planning_results.gate_checks."""
+    hdr("Planning Gate Checks")
+
+    try:
+        if task_id:
+            cur.execute(
+                "SELECT id, task_id, status, gate_checks, created_at FROM planning_results "
+                "WHERE task_id=? ORDER BY created_at DESC LIMIT 5",
+                (task_id,),
+            )
+        else:
+            cur.execute(
+                "SELECT id, task_id, status, gate_checks, created_at FROM planning_results "
+                "WHERE gate_checks IS NOT NULL ORDER BY created_at DESC LIMIT 20"
+            )
+    except Exception as exc:
+        print("  ERROR querying planning_results: {}".format(exc))
+        return
+
+    rows = cur.fetchall()
+    if not rows:
+        print("  No planning gate results found{}.".format(
+            " for task {}".format(task_id) if task_id else ""
+        ))
+        return
+
+    for row in rows:
+        try:
+            checks = json.loads(row["gate_checks"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            checks = []
+
+        passed_count = sum(1 for c in checks if c.get("passed"))
+        print("\n[{}]  {}  status={}  {}/{} checks passed".format(
+            row["task_id"],
+            fmt_ts(row["created_at"]),
+            row["status"],
+            passed_count,
+            len(checks),
+        ))
+
+        for c in checks:
+            if c.get("passed"):
+                icon = "PASS    "
+            elif c.get("hard_fail"):
+                icon = "HARD-FAIL"
+            else:
+                icon = "soft-fail"
+            detail = c.get("detail", "")
+            print("  [{:9s}] {:30s}  {}".format(
+                icon, c.get("name", "?"), detail[:80]
+            ))
+            if len(detail) > 80:
+                print("             {}".format(detail[80:160]))
+
+
+# =============================================================================
 # Entry point
 # =============================================================================
 COMMANDS = {
@@ -674,10 +735,11 @@ COMMANDS = {
     "votes":     lambda cur, args: cmd_votes(cur, task_id=args.task),
     "budget":    lambda cur, args: cmd_budget(cur),
     "children":  lambda cur, args: cmd_children(cur, task_id=args.task),
+    "gate":      lambda cur, args: cmd_gate(cur, task_id=args.task),
     "all": lambda cur, args: [
         cmd_overview(cur), cmd_prereqs(cur), cmd_scheduler(cur),
         cmd_activity(cur, hours=args.hours), cmd_votes(cur),
-        cmd_budget(cur), cmd_children(cur),
+        cmd_budget(cur), cmd_children(cur), cmd_gate(cur),
     ],
 }
 

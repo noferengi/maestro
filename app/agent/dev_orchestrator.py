@@ -233,9 +233,11 @@ class DevOrchestrator:
         component_name = step.get("component", "unknown")
 
         # Build allowed write paths from the step's files
+        from app.agent.tools import get_task_git_cwd
+        _effective_root = get_task_git_cwd() or PROJECT_ROOT
         allowed_paths = []
         for fpath in step.get("files", []):
-            abs_path = os.path.join(PROJECT_ROOT, fpath)
+            abs_path = os.path.join(_effective_root, fpath)
             allowed_paths.append(abs_path)
 
         for retry in range(INDEV_COMPONENT_MAX_RETRIES + 1):

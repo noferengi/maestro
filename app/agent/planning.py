@@ -400,8 +400,8 @@ class PlanningPipeline:
             "- design_rationale: string explaining the approach\n"
             "- file_manifest: list of {path, action, purpose, estimated_lines, depends_on}\n"
             "- dependency_graph: dict mapping component -> [dependencies]\n"
-            "- interface_contracts: list of {component, provides, consumes, invariants}\n"
-            "- test_strategy: list of {component, test_file, test_cases, fixtures}\n"
+            "- interface_contracts: list of {component, provides, consumes, invariants} — OPTIONAL for simple single-component tasks; when provided, every item in 'consumes' MUST appear in the 'provides' list of another contract in the same plan\n"
+            "- test_strategy: list of {component, test_file, test_cases, fixtures} — name test subjects by component/class name (e.g. 'UserService'), not by filename\n"
             "- implementation_steps: list of {order, component, files, description, depends_on, estimated_context_tokens}\n"
             "\nOutput ONLY the JSON object, no markdown fences."
             + (f"\n\n{_arch}" if _arch else "")
@@ -452,8 +452,8 @@ class PlanningPipeline:
             self._track_tokens(resp)
             content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
             try:
-                design = json.loads(content)
-            except json.JSONDecodeError:
+                design, _ = json.JSONDecoder().raw_decode(content.lstrip())
+            except (json.JSONDecodeError, ValueError):
                 design = {"raw": content, "parse_error": True}
             designs.append(design)
 
@@ -503,7 +503,7 @@ class PlanningPipeline:
             self._track_tokens(response)
 
             content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
-            result = json.loads(content)
+            result, _ = json.JSONDecoder().raw_decode(content.lstrip())
             idx = int(result.get("selected_index", valid[0][0]))
             if idx < 0 or idx >= len(designs):
                 idx = valid[0][0]
@@ -623,7 +623,7 @@ class PlanningPipeline:
             self._track_tokens(resp)
             content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
             try:
-                data = json.loads(content)
+                data, _ = json.JSONDecoder().raw_decode(content.lstrip())
                 verdict_str = data.get("verdict", "POSSIBLE").upper()
                 verdict = Verdict(verdict_str)
                 confidence = int(data.get("confidence", 80))
@@ -676,7 +676,8 @@ class PlanningPipeline:
             path = entry.get("path", "")
             if path:
                 try:
-                    _assert_safe_path(os.path.join(PROJECT_ROOT, path))
+                    # Pass path directly — _assert_safe_path uses set_task_git_cwd effective root.
+                    _assert_safe_path(path)
                 except ValueError as e:
                     pitfalls.append({
                         "type": "unsafe_path",
@@ -711,7 +712,7 @@ class PlanningPipeline:
             )
             self._track_tokens(response)
             content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
-            data = json.loads(content)
+            data, _ = json.JSONDecoder().raw_decode(content.lstrip())
             pitfalls.extend(data.get("pitfalls", []))
         except Exception as e:
             logger.warning(f"[{AGENT_NAME}] Pitfall LLM check failed: %s", e)
@@ -755,7 +756,8 @@ class PlanningPipeline:
             )
             self._track_tokens(response)
             content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
-            return json.loads(content)
+            result, _ = json.JSONDecoder().raw_decode(content.lstrip())
+            return result
         except Exception as e:
             logger.warning(f"[{AGENT_NAME}] Consolidation failed: %s. Using original design.", e)
             return design

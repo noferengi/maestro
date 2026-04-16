@@ -260,6 +260,10 @@ def _assert_safe_path(path: str) -> str:
     Returns the absolute resolved path string.
     Raises ValueError if the path escapes the effective root.
     """
+    # Normalize mixed separators (e.g. "src\foo/bar.py" on Windows) before any
+    # path logic — without this, os.path.realpath leaves backslashes intact on
+    # some Python builds and the containment check below can fail spuriously.
+    path = os.path.normpath(path)
     effective_root = _task_git_cwd.get() or PROJECT_ROOT
     # Resolve relative paths against the effective project root, not the process CWD.
     # Without this, 'PRD.md' would resolve to TheMaestro's directory when an agent
@@ -1451,6 +1455,18 @@ def spawn_research_agent(question: str, context: str = "") -> str:
     )
 
 
+def launch_research_agent(question: str, context: str = "") -> str:
+    """
+    Placeholder for synchronous dispatch.  The real implementation lives in
+    async_dispatch_tool() where it can park the caller's LLM slot and await
+    the scheduler-dispatched research job.
+    """
+    return (
+        "ERROR: launch_research_agent requires async dispatch. "
+        "Use async_dispatch_tool() instead of dispatch_tool()."
+    )
+
+
 def get_task(task_id: str) -> str:
     """Fetch a Kanban task by ID and return it as a JSON string."""
     import json
@@ -1664,6 +1680,7 @@ TOOL_REGISTRY: dict[str, Any] = {
     "generate_mermaid_diagram": generate_mermaid_diagram,
     "generate_interface_contract": generate_interface_contract,
     "spawn_research_agent": spawn_research_agent,
+    "launch_research_agent": launch_research_agent,
     "record_benchmark": record_benchmark,
     "run_shell_security": _run_shell_security_wrapper,
     "run_shell_review": _run_shell_review_wrapper,
@@ -2112,6 +2129,38 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "launch_research_agent",
+            "description": (
+                "Schedule a research agent job through the Maestro scheduler and "
+                "block until it completes. Unlike spawn_research_agent (which runs "
+                "inline), this releases the caller's LLM slot while waiting so the "
+                "scheduler can dispatch the research on the same endpoint without "
+                "deadlocking. The caller resumes with the full findings as the tool "
+                "result — the wait may span minutes to an hour depending on queue "
+                "depth and research complexity. Use for deep investigations where "
+                "you want proper scheduler visibility, budget tracking, and "
+                "diagnostics UI integration."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The research question to investigate.",
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Optional background context for the researcher.",
+                        "default": "",
+                    },
+                },
+                "required": ["question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "record_benchmark",
             "description": (
                 "Record a before/after profiling benchmark for an optimization sub-task. "
@@ -2402,6 +2451,83 @@ async def async_dispatch_tool(
             )
         except Exception as exc:
             return f"ERROR: spawn_research_agent failed: {type(exc).__name__}: {exc}"
+
+    if name == "launch_research_agent":
+        import asyncio as _asyncio
+        import json as _json
+        from app.database import create_research_job as _create_rj, get_research_job as _get_rj
+        from app.agent.scheduler import (
+            get_or_create_completion_event as _get_event,
+            park_session as _park,
+            unpark_session as _unpark,
+            is_shutting_down as _shutting_down,
+        )
+
+        question   = arguments.get("question", "").strip()
+        context_str = arguments.get("context", "")
+        if not question:
+            return "ERROR: launch_research_agent requires a non-empty 'question'."
+
+        job = _create_rj(
+            task_id=task_id,
+            question=question,
+            context=_json.dumps({"question": question, "context": context_str}),
+            priority=0.0,
+            llm_id=llm_id,
+            budget_id=budget_id,
+        )
+        if not job:
+            return "ERROR: launch_research_agent failed to create research job in DB."
+
+        # Release this session's LLM slot so the scheduler can dispatch the research
+        # job immediately, even if this agent uses the same endpoint.
+        completion_key = f"research_job_{job.id}"
+        event, _ = _get_event(completion_key)
+        session_parked = False
+        if task_id and llm_id:
+            _park(task_id, llm_id)
+            session_parked = True
+
+        MAX_WAIT_SECS = 7200.0   # 2 hours
+        POLL_INTERVAL = 30.0
+        loop = _asyncio.get_event_loop()
+        elapsed = 0.0
+        try:
+            while not event.is_set() and elapsed < MAX_WAIT_SECS:
+                if _shutting_down():
+                    return "ERROR: Server shutting down while waiting for research job."
+                remaining = min(POLL_INTERVAL, MAX_WAIT_SECS - elapsed)
+                done = await loop.run_in_executor(None, event.wait, remaining)
+                if done:
+                    break
+                elapsed += remaining
+        finally:
+            if session_parked:
+                _unpark(task_id, llm_id)
+
+        if not event.is_set():
+            return f"ERROR: Research job {job.id} timed out after {MAX_WAIT_SECS:.0f}s."
+
+        result = _get_rj(job.id)
+        if not result:
+            return f"ERROR: Research job {job.id} record missing after completion."
+        if result.status == "failed":
+            return f"Research job {job.id} failed — no findings produced."
+        if not result.findings:
+            return f"Research job {job.id} completed but produced no findings."
+
+        verdict_str = ""
+        if result.verdict:
+            try:
+                v = _json.loads(result.verdict)
+                verdict_str = (
+                    f" (verdict: {v.get('verdict', '?')}, "
+                    f"confidence: {v.get('confidence', '?')})"
+                )
+            except Exception:
+                pass
+
+        return f"Research findings{verdict_str}:\n\n{result.findings}"
 
     if name == "web_search":
         try:

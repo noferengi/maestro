@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Card Story — TheMaestro</title>
+    <link rel="stylesheet" href="/static/style.css?v=24">
+    <link rel="stylesheet" href="/static/story.css?v=2">
+</head>
+<body class="story-body">
+
+    <!-- Top header bar -->
+    <div class="story-header">
+        <div class="story-header-left">
+            <a href="/" class="story-back-btn">&larr; Board</a>
+            <div class="story-title-block">
+                <span id="story-task-title" class="story-task-title">Loading…</span>
+                <span id="story-stage-badge" class="story-stage-badge"></span>
+                <span id="story-project-badge" class="story-project-badge"></span>
+            </div>
+        </div>
+        <div class="story-header-right">
+            <span id="story-meta" class="story-meta"></span>
+            <a id="story-diag-link" class="story-diag-link" href="#" target="_blank">Diagnostics &rarr;</a>
+            <button class="story-refresh-btn" onclick="loadStory()">&#8635; Refresh</button>
+        </div>
+    </div>
+
+    <!-- Timeline body -->
+    <div class="story-body-scroll" id="story-scroll">
+        <div class="story-timeline" id="story-timeline">
+            <p class="story-empty">Loading session history…</p>
+        </div>
+    </div>
+
+    <script src="/static/story.js?v=2"></script>
+</body>
+</html>

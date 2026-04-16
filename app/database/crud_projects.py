@@ -117,7 +117,7 @@ def delete_project(name: str) -> bool:
         from .models import ArchGenJob
         from datetime import datetime, timezone
         (db.query(ArchGenJob)
-           .filter(ArchGenJob.project == name,
+           .filter(ArchGenJob.project_id == project.id,
                    ArchGenJob.status.in_(['pending', 'running']))
            .update({"status": "cancelled", "completed_at": datetime.now(timezone.utc)},
                    synchronize_session=False))

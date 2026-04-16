@@ -58,6 +58,7 @@ async def execute_arch_gen_job(
     budget_id: int,
     llm_base_url: str,
     llm_model: str,
+    max_context: int | None = None,
 ) -> dict:
     """Fetch file summaries, call the LLM, create the architecture card.
 
@@ -69,6 +70,7 @@ async def execute_arch_gen_job(
 
     from app.database import get_file_summaries_for_project_root, create_task
     from app.agent.llm_client import call_llm
+    from app.agent.config import SUMMARY_CONTEXT_RATIO
 
     summaries = get_file_summaries_for_project_root(project_root)
     if not summaries:
@@ -122,11 +124,11 @@ async def execute_arch_gen_job(
         raise RuntimeError("All file summaries were empty - nothing to synthesise.")
 
     # Cap the summary block to avoid overwhelming the LLM's context window.
-    # Errors at pos ~2050–2316 indicate per-slot context overflow (~2048 tok/slot).
-    # Reducing from 40 000 → 6 000 chars as a diagnostic step: if errors still cluster
-    # at pos ~2050, the problem is content before the summary block; if they disappear,
-    # increase toward the largest value that succeeds.
-    _MAX_SUMMARY_CHARS = 6_000
+    # We use a fraction of the context window (default 10%) to allow space for 
+    # other architectural notes and the generated response.
+    _ratio = SUMMARY_CONTEXT_RATIO if max_context else 0.10
+    _MAX_SUMMARY_CHARS = max(2000, int((max_context or 12000) * _ratio) * 3)
+
     summary_block = "\n".join(lines)
     if len(summary_block) > _MAX_SUMMARY_CHARS:
         # Truncate to the last complete line within the cap.
@@ -135,9 +137,9 @@ async def execute_arch_gen_job(
         summary_block = truncated[:last_nl] if last_nl != -1 else truncated
         kept = summary_block.count("\n") + 1
         logger.warning(
-            "[%s] Summary block truncated to %d lines (%d chars) — "
-            "%d lines omitted. Increase _MAX_SUMMARY_CHARS if coverage is too low.",
-            AGENT_NAME, kept, len(summary_block), len(lines) - kept,
+            "[%s] Summary block truncated to %d lines (%d chars, cap=%d) — "
+            "%d lines omitted.",
+            AGENT_NAME, kept, len(summary_block), _MAX_SUMMARY_CHARS, len(lines) - kept,
         )
 
     messages = [

@@ -89,8 +89,8 @@ body {
 }
 
 .add-project-btn {
-    margin-top: auto;
-    padding: 0.75rem;
+    margin-top: 0.5rem;
+    padding: 0.5rem 0.75rem;
     background: #495057;
     border: none;
     color: #fff;
@@ -98,30 +98,59 @@ body {
     cursor: pointer;
     text-align: left;
     transition: all 0.2s;
+    font-size: 0.85rem;
 }
 
 .add-project-btn:hover {
     background: #6c757d;
 }
 
+/* Sidebar project actions strip */
+#sidebar-project-actions {
+    margin-top: 0.5rem;
+    padding: 0.5rem 0;
+    border-top: 1px solid #343a40;
+    border-bottom: 1px solid #343a40;
+}
+
+#current-project-display {
+    font-size: 0.75rem;
+    color: #adb5bd;
+    margin-bottom: 0.4rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sidebar-action-buttons {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+}
+
+.sidebar-action-btn {
+    position: relative;  /* needed for .inbox-badge absolute positioning */
+    background: #343a40;
+    color: #e9ecef;
+    border: 1px solid #495057;
+    padding: 0.3rem 0.6rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    line-height: 1;
+    transition: background 0.2s, border-color 0.2s;
+}
+.sidebar-action-btn:hover { background: #495057; border-color: #6c757d; }
+
 /* Main Content */
 .main-content {
     flex: 1;
-    padding: 2rem;
-    overflow-y: auto;
-}
-
-.board-header {
+    padding: 0.75rem 1rem;
+    overflow-y: hidden;
     display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 2rem;
-}
-
-.board-title {
-    font-size: 1.5rem;
-    font-weight: 600;
-    color: #212529;
+    flex-direction: column;
+    height: 100vh;
+    min-height: 0;
 }
 
 .refresh-btn {
@@ -290,7 +319,10 @@ body {
 .kanban-board {
     display: flex;
     gap: 1.5rem;
-    height: 100%;
+    flex: 1;
+    min-height: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
 }
 
 .column {
@@ -301,6 +333,8 @@ body {
     display: flex;
     flex-direction: column;
     min-width: 220px;
+    flex-shrink: 0;
+    height: 100%;
 }
 
 .column-header {
@@ -1231,6 +1265,25 @@ body {
     vertical-align: middle;
     cursor: help;
     border: 1px solid rgba(0,0,0,0.1);
+}
+
+/* Intake retry badge — shown on IDEA cards rejected ≥1 time */
+.intake-retry-badge {
+    display: inline-block;
+    background: #fff3cd;
+    color: #664d03;
+    border: 1px solid #ffe69c;
+    font-size: 0.65rem;
+    font-weight: 600;
+    padding: 0.1rem 0.4rem;
+    border-radius: 8px;
+    vertical-align: middle;
+    cursor: help;
+}
+.intake-retry-badge--exhausted {
+    background: #f8d7da;
+    color: #58151c;
+    border-color: #f1aeb5;
 }
 
 /* PIP card — one per PIP, stacked directly below the main task card */

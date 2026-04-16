@@ -41,7 +41,7 @@ from app.agent.config import (
     LLM_BASE_URL,
     LLM_MODEL,
 )
-from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
+from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError, PipelineAbortedError
 from app.database import get_project_path
 from app.agent.verdicts import Verdict
 
@@ -489,8 +489,11 @@ class IntakePipeline:
                 lines = lines[:-1]
             cleaned = "\n".join(lines)
 
+        # raw_decode reads the first valid JSON object and ignores any trailing
+        # explanatory text the LLM may have appended after the JSON block.
+        parsed_content, _ = json.JSONDecoder().raw_decode(cleaned.lstrip())
         return {
-            "content": json.loads(cleaned),
+            "content": parsed_content,
             "prompt_tokens": usage.get("prompt_tokens", 0),
             "completion_tokens": usage.get("completion_tokens", 0),
             "model": data.get("model", self.llm_model),
@@ -537,13 +540,22 @@ class IntakePipeline:
 
     def _error_vote(self, stage: str, error: Exception) -> dict:
         """
-        Build a fallback NEEDS_RESEARCH vote when a stage fails.
+        Build a fallback NEEDS_RESEARCH vote when a stage fails with an
+        application error (bad JSON, schema mismatch, logic error).
 
-        This ensures the pipeline always produces a result even when
-        LLM calls time out, return malformed JSON, or encounter
-        network errors.
+        For infrastructure errors (server down/overloaded, shutdown), raises
+        PipelineAbortedError instead — the card stays in its current stage and
+        the scheduler will re-dispatch when the endpoint recovers.
         """
-        logger.error("Stage '%s' failed with error: %s", stage, error)
+        import httpx
+        if isinstance(error, (
+            httpx.ConnectError, httpx.ConnectTimeout,
+            httpx.ReadTimeout, ShutdownError,
+        )) or (isinstance(error, httpx.HTTPStatusError)
+               and error.response.status_code >= 500):
+            raise PipelineAbortedError(stage, error)
+
+        logger.error("Stage '%s' failed with application error: %s", stage, error)
         return {
             "stage": stage,
             "verdict": VERDICT_NEEDS_RESEARCH,
@@ -606,6 +618,27 @@ class IntakePipeline:
                     "Static analysis cannot proceed. Add this project to the projects table with its filesystem path."
                 )
 
+            # Differentiate empty-project scenarios so the feasibility LLM gets
+            # a meaningful signal instead of silently seeing "0 files parsed".
+            _STATIC_SKIP = {
+                "stage": "static_analysis",
+                "verdict": VERDICT_POSSIBLE,
+                "confidence": 0.3,
+                "raw_response": None,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "model": "static_analysis",
+            }
+            if not os.path.exists(project_root):
+                msg = (
+                    f"WARNING: The project directory '{project_root}' does not exist on disk. "
+                    "There are no files to analyze — this is a brand-new or misconfigured project. "
+                    "Feasibility cannot be assessed from codebase evidence."
+                )
+                return {**_STATIC_SKIP,
+                        "justification": msg,
+                        "static_summary_override": msg}
+
             # Collect Python files from affected areas in scope analysis
             # and fall back to analyzing all Python files in the project
             raw_scope = scope_vote.get("raw_response") or {}
@@ -636,6 +669,16 @@ class IntakePipeline:
                         if f.endswith(".py"):
                             file_paths.append(os.path.join(root, f))
                 file_paths = list(set(os.path.normpath(p) for p in file_paths if os.path.isfile(p)))
+
+            if not file_paths:
+                msg = (
+                    f"NOTE: The project directory '{project_root}' exists but contains no Python "
+                    "(.py) files. The project may use a different language (e.g. Kotlin, Java, JS). "
+                    "Static analysis produced no output. Assess feasibility from the task description alone."
+                )
+                return {**_STATIC_SKIP,
+                        "justification": msg,
+                        "static_summary_override": msg}
 
             loop = asyncio.get_running_loop()
             # Run CPU-bound analysis in a thread executor
@@ -689,9 +732,13 @@ class IntakePipeline:
         current codebase structure, identifies ambiguities, external
         dependencies, and risks.
         """
-        # Build a summary of the static analysis for the LLM
+        # Build a summary of the static analysis for the LLM.
+        # static_summary_override is set when the project dir is missing or has no .py files —
+        # use it verbatim so the LLM sees a clear explanation instead of "0 files parsed".
         static_summary = "No structural data available."
-        if static_vote.get("raw_response") is not None:
+        if static_vote.get("static_summary_override"):
+            static_summary = static_vote["static_summary_override"]
+        elif static_vote.get("raw_response") is not None:
             try:
                 static_summary = json.dumps(static_vote["raw_response"], indent=2, default=str)
             except (TypeError, ValueError):
@@ -798,11 +845,17 @@ class IntakePipeline:
             "total_completion_tokens": sum(v.get("completion_tokens", 0) for v in self.votes),
         }
 
-        # Check for SUBDIVIDE_IDEA - immediate subdivision (Rule 0)
+        # Rule 0: SUBDIVIDE_IDEA requires majority of LLM stages (>=2 of 3).
+        # Static analysis never emits SUBDIVIDE_IDEA, so only LLM stage votes count.
         subdivide_votes = [v for v in self.votes if v["verdict"] == VERDICT_SUBDIVIDE_IDEA]
-        if subdivide_votes:
+        llm_stage_count = sum(1 for v in self.votes if v["stage"] != "static_analysis")
+        subdivide_threshold = max(2, (llm_stage_count // 2) + 1)
+        if len(subdivide_votes) >= subdivide_threshold:
             result["outcome"] = "subdivide"
-            result["summary"] = f"{len(subdivide_votes)} stage(s) voted SUBDIVIDE_IDEA."
+            result["summary"] = (
+                f"{len(subdivide_votes)}/{llm_stage_count} LLM stages voted SUBDIVIDE_IDEA "
+                f"(threshold: {subdivide_threshold})."
+            )
             return result
 
         # Check for REJECTED - immediate rejection

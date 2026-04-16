@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from sqlalchemy import or_, and_
 
 from .session import SessionLocal
-from .models import ResearchJob, FileSummaryJob, OptimizationBenchmark, ArchGenJob
+from .models import ResearchJob, FileSummaryJob, OptimizationBenchmark, ArchGenJob, Project
 
 logger = logging.getLogger(__name__)
 
@@ -406,8 +406,9 @@ def create_arch_gen_job(
     """Insert a new pending arch gen job."""
     db = SessionLocal()
     try:
+        project_id = db.query(Project.id).filter(Project.name == project).scalar()
         job = ArchGenJob(
-            project=project,
+            project_id=project_id,
             category=category,
             llm_id=llm_id,
             budget_id=budget_id,
@@ -434,7 +435,7 @@ def get_pending_arch_gen_jobs(limit: int = 10) -> "list[ArchGenJob]":
     try:
         return (
             db.query(ArchGenJob)
-            .join(Project, ArchGenJob.project == Project.name)
+            .join(Project, ArchGenJob.project_id == Project.id)
             .filter(ArchGenJob.status == 'pending')
             .order_by(ArchGenJob.priority.asc(), ArchGenJob.created_at.asc())
             .limit(limit)
@@ -481,7 +482,7 @@ def get_retriable_arch_gen_jobs(
         cutoff = datetime.utcnow() - timedelta(seconds=failed_cooldown_seconds)
         return (
             db.query(ArchGenJob)
-            .join(Project, ArchGenJob.project == Project.name)
+            .join(Project, ArchGenJob.project_id == Project.id)
             .filter(
                 or_(
                     and_(

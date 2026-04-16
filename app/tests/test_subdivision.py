@@ -39,34 +39,38 @@ class TestSubdivideVerdict:
 # ============================================================
 
 class TestTallyVotesSubdivide:
-    """Rule 0: any SUBDIVIDE_IDEA vote -> outcome='subdivide'."""
+    """Rule 0: majority of LLM stages (>=2 of 3) must vote SUBDIVIDE_IDEA."""
 
-    def test_single_subdivide_vote(self):
+    def test_single_subdivide_vote_does_not_trigger(self):
+        """A single SUBDIVIDE_IDEA vote is no longer sufficient on its own."""
+        # 1/1 LLM stage; threshold = max(2, 1) = 2 → not met
         votes = [
             Vote(stage="scope", verdict=Verdict.SUBDIVIDE_IDEA, confidence=80, justification="Too large"),
         ]
         result = tally_votes(votes)
-        assert result.outcome == "subdivide"
-        assert "SUBDIVIDE_IDEA" in result.summary
+        assert result.outcome != "subdivide"
 
-    def test_subdivide_beats_rejected(self):
-        """Rule 0 fires before Rule 1 (REJECTED)."""
+    def test_majority_subdivide_beats_rejected(self):
+        """Rule 0 fires before Rule 1 when the majority threshold is met."""
+        # 2/2 LLM stages; threshold = max(2, 2) = 2 → fires
         votes = [
             Vote(stage="scope", verdict=Verdict.SUBDIVIDE_IDEA, confidence=80, justification="Too large"),
-            Vote(stage="feasibility", verdict=Verdict.REJECTED, confidence=30, justification="Bad idea"),
+            Vote(stage="feasibility", verdict=Verdict.SUBDIVIDE_IDEA, confidence=75, justification="Too big"),
+            Vote(stage="conflict", verdict=Verdict.REJECTED, confidence=30, justification="Bad idea"),
         ]
         result = tally_votes(votes)
         assert result.outcome == "subdivide"
 
-    def test_subdivide_beats_passed(self):
-        """Even with LIKELY votes, a single SUBDIVIDE_IDEA triggers subdivision."""
+    def test_minority_subdivide_does_not_beat_passed(self):
+        """1/3 SUBDIVIDE_IDEA votes (below threshold) falls through to normal rules."""
+        # 1/3 LLM stages; threshold = max(2, 2) = 2 → not met → falls to 'passed'
         votes = [
             Vote(stage="scope", verdict=Verdict.SUBDIVIDE_IDEA, confidence=85, justification="Too big"),
             Vote(stage="feasibility", verdict=Verdict.LIKELY, confidence=95, justification="Feasible"),
             Vote(stage="conflict", verdict=Verdict.POSSIBLE, confidence=80, justification="No conflicts"),
         ]
         result = tally_votes(votes)
-        assert result.outcome == "subdivide"
+        assert result.outcome == "passed"
 
     def test_no_subdivide_passes_normally(self):
         """Without SUBDIVIDE_IDEA votes, normal rules apply."""
@@ -78,12 +82,13 @@ class TestTallyVotesSubdivide:
         assert result.outcome == "passed"
 
     def test_subdivide_token_counts(self):
-        """Token counts are accumulated correctly in subdivide outcome."""
+        """Token counts are accumulated correctly when Rule 0 fires."""
+        # 2/2 LLM stages; threshold = max(2, 2) = 2 → fires
         votes = [
             Vote(stage="scope", verdict=Verdict.SUBDIVIDE_IDEA, confidence=80,
                  justification="Big", prompt_tokens=100, completion_tokens=50),
-            Vote(stage="feasibility", verdict=Verdict.LIKELY, confidence=92,
-                 justification="OK", prompt_tokens=200, completion_tokens=100),
+            Vote(stage="feasibility", verdict=Verdict.SUBDIVIDE_IDEA, confidence=85,
+                 justification="Also too big", prompt_tokens=200, completion_tokens=100),
         ]
         result = tally_votes(votes)
         assert result.outcome == "subdivide"
@@ -521,6 +526,7 @@ class TestIntakeBuildTallySubdivide:
             llm_id=1,
             project="TheMaestro",  # Required for static analysis
         )
+        # Two LLM stages vote SUBDIVIDE_IDEA; threshold = max(2, 2) = 2 → fires
         pipeline.votes = [
             {
                 "stage": "scope_analysis",
@@ -534,9 +540,9 @@ class TestIntakeBuildTallySubdivide:
             },
             {
                 "stage": "feasibility_analysis",
-                "verdict": "LIKELY",
-                "confidence": 0.95,
-                "justification": "Feasible",
+                "verdict": "SUBDIVIDE_IDEA",
+                "confidence": 0.80,
+                "justification": "Also too large",
                 "raw_response": {},
                 "prompt_tokens": 100,
                 "completion_tokens": 50,

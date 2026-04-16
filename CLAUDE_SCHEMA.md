@@ -456,3 +456,43 @@ Queue for pending/in-progress file summary generation.
 
 ## sqlite_sequence
 Internal SQLite auto-increment tracking table. Do not modify directly.
+
+---
+
+## agent_sessions
+
+One row per agent invocation. Written by the scheduler `_run_*` functions and the
+`@_pipeline_session` decorator in `main.py`. Stays open (no `ended_at`) while the
+agent is running; closed with exit details on completion or error.
+
+| Column | Type | Nullable | Default |
+|---|---|---|---|
+| id | INTEGER | yes (PK AUTOINCREMENT) | — |
+| task_id | TEXT | no | — |
+| agent_type | TEXT | no | — |
+| started_at | TEXT | no | — |
+| ended_at | TEXT | yes | — |
+| turn_count | INTEGER | yes | — |
+| max_turns | INTEGER | yes | — |
+| exit_reason | TEXT | yes | — |
+| exit_summary | TEXT | yes | — |
+| scheduler_reason | TEXT | no | `'scheduler'` |
+| llm_id | INTEGER | yes | — |
+| budget_id | INTEGER | yes | — |
+| prompt_tokens | INTEGER | no | `0` |
+| completion_tokens | INTEGER | no | `0` |
+
+**`agent_type` values:** `intake`, `planning`, `maestro_loop`, `dev_orchestrator`,
+`conceptual_review`, `optimization`, `security`, `full_review`, `pip_preflight`,
+`pip_research`, `pip_resolution`, `subdivision`, `arch_gen`
+
+**`exit_reason` values:** `completed`, `max_turns`, `stalled`, `error`, `shutdown`,
+`passed`, `rejected`, `subdivide`, `pip_blocked`
+
+**`scheduler_reason` values:** `scheduler`, `user_triggered`
+
+**Index:** `(task_id, started_at)` — primary query pattern is sessions for a given task
+ordered by time.
+
+**API:** `GET /api/tasks/{task_id}/agent-sessions` — returns all rows oldest-first with
+a computed `duration_seconds` field (null if still running).

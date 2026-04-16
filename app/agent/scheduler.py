@@ -69,6 +69,19 @@ _llm_session_counts: dict[int, int] = defaultdict(int)
 _llm_counts_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
+# Dreamer state
+# ---------------------------------------------------------------------------
+# project_name -> timestamp (float) of the most recent pipeline activity we
+# observed for that project.  Initialised to now() when the project is first
+# seen so new projects get a grace period before Dreamer fires.
+_project_last_activity: dict[str, float] = {}
+_project_last_activity_lock = threading.Lock()
+
+# Projects that currently have a Dreamer thread running.
+_active_dreamer_projects: set[str] = set()
+_active_dreamer_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
 # External pipeline session registry
 # ---------------------------------------------------------------------------
 # API-triggered pipelines (intake, planning, review, etc.) run as FastAPI
@@ -217,15 +230,62 @@ def wait_for_completion(key: str, timeout: float = 120.0) -> bool:
     return ev.wait(timeout=timeout)
 
 
+def park_session(session_key: str, llm_id: int) -> None:
+    """Temporarily release an agent's LLM slot while it waits for a child job.
+
+    The thread stays in ``_active_sessions`` so the scheduler won't re-dispatch
+    the task, but the LLM-id entry is removed from ``_session_llm_ids`` and the
+    per-LLM count is decremented so the scheduler can assign that freed slot to
+    the child research job.
+
+    Must be paired with a matching ``unpark_session`` call.
+    """
+    with _active_sessions_lock:
+        removed_lid = _session_llm_ids.pop(session_key, None)
+    if removed_lid is not None:
+        with _llm_counts_lock:
+            _llm_session_counts[removed_lid] = max(0, _llm_session_counts[removed_lid] - 1)
+        logger.debug(
+            "[scheduler] Parked session '%s' (LLM %d freed for child job).",
+            session_key, removed_lid,
+        )
+
+
+def unpark_session(session_key: str, llm_id: int) -> None:
+    """Re-register an agent's LLM slot after its child job completes.
+
+    Call once the child job's completion event fires and the agent is about to
+    resume issuing LLM calls.
+    """
+    with _active_sessions_lock:
+        if session_key in _active_sessions:
+            _session_llm_ids[session_key] = llm_id
+        else:
+            # Thread was cleaned up while parked — re-insert the current thread so
+            # the scheduler still knows this session is alive.
+            _active_sessions[session_key] = threading.current_thread()
+            _session_llm_ids[session_key] = llm_id
+    with _llm_counts_lock:
+        _llm_session_counts[llm_id] += 1
+    logger.debug(
+        "[scheduler] Unparked session '%s' (LLM %d re-acquired).",
+        session_key, llm_id,
+    )
+
+
 # task_id -> timestamp of last failed dispatch (cooldown to avoid retry storms)
 _failed_cooldowns: dict[str, float] = {}
 _FAIL_COOLDOWN_SECONDS = 60.0  # Wait 60s before retrying a failed task
 
 # task_id -> timestamp of last rejected intake run (longer inter-retry backoff)
-# Rejection means "not ready yet", not "permanently blocked" - always retry.
+# Rejection means "not ready yet", not "permanently blocked" — always retry unless exhausted.
 _rejection_cooldowns: dict[str, float] = {}
 _REJECTION_RETRY_COOLDOWN = 300.0   # 5 min between retries
-_MAX_REJECTIONS_BEFORE_SUBDIVIDE = 3  # force subdivision after this many consecutive rejections
+
+# Planning gate failure limits.  After this many failed gate attempts the task
+# is demoted back to IDEA and a forced-subdivide record is written so the
+# stranded-subdivision detector can break it into smaller pieces.
+_MAX_PLANNING_GATE_FAILURES = 5
 
 # Background job retry / rescue parameters.
 # Failed file-summary and research jobs are reset to 'pending' after these cooldowns
@@ -812,10 +872,13 @@ def _tick() -> None:
         if task_type not in SCHEDULER_DISPATCHABLE_TYPES:
             continue
 
-        # For 'idea' tasks, skip ones already successfully processed; retry rejected
-        # ones after a cooldown, and force subdivision after repeated rejections.
+        # For 'idea' tasks: skip exhausted tasks (human reset required), skip ones
+        # already successfully processed, and retry rejected ones after a cooldown.
         if task_type == "idea":
-            from app.database import get_transition_results
+            from app.database import get_transition_results, get_task as _get_task_dispatch
+            _db_task = _get_task_dispatch(task_id)
+            if _db_task and _db_task.intake_exhausted_at:
+                continue  # Intake exhausted — human must reset via /reset-intake
             existing = get_transition_results(task_id, transition="idea_to_planning")
             if existing:
                 latest_outcome = existing[0].outcome
@@ -842,6 +905,13 @@ def _tick() -> None:
                     task_id, task_type,
                 )
                 continue
+
+        # Planning-gate rejection cooldown (5 min) — mirrors the intake rejection
+        # cooldown so a task that keeps failing the gate doesn't spin hot.
+        if task_type == "planning":
+            if task_id in _rejection_cooldowns:
+                if time.time() - _rejection_cooldowns[task_id] < _REJECTION_RETRY_COOLDOWN:
+                    continue
 
         # Cooldown after failure - don't retry for 60s
         if task_id in _failed_cooldowns:
@@ -945,6 +1015,209 @@ def _tick() -> None:
     _dispatch_stranded_subdivisions(
         allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
     )
+
+    # 7. Dreamer: resurrect stalled projects (fires when no pipeline progress for N ticks)
+    _dispatch_dreamer()
+
+
+def _project_has_dreamer_signal(project) -> bool:
+    """Return True if the project has enough signal for the Dreamer to operate on.
+
+    A project has signal when at least one of the following is true:
+      - Its filesystem path contains source files (substantive codebase exists).
+      - It has at least one ACTIVE task of any type (human or AI placed work here).
+
+    Soft-deleted tasks are deliberately excluded — they represent cleaned-up
+    history, not current intent.  A project the user has emptied and whose
+    filesystem path is empty or absent is a placeholder shell; the Dreamer
+    has nothing to latch onto.
+    """
+    import os
+    from app.database.session import SessionLocal
+    from app.database.models import Task
+
+    # Check for any ACTIVE task (arch cards, idea cards, pipeline tasks)
+    db = SessionLocal()
+    try:
+        any_task = (
+            db.query(Task.id)
+              .filter(Task.project_id == project.id, Task.is_active == True)
+              .limit(1)
+              .first()
+        )
+        if any_task:
+            return True
+    except Exception:
+        pass
+    finally:
+        db.close()
+
+    # Check if the project path contains any source files
+    if project.path and os.path.isdir(project.path):
+        for _root, dirs, files in os.walk(project.path):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            if files:
+                return True
+
+    return False
+
+
+def _dispatch_dreamer() -> None:
+    """Fire a DreamerAgent for any project that has been stalled long enough.
+
+    "Stalled" = no TransitionResult created for the project's tasks in the last
+    DREAMER_STALL_TICKS * SCHEDULER_TICK_INTERVAL seconds.
+
+    One Dreamer per project at a time.  Dreamer threads are daemon threads and
+    do NOT count against the one-LLM-at-a-time policy — they consume one LLM
+    slot but are not tracked in _active_sessions.  This keeps them decoupled
+    from normal pipeline dispatch.
+    """
+    from app.agent.config import (
+        DREAMER_ENABLED, DREAMER_STALL_TICKS, SCHEDULER_TICK_INTERVAL,
+    )
+    if not DREAMER_ENABLED:
+        return
+    if is_shutting_down():
+        return
+
+    from app.database import get_all_projects, get_tasks_by_project, get_llm
+    from app.database import get_transition_results
+    from app.database.session import SessionLocal
+    from app.database.models import TransitionResult, Task
+
+    stall_threshold_secs = DREAMER_STALL_TICKS * SCHEDULER_TICK_INTERVAL
+    now = time.time()
+
+    projects = get_all_projects()
+    for project in projects:
+        project_name = project.name
+
+        # Skip projects without an LLM or budget configured
+        if not project.llm_id or not project.budget_id:
+            continue
+
+        # Skip if a Dreamer is already running for this project
+        with _active_dreamer_lock:
+            if project_name in _active_dreamer_projects:
+                continue
+
+        # Determine last pipeline activity time for this project via DB
+        try:
+            db = SessionLocal()
+            try:
+                # Find the max created_at of any TransitionResult whose task belongs to this project
+                result = (
+                    db.query(TransitionResult.created_at)
+                      .join(Task, Task.id == TransitionResult.task_id)
+                      .filter(Task.project_id == project.id, Task.is_active == True)
+                      .order_by(TransitionResult.created_at.desc())
+                      .first()
+                )
+            finally:
+                db.close()
+            last_tr_time: float | None = None
+            if result and result[0]:
+                tr_dt = result[0]
+                if hasattr(tr_dt, "timestamp"):
+                    last_tr_time = tr_dt.timestamp()
+                else:
+                    # Stored as ISO string in some rows
+                    try:
+                        last_tr_time = datetime.fromisoformat(str(tr_dt)).timestamp()
+                    except Exception:
+                        last_tr_time = None
+        except Exception as exc:
+            logger.debug("[Dreamer] Activity query failed for '%s': %s", project_name, exc)
+            continue
+
+        # Initialise the grace-period clock on first sight
+        with _project_last_activity_lock:
+            if project_name not in _project_last_activity:
+                _project_last_activity[project_name] = last_tr_time or now
+            # Update stored value if DB shows more recent activity
+            if last_tr_time and last_tr_time > _project_last_activity[project_name]:
+                _project_last_activity[project_name] = last_tr_time
+            last_activity = _project_last_activity[project_name]
+
+        if (now - last_activity) < stall_threshold_secs:
+            continue  # project is active — skip
+
+        # Guard: only fire when the project has substantive signal to work with.
+        # An empty project (no files, no tasks, no arch cards) has no intent for
+        # the Dreamer to latch onto.  The Dreamer's own survey mode handles the
+        # distinction between "has files but no active tasks" vs "truly empty".
+        if not _project_has_dreamer_signal(project):
+            logger.debug(
+                "[Dreamer] Skipping '%s' — no signal (empty project: no files, "
+                "no tasks, no arch cards).",
+                project_name,
+            )
+            continue
+
+        # Fire Dreamer
+        llm = get_llm(project.llm_id)
+        if not llm:
+            continue
+        llm_base_url = f"http://{llm.address}:{llm.port}/v1"
+        llm_model    = llm.model
+
+        logger.info(
+            "[Dreamer] Project '%s' stalled for %.0fs — starting DreamerAgent.",
+            project_name, now - last_activity,
+        )
+
+        with _active_dreamer_lock:
+            _active_dreamer_projects.add(project_name)
+        # Reset the activity clock so we don't fire again immediately after completion
+        with _project_last_activity_lock:
+            _project_last_activity[project_name] = now
+
+        _start_dreamer_thread(
+            project_name=project_name,
+            project_path=project.path,
+            llm_id=project.llm_id,
+            budget_id=project.budget_id,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+        )
+
+
+def _start_dreamer_thread(
+    project_name: str,
+    project_path: "str | None",
+    llm_id: int,
+    budget_id: int,
+    llm_base_url: str,
+    llm_model: str,
+) -> None:
+    """Spawn a daemon thread that runs DreamerAgent.run() for one project."""
+    import asyncio as _asyncio
+    from app.agent.dreamer import DreamerAgent
+
+    def _run():
+        loop = _asyncio.new_event_loop()
+        _asyncio.set_event_loop(loop)
+        try:
+            agent = DreamerAgent(
+                project_name=project_name,
+                project_path=project_path,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+            )
+            loop.run_until_complete(agent.run())
+        except Exception as exc:
+            logger.exception("[Dreamer] Thread for '%s' raised: %s", project_name, exc)
+        finally:
+            loop.close()
+            with _active_dreamer_lock:
+                _active_dreamer_projects.discard(project_name)
+            logger.debug("[Dreamer] Thread for '%s' exited.", project_name)
+
+    t = threading.Thread(target=_run, daemon=True, name=f"dreamer-{project_name[:24]}")
+    t.start()
 
 
 def _dispatch_file_summary_jobs(
@@ -1207,6 +1480,12 @@ def _run_research_job(job: Any, llm: Any) -> None:
     finally:
         with _llm_counts_lock:
             _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
+        # Wake any agent that called launch_research_agent and is parked waiting.
+        signal_completion(f"research_job_{job.id}")
+        with _active_sessions_lock:
+            _active_sessions.pop(f"research-{job.id}", None)
+            _session_llm_ids.pop(f"research-{job.id}", None)
+            _session_titles.pop(f"research-{job.id}", None)
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
         except Exception:
@@ -1299,6 +1578,7 @@ def _run_arch_gen_job(job: Any, llm: Any) -> None:
             budget_id=job.budget_id,
             llm_base_url=llm_base_url,
             llm_model=llm.model,
+            max_context=getattr(llm, 'max_context', None),
         ))
         update_arch_gen_job(
             job.id,
@@ -1345,7 +1625,7 @@ def _run_pip_preflight_and_gate(
     Returns False — one or more PIPs failed; pip_resolution_jobs were created and
                     the stage pipeline must NOT run.
     """
-    from app.database import get_pips_for_task
+    from app.database import get_pips_for_task, create_agent_session, close_agent_session
     from app.agent.pip_agent import run_pip_preflight
 
     pips = get_pips_for_task(task_id)
@@ -1357,21 +1637,40 @@ def _run_pip_preflight_and_gate(
         task_id, len(pips), stage,
     )
 
+    _session_id = create_agent_session(
+        task_id=task_id,
+        agent_type="pip_preflight",
+        llm_id=llm_id,
+        budget_id=budget_id,
+        scheduler_reason="scheduler",
+    )
+
     preflight = loop.run_until_complete(
         run_pip_preflight(task_id, stage, llm_id, budget_id, project_path)
     )
 
     if preflight["all_passed"]:
+        n = len(preflight["results"])
         logger.info(
             "[pip_preflight] Task '%s' — all PIPs passed at stage '%s'. Proceeding.",
             task_id, stage,
         )
+        close_agent_session(
+            _session_id, "passed",
+            exit_summary=f"All {n}/{n} PIPs passed at stage '{stage}'.",
+        )
         return True
 
     failed = [r for r in preflight["results"] if r["outcome"] != "passed"]
+    total = len(preflight["results"])
+    snippets = "; ".join(r.get("summary", "")[:80] for r in failed[:3])
     logger.warning(
         "[pip_preflight] Task '%s' — %d PIP(s) failed at stage '%s'. Scheduling resolution.",
         task_id, len(failed), stage,
+    )
+    close_agent_session(
+        _session_id, "pip_blocked",
+        exit_summary=f"{len(failed)}/{total} PIPs failed at stage '{stage}': {snippets}",
     )
     _schedule_pip_resolution_jobs(task_id, failed, stage)
     return False
@@ -1506,11 +1805,22 @@ def _run_pip_resolution_research(job: Any, task: Any, llm: Any) -> None:
     from app.database import (
         update_pip_resolution_job, get_pips_for_task,
         get_latest_pip_verification, get_project_path as _get_project_path,
+        create_agent_session, close_agent_session,
     )
     from app.agent.project_snapshot import build_project_snapshot
 
     research_key = f"pip_research_{job.pip_id}"
     job_key = f"pip-research-{job.pip_id}"
+
+    _session_id = create_agent_session(
+        task_id=job.task_id,
+        agent_type="pip_research",
+        llm_id=getattr(task, "llm_id", None),
+        budget_id=getattr(task, "budget_id", None),
+        scheduler_reason="scheduler",
+    )
+    _exit_reason = "error"
+    _exit_summary = ""
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -1549,15 +1859,22 @@ def _run_pip_resolution_research(job: Any, task: Any, llm: Any) -> None:
             )
         )
         update_pip_resolution_job(job.id, research_findings=response_text)
+        _exit_reason = "completed"
+        _exit_summary = f"Research findings recorded for pip {job.pip_id}."
         logger.info("[pip_resolution] Research complete for pip %d.", job.pip_id)
 
     except ShutdownError:
+        _exit_reason = "shutdown"
+        _exit_summary = f"Server shutdown during pip research for pip {job.pip_id}."
         logger.info("[pip_resolution] Research for pip %d aborted (shutdown).", job.pip_id)
         update_pip_resolution_job(job.id, status="failed")
     except Exception:
+        _exit_reason = "error"
+        _exit_summary = f"Exception during pip research for pip {job.pip_id}."
         logger.exception("[pip_resolution] Research for pip %d failed.", job.pip_id)
         update_pip_resolution_job(job.id, status="failed")
     finally:
+        close_agent_session(_session_id, _exit_reason, _exit_summary)
         signal_completion(research_key)
         with _active_sessions_lock:
             _active_sessions.pop(job_key, None)
@@ -1584,12 +1901,25 @@ def _run_pip_resolution_agent(job: Any, task: Any, llm: Any) -> None:
     from app.database import (
         update_pip_resolution_job, get_pips_for_task,
         get_latest_pip_verification, get_project_path as _get_project_path,
-        get_llm,
+        get_llm, create_agent_session, close_agent_session,
     )
     from app.agent.pip_resolution import PIPResolutionAgent
+    from app.agent.config import MAX_TURNS as _PIP_MAX_TURNS
 
     resolve_key = f"pip-resolve-{job.pip_id}"
     completion_key = f"pip_resolution_{job.pip_id}"
+
+    _session_id = create_agent_session(
+        task_id=job.task_id,
+        agent_type="pip_resolution",
+        llm_id=getattr(task, "llm_id", None),
+        budget_id=getattr(task, "budget_id", None),
+        scheduler_reason="scheduler",
+        max_turns=_PIP_MAX_TURNS,
+    )
+    _exit_reason = "error"
+    _exit_summary = ""
+    _turn_count = None
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -1640,6 +1970,9 @@ def _run_pip_resolution_agent(job: Any, task: Any, llm: Any) -> None:
         result = loop.run_until_complete(agent.run())
         status = result.get("status", "done")
         turns = result.get("turns", 0)
+        _turn_count = turns
+        _exit_reason = status if status in ("stalled", "max_turns") else ("completed" if status == "done" else "error")
+        _exit_summary = f"PIP resolution agent finished: status={status}, turns={turns}."
         logger.info(
             "[pip_resolution] pip %d task '%s' — agent finished status=%s turns=%d.",
             job.pip_id, job.task_id, status, turns,
@@ -1648,12 +1981,17 @@ def _run_pip_resolution_agent(job: Any, task: Any, llm: Any) -> None:
         update_pip_resolution_job(job.id, status=db_status)
 
     except ShutdownError:
+        _exit_reason = "shutdown"
+        _exit_summary = f"Server shutdown during pip resolution for pip {job.pip_id}."
         logger.info("[pip_resolution] pip %d — shutdown.", job.pip_id)
         update_pip_resolution_job(job.id, status="failed")
     except Exception:
+        _exit_reason = "error"
+        _exit_summary = f"Unexpected error during pip resolution for pip {job.pip_id}."
         logger.exception("[pip_resolution] pip %d — unexpected error.", job.pip_id)
         update_pip_resolution_job(job.id, status="failed")
     finally:
+        close_agent_session(_session_id, _exit_reason, _exit_summary, turn_count=_turn_count)
         signal_completion(completion_key)
         with _active_sessions_lock:
             _active_sessions.pop(resolve_key, None)
@@ -1866,6 +2204,7 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
     from app.database import (
         get_task, get_all_tasks, update_task,
         create_transition_vote, create_transition_result,
+        create_agent_session, close_agent_session,
     )
 
     task = get_task(task_id)
@@ -1877,6 +2216,18 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
     if not task.description or not task.llm_id or not task.budget_id:
         logger.debug("Task '%s' missing required fields for intake, skipping.", task_id)
         return
+
+    _session_id = create_agent_session(
+        task_id=task_id,
+        agent_type="intake",
+        llm_id=task.llm_id,
+        budget_id=task.budget_id,
+        scheduler_reason="scheduler",
+    )
+    _exit_reason = "error"
+    _exit_summary = ""
+    _prompt_tokens = 0
+    _completion_tokens = 0
 
     all_tasks = get_all_tasks()
     task_dicts = [_task_to_mini_dict(t) for t in all_tasks]
@@ -1897,11 +2248,40 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
                 project=task.project or None,  # Must be configured or pipeline will fail
             )
         )
+        _exit_reason = result.get("outcome", "error")
+        _prompt_tokens = result.get("total_prompt_tokens", 0)
+        _completion_tokens = result.get("total_completion_tokens", 0)
+        reasons = result.get("rejection_reasons", [])
+        _exit_summary = "; ".join(reasons[:3]) if reasons else result.get("outcome", "")
     except ShutdownError:
+        _exit_reason = "shutdown"
+        _exit_summary = "Server shutdown during intake."
         logger.info("[intake] Task '%s' aborted due to server shutdown.", task_id)
+        close_agent_session(_session_id, _exit_reason, _exit_summary,
+                            prompt_tokens=_prompt_tokens, completion_tokens=_completion_tokens)
+        try:
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
         return
     except Exception:
+        _exit_reason = "error"
+        _exit_summary = "Pipeline raised an unexpected exception."
         logger.exception("[intake] Pipeline for '%s' failed.", task_id)
+        close_agent_session(_session_id, _exit_reason, _exit_summary,
+                            prompt_tokens=_prompt_tokens, completion_tokens=_completion_tokens)
+        try:
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
         return
 
     try:
@@ -1938,46 +2318,41 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
             _handle_subdivision_outcome(task, result, llm_base_url, llm_model, max_context, loop)
             logger.info("Task '%s' intake result: subdivide (subdivision dispatched via scheduler).", task_id)
         else:
-            # Rejected - count how many consecutive non-passing results this task has.
-            # After _MAX_REJECTIONS_BEFORE_SUBDIVIDE attempts, force subdivision so the
-            # idea is broken into smaller pieces that can each be researched independently.
-            # Otherwise, schedule a retry after _REJECTION_RETRY_COOLDOWN seconds.
+            # Rejected — count all intake rejection results for this task.
+            # After MAX_INTAKE_REJECTIONS attempts, mark as intake-exhausted so the
+            # scheduler stops auto-retrying. Human must reset via /reset-intake.
             from app.database import get_transition_results as _gtr
             all_results = _gtr(task_id, transition="idea_to_planning") or []
             rejection_count = sum(
                 1 for r in all_results
-                if r.outcome not in ("passed", "subdivide")
+                if r.outcome in ("rejected", "needs_research")
             )
-            if rejection_count >= _MAX_REJECTIONS_BEFORE_SUBDIVIDE:
-                logger.info(
-                    "Task '%s' rejected %d time(s) - forcing subdivision.",
+            MAX_INTAKE_REJECTIONS = 3
+            if rejection_count >= MAX_INTAKE_REJECTIONS:
+                from datetime import datetime as _dt
+                from app.database import update_task as _update_task, append_task_history as _ath
+                _update_task(task_id, intake_exhausted_at=_dt.utcnow().isoformat())
+                _ath(
+                    task_id, "intake_exhausted",
+                    message=(
+                        f"Intake pipeline rejected {rejection_count} times. "
+                        f"Manual review required. Use Reset Intake to retry."
+                    ),
+                )
+                logger.warning(
+                    "[intake] Task '%s' intake exhausted after %d rejections — stopping auto-retry.",
                     task_id, rejection_count,
                 )
-                # Write a subdivide transition result so _dispatch_stranded_subdivisions
-                # picks this task up on the next tick and runs the subdivision agent.
-                from app.database import create_transition_result as _ctr
-                _ctr(
-                    task_id=task_id,
-                    transition="idea_to_planning",
-                    outcome="subdivide",
-                    vote_summary={
-                        "outcome": "subdivide",
-                        "forced": True,
-                        "reason": f"Forced after {rejection_count} rejections",
-                        "votes": [],
-                    },
-                    total_prompt_tokens=0,
-                    total_completion_tokens=0,
-                )
-                # Leave task type as 'idea' so the stranded-subdivision detector fires.
             else:
                 _rejection_cooldowns[task_id] = time.time()
                 logger.info(
-                    "Task '%s' rejected (attempt %d/%d) - retry in %ds.",
-                    task_id, rejection_count, _MAX_REJECTIONS_BEFORE_SUBDIVIDE,
+                    "[intake] Task '%s' rejected (attempt %d/%d) — retry in %ds.",
+                    task_id, rejection_count, MAX_INTAKE_REJECTIONS,
                     int(_REJECTION_RETRY_COOLDOWN),
                 )
     finally:
+        close_agent_session(_session_id, _exit_reason, _exit_summary,
+                            prompt_tokens=_prompt_tokens, completion_tokens=_completion_tokens)
         try:
             loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
         except Exception:
@@ -1997,11 +2372,24 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
     from app.agent.planning import run_planning_pipeline
     from app.agent.planning_gate import run_planning_gate
     from app.database import update_task, get_task, get_all_tasks, create_transition_result, task_to_dict
+    from app.database import create_agent_session, close_agent_session
 
     task = get_task(task_id)
     if not task:
         return
     all_tasks = [task_to_dict(t) for t in get_all_tasks()]
+
+    _session_id = create_agent_session(
+        task_id=task_id,
+        agent_type="planning",
+        llm_id=llm_id,
+        budget_id=budget_id,
+        scheduler_reason="scheduler",
+    )
+    _exit_reason = "error"
+    _exit_summary = ""
+    _prompt_tokens = 0
+    _completion_tokens = 0
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -2023,13 +2411,16 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
         )
 
         # 2. Store transition result
+        _exit_reason = result.get("outcome", "error")
+        _prompt_tokens = result.get("total_prompt_tokens", 0)
+        _completion_tokens = result.get("total_completion_tokens", 0)
         create_transition_result(
             task_id=task_id,
             transition="planning_to_indev",
             outcome=result.get("outcome", "unknown"),
             vote_summary=result,
-            total_prompt_tokens=result.get("total_prompt_tokens", 0),
-            total_completion_tokens=result.get("total_completion_tokens", 0),
+            total_prompt_tokens=_prompt_tokens,
+            total_completion_tokens=_completion_tokens,
         )
 
         if result.get("outcome") == "passed":
@@ -2048,18 +2439,99 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
                 )
             )
             if gate_result.get("passed"):
+                _exit_summary = "Planning passed and gate checks confirmed. Advanced to INDEV."
                 update_task(task_id, type="indev")
                 logger.info("[planning] Task '%s' advanced to IN DEV.", task_id)
             else:
+                _exit_reason = "rejected"
+                _exit_summary = "Planning pipeline passed but gate checks failed."
                 logger.warning("[planning] Task '%s' failed planning gate.", task_id)
+                # Record the gate failure as a separate transition so we can count
+                # it reliably (the entry written above has outcome="passed" because
+                # the planning *pipeline* passed; only the gate check failed).
+                create_transition_result(
+                    task_id=task_id,
+                    transition="planning_gate",
+                    outcome="rejected",
+                    vote_summary=gate_result,
+                    total_prompt_tokens=gate_result.get("prompt_tokens", 0),
+                    total_completion_tokens=gate_result.get("completion_tokens", 0),
+                )
+                from app.database import get_transition_results as _gtr_plan
+                prior_gate = _gtr_plan(task_id, transition="planning_gate") or []
+                gate_fail_count = len(prior_gate)
+                if gate_fail_count >= _MAX_PLANNING_GATE_FAILURES:
+                    logger.warning(
+                        "[planning] Task '%s' failed planning gate %d time(s) — "
+                        "demoting to IDEA for forced subdivision.",
+                        task_id, gate_fail_count,
+                    )
+                    update_task(task_id, type="idea")
+                    create_transition_result(
+                        task_id=task_id,
+                        transition="idea_to_planning",
+                        outcome="subdivide",
+                        vote_summary={
+                            "outcome": "subdivide",
+                            "forced": True,
+                            "reason": f"Forced after {gate_fail_count} planning gate failures",
+                            "votes": [],
+                        },
+                        total_prompt_tokens=0,
+                        total_completion_tokens=0,
+                    )
+                    _exit_summary = (
+                        f"Planning gate failed {gate_fail_count} time(s) — "
+                        "demoted to IDEA for forced subdivision."
+                    )
+                else:
+                    # Not at the cap yet — apply a 5-min cooldown so the scheduler
+                    # doesn't immediately re-dispatch the same failing plan.
+                    _rejection_cooldowns[task_id] = time.time()
+                    logger.info(
+                        "[planning] Task '%s' gate failure %d/%d — retry in %ds.",
+                        task_id, gate_fail_count, _MAX_PLANNING_GATE_FAILURES,
+                        int(_REJECTION_RETRY_COOLDOWN),
+                    )
         else:
-            logger.info("[planning] Task '%s' planning result: %s", task_id, result.get('outcome'))
+            outcome = result.get("outcome", "unknown")
+            _exit_summary = f"Planning outcome: {outcome}"
+            logger.info("[planning] Task '%s' planning result: %s", task_id, outcome)
+            # If the planning pipeline itself voted to subdivide (plan too broad/deep),
+            # demote back to IDEA immediately so the stranded-subdivision detector
+            # can break it into smaller pieces on the next scheduler tick.
+            if outcome == "subdivide":
+                logger.info(
+                    "[planning] Task '%s' planning voted subdivide — demoting to IDEA.",
+                    task_id,
+                )
+                update_task(task_id, type="idea")
+                create_transition_result(
+                    task_id=task_id,
+                    transition="idea_to_planning",
+                    outcome="subdivide",
+                    vote_summary={
+                        "outcome": "subdivide",
+                        "forced": False,
+                        "reason": result.get("scope_reason", "Planning pipeline voted subdivide"),
+                        "votes": [],
+                    },
+                    total_prompt_tokens=0,
+                    total_completion_tokens=0,
+                )
+                _exit_summary = "Planning voted subdivide — demoted to IDEA for subdivision."
 
     except ShutdownError:
+        _exit_reason = "shutdown"
+        _exit_summary = "Server shutdown during planning pipeline."
         logger.info("[planning] Pipeline for '%s' aborted due to server shutdown.", task_id)
     except Exception:
+        _exit_reason = "error"
+        _exit_summary = "Planning pipeline raised an unexpected exception."
         logger.exception("[planning] Pipeline for '%s' failed.", task_id)
     finally:
+        close_agent_session(_session_id, _exit_reason, _exit_summary,
+                            prompt_tokens=_prompt_tokens, completion_tokens=_completion_tokens)
         try:
             loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
         except Exception:
@@ -2077,11 +2549,27 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
                       project_path: str | None = None) -> None:
     """Run the MaestroLoop for a PLANNING/DEVELOPMENT task."""
     from app.agent.loop import MaestroLoop
+    from app.agent.config import MAX_TURNS as _MAX_TURNS
     from app.database import update_task, get_task, get_pips_for_task
+    from app.database import create_agent_session, close_agent_session
+
+    _session_id = None
+    _exit_reason = "error"
+    _exit_summary = ""
+    _turn_count = None
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
+        _session_id = create_agent_session(
+            task_id=task_id,
+            agent_type="maestro_loop",
+            llm_id=llm_id,
+            budget_id=budget_id,
+            scheduler_reason="scheduler",
+            max_turns=_MAX_TURNS,
+        )
+
         maestro = MaestroLoop(
             task_id=task_id,
             llm_base_url=llm_base_url,
@@ -2092,9 +2580,12 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
             project_path=project_path,
         )
         result = loop.run_until_complete(maestro.run())
+        _turn_count = result.turns
+        _exit_summary = result.final_message or ""
 
         # Handle terminal transition
         if result.status == "ACCEPTED":
+            _exit_reason = "completed"
             task = get_task(task_id)
             if not task:
                 return
@@ -2110,12 +2601,13 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
                 logger.info("Task '%s' reached ACCEPTED but current type '%s' has no auto-transition.", task_id, current_type)
 
         elif result.status == "REVERT_TO_DESIGN":
+            _exit_reason = "rejected"
             update_task(task_id, type="planning")
             _record_demotion_inline(task_id, "indev", "planning", result.final_message or "Agent requested revert")
             logger.warning("Task '%s' reverted to PLANNING via scheduler: %s", task_id, result.final_message)
 
-        elif result.status in ("MAX_TURNS", "ERROR"):
-            # Agent exhausted turns or encountered error - still advance task to prevent infinite loops
+        elif result.status == "MAX_TURNS":
+            _exit_reason = "max_turns"
             task = get_task(task_id)
             if not task:
                 return
@@ -2123,16 +2615,36 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
             current_type = (task.type or "").lower()
             if current_type == "planning":
                 update_task(task_id, type="indev")
-                logger.warning("Task '%s' advanced from PLANNING to INDEV (max_turns/error: %s).", task_id, result.status)
+                logger.warning("Task '%s' advanced from PLANNING to INDEV (max_turns).", task_id)
             elif current_type == "indev":
                 update_task(task_id, type="conceptual_review")
-                logger.warning("Task '%s' advanced from INDEV to CONCEPTUAL REVIEW (max_turns/error: %s).", task_id, result.status)
+                logger.warning("Task '%s' advanced from INDEV to CONCEPTUAL REVIEW (max_turns).", task_id)
             else:
-                logger.warning("Task '%s' reached terminal state (%s) but current type '%s' has no auto-transition.", task_id, result.status, current_type)
+                logger.warning("Task '%s' reached terminal state (MAX_TURNS) but current type '%s' has no auto-transition.", task_id, current_type)
+
+        elif result.status == "ERROR":
+            _exit_reason = "error"
+            task = get_task(task_id)
+            if not task:
+                return
+
+            current_type = (task.type or "").lower()
+            if current_type == "planning":
+                update_task(task_id, type="indev")
+                logger.warning("Task '%s' advanced from PLANNING to INDEV (error).", task_id)
+            elif current_type == "indev":
+                update_task(task_id, type="conceptual_review")
+                logger.warning("Task '%s' advanced from INDEV to CONCEPTUAL REVIEW (error).", task_id)
+            else:
+                logger.warning("Task '%s' reached terminal state (ERROR) but current type '%s' has no auto-transition.", task_id, current_type)
 
     except ShutdownError:
+        _exit_reason = "shutdown"
+        _exit_summary = "Server shutdown while loop was running."
         logger.info(f"[{AGENT_NAME}] MaestroLoop for task '%s' aborted due to server shutdown.", task_id)
     except Exception as exc:
+        _exit_reason = "error"
+        _exit_summary = str(exc)
         logger.exception("MaestroLoop failed for task '%s': %s", task_id, exc)
         # Even on exception, try to advance the task to prevent infinite loops
         task = get_task(task_id)
@@ -2145,6 +2657,7 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
                 update_task(task_id, type="conceptual_review")
                 logger.warning("Task '%s' advanced from INDEV to CONCEPTUAL REVIEW (exception).", task_id)
     finally:
+        close_agent_session(_session_id, _exit_reason, _exit_summary, turn_count=_turn_count)
         try:
             loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
         except Exception:
@@ -2164,6 +2677,7 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
     from app.agent.dev_orchestrator import run_dev_orchestrator
     from app.agent.tools import set_task_git_cwd
     from app.database import get_planning_result, update_task
+    from app.database import create_agent_session, close_agent_session
     import json
 
     set_task_git_cwd(project_path)
@@ -2183,6 +2697,18 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
         "test_strategy": json.loads(planning_result_obj.test_strategy or "[]"),
     }
 
+    _session_id = create_agent_session(
+        task_id=task_id,
+        agent_type="dev_orchestrator",
+        llm_id=llm_id,
+        budget_id=budget_id,
+        scheduler_reason="scheduler",
+    )
+    _exit_reason = "error"
+    _exit_summary = ""
+    _prompt_tokens = 0
+    _completion_tokens = 0
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -2196,20 +2722,31 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
                 budget_id=budget_id,
             )
         )
+        _prompt_tokens = result.get("prompt_tokens", 0)
+        _completion_tokens = result.get("completion_tokens", 0)
         if result.get("status") == "ACCEPTED":
+            _exit_reason = "completed"
+            _exit_summary = f"Dev orchestrator completed. {result.get('batches_completed', 0)}/{result.get('total_batches', 0)} batches done."
             update_task(task_id, type="conceptual_review")
             logger.info("Task '%s' advanced to CONCEPTUAL REVIEW via scheduler.", task_id)
-            # Pre-flight PIP gate runs at conceptual_review entry — no separate stage needed.
         else:
+            _exit_reason = "rejected"
+            _exit_summary = result.get("error_detail") or "Dev orchestrator returned non-ACCEPTED status."
             update_task(task_id, type="planning")
             logger.info("Task '%s' reverted to PLANNING: %s", task_id, result.get("error_detail"))
     except ShutdownError:
+        _exit_reason = "shutdown"
+        _exit_summary = "Server shutdown during dev orchestrator."
         logger.info(f"[{AGENT_NAME}] Dev orchestrator for task '%s' aborted due to server shutdown.", task_id)
     except Exception:
+        _exit_reason = "error"
+        _exit_summary = "Dev orchestrator raised an unexpected exception."
         logger.exception(f"[{AGENT_NAME}] Dev orchestrator for task '%s' failed.", task_id)
         update_task(task_id, type="planning")
         _record_demotion_inline(task_id, "indev", "planning", "Exception in dev orchestrator")
     finally:
+        close_agent_session(_session_id, _exit_reason, _exit_summary,
+                            prompt_tokens=_prompt_tokens, completion_tokens=_completion_tokens)
         try:
             loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
         except Exception:
@@ -2231,6 +2768,7 @@ def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
     from app.database import get_task, update_task, get_planning_result
     from app.database import (
         create_transition_vote, create_transition_result,
+        create_agent_session, close_agent_session,
     )
     from datetime import datetime
     import json as _json
@@ -2255,11 +2793,25 @@ def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
         "test_strategy": _json.loads(planning_result_obj.test_strategy or "[]"),
     }
 
+    _session_id = create_agent_session(
+        task_id=task_id,
+        agent_type="conceptual_review",
+        llm_id=llm_id,
+        budget_id=budget_id,
+        scheduler_reason="scheduler",
+    )
+    _exit_reason = "error"
+    _exit_summary = ""
+    _prompt_tokens = 0
+    _completion_tokens = 0
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         # Pre-flight PIP gate — blocks stage entry if any PIP has unmet requirements
         if not _run_pip_preflight_and_gate(task_id, "conceptual_review", llm_id, budget_id, project_path, loop):
+            _exit_reason = "pip_blocked"
+            _exit_summary = "PIP pre-flight gate blocked stage entry."
             return  # card stays in conceptual_review; resolution jobs dispatched
 
         result = loop.run_until_complete(
@@ -2274,13 +2826,17 @@ def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
                 project_path=project_path,
             )
         )
+        _exit_reason = result.get("outcome", "error")
+        _exit_summary = result.get("summary", "")
+        _prompt_tokens = result.get("total_prompt_tokens", 0)
+        _completion_tokens = result.get("total_completion_tokens", 0)
         create_transition_result(
             task_id=task_id,
             transition="conceptual_to_optimization",
             outcome=result.get("outcome", "unknown"),
             vote_summary=result,
-            total_prompt_tokens=result.get("total_prompt_tokens", 0),
-            total_completion_tokens=result.get("total_completion_tokens", 0),
+            total_prompt_tokens=_prompt_tokens,
+            total_completion_tokens=_completion_tokens,
         )
         if result.get("outcome") == "passed":
             update_task(task_id, type="optimization")
@@ -2290,12 +2846,18 @@ def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
             _record_demotion_inline(task_id, "conceptual_review", "indev", result.get("summary", ""))
             logger.info("Task '%s' demoted to INDEV from conceptual review via scheduler.", task_id)
     except ShutdownError:
+        _exit_reason = "shutdown"
+        _exit_summary = "Server shutdown during conceptual review."
         logger.info(f"[{AGENT_NAME}] Conceptual review for task '%s' aborted due to server shutdown.", task_id)
     except Exception:
+        _exit_reason = "error"
+        _exit_summary = "Conceptual review raised an unexpected exception."
         logger.exception(f"[{AGENT_NAME}] Conceptual review for task '%s' failed.", task_id)
         update_task(task_id, type="indev")
         _record_demotion_inline(task_id, "conceptual_review", "indev", "Exception in conceptual review")
     finally:
+        close_agent_session(_session_id, _exit_reason, _exit_summary,
+                            prompt_tokens=_prompt_tokens, completion_tokens=_completion_tokens)
         try:
             loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
         except Exception:
@@ -2318,6 +2880,7 @@ def _run_optimization_security_task(task_id: str, llm_base_url: str, llm_model: 
     from app.database import get_task, update_task
     from app.database import (
         create_transition_vote, create_transition_result,
+        create_agent_session, close_agent_session,
     )
 
     set_task_git_cwd(project_path)
@@ -2326,11 +2889,25 @@ def _run_optimization_security_task(task_id: str, llm_base_url: str, llm_model: 
     if not task:
         return
 
+    # Two separate sessions: one for optimization, one for security.
+    _opt_session_id = create_agent_session(
+        task_id=task_id, agent_type="optimization",
+        llm_id=llm_id, budget_id=budget_id, scheduler_reason="scheduler",
+    )
+    _opt_exit_reason = "error"
+    _opt_exit_summary = ""
+    _sec_session_id = None
+    _sec_exit_reason = "error"
+    _sec_exit_summary = ""
+    _opt_prompt = _opt_compl = _sec_prompt = _sec_compl = 0
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         # Pre-flight PIP gate — runs at optimization stage entry
         if not _run_pip_preflight_and_gate(task_id, "optimization", llm_id, budget_id, project_path, loop):
+            _opt_exit_reason = "pip_blocked"
+            _opt_exit_summary = "PIP pre-flight gate blocked optimization entry."
             return  # card stays in optimization; resolution jobs dispatched
 
         # Run optimization first
@@ -2345,14 +2922,30 @@ def _run_optimization_security_task(task_id: str, llm_base_url: str, llm_model: 
                 project_path=project_path,
             )
         )
+        _opt_exit_reason = opt_result.get("outcome", "error")
+        _opt_exit_summary = opt_result.get("improvement_summary", "")
+        _opt_prompt = opt_result.get("total_prompt_tokens", 0)
+        _opt_compl = opt_result.get("total_completion_tokens", 0)
         logger.info("[optimization] Task '%s' via scheduler: %s", task_id, opt_result.get("outcome"))
+
+        # Close optimization session before starting security
+        close_agent_session(_opt_session_id, _opt_exit_reason, _opt_exit_summary,
+                            prompt_tokens=_opt_prompt, completion_tokens=_opt_compl)
+        _opt_session_id = None  # prevent double-close in finally
 
         # Advance to security stage so the card reflects progress and pre-flight
         # can check requirements at the correct stage.
         update_task(task_id, type="security")
 
+        _sec_session_id = create_agent_session(
+            task_id=task_id, agent_type="security",
+            llm_id=llm_id, budget_id=budget_id, scheduler_reason="scheduler",
+        )
+
         # Pre-flight PIP gate — blocks security entry if any PIP has unmet requirements
         if not _run_pip_preflight_and_gate(task_id, "security", llm_id, budget_id, project_path, loop):
+            _sec_exit_reason = "pip_blocked"
+            _sec_exit_summary = "PIP pre-flight gate blocked security entry."
             return  # card stays in security; resolution jobs dispatched
 
         # Run security review
@@ -2367,13 +2960,17 @@ def _run_optimization_security_task(task_id: str, llm_base_url: str, llm_model: 
                 project_path=project_path,
             )
         )
+        _sec_exit_reason = sec_result.get("outcome", "error")
+        _sec_exit_summary = sec_result.get("summary", "")
+        _sec_prompt = sec_result.get("total_prompt_tokens", 0)
+        _sec_compl = sec_result.get("total_completion_tokens", 0)
         create_transition_result(
             task_id=task_id,
             transition="security_review",
             outcome=sec_result.get("outcome", "unknown"),
             vote_summary=sec_result,
-            total_prompt_tokens=sec_result.get("total_prompt_tokens", 0),
-            total_completion_tokens=sec_result.get("total_completion_tokens", 0),
+            total_prompt_tokens=_sec_prompt,
+            total_completion_tokens=_sec_compl,
         )
 
         if sec_result.get("outcome") == "passed":
@@ -2385,12 +2982,30 @@ def _run_optimization_security_task(task_id: str, llm_base_url: str, llm_model: 
             _record_demotion_inline(task_id, "security", demotion, sec_result.get("summary", ""))
             logger.warning("[security] Task '%s' demoted to %s via scheduler.", task_id, demotion)
     except ShutdownError:
+        _opt_exit_reason = _opt_exit_reason if _opt_session_id else _opt_exit_reason
+        _sec_exit_reason = "shutdown"
+        _sec_exit_summary = "Server shutdown during optimization/security."
+        if _opt_session_id:
+            _opt_exit_reason = "shutdown"
+            _opt_exit_summary = "Server shutdown before optimization completed."
         logger.info(f"[{AGENT_NAME}] Optimization/Security for task '%s' aborted due to server shutdown.", task_id)
     except Exception:
+        if _opt_session_id:
+            _opt_exit_reason = "error"
+            _opt_exit_summary = "Exception during optimization/security pipeline."
+        else:
+            _sec_exit_reason = "error"
+            _sec_exit_summary = "Exception during security pipeline."
         logger.exception(f"[{AGENT_NAME}] Optimization/Security for task '%s' failed.", task_id)
         update_task(task_id, type="indev")
         _record_demotion_inline(task_id, "optimization", "indev", "Exception in optimization/security")
     finally:
+        if _opt_session_id is not None:
+            close_agent_session(_opt_session_id, _opt_exit_reason, _opt_exit_summary,
+                                prompt_tokens=_opt_prompt, completion_tokens=_opt_compl)
+        if _sec_session_id is not None:
+            close_agent_session(_sec_session_id, _sec_exit_reason, _sec_exit_summary,
+                                prompt_tokens=_sec_prompt, completion_tokens=_sec_compl)
         try:
             loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
         except Exception:
@@ -2415,7 +3030,7 @@ def _run_security_task(task_id: str, llm_base_url: str, llm_model: str,
     from app.agent.security_review import run_security_pipeline
     from app.agent.tools import set_task_git_cwd
     from app.database import get_task, update_task
-    from app.database import create_transition_result
+    from app.database import create_transition_result, create_agent_session, close_agent_session
 
     set_task_git_cwd(project_path)
 
@@ -2423,11 +3038,21 @@ def _run_security_task(task_id: str, llm_base_url: str, llm_model: str,
     if not task:
         return
 
+    _session_id = create_agent_session(
+        task_id=task_id, agent_type="security",
+        llm_id=llm_id, budget_id=budget_id, scheduler_reason="scheduler",
+    )
+    _exit_reason = "error"
+    _exit_summary = ""
+    _prompt_tokens = _completion_tokens = 0
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         # Pre-flight PIP gate — blocks security pipeline if any PIP is unmet
         if not _run_pip_preflight_and_gate(task_id, "security", llm_id, budget_id, project_path, loop):
+            _exit_reason = "pip_blocked"
+            _exit_summary = "PIP pre-flight gate blocked security entry."
             return  # card stays in security; resolution jobs dispatched
 
         sec_result = loop.run_until_complete(
@@ -2441,13 +3066,17 @@ def _run_security_task(task_id: str, llm_base_url: str, llm_model: str,
                 project_path=project_path,
             )
         )
+        _exit_reason = sec_result.get("outcome", "error")
+        _exit_summary = sec_result.get("summary", "")
+        _prompt_tokens = sec_result.get("total_prompt_tokens", 0)
+        _completion_tokens = sec_result.get("total_completion_tokens", 0)
         create_transition_result(
             task_id=task_id,
             transition="security_review",
             outcome=sec_result.get("outcome", "unknown"),
             vote_summary=sec_result,
-            total_prompt_tokens=sec_result.get("total_prompt_tokens", 0),
-            total_completion_tokens=sec_result.get("total_completion_tokens", 0),
+            total_prompt_tokens=_prompt_tokens,
+            total_completion_tokens=_completion_tokens,
         )
 
         if sec_result.get("outcome") == "passed":
@@ -2459,12 +3088,18 @@ def _run_security_task(task_id: str, llm_base_url: str, llm_model: str,
             _record_demotion_inline(task_id, "security", demotion, sec_result.get("summary", ""))
             logger.warning("[security] Task '%s' demoted to %s via scheduler.", task_id, demotion)
     except ShutdownError:
+        _exit_reason = "shutdown"
+        _exit_summary = "Server shutdown during security pipeline."
         logger.info(f"[{AGENT_NAME}] Security for task '%s' aborted due to server shutdown.", task_id)
     except Exception:
+        _exit_reason = "error"
+        _exit_summary = "Security pipeline raised an unexpected exception."
         logger.exception(f"[{AGENT_NAME}] Security for task '%s' failed.", task_id)
         update_task(task_id, type="indev")
         _record_demotion_inline(task_id, "security", "indev", "Exception in security pipeline")
     finally:
+        close_agent_session(_session_id, _exit_reason, _exit_summary,
+                            prompt_tokens=_prompt_tokens, completion_tokens=_completion_tokens)
         try:
             loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
         except Exception:
@@ -2486,6 +3121,7 @@ def _run_full_review_task(task_id: str, llm_base_url: str, llm_model: str,
     from app.database import get_task, update_task
     from app.database import (
         create_transition_vote, create_transition_result,
+        create_agent_session, close_agent_session,
     )
 
     set_task_git_cwd(project_path)
@@ -2494,11 +3130,21 @@ def _run_full_review_task(task_id: str, llm_base_url: str, llm_model: str,
     if not task:
         return
 
+    _session_id = create_agent_session(
+        task_id=task_id, agent_type="full_review",
+        llm_id=llm_id, budget_id=budget_id, scheduler_reason="scheduler",
+    )
+    _exit_reason = "error"
+    _exit_summary = ""
+    _prompt_tokens = _completion_tokens = 0
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         # Pre-flight PIP gate — blocks full_review entry if any PIP is unmet
         if not _run_pip_preflight_and_gate(task_id, "full_review", llm_id, budget_id, project_path, loop):
+            _exit_reason = "pip_blocked"
+            _exit_summary = "PIP pre-flight gate blocked full_review entry."
             return  # card stays in full_review; resolution jobs dispatched
 
         result = loop.run_until_complete(
@@ -2512,13 +3158,17 @@ def _run_full_review_task(task_id: str, llm_base_url: str, llm_model: str,
                 project_path=project_path,
             )
         )
+        _exit_reason = result.get("outcome", "error")
+        _exit_summary = result.get("summary", "")
+        _prompt_tokens = result.get("total_prompt_tokens", 0)
+        _completion_tokens = result.get("total_completion_tokens", 0)
         create_transition_result(
             task_id=task_id,
             transition="full_review",
             outcome=result.get("outcome", "unknown"),
             vote_summary=result,
-            total_prompt_tokens=result.get("total_prompt_tokens", 0),
-            total_completion_tokens=result.get("total_completion_tokens", 0),
+            total_prompt_tokens=_prompt_tokens,
+            total_completion_tokens=_completion_tokens,
         )
 
         if result.get("outcome") == "passed":
@@ -2528,15 +3178,17 @@ def _run_full_review_task(task_id: str, llm_base_url: str, llm_model: str,
             pp = project_path
             if not pp and task.project:
                 pp = _get_project_path(task.project)
-            
+
             logger.info("[full_review] Task '%s' passed. Running virtual merge test.", task_id)
             merge_test = execute_merge(task_id, project_path=pp, dry_run=True)
-            
+
             from app.database import append_task_history
             if merge_test.status == "virtual_passed":
+                _exit_summary = "Full review passed. Virtual merge SUCCEEDED."
                 append_task_history(task_id, "ready_for_review", message="Full review passed. Virtual merge/test SUCCEEDED. Ready for final manual review and merge.")
                 logger.info("[full_review] Task '%s' virtual merge SUCCEEDED.", task_id)
             else:
+                _exit_summary = f"Full review passed, but virtual merge FAILED: {merge_test.status}."
                 append_task_history(task_id, "merge_test_failed", message=f"Full review passed, but VIRTUAL MERGE FAILED: {merge_test.status}. Detail: {merge_test.error_detail}")
                 logger.warning("[full_review] Task '%s' virtual merge FAILED: %s", task_id, merge_test.status)
         else:
@@ -2545,12 +3197,18 @@ def _run_full_review_task(task_id: str, llm_base_url: str, llm_model: str,
             _record_demotion_inline(task_id, "full_review", demotion, result.get("summary", ""))
             logger.warning("[full_review] Task '%s' demoted to %s via scheduler.", task_id, demotion)
     except ShutdownError:
+        _exit_reason = "shutdown"
+        _exit_summary = "Server shutdown during full review."
         logger.info(f"[{AGENT_NAME}] Full review for task '%s' aborted due to server shutdown.", task_id)
     except Exception:
+        _exit_reason = "error"
+        _exit_summary = "Full review raised an unexpected exception."
         logger.exception(f"[{AGENT_NAME}] Full review for task '%s' failed.", task_id)
         update_task(task_id, type="indev")
         _record_demotion_inline(task_id, "full_review", "indev", "Exception in full review")
     finally:
+        close_agent_session(_session_id, _exit_reason, _exit_summary,
+                            prompt_tokens=_prompt_tokens, completion_tokens=_completion_tokens)
         try:
             loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
         except Exception:

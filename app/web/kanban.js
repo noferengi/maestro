@@ -271,6 +271,8 @@ function taskFingerprint(task) {
         task.interface_contracts ? '1' : '0',
         (task.tags || []).join(','),
         (task.pips || []).map(p => `${p.id}:${p.status}:${p.last_checked||''}`).join(','),
+        task.intake_exhausted ? '1' : '0',
+        task.intake_rejection_count || 0,
     ].join('|');
 }
 
@@ -1524,7 +1526,7 @@ function startAutoRefresh() {
                 const queueBtn = document.getElementById('scheduler-queue-btn');
                 if (queueBtn) {
                     const total = (data.active || []).length + (data.queued || []).length;
-                    queueBtn.textContent = total > 0 ? `⚙ Queue (${total})` : '⚙ Queue';
+                    queueBtn.textContent = total > 0 ? `⚙ ${total}` : '⚙';
                 }
                 _refreshJobIndicators(data);
             }).catch(() => {});
@@ -1591,7 +1593,6 @@ async function switchProject(projectName) {
     if (matchingTab) matchingTab.classList.add('active');
 
     document.getElementById('current-project-display').textContent = `Selected: ${projectName}`;
-    document.querySelector('.board-title').textContent = projectName;
 
     console.log(`Project switched to: ${projectName}`);
 
@@ -1821,10 +1822,21 @@ function openNewProjectModal() {
     document.getElementById('new-project-path').value = '';
     document.getElementById('new-project-description').value = '';
     document.getElementById('new-project-error').style.display = 'none';
+    document.getElementById('new-project-path-warn').style.display = 'none';
+    document.getElementById('new-project-create-path').checked = false;
     populateProjectLlmSelect('new-project-llm-select', null);
     populateProjectBudgetSelect('new-project-budget-select', null);
     document.getElementById('new-project-modal').classList.add('active');
     document.getElementById('new-project-name').focus();
+}
+
+async function browseFolder(inputId) {
+    try {
+        const resp = await fetch(`${API_BASE}/system/browse-folder`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (data.path) document.getElementById(inputId).value = data.path;
+    } catch (_) { /* picker cancelled or unavailable */ }
 }
 
 function closeNewProjectModal() {
@@ -1839,7 +1851,9 @@ async function saveNewProject() {
     const llm_id = llmVal ? parseInt(llmVal, 10) : null;
     const budgetVal = document.getElementById('new-project-budget-select').value;
     const budget_id = budgetVal ? parseInt(budgetVal, 10) : null;
+    const create_if_missing = document.getElementById('new-project-create-path').checked;
     const errEl = document.getElementById('new-project-error');
+    const warnEl = document.getElementById('new-project-path-warn');
 
     if (!name) {
         errEl.textContent = 'Project name is required.';
@@ -1852,14 +1866,20 @@ async function saveNewProject() {
         const resp = await fetch(`${API_BASE}/projects`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, path, description, llm_id, budget_id }),
+            body: JSON.stringify({ name, path, description, llm_id, budget_id, create_if_missing }),
         });
         if (!resp.ok) {
             const err = await resp.json().catch(() => ({}));
-            errEl.textContent = err.detail || `Error ${resp.status}`;
+            if (resp.status === 422 && err.detail && err.detail.error === 'path_not_found') {
+                warnEl.style.display = 'block';
+                errEl.style.display = 'none';
+                return;
+            }
+            errEl.textContent = (typeof err.detail === 'string' ? err.detail : null) || `Error ${resp.status}`;
             errEl.style.display = 'block';
             return;
         }
+        warnEl.style.display = 'none';
         closeNewProjectModal();
         await loadProjects();
         switchProject(name);
@@ -1876,6 +1896,8 @@ function openEditProjectModal(name, path, description, llmId, budgetId) {
     document.getElementById('edit-project-path').value = path;
     document.getElementById('edit-project-description').value = description;
     document.getElementById('edit-project-error').style.display = 'none';
+    document.getElementById('edit-project-path-warn').style.display = 'none';
+    document.getElementById('edit-project-create-path').checked = false;
     populateProjectLlmSelect('edit-project-llm-select', llmId || null);
     populateProjectBudgetSelect('edit-project-budget-select', budgetId || null);
     document.getElementById('edit-project-modal').classList.add('active');
@@ -1894,20 +1916,28 @@ async function saveEditProject() {
     const llm_id = llmVal ? parseInt(llmVal, 10) : null;
     const budgetVal = document.getElementById('edit-project-budget-select').value;
     const budget_id = budgetVal ? parseInt(budgetVal, 10) : null;
+    const create_if_missing = document.getElementById('edit-project-create-path').checked;
     const errEl = document.getElementById('edit-project-error');
+    const warnEl = document.getElementById('edit-project-path-warn');
 
     try {
         const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(name)}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ path, description, llm_id, budget_id }),
+            body: JSON.stringify({ path, description, llm_id, budget_id, create_if_missing }),
         });
         if (!resp.ok) {
             const err = await resp.json().catch(() => ({}));
-            errEl.textContent = err.detail || `Error ${resp.status}`;
+            if (resp.status === 422 && err.detail && err.detail.error === 'path_not_found') {
+                warnEl.style.display = 'block';
+                errEl.style.display = 'none';
+                return;
+            }
+            errEl.textContent = (typeof err.detail === 'string' ? err.detail : null) || `Error ${resp.status}`;
             errEl.style.display = 'block';
             return;
         }
+        warnEl.style.display = 'none';
         closeEditProjectModal();
         await loadProjects();
     } catch (err) {
@@ -2636,6 +2666,20 @@ function createTaskCard(id, title, tags, owner, status) {
         : '';
     const pipRequirementsHtml = '';  // requirements now live in .pip-card segments below the card
 
+    // Intake retry badge — shown on IDEA cards that have been rejected at least once
+    let intakeRetryBadge = '';
+    if (status === 'idea' || status === 'subdividing') {
+        const rejCount = taskObj.intake_rejection_count || 0;
+        const exhausted = taskObj.intake_exhausted || false;
+        if (rejCount > 0) {
+            const badgeTitle = exhausted
+                ? `Intake exhausted after ${rejCount} rejection(s). Manual reset required.`
+                : `Rejected ${rejCount} time(s) — scheduler will retry.`;
+            const badgeText = exhausted ? `\u2716 ${rejCount}\xd7` : `\u21ba ${rejCount}\xd7`;
+            intakeRetryBadge = `<span class="intake-retry-badge${exhausted ? ' intake-retry-badge--exhausted' : ''}" title="${badgeTitle}">${badgeText}</span>`;
+        }
+    }
+
     // Subdivision badges
     const parentId = taskObj.parent_task_id;
     const generation = taskObj.subdivision_generation || 0;
@@ -2693,6 +2737,7 @@ function createTaskCard(id, title, tags, owner, status) {
         <div class="task-meta">
             ${tagsHtml}
             ${ownerHtml}
+            ${intakeRetryBadge}
         </div>
         ${pipRequirementsHtml}
         ${prereqHtml}
@@ -2714,6 +2759,7 @@ function createTaskCard(id, title, tags, owner, status) {
             <button class="toolbar-btn" title="Set Stage — move to any pipeline stage" onclick="event.stopPropagation();toolbarStagePicker('${id}',this)">⚙</button>
             <span class="toolbar-sep"></span>
             <button class="toolbar-btn" title="Open in Diagnostics" onclick="event.stopPropagation();toolbarOpenDiagnostics('${id}')">📊</button>
+            <button class="toolbar-btn" title="Card Story — agent session timeline" onclick="event.stopPropagation();toolbarOpenStory('${id}')">📜</button>
             <button class="toolbar-btn" title="Stage Journal — artifacts, gate checks, code diff" onclick="event.stopPropagation();openStageJournal('${id}')">📋</button>
             <button class="toolbar-btn" title="Research Jobs — view research agents run for this card" onclick="event.stopPropagation();viewResearchJobs('${id}')">🗂</button>
             ${['indev','conceptual_review','optimization','security','full_review','completed'].includes(status) ? `<button class="toolbar-btn" title="View code diff" onclick="event.stopPropagation();openStageDiff('${id}')">&#9998;</button>` : ''}
@@ -3181,7 +3227,7 @@ function _renderSchedulerModal(data) {
     const queueBtn = document.getElementById('scheduler-queue-btn');
     if (queueBtn) {
         const total = active.length + queued.length;
-        queueBtn.textContent = total > 0 ? `⚙ Queue (${total})` : '⚙ Queue';
+        queueBtn.textContent = total > 0 ? `⚙ ${total}` : '⚙';
     }
 
     // Collect all LLM IDs that appear in any list
@@ -5246,6 +5292,7 @@ function renderColumnMap(colType) {
                 <button class="toolbar-btn" title="Demote one stage" onclick="event.stopPropagation();toolbarDemote('${id}')">↩</button>
                 <button class="toolbar-btn" title="Set Stage" onclick="event.stopPropagation();toolbarStagePicker('${id}',this)">⚙</button>
                 <button class="toolbar-btn" title="Open in Diagnostics" onclick="event.stopPropagation();toolbarOpenDiagnostics('${id}')">📊</button>
+                <button class="toolbar-btn" title="Card Story — agent session timeline" onclick="event.stopPropagation();toolbarOpenStory('${id}')">📜</button>
                 <button class="toolbar-btn" title="Clone as new Idea" onclick="event.stopPropagation();toolbarClone('${id}')">⧉</button>
                 <button class="toolbar-btn" title="Pin to top of column" onclick="event.stopPropagation();toolbarPin('${id}')">📌</button>
             </div>
@@ -5877,6 +5924,10 @@ async function toolbarPin(taskId) {
 
 function toolbarOpenDiagnostics(taskId) {
     window.open(`/diagnostics?task=${encodeURIComponent(taskId)}`, '_blank');
+}
+
+function toolbarOpenStory(taskId) {
+    window.open(`/story?task=${encodeURIComponent(taskId)}`, '_blank');
 }
 
 function toolbarOpenMap(taskId) {

@@ -220,6 +220,19 @@ class ShutdownError(Exception):
     pass
 
 
+class PipelineAbortedError(Exception):
+    """Raised when a pipeline stage must abort due to an infrastructure failure.
+
+    Distinct from ShutdownError (deliberate shutdown) and application errors
+    (JSON parse, schema mismatch). The task's stage is left unchanged so the
+    scheduler can re-dispatch when the LLM endpoint recovers.
+    """
+    def __init__(self, stage: str, cause: Exception):
+        self.stage = stage
+        self.cause = cause
+        super().__init__(f"Stage '{stage}' aborted due to infra error: {cause}")
+
+
 def signal_shutdown() -> None:
     """Phase-1 shutdown: signal in-flight calls to abort at their next check."""
     _shutdown_event.set()
@@ -374,12 +387,68 @@ async def _stream_llm_response(
     }
 
 
+def extract_text_response(response: dict) -> str:
+    """Extract the best available text from an OpenAI-compatible chat completion response.
+
+    Handles two layouts produced by thinking models (Qwen3, QwQ, DeepSeek-R1)
+    running under llama.cpp with ``enable_thinking``:
+
+    - Normal layout: ``choices[0].message.content`` holds the visible text.
+    - Split layout: ``choices[0].message.reasoning_content`` holds the raw
+      thinking block and ``content`` is empty.  In this case we fall back to
+      ``reasoning_content`` and strip the ``<think>…</think>`` wrapper so the
+      caller gets the naked inner text (which may itself contain a JSON object).
+
+    Always returns a string (never None).
+    """
+    msg = response.get("choices", [{}])[0].get("message", {})
+    content = msg.get("content") or ""
+    if content.strip():
+        return content
+    # Fallback: some thinking models put all output in reasoning_content and
+    # leave content empty.  Strip the <think> wrapper to get the inner text.
+    reasoning = msg.get("reasoning_content") or ""
+    if reasoning.strip():
+        return _strip_thinking_blocks(reasoning)
+    return content  # still empty — caller must handle this
+
+
+def _strip_thinking_blocks(content: str) -> str:
+    """Remove model-internal reasoning blocks from assistant content.
+
+    Thinking models (Qwen3, QwQ, DeepSeek-R1, …) emit reasoning wrapped in
+    <think>…</think> tags before their actual response.  These blocks are
+    model-private — the model re-generates its own reasoning on every turn and
+    does NOT need the prior turns' thinking in the conversation history.
+
+    Keeping them in history:
+      - Wastes context tokens on noise the model already "knows".
+      - Confuses non-thinking models that receive the same history.
+      - Can cause llama.cpp Jinja2 parse errors for deeply-nested content.
+
+    Patterns stripped (case-insensitive, dotall):
+      <think>…</think>          — Qwen3 / QwQ / DeepSeek-R1
+      <thinking>…</thinking>    — some fine-tunes
+    """
+    import re as _re
+    _THINK_RE = _re.compile(
+        r'<(think|thinking)>.*?</\1>',
+        _re.IGNORECASE | _re.DOTALL,
+    )
+    stripped = _THINK_RE.sub("", content).strip()
+    return stripped
+
+
 def _sanitize_messages(messages: list[dict]) -> list[dict]:
     """Return a copy of *messages* with problematic bytes/sequences removed or escaped.
 
     Sanitization is ALWAYS performed to prevent llama.cpp Jinja2 parse errors.
     - system/user roles: Log a WARNING to help debug prompt/brief issues.
     - assistant/tool roles: Silent (corrects legacy or "garbage" data).
+
+    Additionally, <think>/<thinking> blocks are stripped from assistant messages
+    so that thinking-model reasoning is never forwarded to downstream models
+    (whether thinking or non-thinking).
     """
     _JINJA2_PAIRS = [("{{", "{ {"), ("}}", "} }"), ("{%", "{ %"), ("{#", "{ #")]
     _UNICODE_REPLACEMENTS = [
@@ -399,6 +468,19 @@ def _sanitize_messages(messages: list[dict]) -> list[dict]:
         changed = False
         log_warn = role in ("system", "user")
 
+        # Strip model-internal reasoning blocks from assistant history.
+        # Thinking models re-derive their reasoning each turn; prior thinking
+        # blocks are noise for the same model and confusing for other models.
+        if role == "assistant":
+            stripped = _strip_thinking_blocks(content)
+            if stripped != content:
+                logger.debug(
+                    "msg[%d] (assistant): Stripped thinking block (%d → %d chars)",
+                    i, len(content), len(stripped),
+                )
+                content = stripped
+                changed = True
+
         if "\x00" in content:
             if log_warn:
                 logger.warning("msg[%d] (%s): Stripping null bytes", i, role)
@@ -408,7 +490,13 @@ def _sanitize_messages(messages: list[dict]) -> list[dict]:
         for raw, safe in _JINJA2_PAIRS:
             if raw in content:
                 if log_warn:
-                    logger.warning("msg[%d] (%s): Escaping Jinja2 delimiter %r", i, role, raw)
+                    count = content.count(raw)
+                    idx = content.find(raw)
+                    snip = content[max(0, idx - 40):idx + len(raw) + 40].replace("\n", "↵")
+                    logger.warning(
+                        "msg[%d] (%s): Escaping Jinja2 delimiter %r ×%d — near: %r",
+                        i, role, raw, count, snip,
+                    )
                 content = content.replace(raw, safe)
                 changed = True
 
@@ -419,9 +507,14 @@ def _sanitize_messages(messages: list[dict]) -> list[dict]:
 
         import re as _re
         _SINGLE_BRACE_RE = _re.compile(r'\{([A-Za-z_][\w.]*)\}')
-        if _SINGLE_BRACE_RE.search(content):
+        _sbrace_match = _SINGLE_BRACE_RE.search(content)
+        if _sbrace_match:
             if log_warn:
-                logger.warning("msg[%d] (%s): Escaping single-brace identifiers", i, role)
+                snip = content[max(0, _sbrace_match.start() - 40):_sbrace_match.end() + 40].replace("\n", "↵")
+                logger.warning(
+                    "msg[%d] (%s): Escaping single-brace identifiers ×%d — near: %r",
+                    i, role, len(_SINGLE_BRACE_RE.findall(content)), snip,
+                )
             content = _SINGLE_BRACE_RE.sub(r'[\1]', content)
             changed = True
 
@@ -603,6 +696,25 @@ async def call_llm(
     # Null bytes in tool-result or file-content messages cause llama.cpp's
     # chat-template engine to fail with "Failed to parse input at pos N".
     messages = _sanitize_messages(messages)
+
+    # Drop trailing empty assistant messages before sending.
+    # llama.cpp with enable_thinking treats any trailing assistant turn as a
+    # "prefill" request (continue-from-here), which conflicts with thinking mode
+    # and returns HTTP 400: "Assistant response prefill is incompatible with
+    # enable_thinking."  An assistant message at the tail with empty/null content
+    # and no tool_calls is never meaningful — it's safe to strip.
+    if (
+        messages
+        and messages[-1].get("role") == "assistant"
+        and not messages[-1].get("tool_calls")
+        and not (messages[-1].get("content") or "").strip()
+    ):
+        _agent_label_pre = f"[{agent_name}]" if agent_name else "[Agent]"
+        logger.debug(
+            "%s Stripping trailing empty assistant message to avoid enable_thinking prefill rejection",
+            _agent_label_pre,
+        )
+        messages = messages[:-1]
 
     # ── Pre-flight context size check ────────────────────────────────────────
     # Estimate the prompt token count from total message character count.

@@ -29,24 +29,40 @@ def _vote(verdict: Verdict, stage: str = "test", justification: str = "ok") -> V
 # ---------------------------------------------------------------------------
 
 class TestRule0:
-    def test_single_subdivide_vote(self):
+    def test_single_subdivide_vote_does_not_trigger(self):
+        """Rule 0 requires majority of LLM stages; a single vote is insufficient."""
+        # 1/1 LLM stage, threshold = max(2, 1) = 2 → not triggered
         votes = [_vote(Verdict.SUBDIVIDE_IDEA)]
         result = tally_votes(votes)
-        assert result.outcome == "subdivide"
+        assert result.outcome != "subdivide"
 
-    def test_subdivide_beats_rejected(self):
-        """Rule 0 overrides Rule 1: SUBDIVIDE_IDEA takes priority over REJECTED."""
+    def test_majority_subdivide_beats_rejected(self):
+        """Rule 0 overrides Rule 1 when majority of LLM stages vote SUBDIVIDE_IDEA."""
+        # 2/3 LLM stages, threshold = max(2, 2) = 2 → fires
         votes = [
             _vote(Verdict.SUBDIVIDE_IDEA, stage="scope"),
+            _vote(Verdict.SUBDIVIDE_IDEA, stage="feasibility"),
             _vote(Verdict.REJECTED, stage="conflict"),
         ]
         result = tally_votes(votes)
         assert result.outcome == "subdivide"
 
-    def test_subdivide_beats_needs_research(self):
+    def test_minority_subdivide_yields_to_rejected(self):
+        """A single SUBDIVIDE_IDEA among two LLM stages does not override REJECTED."""
+        # 1/2 LLM stages < threshold 2 → Rule 0 does not fire; Rule 1 fires instead
         votes = [
             _vote(Verdict.SUBDIVIDE_IDEA, stage="scope"),
-            _vote(Verdict.NEEDS_RESEARCH, stage="feasibility"),
+            _vote(Verdict.REJECTED, stage="conflict"),
+        ]
+        result = tally_votes(votes)
+        assert result.outcome == "rejected"
+
+    def test_majority_subdivide_beats_needs_research(self):
+        """Rule 0 still fires before Rule 3 when the majority threshold is met."""
+        votes = [
+            _vote(Verdict.SUBDIVIDE_IDEA, stage="scope"),
+            _vote(Verdict.SUBDIVIDE_IDEA, stage="feasibility"),
+            _vote(Verdict.NEEDS_RESEARCH, stage="conflict"),
         ]
         result = tally_votes(votes)
         assert result.outcome == "subdivide"

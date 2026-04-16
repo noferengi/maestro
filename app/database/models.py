@@ -10,7 +10,7 @@ from sqlalchemy import (
     Column, Integer, String, Text, DateTime, JSON,
     ForeignKey, UniqueConstraint, Boolean, Float,
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, object_session
 from datetime import datetime, timezone
 
 from .session import Base
@@ -82,13 +82,14 @@ class Project(Base):
     """
     Project registry — maps a project name to its filesystem root.
 
-    Every task references a project by name (tasks.project).  This table
-    stores the canonical filesystem path so the agent can run git operations
-    in the correct repository instead of Maestro's own source tree.
+    Every task references a project by name (tasks.project) and now also by
+    numeric FK (tasks.project_id).  Migration 0044 added the integer PK;
+    migration 0045 (future) will drop tasks.project once all code uses project_id.
     """
     __tablename__ = "projects"
 
-    name = Column(String, primary_key=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String, nullable=False, unique=True)
     path = Column(String, nullable=True)       # Absolute path to the project root
     description = Column(Text, nullable=True)
     llm_id = Column(Integer, ForeignKey("llms.id"), nullable=True)     # Default LLM for maintenance jobs
@@ -96,7 +97,7 @@ class Project(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     def __repr__(self):
-        return f"<Project(name='{self.name}', path='{self.path}')>"
+        return f"<Project(id={self.id}, name='{self.name}', path='{self.path}')>"
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +125,8 @@ class Task(Base):
     history = Column(JSON, nullable=True, default=list)  # Array of {status, timestamp}
     prerequisites = Column(JSON, nullable=True, default=list)  # List of prerequisite task IDs
     position = Column(Integer, nullable=True, default=0)  # Position within column (0 = first)
-    project = Column(String, default='TheMaestro')  # Project this task belongs to
+    project_id = Column(Integer, ForeignKey('projects.id'), nullable=True)  # Numeric FK (migration 0044)
+    project_ref = relationship('Project', foreign_keys=[project_id], lazy='joined')
     parent_task_id = Column(String, ForeignKey('tasks.id'), nullable=True)  # Links sub-ideas to origin
     subdivision_generation = Column(Integer, nullable=False, default=0)  # Recursion depth (0=human)
     is_big_idea = Column(Boolean, nullable=False, default=False)  # Flagged when subdivision produces children
@@ -135,11 +137,27 @@ class Task(Base):
     map_x = Column(Float, nullable=True)   # Saved 2D canvas X position (Column Map View)
     map_y = Column(Float, nullable=True)   # Saved 2D canvas Y position (Column Map View)
     is_active = Column(Boolean, nullable=False, default=True)  # False = soft-deleted (hidden everywhere)
+    intake_exhausted_at = Column(String, nullable=True)  # Set when scheduler gives up retrying intake
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    @property
+    def project(self) -> "str | None":
+        """Backward-compat shim: returns the project name string via the FK relationship."""
+        if self.project_ref is not None:
+            return self.project_ref.name
+        return None
+
+    @project.setter
+    def project(self, value: "str | None") -> None:
+        """No-op setter — project is now set via project_id.
+        Accepts the kwarg in Task(..., project=name) for backward compatibility
+        with direct model construction in tests and legacy call sites.
+        Use create_task(project=name) or set task.project_id directly instead.
+        """
+
     def __repr__(self):
-        return f"<Task(id={self.id}, title='{self.title}', type='{self.type}', project='{self.project}', position={self.position})>"
+        return f"<Task(id={self.id}, title='{self.title}', type='{self.type}', project_id={self.project_id}, position={self.position})>"
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +559,8 @@ class ArchGenJob(Base):
     __tablename__ = "arch_gen_jobs"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    project = Column(String, nullable=False)
+    project_id = Column(Integer, ForeignKey('projects.id'), nullable=True)
+    project_ref = relationship('Project', foreign_keys=[project_id], lazy='joined')
     category = Column(String, nullable=False)
     llm_id = Column(Integer, ForeignKey('llms.id'), nullable=True)
     budget_id = Column(Integer, ForeignKey('budgets.id'), nullable=True)
@@ -554,8 +573,97 @@ class ArchGenJob(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
 
+    @property
+    def project(self) -> "str | None":
+        """Backward-compat shim: returns the project name string via the FK relationship."""
+        if self.project_ref is not None:
+            return self.project_ref.name
+        return None
+
+    @project.setter
+    def project(self, value: "str | None") -> None:
+        """No-op setter for backward compatibility. Set project_id directly instead."""
+
     def __repr__(self):
-        return f"<ArchGenJob(id={self.id}, project={self.project!r}, category={self.category!r}, status={self.status!r}, retries={self.retry_count})>"
+        return f"<ArchGenJob(id={self.id}, project_id={self.project_id}, category={self.category!r}, status={self.status!r}, retries={self.retry_count})>"
+
+
+# ---------------------------------------------------------------------------
+# Agent session tracking
+# ---------------------------------------------------------------------------
+
+class AgentSession(Base):
+    """Persistent record of a single agent invocation.
+
+    One row is written when an agent starts and updated when it exits.
+    Covers all scheduler-dispatched workers and API-triggered pipelines.
+
+    agent_type values:
+        intake, planning, maestro_loop, dev_orchestrator, conceptual_review,
+        optimization, security, full_review, pip_preflight, pip_research,
+        pip_resolution, subdivision, arch_gen
+
+    exit_reason values:
+        completed, max_turns, stalled, error, shutdown, passed, rejected,
+        subdivide, pip_blocked
+
+    scheduler_reason values:
+        scheduler, user_triggered
+    """
+    __tablename__ = "agent_sessions"
+
+    id                = Column(Integer, primary_key=True, autoincrement=True)
+    task_id           = Column(String, ForeignKey("tasks.id"), nullable=False)
+    agent_type        = Column(String, nullable=False)
+    started_at        = Column(String, nullable=False)
+    ended_at          = Column(String, nullable=True)
+    turn_count        = Column(Integer, nullable=True)
+    max_turns         = Column(Integer, nullable=True)
+    exit_reason       = Column(String, nullable=True)
+    exit_summary      = Column(Text, nullable=True)
+    scheduler_reason  = Column(String, nullable=False, default="scheduler")
+    llm_id            = Column(Integer, nullable=True)
+    budget_id         = Column(Integer, nullable=True)
+    prompt_tokens     = Column(Integer, nullable=False, default=0)
+    completion_tokens = Column(Integer, nullable=False, default=0)
+
+    def __repr__(self):
+        return (
+            f"<AgentSession(id={self.id}, task={self.task_id!r}, "
+            f"type={self.agent_type!r}, reason={self.exit_reason!r})>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Dreamer run log
+# ---------------------------------------------------------------------------
+
+class DreamerRun(Base):
+    """Audit record for a single Dreamer agent invocation.
+
+    Dreamer fires when a project has had no pipeline progress for
+    DREAMER_STALL_TICKS consecutive scheduler ticks.  One row per run.
+
+    status values: running | completed | failed
+    """
+    __tablename__ = "dreamer_runs"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    project_name = Column(String, nullable=False)
+    started_at   = Column(String, nullable=False)
+    finished_at  = Column(String, nullable=True)
+    status       = Column(String, nullable=False, default="running")
+    stall_reason = Column(Text, nullable=True)
+    actions_taken = Column(Text, nullable=True)    # JSON list of {action, ...}
+    new_task_ids  = Column(Text, nullable=True)    # JSON list of task ID strings
+    budget_id    = Column(Integer, ForeignKey("budgets.id"), nullable=True)
+    llm_id       = Column(Integer, ForeignKey("llms.id"),    nullable=True)
+
+    def __repr__(self):
+        return (
+            f"<DreamerRun(id={self.id}, project={self.project_name!r}, "
+            f"status={self.status!r})>"
+        )
 
 
 # ---------------------------------------------------------------------------

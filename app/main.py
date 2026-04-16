@@ -32,7 +32,7 @@ import threading
 from pydantic import BaseModel
 from database import (
     init_db, get_db, create_task, get_task, get_tasks_by_type,
-    update_task, delete_task, get_all_tasks, get_task_history, reorder_tasks, seed_sample_tasks,
+    update_task, delete_task, get_all_tasks, get_task_history, append_task_history, reorder_tasks, seed_sample_tasks,
     get_tasks_by_project,
     Project, get_all_projects, get_project, upsert_project, delete_project,
     Task, LLM, Budget, BudgetEntry, SubdivisionRecord, SessionLocal,
@@ -69,7 +69,7 @@ from database import (
 )
 
 from app.agent.config import PIPELINE_COLUMN_ORDER, PIPELINE_DONE_STATUSES
-from app.agent.llm_client import ShutdownError, invalidate_llm_cache
+from app.agent.llm_client import ShutdownError, PipelineAbortedError, invalidate_llm_cache
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -331,6 +331,23 @@ def _store_pipeline_result(task_id, result, budget_id):
             model=vote.get("model", ""),
             budget_id=budget_id,
         )
+
+
+def _store_infra_abort_result(task_id: str, exc: "PipelineAbortedError", budget_id, transition: str = "idea_to_planning") -> None:
+    """Record an infrastructure-abort event so the UI can surface it clearly."""
+    from app.database.crud_pipeline import create_transition_result
+    create_transition_result(
+        task_id=task_id,
+        transition=transition,
+        outcome="aborted_infra",
+        vote_summary={
+            "stage": exc.stage,
+            "error": str(exc.cause),
+            "note": "Pipeline aborted due to infrastructure failure. Will retry when endpoint recovers.",
+        },
+        total_prompt_tokens=0,
+        total_completion_tokens=0,
+    )
 
 
 def _count_recent_failed_planning_runs(task_id: str, limit: int = 3) -> int:
@@ -683,8 +700,21 @@ def _pipeline_session(func):
     subject to the same one-LLM-at-a-time and capacity limits as scheduler-
     dispatched jobs, preventing the model-thrashing that occurs when a manual
     action fires while the scheduler has a different model loaded.
+
+    Also writes an agent_session record for every user-triggered pipeline run.
     """
     import functools
+
+    # Map wrapper function names to agent_type values
+    _AGENT_TYPE_MAP = {
+        "_run_regenerate_subdivision": "subdivision",
+        "_run_planning_pipeline_bg": "planning",
+        "_run_review_pipeline_bg": "conceptual_review",
+        "_run_security_only_bg": "security",
+        "_run_full_review_bg": "full_review",
+        "_run_loop_bg": "maestro_loop",
+        "_run_intake_bg": "intake",
+    }
 
     @functools.wraps(func)
     def wrapper(task_id: str, *args, **kwargs):
@@ -692,6 +722,7 @@ def _pipeline_session(func):
             wait_and_register_pipeline_session,
             unregister_pipeline_session,
         )
+        from app.database import create_agent_session, close_agent_session
         task = get_task(task_id)
         if task and task.llm_id:
             key = f"bg-{func.__name__}-{task_id}"
@@ -702,9 +733,22 @@ def _pipeline_session(func):
                     func.__name__, task_id, task.llm_id,
                 )
                 return
+            agent_type = _AGENT_TYPE_MAP.get(func.__name__, func.__name__.lstrip("_"))
+            _session_id = create_agent_session(
+                task_id=task_id,
+                agent_type=agent_type,
+                llm_id=task.llm_id,
+                budget_id=task.budget_id,
+                scheduler_reason="user_triggered",
+            )
+            _exit_reason = "completed"
             try:
                 return func(task_id, *args, **kwargs)
+            except Exception:
+                _exit_reason = "error"
+                raise
             finally:
+                close_agent_session(_session_id, _exit_reason)
                 unregister_pipeline_session(key, task.llm_id)
         else:
             return func(task_id, *args, **kwargs)
@@ -821,8 +865,8 @@ def _run_intake_pipeline(task_id: str) -> None:
         if llm_base_url:
             logger.info("[intake] Using LLM: %s model=%s", llm_base_url, llm_model)
 
-        all_tasks = get_all_tasks()
-        task_dicts = [task_to_dict(t) for t in all_tasks]
+        project_tasks = get_tasks_by_project(task.project) if task.project else get_all_tasks()
+        task_dicts = [task_to_dict(t) for t in project_tasks]
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -869,6 +913,15 @@ def _run_intake_pipeline(task_id: str) -> None:
 
         finally:
             loop.close()
+    except PipelineAbortedError as exc:
+        logger.warning(
+            "[intake] Task '%s' aborted due to infra error at stage '%s': %s — will retry.",
+            task_id, exc.stage, exc.cause,
+        )
+        try:
+            _store_infra_abort_result(task_id, exc, budget_id=None)
+        except Exception:
+            pass  # best-effort; don't mask the original abort
     except Exception as exc:
         logger.exception("[intake] Pipeline for '%s' failed.", task_id)
 
@@ -890,7 +943,7 @@ def _run_planning_pipeline_bg(task_id: str) -> None:
     project_path = _setup_thread_context(task)
 
     llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
-    all_tasks = [task_to_dict(t) for t in get_all_tasks()]
+    all_tasks = [task_to_dict(t) for t in (get_tasks_by_project(task.project) if task.project else get_all_tasks())]
 
     # Lifecycle: supersede any stale active/in_progress rows, then create a
     # fresh in_progress row so the Stage Journal can show "Pipeline running…"
@@ -922,6 +975,17 @@ def _run_planning_pipeline_bg(task_id: str) -> None:
         )
     except ShutdownError:
         logger.info("[planning] Pipeline for '%s' aborted due to server shutdown.", task_id)
+        return
+    except PipelineAbortedError as exc:
+        logger.warning(
+            "[planning] Task '%s' aborted due to infra error at stage '%s': %s — will retry.",
+            task_id, exc.stage, exc.cause,
+        )
+        try:
+            _store_infra_abort_result(task_id, exc, budget_id=getattr(task, "budget_id", None),
+                                      transition="planning_to_indev")
+        except Exception:
+            pass
         return
     except Exception:
         logger.exception("[planning] Pipeline for '%s' failed.", task_id)
@@ -1136,6 +1200,17 @@ def _advance_to_optimization(task_id: str) -> None:
         except ShutdownError:
             logger.info("[review] Pipeline for '%s' aborted due to server shutdown.", task_id)
             return
+        except PipelineAbortedError as exc:
+            logger.warning(
+                "[review] Task '%s' aborted at stage '%s': %s — will retry.",
+                task_id, exc.stage, exc.cause,
+            )
+            try:
+                _store_infra_abort_result(task_id, exc, getattr(task, "budget_id", None),
+                                          transition="conceptual_to_optimization")
+            except Exception:
+                pass
+            return
         except Exception:
             logger.exception("[review] Pipeline for '%s' failed.", task_id)
             return
@@ -1185,6 +1260,9 @@ def _run_optimization_only_bg(task_id: str) -> None:
             logger.info("[optimization-only] Task '%s': %s", task_id, result.get('outcome'))
         except ShutdownError:
             logger.info("[optimization-only] Pipeline for '%s' aborted due to server shutdown.", task_id)
+        except PipelineAbortedError as exc:
+            logger.warning("[optimization-only] Task '%s' aborted at stage '%s': %s — will retry.",
+                           task_id, exc.stage, exc.cause)
         except Exception:
             logger.exception("[optimization-only] Pipeline for '%s' failed.", task_id)
         finally:
@@ -1232,6 +1310,9 @@ def _run_security_only_bg(task_id: str) -> None:
                 logger.warning("[security-only] Task '%s' demoted to %s.", task_id, demotion)
         except ShutdownError:
             logger.info("[security-only] Pipeline for '%s' aborted due to server shutdown.", task_id)
+        except PipelineAbortedError as exc:
+            logger.warning("[security-only] Task '%s' aborted at stage '%s': %s — will retry.",
+                           task_id, exc.stage, exc.cause)
         except Exception:
             logger.exception("[security-only] Pipeline for '%s' failed.", task_id)
         finally:
@@ -1298,6 +1379,9 @@ def _run_security_pipeline_bg(task_id: str) -> None:
                 logger.warning("[security] Task '%s' demoted to %s.", task_id, demotion)
         except ShutdownError:
             logger.info("[security] Pipeline for '%s' aborted due to server shutdown.", task_id)
+        except PipelineAbortedError as exc:
+            logger.warning("[security] Task '%s' aborted at stage '%s': %s — will retry.",
+                           task_id, exc.stage, exc.cause)
         except Exception:
             logger.exception("[security] Pipeline for '%s' failed.", task_id)
         finally:
@@ -1356,6 +1440,9 @@ def _run_full_review_bg(task_id: str) -> None:
                 logger.warning("[full_review] Task '%s' demoted to %s.", task_id, demotion)
         except ShutdownError:
             logger.info("[full_review] Pipeline for '%s' aborted due to server shutdown.", task_id)
+        except PipelineAbortedError as exc:
+            logger.warning("[full_review] Task '%s' aborted at stage '%s': %s — will retry.",
+                           task_id, exc.stage, exc.cause)
         except Exception:
             logger.exception("[full_review] Pipeline for '%s' failed.", task_id)
         finally:
@@ -2703,6 +2790,16 @@ def task_to_dict(task):
         "created_at": task.created_at.isoformat() if task.created_at else None,
         "updated_at": task.updated_at.isoformat() if task.updated_at else None,
         "pips": pips_data,
+        # Intake exhaustion state (only relevant for IDEA cards)
+        "intake_exhausted": bool(getattr(task, "intake_exhausted_at", None)),
+        "intake_rejection_count": (
+            sum(
+                1 for r in get_transition_results(task.id, transition="idea_to_planning")
+                if r.outcome in ("rejected", "needs_research")
+            )
+            if task.type == "idea"
+            else 0
+        ),
     }
 
 
@@ -2829,13 +2926,46 @@ def list_projects():
     return [_project_to_dict(p) for p in get_all_projects()]
 
 
+@app.get("/api/system/browse-folder")
+def browse_folder():
+    """Open a native folder-picker dialog and return the chosen path."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.wm_attributes("-topmost", 1)
+        chosen = filedialog.askdirectory(parent=root)
+        root.destroy()
+        return {"path": chosen or ""}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Folder picker unavailable: {exc}")
+
+
+def _validate_and_prepare_path(path: str | None, create_if_missing: bool) -> str | None:
+    """Return the path unchanged, create it on request, or raise 422 if it doesn't exist."""
+    if not path:
+        return None
+    if os.path.exists(path):
+        return path
+    if create_if_missing:
+        os.makedirs(path, exist_ok=True)
+        return path
+    raise HTTPException(
+        status_code=422,
+        detail={"error": "path_not_found", "path": path},
+    )
+
+
 @app.post("/api/projects", response_model=dict, status_code=201)
 def create_project(data: dict):
     """Create or update a project record."""
     name = (data.get("name") or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Project name is required.")
-    path = (data.get("path") or "").strip() or None
+    raw_path = (data.get("path") or "").strip() or None
+    create_if_missing = bool(data.get("create_if_missing", False))
+    path = _validate_and_prepare_path(raw_path, create_if_missing)
     description = (data.get("description") or "").strip() or None
     llm_id = data.get("llm_id") or None
     if llm_id is not None:
@@ -2854,7 +2984,9 @@ def create_project(data: dict):
 @app.put("/api/projects/{project_name}", response_model=dict)
 def update_project(project_name: str, data: dict):
     """Update a project's path, description, default LLM, and/or default budget."""
-    path = data.get("path")           # None means "don't change"
+    raw_path = data.get("path")           # None means "don't change"
+    create_if_missing = bool(data.get("create_if_missing", False))
+    path = _validate_and_prepare_path(raw_path, create_if_missing) if raw_path is not None else raw_path
     description = data.get("description")
     llm_id = data.get("llm_id", ...)      # Ellipsis = don't change; None = clear
     if llm_id is not ... and llm_id is not None:
@@ -2938,7 +3070,7 @@ def populate_arch(project_name: str):
             row.category for row in
             _db.query(_ArchGenJob.category)
                .filter(
-                   _ArchGenJob.project == project_name,
+                   _ArchGenJob.project_id == project.id,
                    _ArchGenJob.status.in_(('pending', 'running')),
                )
                .all()
@@ -2981,7 +3113,8 @@ def populate_arch(project_name: str):
 @app.get("/api/projects/{project_name}/arch-gen-jobs")
 def get_project_arch_gen_jobs(project_name: str):
     """Return active jobs and a summary of all arch gen jobs for a project."""
-    if not get_project(project_name):
+    project = get_project(project_name)
+    if not project:
         raise HTTPException(status_code=404, detail=f"Project '{project_name}' not found")
     from app.database import SessionLocal as _SL
     from app.database.models import ArchGenJob as _AGJ
@@ -2990,15 +3123,15 @@ def get_project_arch_gen_jobs(project_name: str):
         # Get pending/running for the ghost cards
         active_jobs = (
             db.query(_AGJ)
-            .filter(_AGJ.project == project_name, _AGJ.status.in_(["pending", "running"]))
+            .filter(_AGJ.project_id == project.id, _AGJ.status.in_(["pending", "running"]))
             .order_by(_AGJ.created_at)
             .all()
         )
-        
+
         # Get counts for the summary
         counts = (
             db.query(_AGJ.status, func.count(_AGJ.id))
-            .filter(_AGJ.project == project_name)
+            .filter(_AGJ.project_id == project.id)
             .group_by(_AGJ.status)
             .all()
         )
@@ -3020,6 +3153,94 @@ def get_project_arch_gen_jobs(project_name: str):
             ],
             "summary": summary
         }
+
+
+# ============================================
+# Dreamer API Endpoints
+# ============================================
+
+def _dreamer_run_to_dict(run) -> dict:
+    import json as _json
+    actions = []
+    new_ids = []
+    if run.actions_taken:
+        try:
+            actions = _json.loads(run.actions_taken)
+        except Exception:
+            pass
+    if run.new_task_ids:
+        try:
+            new_ids = _json.loads(run.new_task_ids)
+        except Exception:
+            pass
+    return {
+        "id":           run.id,
+        "project_name": run.project_name,
+        "started_at":   run.started_at,
+        "finished_at":  run.finished_at,
+        "status":       run.status,
+        "stall_reason": run.stall_reason,
+        "actions_taken": actions,
+        "new_task_ids": new_ids,
+        "llm_id":       run.llm_id,
+        "budget_id":    run.budget_id,
+    }
+
+
+@app.get("/api/projects/{project_name}/dreamer-runs", response_model=List[dict])
+def list_dreamer_runs(project_name: str, limit: int = 20):
+    """Return recent Dreamer run history for a project (newest first)."""
+    from app.database import get_dreamer_runs as _get_runs
+    project = get_project(project_name)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_name}' not found")
+    runs = _get_runs(project_name, limit=max(1, min(limit, 100)))
+    return [_dreamer_run_to_dict(r) for r in runs]
+
+
+@app.get("/api/dreamer-runs/{run_id}", response_model=dict)
+def get_single_dreamer_run(run_id: int):
+    """Return a single Dreamer run by ID."""
+    from app.database import get_dreamer_run as _get_run
+    run = _get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Dreamer run not found")
+    return _dreamer_run_to_dict(run)
+
+
+@app.post("/api/projects/{project_name}/dreamer/trigger", response_model=dict)
+def trigger_dreamer(project_name: str):
+    """Manually trigger a Dreamer run for a project (bypasses stall check)."""
+    from app.agent.scheduler import _active_dreamer_projects, _active_dreamer_lock, _start_dreamer_thread
+    from app.database import get_llm as _get_llm
+
+    project = get_project(project_name)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_name}' not found")
+    if not project.llm_id or not project.budget_id:
+        raise HTTPException(
+            status_code=422,
+            detail="Project must have a default LLM and Budget configured to run Dreamer.",
+        )
+
+    with _active_dreamer_lock:
+        if project_name in _active_dreamer_projects:
+            return {"status": "already_running", "project": project_name}
+
+    llm = _get_llm(project.llm_id)
+    if not llm:
+        raise HTTPException(status_code=422, detail="Project LLM record not found.")
+
+    llm_base_url = f"http://{llm.address}:{llm.port}/v1"
+    _start_dreamer_thread(
+        project_name=project_name,
+        project_path=project.path,
+        llm_id=project.llm_id,
+        budget_id=project.budget_id,
+        llm_base_url=llm_base_url,
+        llm_model=llm.model,
+    )
+    return {"status": "started", "project": project_name}
 
 
 # ============================================
@@ -3366,7 +3587,7 @@ def list_diagnostic_tasks():
                 Task.id,
                 Task.title,
                 Task.type,
-                Task.project,
+                Project.name.label("project"),
                 func.count(BudgetEntry.id).label("entry_count"),
                 func.coalesce(func.sum(BudgetEntry.prompt_cost), 0).label("total_prompt_tokens"),
                 func.coalesce(func.sum(BudgetEntry.generation_cost), 0).label("total_completion_tokens"),
@@ -3374,6 +3595,7 @@ def list_diagnostic_tasks():
                 func.max(BudgetEntry.created_at).label("last_activity"),
             )
             .join(BudgetEntry, Task.id == BudgetEntry.task_id)
+            .outerjoin(Project, Task.project_id == Project.id)
             .group_by(Task.id)
             .order_by(desc("last_activity"))
             .all()
@@ -3426,6 +3648,49 @@ def list_diagnostic_tasks():
 @app.get("/diagnostics")
 def read_diagnostics():
     return FileResponse("app/web/diagnostics.html")
+
+
+@app.get("/story")
+def read_story():
+    return FileResponse("app/web/story.html")
+
+
+@app.get("/api/tasks/{task_id}/agent-sessions")
+def get_task_agent_sessions(task_id: str):
+    """All agent session records for a task, oldest first."""
+    from app.database import get_agent_sessions_for_task as _get_sessions
+    sessions = _get_sessions(task_id)
+    result = []
+    for s in sessions:
+        ended_at = s.ended_at
+        started_at = s.started_at
+        duration_seconds = None
+        if ended_at and started_at:
+            try:
+                from datetime import datetime, timezone
+                t0 = datetime.fromisoformat(started_at)
+                t1 = datetime.fromisoformat(ended_at)
+                duration_seconds = round((t1 - t0).total_seconds(), 1)
+            except Exception:
+                pass
+        result.append({
+            "id": s.id,
+            "task_id": s.task_id,
+            "agent_type": s.agent_type,
+            "started_at": s.started_at,
+            "ended_at": s.ended_at,
+            "duration_seconds": duration_seconds,
+            "turn_count": s.turn_count,
+            "max_turns": s.max_turns,
+            "exit_reason": s.exit_reason,
+            "exit_summary": s.exit_summary,
+            "scheduler_reason": s.scheduler_reason,
+            "llm_id": s.llm_id,
+            "budget_id": s.budget_id,
+            "prompt_tokens": s.prompt_tokens,
+            "completion_tokens": s.completion_tokens,
+        })
+    return result
 
 
 @app.get("/scheduler")
@@ -3702,6 +3967,149 @@ def set_task_stage(task_id: str, body: dict):
         raise HTTPException(status_code=400, detail=f"Invalid stage '{stage}'")
     updated = update_task(task_id, type=stage)
     return task_to_dict(updated)
+
+
+@app.post("/api/tasks/{task_id}/reset-intake")
+def reset_intake(task_id: str):
+    """Clear intake_exhausted_at so the scheduler will retry the task."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    update_task(task_id, intake_exhausted_at=None)
+    append_task_history(task_id, "intake_reset", message="Intake exhaustion cleared by user.")
+    return {"ok": True}
+
+
+@app.get("/api/tasks/{task_id}/transition-history")
+def get_transition_history(task_id: str):
+    """All intake transition runs for a task in chronological order.
+
+    Returns per-run tally narrative, trigger provenance, and per-vote details.
+    Votes are matched to results via a time-window query (no direct FK).
+    """
+    from app.database import get_transition_votes_for_result, get_agent_sessions_for_task
+
+    results = get_transition_results(task_id, transition="idea_to_planning")
+    if not results:
+        return []
+    # Reverse to chronological order (get_transition_results returns DESC)
+    results = list(reversed(results))
+
+    # Intake sessions for trigger provenance
+    sessions = [
+        s for s in get_agent_sessions_for_task(task_id)
+        if s.agent_type == "intake"
+    ]
+
+    output = []
+    prev_created_at = None
+    for run_index, result in enumerate(results):
+        votes = get_transition_votes_for_result(
+            task_id,
+            from_dt=prev_created_at,
+            to_dt=result.created_at,
+        )
+
+        # Infer trigger: find intake session whose started_at is closest before
+        # this result's created_at.
+        trigger = "scheduler"
+        if sessions and result.created_at:
+            for s in reversed(sessions):
+                try:
+                    sess_start = s.started_at
+                    if isinstance(sess_start, str):
+                        from datetime import datetime as _dt
+                        sess_start = _dt.fromisoformat(sess_start.replace("Z", "+00:00"))
+                    if sess_start <= result.created_at:
+                        if getattr(s, "scheduler_reason", "scheduler") == "user_triggered":
+                            trigger = "user"
+                        break
+                except Exception:
+                    pass
+
+        votes_data = [
+            {
+                "stage": v.stage,
+                "verdict": v.verdict,
+                "confidence": v.confidence,
+                "justification": v.justification,
+                "model": v.model or "",
+                "prompt_tokens": v.prompt_tokens or 0,
+                "completion_tokens": v.completion_tokens or 0,
+            }
+            for v in votes
+        ]
+
+        forced = bool(
+            result.vote_summary and result.vote_summary.get("forced")
+        ) if result.vote_summary else False
+
+        output.append({
+            "run": run_index + 1,
+            "outcome": result.outcome,
+            "created_at": result.created_at.isoformat() if result.created_at else None,
+            "trigger": trigger,
+            "tally_narrative": _compute_tally_narrative(votes_data, result.outcome, forced),
+            "votes": votes_data,
+            "total_prompt_tokens": result.total_prompt_tokens or 0,
+            "total_completion_tokens": result.total_completion_tokens or 0,
+            "forced": forced,
+        })
+        prev_created_at = result.created_at
+
+    return output
+
+
+def _compute_tally_narrative(votes_data: list, outcome: str, forced: bool = False) -> str:
+    """Plain-English explanation of why the tally produced the given outcome."""
+    if forced:
+        return "Forced subdivision after repeated rejections (no valid votes)."
+
+    subdivide_v = [v for v in votes_data if v["verdict"] == "SUBDIVIDE_IDEA"]
+    rejected_v = [v for v in votes_data if v["verdict"] == "REJECTED"]
+    not_suitable_v = [v for v in votes_data if v["verdict"] == "NOT_SUITABLE"]
+    needs_research_v = [v for v in votes_data if v["verdict"] == "NEEDS_RESEARCH"]
+    llm_stage_count = sum(1 for v in votes_data if v["stage"] != "static_analysis")
+
+    if subdivide_v:
+        subdivide_threshold = max(2, (llm_stage_count // 2) + 1)
+        stages = ", ".join(v["stage"] for v in subdivide_v)
+        if len(subdivide_v) >= subdivide_threshold:
+            return (
+                f"Rule 0 fired: {len(subdivide_v)}/{llm_stage_count} LLM stages voted SUBDIVIDE_IDEA "
+                f"({stages}) — threshold {subdivide_threshold} met."
+            )
+        else:
+            return (
+                f"Rule 0 not met: {len(subdivide_v)}/{llm_stage_count} LLM stages voted SUBDIVIDE_IDEA "
+                f"({stages}) — threshold {subdivide_threshold} not reached, "
+                f"outcome resolved by other rules."
+            )
+
+    if rejected_v:
+        stage = rejected_v[0]["stage"]
+        conf = rejected_v[0]["confidence"]
+        return f"Rule 1 fired: {stage} voted REJECTED ({conf}%) \u2192 immediate rejection."
+
+    n = len(votes_data)
+    majority_threshold = (n // 2) + 1 if n > 0 else 1
+    if len(not_suitable_v) >= majority_threshold:
+        return (
+            f"Rule 2 fired: {len(not_suitable_v)}/{n} stages voted NOT_SUITABLE "
+            f"(majority threshold {majority_threshold})."
+        )
+
+    if needs_research_v:
+        stages = ", ".join(v["stage"] for v in needs_research_v)
+        return f"Rule 3 fired: {len(needs_research_v)} stage(s) need research ({stages})."
+
+    if outcome == "tie":
+        return "Rule 4 fired: equal split of pass-ish vs fail-ish votes."
+
+    if outcome in ("passed", "conditional_pass"):
+        return "All stages passed — no blocking votes."
+
+    return f"Outcome: {outcome}."
 
 
 @app.post("/api/tasks/{task_id}/clone", response_model=dict)

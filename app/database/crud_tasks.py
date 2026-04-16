@@ -17,7 +17,7 @@ import json
 import logging
 
 from .session import SessionLocal, init_db_tables
-from .models import Task, LLM, Budget, PerformanceImprovementPlan, PipVerification, PipResolutionJob
+from .models import Task, LLM, Budget, PerformanceImprovementPlan, PipVerification, PipResolutionJob, Project
 
 logger = logging.getLogger(__name__)
 
@@ -388,12 +388,19 @@ def seed_sample_tasks():
         db.close()
 
 
+def _resolve_project_id(db, project_name: str) -> "int | None":
+    """Look up a project's numeric id from its name. Returns None if not found."""
+    row = db.query(Project.id).filter(Project.name == project_name).first()
+    return row[0] if row else None
+
+
 def seed_task(db, id, title, task_type, description="", owner="user", tags=None, content=None, llm_id=None, budget_id=None, position=0, project='TheMaestro'):
     """
     Helper function to create a sample task for seeding.
     Accepts database session as first parameter.
     """
     try:
+        project_id = _resolve_project_id(db, project)
         task = Task(
             id=id,
             title=title,
@@ -406,7 +413,7 @@ def seed_task(db, id, title, task_type, description="", owner="user", tags=None,
             budget_id=budget_id,
             history=[{"status": "created", "timestamp": datetime.now().isoformat()}],
             position=position,
-            project=project
+            project_id=project_id
         )
         db.add(task)
         db.commit()
@@ -477,10 +484,17 @@ def seed_sample_tasks_raw(conn):
 # Task CRUD
 # ---------------------------------------------------------------------------
 
-def create_task(title, task_type, description="", owner="user", tags=None, content=None, llm_id=None, budget_id=None, prerequisites=None, project='TheMaestro', position=None):
-    """Create a new task."""
+def create_task(title, task_type, description="", owner="user", tags=None, content=None, llm_id=None, budget_id=None, prerequisites=None, project='TheMaestro', project_id=None, position=None):
+    """Create a new task.
+
+    Pass either ``project`` (name string) or ``project_id`` (integer).  If both
+    are given, ``project_id`` takes precedence.  ``project`` is kept for
+    backward compatibility with all existing callers.
+    """
     db = SessionLocal()
     try:
+        if project_id is None and project:
+            project_id = _resolve_project_id(db, project)
         task = Task(
             id=f"task-{datetime.now().timestamp()}",
             title=title,
@@ -492,7 +506,7 @@ def create_task(title, task_type, description="", owner="user", tags=None, conte
             llm_id=llm_id,
             budget_id=budget_id,
             prerequisites=prerequisites or [],
-            project=project,
+            project_id=project_id,
             position=position,
             history=[{"status": "created", "timestamp": datetime.now().isoformat()}]
         )
@@ -540,12 +554,44 @@ def get_tasks_by_project(project_name):
     """Get all active tasks belonging to a specific project, ordered by position then created_at."""
     db = SessionLocal()
     try:
+        project_id = _resolve_project_id(db, project_name)
+        if project_id is None:
+            return []
         tasks = (db.query(Task)
-                 .filter(Task.project == project_name, Task.is_active == True)
+                 .filter(Task.project_id == project_id, Task.is_active == True)
                  .order_by(Task.position, Task.created_at).all())
         return tasks
     except Exception as e:
         logger.error("Error getting tasks by project: %s", e)
+        return []
+    finally:
+        db.close()
+
+
+def get_deleted_tasks_by_project(project_name: str, limit: int = 20):
+    """Return soft-deleted (is_active=False) tasks for a project, newest first.
+
+    Used by the Dreamer to survey prior intent when no active tasks remain.
+    Architecture tasks are excluded — they convey constraints, not work items.
+    """
+    db = SessionLocal()
+    try:
+        project_id = _resolve_project_id(db, project_name)
+        if project_id is None:
+            return []
+        return (
+            db.query(Task)
+              .filter(
+                  Task.project_id == project_id,
+                  Task.is_active == False,
+                  Task.type != "architecture",
+              )
+              .order_by(Task.created_at.desc())
+              .limit(limit)
+              .all()
+        )
+    except Exception as e:
+        logger.error("Error getting deleted tasks by project: %s", e)
         return []
     finally:
         db.close()
@@ -732,13 +778,13 @@ def reorder_tasks(task_id, new_position, task_type):
         source_type = task_to_move.type
         is_cross_column = source_type != task_type
 
-        project = task_to_move.project or 'TheMaestro'
+        project_id = task_to_move.project_id
 
         if is_cross_column:
             # Remove from source column and re-number it
             source_tasks = (
                 db.query(Task)
-                .filter(Task.type == source_type, Task.project == project, Task.id != task_id)
+                .filter(Task.type == source_type, Task.project_id == project_id, Task.id != task_id)
                 .order_by(Task.position)
                 .all()
             )
@@ -751,7 +797,7 @@ def reorder_tasks(task_id, new_position, task_type):
             # Insert into destination column
             dest_tasks = (
                 db.query(Task)
-                .filter(Task.type == task_type, Task.project == project, Task.id != task_id)
+                .filter(Task.type == task_type, Task.project_id == project_id, Task.id != task_id)
                 .order_by(Task.position)
                 .all()
             )
@@ -761,7 +807,7 @@ def reorder_tasks(task_id, new_position, task_type):
                 t.position = i
         else:
             # Same-column reorder
-            tasks = db.query(Task).filter(Task.type == task_type, Task.project == project).order_by(Task.position).all()
+            tasks = db.query(Task).filter(Task.type == task_type, Task.project_id == project_id).order_by(Task.position).all()
             current_index = tasks.index(task_to_move)
             new_position = max(0, min(new_position, len(tasks) - 1))
             tasks.pop(current_index)

@@ -135,14 +135,15 @@ class PlanningGate:
     # ------------------------------------------------------------------
 
     def _check_interface_completeness(self) -> GateCheck:
-        """Every component has contracts; every consumes resolves to a provides."""
+        """Every consumes resolves to a provides. Empty contracts are fine (simple task)."""
         contracts = self.plan.get("interface_contracts", [])
         if not contracts:
+            # Many simple tasks have no cross-component interfaces — not a hard failure.
             return GateCheck(
                 name="interface_completeness",
-                passed=False,
-                hard_fail=True,
-                detail="No interface contracts defined.",
+                passed=True,
+                hard_fail=False,
+                detail="No interface contracts defined (simple task — skipping).",
             )
 
         all_provides: set[str] = set()
@@ -208,11 +209,24 @@ class PlanningGate:
     # ------------------------------------------------------------------
 
     def _check_test_strategy(self) -> GateCheck:
-        """Every new component has test cases defined."""
-        test_strategy = self.plan.get("test_strategy", [])
-        file_manifest = self.plan.get("file_manifest", [])
+        """A test strategy must exist. Coverage matching is advisory only.
 
-        # Find components that are being created/modified
+        The LLM names test subjects by component name (e.g. "UserService"), not
+        by filename (e.g. "app/services/user.py"), so strict filename-to-component
+        matching produces false failures. We hard-fail only on a completely absent
+        test_strategy; unmatched files are soft-reported for visibility.
+        """
+        test_strategy = self.plan.get("test_strategy", [])
+        if not test_strategy:
+            return GateCheck(
+                name="test_strategy",
+                passed=False,
+                hard_fail=True,
+                detail="No test strategy defined at all.",
+            )
+
+        # Advisory: report files that appear completely unmentioned (soft only)
+        file_manifest = self.plan.get("file_manifest", [])
         components_needing_tests = set()
         for entry in file_manifest:
             action = entry.get("action", "")
@@ -229,12 +243,11 @@ class PlanningGate:
                 tested_components.add(f)
 
         untested = components_needing_tests - tested_components
-        if untested and len(untested) > len(components_needing_tests) * 0.5:
-            return GateCheck(
-                name="test_strategy",
-                passed=False,
-                hard_fail=True,
-                detail=f"Missing test coverage for: {', '.join(sorted(untested)[:5])}",
+        if untested:
+            # Soft advisory — doesn't block the gate
+            logger.debug(
+                "[planning_gate] Test strategy advisory: %d file(s) not explicitly named: %s",
+                len(untested), ", ".join(sorted(untested)[:5]),
             )
 
         return GateCheck(
@@ -300,7 +313,13 @@ class PlanningGate:
     # ------------------------------------------------------------------
 
     def _check_file_safety(self) -> GateCheck:
-        """All paths pass _assert_safe_path(), no blocked commands."""
+        """All paths pass _assert_safe_path(), no blocked commands.
+
+        _assert_safe_path() uses the effective_root set by set_task_git_cwd()
+        (called by run_planning_gate() before this method runs), which means
+        paths are validated against the task's own project root — not
+        TheMaestro's source tree.
+        """
         import os
         from app.agent.tools import _assert_safe_path
 
@@ -311,7 +330,9 @@ class PlanningGate:
             path = entry.get("path", "")
             if path:
                 try:
-                    _assert_safe_path(os.path.join(PROJECT_ROOT, path))
+                    # Pass path directly — _assert_safe_path resolves relative
+                    # paths against _task_git_cwd (the task's project root).
+                    _assert_safe_path(path)
                 except ValueError as e:
                     issues.append(str(e))
 
@@ -376,7 +397,7 @@ class PlanningGate:
                 ct = usage.get("completion_tokens", 0)
 
                 content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
-                data = json.loads(content)
+                data, _ = json.JSONDecoder().raw_decode(content.lstrip())
                 feasible = data.get("feasible", True)
                 concerns = data.get("concerns", [])
 

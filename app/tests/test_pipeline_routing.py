@@ -617,13 +617,14 @@ class TestTallyRules:
         return Vote(stage="test", verdict=verdict, confidence=confidence,
                     justification="test")
 
-    def test_rule0_subdivide_beats_everything(self):
-        """Any SUBDIVIDE_IDEA vote wins over LIKELY votes."""
+    def test_rule0_subdivide_majority_beats_everything(self):
+        """Majority of LLM stages voting SUBDIVIDE_IDEA wins over LIKELY votes."""
         from app.agent.verdicts import tally_votes, Verdict
+        # 2/3 LLM stages vote SUBDIVIDE_IDEA; threshold = max(2, 2) = 2 → fires
         votes = [
             self._vote(Verdict.LIKELY, 95),
-            self._vote(Verdict.LIKELY, 92),
             self._vote(Verdict.SUBDIVIDE_IDEA, 70),
+            self._vote(Verdict.SUBDIVIDE_IDEA, 72),
         ]
         result = tally_votes(votes)
         assert result.outcome == "subdivide"
@@ -690,11 +691,13 @@ class TestTallyRules:
         result = tally_votes(votes)
         assert result.outcome == "passed"
 
-    def test_rule0_has_priority_over_rule1(self):
-        """SUBDIVIDE_IDEA + REJECTED -> outcome is 'subdivide', not 'rejected'."""
+    def test_rule0_majority_has_priority_over_rule1(self):
+        """Majority SUBDIVIDE_IDEA + REJECTED -> outcome is 'subdivide', not 'rejected'."""
         from app.agent.verdicts import tally_votes, Verdict
+        # 2/3 LLM stages vote SUBDIVIDE_IDEA; threshold met → Rule 0 fires before Rule 1
         votes = [
             self._vote(Verdict.SUBDIVIDE_IDEA, 60),
+            self._vote(Verdict.SUBDIVIDE_IDEA, 65),
             self._vote(Verdict.REJECTED, 15),
         ]
         result = tally_votes(votes)
