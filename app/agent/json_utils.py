@@ -18,27 +18,44 @@ logger = logging.getLogger(__name__)
 
 
 def extract_json_block(text: str) -> str | None:
-    """Extract the first JSON object from agent output.
+    """Extract the first valid JSON object from agent output.
 
     Tries, in order:
       1. A fenced code block: ```json { ... } ``` or ``` { ... } ```
       2. The outermost bare ``{ ... }`` in the text.
+      3. Scanning for the first substring that successfully parses as JSON.
 
     Returns the raw JSON string (not parsed), or None if nothing is found.
     """
     if not text:
         return None
 
-    # Fenced block - greedy match on the outermost braces inside the fence
+    # 1. Fenced block - greedy match on the outermost braces inside the fence
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if fenced:
         return fenced.group(1)
 
-    # Bare outermost JSON object
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return text[start : end + 1]
+    # 2. Bare outermost JSON object
+    start_idx = text.find("{")
+    end_idx = text.rfind("}")
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        candidate = text[start_idx : end_idx + 1]
+        try:
+            json.loads(candidate)
+            return candidate
+        except Exception:
+            pass
+
+    # 3. Scanning fallback - try parsing from every '{' position
+    decoder = json.JSONDecoder()
+    for i in range(len(text)):
+        if text[i] == "{":
+            try:
+                # raw_decode returns (object, end_index)
+                _, end = decoder.raw_decode(text[i:])
+                return text[i : i + end]
+            except Exception:
+                continue
 
     return None
 

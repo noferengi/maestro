@@ -348,6 +348,44 @@ def get_retriable_file_summary_jobs(
         db.close()
 
 
+def cancel_bad_file_summary_jobs(max_file_size_bytes: int) -> int:
+    """Cancel pending/failed file summary jobs that exceed the size cap or are log files.
+
+    Called once at scheduler startup so stale jobs from before size guards were
+    added don't consume slots indefinitely.  Returns the number of jobs cancelled.
+    """
+    import re as _re
+    db = SessionLocal()
+    cancelled = 0
+    try:
+        jobs = (
+            db.query(FileSummaryJob)
+            .filter(FileSummaryJob.status.in_(['pending', 'running', 'failed']))
+            .all()
+        )
+        for job in jobs:
+            reason = None
+            if job.file_size_bytes > max_file_size_bytes:
+                reason = f"File too large: {job.file_size_bytes} bytes (cap {max_file_size_bytes})"
+            elif _re.search(r'\.log(\.\d+)?$', job.file_path or '', _re.IGNORECASE):
+                reason = "Log file excluded from summarisation"
+            if reason:
+                job.status = 'cancelled'
+                job.error_message = reason
+                if job.completed_at is None:
+                    from datetime import datetime as _dt
+                    job.completed_at = _dt.utcnow()
+                cancelled += 1
+        if cancelled:
+            db.commit()
+    except Exception as exc:
+        logger.error("cancel_bad_file_summary_jobs failed: %s", exc)
+        db.rollback()
+    finally:
+        db.close()
+    return cancelled
+
+
 # ---------------------------------------------------------------------------
 # OptimizationBenchmark CRUD
 # ---------------------------------------------------------------------------

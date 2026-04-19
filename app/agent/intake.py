@@ -234,6 +234,8 @@ class IntakePipeline:
 
     async def run(self) -> dict:
         """Execute the full pipeline. Returns tally result dict."""
+        from app.agent.llm_client import set_llm_session_context
+        set_llm_session_context(AGENT_NAME)
         if is_shutting_down():
             raise ShutdownError("Server is shutting down")
 
@@ -641,6 +643,7 @@ class IntakePipeline:
 
             # Collect Python files from affected areas in scope analysis
             # and fall back to analyzing all Python files in the project
+            from app.agent.path_filter import walk_safe
             raw_scope = scope_vote.get("raw_response") or {}
             affected_areas = raw_scope.get("affected_areas", [])
             if isinstance(affected_areas, list) and len(affected_areas) > 0:
@@ -648,9 +651,7 @@ class IntakePipeline:
                 for area in affected_areas:
                     area_path = os.path.join(project_root, area.lstrip("/"))
                     if os.path.isdir(area_path):
-                        for root, dirs, files in os.walk(area_path):
-                            # Skip excluded directories
-                            dirs[:] = [d for d in dirs if d not in ("venv", "__pycache__", ".git", ".archive")]
+                        for root, dirs, files in walk_safe(area_path):
                             for f in files:
                                 if f.endswith(".py"):
                                     file_paths.append(os.path.join(root, f))
@@ -662,9 +663,7 @@ class IntakePipeline:
             else:
                 # Fall back: analyze all Python files in the project
                 file_paths = []
-                for root, dirs, files in os.walk(project_root):
-                    # Skip excluded directories
-                    dirs[:] = [d for d in dirs if d not in ("venv", "__pycache__", ".git", ".archive")]
+                for root, dirs, files in walk_safe(project_root):
                     for f in files:
                         if f.endswith(".py"):
                             file_paths.append(os.path.join(root, f))

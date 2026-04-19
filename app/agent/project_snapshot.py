@@ -23,6 +23,7 @@ from app.agent.config import (
     PROJECT_ROOT,
     TOOL_LISTING_EXCLUDED_DIRS,
 )
+from app.agent.path_filter import get_ignored_paths, filter_paths
 
 # Lazy imports for snapshot config - avoids circular import issues
 def _snapshot_max_depth() -> int:
@@ -253,12 +254,7 @@ def _build_snapshot_lines(
     file_formatter(prefix, fname, abs_path) -> str
         Called for each non-ignored file.  Return None to skip the line.
     """
-    excluded = TOOL_LISTING_EXCLUDED_DIRS
     lines: list[str] = ["== PROJECT STRUCTURE =="]
-
-    root_real = os.path.realpath(project_root)
-    _archive_real = os.path.realpath(os.path.join(root_real, ".archive"))
-    git_dir = os.path.join(root_real, ".git")
 
     def _walk(dir_path: str, prefix: str, depth: int) -> None:
         if depth > max_depth:
@@ -269,26 +265,12 @@ def _build_snapshot_lines(
         except OSError:
             return
 
-        candidate_dirs: list[str] = []
-        candidate_files: list[str] = []
-        for entry in entries:
-            if entry.startswith(".") and entry not in (".env.example",):
-                continue
-            full = os.path.join(dir_path, entry)
-            full_real = os.path.realpath(full)
-            if os.path.isdir(full):
-                if entry not in excluded and full_real not in (_archive_real, git_dir):
-                    candidate_dirs.append(entry)
-            elif os.path.isfile(full):
-                candidate_files.append(entry)
+        abs_entries = [os.path.join(dir_path, e) for e in entries]
+        allowed_abs = filter_paths(abs_entries, project_root)
+        allowed_names = {os.path.basename(p) for p in allowed_abs}
 
-        # Batch gitignore check for all candidates at this level.
-        abs_dirs  = [os.path.join(dir_path, d) for d in candidate_dirs]
-        abs_files = [os.path.join(dir_path, f) for f in candidate_files]
-        ignored   = _is_git_ignored(abs_dirs + abs_files, root_real)
-
-        dirs  = [d for d, p in zip(candidate_dirs,  abs_dirs)  if p not in ignored]
-        files = [f for f, p in zip(candidate_files, abs_files) if p not in ignored]
+        dirs = [e for e in entries if e in allowed_names and os.path.isdir(os.path.join(dir_path, e))]
+        files = [e for e in entries if e in allowed_names and os.path.isfile(os.path.join(dir_path, e))]
 
         for fname in files:
             abs_path = os.path.join(dir_path, fname)
@@ -551,32 +533,8 @@ async def async_build_file_summary(
 
 
 # ---------------------------------------------------------------------------
-# Gitignore + symlink safety helpers
+# symlink safety helpers
 # ---------------------------------------------------------------------------
-
-def _is_git_ignored(paths: list[str], cwd: str) -> set[str]:
-    """Batch-check which of the given absolute paths are gitignored.
-
-    Returns a set of absolute paths that git considers ignored.
-    Returns an empty set on any failure (git unavailable, not a repo, etc.).
-    """
-    if not paths:
-        return set()
-    try:
-        rel_paths = [os.path.relpath(p, cwd) for p in paths]
-        result = subprocess.run(
-            ["git", "check-ignore", "--stdin", "-z"],
-            input="\0".join(rel_paths) + "\0",
-            capture_output=True, text=True, cwd=cwd, timeout=10,
-        )
-        if result.returncode not in (0, 1):
-            return set()
-        ignored_rels = {r for r in result.stdout.split("\0") if r}
-        return {p for p, r in zip(paths, rel_paths) if r in ignored_rels}
-    except Exception as exc:
-        logger.debug("_is_git_ignored failed: %s", exc)
-        return set()
-
 
 def _is_symlink_escaping(abs_path: str, project_root: str) -> bool:
     """Return True if abs_path is a symlink whose real target is outside project_root."""
@@ -604,37 +562,33 @@ def prewarm_project_summaries(
     Returns the count of new jobs enqueued (cache hits do not count).
     """
     from app.agent.file_summary_agent import enqueue_file_summary
+    from app.agent.path_filter import walk_safe
+    from app.agent.config import SUMMARY_MAX_FILE_SIZE
 
     project_root = os.path.normpath(os.path.abspath(project_root))
     root_real = os.path.realpath(project_root)
-    _archive_real = os.path.realpath(os.path.join(root_real, ".archive"))
-    git_dir = os.path.join(root_real, ".git")
 
     enqueued = 0
-    for dirpath, dirnames, filenames in os.walk(project_root):
-        # Hard exclusions: known noise dirs + .git + .archive
-        dirnames[:] = [
-            d for d in dirnames
-            if d not in TOOL_LISTING_EXCLUDED_DIRS
-            and os.path.realpath(os.path.join(dirpath, d)) not in (_archive_real, git_dir)
-        ]
-
-        # Batch gitignore check for both dirs and files in this level.
-        abs_dirs  = [os.path.join(dirpath, d) for d in dirnames]
-        abs_files = [os.path.join(dirpath, f) for f in filenames]
-        ignored   = _is_git_ignored(abs_dirs + abs_files, root_real)
-
-        # Prune ignored dirs so os.walk never descends into them.
-        dirnames[:] = [d for d, p in zip(dirnames, abs_dirs) if p not in ignored]
-
+    for dirpath, dirnames, filenames in walk_safe(project_root):
         for fname in filenames:
             abs_path = os.path.join(dirpath, fname)
-            if abs_path in ignored:
-                continue
             if _is_symlink_escaping(abs_path, root_real):
                 continue
+
+            try:
+                filesize = os.path.getsize(abs_path)
+            except OSError:
+                continue
+
+            # Skip oversized files or large logs
+            if filesize > SUMMARY_MAX_FILE_SIZE:
+                continue
+            if abs_path.lower().endswith(".log") and filesize > 512 * 1024:
+                continue
+
             try:
                 with open(abs_path, "rb") as fh:
+                    # Check header for binary content
                     if b"\x00" in fh.read(8192):
                         continue
             except OSError:

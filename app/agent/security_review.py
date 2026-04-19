@@ -172,6 +172,8 @@ class SecurityPipeline:
 
     async def run(self) -> SecurityReviewPipelineResult:
         """Run pre-scan + 3 security reviewers, then research any uncertainties."""
+        from app.agent.llm_client import set_llm_session_context
+        set_llm_session_context(AGENT_NAME)
         if is_shutting_down():
             raise ShutdownError("Server is shutting down")
 

@@ -28,6 +28,7 @@ from app.agent.config import (
     SIGNAL_ACCEPTED,
     SIGNAL_REVERT,
     SIGNAL_NEEDS_RESEARCH,
+    SIGNAL_CONTEXT_TOO_LARGE,
     GIT_SAFETY_BRANCH_PREFIX,
     INDEV_AGENT_TOOLS,
     check_context_saturation,
@@ -136,6 +137,8 @@ class MaestroLoop:
         Execute the Wiggum Loop until a terminal condition is reached.
         Registers itself in _ACTIVE_LOOPS and updates _LOOP_STATUS.
         """
+        from app.agent.llm_client import set_llm_session_context
+        set_llm_session_context(AGENT_NAME)
         # Register in the global registry
         current_task = asyncio.current_task()
         _ACTIVE_LOOPS[self.task_id] = current_task
@@ -263,6 +266,10 @@ class MaestroLoop:
                     })
                     self._consecutive_errors = 0
                     continue
+                if sig_type == SIGNAL_CONTEXT_TOO_LARGE:
+                    return self._revert_result(
+                        "Agent signalled CONTEXT_TOO_LARGE — task scope exceeds context budget."
+                    )
 
             # ── Dispatch tool calls ────────────────────────────────────
             if tool_calls:
@@ -499,7 +506,7 @@ class MaestroLoop:
                 parsed = json.loads(attempt.strip())
                 if isinstance(parsed, dict) and "signal" in parsed:
                     sig = parsed["signal"]
-                    if sig in (SIGNAL_ACCEPTED, SIGNAL_REVERT, SIGNAL_NEEDS_RESEARCH):
+                    if sig in (SIGNAL_ACCEPTED, SIGNAL_REVERT, SIGNAL_NEEDS_RESEARCH, SIGNAL_CONTEXT_TOO_LARGE):
                         return parsed
             except (json.JSONDecodeError, ValueError):
                 continue

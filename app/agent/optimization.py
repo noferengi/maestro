@@ -90,6 +90,8 @@ class OptimizationPipeline:
 
     async def run(self) -> OptimizationPipelineResult:
         """Execute all 5 phases."""
+        from app.agent.llm_client import set_llm_session_context
+        set_llm_session_context(AGENT_NAME)
         if is_shutting_down():
             raise ShutdownError("Server is shutting down")
 

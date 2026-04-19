@@ -216,21 +216,44 @@ def enqueue_file_summary(
     get_file_summary(sha1, filesize).
 
     Raises ValueError if the file cannot be read.
-    Returns ("", "", 0) silently for binary files — they cannot be summarised as text.
+    Returns ("", "", 0) silently for binary files, oversized files, or large logs.
     """
+    from app.agent.config import SUMMARY_MAX_FILE_SIZE
+
+    try:
+        filesize = os.path.getsize(abs_path)
+    except OSError as exc:
+        raise ValueError(f"Cannot stat '{abs_path}': {exc}") from exc
+
+    # Safety limits for summarization:
+    # 1. Hard cap from config (default 1MB)
+    if filesize > SUMMARY_MAX_FILE_SIZE:
+        logger.debug("enqueue_file_summary: skipping oversized file '%s' (%d bytes)", abs_path, filesize)
+        return "", "", 0
+
+    # 2. Log file exclusion: skip .log and rotated log files (.log.1, .log.2, …)
+    #    at any size — they are operational artifacts with no architectural value.
+    import re as _re
+    if _re.search(r'\.log(\.\d+)?$', abs_path, _re.IGNORECASE):
+        logger.debug("enqueue_file_summary: skipping log file '%s'", abs_path)
+        return "", "", 0
+
     try:
         with open(abs_path, "rb") as fh:
+            # Only read the header to check for binary content first
+            header = fh.read(8192)
+            if b"\x00" in header:
+                logger.debug("enqueue_file_summary: skipping binary file '%s'", abs_path)
+                return "", "", 0
+            
+            # If not binary, we need the full content for SHA1 and preview
+            fh.seek(0)
             raw = fh.read()
     except OSError as exc:
         raise ValueError(f"Cannot read '{abs_path}': {exc}") from exc
 
-    # Binary files cannot be summarised as text — skip silently.
-    if b"\x00" in raw[:512]:
-        logger.debug("enqueue_file_summary: skipping binary file '%s'", abs_path)
-        return "", "", 0
-
-    sha1, filesize = _sha1_and_size(raw)
-    completion_key = f"file_summary:{sha1}:{filesize}"
+    sha1, filesize_actual = _sha1_and_size(raw)
+    completion_key = f"file_summary:{sha1}:{filesize_actual}"
 
     # 1. DB cache hit - already summarised
     from app.database import get_file_summary
@@ -302,6 +325,8 @@ async def execute_file_summary(
     All paths use a structured FULL_SUMMARY / SHORT_SUMMARY response format.
     Called by _run_file_summary_job() in the scheduler worker thread.
     """
+    from app.agent.llm_client import set_llm_session_context
+    set_llm_session_context(AGENT_NAME)
     if is_shutting_down():
         raise ShutdownError("Server is shutting down")
 

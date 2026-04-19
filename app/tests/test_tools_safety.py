@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from app.agent.tools import (
     _assert_safe_path,
+    _assert_safe_write_path,
     _is_command_blocked,
     dispatch_tool,
     archive_file,
@@ -28,7 +29,8 @@ from app.agent.config import PROJECT_ROOT
 
 
 # ---------------------------------------------------------------------------
-# Path safety
+# Path safety — reads (_assert_safe_path) are now globally permissive;
+#               writes (_assert_safe_write_path) are restricted to project root.
 # ---------------------------------------------------------------------------
 
 class TestAssertSafePath:
@@ -37,14 +39,22 @@ class TestAssertSafePath:
         result = _assert_safe_path(PROJECT_ROOT)
         assert os.path.isabs(result)
 
-    def test_path_escape_raises_value_error(self):
-        """A path that escapes via traversal raises ValueError."""
-        evil_path = os.path.join(PROJECT_ROOT, "..", "..", "etc", "passwd")
-        with pytest.raises(ValueError, match="outside"):
-            _assert_safe_path(evil_path)
+    def test_read_allows_paths_outside_project_root(self):
+        """_assert_safe_path (reads) now allows global navigation — no ValueError for outside paths."""
+        # Reads are unrestricted except for .git internals and .archive.
+        # A path outside PROJECT_ROOT should resolve without raising.
+        outside = os.path.dirname(PROJECT_ROOT)  # parent dir — valid filesystem path
+        result = _assert_safe_path(outside)
+        assert os.path.isabs(result)
+
+    def test_read_still_blocks_git_internals(self):
+        """_assert_safe_path blocks .git directory access regardless of location."""
+        git_path = os.path.join(PROJECT_ROOT, ".git", "config")
+        with pytest.raises(ValueError, match="git"):
+            _assert_safe_path(git_path)
 
     def test_contextvar_override_accepts_inside(self, tmp_path):
-        """When _task_git_cwd is set, paths inside that dir are accepted."""
+        """When _task_git_cwd is set, paths inside that dir are accepted for reads."""
         token = _task_git_cwd.set(str(tmp_path))
         try:
             inner = str(tmp_path / "subdir")
@@ -54,12 +64,55 @@ class TestAssertSafePath:
         finally:
             _task_git_cwd.reset(token)
 
-    def test_contextvar_override_rejects_outside(self, tmp_path):
-        """When _task_git_cwd is set, paths outside that dir raise ValueError."""
+    def test_contextvar_override_read_allows_outside(self, tmp_path):
+        """_assert_safe_path allows reads outside _task_git_cwd (reads are global)."""
         token = _task_git_cwd.set(str(tmp_path))
         try:
+            # Reading PROJECT_ROOT from a different project's context is allowed.
+            result = _assert_safe_path(PROJECT_ROOT)
+            assert os.path.isabs(result)
+        finally:
+            _task_git_cwd.reset(token)
+
+
+class TestAssertSafeWritePath:
+    def test_accepts_path_inside_project_root(self, tmp_path):
+        """A path inside the effective root is accepted."""
+        token = _task_git_cwd.set(str(tmp_path))
+        try:
+            inner = str(tmp_path / "src" / "main.py")
+            result = _assert_safe_write_path(inner)
+            assert result.startswith(os.path.realpath(str(tmp_path)))
+        finally:
+            _task_git_cwd.reset(token)
+
+    def test_write_rejects_outside_project_root(self, tmp_path):
+        """Writes outside the project root are rejected."""
+        token = _task_git_cwd.set(str(tmp_path))
+        try:
+            outside = os.path.join(PROJECT_ROOT, "some_file.py")
             with pytest.raises(ValueError, match="outside"):
-                _assert_safe_path(PROJECT_ROOT)
+                _assert_safe_write_path(outside)
+        finally:
+            _task_git_cwd.reset(token)
+
+    def test_write_rejects_venv_segment(self, tmp_path):
+        """Writes into venv/ are rejected even when inside the project root."""
+        token = _task_git_cwd.set(str(tmp_path))
+        try:
+            venv_path = str(tmp_path / "venv" / "lib" / "site.py")
+            with pytest.raises(ValueError, match="venv"):
+                _assert_safe_write_path(venv_path)
+        finally:
+            _task_git_cwd.reset(token)
+
+    def test_write_rejects_git_internals(self, tmp_path):
+        """Writes to .git are rejected (inherited from _assert_safe_path)."""
+        token = _task_git_cwd.set(str(tmp_path))
+        try:
+            git_path = str(tmp_path / ".git" / "config")
+            with pytest.raises(ValueError):
+                _assert_safe_write_path(git_path)
         finally:
             _task_git_cwd.reset(token)
 

@@ -56,8 +56,8 @@ _SOURCE_EXTENSIONS = {
 
 def _has_meaningful_source_files(project_root: str = PROJECT_ROOT) -> bool:
     """Check if the project directory contains meaningful source code files."""
-    for root, dirs, files in os.walk(project_root):
-        dirs[:] = [d for d in dirs if d not in LISTING_EXCLUDED_DIRS]
+    from app.agent.path_filter import walk_safe
+    for root, dirs, files in walk_safe(project_root):
         for fname in files:
             ext = os.path.splitext(fname)[1].lower()
             if ext in _SOURCE_EXTENSIONS:
@@ -302,8 +302,10 @@ class SubdivisionAgent:
 
     async def run(self) -> SubdivisionResult:
         """Execute the subdivision agent and return decomposed sub-ideas."""
+        from app.agent.llm_client import set_llm_session_context
+        set_llm_session_context(AGENT_NAME)
         logger.info("Subdivision agent starting for task '%s' (%s).", self.parent_task_id, self.parent_title)
-        
+
         # Ensure tool isolation for this task's project
         if self.project_root:
             set_task_git_cwd(self.project_root)
@@ -318,8 +320,10 @@ class SubdivisionAgent:
         _ctx_warned: set[float] = set()
 
         consecutive_failures = 0
+        turns_run = 0
 
         for turn in range(self.max_turns):
+            turns_run = turn + 1
             if is_shutting_down():
                 raise ShutdownError("Server is shutting down")
 
@@ -422,8 +426,12 @@ class SubdivisionAgent:
                                "Either call a tool to investigate, or output your JSON decomposition.",
                 })
 
-        # Exhausted turns - return a low-confidence empty result
-        logger.warning("Subdivision agent exhausted %d turns for task '%s'.", self.max_turns, self.parent_task_id)
+        # Turn loop exited — either true exhaustion (all max_turns consumed) or an
+        # early break (context saturation, 3 consecutive failures, ContextTooLargeError).
+        logger.warning(
+            "Subdivision agent stopped after %d/%d turns for task '%s' — no decomposition produced.",
+            turns_run, self.max_turns, self.parent_task_id,
+        )
         return SubdivisionResult(
             sub_ideas=[],
             decomposition_rationale="Agent exhausted turn limit without producing decomposition.",

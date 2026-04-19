@@ -21,6 +21,8 @@ import logging
 import random
 import threading
 import time
+import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -35,6 +37,32 @@ from app.agent.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Session identity context vars
+# ---------------------------------------------------------------------------
+# Each agent sets these once at the start of its run via set_llm_session_context().
+# call_llm() uses them as the fallback when session_id/agent_name are not passed
+# explicitly, so all LLM calls within an agent run share the same session_id
+# without every call site needing to thread it through manually.
+
+_ctx_session_id: ContextVar[str | None] = ContextVar('llm_session_id', default=None)
+_ctx_agent_name: ContextVar[str | None] = ContextVar('llm_agent_name', default=None)
+
+
+def set_llm_session_context(agent_name: str, session_id: str | None = None) -> str:
+    """Set the session identity for all subsequent call_llm() calls on this task.
+
+    Call this once at the start of each agent run (in run() or the thread entry
+    point).  Returns the session_id so callers can log it if needed.
+
+    A fresh UUID is generated when session_id is None.
+    """
+    sid = session_id or str(uuid.uuid4())
+    _ctx_session_id.set(sid)
+    _ctx_agent_name.set(agent_name)
+    return sid
+
 
 # ---------------------------------------------------------------------------
 # Context-size guard
@@ -622,8 +650,10 @@ async def call_llm(
     task_id: str | None = None,
     llm_id: int | None = None,
     budget_id: int | None = None,
-    # Diagnostic label - appears in all retry/error log messages
+    # Diagnostic labels - agent_name appears in log messages; session_id groups all
+    # calls from one agent run so the diagnostics page can reconstruct sessions exactly.
     agent_name: str | None = None,
+    session_id: str | None = None,
 ) -> dict:
     """
     POST to an OpenAI-compatible ``/chat/completions`` endpoint.
@@ -929,6 +959,22 @@ async def call_llm(
                 body_text = exc.response.text or ""
                 payload_desc = _describe_payload(payload)
 
+                # llama.cpp returns 500 when the model generates a tool call whose
+                # `arguments` field contains invalid JSON (e.g. unescaped quotes from
+                # triple-quoted Python strings in write_file content).  Retrying the
+                # same message history will produce the same broken output — fail fast
+                # so the caller (component_loop, MaestroLoop) can count the failure and
+                # inject a correction turn or trigger REVERT_TO_DESIGN.
+                if "Failed to parse tool call arguments" in body_text:
+                    logger.warning(
+                        "%s LLM endpoint %s returned %d (non-retryable: model generated"
+                        " invalid tool call arguments JSON — likely unescaped quotes in"
+                        " write_file content).\nError: %s\nPayload:\n%s",
+                        _agent_label, url, exc.response.status_code,
+                        body_text[:300], payload_desc,
+                    )
+                    raise
+
                 # llama.cpp emits "Failed to parse input" for two distinct reasons:
                 #
                 # 1. Bad content in the payload (null bytes, control chars, Jinja2
@@ -1178,10 +1224,14 @@ async def call_llm(
         await asyncio.sleep(_retry_wait)
         # loop continues → retry
 
-    # Log every call to budget_entries
+    # Log every call to budget_entries.
+    # Fall back to the context vars so agents that set set_llm_session_context()
+    # get correct session grouping without passing session_id to every call site.
     _log_budget_entry(
         result, messages,
         task_id=task_id, llm_id=llm_id, budget_id=budget_id,
+        agent_name=agent_name or _ctx_agent_name.get(),
+        session_id=session_id or _ctx_session_id.get(),
     )
 
     return result
@@ -1194,6 +1244,8 @@ def _log_budget_entry(
     task_id: str | None,
     llm_id: int | None,
     budget_id: int | None,
+    agent_name: str | None = None,
+    session_id: str | None = None,
 ) -> None:
     """Persist a budget entry from an LLM response. Best-effort, never raises."""
     try:
@@ -1226,6 +1278,8 @@ def _log_budget_entry(
             tool_calls=total_turns,
             prompt_data=prompt_json,
             response_data=response_json,
+            session_id=session_id,
+            agent_name=agent_name,
         )
         if entry and budget_id is not None:
             from app.database import get_llm, create_expense

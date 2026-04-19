@@ -57,6 +57,11 @@ _task_git_cwd: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "_task_git_cwd", default=None
 )
 
+_task_project_name: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_task_project_name", default=None
+)
+
+
 # ---------------------------------------------------------------------------
 # Per-task file read-range tracking
 # ---------------------------------------------------------------------------
@@ -250,35 +255,37 @@ _BLOCKED_RE = re.compile("|".join(BLOCKED_PATTERNS), re.IGNORECASE)
 
 def _assert_safe_path(path: str) -> str:
     """
-    Resolve path and assert it stays inside the effective project root.
+    Resolve path and ensure it doesn't touch protected system/metadata paths.
 
-    When a task git working directory has been set via set_task_git_cwd(),
-    containment is checked against that path instead of PROJECT_ROOT.
-    This allows agents to operate on managed projects without escaping
-    their own tree.
+    Maestro allows agents to navigate the entire PC, but protects:
+      1. .git internal directories (everywhere)
+      2. The Maestro archive (.archive)
 
     Returns the absolute resolved path string.
-    Raises ValueError if the path escapes the effective root.
+    Raises ValueError if the path touches a protected location.
     """
-    # Normalize mixed separators (e.g. "src\foo/bar.py" on Windows) before any
-    # path logic — without this, os.path.realpath leaves backslashes intact on
-    # some Python builds and the containment check below can fail spuriously.
+    # Normalize mixed separators
     path = os.path.normpath(path)
     effective_root = _task_git_cwd.get() or PROJECT_ROOT
-    # Resolve relative paths against the effective project root, not the process CWD.
-    # Without this, 'PRD.md' would resolve to TheMaestro's directory when an agent
-    # is operating on a different project (e.g. AndroidStreetPass).
+    
     if os.path.isabs(path):
         resolved = os.path.realpath(path)
     else:
         resolved = os.path.realpath(os.path.join(effective_root, path))
-    root = os.path.realpath(effective_root)
-    if not resolved.startswith(root):
-        logger.warning("Path escape attempt: %s outside %s", resolved, effective_root)
-        raise ValueError(
-            f"Path '{path}' resolves to '{resolved}' which is outside "
-            f"the effective project root '{root}'. Access denied."
-        )
+
+    # Protect .git directories everywhere
+    # Case-insensitive check on Windows for safety.
+    norm_path = resolved.lower()
+    if "\\.git\\" in norm_path or "/.git/" in norm_path or norm_path.endswith("\\.git") or norm_path.endswith("/.git"):
+        logger.warning("Blocked access to git internal path: %s", resolved)
+        raise ValueError(f"HARD REJECTION: '{path}' touches a .git directory. Access to git internals is blocked.")
+
+    # Protect .archive (Maestro's soft-delete tombstone)
+    archive_abs = os.path.realpath(ARCHIVE_DIR).lower()
+    if norm_path == archive_abs or norm_path.startswith(archive_abs + os.sep):
+        logger.warning("Blocked access to Maestro archive: %s", resolved)
+        raise ValueError(f"REJECTION: '{path}' is inside the Maestro archive. This folder is managed by the system.")
+
     return resolved
 
 
@@ -287,39 +294,83 @@ def _assert_archivable(path: str) -> str:
     Extended safety check used exclusively by archive_file.
 
     Rules (in priority order):
-      1. Path must be inside PROJECT_ROOT (delegates to _assert_safe_path).
-      2. Path must NOT touch .git or anything inside it - git history is
-         permanently protected. Archiving git internals would destroy the repo.
-      3. Path must NOT be inside the root archive directory (ARCHIVE_DIR).
-         Re-archiving an already-archived file makes no sense and is rejected
-         with instructions on how to restore instead.
+      1. Path must NOT touch .git or anything inside it.
+      2. Path must NOT be inside the root archive directory (ARCHIVE_DIR).
 
     Returns the resolved absolute path on success.
     Raises ValueError with a descriptive message on any violation.
     """
-    safe = _assert_safe_path(path)          # raises ValueError if outside PROJECT_ROOT
-    root = os.path.realpath(PROJECT_ROOT)
-    git_dir = os.path.join(root, ".git")
+    safe = _assert_safe_path(path)
     archive_root = os.path.realpath(ARCHIVE_DIR)
 
-    # Hard reject: .git folder and every path inside it
-    if safe == git_dir or safe.startswith(git_dir + os.sep):
-        raise ValueError(
-            f"HARD REJECTION: '{path}' is inside the .git folder. "
-            "Archiving git internals would permanently destroy repository history. "
-            "This operation is blocked and cannot be overridden."
-        )
-
-    # Hard reject: root archive dir and every path inside it
-    if safe == archive_root or safe.startswith(archive_root + os.sep):
-        raise ValueError(
-            f"HARD REJECTION: '{path}' is already inside the archive directory "
-            f"'{ARCHIVE_DIR}'. Cannot re-archive an archived file. "
-            "If you need to restore it, see the undelete instructions returned "
-            "by calling archive_file on the original path."
-        )
+    # Note: _assert_safe_path already protects .git and .archive internals.
+    # We only need to check if the path IS the archive root itself here.
+    if safe == os.path.realpath(archive_root):
+        raise ValueError("HARD REJECTION: Cannot archive the archive root itself.")
 
     return safe
+
+
+# Segments that are never valid write targets even when inside the project root.
+# Dependency dirs, build artefacts, and VCS metadata are all off-limits for writes.
+_WRITE_BLOCKED_SEGMENTS: frozenset[str] = frozenset({
+    "venv", ".venv", "__pycache__", "node_modules",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    "dist", "build", ".eggs", ".tox", "site-packages",
+})
+
+
+def _assert_safe_write_path(path: str) -> str:
+    """
+    Safety check for all write operations (write_file, append_file).
+
+    Layer 0 — inherited from _assert_safe_path (called first):
+      - .git directories everywhere: HARD REJECTED.  Writing into a .git dir
+        would corrupt the repository.
+      - .archive directory: HARD REJECTED.  Maestro's soft-delete tombstone
+        must not be written to directly.
+
+    Additional write-specific layers:
+      1. The resolved path must be inside the effective project root.
+         Agents may READ anywhere on the PC, but writes are confined to the
+         project they are working on.
+      2. The path must not pass through any dependency/build/VCS segment
+         (_WRITE_BLOCKED_SEGMENTS) — those dirs must never be overwritten.
+      3. Gitignored paths are refused to prevent accidental writes to
+         secrets, data files, or other protected content.
+
+    Returns the resolved absolute path.
+    Raises ValueError with a descriptive message on any violation.
+    """
+    resolved = _assert_safe_path(path)   # Layer 0: blocks .git + .archive
+    effective_root = _task_git_cwd.get() or PROJECT_ROOT
+    root = os.path.realpath(effective_root)
+
+    # 1. Containment: writes must stay inside the project root
+    if not resolved.startswith(root + os.sep) and resolved != root:
+        raise ValueError(
+            f"WRITE REJECTED: '{path}' resolves to '{resolved}' which is outside "
+            f"the project root '{root}'. Writes are restricted to the project directory."
+        )
+
+    # 2. Segment blocklist
+    rel = os.path.relpath(resolved, root)
+    for seg in rel.replace("\\", "/").split("/"):
+        if seg in _WRITE_BLOCKED_SEGMENTS:
+            raise ValueError(
+                f"WRITE REJECTED: '{path}' passes through '{seg}' — "
+                "dependency/build directories cannot be written to."
+            )
+
+    # 3. Gitignored paths — refuse writes (protect secrets, data, generated files)
+    if _is_gitignored(resolved):
+        raise ValueError(
+            f"WRITE REJECTED: '{path}' is listed in .gitignore. "
+            "Writing to gitignored paths is blocked to protect secrets and data files. "
+            "If this is intentional, remove the path from .gitignore first."
+        )
+
+    return resolved
 
 
 def _find_archived_copies(rel_path: str) -> list[str]:
@@ -355,31 +406,12 @@ def _is_command_blocked(command: str) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 # Gitignore guard
 # ---------------------------------------------------------------------------
-#
-# list_directory() already labels gitignored entries as [PROTECTED - gitignored]
-# but read_file / read_file_harder / read_file_lines only checked the project-root
-# boundary, not gitignore status.  An LLM that sees the PROTECTED label can still
-# call read_file("data/kanban.db") directly — which is how 20 MB of binary SQLite
-# content ended up in a tool-result message.
-#
-# Fix: refuse any read on a gitignored path, exactly as the directory listing does.
-# Cache the git check-ignore result per-path (stable for a server process lifetime —
-# .gitignore changes don't invalidate, but that's acceptable here).
-
-_gitignore_cache: dict[str, bool] = {}  # abs_path -> is_ignored
-
 
 def _is_gitignored(abs_path: str) -> bool:
-    """Return True if abs_path is git-ignored. Result cached for process lifetime."""
-    if abs_path in _gitignore_cache:
-        return _gitignore_cache[abs_path]
-    try:
-        from app.agent.project_snapshot import _is_git_ignored
-        ignored = bool(_is_git_ignored([abs_path], os.path.dirname(abs_path)))
-    except Exception:
-        ignored = False
-    _gitignore_cache[abs_path] = ignored
-    return ignored
+    """Return True if abs_path is git-ignored. Uses centralized PathFilter."""
+    from app.agent.path_filter import is_ignored
+    effective_root = _task_git_cwd.get() or PROJECT_ROOT
+    return is_ignored(abs_path, effective_root)
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +436,12 @@ def _cap_tool_result(name: str, result: str) -> str:
         "Tool '%s' returned %d chars — truncating to %d to prevent context overflow.",
         name, len(result), len(truncated),
     )
-    return truncated + f"\n\n[TRUNCATED: result was {len(result):,} chars total; only first {len(truncated):,} shown]"
+    return (
+        truncated
+        + f"\n\n[TRUNCATED: result was {len(result):,} chars total; only first {len(truncated):,} chars shown. "
+        "This file is too large to read in full. Use `search_files` to find specific content "
+        "within it instead of calling `read_file` on the same path again.]"
+    )
 
 
 def _is_binary_path(abs_path: str) -> bool:
@@ -438,12 +475,6 @@ def read_file(path: str) -> str:
             f"ERROR: '{path}' is a binary file (contains null bytes) and cannot be read as text. "
             "Binary files (databases, compiled bytecode, archives) must be inspected with "
             "appropriate non-text tools."
-        )
-    if _is_gitignored(safe_path):
-        return (
-            f"ERROR: '{path}' is listed in .gitignore and is not accessible to agents. "
-            "Gitignored files (data files, build artefacts, secrets) are protected — "
-            "they appear as [PROTECTED - gitignored] in directory listings for this reason."
         )
     norm = os.path.normpath(os.path.realpath(safe_path))
     from app.agent.project_snapshot import _count_file_lines, build_file_summary
@@ -495,11 +526,12 @@ def write_file(path: str, content: str) -> str:
     Write (overwrite) a file with the given content.
     Auto-stages the file for git tracking after writing.
     """
-    safe_path = _assert_safe_path(path)
+    try:
+        safe_path = _assert_safe_write_path(path)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
     if os.path.exists(safe_path) and _is_binary_path(safe_path):
         return f"ERROR: '{path}' is a binary file; refusing to overwrite with text content."
-    if _is_gitignored(safe_path):
-        return f"ERROR: '{path}' is listed in .gitignore; refusing to write to a protected path."
     try:
         os.makedirs(os.path.dirname(safe_path), exist_ok=True)
         with open(safe_path, "w", encoding="utf-8") as fh:
@@ -513,11 +545,12 @@ def write_file(path: str, content: str) -> str:
 
 def append_file(path: str, content: str) -> str:
     """Append content to the end of a file (creates the file if absent)."""
-    safe_path = _assert_safe_path(path)
+    try:
+        safe_path = _assert_safe_write_path(path)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
     if os.path.exists(safe_path) and _is_binary_path(safe_path):
         return f"ERROR: '{path}' is a binary file; refusing to append text content."
-    if _is_gitignored(safe_path):
-        return f"ERROR: '{path}' is listed in .gitignore; refusing to write to a protected path."
     try:
         os.makedirs(os.path.dirname(safe_path), exist_ok=True)
         with open(safe_path, "a", encoding="utf-8") as fh:
@@ -553,81 +586,97 @@ def list_directory(path: str = ".") -> str:
     """
     List files and directories at the given path.
 
-    Files are shown with their cached summary inline (or SUMMARY NOT AVAILABLE
-    on a cache miss).  Special entries:
-      - .git: shown as DIR with [PROTECTED]
-      - gitignored entries: shown with [PROTECTED - gitignored]
-      - symlinks escaping the project root: shown with [PROTECTED - symlink escapes project]
-      - .archive and LISTING_EXCLUDED_DIRS: hidden (counted in footer)
+    Maestro allows navigation of the entire PC. Files are shown with their
+    cached summary if available. Entries are annotated but never hidden (except
+    .archive which is a Maestro-internal tombstone):
+      - .git/:       [PROTECTED - git internals; use git tools, no direct writes]
+      - venv/, __pycache__/, etc.:
+                     [AUTO-EXCLUDED - skipped by agent tools and summarization]
+      - gitignored:  [GITIGNORED - excluded from auto-summarization; read_file access OK]
+      - symlink escaping project: [PROTECTED - symlink escapes project]
     """
     safe_path = _assert_safe_path(path)
     if not os.path.isdir(safe_path):
         return f"ERROR: '{path}' is not a directory."
 
-    _archive_real = os.path.realpath(ARCHIVE_DIR)
-    root_real = os.path.realpath(PROJECT_ROOT)
-    git_dir = os.path.join(root_real, ".git")
+    from app.agent.path_filter import get_ignored_paths
+    from app.agent.project_snapshot import _is_symlink_escaping
+
+    effective_root = _task_git_cwd.get() or PROJECT_ROOT
+    root_real = os.path.realpath(effective_root)
+    archive_real = os.path.realpath(ARCHIVE_DIR)
 
     try:
-        from app.agent.project_snapshot import _is_git_ignored, _is_symlink_escaping
+        entries = sorted(os.listdir(safe_path))
+    except OSError as exc:
+        return f"ERROR: Cannot read directory '{path}': {exc}"
+
+    # Batch gitignore check for all entries at once (single subprocess call)
+    all_full = [os.path.join(safe_path, e) for e in entries]
+    try:
+        gitignored_set = get_ignored_paths(all_full, effective_root)
     except Exception:
-        _is_git_ignored = lambda paths, cwd: set()  # noqa: E731
-        _is_symlink_escaping = lambda p, r: False  # noqa: E731
+        gitignored_set = set()
 
-    entries = sorted(os.listdir(safe_path))
-    all_full_paths = [os.path.join(safe_path, e) for e in entries]
-    ignored_set = _is_git_ignored(all_full_paths, safe_path)
-    
     lines: list[str] = []
-    hidden = 0
-    for entry, full in zip(entries, all_full_paths):
-        full_real = os.path.realpath(full)
 
-        # Always hide: archive dir and excluded dirs (not .git - show it as PROTECTED)
-        if full_real == _archive_real:
-            hidden += 1
-            continue
-        if os.path.isdir(full) and entry in LISTING_EXCLUDED_DIRS:
-            hidden += 1
-            continue
+    for entry, full in zip(entries, all_full):
+        full_real = os.path.realpath(full)
 
         is_dir = os.path.isdir(full)
         kind = "DIR " if is_dir else "FILE"
+        suffix = "/" if is_dir else ""
 
-        # .git - show as PROTECTED
-        if full_real == git_dir:
-            lines.append(f"{kind}  {entry}/  [PROTECTED]")
+        # 1. .archive — shown as RESERVED; contents are not listable (_assert_safe_path
+        #    blocks any path inside .archive so list_directory(".archive/...") will fail).
+        if full_real == archive_real:
+            lines.append(f"{kind}  {entry}/  [RESERVED - Maestro soft-delete archive; contents not accessible]")
             continue
 
-        # Gitignored
-        if full in ignored_set:
-            suffix = "/" if is_dir else ""
-            lines.append(f"{kind}  {entry}{suffix}  [PROTECTED - gitignored]")
+        # 2. .git — shown but hard-protected; listing inside .git is also blocked by
+        #    _assert_safe_path so list_directory(".git/objects") will fail.
+        if entry.lower() == ".git" and is_dir:
+            lines.append(f"{kind}  {entry}/  [PROTECTED - git internals; contents not accessible, use git tools]")
             continue
 
-        # Symlink escaping project
+        # 3. Symlinks escaping the project root
         if _is_symlink_escaping(full, root_real):
             target = os.readlink(full) if os.path.islink(full) else "?"
-            lines.append(f"{kind}  {entry} -> {target}  [PROTECTED - symlink escapes project]")
+            lines.append(f"{kind}  {entry}{suffix} -> {target}  [PROTECTED - symlink escapes project]")
             continue
 
-        # Normal directory
+        # 4. Built-in excluded dirs (venv, __pycache__, node_modules, etc.)
+        #    Check by name — these are shown but flagged as auto-excluded.
+        #    Agent CAN read inside them if truly needed, but tools skip them automatically.
+        if is_dir and entry in TOOL_LISTING_EXCLUDED_DIRS:
+            lines.append(f"{kind}  {entry}/  [AUTO-EXCLUDED - skipped by agent tools and summarization]")
+            continue
+
+        # Hidden files/dirs (except a few explicit allowances)
+        if entry.startswith(".") and entry not in (".env.example", ".gitignore", ".geminiignore"):
+            lines.append(f"{kind}  {entry}{suffix}  [AUTO-EXCLUDED - hidden file/dir]")
+            continue
+
+        # 5. Gitignored — shown but labelled so agent knows automatic processing is skipped.
+        #    Direct read_file / search_files calls are still allowed on these paths.
+        if full in gitignored_set:
+            lines.append(
+                f"{kind}  {entry}{suffix}  [GITIGNORED - excluded from auto-summarization; "
+                "read_file/search_files access is allowed]"
+            )
+            continue
+
+        # 6. Normal entries
         if is_dir:
             lines.append(f"{kind}  {entry}/")
-            continue
-
-        # Normal file - show with summary
-        summary = _get_cached_summary_for_listing(full)
-        if summary is not None:
-            lines.append(f"{kind}  {entry}  - {summary}")
         else:
-            logger.debug("list_directory: no cached summary for %s", full)
-            lines.append(f"{kind}  {entry}  - (SUMMARY NOT AVAILABLE)")
+            summary = _get_cached_summary_for_listing(full)
+            if summary:
+                lines.append(f"{kind}  {entry}  - {summary}")
+            else:
+                lines.append(f"{kind}  {entry}  - (SUMMARY NOT AVAILABLE)")
 
-    result = "\n".join(lines) if lines else "(empty directory)"
-    if hidden:
-        result += f"\n[{hidden} system/excluded director{'ies' if hidden != 1 else 'y'} hidden]"
-    return result
+    return "\n".join(lines) if lines else "(empty directory)"
 
 
 def search_files(pattern: str, directory: str = ".") -> str:
@@ -637,26 +686,21 @@ def search_files(pattern: str, directory: str = ".") -> str:
     """
     safe_dir = _assert_safe_path(directory)
     results: list[str] = []
+    
     try:
         compiled = re.compile(pattern, re.IGNORECASE)
     except re.error as exc:
-        return f"ERROR: invalid regex pattern '{pattern}': {exc}"
+        return f"ERROR: Invalid regex pattern: {exc}"
 
-    _archive_real = os.path.realpath(ARCHIVE_DIR)
-    for root, dirs, files in os.walk(safe_dir):
-        # Skip excluded directories (LISTING_EXCLUDED_DIRS covers .git, venv, etc.)
-        # Also skip the root archive folder by absolute path so nested .archive
-        # subdirectories inside source trees are not affected.
-        dirs[:] = [
-            d for d in dirs
-            if d not in LISTING_EXCLUDED_DIRS
-            and os.path.realpath(os.path.join(root, d)) != _archive_real
-        ]
+    from app.agent.path_filter import walk_safe
+    from app.agent.config import PROJECT_ROOT
+
+    effective_root = _task_git_cwd.get() or PROJECT_ROOT
+
+    for root, dirs, files in walk_safe(safe_dir):
         for fname in files:
             fpath = os.path.join(root, fname)
             if _is_binary_path(fpath):
-                continue
-            if _is_gitignored(fpath):
                 continue
             try:
                 with open(fpath, "r", encoding="utf-8", errors="ignore") as fh:
@@ -680,8 +724,6 @@ def read_file_lines(path: str, start: int, end: int) -> str:
         return f"ERROR: '{path}' is not a file or does not exist."
     if _is_binary_path(safe_path):
         return f"ERROR: '{path}' is a binary file and cannot be read as text."
-    if _is_gitignored(safe_path):
-        return f"ERROR: '{path}' is gitignored and not accessible to agents."
     try:
         with open(safe_path, "r", encoding="utf-8", errors="replace") as fh:
             lines = fh.readlines()
@@ -716,8 +758,6 @@ def read_file_harder(
         return f"ERROR: '{path}' is not a file or does not exist."
     if _is_binary_path(safe_path):
         return f"ERROR: '{path}' is a binary file and cannot be read as text."
-    if _is_gitignored(safe_path):
-        return f"ERROR: '{path}' is gitignored and not accessible to agents."
 
     # Auto-prep: show structural summary first if not yet done
     if not _is_file_prepped(safe_path):
@@ -762,8 +802,6 @@ def count_lines(path: str) -> str:
         return f"ERROR: '{path}' is not a file or does not exist."
     if _is_binary_path(safe_path):
         return f"ERROR: '{path}' is a binary file; cannot count lines meaningfully."
-    if _is_gitignored(safe_path):
-        return f"ERROR: '{path}' is gitignored and not accessible to agents."
     try:
         byte_size = os.path.getsize(safe_path)
         with open(safe_path, "r", encoding="utf-8", errors="replace") as fh:
@@ -789,7 +827,6 @@ def find_files(glob_pattern: str, directory: str = ".") -> str:
         and not os.path.realpath(m).startswith(_archive_real + os.sep)
         and os.path.realpath(m) != _archive_real
     ]
-    filtered = [m for m in filtered if not _is_gitignored(os.path.realpath(m))]
     if not filtered:
         return "No files found matching the pattern."
     lines = [os.path.relpath(m, safe_dir) for m in sorted(filtered)[:TOOL_MAX_SEARCH_RESULTS]]
@@ -1578,6 +1615,86 @@ def append_task_history(task_id: str, entry: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Survey tools
+# ---------------------------------------------------------------------------
+
+def _get_survey_orchestrator():
+    from app.agent.survey_orchestrator import SurveyOrchestrator
+    return SurveyOrchestrator()
+
+
+def get_project_summary(project: str | None = None) -> str:
+    """Return the top-level project health summary if it exists and is fresh."""
+    p_name = project or _task_project_name.get()
+    if not p_name:
+        return "ERROR: No project name provided or configured in context."
+    try:
+        so = _get_survey_orchestrator()
+        summary = so.get_project_summary(p_name)
+        if not summary:
+            return f"No fresh project summary found for '{p_name}'. A survey may be in progress."
+        return summary
+    except Exception as exc:
+        return f"ERROR fetching project summary: {exc}"
+
+
+def get_directory_summary(rel_dir: str, project: str | None = None) -> str:
+    """Return the summary for a specific directory within the project."""
+    p_name = project or _task_project_name.get()
+    if not p_name:
+        return "ERROR: No project name provided or configured in context."
+    try:
+        from app.database import get_scope_summary
+        summary = get_scope_summary(p_name, "directory", rel_dir)
+        if not summary:
+            return f"No summary found for directory '{rel_dir}' in project '{p_name}'."
+        return f"Summary for {rel_dir}:\n{summary.summary}"
+    except Exception as exc:
+        return f"ERROR fetching directory summary: {exc}"
+
+
+def get_module_summary(module_name: str, project: str | None = None) -> str:
+    """Return the summary for a logical module within the project."""
+    p_name = project or _task_project_name.get()
+    if not p_name:
+        return "ERROR: No project name provided or configured in context."
+    try:
+        from app.database import get_scope_summary
+        summary = get_scope_summary(p_name, "module", module_name)
+        if not summary:
+            return f"No summary found for module '{module_name}' in project '{p_name}'."
+        return f"Summary for module {module_name}:\n{summary.summary}"
+    except Exception as exc:
+        return f"ERROR fetching module summary: {exc}"
+
+
+def list_scope_summaries(project: str | None = None, scope_type: str | None = None) -> str:
+    """List all available scope summaries (type, key, short_summary, freshness) for a project."""
+    p_name = project or _task_project_name.get()
+    if not p_name:
+        return "ERROR: No project name provided or configured in context."
+    import json
+    try:
+        from app.database import list_scope_summaries as db_list_scopes
+        scopes = db_list_scopes(p_name, scope_type=scope_type)
+        if not scopes:
+            return f"No scope summaries found for project '{p_name}'."
+        
+        results = []
+        for s in scopes:
+            results.append({
+                "type": s.scope_type,
+                "key": s.scope_key,
+                "short_summary": s.short_summary,
+                "staleness": s.staleness_state,
+                "updated_at": s.updated_at.isoformat() if s.updated_at else None
+            })
+        return json.dumps(results, indent=2)
+    except Exception as exc:
+        return f"ERROR listing scope summaries: {exc}"
+
+
+# ---------------------------------------------------------------------------
 # Allowlisted shell wrappers (delegate to pipeline modules)
 # ---------------------------------------------------------------------------
 
@@ -1685,6 +1802,10 @@ TOOL_REGISTRY: dict[str, Any] = {
     "run_shell_security": _run_shell_security_wrapper,
     "run_shell_review": _run_shell_review_wrapper,
     "run_shell_indev": run_shell_indev,
+    "get_project_summary": get_project_summary,
+    "get_directory_summary": get_directory_summary,
+    "get_module_summary": get_module_summary,
+    "list_scope_summaries": list_scope_summaries,
 }
 
 TOOL_SCHEMAS: list[dict] = [
@@ -2280,6 +2401,65 @@ TOOL_SCHEMAS: list[dict] = [
                     "url": {"type": "string", "description": "The URL to fetch."},
                 },
                 "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_project_summary",
+            "description": "Return the top-level project health summary if it exists and is fresh.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Optional project name (inferred from context if omitted)."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_directory_summary",
+            "description": "Return the summary for a specific directory within the project.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rel_dir": {"type": "string", "description": "Relative path to the directory (e.g. 'app/agent')."},
+                    "project": {"type": "string", "description": "Optional project name."},
+                },
+                "required": ["rel_dir"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_module_summary",
+            "description": "Return the summary for a logical module within the project.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "module_name": {"type": "string", "description": "Name of the module (as assigned during survey)."},
+                    "project": {"type": "string", "description": "Optional project name."},
+                },
+                "required": ["module_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_scope_summaries",
+            "description": "List all available scope summaries (type, key, short_summary, freshness) for a project.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Optional project name."},
+                    "scope_type": {"type": "string", "description": "Optional filter: 'directory', 'module', 'collection', or 'project'."},
+                },
+                "required": [],
             },
         },
     },

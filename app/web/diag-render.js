@@ -262,6 +262,83 @@ function renderConversation(entry, highlightFrom, anchorEntryId, selectedFull, s
     const groupEntries = cachedSession?.fullEntries || [headerEntry];
     const conceptualTurns = getConceptualTurns(groupEntries);
 
+    // Parallel session: all entries share the same prompt (no accumulating context).
+    // Each entry is an independent response — render them all side-by-side rather than
+    // trying to stitch them into a single accumulating conversation.
+    const isParallelSession = isSessionView
+        && groupEntries.length > 1
+        && (groupEntries[groupEntries.length - 1].prompt_data?.length ?? 0) === (groupEntries[0].prompt_data?.length ?? 0)
+        && (groupEntries[0].prompt_data?.length ?? 0) > 0;
+
+    if (isParallelSession) {
+        // Shared prompt (system + user messages, identical for every entry)
+        const sharedMsgs = Array.isArray(groupEntries[0].prompt_data) ? groupEntries[0].prompt_data : effectiveMessages;
+        html += `<div class="diag-turn-divider diag-turn-divider-other" data-entry-id="${groupEntries[0].id}" data-msg-idx="0">` +
+                `<span class="diag-divider-label">── SYSTEM Prompt (shared · ${groupEntries.length} parallel requests) ──</span>` +
+                `</div>`;
+        const sharedGrouped = groupMessages(sharedMsgs, []);
+        let msgIdx = 0;
+        sharedGrouped.forEach(g => {
+            if (g.type === 'tool_group') {
+                html += renderToolGroup(g.messages, msgIdx, false);
+                msgIdx += g.messages.length;
+            } else {
+                html += renderMessage(g.message, msgIdx, false);
+                msgIdx++;
+            }
+        });
+
+        // One labeled response block per entry
+        groupEntries.forEach((fe, i) => {
+            const isAnchor = fe.id === anchorEntryId;
+            const divClass = isAnchor
+                ? 'diag-turn-divider diag-turn-divider-anchor'
+                : 'diag-turn-divider diag-turn-divider-other';
+            const anchorAttr = isAnchor ? ' id="turn-anchor"' : '';
+            const ctxBar = buildCtxBar(fe.id);
+            html += `<div class="${divClass}${ctxBar ? ' has-ctx-bar' : ''}"${anchorAttr} data-entry-id="${fe.id}">` +
+                    `<span class="diag-divider-label">── Parallel Request ${i + 1} of ${groupEntries.length} (#${fe.id}) ──</span>` +
+                    ctxBar +
+                    `</div>`;
+
+            const feMsg       = fe.response_data?.choices?.[0]?.message || {};
+            const feFinish    = fe.response_data?.choices?.[0]?.finish_reason || 'unknown';
+            const feContent   = feMsg.content || '';
+            const feToolCalls = feMsg.tool_calls || [];
+            const feReasoning = feMsg.reasoning_content || '';
+
+            if (feContent || feToolCalls.length > 0 || feReasoning) {
+                const hlClass = isAnchor ? ' msg-highlighted' : '';
+                const feFinishLabel = feFinish === 'stop'   ? 'COMPLETED'
+                                    : feFinish === 'length' ? 'HIT TOKEN LIMIT'
+                                    : feFinish.toUpperCase();
+                html += `<div class="diag-msg msg-assistant${hlClass}">
+                    <div class="diag-msg-header">
+                        <span class="diag-msg-idx">[REQUEST ${i + 1}]</span>
+                        <span>ASSISTANT</span>
+                        <span class="diag-finish-badge finish-${feFinish}" style="font-size:0.75em">${escapeHtml(feFinishLabel)}</span>
+                        ${feToolCalls.length > 0 ? `<span>&#8595; ${feToolCalls.length} tool call(s)</span>` : ''}
+                    </div>
+                    <div class="diag-msg-body">`;
+                if (feReasoning) {
+                    html += `<div class="diag-reasoning-toggle" onclick="toggleReasoning(this)">` +
+                            `&#9658; Reasoning (${feReasoning.length.toLocaleString()} chars) — click to expand` +
+                            `</div><div class="diag-reasoning-body" style="display:none">${escapeHtml(feReasoning)}</div>`;
+                }
+                if (feToolCalls.length > 0) feToolCalls.forEach(tc => { html += renderToolCall(tc); });
+                if (feContent) {
+                    html += `<div class="diag-msg-text"${(feReasoning || feToolCalls.length) ? ' style="margin-top:0.5rem"' : ''}>${escapeHtml(feContent)}</div>`;
+                }
+                html += `</div></div>`;
+            }
+        });
+
+        html += `<div class="diag-turn-divider diag-turn-divider-end">` +
+                `<span>── end of parallel session (${groupEntries.length} parallel requests) ──</span>` +
+                `</div>`;
+
+    } else {
+
     // Precise msgIdx for all conceptual turns
     conceptualTurns.forEach(t => {
         const b = (effectiveBoundaries || []).find(b => b.entryId === t.entryId);
@@ -277,20 +354,20 @@ function renderConversation(entry, highlightFrom, anchorEntryId, selectedFull, s
     // Ensure groupMessages breaks at EVERY conceptual turn boundary
     const allBoundaries = conceptualTurns.map(t => ({ startMsgIdx: t.msgIdx, entryId: t.entryId }));
     const grouped = groupMessages(effectiveMessages, allBoundaries);
-    
+
     let msgIdx = 0;
     grouped.forEach(g => {
         // Render any turn dividers that start at this msgIdx
         const turnsToRender = conceptualTurns.filter(t => t.msgIdx === msgIdx);
         turnsToRender.forEach(turn => {
-            const isAnchor = turn.entryId === anchorEntryId && 
+            const isAnchor = turn.entryId === anchorEntryId &&
                 (targetMsgIdx === null || targetMsgIdx === turn.msgIdx || (turn.type === 'user' && targetMsgIdx === -1));
-            
+
             const divClass = isAnchor
                 ? 'diag-turn-divider diag-turn-divider-anchor'
                 : 'diag-turn-divider diag-turn-divider-other';
             const anchorAttr = isAnchor ? ' id="turn-anchor"' : '';
-            
+
             const ctxBar = buildCtxBar(turn.entryId);
             const dataMsgIdx = turn.msgIdx !== undefined ? ` data-msg-idx="${turn.msgIdx}"` : '';
             html += `<div class="${divClass}${ctxBar ? ' has-ctx-bar' : ''}"${anchorAttr} data-entry-id="${turn.entryId}"${dataMsgIdx}>` +
@@ -362,6 +439,8 @@ function renderConversation(entry, highlightFrom, anchorEntryId, selectedFull, s
             <span>${endLabel}</span>
         </div>`;
     }
+
+    } // end !isParallelSession
 
     html += '</div>'; // .diag-messages
     detail.innerHTML = html;

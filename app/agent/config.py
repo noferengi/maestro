@@ -155,6 +155,7 @@ STATUS_REJECTED: str = "REJECTED"
 SIGNAL_REVERT: str = "REVERT_TO_DESIGN"
 SIGNAL_ACCEPTED: str = "ACCEPTED"
 SIGNAL_NEEDS_RESEARCH: str = "NEEDS_RESEARCH"
+SIGNAL_CONTEXT_TOO_LARGE: str = "CONTEXT_TOO_LARGE"
 
 # ===========================================================================
 # Intake pipeline settings
@@ -439,9 +440,18 @@ SNAPSHOT_CONTEXT_RATIO: float = _getfloat("snapshot", "context_ratio", None, 0.1
 # ===========================================================================
 
 SUMMARY_CONTEXT_RATIO: float = _getfloat("survey", "summary_context_ratio", None, 0.10)
+SUMMARY_MAX_FILE_SIZE: int = _getint("survey", "max_file_size_bytes", None, 1024 * 1024)
+SURVEY_STALENESS_ENABLED: bool = _getbool("survey", "staleness_enabled", None, True)
+SURVEY_STALENESS_CHECK_RATIO: float = _getfloat("survey", "staleness_check_ratio", None, 0.05)
+SURVEY_MAX_CONCURRENT_JOBS: int = _getint("survey", "max_concurrent_scope_jobs", None, 3)
+SURVEY_DIRECTORY_MAX_FILES: int = _getint("survey", "directory_max_files", None, 50)
+SURVEY_MODULE_TARGET_FILES: int = _getint("survey", "module_target_files", None, 30)
 
 TOOL_LISTING_EXCLUDED_DIRS: set[str] = set(_getlist(
     "tools", "excluded_directories",
+    # 'logs' intentionally absent — log directories should be visible in listings
+    # (agents may legitimately inspect them); they are excluded from auto-summarization
+    # by the size cap in enqueue_file_summary, not by directory exclusion.
     ".archive, .git, venv, .venv, __pycache__, node_modules, .mypy_cache, .pytest_cache, .ruff_cache, dist, build, .eggs",
 ))
 
@@ -482,3 +492,4 @@ DREAMER_STALL_TICKS: int     = _getint ("dreamer", "stall_ticks",          None,
 DREAMER_MAX_RESURRECTIONS: int = _getint("dreamer", "max_cards_to_resurrect", None,                   3)
 DREAMER_MAX_NEW_CARDS: int   = _getint ("dreamer", "max_new_cards",        None,                      2)
 DREAMER_DECIDE_MAX_TOKENS: int = _getint("dreamer", "decide_max_tokens",   None,                      4096)
+DREAMER_SURVEY_TOOLS: list[str] = _getlist("dreamer", "survey_tools", "get_project_summary, get_directory_summary, get_module_summary, list_scope_summaries")

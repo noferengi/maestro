@@ -89,6 +89,8 @@ class ConceptualReviewPipeline:
 
     async def run(self) -> ConceptualReviewResult:
         """Execute all review phases and return the result."""
+        from app.agent.llm_client import set_llm_session_context
+        set_llm_session_context(AGENT_NAME)
         if is_shutting_down():
             raise ShutdownError("Server is shutting down")
 

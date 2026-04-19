@@ -14,7 +14,7 @@ import logging
 import os
 import re
 
-from app.agent.llm_client import is_shutting_down, ShutdownError
+from app.agent.llm_client import is_shutting_down, ShutdownError, extract_text_response
 
 logger = logging.getLogger(__name__)
 AGENT_NAME = "Arch Gen Agent"
@@ -65,12 +65,15 @@ async def execute_arch_gen_job(
     Returns ``{"prompt_tokens": int, "completion_tokens": int}``.
     Raises on LLM error or empty response so the scheduler can mark the job failed.
     """
+    from app.agent.llm_client import set_llm_session_context
+    set_llm_session_context(AGENT_NAME)
     if is_shutting_down():
         raise ShutdownError("Server is shutting down")
 
     from app.database import get_file_summaries_for_project_root, create_task
     from app.agent.llm_client import call_llm
     from app.agent.config import SUMMARY_CONTEXT_RATIO
+    from app.agent.path_filter import is_ignored
 
     summaries = get_file_summaries_for_project_root(project_root)
     if not summaries:
@@ -84,32 +87,13 @@ async def execute_arch_gen_job(
             "Run a prewarm/file-summary pass first."
         )
 
-    # Filter out noise paths (venv, __pycache__, .git, node_modules, etc.)
-    # These inflate the prompt without adding architectural signal.
-    _NOISE_SEGMENTS = (
-        "/venv/", "\\venv\\",
-        "/__pycache__/", "\\__pycache__\\",
-        "/.git/", "\\.git\\",
-        "/node_modules/", "\\node_modules\\",
-        "/site-packages/", "\\site-packages\\",
-        "/dist-packages/", "\\dist-packages\\",
-        "/build/", "\\build\\",
-        "/dist/", "\\dist\\",
-        "/.tox/", "\\.tox\\",
-        "/eggs/", "\\eggs\\",
-        # .maestro/ is Maestro's own generated metadata (contracts, architecture snapshots).
-        # Including it in arch gen prompts is circular and its JSON content can contain
-        # sequences that confuse llama.cpp's Jinja2 template renderer.
-        "/.maestro/", "\\.maestro\\",
-    )
-
     # Deduplicate: multiple summary rows may exist per file (re-runs, stale cache).
     # Keep only the most recent row per file path (summaries are ordered by path,
     # but may have multiple rows; pick the one with the best content).
     seen_paths: dict[str, str] = {}  # rel_path -> best text so far
     for row in summaries:
         fp = row.file_path
-        if any(seg in fp for seg in _NOISE_SEGMENTS):
+        if is_ignored(fp, project_root):
             continue
         rel = _rel_path(fp, project_root)
         text = _two_sentences(
@@ -164,12 +148,7 @@ async def execute_arch_gen_job(
         agent_name=AGENT_NAME,
     )
 
-    raw_body = (
-        response.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-        .strip()
-    )
+    raw_body = extract_text_response(response).strip()
     usage = response.get("usage", {})
     prompt_tokens = usage.get("prompt_tokens", 0)
     completion_tokens = usage.get("completion_tokens", 0)

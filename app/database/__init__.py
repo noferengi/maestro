@@ -50,7 +50,9 @@ if globals().get('_initialized'):
         'app.database.crud_pipeline', 'app.database.crud_jobs',
         'app.database.crud_files', 'app.database.crud_inbox',
         'app.database.crud_sessions', 'app.database.crud_dreamer',
-    ]:  # NOTE: keep this list in sync with the from-imports below
+        'app.database.crud_survey',
+        ]:  # NOTE: keep this list in sync with the from-imports below
+
         if _sub in _sys.modules:
             _il.reload(_sys.modules[_sub])
 
@@ -95,6 +97,8 @@ from .models import (
     SearchCache,
     InboxMessage,
     DreamerRun,
+    ScopeSummary,
+    ScopeSurveyJob,
 )
 
 # Task CRUD + seeding + helpers
@@ -225,6 +229,7 @@ from .crud_jobs import (
     get_file_summary_job_by_sha1,
     update_file_summary_job,
     count_pending_file_summary_jobs,
+    cancel_bad_file_summary_jobs,
     create_optimization_benchmark,
     get_optimization_benchmarks,
     create_arch_gen_job,
@@ -269,6 +274,18 @@ from .crud_dreamer import (
     get_dreamer_run,
 )
 
+# Project survey / summarization
+from .crud_survey import (
+    upsert_scope_summary,
+    get_scope_summary,
+    list_scope_summaries,
+    mark_scope_stale,
+    enqueue_scope_survey_job,
+    get_pending_scope_survey_jobs,
+    update_scope_survey_job,
+    get_scope_survey_page_jobs,
+)
+
 __all__ = [
     # session
     "DATABASE_PATH", "engine", "SessionLocal", "Base", "get_db", "init_db_tables",
@@ -282,6 +299,8 @@ __all__ = [
     "ResearchJob", "FileSummaryJob", "OptimizationBenchmark", "ArchGenJob",
     "AgentSession",
     "FileSummary", "SearchCache", "InboxMessage",
+    "DreamerRun",
+    "ScopeSummary", "ScopeSurveyJob",
     # crud_tasks
     "init_db", "seed_sample_tasks", "seed_task", "seed_sample_tasks_raw",
     "create_task", "get_task", "get_tasks_by_type", "get_tasks_by_project",
@@ -323,7 +342,7 @@ __all__ = [
     "get_research_jobs_for_task", "count_pending_research_jobs",
     "create_file_summary_job", "get_pending_file_summary_jobs",
     "get_retriable_file_summary_jobs", "get_file_summary_job_by_sha1",
-    "update_file_summary_job", "count_pending_file_summary_jobs",
+    "update_file_summary_job", "count_pending_file_summary_jobs", "cancel_bad_file_summary_jobs",
     "create_optimization_benchmark", "get_optimization_benchmarks",
     "create_arch_gen_job", "get_pending_arch_gen_jobs",
     "update_arch_gen_job", "get_retriable_arch_gen_jobs",
@@ -337,8 +356,12 @@ __all__ = [
     # crud_sessions
     "create_agent_session", "close_agent_session", "get_agent_sessions_for_task",
     # crud_dreamer
-    "DreamerRun",
     "create_dreamer_run", "update_dreamer_run", "get_dreamer_runs", "get_dreamer_run",
+    # crud_survey
+    "upsert_scope_summary", "get_scope_summary", "list_scope_summaries",
+    "mark_scope_stale", "enqueue_scope_survey_job",
+    "get_pending_scope_survey_jobs", "update_scope_survey_job",
+    "get_scope_survey_page_jobs",
 ]
 
 # Sentinel — presence of this flag on a subsequent execution means we're

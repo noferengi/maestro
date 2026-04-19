@@ -16,6 +16,7 @@ from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
 
 logger = logging.getLogger(__name__)
 
+AGENT_NAME = "Merge Conflict Resolver"
 _MAX_RETRIES = 2
 
 _MERGE_PROMPT = """\
@@ -65,6 +66,8 @@ class MergeConflictResolver:
         Returns:
             {"success": bool, "merged_content": str, "explanation": str}
         """
+        from app.agent.llm_client import set_llm_session_context
+        set_llm_session_context(AGENT_NAME)
         prompt = _MERGE_PROMPT.format(
             base_content=base_content,
             component_a_context=component_a_context,

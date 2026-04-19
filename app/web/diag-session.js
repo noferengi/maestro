@@ -152,8 +152,8 @@ function buildSessionSummary(anchorEntryId) {
             <tfoot><tr class="diag-summary-totals">
                 <td colspan="5">ALL TURNS</td>
                 <td class="col-r" title="Final prompt size (last turn)">${fmtTokens(fullEntries[fullEntries.length - 1].prompt_cost || 0)}</td>
-                <td class="col-r">${fmtTokens(fullEntries[fullEntries.length - 1].prompt_cost - fullEntries[0].prompt_cost || 0)}</td>
-                <td class="col-r">${fmtTokens(fullEntries[fullEntries.length - 1].prompt_cost / (lastMaxCtx || 1) * 100)}</td>
+                <td class="col-r">${fmtTokens((fullEntries[fullEntries.length - 1].prompt_cost - fullEntries[0].prompt_cost) || 0)}</td>
+                <td class="col-r">${lastMaxCtx > 0 ? Math.round(fullEntries[fullEntries.length - 1].prompt_cost / lastMaxCtx * 100) + '%' : '—'}</td>
                 <td class="col-r">${fmtTokens(grandTG)}</td>
                 <td class="col-r col-bold">${fmtTokens(grandPP + grandTG)}</td>
                 <td class="col-r col-dim">${grandCacheStr}</td>

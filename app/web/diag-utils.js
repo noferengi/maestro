@@ -115,8 +115,15 @@ function getConceptualTurns(group) {
     const turns = [];
     if (group.length === 0) return turns;
 
-    // 1. SYSTEM and USER (Turn 0 Setup)
     const first = group[0];
+
+    // Parallel session: all entries share identical prompt_cost → same prompt was sent to each.
+    // (Pipeline stages use tool-call format for structured output so tool_calls ≥ 1 even when
+    // parallel — prompt_cost equality is the reliable signal.)
+    const basePP = group[0].prompt_cost || 0;
+    const isParallel = group.length > 1 && basePP > 0
+        && group.every(e => (e.prompt_cost || 0) === basePP);
+
     turns.push({
         label: 'SYSTEM Prompt',
         entryId: first.id,
@@ -124,6 +131,22 @@ function getConceptualTurns(group) {
         msgIdx: 0,
         entry: first
     });
+
+    if (isParallel) {
+        group.forEach((entry, i) => {
+            turns.push({
+                label: `Parallel Request ${i + 1}`,
+                entryId: entry.id,
+                type: 'turn',
+                turnNum: i + 1,
+                toolName: '',
+                isAbruptEnd: false,
+                entry: entry,
+                msgIdx: null
+            });
+        });
+        return turns;
+    }
 
     // Determine the user message index.  Usually it's 1.
     // If we have multiple entries, Entry 1 is likely the first USER turn.
@@ -143,7 +166,7 @@ function getConceptualTurns(group) {
     let turnCount = 0;
     for (let i = 0; i < group.length; i++) {
         const entry = group[i];
-        
+
         // Skip entry 0 (setup) for Turn labels unless it's a 1-entry session with tools
         if (i === 0 && group.length > 1) continue;
         

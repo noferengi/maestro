@@ -71,6 +71,8 @@ class PlanningGate:
 
     async def run(self) -> GateResult:
         """Execute all 7 checks and return the gate result."""
+        from app.agent.llm_client import set_llm_session_context
+        set_llm_session_context(AGENT_NAME)
         checks: list[GateCheck] = []
 
         # Check 1: Interface completeness
@@ -361,7 +363,7 @@ class PlanningGate:
         Returns (GateCheck, prompt_tokens, completion_tokens, llm_check_unavailable).
         llm_check_unavailable=True means all retries failed and the check was skipped.
         """
-        from app.agent.llm_client import call_llm
+        from app.agent.llm_client import call_llm, extract_text_response
 
         prompt = (
             "Review this implementation plan for feasibility. Is it still viable?\n\n"
@@ -385,7 +387,6 @@ class PlanningGate:
                     messages,
                     base_url=self.llm_base_url,
                     model=self.llm_model,
-                    temperature=0.1,
                     response_format={"type": "json_object"},
                     task_id=self.task_id,
                     llm_id=self.llm_id,
@@ -396,7 +397,7 @@ class PlanningGate:
                 pt = usage.get("prompt_tokens", 0)
                 ct = usage.get("completion_tokens", 0)
 
-                content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+                content = extract_text_response(response)
                 data, _ = json.JSONDecoder().raw_decode(content.lstrip())
                 feasible = data.get("feasible", True)
                 concerns = data.get("concerns", [])

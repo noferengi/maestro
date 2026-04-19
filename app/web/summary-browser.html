@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SummaryBrowser — Project Health</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/summary-browser.css">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔭</text></svg>">
+</head>
+<body>
+    <div id="app">
+        <header class="browser-header">
+            <div class="header-left">
+                <h1>SummaryBrowser</h1>
+                <select id="project-select">
+                    <option value="">Select Project...</option>
+                </select>
+            </div>
+            <div class="header-right">
+                <button id="trigger-survey-btn" class="btn btn-primary">🔭 Re-survey Project</button>
+                <a href="/" class="btn">← Back to Board</a>
+            </div>
+        </header>
+
+        <main class="browser-main">
+            <aside class="scope-sidebar">
+                <div class="sidebar-header">
+                    <h2>Scope Tree</h2>
+                    <div class="view-toggles">
+                        <button id="view-dir" class="btn btn-sm active">Directory</button>
+                        <button id="view-module" class="btn btn-sm">Module</button>
+                    </div>
+                </div>
+                <div id="scope-tree" class="scope-tree">
+                    <div class="empty-state">Select a project to view scopes</div>
+                </div>
+            </aside>
+
+            <section class="summary-detail" id="summary-detail">
+                <div class="empty-state">Select a scope from the tree to view its summary</div>
+            </section>
+        </main>
+    </div>
+
+    <script src="/static/summary-browser.js"></script>
+</body>
+</html>

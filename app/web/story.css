@@ -497,3 +497,107 @@
     word-break: break-word;
     max-width: 420px;
 }
+
+/* ── Inline failure detail block (inside session cards) ─── */
+.story-inline-detail {
+    margin-top: 0.55rem;
+    padding-top: 0.5rem;
+    border-top: 1px solid #f1aeb5;
+}
+
+.story-inline-detail-title {
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #842029;
+    margin-bottom: 0.35rem;
+}
+
+/* ── Demotion card ───────────────────────────────────────── */
+.story-demotion-card {
+    display: flex;
+    gap: 0;
+    margin-bottom: 0.85rem;
+    border-radius: 6px;
+    overflow: hidden;
+    background: #f8f9fa;
+    border: 1px solid #dee2e6;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+}
+
+.story-demotion-arrow {
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: #6c757d;
+    padding: 0.1rem 0.35rem;
+    background: #e9ecef;
+    border-radius: 3px;
+}
+
+.story-demotion-reason {
+    font-size: 0.8rem;
+    color: #495057;
+    margin-top: 0.3rem;
+    line-height: 1.45;
+}
+
+/* ── Gate check grid ─────────────────────────────────────── */
+.gate-check-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    margin-top: 0.55rem;
+}
+
+.gate-check-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    padding: 0.3rem 0.5rem;
+    border-radius: 4px;
+    background: #f8fff9;
+    border: 1px solid #a3cfbb;
+    font-size: 0.8rem;
+}
+
+.gate-check-row--fail {
+    background: #fff5f5;
+    border-color: #f1aeb5;
+}
+
+.gate-check-icon {
+    font-size: 0.85rem;
+    font-weight: 700;
+    flex-shrink: 0;
+    width: 14px;
+}
+.gate-check-row .gate-check-icon       { color: #198754; }
+.gate-check-row--fail .gate-check-icon { color: #dc3545; }
+
+.gate-check-name {
+    font-weight: 600;
+    color: #212529;
+    min-width: 140px;
+    text-transform: capitalize;
+}
+
+.gate-check-soft {
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #6c757d;
+    background: #e9ecef;
+    padding: 0.1rem 0.3rem;
+    border-radius: 3px;
+    flex-shrink: 0;
+}
+
+.gate-check-detail {
+    font-size: 0.78rem;
+    color: #495057;
+    flex: 1;
+    min-width: 0;
+    word-break: break-word;
+}

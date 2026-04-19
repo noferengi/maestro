@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Body
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from typing import List
@@ -2880,30 +2880,33 @@ def _pick_prewarm_resources(
 
 
 def _trigger_project_prewarm(
+    project_name: str,
     project_path: str,
     project_llm_id: "int | None" = None,
     project_budget_id: "int | None" = None,
 ) -> None:
-    """Fire prewarm_project_summaries in a background daemon thread.
-
-    Uses the project's configured LLM/budget if set; falls back to the first
-    available LLM and an infinite budget.
-    Silently skips if no LLM or budget is configured — prewarm is best-effort.
+    """Trigger the tiered project survey process in a background thread.
+    
+    This replaces the old flat file-summary prewarm with the new
+    hierarchical SurveyOrchestrator approach.
     """
     llm_id, budget_id = _pick_prewarm_resources(project_llm_id, project_budget_id)
     if llm_id is None or budget_id is None:
-        logger.debug("prewarm skipped for '%s' — no LLM/budget configured", project_path)
+        logger.debug("survey/prewarm skipped for '%s' — no LLM/budget configured", project_path)
         return
 
     def _run():
-        from app.agent.project_snapshot import prewarm_project_summaries
+        from app.agent.survey_orchestrator import SurveyOrchestrator
         try:
-            n = prewarm_project_summaries(project_path, llm_id=llm_id, budget_id=budget_id)
-            logger.info("prewarm triggered by project update: %d jobs for '%s'", n, project_path)
+            orchestrator = SurveyOrchestrator()
+            result = orchestrator.ensure_project_surveyed(
+                project_name, project_path, llm_id, budget_id
+            )
+            logger.info("[Survey] Tiered survey triggered for '%s': %s", project_name, result)
         except Exception:
-            logger.exception("prewarm failed for '%s'", project_path)
+            logger.exception("[Survey] Tiered survey failed to initiate for '%s'", project_name)
 
-    threading.Thread(target=_run, daemon=True, name=f"prewarm-{project_path[-32:]}").start()
+    threading.Thread(target=_run, daemon=True, name=f"survey-{project_name}").start()
 
 
 # ============================================
@@ -2977,7 +2980,7 @@ def create_project(data: dict):
     if not project:
         raise HTTPException(status_code=500, detail="Failed to create project.")
     if project.path:
-        _trigger_project_prewarm(project.path, project_llm_id=project.llm_id, project_budget_id=project.budget_id)
+        _trigger_project_prewarm(project.name, project.path, project_llm_id=project.llm_id, project_budget_id=project.budget_id)
     return _project_to_dict(project)
 
 
@@ -2998,7 +3001,7 @@ def update_project(project_name: str, data: dict):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or update failed.")
     if project.path:
-        _trigger_project_prewarm(project.path, project_llm_id=project.llm_id, project_budget_id=project.budget_id)
+        _trigger_project_prewarm(project.name, project.path, project_llm_id=project.llm_id, project_budget_id=project.budget_id)
     return _project_to_dict(project)
 
 
@@ -3153,6 +3156,60 @@ def get_project_arch_gen_jobs(project_name: str):
             ],
             "summary": summary
         }
+
+
+@app.post("/api/projects/{name}/survey")
+async def trigger_project_survey(name: str):
+    """Enqueue a full survey pass for the project."""
+    project = db.get_project(name)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    from app.agent.survey_orchestrator import SurveyOrchestrator
+    orchestrator = SurveyOrchestrator()
+    result = orchestrator.ensure_project_surveyed(
+        name, project.path, project.llm_id, project.budget_id
+    )
+    return result
+
+
+@app.get("/api/projects/{name}/scope-summaries")
+async def list_project_scopes(name: str, scope_type: str = None):
+    """List all scopes for a project."""
+    return db.list_scope_summaries(name, scope_type)
+
+
+@app.get("/api/projects/{name}/scope-summaries/{scope_type}/{scope_key:path}")
+async def get_scope_detail(name: str, scope_type: str, scope_key: str):
+    """Get detail for a specific scope. Note: scope_key may contain slashes."""
+    scope = db.get_scope_summary(name, scope_type, scope_key)
+    if not scope:
+        raise HTTPException(status_code=404, detail="Scope not found")
+    return scope
+
+
+@app.post("/api/projects/{name}/scope-summaries/{scope_type}/{scope_key:path}/re-survey")
+async def enqueue_resurvey(name: str, scope_type: str, scope_key: str):
+    """Enqueue a re-survey for a specific scope."""
+    project = db.get_project(name)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    db.enqueue_scope_survey_job(
+        name, scope_type, scope_key, action="generate",
+        llm_id=project.llm_id, budget_id=project.budget_id
+    )
+    return {"status": "enqueued"}
+
+
+@app.get("/summary-browser", response_class=HTMLResponse)
+async def get_summary_browser():
+    """Standalone summary browser UI."""
+    try:
+        with open("app/web/summary-browser.html", "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        return f"Error loading summary-browser.html: {e}"
 
 
 # ============================================
@@ -3503,6 +3560,8 @@ def budget_entry_to_dict(entry):
         "first_tool": first_tool,
         "first_tool_args": first_tool_args,
         "created_at": entry.created_at.isoformat() if entry.created_at else None,
+        "session_id": entry.session_id,
+        "agent_name": entry.agent_name,
     }
 
 
@@ -4058,6 +4117,52 @@ def get_transition_history(task_id: str):
         prev_created_at = result.created_at
 
     return output
+
+
+@app.get("/api/tasks/{task_id}/planning-gate-results")
+def get_planning_gate_results(task_id: str):
+    """Planning gate check results for a task, chronological order."""
+    results = get_transition_results(task_id, transition="planning_gate")
+    if not results:
+        return []
+    results = list(reversed(results))  # chronological
+    output = []
+    for i, r in enumerate(results):
+        vs = r.vote_summary or {}
+        output.append({
+            "run": i + 1,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "passed": r.outcome != "rejected",
+            "llm_check_unavailable": vs.get("llm_check_unavailable", False),
+            "checks": vs.get("checks", []),
+            "prompt_tokens": r.total_prompt_tokens or 0,
+            "completion_tokens": r.total_completion_tokens or 0,
+        })
+    return output
+
+
+@app.get("/api/tasks/{task_id}/component-results")
+def get_task_component_results(task_id: str):
+    """Per-component DevOrchestrator results for a task."""
+    from app.database import get_component_results
+    rows = get_component_results(task_id)
+    return [
+        {
+            "id": r.id,
+            "component_name": r.component_name,
+            "batch_number": r.batch_number,
+            "step_order": r.step_order,
+            "status": r.status,
+            "files_changed": json.loads(r.files_changed or "[]"),
+            "tests_passed": r.tests_passed,
+            "turns_used": r.turns_used,
+            "error_detail": r.error_detail,
+            "prompt_tokens": r.prompt_tokens or 0,
+            "completion_tokens": r.completion_tokens or 0,
+            "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+        }
+        for r in rows
+    ]
 
 
 def _compute_tally_narrative(votes_data: list, outcome: str, forced: bool = False) -> str:

@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from itertools import zip_longest
@@ -63,9 +64,8 @@ _SOURCE_EXTENSIONS = {
 
 def _has_meaningful_source_files(project_root: str = PROJECT_ROOT) -> bool:
     """Check if the project directory contains meaningful source code files."""
-    import os
-    for root, dirs, files in os.walk(project_root):
-        dirs[:] = [d for d in dirs if d not in LISTING_EXCLUDED_DIRS]
+    from app.agent.path_filter import walk_safe
+    for root, dirs, files in walk_safe(project_root):
         for fname in files:
             ext = os.path.splitext(fname)[1].lower()
             if ext in _SOURCE_EXTENSIONS:
@@ -345,6 +345,8 @@ class ResearchAgent:
 
     async def run(self) -> ResearchResult:
         """Execute the research agent across all lives. Returns a ResearchResult."""
+        from app.agent.llm_client import set_llm_session_context
+        set_llm_session_context(AGENT_NAME)
         total_turns = 0
 
         for life_num in range(1, self.max_lives + 1):
@@ -634,6 +636,26 @@ class ResearchAgent:
                 return LifeResult(
                     findings=vote.get("findings", ""),
                     vote=vote,
+                    turns_used=turns_used,
+                    prompt_tokens=life_prompt_tokens,
+                    completion_tokens=life_completion_tokens,
+                )
+
+            # If the LLM self-reported CONTEXT_TOO_LARGE, exit immediately without
+            # dispatching the tool calls — they would only grow an already-oversized context.
+            if content and '"CONTEXT_TOO_LARGE"' in content:
+                logger.warning(
+                    "Research agent CONTEXT_TOO_LARGE signal (life %d, turn %d) — exiting immediately",
+                    life_num, turns_used,
+                )
+                return LifeResult(
+                    findings=f"Life {life_num} self-reported CONTEXT_TOO_LARGE at turn {turns_used}.",
+                    vote={
+                        "verdict": "TOO_LARGE",
+                        "confidence": 100,
+                        "justification": "Agent signalled CONTEXT_TOO_LARGE — not dispatching further tool calls.",
+                        "findings": f"Context too large at turn {turns_used} of life {life_num}.",
+                    },
                     turns_used=turns_used,
                     prompt_tokens=life_prompt_tokens,
                     completion_tokens=life_completion_tokens,
@@ -983,6 +1005,8 @@ class InvestigationAgent:
 
     async def run(self) -> InvestigationResult:
         """Execute investigation across up to max_lives. Returns InvestigationResult."""
+        from app.agent.llm_client import set_llm_session_context
+        set_llm_session_context(_INVESTIGATION_AGENT_NAME)
         total_turns = 0
         final_report: dict = {}
 
@@ -1257,6 +1281,8 @@ class WebSearchAgent:
         self.budget_id = budget_id
 
     async def run(self) -> str:
+        from app.agent.llm_client import set_llm_session_context
+        set_llm_session_context(_WEB_SEARCH_AGENT_NAME)
         messages = [
             {"role": "system", "content": _WEB_SEARCH_SYSTEM_PROMPT},
             {"role": "user", "content": f"Query: {self.query}\n\nSearch Results:\n{json.dumps(self.results, indent=2)}"}

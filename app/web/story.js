@@ -52,12 +52,14 @@ const STAGE_LABELS = {
 
 // ── State ────────────────────────────────────────────────────
 
-let _taskId      = null;
-let _sessions    = [];
-let _task        = null;
-let _pips        = [];
-let _transitions = [];
-let _refreshTimer = null;
+let _taskId          = null;
+let _sessions        = [];
+let _task            = null;
+let _pips            = [];
+let _transitions     = [];
+let _gateResults     = [];
+let _componentResults = [];
+let _refreshTimer    = null;
 
 // ── Init ─────────────────────────────────────────────────────
 
@@ -78,12 +80,14 @@ document.addEventListener('DOMContentLoaded', () => {
 async function loadStory() {
     clearTimeout(_refreshTimer);
     try {
-        // Parallel fetch: task metadata, sessions, PIPs, transition history
-        const [taskRes, sessionsRes, pipsRes, transRes] = await Promise.all([
+        // Parallel fetch: task metadata, sessions, PIPs, transition history, gate results, component results
+        const [taskRes, sessionsRes, pipsRes, transRes, gateRes, compRes] = await Promise.all([
             fetch(`/api/tasks/${encodeURIComponent(_taskId)}`),
             fetch(`/api/tasks/${encodeURIComponent(_taskId)}/agent-sessions`),
             fetch(`/api/tasks/${encodeURIComponent(_taskId)}/pips`),
             fetch(`/api/tasks/${encodeURIComponent(_taskId)}/transition-history`),
+            fetch(`/api/tasks/${encodeURIComponent(_taskId)}/planning-gate-results`),
+            fetch(`/api/tasks/${encodeURIComponent(_taskId)}/component-results`),
         ]);
 
         if (!taskRes.ok) {
@@ -93,13 +97,16 @@ async function loadStory() {
             return;
         }
 
-        _task        = await taskRes.json();
-        _sessions    = sessionsRes.ok ? await sessionsRes.json() : [];
-        _pips        = pipsRes.ok     ? await pipsRes.json()     : [];
-        _transitions = transRes.ok    ? await transRes.json()    : [];
+        _task             = await taskRes.json();
+        _sessions         = sessionsRes.ok ? await sessionsRes.json() : [];
+        _pips             = pipsRes.ok     ? await pipsRes.json()     : [];
+        _transitions      = transRes.ok    ? await transRes.json()    : [];
+        _gateResults      = gateRes.ok     ? await gateRes.json()     : [];
+        _componentResults = compRes.ok     ? await compRes.json()     : [];
 
         renderHeader();
         renderTimeline();
+        renderGateLedger();
         renderDecisionLedger();
 
         // Auto-refresh while any session is still running
@@ -136,7 +143,7 @@ function renderHeader() {
     // Meta line: demotions, PIPs
     const metaEl = document.getElementById('story-meta');
     const parts = [];
-    const demotions = (_task.history || []).filter(h => h.event === 'demotion').length;
+    const demotions = (_task.demotion_count || 0);
     if (demotions > 0) parts.push(`Demotions: ${demotions}`);
     if (_pips.length > 0) {
         const unsatisfied = _pips.filter(p => p.status === 'unsatisfied').length;
@@ -153,25 +160,80 @@ function renderHeader() {
 
 function renderTimeline() {
     const container = document.getElementById('story-timeline');
+    container.innerHTML = '';
 
-    if (_sessions.length === 0) {
-        container.innerHTML = '<p class="story-empty">No agent sessions recorded for this card yet.</p>';
+    // Pre-match gate results to planning sessions by time window
+    // gate created_at falls between session.started_at and session.ended_at
+    const gateBySession = new Map(); // session.id -> gate result
+    for (const s of _sessions) {
+        if (s.agent_type !== 'planning' || s.exit_reason !== 'rejected' || !s.ended_at) continue;
+        const gate = _gateResults.find(g =>
+            g.created_at && g.created_at >= s.started_at && g.created_at <= s.ended_at
+        );
+        if (gate) gateBySession.set(s.id, gate);
+    }
+
+    // Pre-group component results by batch_number, keyed to dev_orchestrator sessions by time
+    // Group all components by batch number for display
+    const compsByBatch = new Map(); // batch_number -> [component]
+    for (const c of _componentResults) {
+        const bn = c.batch_number ?? 0;
+        if (!compsByBatch.has(bn)) compsByBatch.set(bn, []);
+        compsByBatch.get(bn).push(c);
+    }
+    // Map dev_orchestrator sessions to their component results (all components up to that run)
+    const compsBySession = new Map(); // session.id -> [component]
+    const devSessions = _sessions
+        .filter(s => s.agent_type === 'dev_orchestrator')
+        .sort((a, b) => (a.started_at < b.started_at ? -1 : 1));
+    if (devSessions.length > 0 && _componentResults.length > 0) {
+        // Assign all component results to the last dev_orchestrator session (simplest correct approach)
+        // since component results accumulate across retries on the same task
+        const lastDev = devSessions[devSessions.length - 1];
+        compsBySession.set(lastDev.id, _componentResults);
+    }
+
+    // Build a unified event list: sessions + demotion events, sorted by time
+    const events = [];
+    for (const s of _sessions) {
+        events.push({ kind: 'session', ts: s.started_at || '', data: s });
+    }
+    const demotions = _task.demotion_history || [];
+    for (const d of demotions) {
+        events.push({ kind: 'demotion', ts: d.timestamp || '', data: d });
+    }
+    events.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+
+    if (events.length === 0) {
+        container.innerHTML = '<p class="story-empty">No agent sessions or demotion events recorded for this card yet.</p>';
         return;
     }
 
-    container.innerHTML = '';
+    const sessionCount = events.filter(e => e.kind === 'session').length;
+    const demotionCount = events.filter(e => e.kind === 'demotion').length;
+    const parts = [];
+    if (sessionCount > 0) parts.push(`${sessionCount} Session${sessionCount !== 1 ? 's' : ''}`);
+    if (demotionCount > 0) parts.push(`${demotionCount} Demotion${demotionCount !== 1 ? 's' : ''}`);
 
     const label = document.createElement('div');
     label.className = 'story-section-label';
-    label.textContent = `${_sessions.length} Session${_sessions.length !== 1 ? 's' : ''}`;
+    label.textContent = parts.join(' · ');
     container.appendChild(label);
 
-    for (const s of _sessions) {
-        container.appendChild(buildSessionCard(s));
+    for (const ev of events) {
+        if (ev.kind === 'session') {
+            container.appendChild(buildSessionCard(
+                ev.data,
+                gateBySession.get(ev.data.id) || null,
+                compsBySession.get(ev.data.id) || null,
+            ));
+        } else {
+            container.appendChild(buildDemotionCard(ev.data));
+        }
     }
 }
 
-function buildSessionCard(s) {
+function buildSessionCard(s, matchedGate = null, matchedComponents = null) {
     const running = !s.ended_at;
     const agentKey = s.agent_type || 'unknown';
     const color = AGENT_TYPE_COLORS[agentKey] || '#6c757d';
@@ -311,6 +373,74 @@ function buildSessionCard(s) {
         inner.appendChild(tokLine);
     }
 
+    // ── Inline gate check details (planning session, rejected) ──
+    if (matchedGate && matchedGate.checks && matchedGate.checks.length > 0) {
+        const failedChecks = matchedGate.checks.filter(c => !c.passed);
+        if (failedChecks.length > 0) {
+            const gateBlock = document.createElement('div');
+            gateBlock.className = 'story-inline-detail';
+
+            const gateTitle = document.createElement('div');
+            gateTitle.className = 'story-inline-detail-title';
+            gateTitle.textContent = `Gate: ${failedChecks.length} check${failedChecks.length !== 1 ? 's' : ''} failed`;
+            gateBlock.appendChild(gateTitle);
+
+            const grid = document.createElement('div');
+            grid.className = 'gate-check-grid';
+            for (const chk of failedChecks) {
+                grid.appendChild(_buildCheckRow(chk));
+            }
+            gateBlock.appendChild(grid);
+            inner.appendChild(gateBlock);
+        }
+    }
+
+    // ── Inline component failure details (dev_orchestrator, rejected) ──
+    if (matchedComponents && matchedComponents.length > 0) {
+        const failedComps = matchedComponents.filter(c => c.status !== 'ACCEPTED');
+        if (failedComps.length > 0) {
+            const compBlock = document.createElement('div');
+            compBlock.className = 'story-inline-detail';
+
+            const compTitle = document.createElement('div');
+            compTitle.className = 'story-inline-detail-title';
+            compTitle.textContent = `${failedComps.length} component${failedComps.length !== 1 ? 's' : ''} failed`;
+            compBlock.appendChild(compTitle);
+
+            const compGrid = document.createElement('div');
+            compGrid.className = 'gate-check-grid';
+            for (const comp of failedComps) {
+                const row = document.createElement('div');
+                row.className = 'gate-check-row gate-check-row--fail';
+
+                const icon = document.createElement('span');
+                icon.className = 'gate-check-icon';
+                icon.textContent = '✗';
+                row.appendChild(icon);
+
+                const name = document.createElement('span');
+                name.className = 'gate-check-name';
+                name.textContent = comp.component_name || `batch ${comp.batch_number}`;
+                row.appendChild(name);
+
+                const statusBadge = document.createElement('span');
+                statusBadge.className = 'gate-check-soft';
+                statusBadge.textContent = (comp.status || 'error').toLowerCase();
+                row.appendChild(statusBadge);
+
+                if (comp.error_detail) {
+                    const detail = document.createElement('span');
+                    detail.className = 'gate-check-detail';
+                    detail.textContent = comp.error_detail;
+                    row.appendChild(detail);
+                }
+                compGrid.appendChild(row);
+            }
+            compBlock.appendChild(compGrid);
+            inner.appendChild(compBlock);
+        }
+    }
+
     // ── Diagnostics link ─────────────────────────────────────
     const diagLink = document.createElement('a');
     diagLink.className = 'story-session-diag';
@@ -320,6 +450,162 @@ function buildSessionCard(s) {
     inner.appendChild(diagLink);
 
     card.appendChild(inner);
+    return card;
+}
+
+function _buildCheckRow(chk) {
+    const row = document.createElement('div');
+    row.className = `gate-check-row${chk.passed ? '' : ' gate-check-row--fail'}`;
+
+    const icon = document.createElement('span');
+    icon.className = 'gate-check-icon';
+    icon.textContent = chk.passed ? '✓' : '✗';
+    row.appendChild(icon);
+
+    const name = document.createElement('span');
+    name.className = 'gate-check-name';
+    name.textContent = chk.name.replace(/_/g, ' ');
+    row.appendChild(name);
+
+    if (!chk.hard_fail) {
+        const soft = document.createElement('span');
+        soft.className = 'gate-check-soft';
+        soft.textContent = 'advisory';
+        row.appendChild(soft);
+    }
+
+    if (chk.detail) {
+        const detail = document.createElement('span');
+        detail.className = 'gate-check-detail';
+        detail.textContent = chk.detail;
+        row.appendChild(detail);
+    }
+    return row;
+}
+
+function buildDemotionCard(d) {
+    const card = document.createElement('div');
+    card.className = 'story-demotion-card';
+
+    const gutter = document.createElement('div');
+    gutter.className = 'story-session-gutter';
+    gutter.style.background = '#868e96';
+    card.appendChild(gutter);
+
+    const inner = document.createElement('div');
+    inner.className = 'story-session-inner';
+
+    const header = document.createElement('div');
+    header.className = 'story-session-header';
+
+    const badge = document.createElement('span');
+    badge.className = 'story-agent-badge';
+    badge.style.background = '#868e96';
+    badge.textContent = 'Demotion';
+    header.appendChild(badge);
+
+    const arrow = document.createElement('span');
+    arrow.className = 'story-demotion-arrow';
+    const fromLabel = STAGE_LABELS[d.from] || (d.from || '?').toUpperCase();
+    const toLabel   = STAGE_LABELS[d.to]   || (d.to   || '?').toUpperCase();
+    arrow.textContent = `${fromLabel} → ${toLabel}`;
+    header.appendChild(arrow);
+
+    if (d.timestamp) {
+        const ts = document.createElement('span');
+        ts.className = 'story-timestamp';
+        ts.textContent = fmtDate(d.timestamp);
+        header.appendChild(ts);
+    }
+
+    inner.appendChild(header);
+
+    if (d.reason) {
+        const reason = document.createElement('div');
+        reason.className = 'story-demotion-reason';
+        reason.textContent = d.reason;
+        inner.appendChild(reason);
+    }
+
+    card.appendChild(inner);
+    return card;
+}
+
+// ── Gate Ledger ──────────────────────────────────────────────
+
+function renderGateLedger() {
+    const container = document.getElementById('story-timeline');
+    if (!_gateResults || _gateResults.length === 0) return;
+
+    const section = document.createElement('div');
+    section.className = 'story-section-label';
+    section.textContent = `Planning Gate — ${_gateResults.length} Run${_gateResults.length !== 1 ? 's' : ''}`;
+    container.appendChild(section);
+
+    const ledger = document.createElement('div');
+    ledger.className = 'decision-ledger';
+
+    for (const run of _gateResults) {
+        ledger.appendChild(buildGateRunCard(run));
+    }
+
+    container.appendChild(ledger);
+}
+
+function buildGateRunCard(run) {
+    const card = document.createElement('div');
+    const outcomeKey = run.passed ? 'passed' : 'rejected';
+    card.className = `ledger-run-card ledger-outcome--${outcomeKey}`;
+
+    // Header
+    const header = document.createElement('div');
+    header.className = 'ledger-run-header';
+
+    const runNum = document.createElement('span');
+    runNum.className = 'ledger-run-num';
+    runNum.textContent = `Gate Run #${run.run}`;
+    header.appendChild(runNum);
+
+    if (run.created_at) {
+        const ts = document.createElement('span');
+        ts.className = 'story-timestamp';
+        ts.textContent = fmtDate(run.created_at);
+        header.appendChild(ts);
+    }
+
+    const outcomeBadge = document.createElement('span');
+    outcomeBadge.className = `ledger-outcome-badge ledger-outcome-badge--${outcomeKey}`;
+    outcomeBadge.textContent = run.passed ? 'PASSED' : 'FAILED';
+    header.appendChild(outcomeBadge);
+
+    if (run.llm_check_unavailable) {
+        const warn = document.createElement('span');
+        warn.className = 'story-reason-tag';
+        warn.style.background = '#868e96';
+        warn.textContent = 'LLM check unavailable';
+        header.appendChild(warn);
+    }
+
+    if (run.prompt_tokens > 0) {
+        const tok = document.createElement('span');
+        tok.className = 'story-token-line';
+        tok.style.marginLeft = 'auto';
+        tok.textContent = `${fmtTokens(run.prompt_tokens)}p + ${fmtTokens(run.completion_tokens)}c`;
+        header.appendChild(tok);
+    }
+
+    card.appendChild(header);
+
+    // Check grid
+    if (run.checks && run.checks.length > 0) {
+        const grid = document.createElement('div');
+        grid.className = 'gate-check-grid';
+        for (const chk of run.checks) {
+            grid.appendChild(_buildCheckRow(chk));
+        }
+        card.appendChild(grid);
+    }
+
     return card;
 }
 

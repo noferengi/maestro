@@ -95,6 +95,9 @@ class DreamerAgent:
         self.budget_id    = budget_id
         self.llm_base_url = llm_base_url
         self.llm_model    = llm_model
+        
+        from app.agent.survey_orchestrator import SurveyOrchestrator
+        self.orchestrator = SurveyOrchestrator()
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -102,6 +105,8 @@ class DreamerAgent:
 
     async def run(self) -> dict:
         """Full Dreamer lifecycle: survey → decide → act."""
+        from app.agent.llm_client import set_llm_session_context
+        set_llm_session_context(AGENT_NAME)
         from app.database import create_dreamer_run, update_dreamer_run
 
         run = create_dreamer_run(self.project, self.llm_id, self.budget_id)
@@ -285,8 +290,8 @@ class DreamerAgent:
 
         # Detect whether the project path has any source files.
         if self.project_path and os.path.isdir(self.project_path):
-            for _root, dirs, files in os.walk(self.project_path):
-                dirs[:] = [d for d in dirs if not d.startswith(".")]
+            from app.agent.path_filter import walk_safe
+            for _root, dirs, files in walk_safe(self.project_path):
                 if files:
                     state.has_files = True
                     break
@@ -498,35 +503,24 @@ class DreamerAgent:
         """Generate new idea cards by surveying what the project does and could do.
 
         Called when there are no failed tasks to resurrect.  The LLM receives:
-          - the project file-tree snapshot (if a path is configured)
           - arch context cards (if any)
           - a summary of recently deleted tasks (prior human/AI intent)
+          - access to survey tools (get_project_summary, list_scope_summaries, etc.)
 
         The model is asked to propose up to 3 concrete new idea cards.
-        If it cannot determine intent from the available signal, it returns
-        an empty new_cards list and the Dreamer takes no action.
         """
         from app.agent.llm_client import call_llm, extract_text_response
         from app.agent.json_utils import extract_json_block
-        from app.agent.config import DREAMER_DECIDE_MAX_TOKENS
+        from app.agent.config import DREAMER_DECIDE_MAX_TOKENS, DREAMER_SURVEY_TOOLS
+        from app.agent.survey_orchestrator import SurveyOrchestrator
+        from app.agent.tools import build_tool_schemas, async_dispatch_tool, _task_project_name, _task_git_cwd
 
-        # Build snapshot with inline file summaries, sized to this LLM's context window.
-        # build_snapshot_with_summaries appends each file's short_summary from the DB,
-        # giving the LLM semantic content rather than bare line/class counts.
-        # _apply_token_budget inside the call handles truncation gracefully — no hard cap.
-        snapshot_block = ""
+        # 1. Ensure project is being surveyed (enqueues jobs if needed)
+        orchestrator = SurveyOrchestrator()
         if self.project_path:
-            try:
-                from app.agent.project_snapshot import build_snapshot_with_summaries
-                from app.agent.config import SNAPSHOT_CONTEXT_RATIO, SNAPSHOT_MAX_TOKENS
-                from app.agent.llm_client import _get_llm_max_context
-                _max_ctx = _get_llm_max_context(self.llm_id) if self.llm_id else None
-                _snap_max = int(_max_ctx * SNAPSHOT_CONTEXT_RATIO) if _max_ctx else SNAPSHOT_MAX_TOKENS
-                snapshot = build_snapshot_with_summaries(self.project_path, max_tokens=_snap_max)
-                if snapshot.strip():
-                    snapshot_block = f"\nProject file structure:\n{snapshot}\n"
-            except Exception:
-                pass
+            orchestrator.ensure_project_surveyed(
+                self.project, self.project_path, self.llm_id, self.budget_id
+            )
 
         arch_block = (
             f"\nArchitecture context:\n{state.arch_context}\n"
@@ -551,59 +545,81 @@ class DreamerAgent:
             "A software project has no active work items.  Your job is to survey "
             "its codebase and history, then propose new concrete idea cards for "
             "work that would be valuable, feasible, and not yet tracked.\n\n"
+            "You have access to survey tools to explore the project's health and organization. "
+            "Use them to understand the project before making your final proposal.\n\n"
             "Focus on:\n"
-            "  1. Features or improvements clearly present in the codebase but "
-            "untracked\n"
-            "  2. Obvious gaps or natural next steps given the project's current "
-            "state\n"
+            "  1. Features or improvements clearly present in the codebase but untracked\n"
+            "  2. Obvious gaps or natural next steps given the project's current state\n"
             "  3. High-value technical debt, observability, or quality work\n\n"
             "Rules:\n"
-            "  - If the project is too sparse to determine intent, output "
-            "new_cards: []\n"
+            "  - If the project is too sparse to determine intent, output new_cards: []\n"
             "  - new_cards descriptions must be concrete and actionable\n"
             "  - Max 3 cards\n\n"
             "Output a single JSON object with exactly these fields:\n"
             "  tasks_to_resurrect  — always []\n"
             "  tasks_to_research   — always []\n"
             "  new_cards           — list of {title, description, rationale}\n\n"
-            "Output JSON only. No prose before or after."
+            "Provide your final answer as a JSON block. No prose before or after the JSON."
         )
 
-        user_msg = (
-            f"Project: {self.project}\n"
-            f"{arch_block}"
-            f"{snapshot_block}"
-            f"{deleted_block}"
-            "\nSurvey this project and propose up to 3 new idea cards. "
-            "If the codebase or history is too sparse to infer intent, "
-            "return new_cards: []"
-        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": f"Project: {self.project}\n{arch_block}{deleted_block}\nSurvey this project and propose up to 3 new idea cards."}
+        ]
+        
+        tool_schemas = build_tool_schemas(DREAMER_SURVEY_TOOLS)
+        
+        # Set context for tools
+        _task_project_name.set(self.project)
+        _task_git_cwd.set(self.project_path)
 
-        try:
-            response = await call_llm(
-                [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": user_msg},
-                ],
-                base_url=self.llm_base_url,
-                model=self.llm_model,
-                llm_id=self.llm_id,
-                budget_id=self.budget_id,
-                max_tokens=DREAMER_DECIDE_MAX_TOKENS,
-                agent_name="Dreamer",
-                response_format={"type": "json_object"},
-            )
-            raw = extract_text_response(response)
-        except Exception as exc:
-            logger.warning("[Dreamer] Survey LLM call failed: %s — using empty plan.", exc)
-            raw = "{}"
+        # Multi-turn loop (max 10 turns)
+        raw = "{}"
+        for turn in range(10):
+            try:
+                response = await call_llm(
+                    messages,
+                    base_url=self.llm_base_url,
+                    model=self.llm_model,
+                    llm_id=self.llm_id,
+                    budget_id=self.budget_id,
+                    max_tokens=DREAMER_DECIDE_MAX_TOKENS,
+                    agent_name="Dreamer",
+                    tools=tool_schemas,
+                )
+            except Exception as exc:
+                logger.warning("[Dreamer] Survey LLM call failed on turn %d: %s", turn, exc)
+                break
+
+            msg = response.get("message") or {}
+            messages.append(msg)
+            
+            if not msg.get("tool_calls"):
+                raw = msg.get("content") or "{}"
+                break
+            
+            for tc in msg["tool_calls"]:
+                t_id = tc["id"]
+                t_name = tc["function"]["name"]
+                t_args = json.loads(tc["function"]["arguments"])
+                
+                result = await async_dispatch_tool(
+                    t_name, t_args,
+                    llm_id=self.llm_id, budget_id=self.budget_id,
+                    llm_base_url=self.llm_base_url, llm_model=self.llm_model
+                )
+                messages.append({"role": "tool", "tool_call_id": t_id, "name": t_name, "content": result})
 
         try:
             candidate = extract_json_block(raw) if raw.strip() else None
             if candidate:
                 data = json.loads(candidate)
             elif raw.strip():
-                data, _ = json.JSONDecoder().raw_decode(raw.lstrip())
+                # Try simple cleaning for stubborn LLMs
+                cleaned = raw.strip()
+                if cleaned.startswith("```"):
+                    cleaned = cleaned.split("\n", 1)[1].rsplit("\n", 1)[0]
+                data = json.loads(cleaned)
             else:
                 data = {}
         except Exception:

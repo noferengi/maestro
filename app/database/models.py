@@ -177,10 +177,12 @@ class BudgetEntry(Base):
     tool_calls = Column(Integer, nullable=False, default=0)         # total LLM turns
     prompt_data = Column(Text, nullable=True)                       # full prompt messages (JSON)
     response_data = Column(Text, nullable=True)                     # full response (JSON)
+    session_id = Column(String, nullable=True)                      # UUID shared by all calls in one agent run
+    agent_name = Column(String, nullable=True)                      # e.g. "Subdivision Agent"
     created_at = Column(DateTime, default=datetime.utcnow)
 
     def __repr__(self):
-        return f"<BudgetEntry(id={self.id}, llm={self.llm_id}, budget={self.budget_id}, task={self.task_id}, prompt={self.prompt_cost}, gen={self.generation_cost})>"
+        return f"<BudgetEntry(id={self.id}, llm={self.llm_id}, budget={self.budget_id}, task={self.task_id}, agent={self.agent_name}, prompt={self.prompt_cost}, gen={self.generation_cost})>"
 
 
 class Expense(Base):
@@ -613,7 +615,7 @@ class AgentSession(Base):
     __tablename__ = "agent_sessions"
 
     id                = Column(Integer, primary_key=True, autoincrement=True)
-    task_id           = Column(String, ForeignKey("tasks.id"), nullable=False)
+    task_id           = Column(String, nullable=False)  # No FK — synthetic IDs (e.g. "survey-N") are valid
     agent_type        = Column(String, nullable=False)
     started_at        = Column(String, nullable=False)
     ended_at          = Column(String, nullable=True)
@@ -735,3 +737,57 @@ class InboxMessage(Base):
 
     def __repr__(self):
         return f"<InboxMessage(id={self.id[:8]}…, subject='{self.subject[:40]}', read={self.read})>"
+
+
+# ---------------------------------------------------------------------------
+# Project survey / summarization tables
+# ---------------------------------------------------------------------------
+
+class ScopeSummary(Base):
+    """Hierarchical project health summaries (Directory -> Module -> Project)."""
+    __tablename__ = "scope_summaries"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    project_name    = Column(String, nullable=False)
+    scope_type      = Column(String, nullable=False)    # 'directory' | 'module' | 'collection' | 'project'
+    scope_key       = Column(String, nullable=False)    # rel_dir, module name, or '__ROOT__'
+    parent_scope_key = Column(String, nullable=True)    # enables hierarchy navigation
+    depth           = Column(Integer, nullable=False, default=0)
+    summary         = Column(Text, nullable=False)
+    short_summary   = Column(Text, nullable=True)       # 2-sentence version for context injection
+    file_paths      = Column(Text, nullable=True)       # JSON array of relative paths in this scope
+    file_count      = Column(Integer, nullable=False, default=0)
+    content_hash    = Column(String, nullable=True)     # SHA1 of sorted child hashes (staleness key)
+    git_commit      = Column(String, nullable=True)     # HEAD at generation time
+    staleness_state = Column(String, nullable=False, default="fresh") # fresh | stale | checking
+    llm_id          = Column(Integer, nullable=True)
+    budget_id       = Column(Integer, nullable=True)
+    created_at      = Column(DateTime, default=datetime.utcnow)
+    updated_at      = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<ScopeSummary(id={self.id}, project={self.project_name!r}, type={self.scope_type!r}, key={self.scope_key!r})>"
+
+
+class ScopeSurveyJob(Base):
+    """Background job for scheduler-dispatched project survey LLM calls."""
+    __tablename__ = "scope_survey_jobs"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    project_name    = Column(String, nullable=False)
+    scope_type      = Column(String, nullable=False)
+    scope_key       = Column(String, nullable=False)
+    action          = Column(String, nullable=False, default='generate') # generate | staleness_check | edit_summary
+    status          = Column(String, nullable=False, default='pending')  # pending | running | done | failed
+    priority        = Column(Float, nullable=False, default=0.0)
+    llm_id          = Column(Integer, nullable=True)
+    budget_id       = Column(Integer, nullable=True)
+    prompt_tokens   = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    error_message   = Column(Text, nullable=True)
+    retry_count     = Column(Integer, nullable=False, default=0)
+    created_at      = Column(DateTime, default=datetime.utcnow)
+    completed_at    = Column(DateTime, nullable=True)
+
+    def __repr__(self):
+        return f"<ScopeSurveyJob(id={self.id}, project={self.project_name!r}, type={self.scope_type!r}, key={self.scope_key!r}, status={self.status!r})>"

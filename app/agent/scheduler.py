@@ -335,6 +335,19 @@ def start_scheduler() -> None:
     if _scheduler_thread is not None and _scheduler_thread.is_alive():
         logger.warning("Scheduler already running.")
         return
+
+    # One-time startup cleanup: cancel any stale oversized or log-file jobs that
+    # were created before size/log guards existed.  These would otherwise loop
+    # forever: fail → 5-min cooldown → retry → fail.
+    try:
+        from app.database import cancel_bad_file_summary_jobs
+        from app.agent.config import SUMMARY_MAX_FILE_SIZE
+        n = cancel_bad_file_summary_jobs(SUMMARY_MAX_FILE_SIZE)
+        if n:
+            logger.info("Startup: cancelled %d oversized/log file summary job(s).", n)
+    except Exception:
+        logger.exception("Startup: cancel_bad_file_summary_jobs failed (non-fatal).")
+
     _scheduler_stop.clear()
     _scheduler_thread = threading.Thread(
         target=_scheduler_loop, daemon=True, name="maestro-scheduler"
@@ -1006,6 +1019,11 @@ def _tick() -> None:
         allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
     )
 
+    # 5.5.5. Dispatch project survey jobs (hierarchical summarization)
+    _dispatch_scope_survey_jobs(
+        allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
+    )
+
     # 5.6. Dispatch pending PIP resolution jobs (research + resolution agents for blocked PIPs)
     _dispatch_pip_resolution_jobs(
         allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
@@ -1017,7 +1035,9 @@ def _tick() -> None:
     )
 
     # 7. Dreamer: resurrect stalled projects (fires when no pipeline progress for N ticks)
-    _dispatch_dreamer()
+    _dispatch_dreamer(
+        allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
+    )
 
 
 def _project_has_dreamer_signal(project) -> bool:
@@ -1054,24 +1074,29 @@ def _project_has_dreamer_signal(project) -> bool:
 
     # Check if the project path contains any source files
     if project.path and os.path.isdir(project.path):
-        for _root, dirs, files in os.walk(project.path):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
+        from app.agent.path_filter import walk_safe
+        for _root, dirs, files in walk_safe(project.path):
             if files:
                 return True
 
     return False
 
 
-def _dispatch_dreamer() -> None:
+def _dispatch_dreamer(
+    allowed_llm_id: "int | None",
+    node_active_counts: "dict[int, int]",
+    node_session_counts: "dict[int, int]",
+    node_obj_cache: "dict[int, Any]",
+    llm_node_cache: "dict[int, int | None]",
+) -> None:
     """Fire a DreamerAgent for any project that has been stalled long enough.
 
     "Stalled" = no TransitionResult created for the project's tasks in the last
     DREAMER_STALL_TICKS * SCHEDULER_TICK_INTERVAL seconds.
 
-    One Dreamer per project at a time.  Dreamer threads are daemon threads and
-    do NOT count against the one-LLM-at-a-time policy — they consume one LLM
-    slot but are not tracked in _active_sessions.  This keeps them decoupled
-    from normal pipeline dispatch.
+    One Dreamer per project at a time.  Dreamers MUST respect LLM/node capacity —
+    each Dreamer holds one session slot for its entire run so it doesn't pile on
+    top of a full pipeline load.  The session key is 'dreamer-{project_name}'.
     """
     from app.agent.config import (
         DREAMER_ENABLED, DREAMER_STALL_TICKS, SCHEDULER_TICK_INTERVAL,
@@ -1159,12 +1184,31 @@ def _dispatch_dreamer() -> None:
         llm = get_llm(project.llm_id)
         if not llm:
             continue
+
+        # One-LLM-at-a-time: respect the pinned LLM for this tick
+        if allowed_llm_id is not None and llm.id != allowed_llm_id:
+            logger.debug(
+                "[Dreamer] Skipping '%s' — LLM %d not pinned (pinned=%s).",
+                project_name, llm.id, allowed_llm_id,
+            )
+            continue
+
+        # Check and reserve a capacity slot — Dreamers must not bypass limits
+        if not _check_and_reserve_slot(
+            llm, node_active_counts, node_session_counts, node_obj_cache, llm_node_cache,
+            label=f"dreamer '{project_name}'",
+        ):
+            logger.debug(
+                "[Dreamer] Skipping '%s' — LLM %d at capacity.", project_name, llm.id,
+            )
+            continue
+
         llm_base_url = f"http://{llm.address}:{llm.port}/v1"
         llm_model    = llm.model
 
         logger.info(
-            "[Dreamer] Project '%s' stalled for %.0fs — starting DreamerAgent.",
-            project_name, now - last_activity,
+            "[Dreamer] Project '%s' stalled for %.0fs — starting DreamerAgent (LLM %d).",
+            project_name, now - last_activity, llm.id,
         )
 
         with _active_dreamer_lock:
@@ -1191,9 +1235,18 @@ def _start_dreamer_thread(
     llm_base_url: str,
     llm_model: str,
 ) -> None:
-    """Spawn a daemon thread that runs DreamerAgent.run() for one project."""
+    """Spawn a daemon thread that runs DreamerAgent.run() for one project.
+
+    The slot was already reserved by _check_and_reserve_slot in _dispatch_dreamer.
+    Here we register the thread in _active_sessions / _session_llm_ids so that:
+      - _cleanup_finished() can spot when it dies and decrement _llm_session_counts
+      - the one-LLM-at-a-time policy pins the Dreamer's LLM for the duration
+      - scheduler status endpoints show the Dreamer as an active session
+    """
     import asyncio as _asyncio
     from app.agent.dreamer import DreamerAgent
+
+    session_key = f"dreamer-{project_name}"
 
     def _run():
         loop = _asyncio.new_event_loop()
@@ -1212,11 +1265,29 @@ def _start_dreamer_thread(
             logger.exception("[Dreamer] Thread for '%s' raised: %s", project_name, exc)
         finally:
             loop.close()
+            # Release the capacity slot — mirrors what _cleanup_finished does for
+            # normal sessions, but the dreamer does it explicitly so the count
+            # drops immediately when the thread exits rather than waiting for the
+            # next cleanup pass.
+            with _llm_counts_lock:
+                _llm_session_counts[llm_id] = max(0, _llm_session_counts[llm_id] - 1)
+            with _active_sessions_lock:
+                _active_sessions.pop(session_key, None)
+                _session_llm_ids.pop(session_key, None)
+                _session_titles.pop(session_key, None)
             with _active_dreamer_lock:
                 _active_dreamer_projects.discard(project_name)
-            logger.debug("[Dreamer] Thread for '%s' exited.", project_name)
+            logger.debug(
+                "[Dreamer] Thread for '%s' exited (LLM %d slot released).",
+                project_name, llm_id,
+            )
 
     t = threading.Thread(target=_run, daemon=True, name=f"dreamer-{project_name[:24]}")
+    # Register in the session tracking so the scheduler sees this as an active slot
+    with _active_sessions_lock:
+        _active_sessions[session_key] = t
+        _session_llm_ids[session_key] = llm_id
+        _session_titles[session_key] = f"Dreamer: {project_name}"
     t.start()
 
 
@@ -1288,6 +1359,12 @@ def _dispatch_file_summary_jobs(
     return allowed_llm_id
 
 
+def _is_log_like_path(path: str) -> bool:
+    """Return True for log files and rotated log files (e.g. .log, .log.1, .log.2)."""
+    import re as _re
+    return bool(_re.search(r'\.log(\.\d+)?$', path, _re.IGNORECASE))
+
+
 def _run_file_summary_job(job: Any, llm: Any) -> None:
     """Execute a single file summary job in its own thread + event loop."""
     from app.database import update_file_summary_job
@@ -1297,6 +1374,28 @@ def _run_file_summary_job(job: Any, llm: Any) -> None:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
+        # Reject oversized files and log files — these are not worth summarising
+        # and can generate hundreds of LLM calls via the sliding-window chunker.
+        from app.agent.config import SUMMARY_MAX_FILE_SIZE
+        if job.file_size_bytes > SUMMARY_MAX_FILE_SIZE:
+            logger.info(
+                "[file_summary] Cancelling oversized job %d '%s' (%d bytes > %d byte cap).",
+                job.id, job.file_path, job.file_size_bytes, SUMMARY_MAX_FILE_SIZE,
+            )
+            update_file_summary_job(job.id, status="cancelled",
+                                    error_message=f"File too large: {job.file_size_bytes} bytes")
+            signal_completion(completion_key)
+            return
+        if _is_log_like_path(job.file_path):
+            logger.info(
+                "[file_summary] Cancelling log file job %d '%s' — log files are not summarised.",
+                job.id, job.file_path,
+            )
+            update_file_summary_job(job.id, status="cancelled",
+                                    error_message="Log file excluded from summarisation")
+            signal_completion(completion_key)
+            return
+
         # Reject binary files before doing any LLM work — binary data cannot be
         # summarised as text and would produce garbage or overflow the context.
         try:
@@ -1555,6 +1654,416 @@ def _dispatch_arch_gen_jobs(
             _session_llm_ids[job_key] = llm.id
             _session_titles[job_key] = f"Arch Gen: {job.project} ({job.category})"
         thread.start()
+
+
+def _dispatch_scope_survey_jobs(
+    allowed_llm_id: "int | None",
+    node_active_counts: "dict[int, int]",
+    node_session_counts: "dict[int, int]",
+    node_obj_cache: "dict[int, Any]",
+    llm_node_cache: "dict[int, int | None]",
+) -> None:
+    """Dispatch pending ScopeSurveyJobs. Runs after arch gen jobs."""
+    from app.database import get_pending_scope_survey_jobs, get_llm, update_scope_survey_job
+    from app.agent.config import SURVEY_MAX_CONCURRENT_JOBS
+
+    pending = get_pending_scope_survey_jobs(limit=SURVEY_MAX_CONCURRENT_JOBS)
+    for job in pending:
+        if not job.llm_id:
+            continue
+
+        job_key = f"scope-survey-{job.id}"
+        with _active_sessions_lock:
+            if job_key in _active_sessions and _active_sessions[job_key].is_alive():
+                continue
+
+        llm = get_llm(job.llm_id)
+        if not llm:
+            continue
+
+        # One-LLM-at-a-time gate
+        if allowed_llm_id is not None and llm.id != allowed_llm_id:
+            continue
+
+        if not _check_and_reserve_slot(
+            llm, node_active_counts, node_session_counts, node_obj_cache, llm_node_cache,
+            label=f"scope-survey-{job.id}",
+        ):
+            continue
+
+        update_scope_survey_job(job.id, status='running')
+
+        thread = threading.Thread(
+            target=_run_scope_survey_job,
+            args=(job, llm),
+            daemon=True,
+            name=f"maestro-scope-survey-{job.id}",
+        )
+        with _active_sessions_lock:
+            _active_sessions[job_key] = thread
+            _session_llm_ids[job_key] = llm.id
+            _session_titles[job_key] = f"Survey: {job.project_name} ({job.scope_key})"
+        thread.start()
+
+
+def _run_scope_survey_job(job: Any, llm: Any) -> None:
+    """Worker thread for a single scope survey job.
+    
+    Implements recursive 'paging' for large scopes and bottom-up chaining.
+    """
+    from app.database import (
+        update_scope_survey_job, get_file_summaries_for_project_root,
+        get_project_path, list_scope_summaries, upsert_scope_summary,
+        get_scope_summary, create_agent_session, close_agent_session,
+        enqueue_scope_survey_job, get_pending_scope_survey_jobs
+    )
+    from app.agent.llm_client import call_llm
+    from app.agent.survey_orchestrator import SurveyOrchestrator
+
+    orchestrator = SurveyOrchestrator()
+    session_key = f"scope-survey-{job.id}"
+    _session_id = create_agent_session(
+        task_id=f"survey-{job.id}",
+        agent_type="survey",
+        llm_id=llm.id,
+        budget_id=job.budget_id,
+        scheduler_reason="scheduler",
+    )
+    
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        project_root = get_project_path(job.project_name)
+        if not project_root:
+            raise RuntimeError(f"Project '{job.project_name}' root not found.")
+
+        # --- Staleness & Patching Logic ---
+        if job.action == "staleness_check":
+            existing = get_scope_summary(job.project_name, job.scope_type, job.scope_key)
+            if not existing:
+                update_scope_survey_job(job.id, action="generate", status="pending")
+                close_agent_session(_session_id, "completed", "No existing summary, switching to generate")
+                return
+
+            # Get diff for the files in this scope
+            from app.agent.tools import run_shell
+            diff_text = ""
+            if existing.file_paths:
+                file_list = json.loads(existing.file_paths)
+                # Cap diff size
+                diff_cmd = f"git diff {existing.git_commit or 'HEAD^'}..HEAD -- " + " ".join(file_list[:20])
+                diff_text = loop.run_until_complete(run_shell(diff_cmd, cwd=project_root))
+
+            prompt = (
+                f"Here is the current summary for the '{job.scope_key}' {job.scope_type} in project '{job.project_name}':\n"
+                f"{existing.summary}\n\n"
+                f"Here is the git diff since it was generated:\n{diff_text[:3000]}\n\n"
+                "Does this diff require (a) a full re-summarization (FULL_REINGEST), "
+                "(b) a minor edit to the summary (EDIT_SUMMARY), or (c) no change (NO_CHANGE)? "
+                "Answer with exactly one of those three words."
+            )
+            resp = loop.run_until_complete(call_llm(
+                messages=[{"role": "user", "content": prompt}],
+                base_url=f"http://{llm.address}:{llm.port}/v1", model=llm.model,
+                llm_id=llm.id, budget_id=job.budget_id,
+                max_tokens=10, temperature=0.0
+            ))
+            verdict = resp.get("content", "").strip().upper()
+            if "FULL_REINGEST" in verdict:
+                update_scope_survey_job(job.id, action="generate", status="pending")
+            elif "EDIT_SUMMARY" in verdict:
+                update_scope_survey_job(job.id, action="edit_summary", status="pending")
+            else:
+                upsert_scope_summary(
+                    project_name=job.project_name, scope_type=job.scope_type, scope_key=job.scope_key,
+                    summary=existing.summary, staleness_state="fresh", git_commit="HEAD"
+                )
+                update_scope_survey_job(job.id, status="done")
+            
+            close_agent_session(_session_id, "completed", f"Staleness check: {verdict}")
+            return
+
+        if job.action == "edit_summary":
+            existing = get_scope_summary(job.project_name, job.scope_type, job.scope_key)
+            if not existing:
+                update_scope_survey_job(job.id, action="generate", status="pending")
+                close_agent_session(_session_id, "completed", "No existing summary, switching to generate")
+                return
+
+            # Get diff for the files in this scope
+            from app.agent.tools import run_shell
+            diff_text = ""
+            if existing.file_paths:
+                file_list = json.loads(existing.file_paths)
+                diff_cmd = f"git diff {existing.git_commit or 'HEAD^'}..HEAD -- " + " ".join(file_list[:20])
+                diff_text = loop.run_until_complete(run_shell(diff_cmd, cwd=project_root))
+
+            prompt = (
+                f"You are updating the summary for the '{job.scope_key}' {job.scope_type} in project '{job.project_name}'.\n"
+                f"Old Summary:\n{existing.summary}\n\n"
+                f"Git Diff of changes:\n{diff_text[:4000]}\n\n"
+                "Please provide an updated summary that incorporates these changes. Maintain the same style. "
+                "Provide a detailed summary and a 2-sentence 'short_summary' at the very end of your response, "
+                "prefixed with 'SHORT_SUMMARY: '."
+            )
+            resp = loop.run_until_complete(call_llm(
+                messages=[{"role": "user", "content": prompt}],
+                base_url=f"http://{llm.address}:{llm.port}/v1", model=llm.model,
+                llm_id=llm.id, budget_id=job.budget_id,
+                max_tokens=2048, temperature=0.2
+            ))
+            
+            content = resp.get("content", "")
+            summary = content
+            short = ""
+            if "SHORT_SUMMARY: " in content:
+                parts = content.split("SHORT_SUMMARY: ")
+                summary = parts[0].strip()
+                short = parts[1].strip()
+            else:
+                short = content.split(". ")[0] + "." if ". " in content else content[:200]
+
+            upsert_scope_summary(
+                project_name=job.project_name, scope_type=job.scope_type, scope_key=job.scope_key,
+                summary=summary, short_summary=short, staleness_state="fresh", git_commit="HEAD"
+            )
+            update_scope_survey_job(job.id, status="done")
+            close_agent_session(_session_id, "completed", "Summary updated via patch")
+            return
+
+        # 1. Gather child items
+        children = [] # List of strings/dicts representing inputs
+        if job.scope_type == "directory":
+            all_files = get_file_summaries_for_project_root(project_root)
+            for f in all_files:
+                rel_path = os.path.relpath(f.file_path, project_root).replace("\\", "/")
+                rel_dir = os.path.dirname(rel_path)
+                if rel_dir == ".": rel_dir = ""
+                if rel_dir == job.scope_key:
+                    children.append({
+                        "id": rel_path,
+                        "text": f.short_summary or f.summary or ""
+                    })
+        
+        elif job.scope_type == "project":
+            # Project summarizes Directories AND Modules
+            all_scopes = list_scope_summaries(job.project_name)
+            for s in all_scopes:
+                if s.scope_type in ("directory", "module") and s.staleness_state == "fresh":
+                    children.append({
+                        "id": f"[{s.scope_type}] {s.scope_key}",
+                        "text": s.short_summary or s.summary or ""
+                    })
+
+        elif job.scope_type == "module":
+            # Module summarizes its specific files
+            existing = get_scope_summary(job.project_name, "module", job.scope_key)
+            if existing and existing.file_paths:
+                file_list = json.loads(existing.file_paths)
+                all_files = get_file_summaries_for_project_root(project_root)
+                f_map = {os.path.relpath(f.file_path, project_root).replace("\\", "/"): f for f in all_files}
+                for path in file_list:
+                    f = f_map.get(path)
+                    if f:
+                        children.append({
+                            "id": path,
+                            "text": f.short_summary or f.summary or ""
+                        })
+
+        elif job.scope_type == "module_clustering":
+            # Clustering needs ALL file summaries
+            all_files = get_file_summaries_for_project_root(project_root)
+            for f in all_files:
+                rel_path = os.path.relpath(f.file_path, project_root).replace("\\", "/")
+                children.append({
+                    "id": rel_path,
+                    "text": f.short_summary or f.summary or ""
+                })
+
+        # --- Recursive Partitioning (The "Pages" Strategy) ---
+        branch_factor = orchestrator.get_branching_factor(llm.max_context)
+
+        # Special case: module_clustering is one-shot (LLM must see everything to cluster)
+        if job.scope_type != "module_clustering" and len(children) > branch_factor:
+            import math
+            page_count = math.ceil(len(children) / branch_factor)
+            page_scope_type = f"{job.scope_type}_page"
+
+            # Check whether page jobs for this parent already exist (any status).
+            # On first partition: no rows → create them and log.
+            # On subsequent ticks (LLM down / retrying): rows exist → don't re-create,
+            # don't spam the log.  Reset any failed pages to pending so they retry via
+            # call_llm's own backoff rather than accumulating duplicate rows each tick.
+            from app.database import get_scope_survey_page_jobs
+            existing_pages = get_scope_survey_page_jobs(
+                job.project_name, page_scope_type, job.scope_key
+            )
+
+            if not existing_pages:
+                # First partition: create page jobs and log.
+                logger.info(
+                    "[Survey] Partitioning %s '%s' into %d pages.",
+                    job.scope_type, job.scope_key, page_count,
+                )
+                for i in range(page_count):
+                    page_key = f"{job.scope_key}:page-{i + 1}"
+                    enqueue_scope_survey_job(
+                        job.project_name, page_scope_type, page_key,
+                        action="generate", priority=job.priority - 0.1,
+                        llm_id=llm.id, budget_id=job.budget_id,
+                    )
+            else:
+                # Pages already exist — reset any that failed so they retry.
+                failed_pages = [p for p in existing_pages if p.status == "failed"]
+                if failed_pages:
+                    logger.debug(
+                        "[Survey] %d/%d page job(s) for '%s' failed; resetting to pending for retry.",
+                        len(failed_pages), len(existing_pages), job.scope_key,
+                    )
+                    for p in failed_pages:
+                        update_scope_survey_job(
+                            p.id, status="pending",
+                            retry_count=p.retry_count + 1,
+                            error_message=None,
+                        )
+
+            update_scope_survey_job(job.id, status="pending", error_message=f"Waiting for {page_count} pages")
+            close_agent_session(_session_id, "completed", "Waiting for page jobs")
+            return
+
+        # 2. Check if children are ready (some might be pages or missing file summaries)
+        if not children:
+            if job.scope_type == "project":
+                # Check if we should wait for Level 1 jobs
+                pending_seeds = get_pending_scope_survey_jobs(limit=1)
+                if pending_seeds:
+                    update_scope_survey_job(job.id, status="pending", priority=job.priority + 0.1)
+                    close_agent_session(_session_id, "completed", "Waiting for Level 1 seeds")
+                    return
+            
+            update_scope_survey_job(job.id, status="done", error_message="No children found to summarize")
+            close_agent_session(_session_id, "completed", "No children")
+            return
+
+        # 3. Build prompt
+        # Use orchestrator to determine how many chars we can afford per child.
+        total_limit = orchestrator.get_summary_context_limit(llm.max_context)
+        per_child_limit = max(200, int(total_limit / max(1, len(children))))
+        
+        child_block = "\n".join([f"- {c['id']}: {c['text'][:per_child_limit]}" for c in children])
+        
+        if job.scope_type == "module_clustering":
+            prompt = (
+                f"Given these file summaries for project '{job.project_name}', group them into 3-8 logical modules. "
+                "A module may span multiple directories. For each module, provide a name, a 2-sentence purpose, "
+                "and the list of files it contains.\n"
+                "Output as JSON: [{\"name\": \"...\", \"purpose\": \"...\", \"files\": [\"...\", ...]}, ...]\n\n"
+                "Files:\n" + child_block
+            )
+        else:
+            prompt = (
+                f"Summarize the health, purpose, and key components of the '{job.scope_key}' {job.scope_type} "
+                f"in project '{job.project_name}'. Provide a detailed summary and a 2-sentence 'short_summary' "
+                "at the very end of your response, prefixed with 'SHORT_SUMMARY: '.\n\n"
+                "Child components:\n" + child_block
+            )
+
+        # 4. Call LLM
+        resp = loop.run_until_complete(call_llm(
+            messages=[{"role": "user", "content": prompt}],
+            base_url=f"http://{llm.address}:{llm.port}/v1",
+            model=llm.model,
+            llm_id=llm.id,
+            budget_id=job.budget_id,
+            max_tokens=2048,
+            temperature=0.2,
+        ))
+
+        content = resp.get("content", "")
+        if job.scope_type == "module_clustering":
+            try:
+                # Basic JSON extraction
+                if "```json" in content:
+                    content = content.split("```json")[1].split("```")[0].strip()
+                elif "```" in content:
+                    content = content.split("```")[1].split("```")[0].strip()
+                
+                modules = json.loads(content)
+                for m in modules:
+                    upsert_scope_summary(
+                        project_name=job.project_name,
+                        scope_type="module",
+                        scope_key=m["name"],
+                        summary=m["purpose"],
+                        short_summary=m["purpose"],
+                        file_paths=m.get("files", []),
+                        file_count=len(m.get("files", [])),
+                        llm_id=llm.id,
+                        budget_id=job.budget_id
+                    )
+                    # Enqueue the actual summary job for this newly created module
+                    enqueue_scope_survey_job(
+                        job.project_name, "module", m["name"],
+                        action="generate", priority=job.priority + 0.1,
+                        llm_id=llm.id, budget_id=job.budget_id
+                    )
+            except Exception as e:
+                logger.error(f"Failed to parse module clustering JSON: {e}\nContent: {content[:500]}")
+        else:
+            summary = content
+            short = ""
+            if "SHORT_SUMMARY: " in content:
+                parts = content.split("SHORT_SUMMARY: ")
+                summary = parts[0].strip()
+                short = parts[1].strip()
+            else:
+                short = content.split(". ")[0] + "." if ". " in content else content[:200]
+            
+            upsert_scope_summary(
+                project_name=job.project_name,
+                scope_type=job.scope_type,
+                scope_key=job.scope_key,
+                summary=summary,
+                short_summary=short,
+                file_count=len(children),
+                llm_id=llm.id,
+                budget_id=job.budget_id
+            )
+
+        update_scope_survey_job(
+            job.id, status="done",
+            prompt_tokens=resp.get("prompt_tokens", 0),
+            completion_tokens=resp.get("completion_tokens", 0)
+        )
+        close_agent_session(_session_id, "completed", "Survey generation complete",
+                            prompt_tokens=resp.get("prompt_tokens", 0),
+                            completion_tokens=resp.get("completion_tokens", 0))
+
+        # Bottom-up Chaining: Check if we can trigger the next level
+        if job.scope_type in ("directory", "module", "directory_page", "module_page"):
+            # Check if all siblings are done to trigger the Project summary
+            # (In a real implementation, we'd check if all non-'project' jobs are done)
+            pass
+
+    except ShutdownError:
+        update_scope_survey_job(job.id, status='failed', error_message="Server shutdown")
+        close_agent_session(_session_id, "shutdown", "Server shutdown")
+    except Exception as e:
+        logger.exception("Scope survey job %d failed.", job.id)
+        update_scope_survey_job(job.id, status='failed', error_message=str(e))
+        close_agent_session(_session_id, "error", str(e))
+    finally:
+        with _llm_counts_lock:
+            _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
+        signal_completion(session_key)
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 def _run_arch_gen_job(job: Any, llm: Any) -> None:
@@ -1849,15 +2358,15 @@ def _run_pip_resolution_research(job: Any, task: Any, llm: Any) -> None:
             f"PROJECT SNAPSHOT:\n{snapshot}"
         )
 
-        llm_base_url = f"http://{llm.address}:{llm.port}/v1"
         from app.agent.llm_client import call_llm as _call_llm
-        response_text, _ = loop.run_until_complete(
+        _resp = loop.run_until_complete(
             _call_llm(
                 messages=[{"role": "user", "content": prompt}],
                 llm_id=task.llm_id,
                 budget_id=task.budget_id,
             )
         )
+        response_text = _resp.get("content", "")
         update_pip_resolution_job(job.id, research_findings=response_text)
         _exit_reason = "completed"
         _exit_summary = f"Research findings recorded for pip {job.pip_id}."

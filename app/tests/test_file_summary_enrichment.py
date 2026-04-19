@@ -46,7 +46,7 @@ class TestListDirectoryEnrichment:
             patch("app.agent.tools.PROJECT_ROOT", str(tmp_path)),
             patch("app.agent.tools.LISTING_EXCLUDED_DIRS", set()),
             patch("app.agent.tools._get_cached_summary_for_listing", return_value="Does something useful. Has one global."),
-            patch("app.agent.project_snapshot._is_git_ignored", return_value=set()),
+            patch("app.agent.path_filter.get_ignored_paths", return_value=set()),
             patch("app.agent.project_snapshot._is_symlink_escaping", return_value=False),
         ):
             from app.agent.tools import list_directory
@@ -64,7 +64,7 @@ class TestListDirectoryEnrichment:
             patch("app.agent.tools.PROJECT_ROOT", str(tmp_path)),
             patch("app.agent.tools.LISTING_EXCLUDED_DIRS", set()),
             patch("app.agent.tools._get_cached_summary_for_listing", return_value=None),
-            patch("app.agent.project_snapshot._is_git_ignored", return_value=set()),
+            patch("app.agent.path_filter.get_ignored_paths", return_value=set()),
             patch("app.agent.project_snapshot._is_symlink_escaping", return_value=False),
         ):
             from app.agent.tools import list_directory
@@ -82,17 +82,18 @@ class TestListDirectoryEnrichment:
             patch("app.agent.tools.PROJECT_ROOT", str(tmp_path)),
             patch("app.agent.tools.LISTING_EXCLUDED_DIRS", set()),
             patch("app.agent.tools._get_cached_summary_for_listing", return_value=None),
-            patch("app.agent.project_snapshot._is_git_ignored", return_value=set()),
+            patch("app.agent.path_filter.get_ignored_paths", return_value=set()),
             patch("app.agent.project_snapshot._is_symlink_escaping", return_value=False),
         ):
             from app.agent.tools import list_directory
             result = list_directory(str(tmp_path))
 
-        assert "[PROTECTED]" in result
+        assert "PROTECTED" in result
         assert ".git" in result
 
     def test_gitignored_entry_shown_as_protected(self, tmp_path):
-        secret = tmp_path / ".env"
+        # Use a non-hidden file so it doesn't get swallowed by the hidden-file rule first
+        secret = tmp_path / "secret_logic.py"
         secret.write_text("SECRET=abc")
 
         with (
@@ -101,14 +102,14 @@ class TestListDirectoryEnrichment:
             patch("app.agent.tools.PROJECT_ROOT", str(tmp_path)),
             patch("app.agent.tools.LISTING_EXCLUDED_DIRS", set()),
             patch("app.agent.tools._get_cached_summary_for_listing", return_value=None),
-            patch("app.agent.project_snapshot._is_git_ignored", return_value={str(secret)}),
+            patch("app.agent.path_filter.get_ignored_paths", return_value={str(secret)}),
             patch("app.agent.project_snapshot._is_symlink_escaping", return_value=False),
         ):
             from app.agent.tools import list_directory
             result = list_directory(str(tmp_path))
 
-        assert "gitignored" in result
-        assert ".env" in result
+        assert "GITIGNORED" in result
+        assert "secret_logic.py" in result
 
     def test_symlink_escaping_shown_as_protected(self, tmp_path):
         # Create a regular file - we'll make the escape helper claim it's an escaping symlink
@@ -125,7 +126,7 @@ class TestListDirectoryEnrichment:
             patch("app.agent.tools.PROJECT_ROOT", str(tmp_path)),
             patch("app.agent.tools.LISTING_EXCLUDED_DIRS", set()),
             patch("app.agent.tools._get_cached_summary_for_listing", return_value=None),
-            patch("app.agent.project_snapshot._is_git_ignored", return_value=set()),
+            patch("app.agent.path_filter.get_ignored_paths", return_value=set()),
             patch("app.agent.project_snapshot._is_symlink_escaping", side_effect=_fake_escape),
             patch("os.readlink", return_value="/outside/path"),
             patch("os.path.islink", return_value=True),
@@ -135,7 +136,7 @@ class TestListDirectoryEnrichment:
 
         assert "symlink escapes project" in result
 
-    def test_excluded_dirs_hidden(self, tmp_path):
+    def test_excluded_dirs_annotated(self, tmp_path):
         (tmp_path / "venv").mkdir()
         (tmp_path / "visible.py").write_text("pass")
 
@@ -145,14 +146,15 @@ class TestListDirectoryEnrichment:
             patch("app.agent.tools.PROJECT_ROOT", str(tmp_path)),
             patch("app.agent.tools.LISTING_EXCLUDED_DIRS", {"venv"}),
             patch("app.agent.tools._get_cached_summary_for_listing", return_value=None),
-            patch("app.agent.project_snapshot._is_git_ignored", return_value=set()),
+            patch("app.agent.path_filter.get_ignored_paths", return_value=set()),
             patch("app.agent.project_snapshot._is_symlink_escaping", return_value=False),
         ):
             from app.agent.tools import list_directory
             result = list_directory(str(tmp_path))
 
-        assert "venv" not in result
-        assert "hidden" in result
+        assert "venv" in result
+        assert "AUTO-EXCLUDED" in result
+        assert "visible.py" in result
 
     def test_no_llm_calls_ever(self, tmp_path):
         """list_directory must never make LLM calls."""
@@ -164,7 +166,7 @@ class TestListDirectoryEnrichment:
             patch("app.agent.tools.PROJECT_ROOT", str(tmp_path)),
             patch("app.agent.tools.LISTING_EXCLUDED_DIRS", set()),
             patch("app.agent.tools._get_cached_summary_for_listing", return_value=None),
-            patch("app.agent.project_snapshot._is_git_ignored", return_value=set()),
+            patch("app.agent.path_filter.get_ignored_paths", return_value=set()),
             patch("app.agent.project_snapshot._is_symlink_escaping", return_value=False),
             patch("app.agent.llm_client.call_llm") as mock_llm,
         ):

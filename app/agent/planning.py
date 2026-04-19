@@ -173,6 +173,8 @@ class PlanningPipeline:
 
     async def run(self) -> PlanningResult:
         """Execute all planning sub-stages and return the result."""
+        from app.agent.llm_client import set_llm_session_context
+        set_llm_session_context(AGENT_NAME)
         logger.info(f"[{AGENT_NAME}] Starting pipeline for task '%s'", self.task_id)
 
         # Stage 1: Codebase survey

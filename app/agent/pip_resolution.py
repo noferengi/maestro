@@ -102,6 +102,8 @@ class PIPResolutionAgent:
         "max_turns" — turn cap exceeded.
         "error"     — server shutting down or unexpected exception.
         """
+        from app.agent.llm_client import set_llm_session_context
+        set_llm_session_context(AGENT_NAME)
         if is_shutting_down():
             return {"status": "error", "turns": 0}
 

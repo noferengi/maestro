@@ -28,13 +28,15 @@ logger = logging.getLogger(__name__)
 
 def create_budget_entry(llm_id=None, budget_id=None, task_id=None,
                         prompt_cost=0, generation_cost=0, tool_calls=0,
-                        prompt_data=None, response_data=None):
+                        prompt_data=None, response_data=None,
+                        session_id=None, agent_name=None):
     db = SessionLocal()
     try:
         entry = BudgetEntry(
             llm_id=llm_id, budget_id=budget_id, task_id=task_id,
             prompt_cost=prompt_cost, generation_cost=generation_cost,
             tool_calls=tool_calls, prompt_data=prompt_data, response_data=response_data,
+            session_id=session_id, agent_name=agent_name,
         )
         db.add(entry)
         db.commit()
