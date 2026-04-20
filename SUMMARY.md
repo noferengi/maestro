@@ -7,128 +7,79 @@ A Kanban board with an agentic LLM orchestration backend. The board is the UI fa
 Verify cycles until all DAG task nodes reach ACCEPTED. Tasks transition through a 9-stage
 pipeline (IDEA → PLANNING → INDEV → CONCEPTUAL_REVIEW → OPTIMIZATION → SECURITY →
 FULL_REVIEW → COMPLETED), gated by multi-stage intake voting. A horizontal Architecture
-Bar above the pipeline columns holds architectural constraints that are injected into all
-agent prompts.
+Bar above the pipeline columns holds architectural constraints injected into all agent
+prompts. 52 migrations applied. 690 tests passing.
 
 ---
 
 ## Recent work (this session)
 
-### Graceful shutdown on Ctrl-C (`llm_client.py`, `research.py`, `main.py`)
+### Planning pipeline stuck-in-planning diagnosis and fixes
 
-**Problem:** Pressing Ctrl-C flooded the terminal with hundreds of
-`RuntimeError: cannot schedule new futures after interpreter shutdown` errors
-before the process died, continuing for several seconds.
+**Context:** Three tasks were stuck in `planning` type across two projects (AndroidStreetPass
+and Garden). The scheduler was running and dispatching them, but none advanced to INDEV.
 
-**Root cause:** Python's interpreter teardown shuts down all `ThreadPoolExecutor`
-instances before daemon threads finish. Agent threads (research agents, up to 3 lives ×
-50 turns each) were still alive and retrying LLM calls. The research agent's `_run_life`
-caught *every* exception with a blanket `except Exception`, logged ERROR, appended a
-system message, and **`continue`d** to the next turn — a tight spin of ~12 errors/second
-per agent.
+**Bug 1 — Design judge truncated by `max_tokens=256` (FIXED)**
 
-**Fix (three-part):**
-- `llm_client.py` — Added `_shutdown_event = threading.Event()` with `signal_shutdown()`
-  and `is_shutting_down()` helpers. The `call_llm` retry loop checks the flag at the top
-  of every iteration and raises `RuntimeError("Server is shutting down")` immediately.
-- `research.py` — Added `if is_shutting_down(): raise` before the `continue` in
-  `_run_life`'s except block, and in `_post_mortem_call` and `_forced_verdict_call`.
-  Shutdown exceptions now propagate instead of being swallowed.
-- `main.py` — Lifespan shutdown calls `signal_shutdown()` **before** `stop_scheduler()`,
-  arming the flag while threads are still alive.
+The design judge call in `app/agent/planning.py` had `max_tokens=256` hardcoded. Reasoning
+models (Qwen3.5) spend all 256 tokens on chain-of-thought (`reasoning_content`) and produce
+empty `content`. `finish_reason: "length"` appeared in every judge budget entry. The judge
+silently fell back to `designs[0]` via the `except Exception` handler.
 
----
+**Fix:** Added `PLANNING_JUDGE_MAX_TOKENS` to `app/agent/config.py` (default 8192), wired
+it into the `call_llm` call in `planning.py`. Set `maestro.ini [planning] judge_max_tokens = 8192`.
 
-### llama.cpp 500 errors — PEG parser failure (`research.py`)
+**Bug 2 — Design review panel starved by parallel LLM calls (FIXED)**
 
-**Problem:** The llama.cpp server at port 21982 returned intermittent
-`{"error": {"code": 500, "message": "Failed to parse input at pos ~1100-1135"}}`
-during normal operation.
+5 reviewer calls were fired via `asyncio.gather`. With 3 concurrent planning sessions ×
+5 reviewers = 15 simultaneous LLM requests. The per-call `total_timeout_secs=90` caused
+most reviewers to time out, returning `NEEDS_RESEARCH` votes. `tally_votes` Rule 3 ("any
+NEEDS_RESEARCH → needs_research outcome") blocked advancement even when 3/5 reviewers
+succeeded legitimately.
 
-**Root cause:** The server runs Qwen3 with `chat_format: peg-native`. Qwen3 in thinking
-mode opens a `<think>...</think>` scratchpad before producing visible output. The PEG
-parser processes the raw token stream *after* generation and expects a properly closed
-`</think>`. When thinking consumes the full token budget before `</think>` is written, the
-parser hits end-of-stream mid-thought and fails at the character position where truncation
-occurred (~4.4 chars/token × token limit ≈ 1100–1135 chars).
+**Fix:** Reviewer calls now run **sequentially** in a for-loop instead of `asyncio.gather`.
+The `total_timeout_secs=90` parameter was removed. Each call gets a clean LLM slot with no
+contention; total review time is similar (calls were queuing internally anyway).
 
-The GBNF grammar constraint (`grammar=_FORCED_VERDICT_GRAMMAR`) does **not** suppress
-Qwen3 thinking — it constrains only the visible output *after* `</think>`. The model still
-thinks first, potentially exhausting the budget before the JSON is ever reached.
+**Bug 3 — PlanningCorrectionAgent never triggered (IN PROGRESS)**
 
-**Fix:**
-- Added `/no_think` at the start of the forced verdict epilogue system prompt. Qwen3
-  recognises this and skips the thinking block, producing short grammar-constrained JSON
-  that fits within any reasonable token budget.
-- Raised `max_tokens` for the forced verdict call 512 → 4096 so that once the underlying
-  token budget issue is resolved, the model has adequate headroom to reason before
-  synthesising its verdict.
+`PlanningCorrectionAgent` was implemented by the prior Claude session (`planning_correction.py`,
+migration 0052, `update_plan_fields` tool, scheduler integration at `scheduler.py:3089`).
+Zero `planning_correction` sessions have ever run. Root cause: all prior planning sessions
+for the stuck tasks ended in `shutdown` (server restarts) before completing the full
+pipeline → gate → correction path. Current sessions (started 07:13 UTC) are the **first**
+to run with the correction agent wired in. They need to reach the gate to test it.
 
-**Open:** Two hardcoded `max_tokens=256` calls were found in `planning.py` (planning
-judge) and `arch_gen_agent.py` (arch card generation). Both will fail identically with
-Qwen3 thinking mode — thinking consumes the full 256-token budget before the JSON output
-is reached. These need either `/no_think` in their system prompts or a raised budget.
-The root source of the 256-token cap on regular research agent calls (which send
-`max_tokens=4096`) remains unconfirmed; `n_predict=-1` on the llama.cpp server rules out
-a server-level cap. The proxy at port 8008 and Qwen3's chat template `thinking_budget`
-default are the remaining suspects.
+The gate fails with `interface_completeness` hard fail: designs include intra-file type refs
+(e.g., `BlePacketType`, `PacketPayload`) in `interface_contracts.consumes` with no matching
+`provides`. The correction agent prompt already explains this pattern and instructs the agent
+to remove them from `consumes`.
 
----
+**Bug 4 — Design review content failures (OPEN)**
 
-### Thundering herd under concurrent jobs (`llm_client.py`)
+- *SQL Migration:* LLM designs a "simplified" migration removing `password_hash`, `is_active`,
+  `last_login_at`. Security reviewer correctly REJECTs this. After 3 retries the pipeline
+  proceeds anyway with the bad design, hits the gate, and the correction agent should fix
+  `interface_completeness`.
+- *Create Supporting Types:* Interface reviewer gives NEEDS_RESEARCH because `PacketMetadata`
+  is already in the codebase but the design still references it as a new file. After 3 retries
+  the pipeline proceeds.
 
-**Problem:** Running 3 simultaneous tasks produced noticeably more 500 errors than a
-single task — bursts of two or three 500s at the same timestamp, brief recovery, then
-another burst.
+Both are task-description clarity issues, not code bugs.
 
-**Two compounding effects:**
+### `scripts/inspect_cards.py` — major expansion (DONE)
 
-**Statistical pile-up.** Each LLM call has some probability *P* of hitting the Qwen3
-thinking truncation condition. With N concurrent callers the probability that *at least
-one* fails in a given window is `1 − (1−P)^N`. At N=3 this is ~2.7× the single-caller
-failure rate — more errors simply because more calls happen in parallel.
+Added new diagnostic sections:
+- `scheduler` — simulates scheduler state (READY/BLOCKED/PARENT_SKIP/DONE_SKIPPED/STUCK_SUBDIVIDING)
+- `activity` — recent LLM activity timeline with `--hours` flag
+- `votes` — transition vote detail with `--task` filter
+- `budget` — LLM capacity and spending summary
+- `children` — parent→child tree with activity counts
 
-**Thundering herd amplifier.** The backoff state (`_endpoint_states`) is a global dict
-shared across all threads. When all three agents receive 500s at the same timestamp:
-1. Each increments `fail_count` and computes `wait = BACKOFF_BASE_DELAY = 3.0s`.
-2. Each calls `await asyncio.sleep(3.0)` — all three sleep for *exactly* the same
-   duration.
-3. All three wake up simultaneously and fire their next request together.
-4. The server receives another burst of 3 concurrent requests; the same ratio of
-   successes to failures repeats, producing another burst of errors.
+### `CLAUDE.md` — planning pipeline diagnostic playbook added (DONE)
 
-This is the textbook thundering herd: synchronised failure → synchronised retry →
-synchronised failure again.
-
-**Fix:** Added `random.uniform(0, wait * 0.5)` jitter to both retry sleep sites
-(ConnectError handler and 500 handler). For the 3-second base wait, agents now sleep
-3.0–4.5s independently. Three concurrent failures spread their retries across a 1.5s
-window, each hitting the server individually with a fresh slot assignment.
-
----
-
-### Arch Bar Populate feature (previous session, complete)
-
-Added a `⚡ Populate` button to the architecture bar header. When clicked it queues
-scheduler jobs to generate one architecture card per missing category, using existing
-file summaries as context. No existing cards are modified.
-
-**Migration 0036** — `arch_gen_jobs` table:
-- `project`, `category`, `llm_id`, `budget_id`, `status`, `priority` (1.0), token counts,
-  `error_message`, `created_at`, `completed_at`
-- Index on `(status, priority, created_at)` for fast dispatch
-
-**`app/agent/arch_gen_agent.py`** (new) — single-call agent: fetches file summaries,
-builds prompt (relative path + 2 sentences each), calls LLM with `temperature=0.4`,
-`max_tokens=256`, creates architecture task.
-
-**`app/agent/scheduler.py`** — `_dispatch_arch_gen_jobs()`, `_run_arch_gen_job()`, rescue
-block in `_rescue_stale_jobs()`, and `_tick()` step 5.5.
-
-**`app/main.py`** — `POST /api/projects/{project_name}/populate-arch`.
-
-**`app/web/`** — `⚡ Populate` button in arch bar header; `populateArchBar()` in
-`kanban.js`.
+Added a "Diagnosing cards stuck in PLANNING" section with step-by-step DB queries,
+signal interpretation tables, and a common root causes table.
 
 ---
 
@@ -136,24 +87,69 @@ block in `_rescue_stale_jobs()`, and `_tick()` step 5.5.
 
 | File | Change |
 |---|---|
-| `app/agent/llm_client.py` | Shutdown flag + helpers; shutdown check in retry loop; jitter on both sleep sites; `import random` |
-| `app/agent/research.py` | Import `is_shutting_down`; re-raise on shutdown in `_run_life`, `_post_mortem_call`, `_forced_verdict_call`; `/no_think` in forced verdict system prompt; `max_tokens` 512 → 4096 |
-| `app/main.py` | `signal_shutdown()` before `stop_scheduler()` in lifespan shutdown |
+| `app/agent/config.py` | `PLANNING_JUDGE_MAX_TOKENS` (default 8192), `CORRECTION_MAX_TURNS`, `CORRECTION_SKIP_AFTER_FAILURES` |
+| `app/agent/planning.py` | Judge call: hardcoded 256 → `PLANNING_JUDGE_MAX_TOKENS`; reviewers `asyncio.gather` → sequential for-loop |
+| `app/agent/planning_correction.py` | **New** — `PlanningCorrectionAgent` class (prior session, untracked) |
+| `app/agent/scheduler.py` | Correction agent integration: `_run_planning_correction()` helper, trigger at gate failure |
+| `app/agent/tools.py` | `update_plan_fields()` tool + schema + `CORRECTION_AGENT_TOOLS` list |
+| `app/migrations/versions/0052_planning_correction_tracking.py` | **New** — adds `correction_attempts` column to `planning_results` |
+| `maestro.ini` | `[planning] judge_max_tokens = 8192` |
+| `scripts/inspect_cards.py` | Major expansion: scheduler/activity/votes/budget/children sections |
+| `CLAUDE.md` | Planning pipeline diagnostic playbook |
 
 ---
 
-## Open questions / next steps
+## Open / next steps
 
-- **`planning.py` and `arch_gen_agent.py` hardcoded `max_tokens=256`** — will fail with
-  Qwen3 thinking mode. Add `/no_think` to those system prompts or raise budget.
-- **Root cause of 256-token cap on research agent calls** — proxy at port 8008 config
-  or Qwen3 `thinking_budget` default. Check proxy configuration.
-- **Populate deduplication** — clicking Populate twice creates duplicate arch_gen_jobs.
-  Add a pending-job check before creating.
-- **Populate prewarm gate** — if no file summaries exist, jobs silently fail. Return 409
-  with a helpful message.
-- **Populate progress indicator** — arch bar subtitle showing "Generating N categories…"
-  while jobs are pending/running.
+**P0 — Verify correction agent triggers end-to-end**
+
+The current planning sessions (3 tasks) need to complete their design cycles and hit the
+gate. After the gate fails with `interface_completeness`, verify `planning_correction` rows
+appear in `agent_sessions`. If not, debug `scheduler.py:3089` trigger condition.
+
+```bash
+venv/Scripts/python.exe -c "
+import sqlite3
+conn = sqlite3.connect('data/kanban.db')
+print(conn.execute(\"SELECT task_id, exit_reason, exit_summary, started_at FROM agent_sessions WHERE agent_type='planning_correction' ORDER BY id DESC LIMIT 5\").fetchall())
+"
+```
+
+**P0 — Fix SQL Migration task description**
+
+The LLM keeps proposing to strip security columns because the task description doesn't say
+to preserve them. Edit via board UI: add "The existing migration at
+`migrations/001_create_users_table.sql` is authoritative; preserve all existing columns and
+extend if needed."
+
+**P0 — Fix Create Supporting Types task description**
+
+`PacketMetadata.kt` already exists at
+`core/models/src/main/java/com/androidstreetpass/core/models/PacketMetadata.kt`. Task
+description should say so, limiting scope to PacketPayload only.
+
+**P1 — If correction agent stalls: soften `interface_completeness` gate check**
+
+`app/agent/planning_gate.py:165` — change `hard_fail=True` to `hard_fail=False` for
+`interface_completeness`. This demotes it from a blocking gate failure to a warning. The
+correction agent then has a chance to patch it before the next planning cycle rather than
+requiring an inline correction under time pressure.
+
+**P1 — Call `supersede_planning_results` at start of each planning run**
+
+`app/database/crud_pipeline.py:225` defines `supersede_planning_results(task_id)` but it's
+never called. Add a call in `_run_planning_task` in `scheduler.py` (around line 2988, before
+`run_planning_pipeline(...)`). Prevents zombie `status='active'` rows accumulating.
+
+**P2 — Populate deduplication (arch bar)**
+
+Before creating `arch_gen_jobs`, check for already-pending/running jobs for the same
+category (filter `status IN ('pending', 'running')`). See old PLAN.md for code snippet.
+
+**P2 — Populate prewarm gate**
+
+Return HTTP 409 if no file summaries exist for the project path. See old PLAN.md for
+code snippet.
 
 ---
 
@@ -163,8 +159,20 @@ block in `_rescue_stale_jobs()`, and `_tick()` step 5.5.
 IDEA → PLANNING → INDEV → CONCEPTUAL_REVIEW → OPTIMIZATION → SECURITY → FULL_REVIEW → COMPLETED
 ```
 
-Special types: `architecture` (arch bar only, never dispatched), `subdividing` (Big Idea
-mid-subdivision).
+Special types: `architecture` (arch bar only), `subdividing` (Big Idea mid-subdivision).
+
+### PLANNING stage detail
+
+`_run_planning_task` in `scheduler.py`:
+1. `run_planning_pipeline` — survey → best-of-N designs → sequential design review panel →
+   pitfall detection → plan consolidation → store to `planning_results`
+2. `run_planning_gate` — deterministic + LLM gate checks (interface_completeness,
+   file_safety, context_budget, feasibility_recheck)
+3. On gate pass → `update_task(type='indev')`
+4. On gate fail → if hard failures + correction attempts < cap: `_run_planning_correction()`
+   (PlanningCorrectionAgent patches `interface_contracts` via `update_plan_fields` tool) →
+   re-run gate → if now passes, advance to INDEV
+5. After correction (pass or fail) → apply 5-min rejection cooldown
 
 ---
 
@@ -177,9 +185,8 @@ mid-subdivision).
 | `ArchGenJob` | 1.0 | Fire-and-forget arch card generation |
 | DAG tasks | computed | Based on pipeline stage + position |
 
-All jobs respect: one-LLM-at-a-time policy, per-LLM `parallel_sessions` cap,
-per-node `max_loaded_models` + `max_parallel_sessions` caps, 5-min retry cooldown on
-failure, orphan rescue on restart.
+All jobs respect: per-LLM `parallel_sessions` cap, per-node `max_parallel_sessions` cap,
+5-min retry cooldown on failure, orphan rescue on restart.
 
 ---
 
@@ -187,40 +194,47 @@ failure, orphan rescue on restart.
 
 ```
 app/
-  main.py                    FastAPI app, all routes
+  main.py                         FastAPI app, all routes
   agent/
-    arch_gen_agent.py        Arch card generation from file summaries
-    config.py                INI-driven constants
-    dag.py                   DAGResolver (Kahn's topo sort)
-    file_summary_agent.py    File summary generation agent
-    intake.py                IDEA→PLANNING pipeline
-    llm_client.py            Centralised LLM HTTP client (shutdown flag, jitter)
-    loop.py                  MaestroLoop (Design→Implement→Test→Verify)
-    planning.py / planning_gate.py
+    arch_gen_agent.py             Arch card generation from file summaries
+    config.py                     INI-driven constants (incl. PLANNING_JUDGE_MAX_TOKENS)
+    dag.py                        DAGResolver (Kahn's topo sort)
+    file_summary_agent.py         File summary generation agent
+    intake.py                     IDEA→PLANNING pipeline
+    llm_client.py                 Centralised LLM HTTP client
+    loop.py                       MaestroLoop (Design→Implement→Test→Verify)
+    planning.py                   Planning pipeline (survey→design→review→consolidate)
+    planning_correction.py        PlanningCorrectionAgent (patches failing plan fields)
+    planning_gate.py              Gate checks (interface_completeness, file_safety, etc.)
     conceptual_review.py / security_review.py / full_review.py / optimization.py
-    project_snapshot.py      build_project_snapshot, build_architecture_context
-    research.py              Research agent (lives system, shutdown-aware)
-    scheduler.py             Push-first eager scheduler (tick loop)
-    subdivide.py             Subdivision agent
-    tools.py                 Agent tool implementations
-    verdicts.py              Vote tally logic
+    pip_agent.py / pip_resolution.py  PIP generation and resolution
+    project_snapshot.py           build_project_snapshot, build_architecture_context
+    research.py                   Research agent (lives system)
+    scheduler.py                  Push-first eager scheduler
+    subdivide.py                  Subdivision agent
+    survey_orchestrator.py        Hierarchical project summarization
+    tools.py                      Agent tools (incl. update_plan_fields)
+    verdicts.py                   Vote tally logic
   database/
-    __init__.py              Re-exports everything
-    models.py                All SQLAlchemy models (incl. ArchGenJob)
+    __init__.py                   Re-exports everything
+    models.py                     All SQLAlchemy models
     crud_tasks.py / crud_projects.py / crud_infra.py / crud_costs.py
-    crud_pipeline.py / crud_jobs.py / crud_files.py / crud_inbox.py
-    session.py               Engine, SessionLocal, Base
+    crud_pipeline.py              Planning results, gate checks, correction_attempts
+    crud_jobs.py / crud_files.py / crud_inbox.py
+    session.py                    Engine, SessionLocal, Base
   migrations/
-    runner.py                Standalone sqlite3 migration engine
-    versions/0001–0036       36 applied migrations
+    runner.py                     Standalone sqlite3 migration engine
+    versions/0001–0052            52 applied migrations
   web/
-    index.html               Board shell
-    kanban.js                All board behaviour
-    style.css                Board styles
-    diagnostics.html + diag-*.js   LLM conversation viewer
+    index.html                    Board shell
+    kanban.js                     All board behaviour
+    style.css                     Board styles
+    diagnostics.html + diag-*.js  LLM conversation viewer
 data/
-  kanban.db                  SQLite database
-maestro.ini                  Runtime configuration
+  kanban.db                       SQLite database
+maestro.ini                       Runtime configuration
+scripts/
+  inspect_cards.py                Multi-section diagnostic tool
 ```
 
 ---
@@ -231,14 +245,37 @@ maestro.ini                  Runtime configuration
 # Server
 venv/Scripts/python.exe -m uvicorn app.main:app --port 8000
 
-# Tests
+# Tests (690 passing)
 venv/Scripts/python.exe -m pytest app/tests/ -v
 
 # Migrations
-venv/Scripts/python.exe app/migrations/runner.py status
-venv/Scripts/python.exe app/migrations/runner.py migrate
+migrate.bat status
+migrate.bat migrate
 
 # Diagnostics
 venv/Scripts/python.exe scripts/inspect_cards.py scheduler
 venv/Scripts/python.exe scripts/inspect_cards.py activity --hours 4
+venv/Scripts/python.exe scripts/inspect_cards.py votes --task <id>
 ```
+
+---
+
+## Key design decisions
+
+- **Planning reviewers run sequentially, not in parallel.** Parallel `asyncio.gather` with
+  90s timeout caused starvation under concurrent planning sessions (15 simultaneous LLM
+  requests), producing spurious NEEDS_RESEARCH votes that blocked the tally. Sequential
+  execution is slightly slower per-review but eliminates false failures entirely.
+
+- **`PLANNING_JUDGE_MAX_TOKENS = 8192` (not `MAX_TOKENS_PER_TURN`).** The judge needs more
+  headroom than 256 for reasoning models but doesn't need 32k. 8192 covers Qwen3.5's
+  chain-of-thought for typical 3-5 design comparison tasks.
+
+- **Correction agent runs inline in the planning session thread.** The `_run_planning_correction`
+  call is synchronous within `_run_planning_task`. No new scheduler slot is consumed — the
+  correction happens as part of the same `agent_sessions` row lifecycle (separate row
+  created with `agent_type='planning_correction'`).
+
+- **`interface_completeness` remains a hard gate failure.** It catches designs that reference
+  types across tasks without explicit contracts. The correction agent (not a gate softening)
+  is the intended fix path for the common false-positive case of intra-file refs.

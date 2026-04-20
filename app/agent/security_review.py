@@ -23,7 +23,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.agent.config import (
-    SECURITY_REVIEW_LLM_TEMPERATURE,
     SECURITY_REVIEW_VETO_POWER,
     SECURITY_REVIEW_RESEARCH_LIVES,
     SECURITY_REVIEW_MAX_REVIEWER_TURNS,
@@ -367,7 +366,6 @@ class SecurityPipeline:
                 messages,
                 base_url=self.llm_base_url,
                 model=self.llm_model,
-                temperature=SECURITY_REVIEW_LLM_TEMPERATURE,
                 tools=self._REVIEWER_SCHEMAS,
                 tool_choice="auto",
                 task_id=self.task_id,

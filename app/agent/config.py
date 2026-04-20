@@ -75,8 +75,7 @@ def _getlist(section: str, key: str, fallback: str) -> list[str]:
 
 LLM_BASE_URL: str = _get("llm", "base_url", "MAESTRO_LLM_BASE_URL", "http://localhost:8008/v1")
 LLM_MODEL: str = _get("llm", "model", "MAESTRO_LLM_MODEL", "omnicoder-9b")
-MAX_TOKENS_PER_TURN: int = _getint("llm", "max_tokens_per_turn", "MAESTRO_MAX_TOKENS", 4096)
-LLM_TEMPERATURE: float = _getfloat("llm", "temperature", "MAESTRO_TEMPERATURE", 0.2)
+MAX_TOKENS_PER_TURN: int = _getint("llm", "max_tokens_per_turn", "MAESTRO_MAX_TOKENS", 8192)
 LLM_TIMEOUT_SECONDS: int = _getint("llm", "timeout_seconds", "MAESTRO_LLM_TIMEOUT", 120)
 
 # ===========================================================================
@@ -165,7 +164,6 @@ RESEARCH_AGENT_MAX_LIVES: int = _getint("intake", "research_agent_max_lives", "M
 RESEARCH_AGENT_MAX_TURNS_PER_LIFE: int = _getint("intake", "research_agent_max_turns", None, 20)
 RESEARCH_CONTEXT_BUDGET_RATIO: float = _getfloat("intake", "context_budget_ratio", None, 0.60)
 TIEBREAKER_ENABLED: bool = _getbool("intake", "tiebreaker_enabled", None, True)
-INTAKE_LLM_TEMPERATURE: float = _getfloat("intake", "llm_temperature", "MAESTRO_INTAKE_TEMP", 0.1)
 
 RESEARCH_AGENT_TOOLS: list[str] = _getlist("intake", "research_agent_tools",
     "web_search, read_file, read_file_harder, count_lines, "
@@ -182,7 +180,6 @@ SUBDIVISION_AGENT_MAX_TURNS: int = _getint("subdivision", "max_turns", None, 50)
 SUBDIVISION_MAX_DEPTH: int = _getint("subdivision", "max_depth", None, 6)
 SUBDIVISION_MAX_RETRIES: int = _getint("subdivision", "max_retries_per_level", None, 4)
 SUBDIVISION_MAX_TOTAL_SUB_IDEAS: int = _getint("subdivision", "max_total_sub_ideas", None, 30)
-SUBDIVISION_LLM_TEMPERATURE: float = _getfloat("subdivision", "llm_temperature", None, 0.3)
 SUBDIVISION_CONTEXT_BUDGET_RATIO: float = _getfloat("subdivision", "context_budget_ratio", None, 0.60)
 SUBDIVISION_CONTEXT_AWARE_TOOLS: bool = _getbool("subdivision", "context_aware_tools", None, True)
 
@@ -253,6 +250,44 @@ def check_context_saturation(
     return False
 
 # ===========================================================================
+# Turn budget warnings
+# ===========================================================================
+
+TURN_WARNING_ENABLED: bool = _getbool("turn_warnings", "enabled", None, True)
+
+def check_turn_saturation(
+    current_turn: int,
+    max_turns: int,
+    warned_set: set,
+    messages: list,
+) -> bool:
+    """
+    Injects a system warning when the agent is running low on tool-call turns.
+    Thresholds: last 25, last 5.
+    """
+    if not TURN_WARNING_ENABLED or max_turns <= 0:
+        return False
+    
+    remaining = max_turns - current_turn
+    # Thresholds are "remaining turns"
+    thresholds = [25, 5]
+    
+    for t in thresholds:
+        # If we have reached or dropped below the threshold, and haven't warned for it yet
+        if remaining <= t and t not in warned_set:
+            warned_set.add(t)
+            messages.append({
+                "role": "user", 
+                "content": (
+                    f"[SYSTEM WARNING] You have {remaining} tool-call turns remaining. "
+                    "Focus on completing your current task, validating your changes, "
+                    "and providing your final output before the budget is exhausted."
+                )
+            })
+            return True
+    return False
+
+# ===========================================================================
 # Verdict confidence ranges
 # ===========================================================================
 
@@ -281,13 +316,9 @@ PLANNING_BEST_OF_N: int = _getint("planning", "best_of_n", None, 5)
 PLANNING_MAX_FILES: int = _getint("planning", "max_files", None, 8)
 PLANNING_MAX_STEPS: int = _getint("planning", "max_steps", None, 6)
 PLANNING_MAX_CONSECUTIVE_FAILURES: int = _getint("planning", "max_consecutive_failures", None, 3)
-PLANNING_TEMPERATURE_SPREAD: list[float] = [
-    float(x.strip()) for x in _get("planning", "temperature_spread", None, "0.3, 0.4, 0.5, 0.6, 0.7").split(",") if x.strip()
-]
-PLANNING_JUDGE_TEMPERATURE: float = _getfloat("planning", "judge_temperature", None, 0.1)
+PLANNING_JUDGE_MAX_TOKENS: int = _getint("planning", "judge_max_tokens", None, 8192)
 PLANNING_MAX_DESIGN_RETRIES: int = _getint("planning", "max_design_retries", None, 3)
 PLANNING_SURVEY_MAX_TURNS: int = _getint("planning", "survey_max_turns", None, 50)
-PLANNING_LLM_TEMPERATURE: float = _getfloat("planning", "llm_temperature", None, 0.2)
 
 PLANNING_GATE_FEASIBILITY_RECHECK: bool = _getbool("planning_gate", "feasibility_recheck_enabled", None, True)
 PLANNING_GATE_CONTEXT_SAFETY_MARGIN: float = _getfloat("planning_gate", "context_safety_margin", None, 0.15)
@@ -298,7 +329,6 @@ PLANNING_GATE_CONTEXT_SAFETY_MARGIN: float = _getfloat("planning_gate", "context
 
 INDEV_COMPONENT_MAX_TURNS: int = _getint("indev", "component_max_turns", None, 50)
 INDEV_COMPONENT_MAX_RETRIES: int = _getint("indev", "component_max_retries", None, 2)
-INDEV_LLM_TEMPERATURE: float = _getfloat("indev", "llm_temperature", None, 0.2)
 INDEV_ENFORCE_FILE_CONTAINMENT: bool = _getbool("indev", "enforce_file_containment", None, True)
 
 INDEV_AGENT_TOOLS: list[str] = _getlist("indev", "agent_tools",
@@ -316,7 +346,6 @@ INDEV_AGENT_TOOLS: list[str] = _getlist("indev", "agent_tools",
 # ===========================================================================
 
 CONCEPTUAL_REVIEW_MAX_TURNS: int = _getint("conceptual_review", "reviewer_max_turns", None, 15)
-CONCEPTUAL_REVIEW_LLM_TEMPERATURE: float = _getfloat("conceptual_review", "llm_temperature", None, 0.15)
 CONCEPTUAL_REVIEW_HIGH_SEVERITY_BLOCKS: bool = _getbool("conceptual_review", "high_severity_blocks_advance", None, True)
 CONCEPTUAL_REVIEW_RESEARCH_LIVES: int = _getint("conceptual_review", "research_agent_max_lives", None, 3)
 
@@ -332,9 +361,6 @@ CONCEPTUAL_REVIEW_REVIEWER_TOOLS: list[str] = _getlist("conceptual_review", "rev
 OPTIMIZATION_PROPOSAL_COUNT: int = _getint("optimization", "proposal_count", None, 5)
 OPTIMIZATION_JUDGE_COUNT: int = _getint("optimization", "judge_count", None, 3)
 OPTIMIZATION_IMPL_MAX_TURNS: int = _getint("optimization", "implementation_max_turns", None, 100)
-OPTIMIZATION_PROPOSER_TEMPERATURE: float = _getfloat("optimization", "proposer_temperature", None, 0.4)
-OPTIMIZATION_JUDGE_TEMPERATURE: float = _getfloat("optimization", "judge_temperature", None, 0.1)
-OPTIMIZATION_IMPL_TEMPERATURE: float = _getfloat("optimization", "implementation_temperature", None, 0.2)
 OPTIMIZATION_MIN_IMPROVEMENT_PCT: float = _getfloat("optimization", "min_improvement_pct", None, 2.0)
 OPTIMIZATION_MAX_REGRESSION_PCT: float = _getfloat("optimization", "max_regression_pct", None, 5.0)
 OPTIMIZATION_MAX_REVIEWER_TURNS: int = _getint("optimization", "reviewer_max_turns", None, 50)
@@ -361,7 +387,6 @@ OPTIMIZATION_BIG_O_BONUS_PCT: float = _getfloat("optimization_weights", "big_o_b
 # Security review
 # ===========================================================================
 
-SECURITY_REVIEW_LLM_TEMPERATURE: float = _getfloat("security_review", "llm_temperature", None, 0.1)
 SECURITY_REVIEW_VETO_POWER: bool = _getbool("security_review", "veto_power", None, True)
 SECURITY_REVIEW_RESEARCH_LIVES: int = _getint("security_review", "research_agent_max_lives", None, 2)
 SECURITY_REVIEW_MAX_REVIEWER_TURNS: int = _getint("security_review", "reviewer_max_turns", None, 50)
@@ -375,7 +400,6 @@ SECURITY_REVIEWER_TOOLS: list[str] = _getlist("security_review", "reviewer_tools
 # Full review
 # ===========================================================================
 
-FULL_REVIEW_LLM_TEMPERATURE: float = _getfloat("full_review", "llm_temperature", None, 0.1)
 FULL_REVIEW_AUTO_UX: bool = _getbool("full_review", "auto_ux_review", None, True)
 FULL_REVIEW_FRONTEND_PATTERNS: list[str] = _getlist("full_review", "frontend_patterns", "app/web/*.html, app/web/*.js, app/web/*.css")
 FULL_REVIEW_RESEARCH_LIVES: int = _getint("full_review", "research_agent_max_lives", None, 2)
@@ -441,6 +465,8 @@ SNAPSHOT_CONTEXT_RATIO: float = _getfloat("snapshot", "context_ratio", None, 0.1
 
 SUMMARY_CONTEXT_RATIO: float = _getfloat("survey", "summary_context_ratio", None, 0.10)
 SUMMARY_MAX_FILE_SIZE: int = _getint("survey", "max_file_size_bytes", None, 1024 * 1024)
+SURVEY_VERDICT_MAX_TOKENS: int = _getint("survey", "verdict_max_tokens", None, 8192)
+SURVEY_SUMMARY_MAX_TOKENS: int = _getint("survey", "summary_max_tokens", None, 8192)
 SURVEY_STALENESS_ENABLED: bool = _getbool("survey", "staleness_enabled", None, True)
 SURVEY_STALENESS_CHECK_RATIO: float = _getfloat("survey", "staleness_check_ratio", None, 0.05)
 SURVEY_MAX_CONCURRENT_JOBS: int = _getint("survey", "max_concurrent_scope_jobs", None, 3)
@@ -484,6 +510,13 @@ FILE_SUMMARY_STREAM_IDLE_TIMEOUT: float = _getfloat("scheduler", "file_summary_s
 PIP_RESOLUTION_MAX_TURNS: int = _getint("pip", "resolution_max_turns", None, 20)
 
 # ===========================================================================
+# Planning Correction Agent settings
+# ===========================================================================
+
+CORRECTION_MAX_TURNS: int = _getint("correction", "max_turns", None, 15)
+CORRECTION_SKIP_AFTER_FAILURES: int = _getint("correction", "correction_skip_after_failures", None, 2)
+
+# ===========================================================================
 # Dreamer — autonomous project resurrection agent
 # ===========================================================================
 
@@ -491,5 +524,22 @@ DREAMER_ENABLED: bool        = _getbool("dreamer", "enabled",              "MAES
 DREAMER_STALL_TICKS: int     = _getint ("dreamer", "stall_ticks",          None,                      60)
 DREAMER_MAX_RESURRECTIONS: int = _getint("dreamer", "max_cards_to_resurrect", None,                   3)
 DREAMER_MAX_NEW_CARDS: int   = _getint ("dreamer", "max_new_cards",        None,                      2)
-DREAMER_DECIDE_MAX_TOKENS: int = _getint("dreamer", "decide_max_tokens",   None,                      4096)
+DREAMER_DECIDE_MAX_TOKENS: int = _getint("dreamer", "decide_max_tokens",   None,                      8192)
 DREAMER_SURVEY_TOOLS: list[str] = _getlist("dreamer", "survey_tools", "get_project_summary, get_directory_summary, get_module_summary, list_scope_summaries")
+
+# ===========================================================================
+# Arch Gen — architecture card population agent
+# ===========================================================================
+
+ARCH_GEN_MAX_TOKENS: int = _getint("arch_gen", "max_tokens", None, 8192)
+
+# ===========================================================================
+# Server admin
+# ===========================================================================
+
+# When True, POST /api/admin/restart is active and the MCP restart_server tool works.
+# SECURITY: this endpoint triggers a forced process exit — never enable on a
+# publicly accessible server.  Default: False.  Override in maestro.ini or env.
+SERVER_ALLOW_REMOTE_RESTART: bool = _getbool(
+    "server", "allow_remote_restart", "MAESTRO_ALLOW_REMOTE_RESTART", False
+)

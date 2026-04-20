@@ -263,6 +263,7 @@ from .crud_inbox import (
 from .crud_sessions import (
     create_agent_session,
     close_agent_session,
+    close_zombie_sessions,
     get_agent_sessions_for_task,
 )
 

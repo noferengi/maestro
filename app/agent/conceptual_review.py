@@ -31,7 +31,6 @@ from typing import Any
 
 from app.agent.config import (
     CONCEPTUAL_REVIEW_MAX_TURNS,
-    CONCEPTUAL_REVIEW_LLM_TEMPERATURE,
     CONCEPTUAL_REVIEW_HIGH_SEVERITY_BLOCKS,
     CONCEPTUAL_REVIEW_RESEARCH_LIVES,
     CONCEPTUAL_REVIEW_REVIEWER_TOOLS,
@@ -383,7 +382,6 @@ class ConceptualReviewPipeline:
                 messages,
                 base_url=self.llm_base_url,
                 model=self.llm_model,
-                temperature=CONCEPTUAL_REVIEW_LLM_TEMPERATURE,
                 tools=self._REVIEWER_SCHEMAS,
                 tool_choice="auto",
                 task_id=self.task_id,

@@ -15,6 +15,7 @@ import os
 import re
 
 from app.agent.llm_client import is_shutting_down, ShutdownError, extract_text_response
+from app.agent.config import ARCH_GEN_MAX_TOKENS
 
 logger = logging.getLogger(__name__)
 AGENT_NAME = "Arch Gen Agent"
@@ -139,8 +140,7 @@ async def execute_arch_gen_job(
         messages,
         base_url=llm_base_url,
         model=llm_model,
-        temperature=0.4,
-        max_tokens=512,
+        max_tokens=ARCH_GEN_MAX_TOKENS,
         max_retries=5,
         task_id=None,
         llm_id=llm_id,

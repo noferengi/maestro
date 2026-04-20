@@ -6,6 +6,80 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Project Maestro — a Kanban board with an agentic LLM orchestration backend. The board is the UI face of a "Wiggum Loop": a Do-While that drives a local LLM through Design → Implement → Test → Verify cycles until all DAG task nodes reach ACCEPTED. Tasks transition IDEA → PLANNING → INDEV → CONCEPTUAL_REVIEW → OPTIMIZATION → SECURITY → FULL_REVIEW → COMPLETED, gated by a multi-stage intake pipeline with LLM voting.
 
+## MCP server — primary diagnostic interface
+
+A `maestro` MCP server is registered in `.mcp.json` and enabled via `.claude/settings.local.json`.
+**Prefer MCP tools over raw SQL queries or Bash scripts for all diagnostic and admin tasks.**
+
+Run `/mcp` to confirm the server is connected (should show `maestro  connected  22 tools`).
+If disconnected, restart Claude Code.
+
+### Default monitoring behavior
+
+When asked to watch, monitor, or babysit Maestro, the default workflow is `/loop` with `monitor()`:
+
+```
+/loop
+```
+
+Each iteration calls `monitor()` with no arguments, blocks for the window defined in
+`maestro.ini [monitor] duration_seconds` (default 5 minutes), then returns a structured
+report. Review the report, take any corrective actions using the action tools below, then
+the loop fires again automatically.
+
+To run a single 5-minute monitoring window without looping:
+
+```
+mcp__maestro__monitor(duration_seconds=300)
+```
+
+The report includes new budget entries, session starts/completions, stage changes, and
+five pattern flags: `rapid_cycling`, `token_limited`, `zombie_sessions`, `stage_thrash`,
+`tool_call_storms`. When a flag fires, drill in with `diagnose_task` or `get_budget_entry_full`.
+
+### When to use which tool
+
+| Goal | Tool |
+|---|---|
+| Watch activity over time | `monitor()` — blocks N seconds, returns diff report + pattern flags |
+| Why is task X stuck? | `diagnose_task(task_id)` — one call, complete picture |
+| What's running right now? | `get_scheduler_state()` (DB) + `get_scheduler_api_status()` (live API) |
+| Find tasks with no recent LLM activity | `find_stuck_tasks(idle_minutes=10)` |
+| Inspect raw LLM call history | `get_budget_trace(task_id, n=20)` |
+| Read full prompt/response for one LLM call | `get_budget_entry_full(entry_id)` |
+| Check planning gate failure history | `get_gate_history(task_id)` |
+| See full plan content (interface_contracts etc.) | `get_planning_result(task_id)` |
+| List tasks by project or type | `list_tasks(project="Garden", type="planning")` |
+| Add scope note to task description | `append_task_description(task_id, text)` |
+| Fix interface_contracts / file_manifest in a plan | `patch_planning_fields(result_id, fields_dict)` |
+| Force a task to a pipeline stage (no demotion record) | `set_task_type(task_id, "planning")` |
+| Move task backward with demotion record | `demote_task(task_id, target_stage?)` |
+| Trigger planning pipeline manually | `trigger_planning_run(task_id)` |
+| Trigger review / security / full_review | `run_pipeline_stage(task_id, stage)` |
+| Stop a running MaestroLoop | `stop_agent(task_id)` |
+| Anything not covered above | `run_inspect_cards(section, extra_args)` |
+
+### Key signal from `diagnose_task`
+
+- `activity_status: "active — last LLM call at ..."` → session running normally
+- `activity_status: "active — no budget entries yet"` → in survey phase or waiting for LLM slot
+- `activity_status: "idle"` → session is a zombie (server restart); task needs re-dispatch
+- `budget_trace[0].finish_reason == "length"` + empty `content_preview` → max_tokens too low for reasoning model
+- `correction_sessions` present → PlanningCorrectionAgent has run; check `exit_reason`
+- `planning.correction_attempts > 0` → gate has failed and correction was attempted
+
+### Source files
+
+```
+mcp_server.py          ← entry point, tool registration
+mcp_tools/
+  helpers.py           ← DB connection, response field extraction
+  diagnostics.py       ← all read-only tools
+  actions.py           ← write/admin tools
+  monitor.py           ← blocking monitor tool + pattern detectors
+.mcp.json              ← server registration (picked up by Claude Code)
+```
+
 ## Shell / path conventions (Windows)
 
 The shell is bash. Use **forward slashes** — backslashes are treated as escape characters and
@@ -76,6 +150,74 @@ Key diagnostics to check first when cards are stuck:
 1. `scheduler` — shows READY (should dispatch), BLOCKED (waiting on prereqs), STUCK_SUBDIVIDING (needs recovery)
 2. `prereqs` — reveals transitive DAG locks and phantom prerequisite IDs
 3. `activity --hours 4` — confirms the scheduler is actually dispatching tasks
+
+### Diagnosing cards stuck in PLANNING
+
+When tasks are in `planning` type but not advancing, run through this checklist:
+
+**Step 1 — confirm scheduler is running and tasks are active:**
+```bash
+curl -s http://localhost:8000/api/scheduler/status | python -m json.tool
+```
+Look for `active_sessions` containing the stuck task IDs.
+
+**Step 2 — check recent budget entries for those tasks:**
+```python
+# Quick DB query (run via venv/Scripts/python.exe -c "...")
+import sqlite3, json
+conn = sqlite3.connect('data/kanban.db')
+rows = conn.execute('''
+    SELECT id, agent_name, prompt_cost, generation_cost,
+           substr(response_data, 1, 200), created_at
+    FROM budget_entries WHERE task_id=? ORDER BY id DESC LIMIT 5
+''', ('task-id-here',)).fetchall()
+for r in rows: print(r)
+```
+Key signals:
+- `finish_reason: "length"` with empty `content` and non-empty `reasoning_content` → LLM hit `max_tokens` during chain-of-thought; increase the relevant `*_MAX_TOKENS` config value
+- Rapid small calls (< 700 prompt_cost) cycling every 30s → gate checks looping on a failure
+- No entries for > 10 minutes despite active session → pipeline waiting for LLM slot behind other tasks (check LLM capacity)
+
+**Step 3 — check planning results and gate history:**
+```python
+conn.execute('SELECT id, status, gate_checks, correction_attempts, created_at FROM planning_results WHERE task_id=? ORDER BY id DESC LIMIT 3', (task_id,)).fetchall()
+conn.execute("SELECT transition, outcome, substr(vote_summary,1,300), created_at FROM transition_results WHERE task_id=? AND transition='planning_gate' ORDER BY id DESC LIMIT 3", (task_id,)).fetchall()
+```
+- `gate_checks` empty + `correction_attempts=0` + gate transitions showing "rejected" → correction agent trigger is being evaluated but conditions may not be met
+- `correction_attempts > 0` → correction agent ran (check agent_sessions for outcome)
+- Multiple `status=active` rows → `supersede_planning_results` not being called (cosmetic, doesn't break logic)
+
+**Step 4 — check agent session history:**
+```python
+conn.execute('SELECT agent_type, exit_reason, exit_summary, started_at, ended_at FROM agent_sessions WHERE task_id=? ORDER BY id DESC LIMIT 8', (task_id,)).fetchall()
+```
+- `exit_reason=None, ended_at=None` → session still running (expected for active tasks)
+- `exit_reason='rejected'` with `exit_summary='Planning pipeline passed but gate checks failed.'` → gate is failing; correction agent should have triggered
+- `exit_reason='planning_correction'` entries → correction agent did run
+- Multiple `shutdown` entries → repeated server restarts are interrupting long-running sessions
+
+**Step 5 — check design review vote pattern:**
+
+Look at budget entries for the task in order. The design review runs 5 sequential reviewer calls (each ~5-15 min on a loaded LLM). Each reviewer LLM response should have a verdict in the content:
+- `LIKELY` / `POSSIBLE` → reviewer approved the design
+- `NEEDS_RESEARCH` / `REJECTED` → reviewer flagged an issue; check the justification — it may be a real design flaw or a false positive
+
+If `tally_votes` returns `needs_research` (any NEEDS_RESEARCH vote) or `rejected` (any REJECTED), the design retry loop fires. After `PLANNING_MAX_DESIGN_RETRIES` (default 3) retries, the pipeline proceeds to consolidation and gate regardless.
+
+**Step 6 — check the interface_completeness gate check:**
+
+The most common gate failure. The check computes `all_consumes - all_provides` across `interface_contracts`. If the LLM puts intra-file refs (e.g., language stdlib types, sealed class subtypes defined in the same file) in `consumes` without matching `provides` entries, the gate hard-fails. The `PlanningCorrectionAgent` is supposed to fix this by removing them from `consumes`. Verify it triggers by looking for `planning_correction` agent sessions.
+
+**Common root causes table:**
+
+| Symptom | Root cause | Fix |
+|---------|-----------|-----|
+| Design judge has `finish_reason: "length"`, empty `content` | `PLANNING_JUDGE_MAX_TOKENS` too low for reasoning model | Increase in `maestro.ini [planning] judge_max_tokens` |
+| Design review NEEDS_RESEARCH from timed-out reviewer | Reviewers ran in parallel; LLM slot starvation under concurrent sessions | Reviewers now run sequentially (fixed) |
+| Design review REJECTED by security reviewer | Design proposes removing security-critical columns | Improve planning prompt or task description |
+| Gate fails `interface_completeness` every run | Design puts stdlib/intra-file types in `consumes` | `PlanningCorrectionAgent` should patch this; verify it triggers |
+| `correction_attempts=0` despite gate failures | Correction agent code is new; gate hasn't been reached in current session | Wait for pipeline to complete; check agent_sessions after |
+| `planning_correction` session stalled | LLM can't determine a fix | Check exit_summary; may need manual task description update |
 
 ## Architecture
 

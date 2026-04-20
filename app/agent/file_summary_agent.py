@@ -361,7 +361,6 @@ async def execute_file_summary(
     async def _call(prompt_text: str) -> "tuple[str, int, int]":
         response = await call_llm(
             [{"role": "user", "content": prompt_text}],
-            temperature=0.1,
             task_id=task_id,
             llm_id=llm_id,
             budget_id=budget_id,

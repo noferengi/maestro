@@ -196,6 +196,7 @@ Aggregate result for a full transition run (all stages combined).
 | confidence | INTEGER | yes | — |
 | prompt_tokens | INTEGER | yes | — |
 | completion_tokens | INTEGER | yes | — |
+| correction_attempts | INTEGER | no | 0 |
 | status | VARCHAR | no | — |
 | created_at | DATETIME | yes | — |
 

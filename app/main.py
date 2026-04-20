@@ -75,6 +75,10 @@ from app.agent.llm_client import ShutdownError, PipelineAbortedError, invalidate
 async def lifespan(app: FastAPI):
     # --- startup ---
     init_db()
+    from app.database.crud_sessions import close_zombie_sessions
+    n = close_zombie_sessions()
+    if n:
+        logger.info("Closed %d zombie agent_sessions on startup.", n)
     seed_sample_tasks()
     # Ensure TheMaestro always has a project record (migration backfill covers
     # existing names, but a fresh DB after reset needs it too).
@@ -433,7 +437,8 @@ def _create_sub_idea_tasks(task, sub_result, generation):
         try:
             latest = (db.query(TaskModel)
                       .filter(TaskModel.title == sub_idea.title,
-                              TaskModel.owner == "system")
+                              TaskModel.owner == "system",
+                              TaskModel.id != task.id)
                       .order_by(TaskModel.created_at.desc())
                       .first())
             if latest:
@@ -4469,6 +4474,50 @@ def scheduler_status():
     """Return the current state of the push-first eager scheduler."""
     from app.agent.scheduler import get_scheduler_status  # noqa: PLC0415
     return get_scheduler_status()
+
+
+# ---------------------------------------------------------------------------
+# Admin routes
+# ---------------------------------------------------------------------------
+
+@app.post("/api/admin/restart", response_model=dict)
+async def admin_restart():
+    """Trigger a graceful process exit so the Launcher.ps1 loop can restart the server.
+
+    Requires [server] allow_remote_restart = true in maestro.ini (default: false).
+    SECURITY: never expose this endpoint to the public internet.
+
+    Mechanism:
+      1. Writes restart.flag to the project root.
+      2. Returns the response immediately.
+      3. Calls os._exit(0) 400 ms later — Launcher.ps1 detects the flag and
+         relaunches uvicorn.  The exit is intentionally immediate (no cleanup)
+         because the flag was already written and the launcher handles recovery.
+    """
+    from app.agent.config import SERVER_ALLOW_REMOTE_RESTART, PROJECT_ROOT
+    if not SERVER_ALLOW_REMOTE_RESTART:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Remote restart is disabled. "
+                "Set allow_remote_restart = true under [server] in maestro.ini."
+            ),
+        )
+
+    import pathlib
+    flag_path = pathlib.Path(PROJECT_ROOT) / "restart.flag"
+    flag_path.write_text("restart\n", encoding="utf-8")
+    logger.warning("[admin] restart_server: flag written to %s — exiting in 400 ms.", flag_path)
+
+    async def _exit_soon():
+        await asyncio.sleep(0.4)
+        os._exit(0)
+
+    asyncio.create_task(_exit_soon())
+    return {
+        "status": "restarting",
+        "message": "Server will exit momentarily. Launcher.ps1 will restart it in ~3 seconds.",
+    }
 
 
 # ---------------------------------------------------------------------------

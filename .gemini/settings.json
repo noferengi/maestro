@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "maestro": {
+      "command": "D:/workspace/TheMaestro/venv/Scripts/python.exe",
+      "args": [
+        "D:/workspace/TheMaestro/mcp_server.py"
+      ]
+    }
+  }
+}

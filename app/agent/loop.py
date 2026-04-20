@@ -21,7 +21,6 @@ from typing import Literal
 from app.agent.config import (
     LLM_BASE_URL,
     LLM_MODEL,
-    LLM_TEMPERATURE,
     MAX_TURNS,
     MAX_CONSECUTIVE_ERRORS,
     PROJECT_ROOT,
@@ -408,7 +407,6 @@ class MaestroLoop:
             messages,
             base_url=self.llm_base_url,
             model=self.llm_model,
-            temperature=LLM_TEMPERATURE,
             tools=_INDEV_TOOL_SCHEMAS,
             tool_choice="auto",
             task_id=self.task_id,

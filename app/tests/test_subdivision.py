@@ -380,11 +380,6 @@ class TestSubdivisionConfig:
         assert isinstance(SUBDIVISION_MAX_TOTAL_SUB_IDEAS, int)
         assert SUBDIVISION_MAX_TOTAL_SUB_IDEAS > 0
 
-    def test_llm_temperature_loaded(self):
-        from app.agent.config import SUBDIVISION_LLM_TEMPERATURE
-        assert isinstance(SUBDIVISION_LLM_TEMPERATURE, float)
-        assert 0.0 <= SUBDIVISION_LLM_TEMPERATURE <= 2.0
-
     def test_tools_loaded(self):
         from app.agent.config import SUBDIVISION_AGENT_TOOLS
         assert isinstance(SUBDIVISION_AGENT_TOOLS, list)

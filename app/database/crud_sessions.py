@@ -92,6 +92,31 @@ def close_agent_session(
         db.close()
 
 
+def close_zombie_sessions() -> int:
+    """Mark all open agent_sessions as closed on server startup.
+
+    Returns count of rows updated.
+    """
+    db = SessionLocal()
+    try:
+        result = db.execute(
+            __import__("sqlalchemy").text(
+                "UPDATE agent_sessions SET ended_at=:now, exit_reason='shutdown', "
+                "exit_summary='Closed on server startup (zombie session)' "
+                "WHERE ended_at IS NULL"
+            ),
+            {"now": _now_iso()},
+        )
+        db.commit()
+        return result.rowcount
+    except Exception as exc:
+        db.rollback()
+        logger.error("Error closing zombie sessions: %s", exc)
+        return 0
+    finally:
+        db.close()
+
+
 def get_agent_sessions_for_task(task_id: str) -> list[AgentSession]:
     """Return all sessions for a task, oldest first."""
     db = SessionLocal()

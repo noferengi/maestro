@@ -24,7 +24,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.agent.config import (
-    FULL_REVIEW_LLM_TEMPERATURE,
     FULL_REVIEW_AUTO_UX,
     FULL_REVIEW_FRONTEND_PATTERNS,
     FULL_REVIEW_MAX_REVIEWER_TURNS,
@@ -269,7 +268,6 @@ class FullReviewPipeline:
                 messages,
                 base_url=self.llm_base_url,
                 model=self.llm_model,
-                temperature=FULL_REVIEW_LLM_TEMPERATURE,
                 tools=schemas,
                 tool_choice="auto",
                 task_id=self.task_id,

@@ -5,7 +5,7 @@ Centralised LLM HTTP client for all Maestro subsystems.
 
 Every LLM call in the project - intake pipeline, research agent,
 MaestroLoop - goes through this module.  Callers can override the
-endpoint, model, temperature, and optional payload fields (tools,
+endpoint, model, and optional payload fields (tools,
 response_format, etc.) per call.
 
 When ``budget_id`` is provided, the call is automatically logged to the
@@ -31,7 +31,6 @@ import httpx
 from app.agent.config import (
     LLM_BASE_URL,
     LLM_MODEL,
-    LLM_TEMPERATURE,
     LLM_TIMEOUT_SECONDS,
     MAX_TOKENS_PER_TURN,
 )
@@ -635,7 +634,6 @@ async def call_llm(
     *,
     base_url: str | None = None,
     model: str | None = None,
-    temperature: float | None = None,
     max_tokens: int | None = None,
     timeout: int | None = None,
     tools: list[dict] | None = None,
@@ -671,8 +669,6 @@ async def call_llm(
     model
         Model identifier sent in the payload.
         Defaults to the global ``LLM_MODEL`` from config.
-    temperature
-        Sampling temperature.  Defaults to ``LLM_TEMPERATURE``.
     max_tokens
         Max completion tokens.  Defaults to ``MAX_TOKENS_PER_TURN``.
     timeout
@@ -781,7 +777,6 @@ async def call_llm(
     payload: dict[str, Any] = {
         "model": resolved_model,
         "messages": messages,
-        "temperature": temperature if temperature is not None else LLM_TEMPERATURE,
         "max_tokens": max_tokens or MAX_TOKENS_PER_TURN,
     }
 

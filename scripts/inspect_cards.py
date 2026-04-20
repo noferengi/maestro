@@ -1,20 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-inspect_meshtastic.py -- Meshtastic pipeline debug tool
+inspect_cards.py -- Maestro pipeline debug tool
 
 Usage:
-    python scripts/inspect_meshtastic.py [command] [options]
+    python scripts/inspect_cards.py [command] [options]
 
 Commands:
     overview      (default) Tasks list: type, prereqs, transition results, sub records, activity
     prereqs       Prerequisite chain analysis -- what's blocking what, phantom IDs, deadlocks
     scheduler     Simulate scheduler state -- ready / blocked / stuck, grouped by LLM
-    activity      LLM activity timeline across all Meshtastic tasks  [--hours N, default 48]
-    votes         Transition vote detail for all Meshtastic tasks    [--task TASK_ID]
+    planning      Planning-stage diagnosis -- cooldowns, gate failures, PIP jobs, session exits
+    activity      LLM activity timeline across all tasks  [--hours N, default 48]
+    votes         Transition vote detail for all tasks    [--task TASK_ID]
     budget        LLM capacity and budget spending summary
-    children      Parent->child tree with stage progress             [--task TASK_ID]
-    gate          Planning gate check outcomes                       [--task TASK_ID]
+    children      Parent->child tree with stage progress  [--task TASK_ID]
+    gate          Planning gate check outcomes             [--task TASK_ID]
     all           Run all sections in sequence
+
+Global options:
+    --project, -p   Filter to a specific project name (default: all active tasks)
 """
 
 import argparse
@@ -22,6 +26,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 # -- Config -------------------------------------------------------------------
@@ -33,6 +38,7 @@ PIPELINE_STAGES = [
     "idea", "planning", "indev", "conceptual_review",
     "optimization", "security", "full_review", "completed",
 ]
+_REJECTION_RETRY_COOLDOWN = 300  # seconds, matches scheduler.py
 
 # -- DB helpers ---------------------------------------------------------------
 def open_db():
@@ -55,36 +61,23 @@ def sep():
     print("-" * 50)
 
 
-# -- Meshtastic task fetch ----------------------------------------------------
-def get_meshtastic_tasks(cur):
-    """All active tasks whose title/project contains Meshtastic/StreetPass,
-    plus any active children of those tasks."""
-    cur.execute("""
-        SELECT id, title, type, prerequisites, parent_task_id,
-               llm_id, budget_id, is_active, position, history
-        FROM tasks
-        WHERE is_active=1
-          AND (title LIKE '%Meshtastic%' OR title LIKE '%meshtastic%'
-               OR project LIKE '%Meshtastic%' OR project LIKE '%meshtastic%'
-               OR title LIKE '%StreetPass%' OR title LIKE '%streetpass%')
-        ORDER BY type, position
-    """)
-    direct = list(cur.fetchall())
-    direct_ids = {t["id"] for t in direct}
-
-    if direct_ids:
-        placeholders = ",".join("?" * len(direct_ids))
-        cur.execute("""
-            SELECT id, title, type, prerequisites, parent_task_id,
-                   llm_id, budget_id, is_active, position, history
-            FROM tasks
-            WHERE is_active=1 AND parent_task_id IN ({})
-        """.format(placeholders), list(direct_ids))
-        children = [r for r in cur.fetchall() if r["id"] not in direct_ids]
+# -- Task fetch ---------------------------------------------------------------
+def get_tasks(cur, project=None):
+    """All active tasks, optionally filtered to one project."""
+    if project:
+        cur.execute(
+            "SELECT id, title, type, prerequisites, parent_task_id, "
+            "llm_id, budget_id, is_active, position, history "
+            "FROM tasks WHERE is_active=1 AND project=? ORDER BY type, position",
+            (project,),
+        )
     else:
-        children = []
-
-    return direct + children
+        cur.execute(
+            "SELECT id, title, type, prerequisites, parent_task_id, "
+            "llm_id, budget_id, is_active, position, history "
+            "FROM tasks WHERE is_active=1 ORDER BY type, position"
+        )
+    return list(cur.fetchall())
 
 
 # -- Helpers ------------------------------------------------------------------
@@ -126,12 +119,25 @@ def since(ts_str):
         return str(ts_str)[:16]
 
 
+def age_seconds(ts_str):
+    """Age of a timestamp in seconds, or None if unparseable."""
+    if not ts_str:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - ts).total_seconds()
+    except Exception:
+        return None
+
+
 # =============================================================================
 # COMMAND: overview
 # =============================================================================
-def cmd_overview(cur):
-    hdr("Meshtastic Tasks -- Overview")
-    tasks = get_meshtastic_tasks(cur)
+def cmd_overview(cur, project=None):
+    hdr("Tasks -- Overview" + (" [{}]".format(project) if project else " [all projects]"))
+    tasks = get_tasks(cur, project)
     task_map = {t["id"]: t for t in tasks}
 
     for t in tasks:
@@ -196,9 +202,9 @@ def cmd_overview(cur):
 # =============================================================================
 # COMMAND: prereqs
 # =============================================================================
-def cmd_prereqs(cur):
-    hdr("Prerequisite Chain Analysis")
-    tasks = get_meshtastic_tasks(cur)
+def cmd_prereqs(cur, project=None):
+    hdr("Prerequisite Chain Analysis" + (" [{}]".format(project) if project else ""))
+    tasks = get_tasks(cur, project)
     task_map = {t["id"]: t for t in tasks}
 
     all_prereq_ids = set()
@@ -291,9 +297,9 @@ def cmd_prereqs(cur):
 # =============================================================================
 # COMMAND: scheduler
 # =============================================================================
-def cmd_scheduler(cur):
-    hdr("Scheduler State Simulation")
-    tasks = get_meshtastic_tasks(cur)
+def cmd_scheduler(cur, project=None):
+    hdr("Scheduler State Simulation" + (" [{}]".format(project) if project else ""))
+    tasks = get_tasks(cur, project)
     task_map = {t["id"]: t for t in tasks}
 
     task_ids = list(task_map.keys())
@@ -452,11 +458,150 @@ def cmd_scheduler(cur):
 
 
 # =============================================================================
+# COMMAND: planning
+# =============================================================================
+def cmd_planning(cur, project=None):
+    """Planning-stage diagnosis: cooldowns, gate failures, session exits, PIP jobs."""
+    hdr("Planning Stage Diagnosis" + (" [{}]".format(project) if project else " [all projects]"))
+
+    tasks = get_tasks(cur, project)
+    planning_tasks = [t for t in tasks if (t["type"] or "").lower() == "planning"]
+
+    if not planning_tasks:
+        print("  No active planning-stage tasks found.")
+        return
+
+    print("  {} planning task(s) found.\n".format(len(planning_tasks)))
+
+    for t in planning_tasks:
+        tid = t["id"]
+        print("=" * 55)
+        print("[PLANNING] {}".format(t["title"][:60]))
+        print("  id={}  llm={}  budget={}".format(tid, t["llm_id"], t["budget_id"]))
+
+        # -- Last planning pipeline transition result (planning_to_indev)
+        cur.execute(
+            "SELECT outcome, created_at FROM transition_results "
+            "WHERE task_id=? AND transition='planning_to_indev' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (tid,),
+        )
+        tr = cur.fetchone()
+        if tr:
+            print("  pipeline result : {} @ {} ({})".format(
+                tr["outcome"], fmt_ts(tr["created_at"]), since(tr["created_at"])
+            ))
+        else:
+            print("  pipeline result : (no planning_to_indev result yet)")
+
+        # -- Planning gate failure count
+        cur.execute(
+            "SELECT COUNT(*) as cnt, MAX(created_at) as last_fail "
+            "FROM transition_results "
+            "WHERE task_id=? AND transition='planning_gate' AND outcome='rejected'",
+            (tid,),
+        )
+        gf = cur.fetchone()
+        gate_fail_count = gf["cnt"] if gf else 0
+        last_gate_fail_ts = gf["last_fail"] if gf else None
+        print("  gate failures   : {} / 5 max".format(gate_fail_count))
+
+        # -- Cooldown estimate
+        if last_gate_fail_ts:
+            age = age_seconds(last_gate_fail_ts)
+            if age is not None and age < _REJECTION_RETRY_COOLDOWN:
+                remaining = int(_REJECTION_RETRY_COOLDOWN - age)
+                print("  cooldown        : [COOLING DOWN -- {}s remaining]".format(remaining))
+            else:
+                print("  cooldown        : [expired -- eligible for retry]")
+
+        # -- Last agent session
+        try:
+            cur.execute(
+                "SELECT agent_type, started_at, ended_at, exit_reason, turn_count, max_turns "
+                "FROM agent_sessions "
+                "WHERE task_id=? AND agent_type='planning' "
+                "ORDER BY started_at DESC LIMIT 1",
+                (tid,),
+            )
+            sess = cur.fetchone()
+            if sess:
+                running = "(running)" if not sess["ended_at"] else ""
+                print("  last session    : exit={!s:15s}  turns={}/{}  started={}  {}".format(
+                    sess["exit_reason"] or "?",
+                    sess["turn_count"] or "?", sess["max_turns"] or "?",
+                    fmt_ts(sess["started_at"]), running or since(sess["ended_at"]),
+                ))
+            else:
+                print("  last session    : (no planning session recorded)")
+        except Exception as exc:
+            print("  last session    : (query error: {})".format(exc))
+
+        # -- Active PIP resolution jobs
+        try:
+            cur.execute(
+                "SELECT status, COUNT(*) as cnt FROM pip_resolution_jobs "
+                "WHERE task_id=? AND status NOT IN ('done', 'failed') "
+                "GROUP BY status",
+                (tid,),
+            )
+            pip_rows = cur.fetchall()
+            if pip_rows:
+                statuses = ", ".join("{}x {}".format(r["cnt"], r["status"]) for r in pip_rows)
+                print("  pip jobs active : {} [{}]".format(
+                    sum(r["cnt"] for r in pip_rows), statuses
+                ))
+            else:
+                print("  pip jobs active : none")
+        except Exception:
+            print("  pip jobs active : (pip_resolution_jobs table not found)")
+
+        # -- Latest planning_results row
+        try:
+            cur.execute(
+                "SELECT status, gate_checks, created_at FROM planning_results "
+                "WHERE task_id=? ORDER BY created_at DESC LIMIT 1",
+                (tid,),
+            )
+            pr = cur.fetchone()
+            if pr:
+                print("  planning_result : status={}  {}".format(
+                    pr["status"], since(pr["created_at"])
+                ))
+                try:
+                    checks = json.loads(pr["gate_checks"] or "[]")
+                    failed = [c for c in checks if not c.get("passed")]
+                    if failed:
+                        print("  gate failures   :")
+                        for c in failed:
+                            severity = "HARD" if c.get("hard_fail") else "soft"
+                            detail = c.get("detail", "")[:80]
+                            print("    [{}] {}  {}".format(severity, c.get("name", "?"), detail))
+                    elif checks:
+                        print("  gate checks     : all {} passed".format(len(checks)))
+                except Exception:
+                    pass
+            else:
+                print("  planning_result : (no planning_results row)")
+        except Exception as exc:
+            print("  planning_result : (query error: {})".format(exc))
+
+        print("")
+
+    print("\nDiagnosis key:")
+    print("  COOLING DOWN       -- gate rejected, waiting {}s before retry".format(_REJECTION_RETRY_COOLDOWN))
+    print("  exit=pip_blocked   -- PIP resolution jobs must finish before planning can re-run")
+    print("  gate failures 5/5  -- next rejection will demote card back to IDEA")
+    print("  exit=error         -- planning pipeline crashed; check diagnostics UI")
+    print("  no session + ready -- scheduler hasn't dispatched yet (capacity or LLM issue)")
+
+
+# =============================================================================
 # COMMAND: activity
 # =============================================================================
-def cmd_activity(cur, hours=48):
-    hdr("LLM Activity -- Last {}h".format(hours))
-    tasks = get_meshtastic_tasks(cur)
+def cmd_activity(cur, project=None, hours=48):
+    hdr("LLM Activity -- Last {}h".format(hours) + (" [{}]".format(project) if project else ""))
+    tasks = get_tasks(cur, project)
     task_ids = [t["id"] for t in tasks]
     task_map = {t["id"]: t for t in tasks}
 
@@ -515,9 +660,9 @@ def cmd_activity(cur, hours=48):
 # =============================================================================
 # COMMAND: votes
 # =============================================================================
-def cmd_votes(cur, task_id=None):
+def cmd_votes(cur, project=None, task_id=None):
     hdr("Transition Votes")
-    tasks = get_meshtastic_tasks(cur)
+    tasks = get_tasks(cur, project)
     task_map = {t["id"]: t for t in tasks}
 
     if task_id:
@@ -557,9 +702,9 @@ def cmd_votes(cur, task_id=None):
 # =============================================================================
 # COMMAND: budget
 # =============================================================================
-def cmd_budget(cur):
-    hdr("LLM & Budget Summary")
-    tasks = get_meshtastic_tasks(cur)
+def cmd_budget(cur, project=None):
+    hdr("LLM & Budget Summary" + (" [{}]".format(project) if project else ""))
+    tasks = get_tasks(cur, project)
 
     llm_ids = {t["llm_id"] for t in tasks if t["llm_id"]}
     budget_ids = {t["budget_id"] for t in tasks if t["budget_id"]}
@@ -610,9 +755,9 @@ def cmd_budget(cur):
 # =============================================================================
 # COMMAND: children
 # =============================================================================
-def cmd_children(cur, task_id=None):
+def cmd_children(cur, project=None, task_id=None):
     hdr("Parent -> Child Tree")
-    tasks = get_meshtastic_tasks(cur)
+    tasks = get_tasks(cur, project)
     task_map = {t["id"]: t for t in tasks}
 
     children_of = {}
@@ -667,7 +812,7 @@ def cmd_children(cur, task_id=None):
 # =============================================================================
 # COMMAND: gate
 # =============================================================================
-def cmd_gate(cur, task_id=None):
+def cmd_gate(cur, project=None, task_id=None):
     """Show planning gate check outcomes stored in planning_results.gate_checks."""
     hdr("Planning Gate Checks")
 
@@ -728,24 +873,31 @@ def cmd_gate(cur, task_id=None):
 # Entry point
 # =============================================================================
 COMMANDS = {
-    "overview":  lambda cur, args: cmd_overview(cur),
-    "prereqs":   lambda cur, args: cmd_prereqs(cur),
-    "scheduler": lambda cur, args: cmd_scheduler(cur),
-    "activity":  lambda cur, args: cmd_activity(cur, hours=args.hours),
-    "votes":     lambda cur, args: cmd_votes(cur, task_id=args.task),
-    "budget":    lambda cur, args: cmd_budget(cur),
-    "children":  lambda cur, args: cmd_children(cur, task_id=args.task),
-    "gate":      lambda cur, args: cmd_gate(cur, task_id=args.task),
+    "overview":  lambda cur, args: cmd_overview(cur, args.project),
+    "prereqs":   lambda cur, args: cmd_prereqs(cur, args.project),
+    "scheduler": lambda cur, args: cmd_scheduler(cur, args.project),
+    "planning":  lambda cur, args: cmd_planning(cur, args.project),
+    "activity":  lambda cur, args: cmd_activity(cur, args.project, hours=args.hours),
+    "votes":     lambda cur, args: cmd_votes(cur, args.project, task_id=args.task),
+    "budget":    lambda cur, args: cmd_budget(cur, args.project),
+    "children":  lambda cur, args: cmd_children(cur, args.project, task_id=args.task),
+    "gate":      lambda cur, args: cmd_gate(cur, args.project, task_id=args.task),
     "all": lambda cur, args: [
-        cmd_overview(cur), cmd_prereqs(cur), cmd_scheduler(cur),
-        cmd_activity(cur, hours=args.hours), cmd_votes(cur),
-        cmd_budget(cur), cmd_children(cur), cmd_gate(cur),
+        cmd_overview(cur, args.project),
+        cmd_prereqs(cur, args.project),
+        cmd_scheduler(cur, args.project),
+        cmd_planning(cur, args.project),
+        cmd_activity(cur, args.project, hours=args.hours),
+        cmd_votes(cur, args.project),
+        cmd_budget(cur, args.project),
+        cmd_children(cur, args.project),
+        cmd_gate(cur, args.project),
     ],
 }
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Meshtastic pipeline debug tool",
+        description="Maestro pipeline debug tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -757,9 +909,14 @@ if __name__ == "__main__":
         help="What to display (default: overview)",
     )
     parser.add_argument(
+        "--project", "-p",
+        default=None,
+        help="Filter to a specific project name (default: all projects)",
+    )
+    parser.add_argument(
         "--task", "-t",
         default=None,
-        help="Filter to a specific task ID (used by: votes, children)",
+        help="Filter to a specific task ID (used by: votes, children, gate)",
     )
     parser.add_argument(
         "--hours", "-H",

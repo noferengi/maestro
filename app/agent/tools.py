@@ -1614,6 +1614,49 @@ def append_task_history(task_id: str, entry: str) -> str:
         return f"ERROR appending history: {exc}"
 
 
+def update_plan_fields(result_id: int, fields_json: str) -> str:
+    """
+    Patch specific fields on a planning_results row.
+
+    Allowed fields: interface_contracts, dependency_graph, file_manifest,
+    test_strategy, implementation_steps.
+
+    Each value in fields_json may be a JSON-encoded string or a native
+    Python object (list/dict) — both are accepted and stored as JSON text.
+    """
+    import json as _json
+    ALLOWED = {"interface_contracts", "dependency_graph", "file_manifest",
+               "test_strategy", "implementation_steps"}
+    try:
+        fields = _json.loads(fields_json) if isinstance(fields_json, str) else fields_json
+        if not isinstance(fields, dict):
+            return "ERROR: fields_json must be a JSON object mapping field names to values."
+        invalid = set(fields.keys()) - ALLOWED
+        if invalid:
+            return (
+                f"ERROR: Invalid field(s): {sorted(invalid)}. "
+                f"Allowed: {sorted(ALLOWED)}"
+            )
+        if not fields:
+            return "ERROR: fields_json is empty — nothing to update."
+        serialized = {
+            k: (v if isinstance(v, str) else _json.dumps(v))
+            for k, v in fields.items()
+        }
+        from app.database import update_planning_result
+        from app.database.session import SessionLocal as _SL
+        db = _SL()
+        try:
+            result = update_planning_result(db, result_id, **serialized)
+            if result is None:
+                return f"ERROR: Planning result id={result_id} not found."
+            return f"Updated fields: {sorted(serialized.keys())}"
+        finally:
+            db.close()
+    except Exception as exc:
+        return f"ERROR: {exc}"
+
+
 # ---------------------------------------------------------------------------
 # Survey tools
 # ---------------------------------------------------------------------------
@@ -1791,6 +1834,7 @@ TOOL_REGISTRY: dict[str, Any] = {
     "list_tasks": list_tasks,
     "update_task_status": update_task_status,
     "append_task_history": append_task_history,
+    "update_plan_fields": update_plan_fields,
     "web_search": web_search,
     "web_fetch": web_fetch,
     "generate_architecture_doc": generate_architecture_doc,
@@ -2463,6 +2507,55 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_plan_fields",
+            "description": (
+                "Patch one or more fields on a planning_results row. "
+                "Use this to make targeted corrections to interface_contracts, dependency_graph, "
+                "file_manifest, test_strategy, or implementation_steps. "
+                "Pass result_id (from the system prompt) and fields_json as a JSON object "
+                "mapping field names to their corrected values. "
+                "Call once with all corrections — do not call multiple times."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "result_id": {
+                        "type": "integer",
+                        "description": "The planning_results row ID to patch (provided in the system prompt).",
+                    },
+                    "fields_json": {
+                        "type": "string",
+                        "description": (
+                            "JSON object mapping field name(s) to corrected value(s). "
+                            "Allowed keys: interface_contracts, dependency_graph, file_manifest, "
+                            "test_strategy, implementation_steps. "
+                            'Example: {"interface_contracts": [...corrected list...]}'
+                        ),
+                    },
+                },
+                "required": ["result_id", "fields_json"],
+            },
+        },
+    },
+]
+
+
+# ---------------------------------------------------------------------------
+# Tool list for PlanningCorrectionAgent
+# ---------------------------------------------------------------------------
+
+CORRECTION_AGENT_TOOLS: list[str] = [
+    "read_file",
+    "read_file_harder",
+    "search_files",
+    "find_files",
+    "list_directory",
+    "get_task",
+    "list_tasks",
+    "update_plan_fields",
 ]
 
 

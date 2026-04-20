@@ -26,6 +26,53 @@ from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
 logger = logging.getLogger(__name__)
 AGENT_NAME = "Planning Gate"
 
+_PYTHON_BUILTINS: frozenset[str] = frozenset({
+    "int", "str", "float", "bool", "bytes", "list", "dict", "set", "tuple",
+    "none", "nonetype", "exception", "object", "type", "any", "callable",
+})
+
+_STDLIB_MODULES: frozenset[str] = frozenset({
+    "datetime", "typing", "dataclasses", "json", "os", "sys", "asyncio",
+    "collections", "pathlib", "re", "enum", "abc", "functools", "itertools",
+    "uuid", "time", "logging", "io", "pickle", "threading", "hashlib",
+})
+
+_KOTLIN_BUILTINS: frozenset[str] = frozenset({
+    "long", "string", "boolean", "int", "float", "double", "char", "short", "byte",
+    "bytearray", "unit", "any", "nothing", "pair", "triple", "array",
+    "list", "map", "set", "sequence", "mutablelist", "mutablemap", "mutableset",
+    "flow", "stateflow", "sharedflow", "deferred", "job", "channel",
+})
+
+_ANDROID_FRAMEWORK: frozenset[str] = frozenset({
+    "context", "intent", "bundle", "activity", "fragment", "viewmodel",
+    "coroutinescope", "dispatcher", "lifecycleowner", "lifecyclescope",
+    "application", "service", "broadcastreceiver",
+})
+
+
+def _is_primitive_or_stdlib(item: str) -> bool:
+    """Return True if a consumes entry looks like a stdlib/primitive false-positive."""
+    low = item.lower().strip()
+    if low.endswith(" type") or low.endswith(" module"):
+        return True
+    if " for " in low:
+        first = low.split(" for ")[0].strip()
+        if first in _PYTHON_BUILTINS or first in _KOTLIN_BUILTINS:
+            return True
+    normalized = (
+        low.removeprefix("python ")
+           .removeprefix("kotlin ")
+           .removeprefix("android ")
+    )
+    base = normalized.split(" ")[0].split(".")[0]
+    return (
+        base in _PYTHON_BUILTINS
+        or base in _STDLIB_MODULES
+        or base in _KOTLIN_BUILTINS
+        or base in _ANDROID_FRAMEWORK
+    )
+
 
 @dataclass(slots=True)
 class GateCheck:
@@ -77,6 +124,9 @@ class PlanningGate:
 
         # Check 1: Interface completeness
         checks.append(self._check_interface_completeness())
+
+        # Check 1b: Implementation steps present
+        checks.append(self._check_implementation_steps_present())
 
         # Check 2: Circular dependency detection
         checks.append(self._check_circular_dependencies())
@@ -159,11 +209,21 @@ class PlanningGate:
 
         unresolved = all_consumes - all_provides
         if unresolved:
+            filtered = {u for u in unresolved if _is_primitive_or_stdlib(u)}
+            real_unresolved = unresolved - filtered
+            if real_unresolved:
+                detail = f"Unresolved consumes: {', '.join(sorted(real_unresolved))}"
+                if filtered:
+                    detail += f" (auto-filtered stdlib/primitives: {', '.join(sorted(filtered))})"
+                return GateCheck(name="interface_completeness", passed=False, hard_fail=True, detail=detail)
             return GateCheck(
                 name="interface_completeness",
-                passed=False,
-                hard_fail=True,
-                detail=f"Unresolved consumes: {', '.join(sorted(unresolved))}",
+                passed=True,
+                hard_fail=False,
+                detail=(
+                    f"Filtered {len(filtered)} stdlib/primitive consumes (not cross-task contracts): "
+                    f"{', '.join(sorted(filtered))}"
+                ),
             )
 
         return GateCheck(
@@ -171,6 +231,27 @@ class PlanningGate:
             passed=True,
             hard_fail=True,
             detail=f"{len(contracts)} contracts validated, all consumes resolved.",
+        )
+
+    # ------------------------------------------------------------------
+    # Check 1b: Implementation steps present
+    # ------------------------------------------------------------------
+
+    def _check_implementation_steps_present(self) -> GateCheck:
+        """Ensure the plan has at least one implementation step."""
+        steps = self.plan.get("implementation_steps", [])
+        if not steps:
+            return GateCheck(
+                name="implementation_steps_present",
+                passed=False,
+                hard_fail=True,
+                detail="Planning result has no implementation steps — plan is incomplete.",
+            )
+        return GateCheck(
+            name="implementation_steps_present",
+            passed=True,
+            hard_fail=True,
+            detail=f"{len(steps)} implementation step(s) defined.",
         )
 
     # ------------------------------------------------------------------

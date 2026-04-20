@@ -21,7 +21,6 @@ from typing import Any
 
 from app.agent.config import (
     INDEV_COMPONENT_MAX_TURNS,
-    INDEV_LLM_TEMPERATURE,
     INDEV_ENFORCE_FILE_CONTAINMENT,
     INDEV_AGENT_TOOLS,
     PROJECT_ROOT,
@@ -49,6 +48,7 @@ class ComponentToolDispatcher:
         )
 
     def dispatch(self, name: str, arguments: dict) -> str:
+        prefix = ""
         if INDEV_ENFORCE_FILE_CONTAINMENT and name in ("write_file", "append_file"):
             path = arguments.get("path", "")
             _effective_root = get_task_git_cwd() or PROJECT_ROOT
@@ -56,11 +56,13 @@ class ComponentToolDispatcher:
                 os.path.join(_effective_root, path) if not os.path.isabs(path) else path
             ))
             if resolved not in self._allowed:
-                return (
-                    f"ERROR: Write denied. File '{path}' is not in this component's "
-                    f"assigned manifest. Allowed: {[os.path.basename(p) for p in sorted(self._allowed)]}"
+                prefix = (
+                    f"[MANIFEST NOTE: '{path}' is outside the primary manifest "
+                    f"({[os.path.basename(p) for p in sorted(self._allowed)]}), "
+                    f"but the write was allowed. Prefer staying within your assigned files.]\n"
                 )
-        return dispatch_tool(name, arguments)
+        result = dispatch_tool(name, arguments)
+        return prefix + result if prefix else result
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +203,6 @@ class ComponentLoop:
                     messages,
                     base_url=self.llm_base_url,
                     model=self.llm_model,
-                    temperature=INDEV_LLM_TEMPERATURE,
                     tools=_INDEV_TOOL_SCHEMAS,
                     task_id=self.task_id,
                     llm_id=self.llm_id,

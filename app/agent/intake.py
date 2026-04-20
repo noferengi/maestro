@@ -468,7 +468,6 @@ class IntakePipeline:
             messages,
             base_url=self.llm_base_url,
             model=self.llm_model,
-            temperature=0.1,
             response_format={"type": "json_object"},
             task_id=self.task_id,
             llm_id=self.llm_id,

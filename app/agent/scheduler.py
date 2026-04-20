@@ -42,6 +42,8 @@ from app.agent.config import (
     PIPELINE_COLUMN_ORDER,
     PIPELINE_DONE_STATUSES,
     MAX_TOKENS_PER_TURN,
+    SURVEY_VERDICT_MAX_TOKENS,
+    SURVEY_SUMMARY_MAX_TOKENS,
 )
 from app.agent.llm_client import is_shutting_down, signal_shutdown, signal_force_shutdown, ShutdownError
 
@@ -1766,7 +1768,7 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
                 messages=[{"role": "user", "content": prompt}],
                 base_url=f"http://{llm.address}:{llm.port}/v1", model=llm.model,
                 llm_id=llm.id, budget_id=job.budget_id,
-                max_tokens=10, temperature=0.0
+                max_tokens=SURVEY_VERDICT_MAX_TOKENS
             ))
             verdict = resp.get("content", "").strip().upper()
             if "FULL_REINGEST" in verdict:
@@ -1810,9 +1812,9 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
                 messages=[{"role": "user", "content": prompt}],
                 base_url=f"http://{llm.address}:{llm.port}/v1", model=llm.model,
                 llm_id=llm.id, budget_id=job.budget_id,
-                max_tokens=2048, temperature=0.2
+                max_tokens=SURVEY_SUMMARY_MAX_TOKENS
             ))
-            
+
             content = resp.get("content", "")
             summary = content
             short = ""
@@ -1975,8 +1977,7 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
             model=llm.model,
             llm_id=llm.id,
             budget_id=job.budget_id,
-            max_tokens=2048,
-            temperature=0.2,
+            max_tokens=SURVEY_SUMMARY_MAX_TOKENS,
         ))
 
         content = resp.get("content", "")
@@ -2872,6 +2873,89 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
             pass
 
 
+def _run_planning_correction(
+    loop,
+    task_id: str,
+    current_plan: dict,
+    planning_result_id: int,
+    hard_failures: list[dict],
+    llm_base_url: str | None,
+    llm_model: str | None,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+    task_title: str = "",
+    task_description: str = "",
+) -> dict:
+    """Run PlanningCorrectionAgent inline and increment correction_attempts."""
+    from app.agent.planning_correction import PlanningCorrectionAgent
+    from app.database import update_planning_result, create_agent_session, close_agent_session
+    from app.database.session import SessionLocal as _SL
+
+    _session_id = create_agent_session(
+        task_id=task_id,
+        agent_type="planning_correction",
+        llm_id=llm_id,
+        budget_id=budget_id,
+        scheduler_reason="gate_repair",
+    )
+    _exit_reason = "error"
+    _exit_summary = ""
+
+    agent = PlanningCorrectionAgent(
+        task_id=task_id,
+        planning_result_id=planning_result_id,
+        current_plan=current_plan,
+        gate_failures=hard_failures,
+        project_root=project_path,
+        llm_id=llm_id,
+        budget_id=budget_id,
+        llm_base_url=llm_base_url,
+        llm_model=llm_model,
+        max_context=max_context,
+        task_title=task_title,
+        task_description=task_description,
+    )
+    try:
+        correction_result = loop.run_until_complete(agent.run())
+        _exit_reason = correction_result.get("outcome", "error")
+        _exit_summary = (
+            f"correction outcome={_exit_reason}, "
+            f"fields_patched={correction_result.get('fields_patched', [])}"
+        )
+    except ShutdownError:
+        _exit_reason = "shutdown"
+        _exit_summary = "Shutdown during planning correction."
+        correction_result = {"outcome": "error", "fields_patched": []}
+    except Exception:
+        _exit_reason = "error"
+        _exit_summary = "Unexpected error in planning correction."
+        logger.exception("[planning_correction] Unexpected error for task '%s'.", task_id)
+        correction_result = {"outcome": "error", "fields_patched": []}
+    finally:
+        close_agent_session(_session_id, _exit_reason, _exit_summary)
+        # Increment correction_attempts on the planning result row
+        _db = _SL()
+        try:
+            from app.database.models import PlanningResult as _PR
+            _pr_row = _db.query(_PR).filter(_PR.id == planning_result_id).first()
+            if _pr_row is not None:
+                update_planning_result(
+                    _db, planning_result_id,
+                    correction_attempts=_pr_row.correction_attempts + 1,
+                )
+        except Exception:
+            logger.debug(
+                "[planning_correction] Could not increment correction_attempts for result %d.",
+                planning_result_id,
+            )
+        finally:
+            _db.close()
+
+    return correction_result
+
+
 def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
                        max_context: int | None = None,
                        llm_id: int | None = None,
@@ -2994,6 +3078,81 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
                         "demoted to IDEA for forced subdivision."
                     )
                 else:
+                    # Try correction agent before applying cooldown.
+                    hard_failures = [
+                        c for c in gate_result.get("checks", [])
+                        if not c.get("passed") and c.get("hard_fail")
+                    ]
+                    from app.database import get_planning_result as _gpr_corr
+                    _pr_for_correction = _gpr_corr(task_id)
+                    from app.agent.config import CORRECTION_SKIP_AFTER_FAILURES as _CORR_SKIP
+                    _corr_attempts = getattr(_pr_for_correction, "correction_attempts", 0) if _pr_for_correction else 0
+                    if hard_failures and _corr_attempts < _CORR_SKIP and _pr_for_correction:
+                        correction_result = _run_planning_correction(
+                            loop=loop,
+                            task_id=task_id,
+                            current_plan=result,
+                            planning_result_id=_pr_for_correction.id,
+                            hard_failures=hard_failures,
+                            llm_base_url=llm_base_url,
+                            llm_model=llm_model,
+                            max_context=max_context,
+                            llm_id=llm_id,
+                            budget_id=budget_id,
+                            project_path=project_path,
+                            task_title=task.title or "",
+                            task_description=task.description or "",
+                        )
+                        if correction_result.get("outcome") == "corrected":
+                            # Re-run gate on the patched plan
+                            _pr_patched = _gpr_corr(task_id)
+                            if _pr_patched:
+                                import json as _json_corr
+                                patched_plan = {
+                                    "implementation_steps": _json_corr.loads(_pr_patched.implementation_steps or "[]"),
+                                    "file_manifest": _json_corr.loads(_pr_patched.file_manifest or "[]"),
+                                    "dependency_graph": _json_corr.loads(_pr_patched.dependency_graph or "{}"),
+                                    "interface_contracts": _json_corr.loads(_pr_patched.interface_contracts or "[]"),
+                                    "test_strategy": _json_corr.loads(_pr_patched.test_strategy or "[]"),
+                                }
+                                gate_result2 = loop.run_until_complete(
+                                    run_planning_gate(
+                                        task_id=task_id,
+                                        planning_result=patched_plan,
+                                        all_tasks=all_tasks,
+                                        max_context=max_context,
+                                        llm_base_url=llm_base_url,
+                                        llm_model=llm_model,
+                                        llm_id=llm_id,
+                                        budget_id=budget_id,
+                                        project_path=project_path,
+                                    )
+                                )
+                                if gate_result2.get("passed"):
+                                    _exit_summary = (
+                                        "Correction agent patched plan; gate now passes. "
+                                        "Advanced to INDEV."
+                                    )
+                                    update_task(task_id, type="indev")
+                                    logger.info(
+                                        "[planning] Task '%s' advanced to INDEV after correction.",
+                                        task_id,
+                                    )
+                                    return
+                                create_transition_result(
+                                    task_id=task_id,
+                                    transition="planning_gate",
+                                    outcome="rejected",
+                                    vote_summary=gate_result2,
+                                    total_prompt_tokens=gate_result2.get("prompt_tokens", 0),
+                                    total_completion_tokens=gate_result2.get("completion_tokens", 0),
+                                )
+                                logger.info(
+                                    "[planning] Task '%s' — corrected plan still fails gate; "
+                                    "applying cooldown.",
+                                    task_id,
+                                )
+
                     # Not at the cap yet — apply a 5-min cooldown so the scheduler
                     # doesn't immediately re-dispatch the same failing plan.
                     _rejection_cooldowns[task_id] = time.time()
