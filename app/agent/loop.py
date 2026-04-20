@@ -126,6 +126,7 @@ class MaestroLoop:
         self._files_changed: list[str] = []
         self._last_prompt_tokens: int = 0
         self._warnings_fired: set[float] = set()
+        self._turn_warnings_fired: set[int] = set()
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -238,10 +239,11 @@ class MaestroLoop:
             assistant_message = response.get("choices", [{}])[0].get("message", {})
             self._messages.append(assistant_message)
 
-            # ── Track token usage & inject context warnings ────────────
+            # ── Track token usage & inject context/turn warnings ───────
             usage = response.get("usage", {})
             self._last_prompt_tokens = usage.get("prompt_tokens", 0)
             self._maybe_inject_context_warning()
+            self._maybe_inject_turn_warning()
 
             tool_calls = assistant_message.get("tool_calls") or []
             content = assistant_message.get("content") or ""
@@ -391,6 +393,16 @@ class MaestroLoop:
             self._warnings_fired,
             self._messages,
             terminate_threshold=0,
+        )
+
+    def _maybe_inject_turn_warning(self) -> None:
+        """Inject a warning message if tool-call turns are running low."""
+        from app.agent.config import check_turn_saturation
+        check_turn_saturation(
+            self._turn,
+            self.max_turns,
+            self._turn_warnings_fired,
+            self._messages,
         )
 
     # ------------------------------------------------------------------

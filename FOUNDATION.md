@@ -16,7 +16,7 @@ D:\workspace\TheMaestro\
 ├── app/
 │   ├── agent/
 │   │   ├── __init__.py
-│   │   ├── config.py         # Constants: LLM endpoint, MAX_TURNS=150, limits, paths
+│   │   ├── config.py         # Constants: LLM endpoint, MAX_TURNS=100, limits, paths
 │   │   ├── dag.py            # DAGResolver: Kahn's topological sort, ready-task finder, cycle detection
 │   │   ├── loop.py           # MaestroLoop class; _ACTIVE_LOOPS/_LOOP_STATUS dicts
 │   │   ├── system_prompt.py  # MAESTRO_SYSTEM_PROMPT
@@ -99,7 +99,7 @@ These invariants are enforced at the tool level in `app/agent/tools.py` — any 
 2. **Branch enforcement.** `git_checkout` blocks any branch that is not `maestro/task-{id}`, `main`, or `master`.
 3. **Shell blocklist.** `run_shell()` rejects patterns including `rm -rf`, `del /s`, fork bombs, and deep `../` traversal.
 4. **Failure circuit-breaker.** After 3 consecutive tool failures, `MaestroLoop` emits `{"signal": "REVERT_TO_DESIGN"}` and halts.
-5. **Turn cap.** `MAX_TURNS=150` in `app/agent/config.py` terminates runaway loops.
+5. **Turn cap.** `MAX_TURNS=100` in `app/agent/config.py` terminates runaway loops.
 
 ---
 

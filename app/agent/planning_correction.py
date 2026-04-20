@@ -78,6 +78,7 @@ class PlanningCorrectionAgent:
         self._consecutive_errors: int = 0
         self._no_tool_turns: int = 0
         self._warnings_fired: set[float] = set()
+        self._turn_warnings_fired: set[int] = set()
 
     async def run(self) -> dict:
         """
@@ -103,6 +104,14 @@ class PlanningCorrectionAgent:
                 "[planning_correction] task '%s' — turn %d/%d",
                 self.task_id, self._turn, CORRECTION_MAX_TURNS,
             )
+
+            # Turn saturation check
+            from app.agent.config import check_turn_saturation
+            if check_turn_saturation(
+                self._turn, CORRECTION_MAX_TURNS, self._turn_warnings_fired, self._messages
+            ):
+                # Turn nudge was injected
+                pass
 
             try:
                 response = await self._call_llm(self._messages)

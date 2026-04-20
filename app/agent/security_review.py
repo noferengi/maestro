@@ -357,10 +357,19 @@ class SecurityPipeline:
 
         max_turns = SECURITY_REVIEW_MAX_REVIEWER_TURNS
         _ctx_warned: set[float] = set()
+        _turn_warned: set[int] = set()
 
         for turn in range(max_turns):
             if is_shutting_down():
                 raise ShutdownError("Server is shutting down")
+
+            # Turn saturation check
+            from app.agent.config import check_turn_saturation
+            if check_turn_saturation(
+                turn, max_turns, _turn_warned, messages
+            ):
+                # Turn nudge was injected
+                pass
 
             response = await call_llm(
                 messages,

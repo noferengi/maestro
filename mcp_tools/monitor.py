@@ -151,7 +151,7 @@ def monitor(
             if rows:
                 max_budget_id = rows[-1]["id"]
 
-            # session completions: sessions that were open and are now closed
+            # session completions: sessions that were open and closed DURING this window
             closed_ids = list(open_sessions.keys())
             if closed_ids:
                 placeholders = ",".join("?" * len(closed_ids))
@@ -160,8 +160,9 @@ def monitor(
                     f"s.ended_at, t.title "
                     f"FROM agent_sessions s JOIN tasks t ON s.task_id=t.id "
                     f"WHERE s.task_id IN ({placeholders}) AND s.ended_at IS NOT NULL "
+                    f"AND s.ended_at >= ? "
                     f"AND s.id=(SELECT MAX(id) FROM agent_sessions WHERE task_id=s.task_id)",
-                    closed_ids,
+                    closed_ids + [start_wall],
                 ).fetchall():
                     tid = r["task_id"]
                     if tid in open_sessions:

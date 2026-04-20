@@ -574,9 +574,20 @@ class DreamerAgent:
         _task_project_name.set(self.project)
         _task_git_cwd.set(self.project_path)
 
-        # Multi-turn loop (max 10 turns)
+        # Multi-turn loop (max 100 turns)
+        max_turns = 100
         raw = "{}"
-        for turn in range(10):
+        _turn_warned: set[int] = set()
+
+        for turn in range(max_turns):
+            # Turn saturation check
+            from app.agent.config import check_turn_saturation
+            if check_turn_saturation(
+                turn, max_turns, _turn_warned, messages
+            ):
+                # Turn nudge was injected
+                pass
+
             try:
                 response = await call_llm(
                     messages,

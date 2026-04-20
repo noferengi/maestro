@@ -681,3 +681,111 @@ def test_execute_stores_result(tmp_path, monkeypatch):
     cached = db_mod.get_file_summary(sha1, filesize)
     assert cached is not None
     assert cached.summary == "Bar returns 1."
+
+
+# ---------------------------------------------------------------------------
+# write_file / append_file cache invalidation (Bug #1 fix)
+# ---------------------------------------------------------------------------
+
+def test_write_file_invalidates_prepped_cache(tmp_path):
+    """After write_file, the next read_file must return fresh content, not ALREADY IN CONTEXT."""
+    from app.agent.tools import read_file, write_file, _prepped_files
+
+    # Create a small file (≤25 lines → inlined) and serve it via read_file
+    p = tmp_path / "target.txt"
+    p.write_text("original content\n", encoding="utf-8")
+
+    first = read_file(str(p))
+    assert "original" in first or "ALREADY IN CONTEXT" not in first
+
+    # Now overwrite it
+    write_result = write_file(str(p), "updated content\n")
+    assert write_result.startswith("OK:")
+
+    # Cache must be cleared — a second read should NOT return ALREADY IN CONTEXT
+    second = read_file(str(p))
+    assert "ALREADY IN CONTEXT" not in second, (
+        "write_file must invalidate the _prepped_files cache so read_file returns fresh content"
+    )
+    assert "updated" in second
+
+
+def test_append_file_invalidates_prepped_cache(tmp_path):
+    """After append_file, the next read_file must not return ALREADY IN CONTEXT."""
+    from app.agent.tools import read_file, append_file
+
+    p = tmp_path / "log.txt"
+    p.write_text("line one\n", encoding="utf-8")
+
+    first = read_file(str(p))
+    assert "ALREADY IN CONTEXT" not in first
+
+    append_result = append_file(str(p), "line two\n")
+    assert append_result.startswith("OK:")
+
+    second = read_file(str(p))
+    assert "ALREADY IN CONTEXT" not in second, (
+        "append_file must invalidate the _prepped_files cache so read_file returns fresh content"
+    )
+
+
+# ---------------------------------------------------------------------------
+# STATUS_TO_TYPE mapping (Bug #2 fix)
+# ---------------------------------------------------------------------------
+
+def test_status_to_type_uses_canonical_column_names():
+    """ACTIVE→indev and VERIFYING→conceptual_review must be scheduler-dispatchable."""
+    from app.agent.config import SCHEDULER_DISPATCHABLE_TYPES
+
+    STATUS_TO_TYPE = {
+        "PENDING": "planning",
+        "ACTIVE": "indev",
+        "VERIFYING": "conceptual_review",
+        "ACCEPTED": "completed",
+        "REJECTED": "planning",
+    }
+
+    assert STATUS_TO_TYPE["ACTIVE"] == "indev"
+    assert STATUS_TO_TYPE["VERIFYING"] == "conceptual_review"
+
+    for status, col_type in STATUS_TO_TYPE.items():
+        if col_type == "completed":
+            continue  # completed is terminal, not dispatchable
+        assert col_type in SCHEDULER_DISPATCHABLE_TYPES, (
+            f"STATUS_TO_TYPE['{status}'] = '{col_type}' is not in SCHEDULER_DISPATCHABLE_TYPES; "
+            "tasks set to this type would become invisible to the scheduler"
+        )
+
+
+def test_update_task_status_maps_to_indev(tmp_path, monkeypatch):
+    """update_task_status('ACTIVE') must write type='indev', not 'development'."""
+    from unittest.mock import MagicMock, patch
+
+    mock_task = MagicMock()
+    mock_task.id = "task-123"
+    mock_db = MagicMock()
+    mock_db.update_task.return_value = mock_task
+
+    with patch("app.agent.tools._import_db", return_value=mock_db):
+        from app.agent.tools import update_task_status
+        result = update_task_status("task-123", "ACTIVE")
+
+    mock_db.update_task.assert_called_once_with("task-123", type="indev")
+    assert "indev" in result
+
+
+def test_update_task_status_maps_to_conceptual_review(tmp_path, monkeypatch):
+    """update_task_status('VERIFYING') must write type='conceptual_review', not 'review'."""
+    from unittest.mock import MagicMock, patch
+
+    mock_task = MagicMock()
+    mock_task.id = "task-456"
+    mock_db = MagicMock()
+    mock_db.update_task.return_value = mock_task
+
+    with patch("app.agent.tools._import_db", return_value=mock_db):
+        from app.agent.tools import update_task_status
+        result = update_task_status("task-456", "VERIFYING")
+
+    mock_db.update_task.assert_called_once_with("task-456", type="conceptual_review")
+    assert "conceptual_review" in result

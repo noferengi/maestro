@@ -4490,9 +4490,9 @@ async def admin_restart():
     Mechanism:
       1. Writes restart.flag to the project root.
       2. Returns the response immediately.
-      3. Calls os._exit(0) 400 ms later — Launcher.ps1 detects the flag and
-         relaunches uvicorn.  The exit is intentionally immediate (no cleanup)
-         because the flag was already written and the launcher handles recovery.
+      3. Signals shutdown and waits up to 55s for active sessions (LLM calls/jobs)
+          to finish naturally.
+      4. Calls os._exit(0) — Launcher.ps1 detects the flag and relaunches uvicorn.
     """
     from app.agent.config import SERVER_ALLOW_REMOTE_RESTART, PROJECT_ROOT
     if not SERVER_ALLOW_REMOTE_RESTART:
@@ -4507,16 +4507,29 @@ async def admin_restart():
     import pathlib
     flag_path = pathlib.Path(PROJECT_ROOT) / "restart.flag"
     flag_path.write_text("restart\n", encoding="utf-8")
-    logger.warning("[admin] restart_server: flag written to %s — exiting in 400 ms.", flag_path)
+    logger.warning("[admin] restart_server: flag written to %s — entering graceful shutdown (max 55s).", flag_path)
 
     async def _exit_soon():
-        await asyncio.sleep(0.4)
+        # Wait a bit to ensure the HTTP response is sent before we block/drain
+        await asyncio.sleep(0.5)
+        
+        from app.agent.llm_client import signal_shutdown
+        from app.agent.scheduler import stop_scheduler
+        
+        logger.info("[admin] Gentle shutdown: waiting up to 55s for active LLM sessions to finish.")
+        signal_shutdown()
+        
+        # Total timeout 55s as requested for "gentle shutdown"
+        # stop_scheduler already handles Phase 1/Phase 2 logging internally.
+        stop_scheduler(wait_for_sessions=True, timeout=55.0)
+        
+        logger.warning("[admin] Gentle shutdown complete — exiting process now.")
         os._exit(0)
 
     asyncio.create_task(_exit_soon())
     return {
         "status": "restarting",
-        "message": "Server will exit momentarily. Launcher.ps1 will restart it in ~3 seconds.",
+        "message": "Restart triggered. Server will drain active sessions (max 55s) and restart shortly.",
     }
 
 

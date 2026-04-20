@@ -44,7 +44,7 @@ Every item below is grounded in the current codebase state as of 2026-03-14. Ite
 ### 2.1 Core Loop (The Wiggum)
 
 - [x] **MaestroLoop Class:** Async Do-While in `app/agent/loop.py`. Drives the LLM→tool-call→result→LLM cycle.
-- [x] **Turn Cap:** `MAX_TURNS=150` in config. Terminates runaway loops.
+- [x] **Turn Cap:** `MAX_TURNS=100` in config. Terminates runaway loops.
 - [x] **Consecutive Error Circuit Breaker:** After 3 consecutive tool errors, emits `REVERT_TO_DESIGN` and halts.
 - [x] **Terminal Signals:** Agent emits `{"signal": "ACCEPTED"}` or `{"signal": "REVERT_TO_DESIGN"}` as structured JSON to end the loop.
 - [x] **Status Registry:** `_ACTIVE_LOOPS` and `_LOOP_STATUS` dicts power the `/api/agent/status/{task_id}` endpoint.

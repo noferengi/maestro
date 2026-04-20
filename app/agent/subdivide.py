@@ -317,6 +317,7 @@ class SubdivisionAgent:
         ]
 
         _ctx_warned: set[float] = set()
+        _turn_warned: set[int] = set()
 
         consecutive_failures = 0
         turns_run = 0
@@ -325,6 +326,21 @@ class SubdivisionAgent:
             turns_run = turn + 1
             if is_shutting_down():
                 raise ShutdownError("Server is shutting down")
+
+            # Context saturation check
+            if check_context_saturation(
+                self._last_prompt_tokens, self.max_context, _ctx_warned, messages
+            ):
+                logger.warning("Subdivision agent context saturation (turn %d) - terminating", turn)
+                break
+
+            # Turn saturation check
+            from app.agent.config import check_turn_saturation
+            if check_turn_saturation(
+                turn, self.max_turns, _turn_warned, messages
+            ):
+                # Turn nudge was injected
+                pass
 
             # Hard budget enforcement
             if self._budget_exceeded:

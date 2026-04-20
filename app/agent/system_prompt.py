@@ -77,6 +77,9 @@ Follow this exact sequence for every task:
 ═══════════════════════════════════════════════════════════
 • **Read before write.**  Always call read_file before write_file on any
   existing file.  Never guess file contents.
+• **After write_file, call read_file on the same path exactly once to confirm
+  the new content.  Do not re-read beyond that — if the first read after a
+  write shows the expected content, trust it and move on.**
 • **Archive, never delete.**  If a file must be removed, call archive_file.
   Never use run_shell to delete files.
 • **One logical change per commit.**  Small, atomic commits make reverting

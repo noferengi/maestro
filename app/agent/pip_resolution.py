@@ -87,6 +87,7 @@ class PIPResolutionAgent:
         self._consecutive_errors: int = 0
         self._no_tool_turns: int = 0
         self._warnings_fired: set[float] = set()
+        self._turn_warnings_fired: set[int] = set()
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -120,6 +121,14 @@ class PIPResolutionAgent:
                 "[pip_resolution] pip %d task '%s' — turn %d/%d",
                 self.pip_id, self.task_id, self._turn, max_turns,
             )
+
+            # Turn saturation check
+            from app.agent.config import check_turn_saturation
+            if check_turn_saturation(
+                self._turn, max_turns, self._turn_warnings_fired, self._messages
+            ):
+                # Turn nudge was injected
+                pass
 
             # LLM call
             try:

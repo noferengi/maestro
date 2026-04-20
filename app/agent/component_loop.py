@@ -13,6 +13,7 @@ A stripped-down MaestroLoop with:
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import os
@@ -172,6 +173,9 @@ class ComponentLoop:
         self._total_prompt = 0
         self._total_completion = 0
         self._tests_passed: bool = False
+        # Repeat-tool-call circuit breaker: tracks last 4 (name, args_json) pairs
+        self._recent_calls: collections.deque[tuple[str, str]] = collections.deque(maxlen=4)
+        self._repeat_notice_count = 0
 
     async def run(self) -> ComponentLoopResult:
         """Run the component implementation loop."""
@@ -194,10 +198,20 @@ class ComponentLoop:
         consecutive_errors = 0
         files_changed: set[str] = set()
         _ctx_warned: set[float] = set()
+        _turn_warned: set[int] = set()
 
         for turn in range(self.max_turns):
             if is_shutting_down():
                 raise ShutdownError("Server is shutting down")
+
+            # Turn saturation check
+            from app.agent.config import check_turn_saturation
+            if check_turn_saturation(
+                turn, self.max_turns, _turn_warned, messages
+            ):
+                # Turn nudge was injected
+                pass
+
             try:
                 response = await call_llm(
                     messages,
@@ -316,6 +330,36 @@ class ComponentLoop:
                         fn_args = tc["function"]["arguments"] if isinstance(tc["function"]["arguments"], dict) else json.loads(tc["function"]["arguments"])
                     except json.JSONDecodeError:
                         fn_args = {}
+
+                    # Repeat-tool-call circuit breaker
+                    call_key = (fn_name, json.dumps(fn_args, sort_keys=True))
+                    self._recent_calls.append(call_key)
+                    repeat_count = sum(1 for c in self._recent_calls if c == call_key)
+                    if repeat_count >= 3:
+                        self._repeat_notice_count += 1
+                        logger.warning(
+                            "[component] '%s' repeat tool call detected: %s called %d times in last 4 calls (notice #%d)",
+                            self.component_name, fn_name, repeat_count, self._repeat_notice_count,
+                        )
+                        if self._repeat_notice_count >= 2:
+                            return ComponentLoopResult(
+                                component_name=self.component_name,
+                                status="REVERT_TO_DESIGN",
+                                turns=turn + 1,
+                                files_changed=sorted(files_changed),
+                                error_detail=f"repeat_tool_call_circuit_breaker: {fn_name} called identically {repeat_count}+ times",
+                                prompt_tokens=self._total_prompt,
+                                completion_tokens=self._total_completion,
+                            )
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"SYSTEM NOTICE: You have called {fn_name}({json.dumps(fn_args)}) "
+                                f"{repeat_count} times with identical arguments. "
+                                "The tool's output will not change on further repeats. Either take a different "
+                                "action, read a different file, or emit a final signal (ACCEPTED / REVERT_TO_DESIGN)."
+                            ),
+                        })
 
                     result = self.dispatcher.dispatch(fn_name, fn_args)
 

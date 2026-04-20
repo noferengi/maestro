@@ -96,6 +96,15 @@ def _is_file_prepped(path: str) -> bool:
     return os.path.normpath(os.path.realpath(path)) in _get_prepped_files()
 
 
+def _invalidate_prepped_cache(path: str) -> None:
+    """Drop any served-range record for path so the next read_file returns fresh content."""
+    try:
+        norm = os.path.normpath(os.path.realpath(path))
+    except OSError:
+        return
+    _get_prepped_files().pop(norm, None)
+
+
 def _record_served_range(norm_path: str, start: int, end: int) -> None:
     """Record that lines start..end (inclusive, 1-indexed) have been delivered."""
     intervals = _get_prepped_files().setdefault(norm_path, [])
@@ -536,6 +545,7 @@ def write_file(path: str, content: str) -> str:
         os.makedirs(os.path.dirname(safe_path), exist_ok=True)
         with open(safe_path, "w", encoding="utf-8") as fh:
             fh.write(content)
+        _invalidate_prepped_cache(safe_path)
         # Stage for git
         _git_run(["git", "add", safe_path])
         return f"OK: wrote {len(content)} chars to '{path}' and staged for git."
@@ -555,6 +565,7 @@ def append_file(path: str, content: str) -> str:
         os.makedirs(os.path.dirname(safe_path), exist_ok=True)
         with open(safe_path, "a", encoding="utf-8") as fh:
             fh.write(content)
+        _invalidate_prepped_cache(safe_path)
         _git_run(["git", "add", safe_path])
         return f"OK: appended {len(content)} chars to '{path}'."
     except OSError as exc:
@@ -1569,8 +1580,8 @@ def update_task_status(task_id: str, new_status: str) -> str:
     """
     STATUS_TO_TYPE = {
         "PENDING": "planning",
-        "ACTIVE": "development",
-        "VERIFYING": "review",
+        "ACTIVE": "indev",
+        "VERIFYING": "conceptual_review",
         "ACCEPTED": "completed",
         "REJECTED": "planning",
     }

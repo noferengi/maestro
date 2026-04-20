@@ -75,7 +75,7 @@ The management dashboard consists of three primary views:
 
 * **Structured Querying:** Use JSON-mode/Schema constraints for agent handoffs.  
 * **Task DAG:** Stored as a JSON or YAML manifest representing the state of the Kanban board.  
-* **FITM (Fill-In-The-Middle):** To be explored for code completion/editing tasks to minimize token usage in large contexts. Context window discipline is currently handled by `MAX_TURNS=150` in `app/agent/config.py`, which terminates runaway loops before they exhaust the context window.
+* **FITM (Fill-In-The-Middle):** To be explored for code completion/editing tasks to minimize token usage in large contexts. Context window discipline is currently handled by `MAX_TURNS=100` in `app/agent/config.py`, which terminates runaway loops before they exhaust the context window.
 
 ## **9. Future Integration**
 

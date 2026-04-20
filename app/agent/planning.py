@@ -359,24 +359,29 @@ class PlanningPipeline:
         tool_schemas = _get_survey_tool_schemas()
         survey_result = ""
         _ctx_warned: set[float] = set()
-        _turn_nudge_threshold = max(3, int(PLANNING_SURVEY_MAX_TURNS * 0.6))
-        _turn_nudge_sent = False
+        _turn_warned: set[int] = set()
 
         for turn in range(PLANNING_SURVEY_MAX_TURNS):
             if is_shutting_down():
                 raise ShutdownError("Server is shutting down")
 
-            # Inject a turn-budget nudge when approaching the limit (once only).
-            if not _turn_nudge_sent and turn >= _turn_nudge_threshold:
-                _turn_nudge_sent = True
-                remaining = PLANNING_SURVEY_MAX_TURNS - turn
-                messages.append({"role": "user", "content": (
-                    f"You have {remaining} tool-call turns remaining. "
-                    "Stop reading files now and immediately emit SURVEY_COMPLETE: "
-                    "followed by a summary of everything you have learned so far."
-                )})
-                logger.info(f"[{AGENT_NAME}] Survey turn-budget nudge injected at turn %d/%d",
-                            turn + 1, PLANNING_SURVEY_MAX_TURNS)
+            # Context saturation check
+            if check_context_saturation(
+                response.get("usage", {}).get("prompt_tokens", 0) if turn > 0 else 0,
+                self.max_context or 0,
+                _ctx_warned,
+                messages,
+            ):
+                logger.warning("Planning survey context saturation (turn %d) - terminating", turn)
+                break
+
+            # Turn saturation check
+            from app.agent.config import check_turn_saturation
+            if check_turn_saturation(
+                turn, PLANNING_SURVEY_MAX_TURNS, _turn_warned, messages
+            ):
+                # Turn nudge was injected
+                pass
 
             response = await call_llm(
                 messages,

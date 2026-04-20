@@ -539,6 +539,7 @@ class ResearchAgent:
         life_prompt_tokens = 0
         life_completion_tokens = 0
         _ctx_warned: set[float] = set()
+        _turn_warned: set[int] = set()
         _last_prompt_tokens = 0  # actual context size from the most recent LLM call
 
         for turn in range(self.max_turns_per_life):
@@ -689,25 +690,23 @@ class ResearchAgent:
                 )
                 break  # falls through to _post_mortem_call()
 
+            # Turn saturation check
+            from app.agent.config import check_turn_saturation
+            if check_turn_saturation(
+                turns_used, self.max_turns_per_life, _turn_warned, messages
+            ):
+                # Turn nudge was injected
+                pass
+
             # No tool calls and no verdict - nudge
             if not tool_calls and not vote:
-                remaining = self.max_turns_per_life - turns_used
-                if remaining <= 3:
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            f"[SYSTEM] You have {remaining} turns remaining. "
-                            "You MUST render your JSON verdict now based on what you've found so far."
-                        ),
-                    })
-                else:
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "[SYSTEM] You did not call any tool and did not render a verdict. "
-                            "Either call a tool to investigate further, or output your JSON verdict."
-                        ),
-                    })
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "[SYSTEM] You did not call any tool and did not render a verdict. "
+                        "Either call a tool to investigate further, or output your JSON verdict."
+                    ),
+                })
 
         # Turn cap hit without verdict - fire a post-mortem call to capture a structured
         # handoff summary for the next life.  Tokens are tracked inside the method.
@@ -1092,6 +1091,7 @@ class InvestigationAgent:
         life_prompt_tokens = 0
         life_completion_tokens = 0
         _ctx_warned: set[float] = set()
+        _turn_warned: set[int] = set()
         _last_prompt_tokens = 0  # actual context size from the most recent LLM call
         findings_text = ""
 
@@ -1190,26 +1190,26 @@ class InvestigationAgent:
                 logger.warning("Investigation agent context saturation (life %d, turn %d)", life_num, turns_used)
                 break
 
+            # Turn saturation check
+            from app.agent.config import check_turn_saturation
+            if check_turn_saturation(
+                turns_used, self.max_turns_per_life, _turn_warned, messages
+            ):
+                # Turn nudge was injected
+                pass
+
             # Nudge
-            remaining = self.max_turns_per_life - turns_used
-            if remaining <= 3:
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        f"[SYSTEM] You have {remaining} turns remaining. "
-                        "You MUST output your JSON report now."
-                    ),
-                })
-            elif content:
-                findings_text = content
-            else:
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "[SYSTEM] You did not call any tool and did not produce a report. "
-                        "Either call a tool to investigate further, or output your JSON report."
-                    ),
-                })
+            if not tool_calls and not report:
+                if content:
+                    findings_text = content
+                else:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "[SYSTEM] You did not call any tool and did not produce a report. "
+                            "Either call a tool to investigate further, or output your JSON report."
+                        ),
+                    })
 
         return None, turns_used, life_prompt_tokens, life_completion_tokens, findings_text
 
@@ -1286,13 +1286,22 @@ class WebSearchAgent:
         # Allowed tools: only web_fetch
         fetch_schema = [s for s in TOOL_SCHEMAS if s["function"]["name"] == "web_fetch"]
 
-        max_turns = 10
+        max_turns = 100
         total_prompt_tokens = 0
         total_completion_tokens = 0
+        _turn_warned: set[int] = set()
 
         for turn in range(max_turns):
             if is_shutting_down():
                 raise ShutdownError("Server is shutting down")
+
+            # Turn saturation check
+            from app.agent.config import check_turn_saturation
+            if check_turn_saturation(
+                turn, max_turns, _turn_warned, messages
+            ):
+                # Turn nudge was injected
+                pass
 
             response = await call_llm(
                 messages,

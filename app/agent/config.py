@@ -161,7 +161,7 @@ SIGNAL_CONTEXT_TOO_LARGE: str = "CONTEXT_TOO_LARGE"
 # ===========================================================================
 
 RESEARCH_AGENT_MAX_LIVES: int = _getint("intake", "research_agent_max_lives", "MAESTRO_RESEARCH_LIVES", 3)
-RESEARCH_AGENT_MAX_TURNS_PER_LIFE: int = _getint("intake", "research_agent_max_turns", None, 20)
+RESEARCH_AGENT_MAX_TURNS_PER_LIFE: int = _getint("intake", "research_agent_max_turns", None, 100)
 RESEARCH_CONTEXT_BUDGET_RATIO: float = _getfloat("intake", "context_budget_ratio", None, 0.60)
 TIEBREAKER_ENABLED: bool = _getbool("intake", "tiebreaker_enabled", None, True)
 
@@ -176,7 +176,7 @@ RESEARCH_AGENT_TOOLS: list[str] = _getlist("intake", "research_agent_tools",
 # Subdivision settings
 # ===========================================================================
 
-SUBDIVISION_AGENT_MAX_TURNS: int = _getint("subdivision", "max_turns", None, 50)
+SUBDIVISION_AGENT_MAX_TURNS: int = _getint("subdivision", "max_turns", None, 100)
 SUBDIVISION_MAX_DEPTH: int = _getint("subdivision", "max_depth", None, 6)
 SUBDIVISION_MAX_RETRIES: int = _getint("subdivision", "max_retries_per_level", None, 4)
 SUBDIVISION_MAX_TOTAL_SUB_IDEAS: int = _getint("subdivision", "max_total_sub_ideas", None, 30)
@@ -318,7 +318,7 @@ PLANNING_MAX_STEPS: int = _getint("planning", "max_steps", None, 6)
 PLANNING_MAX_CONSECUTIVE_FAILURES: int = _getint("planning", "max_consecutive_failures", None, 3)
 PLANNING_JUDGE_MAX_TOKENS: int = _getint("planning", "judge_max_tokens", None, 8192)
 PLANNING_MAX_DESIGN_RETRIES: int = _getint("planning", "max_design_retries", None, 3)
-PLANNING_SURVEY_MAX_TURNS: int = _getint("planning", "survey_max_turns", None, 50)
+PLANNING_SURVEY_MAX_TURNS: int = _getint("planning", "survey_max_turns", None, 100)
 
 PLANNING_GATE_FEASIBILITY_RECHECK: bool = _getbool("planning_gate", "feasibility_recheck_enabled", None, True)
 PLANNING_GATE_CONTEXT_SAFETY_MARGIN: float = _getfloat("planning_gate", "context_safety_margin", None, 0.15)
@@ -327,7 +327,7 @@ PLANNING_GATE_CONTEXT_SAFETY_MARGIN: float = _getfloat("planning_gate", "context
 # In-development (component loops)
 # ===========================================================================
 
-INDEV_COMPONENT_MAX_TURNS: int = _getint("indev", "component_max_turns", None, 50)
+INDEV_COMPONENT_MAX_TURNS: int = _getint("indev", "component_max_turns", None, 100)
 INDEV_COMPONENT_MAX_RETRIES: int = _getint("indev", "component_max_retries", None, 2)
 INDEV_ENFORCE_FILE_CONTAINMENT: bool = _getbool("indev", "enforce_file_containment", None, True)
 
@@ -345,7 +345,7 @@ INDEV_AGENT_TOOLS: list[str] = _getlist("indev", "agent_tools",
 # Conceptual review
 # ===========================================================================
 
-CONCEPTUAL_REVIEW_MAX_TURNS: int = _getint("conceptual_review", "reviewer_max_turns", None, 15)
+CONCEPTUAL_REVIEW_MAX_TURNS: int = _getint("conceptual_review", "reviewer_max_turns", None, 100)
 CONCEPTUAL_REVIEW_HIGH_SEVERITY_BLOCKS: bool = _getbool("conceptual_review", "high_severity_blocks_advance", None, True)
 CONCEPTUAL_REVIEW_RESEARCH_LIVES: int = _getint("conceptual_review", "research_agent_max_lives", None, 3)
 
@@ -363,7 +363,7 @@ OPTIMIZATION_JUDGE_COUNT: int = _getint("optimization", "judge_count", None, 3)
 OPTIMIZATION_IMPL_MAX_TURNS: int = _getint("optimization", "implementation_max_turns", None, 100)
 OPTIMIZATION_MIN_IMPROVEMENT_PCT: float = _getfloat("optimization", "min_improvement_pct", None, 2.0)
 OPTIMIZATION_MAX_REGRESSION_PCT: float = _getfloat("optimization", "max_regression_pct", None, 5.0)
-OPTIMIZATION_MAX_REVIEWER_TURNS: int = _getint("optimization", "reviewer_max_turns", None, 50)
+OPTIMIZATION_MAX_REVIEWER_TURNS: int = _getint("optimization", "reviewer_max_turns", None, 100)
 
 OPTIMIZATION_REVIEWER_TOOLS: list[str] = _getlist("optimization", "reviewer_tools",
     "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "
@@ -389,7 +389,7 @@ OPTIMIZATION_BIG_O_BONUS_PCT: float = _getfloat("optimization_weights", "big_o_b
 
 SECURITY_REVIEW_VETO_POWER: bool = _getbool("security_review", "veto_power", None, True)
 SECURITY_REVIEW_RESEARCH_LIVES: int = _getint("security_review", "research_agent_max_lives", None, 2)
-SECURITY_REVIEW_MAX_REVIEWER_TURNS: int = _getint("security_review", "reviewer_max_turns", None, 50)
+SECURITY_REVIEW_MAX_REVIEWER_TURNS: int = _getint("security_review", "reviewer_max_turns", None, 100)
 
 SECURITY_REVIEWER_TOOLS: list[str] = _getlist("security_review", "reviewer_tools",
     "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "
@@ -403,7 +403,7 @@ SECURITY_REVIEWER_TOOLS: list[str] = _getlist("security_review", "reviewer_tools
 FULL_REVIEW_AUTO_UX: bool = _getbool("full_review", "auto_ux_review", None, True)
 FULL_REVIEW_FRONTEND_PATTERNS: list[str] = _getlist("full_review", "frontend_patterns", "app/web/*.html, app/web/*.js, app/web/*.css")
 FULL_REVIEW_RESEARCH_LIVES: int = _getint("full_review", "research_agent_max_lives", None, 2)
-FULL_REVIEW_MAX_REVIEWER_TURNS: int = _getint("full_review", "reviewer_max_turns", None, 50)
+FULL_REVIEW_MAX_REVIEWER_TURNS: int = _getint("full_review", "reviewer_max_turns", None, 100)
 
 FULL_REVIEW_CODE_QUALITY_TOOLS: list[str] = _getlist("full_review", "code_quality_reviewer_tools",
     "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "
@@ -470,7 +470,7 @@ SURVEY_SUMMARY_MAX_TOKENS: int = _getint("survey", "summary_max_tokens", None, 8
 SURVEY_STALENESS_ENABLED: bool = _getbool("survey", "staleness_enabled", None, True)
 SURVEY_STALENESS_CHECK_RATIO: float = _getfloat("survey", "staleness_check_ratio", None, 0.05)
 SURVEY_MAX_CONCURRENT_JOBS: int = _getint("survey", "max_concurrent_scope_jobs", None, 3)
-SURVEY_DIRECTORY_MAX_FILES: int = _getint("survey", "directory_max_files", None, 50)
+SURVEY_DIRECTORY_MAX_FILES: int = _getint("survey", "directory_max_files", None, 100)
 SURVEY_MODULE_TARGET_FILES: int = _getint("survey", "module_target_files", None, 30)
 
 TOOL_LISTING_EXCLUDED_DIRS: set[str] = set(_getlist(
@@ -507,13 +507,13 @@ FILE_SUMMARY_STREAM_IDLE_TIMEOUT: float = _getfloat("scheduler", "file_summary_s
 # PIP (Performance Improvement Plan) settings
 # ===========================================================================
 
-PIP_RESOLUTION_MAX_TURNS: int = _getint("pip", "resolution_max_turns", None, 20)
+PIP_RESOLUTION_MAX_TURNS: int = _getint("pip", "resolution_max_turns", None, 100)
 
 # ===========================================================================
 # Planning Correction Agent settings
 # ===========================================================================
 
-CORRECTION_MAX_TURNS: int = _getint("correction", "max_turns", None, 15)
+CORRECTION_MAX_TURNS: int = _getint("correction", "max_turns", None, 100)
 CORRECTION_SKIP_AFTER_FAILURES: int = _getint("correction", "correction_skip_after_failures", None, 2)
 
 # ===========================================================================
