@@ -11,7 +11,7 @@ Project Maestro — a Kanban board with an agentic LLM orchestration backend. Th
 A `maestro` MCP server is registered in `.mcp.json` and enabled via `.claude/settings.local.json`.
 **Prefer MCP tools over raw SQL queries or Bash scripts for all diagnostic and admin tasks.**
 
-Run `/mcp` to confirm the server is connected (should show `maestro  connected  22 tools`).
+Run `/mcp` to confirm the server is connected (should show `maestro  connected` with tool list).
 If disconnected, restart Claude Code.
 
 ### Default monitoring behavior
@@ -57,6 +57,7 @@ five pattern flags: `rapid_cycling`, `token_limited`, `zombie_sessions`, `stage_
 | Trigger planning pipeline manually | `trigger_planning_run(task_id)` |
 | Trigger review / security / full_review | `run_pipeline_stage(task_id, stage)` |
 | Stop a running MaestroLoop | `stop_agent(task_id)` |
+| Restart the Maestro server | `restart_server()` — drains sessions, waits ~60 s |
 | Anything not covered above | `run_inspect_cards(section, extra_args)` |
 
 ### Key signal from `diagnose_task`
@@ -99,6 +100,16 @@ venv/Scripts/python.exe -m pytest app/tests/ -q
 ```bash
 venv/Scripts/python.exe -m uvicorn app.main:app --port 8000
 ```
+
+**To restart a running server** — use the MCP tool, not a shell command:
+
+```
+mcp__maestro__restart_server()
+```
+
+Wait ~60 seconds after triggering. The server drains active sessions before exiting; the
+`Launcher.ps1` process detects `restart.flag` and relaunches uvicorn automatically.
+Do **not** use `pkill` or `Bash` to kill the process — that bypasses session drain.
 
 Board is at `http://localhost:8000/`. LLM endpoints are configurable per-task via the UI (managed in the `llms` table). Default expects `llama.cpp` on `http://localhost:8008/v1` (OpenAI-compatible).
 
@@ -235,7 +246,7 @@ The most common gate failure. The check computes `all_consumes - all_provides` a
 - `llm_client.py` — Centralized HTTP client for all LLM calls. Requires both `llm_id` and `budget_id`. Logs every call to `budget_entries` + `expenses`. `ContextTooLargeError` (carries `estimated_tokens`, `max_context`) is raised as a pre-flight check before any HTTP call — estimation is `total_chars // 3` (conservative over-estimate), checked against `context_window - max_tokens`; callers must treat this as a clean abort, not an infrastructure error. `_get_llm_max_context(llm_id)` is a module-level cache of context window sizes. All message content is NFKD-normalized and stripped to ASCII before sending (prevents llama.cpp chat-template parse errors on Unicode/control chars). **Hardened backoff**: `_EndpointState` now tracks `fail_count_connect` (server down: ConnectError/ConnectTimeout, cap 15 min) and `fail_count_response` (server overloaded/bad prompt: ReadTimeout/5xx/parse errors, cap 1 min) separately — overload events back off slowly; connection failures back off aggressively. `invalidate_llm_cache(llm_id)` + `update_llm_context_cache(llm_id, max_context)` allow `main.py` to evict stale context/capacity state after LLM record updates.
 - `verdicts.py` — Verdict classification with confidence ranges. `Vote` and `TallyResult` dataclasses. `tally_votes()` aggregation logic.
 - `static_analysis.py` — Tree-sitter based deterministic Python code analysis for intake stage 2a.
-- `tools.py` — Agent tools with OpenAI JSON schemas + `dispatch_tool()`. **Path policy**: `_assert_safe_path()` (reads) allows navigation anywhere on the PC but blocks `.git` internals and `.archive`. `_assert_safe_write_path()` (writes) additionally enforces that the path must be inside `effective_root` (the project root) and must not traverse `venv`, `__pycache__`, `node_modules`, etc. Relative paths are always resolved against `effective_root`, not the process CWD. **gitignore policy**: gitignore filtering applies to automatic operations only (prewarm, `walk_safe`, arch-gen, snapshot) — it does NOT block manual tool reads. An agent can call `read_file("app.log")` even if `*.log` is in `.gitignore`; the agent just can't write to gitignored paths. `list_directory` shows ALL entries (never hides them), annotating with: `[PROTECTED - git internals; use git tools, no direct writes]`, `[AUTO-EXCLUDED - skipped by agent tools and summarization]` (venv/build dirs), or `[GITIGNORED - excluded from auto-summarization; read_file/search_files access is allowed]`. All tool results pass through `_cap_tool_result()` which hard-truncates at 200 KiB with a notice.
+- `tools.py` — Agent tools with OpenAI JSON schemas + `dispatch_tool()`. Named shell tools (`run_pytest`, `run_mypy`, `run_ruff`, `git_restore`, `git_add`, `git_unstage`, etc.) replace the old grouped `run_shell_indev/build/deps/security/review` tools — each tool does exactly one operation. **Path policy**: `_assert_safe_path()` (reads) allows navigation anywhere on the PC but blocks `.git` internals and `.archive`. `_assert_safe_write_path()` (writes) additionally enforces that the path must be inside `effective_root` (the project root) and must not traverse `venv`, `__pycache__`, `node_modules`, etc. Relative paths are always resolved against `effective_root`, not the process CWD. **gitignore policy**: gitignore filtering applies to automatic operations only (prewarm, `walk_safe`, arch-gen, snapshot) — it does NOT block manual tool reads. An agent can call `read_file("app.log")` even if `*.log` is in `.gitignore`; the agent just can't write to gitignored paths. `list_directory` shows ALL entries (never hides them), annotating with: `[PROTECTED - git internals; use git tools, no direct writes]`, `[AUTO-EXCLUDED - skipped by agent tools and summarization]` (venv/build dirs), or `[GITIGNORED - excluded from auto-summarization; read_file/search_files access is allowed]`. All tool results pass through `_cap_tool_result()` which hard-truncates at 200 KiB with a notice.
 - `project_snapshot.py` — `build_project_snapshot(project_root)` and `build_snapshot_with_summaries(project_root)` **require an explicit `project_root`** — no default fallback to TheMaestro's own directory. **`build_project_snapshot` respects `.gitignore`**: at each directory level, candidate paths are filtered via `app.agent.path_filter.filter_paths` (consolidates built-in exclusions, hidden files, and .gitignore via `git check-ignore`). `build_file_summary` / `async_build_file_summary` also skip binary files. `async_build_file_summary()` uses enqueue+wait pattern. Session cache uses `("llm", path, mtime, size)` prefix. `build_architecture_context(project_name, agent_type=None)` fetches `type='architecture'` tasks and formats them as a structured constraint block; `ARCH_CATEGORY_RELEVANCE` maps agent type → relevant category set (None = all).
 - `path_filter.py` — Central authority for path exclusions. `is_ignored(path, root)` and `filter_paths(paths, root)` combine `TOOL_LISTING_EXCLUDED_DIRS` (venv, node_modules, etc), hidden-file rules, and batch `.gitignore` checks. `walk_safe(root)` provides an `os.walk` replacement that prunes ignored directories in-place for efficiency.
 - `survey_orchestrator.py` — Hierarchical project summarization engine. Generates scope summaries bottom-up: Files → Directories → Modules → Project, fitting within LLM context windows by summarizing child summaries. Driven by `ScopeSurveyJob` records in the scheduler.
@@ -250,6 +261,25 @@ The most common gate failure. The check computes `all_consumes - all_provides` a
 ### Project isolation
 
 Each project record has: `name` (PK), `path` (absolute filesystem root), `description`, `llm_id` (default LLM for maintenance), `budget_id` (default budget for maintenance).
+
+#### Why isolation matters
+
+Multiple agent sessions can be dispatched simultaneously — one per task, each running in its own thread. Without isolation, they would share a single git working tree. Agent A calling `git checkout maestro/task-A` would silently switch HEAD for agent B, causing B to read wrong files, write to the wrong branch, or commit changes into A's history. Worse, an agent working on a user project that happens to be hosted inside `D:/workspace/TheMaestro/` could write to — or delete — Maestro's own source files while the server is running.
+
+Isolation is enforced at three levels:
+
+1. **Git worktree isolation** — each dispatched task gets its own independent checkout via `git worktree add`. The checkout lives at `{project_path}/.maestro-worktrees/{task_id}/` and has its own HEAD, index, and working files backed by the shared `.git` object store. Agent writes on one task's branch never touch another task's files.
+
+2. **Filesystem write isolation** — `_assert_safe_write_path()` in `tools.py` enforces that every write, move, or delete targets a path *inside* `effective_root` (the task's project root / worktree). Paths traversing into `venv/`, `__pycache__/`, `node_modules/`, or any other excluded directory are rejected before the operation executes.
+
+3. **Self-protection** — Maestro's own source tree (`D:/workspace/TheMaestro/`) must never be a target project. An agent running against a task whose project path is Maestro itself could corrupt the running server. The rule is: **never configure Maestro's own directory as a project path**. Additionally, `_assert_safe_path()` (reads) blocks `.git` internals, and the `git_checkout` tool blocks any branch that does not start with `maestro/*`, `main`, or `master`.
+
+#### Worktree lifecycle (`app/agent/worktree.py`)
+
+- `setup_task_worktree(task_id, project_path)` — called at the top of `_run_task()` in `scheduler.py`. Creates `{project_path}/.maestro-worktrees/{task_id}/` and a `maestro/task-{task_id}` branch. If the branch already exists (re-dispatched task after restart), calls `git worktree add` without `-b`. Returns `None` for non-git projects; `_run_task` silently falls back to bare `project_path`.
+- `teardown_task_worktree(task_id, project_path)` — called in the `finally` block of `_run_task()` so cleanup always runs, even on exception or shutdown. Calls `git worktree remove --force` then `git worktree prune`.
+- `prune_orphaned_worktrees(project_paths)` — called once in `start_scheduler()` at server startup. Walks `git worktree list --porcelain` for every project and removes any entries whose path falls under `.maestro-worktrees/`, clearing state left by a previous crashed process.
+- `.maestro-worktrees/` is automatically appended to the project's `.gitignore` on first use; the lock `_gitignore_lock` prevents concurrent threads double-writing the entry.
 
 - **Agent isolation** — `IntakePipeline`, `ResearchAgent`, `SubdivisionAgent`, and `MaestroLoop` all receive `project_root` derived from `get_project_path(task.project)`. Snapshot injection is scoped to the task's project, never Maestro's own source tree.
 - **Architecture context injection** — `build_architecture_context(project_name, agent_type)` is called in `loop.py` (`_build_messages`), `research.py` (`_build_life_context` life 1), `subdivide.py` (`_build_context`), and `file_summary_agent.py` (`execute_file_summary`). Each agent type receives only the card categories relevant to its work, as defined by `ARCH_CATEGORY_RELEVANCE` in `project_snapshot.py`. Categories with `None` (research, loop, full_review) receive all cards; categories with a set receive only matching cards.
@@ -349,5 +379,5 @@ GET    /api/tasks/{id}/pips               — full PIP list with verification hi
 
 - **Never hard-delete.** Use `archive_file()` which moves to `.archive/YYYY-MM-DD_HH-MM-SS/`. No `rm`, `del`, `shutil.rmtree`.
 - **Agent git work happens on `maestro/task-{id}` branches only.** `git_checkout` blocks anything that isn't `maestro/*`, `main`, or `master`.
-- **`run_shell()` has a blocklist** — `rm -rf`, `del /s`, fork bombs, deep `../` traversal, etc. are all blocked at the tool level.
+- **Named shell tools replace grouped `run_shell_*` tools.** Each tool does exactly one operation with no hidden allowlist for agents to guess. Key tools: `run_pytest`, `run_mypy`, `run_ruff`, `run_black_check`, `run_unittest`, `run_npm_test`, `run_cargo_test`, `run_go_test` (testing); `run_make`, `run_cargo_build`, `run_go_build`, `run_npm_build`, `run_tsc` (build); `run_pip_install`, `run_npm_install`, `run_cargo_fetch` (deps); `run_bandit`, `run_pip_audit`, `run_semgrep`, `run_npm_audit` (security); `git_restore`, `git_add`, `git_unstage` (git helpers). Per-stage access is still controlled by `build_tool_schemas(allowed_names)` in `config.py`.
 - After 3 consecutive tool failures, `MaestroLoop` emits `{"signal": "REVERT_TO_DESIGN"}` and halts.
