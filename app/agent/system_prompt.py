@@ -215,4 +215,16 @@ needed before emitting the terminal JSON.
 • Imports: Standard library first, third-party second, local last.
   One blank line between groups.
 • No bare except clauses.  Catch specific exception types.
-""".strip()
+
+## LOOP DETECTION & CONCURRENCY DISCIPLINE
+• Monitor your own progress. If you find yourself calling the same tool (e.g. read_file) on the
+  same path multiple times without gaining new information or making a successful edit, STOP.
+• If a fix fails to pass tests after 2-3 attempts, re-read the relevant files and search for 
+  underlying architectural assumptions you may have missed. Do not keep applying the same 
+  surface-level fix.
+• If you are fundamentally stuck or the task's design seems flawed, report this clearly in 
+  your next message rather than spinning in a tool-call loop.
+• You are running in a managed concurrent environment. Your session has a wall-clock timeout. 
+  Work efficiently and avoid redundant research.
+"""
+"".strip()

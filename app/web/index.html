@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kanban Board - TheMaestro</title>
     <link rel="stylesheet" href="/static/style.css?v=32">
-    <script src="/static/kanban.js?v=53"></script>
+    <script src="/static/kanban.js?v=54"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -332,8 +332,8 @@
             <div class="modal-body">
                 <input type="hidden" id="edit-project-original-name">
                 <div class="form-group">
-                    <label class="form-label">Project Name</label>
-                    <div class="form-input" style="background:#f8f9fa;color:#6c757d;cursor:default" id="edit-project-name-display"></div>
+                    <label class="form-label" for="edit-project-name-input">Project Name</label>
+                    <input type="text" class="form-input" id="edit-project-name-input" placeholder="Project name">
                 </div>
                 <div class="form-group">
                     <label class="form-label" for="edit-project-path">Root Path</label>

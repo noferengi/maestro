@@ -305,6 +305,7 @@ class ComponentResult(Base):
     component_name = Column(String, nullable=False)
     step_order = Column(Integer, nullable=False)
     batch_number = Column(Integer, nullable=False)
+    dev_run_number = Column(Integer, nullable=False, default=0)
     status = Column(String, nullable=False, default='pending')
     files_changed = Column(Text, nullable=True)
     tests_passed = Column(Integer, default=0)

@@ -2477,7 +2477,8 @@ body {
     line-height: 1.4;
 }
 .card-job-indicator.ji-running,
-.card-job-indicator.ji-queued {
+.card-job-indicator.ji-queued,
+.card-job-indicator.ji-stopped {
     display: flex;
 }
 .card-job-indicator.ji-running {
@@ -2489,6 +2490,15 @@ body {
     background: rgba(245,158,11,0.10);
     color: #fcd34d;
     border: 1px solid rgba(245,158,11,0.18);
+}
+.card-job-indicator.ji-stopped {
+    background: rgba(239,68,68,0.12);
+    color: #fca5a5;
+    border: 1px solid rgba(239,68,68,0.25);
+}
+.card-job-indicator.ji-stopped .ji-dot {
+    animation: none;
+    opacity: 0.85;
 }
 .ji-dot {
     width: 5px;

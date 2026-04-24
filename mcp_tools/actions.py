@@ -164,8 +164,9 @@ def restart_server() -> str:
     Mechanism: the server writes restart.flag and calls os._exit(0).
     Launcher.ps1 detects the flag, removes it, waits 3 s, and relaunches uvicorn.
 
-    After calling this tool wait ~5 seconds before making further API calls —
-    the server will be unavailable while restarting.
+    After calling this tool wait ~60 seconds before making further API calls —
+    the server drains active sessions before restarting and will be unavailable
+    for up to a minute.
     """
     import urllib.request, urllib.error
     url = "http://localhost:8000/api/admin/restart"
@@ -173,7 +174,7 @@ def restart_server() -> str:
         req = urllib.request.Request(url, method="POST", data=b"")
         with urllib.request.urlopen(req, timeout=5) as resp:
             body = resp.read().decode()
-            return f"OK: restart triggered. Server will be back in ~5 s. Response: {body[:300]}"
+            return f"OK: restart triggered. Server will be back in ~60 s (drains sessions first). Response: {body[:300]}"
     except urllib.error.HTTPError as e:
         body = e.read().decode()[:300]
         return f"ERROR {e.code}: {body}"

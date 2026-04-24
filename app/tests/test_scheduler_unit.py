@@ -276,6 +276,42 @@ class TestCleanupFinished:
             _active_sessions.pop("alive-m", None)
 
 
+class TestCheckPlanningTimeouts:
+    def test_check_planning_timeouts_kills_session(self):
+        from app.agent.scheduler import (
+            _check_planning_timeouts, _active_sessions, _session_types,
+            _session_started_at, _session_ids, _PLANNING_SESSION_TIMEOUT_SECS,
+            _session_llm_ids, _llm_session_counts
+        )
+        import time
+        
+        mock_thread = MagicMock(spec=threading.Thread)
+        mock_thread.is_alive.return_value = True
+        task_id = "timeout-task"
+        session_id = "llm-session-123"
+        
+        # Patch the function in llm_client since it's imported locally in _check_planning_timeouts
+        with patch("app.agent.llm_client.kill_session") as mock_kill:
+            with _active_sessions_lock:
+                _active_sessions[task_id] = mock_thread
+                _session_types[task_id] = "planning"
+                _session_started_at[task_id] = time.time() - (_PLANNING_SESSION_TIMEOUT_SECS + 10)
+                _session_ids[task_id] = session_id
+                _session_llm_ids[task_id] = 46
+            
+            with _llm_counts_lock:
+                _llm_session_counts[46] = 1
+                
+            _check_planning_timeouts()
+            
+            mock_kill.assert_called_once_with(session_id)
+            with _active_sessions_lock:
+                assert task_id not in _active_sessions
+                assert task_id not in _session_ids
+            with _llm_counts_lock:
+                assert _llm_session_counts[46] == 0
+
+
 # ===========================================================================
 # _run_task - LLM slot lifecycle
 # ===========================================================================

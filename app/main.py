@@ -34,7 +34,7 @@ from database import (
     init_db, get_db, create_task, get_task, get_tasks_by_type,
     update_task, delete_task, get_all_tasks, get_task_history, append_task_history, reorder_tasks, seed_sample_tasks,
     get_tasks_by_project,
-    Project, get_all_projects, get_project, upsert_project, delete_project,
+    Project, get_all_projects, get_project, upsert_project, rename_project, delete_project,
     Task, LLM, Budget, BudgetEntry, SubdivisionRecord, SessionLocal,
     get_all_llms, get_llm, create_llm, update_llm, delete_llm,
     get_all_budgets, get_budget, create_budget, update_budget, delete_budget,
@@ -244,10 +244,12 @@ def batch_update_map_positions_endpoint(updates: list = Body(...)):
 @app.delete("/api/tasks/{task_id}", response_model=dict)
 def delete_task_endpoint(task_id: str):
     """Soft-delete a task and all its descendants (sets is_active=False)."""
-    count = delete_task(task_id)
-    if not count:
+    deactivated_ids = delete_task(task_id)
+    if not deactivated_ids:
         raise HTTPException(status_code=404, detail="Task not found")
-    return {"deactivated": count}
+    from app.agent.scheduler import cancel_task_sessions
+    cancel_task_sessions(deactivated_ids)
+    return {"deactivated": len(deactivated_ids)}
 
 
 @app.get("/api/tasks/{task_id}/history", response_model=dict)
@@ -512,7 +514,11 @@ def _handle_subdivision_outcome(task, result, llm_base_url, llm_model, max_conte
     )
 
     if not sub_result.sub_ideas or sub_result.confidence < 50:
-        logger.warning("[intake] Subdivision agent returned low confidence (%d) or no sub-ideas. Reverting to idea.", sub_result.confidence)
+        logger.warning(
+            "[subdivide] Subdivision for task '%s' failed to produce confident children "
+            "(sub_ideas=%d, confidence=%d). Reverting to IDEA.",
+            task.id, len(sub_result.sub_ideas), sub_result.confidence
+        )
         update_task(task.id, type="idea")
         return
 
@@ -2991,7 +2997,20 @@ def create_project(data: dict):
 
 @app.put("/api/projects/{project_name}", response_model=dict)
 def update_project(project_name: str, data: dict):
-    """Update a project's path, description, default LLM, and/or default budget."""
+    """Update a project's name, path, description, default LLM, and/or default budget."""
+    new_name = (data.get("name") or "").strip() or None
+
+    # Rename first if a different name was requested
+    effective_name = project_name
+    if new_name and new_name != project_name:
+        try:
+            renamed = rename_project(project_name, new_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        if not renamed:
+            raise HTTPException(status_code=404, detail="Project not found.")
+        effective_name = new_name
+
     raw_path = data.get("path")           # None means "don't change"
     create_if_missing = bool(data.get("create_if_missing", False))
     path = _validate_and_prepare_path(raw_path, create_if_missing) if raw_path is not None else raw_path
@@ -3002,7 +3021,7 @@ def update_project(project_name: str, data: dict):
     budget_id = data.get("budget_id", ...)  # Ellipsis = don't change; None = clear
     if budget_id is not ... and budget_id is not None:
         budget_id = int(budget_id)
-    project = upsert_project(project_name, path=path, description=description, llm_id=llm_id, budget_id=budget_id)
+    project = upsert_project(effective_name, path=path, description=description, llm_id=llm_id, budget_id=budget_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or update failed.")
     if project.path:
@@ -3633,6 +3652,67 @@ def read_budget_summary(budget_id: int):
 
 
 # ============================================
+# Stats API Endpoints
+# ============================================
+
+@app.get("/api/stats/throughput", response_model=dict)
+def get_stats_throughput(bucket_minutes: int = 5, hours: int = 24):
+    """Time-bucketed token throughput + grand totals across all projects.
+
+    Returns PP (prompt) and TG (generation) tokens per bucket, suitable for
+    a time-series chart. Also returns all-time grand totals.
+    """
+    from sqlalchemy import text
+    from datetime import datetime, timedelta
+    db = SessionLocal()
+    try:
+        bucket_secs = bucket_minutes * 60
+        cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+
+        buckets = db.execute(text("""
+            SELECT
+                datetime(
+                    CAST(strftime('%s', created_at) / :bsecs AS INTEGER) * :bsecs,
+                    'unixepoch'
+                ) AS bucket,
+                COALESCE(SUM(prompt_cost), 0)     AS pp,
+                COALESCE(SUM(generation_cost), 0) AS tg,
+                COUNT(*)                           AS calls
+            FROM budget_entries
+            WHERE created_at >= :cutoff
+            GROUP BY bucket
+            ORDER BY bucket
+        """), {"bsecs": bucket_secs, "cutoff": cutoff}).fetchall()
+
+        totals = db.execute(text("""
+            SELECT
+                COALESCE(SUM(prompt_cost), 0)     AS total_pp,
+                COALESCE(SUM(generation_cost), 0) AS total_tg,
+                COUNT(*)                           AS total_calls,
+                COUNT(DISTINCT task_id)            AS total_tasks
+            FROM budget_entries
+        """)).fetchone()
+
+        return {
+            "bucket_minutes": bucket_minutes,
+            "hours": hours,
+            "buckets": [
+                {"t": str(r[0]) + "Z", "pp": r[1], "tg": r[2], "calls": r[3]}
+                for r in buckets
+            ],
+            "totals": {
+                "pp_tokens":   totals[0],
+                "tg_tokens":   totals[1],
+                "total_tokens": totals[0] + totals[1],
+                "calls":       totals[2],
+                "tasks":       totals[3],
+            },
+        }
+    finally:
+        db.close()
+
+
+# ============================================
 # Diagnostics API Endpoints
 # ============================================
 
@@ -3712,6 +3792,11 @@ def list_diagnostic_tasks():
 @app.get("/diagnostics")
 def read_diagnostics():
     return FileResponse("app/web/diagnostics.html")
+
+
+@app.get("/stats")
+def read_stats():
+    return FileResponse("app/web/stats.html")
 
 
 @app.get("/story")
@@ -4268,6 +4353,9 @@ def run_planning_on_demand(task_id: str):
         raise HTTPException(status_code=404, detail="Task not found")
     if not task.llm_id or not task.budget_id:
         raise HTTPException(status_code=400, detail="Task needs an LLM endpoint and budget assigned.")
+    # Clear stopped state so the scheduler (and status API) no longer shows this as stopped.
+    from app.agent.scheduler import clear_planning_stopped
+    clear_planning_stopped(task_id)
     _start_bg(_run_planning_pipeline_bg, task_id)
     return {"task_id": task_id, "status": "STARTED", "pipeline": "planning"}
 

@@ -272,10 +272,40 @@ class MaestroLoop:
                         "Agent signalled CONTEXT_TOO_LARGE — task scope exceeds context budget."
                     )
 
-            # ── Dispatch tool calls ────────────────────────────────────
             if tool_calls:
                 tool_result_messages = await self._handle_tool_calls(tool_calls)
                 self._messages.extend(tool_result_messages)
+                
+                # Check for timeouts in tool results
+                has_timeout = any(
+                    "ERROR: Command timed out" in msg.get("content", "")
+                    for msg in tool_result_messages
+                )
+                if has_timeout:
+                    logger.info("MaestroLoop detected shell timeout for task '%s' - triggering research.", self.task_id)
+                    research_signal = {
+                        "signal": SIGNAL_NEEDS_RESEARCH,
+                        "question": (
+                            "The last shell command timed out. Investigate the source code and tests "
+                            "to see if there is an infinite loop, a deadlock, or a high-complexity "
+                            "algorithm (like naive Fibonacci) being called with large inputs in a test."
+                        ),
+                        "context": "A shell command timed out during implementation."
+                    }
+                    research_result = await self._handle_needs_research(research_signal)
+                    self._messages.append({
+                        "role": "user",
+                        "content": (
+                            "[SYSTEM] The shell command timed out, and a Research Agent was triggered to investigate.\n"
+                            f"Verdict: {research_result.get('verdict', 'unknown')}\n"
+                            f"Findings:\n{research_result.get('findings', 'No findings.')}\n\n"
+                            "Based on these findings, fix the implementation or the tests to avoid the timeout."
+                        ),
+                    })
+                    # Reset consecutive errors since we've handled the timeout with research
+                    self._consecutive_errors = 0
+                    continue
+
                 # Reset consecutive error counter if any tool succeeded
                 if not all(
                     msg.get("content", "").startswith("ERROR")
@@ -370,7 +400,9 @@ class MaestroLoop:
                     f"Your assigned task ID is: **{self.task_id}**"
                     f"{snapshot_block}{arch_block}{pip_block}\n\n"
                     f"Begin by calling get_task('{self.task_id}') to load the full "
-                    f"task definition, then follow the workflow in your system prompt.\n\n"
+                    f"task definition, including the approved PLANNING result "
+                    f"(file_manifest, implementation_steps, interface_contracts). "
+                    f"Then follow the workflow in your system prompt.\n\n"
                     f"Your first action should be to create a safety branch: "
                     f"git_create_branch('{GIT_SAFETY_BRANCH_PREFIX}{self.task_id}').\n\n"
                     f"Proceed."

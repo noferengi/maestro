@@ -288,6 +288,19 @@ def update_planning_result(db, result_id, **kwargs):
 # ComponentResult
 # ---------------------------------------------------------------------------
 
+def get_latest_dev_run_number(task_id: str) -> int:
+    """Return the highest dev_run_number recorded for a task (0 if none)."""
+    from sqlalchemy import func
+    db = SessionLocal()
+    try:
+        result = (db.query(func.max(ComponentResult.dev_run_number))
+                  .filter(ComponentResult.task_id == task_id)
+                  .scalar())
+        return result if result is not None else 0
+    finally:
+        db.close()
+
+
 def create_component_result(task_id, component_name, step_order, batch_number, **kwargs):
     db = SessionLocal()
     try:
@@ -307,13 +320,24 @@ def create_component_result(task_id, component_name, step_order, batch_number, *
         db.close()
 
 
-def get_component_results(task_id):
+def get_component_results(task_id, *, latest_run_only: bool = True):
+    """Return component results for a task.
+
+    By default returns only the most recent dev_run_number so the UI shows
+    the current run rather than a pile of accumulated historical rows.
+    Pass latest_run_only=False to retrieve all runs (e.g. diagnostics).
+    """
     db = SessionLocal()
     try:
-        return (db.query(ComponentResult)
-                .filter(ComponentResult.task_id == task_id)
-                .order_by(ComponentResult.batch_number, ComponentResult.step_order)
-                .all())
+        q = db.query(ComponentResult).filter(ComponentResult.task_id == task_id)
+        if latest_run_only:
+            from sqlalchemy import func
+            max_run = (db.query(func.max(ComponentResult.dev_run_number))
+                       .filter(ComponentResult.task_id == task_id)
+                       .scalar())
+            if max_run is not None:
+                q = q.filter(ComponentResult.dev_run_number == max_run)
+        return q.order_by(ComponentResult.batch_number, ComponentResult.step_order).all()
     finally:
         db.close()
 

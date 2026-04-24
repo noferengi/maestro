@@ -146,6 +146,7 @@ from .crud_projects import (
     get_project,
     get_project_path,
     upsert_project,
+    rename_project,
     delete_project,
 )
 
@@ -199,6 +200,7 @@ from .crud_pipeline import (
     update_planning_result,
     create_component_result,
     get_component_results,
+    get_latest_dev_run_number,
     update_component_result,
     create_optimization_result,
     get_optimization_result,
@@ -246,6 +248,8 @@ from .crud_files import (
     get_file_summaries_for_project_root,
     get_search_cache,
     create_search_cache,
+    delete_search_cache,
+    get_last_search_time,
 )
 
 # Inbox / notifications
@@ -332,7 +336,7 @@ __all__ = [
     "create_subdivision_record", "get_subdivision_records", "update_subdivision_record",
     "create_planning_result", "get_planning_result", "get_latest_planning_result",
     "supersede_planning_results", "update_planning_result",
-    "create_component_result", "get_component_results", "update_component_result",
+    "create_component_result", "get_component_results", "get_latest_dev_run_number", "update_component_result",
     "create_optimization_result", "get_optimization_result", "update_optimization_result",
     "create_security_review_result", "get_security_review_results", "update_security_review_result",
     "create_full_review_result", "get_full_review_results", "update_full_review_result",
@@ -350,7 +354,7 @@ __all__ = [
     # crud_files
     "get_file_summary", "create_file_summary", "get_file_summary_by_path",
     "get_file_summaries_for_project_root",
-    "get_search_cache", "create_search_cache",
+    "get_search_cache", "create_search_cache", "delete_search_cache", "get_last_search_time",
     # crud_inbox
     "create_inbox_message", "get_inbox_messages", "get_inbox_message",
     "mark_inbox_read", "mark_all_inbox_read", "delete_inbox_message", "count_unread_inbox",

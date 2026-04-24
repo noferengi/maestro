@@ -91,12 +91,31 @@ class TestRule1:
 
 
 # ---------------------------------------------------------------------------
-# Rule 2 - Majority NOT_SUITABLE
+# Rule 2 - NOT_SUITABLE abstentions
 # ---------------------------------------------------------------------------
 
 class TestRule2:
-    def test_majority_not_suitable(self):
-        """3 of 4 votes NOT_SUITABLE triggers Rule 2 (majority_threshold = 3)."""
+    def test_not_suitable_is_abstention_not_rejection(self):
+        """NOT_SUITABLE is an abstention — a single one among passing votes must not reject."""
+        votes = [
+            _vote(Verdict.LIKELY, stage="s1"),
+            _vote(Verdict.LIKELY, stage="s2"),
+            _vote(Verdict.NOT_SUITABLE, stage="s3"),
+        ]
+        result = tally_votes(votes)
+        assert result.outcome == "passed"
+
+    def test_all_not_suitable_passes(self):
+        """All reviewers abstaining (NOT_SUITABLE) means no objections — outcome=passed."""
+        votes = [
+            _vote(Verdict.NOT_SUITABLE, stage="s1"),
+            _vote(Verdict.NOT_SUITABLE, stage="s2"),
+        ]
+        result = tally_votes(votes)
+        assert result.outcome == "passed"
+
+    def test_majority_not_suitable_with_one_likely_passes(self):
+        """3 of 4 NOT_SUITABLE (abstain) + 1 LIKELY: only the LIKELY vote counts → passed."""
         votes = [
             _vote(Verdict.NOT_SUITABLE, stage="s1"),
             _vote(Verdict.NOT_SUITABLE, stage="s2"),
@@ -104,10 +123,10 @@ class TestRule2:
             _vote(Verdict.LIKELY, stage="s4"),
         ]
         result = tally_votes(votes)
-        assert result.outcome == "rejected"
+        assert result.outcome == "passed"
 
-    def test_not_majority_not_suitable(self):
-        """2 of 5 NOT_SUITABLE does NOT trigger Rule 2 (majority_threshold = 3)."""
+    def test_not_suitable_with_passing_votes_passes(self):
+        """2 of 5 NOT_SUITABLE (abstain) + 3 pass-ish: abstentions excluded → passed."""
         votes = [
             _vote(Verdict.NOT_SUITABLE, stage="s1"),
             _vote(Verdict.NOT_SUITABLE, stage="s2"),
@@ -116,16 +135,29 @@ class TestRule2:
             _vote(Verdict.POSSIBLE, stage="s5"),
         ]
         result = tally_votes(votes)
-        assert result.outcome != "rejected"
+        assert result.outcome == "passed"
 
-    def test_two_of_two_not_suitable(self):
-        """2 of 2 NOT_SUITABLE: majority_threshold = 2, so Rule 2 fires."""
+    def test_not_suitable_does_not_count_toward_tie(self):
+        """NOT_SUITABLE abstentions must not make a passing vote look like a tie."""
         votes = [
-            _vote(Verdict.NOT_SUITABLE, stage="s1"),
+            _vote(Verdict.LIKELY, stage="s1"),
             _vote(Verdict.NOT_SUITABLE, stage="s2"),
         ]
         result = tally_votes(votes)
-        assert result.outcome == "rejected"
+        # Only 1 effective vote (LIKELY); tie requires equal fail/pass counts > 0.
+        assert result.outcome == "passed"
+
+    def test_three_likely_two_not_suitable_passes(self):
+        """3 LIKELY + 2 NOT_SUITABLE: abstentions ignored, 3 pass → passed (plan verification b)."""
+        votes = [
+            _vote(Verdict.LIKELY, stage="s1"),
+            _vote(Verdict.LIKELY, stage="s2"),
+            _vote(Verdict.LIKELY, stage="s3"),
+            _vote(Verdict.NOT_SUITABLE, stage="s4"),
+            _vote(Verdict.NOT_SUITABLE, stage="s5"),
+        ]
+        result = tally_votes(votes)
+        assert result.outcome == "passed"
 
 
 # ---------------------------------------------------------------------------
@@ -159,16 +191,18 @@ class TestRule3:
 # ---------------------------------------------------------------------------
 
 class TestRule4:
-    def test_equal_pass_fail_split(self):
-        """Equal pass-ish vs fail-ish counts with no NEEDS_RESEARCH triggers tie."""
+    def test_not_suitable_no_longer_causes_tie(self):
+        """NOT_SUITABLE is now an abstention — LIKELY + NOT_SUITABLE produces 'passed', not 'tie'."""
         votes = [
             _vote(Verdict.LIKELY, stage="scope"),
             _vote(Verdict.NOT_SUITABLE, stage="conflict"),
         ]
         result = tally_votes(votes)
-        assert result.outcome == "tie"
+        # Only 1 effective vote (LIKELY); NOT_SUITABLE is excluded from quorum.
+        assert result.outcome == "passed"
 
-    def test_two_two_split(self):
+    def test_two_pass_two_not_suitable_passes(self):
+        """Two pass-ish + two NOT_SUITABLE: abstentions excluded, 2 pass → passed (not tie)."""
         votes = [
             _vote(Verdict.LIKELY, stage="s1"),
             _vote(Verdict.POSSIBLE, stage="s2"),
@@ -176,7 +210,7 @@ class TestRule4:
             _vote(Verdict.NOT_SUITABLE, stage="s4"),
         ]
         result = tally_votes(votes)
-        assert result.outcome == "tie"
+        assert result.outcome == "passed"
 
 
 # ---------------------------------------------------------------------------
@@ -300,3 +334,37 @@ class TestRule3EpilogueSourceGuard:
         )
         result = tally_votes([vote])
         assert result.outcome == "needs_research"
+
+
+# ---------------------------------------------------------------------------
+# Plan verification: NOT_SUITABLE abstention scenarios (plan §Verification 1)
+# ---------------------------------------------------------------------------
+
+class TestNotSuitableAbstentionVerification:
+    def test_all_not_suitable_passes(self):
+        """(a) All reviewers NOT_SUITABLE → passed (no objections, no quorum required)."""
+        votes = [_vote(Verdict.NOT_SUITABLE, stage=f"r{i}") for i in range(5)]
+        result = tally_votes(votes)
+        assert result.outcome == "passed"
+
+    def test_three_likely_two_not_suitable_passes(self):
+        """(b) 3 LIKELY + 2 NOT_SUITABLE → passed (abstentions ignored, 3/3 effective pass)."""
+        votes = [
+            _vote(Verdict.LIKELY, stage="r0"),
+            _vote(Verdict.LIKELY, stage="r1"),
+            _vote(Verdict.LIKELY, stage="r2"),
+            _vote(Verdict.NOT_SUITABLE, stage="r3"),
+            _vote(Verdict.NOT_SUITABLE, stage="r4"),
+        ]
+        result = tally_votes(votes)
+        assert result.outcome == "passed"
+
+    def test_rejected_still_rejects_despite_not_suitable(self):
+        """(c) REJECTED still rejects immediately, even with NOT_SUITABLE votes present."""
+        votes = [
+            _vote(Verdict.REJECTED, stage="r0"),
+            _vote(Verdict.NOT_SUITABLE, stage="r1"),
+            _vote(Verdict.LIKELY, stage="r2"),
+        ]
+        result = tally_votes(votes)
+        assert result.outcome == "rejected"

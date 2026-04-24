@@ -110,32 +110,51 @@ class ConceptualReviewPipeline:
             all_votes = await self._handle_needs_research(all_votes)
             tally = tally_votes(all_votes)
 
-        # Check for high-severity findings using structured severity prefix
-        high_severity = []
+        # Separate findings by severity: only CRITICAL blocks; HIGH is advisory.
+        critical_findings = []
+        advisory_findings = []
         for v in all_votes:
             if v.verdict in (Verdict.REJECTED, Verdict.NOT_SUITABLE):
-                if v.justification.startswith("[HIGH]") or v.justification.startswith("[CRITICAL]"):
-                    high_severity.append({
+                if v.justification.startswith("[CRITICAL]"):
+                    critical_findings.append({
                         "stage": v.stage,
                         "verdict": v.verdict.value,
                         "justification": v.justification,
                     })
+                elif v.justification.startswith("[HIGH]"):
+                    advisory_findings.append({
+                        "stage": v.stage,
+                        "verdict": v.verdict.value,
+                        "justification": v.justification,
+                    })
+        high_severity = critical_findings  # kept for result field compat
 
-        # Block on high severity if configured
-        if CONCEPTUAL_REVIEW_HIGH_SEVERITY_BLOCKS and high_severity:
+        advisory_note = ""
+        if advisory_findings:
+            advisory_note = (
+                f" Advisory ({len(advisory_findings)} high finding(s) — "
+                "review before next stage):"
+                + " | ".join(f["justification"][:120] for f in advisory_findings)
+            )
+
+        # Block on CRITICAL severity only (HIGH is advisory, not blocking)
+        if CONCEPTUAL_REVIEW_HIGH_SEVERITY_BLOCKS and critical_findings:
             outcome = "rejected"
-            summary = f"Blocked: {len(high_severity)} high-severity finding(s). {tally.summary}"
+            summary = f"Blocked: {len(critical_findings)} critical finding(s). {tally.summary}"
         else:
             raw_outcome = tally.outcome
             summary = tally.summary
             if raw_outcome in ("passed", "conditional_pass", "tie"):
                 outcome = "passed"
             elif raw_outcome == "needs_research":
-                # Research agent exhausted without resolution - reject conservatively
-                outcome = "rejected"
-                summary = f"Research exhausted without resolution: {tally.summary}"
+                # Research exhausted — couldn't prove a problem; pass with advisory note.
+                outcome = "passed"
+                summary = f"Passed (research inconclusive — no confirmed defect found). {tally.summary}"
             else:
                 outcome = "rejected"
+
+        if advisory_note and outcome == "passed":
+            summary += advisory_note
 
         logger.info("[conceptual_review] Task '%s': %s", self.task_id, outcome)
 
@@ -356,7 +375,14 @@ class ConceptualReviewPipeline:
         """Run a single LLM reviewer using a mini-loop with tool access."""
         prompt = (
             f"You are reviewing code from the perspective of: {focus}\n\n"
-            f"Task: {self.task_description}\n\n"
+            f"Task description (authoritative user intent):\n{self.task_description}\n\n"
+            "IMPORTANT: The task description above is the user's authoritative specification. "
+            "If the description explicitly requests a particular algorithm, approach, or trade-off "
+            "(e.g. 'naive recursive', 'simple', 'no caching'), treat that as an intentional design "
+            "decision, not a defect. You may note it as a warning in your justification, but you "
+            "must not classify it as NOT_SUITABLE or REJECTED solely because it conflicts with "
+            "general best practices. Reserve REJECTED/NOT_SUITABLE for genuine defects that "
+            "contradict the task description or would cause functional failures.\n\n"
             f"Planning result:\n{plan_summary}\n\n"
             f"Deterministic check results:\n{det_summary}\n\n"
             f"{extra_context}"

@@ -221,7 +221,7 @@ def update_llm_context_cache(llm_id: int, max_context: int | None):
 
 
 # ---------------------------------------------------------------------------
-# Graceful shutdown flags
+# Graceful shutdown & session killing flags
 #
 # Two-phase shutdown:
 #   Phase 1 — signal_shutdown(): sets _shutdown_event.  In-flight calls exit at
@@ -231,10 +231,17 @@ def update_llm_context_cache(llm_id: int, max_context: int | None):
 #     poll loop checks this flag every _SHUTDOWN_POLL_SLICE seconds even while
 #     waiting for the first token, providing a hard-deadline interrupt for calls
 #     that are still in the prompt-processing (first-token latency) window.
+#
+# Session killing:
+#   kill_session(session_id): adds a session_id to _session_kill_set.  Any call_llm()
+#     associated with that session will abort immediately with SessionKilledError.
+#     Used by the scheduler to terminate zombie threads after timeout/restart.
 # ---------------------------------------------------------------------------
 
 _shutdown_event = threading.Event()
 _force_shutdown_event = threading.Event()
+_session_kill_set: set[str] = set()
+_kill_lock = threading.Lock()
 
 # Maximum seconds between shutdown-flag checks while waiting for the next SSE
 # chunk.  Applies only when _shutdown_event or _force_shutdown_event is set and
@@ -245,6 +252,52 @@ _SHUTDOWN_POLL_SLICE: float = 1.0
 class ShutdownError(Exception):
     """Raised when an LLM call is aborted because the server is shutting down."""
     pass
+
+
+class SessionKilledError(ShutdownError):
+    """Raised when an LLM call is aborted because its session was killed."""
+    pass
+
+
+def signal_shutdown() -> None:
+    """Phase-1 shutdown: signal in-flight calls to abort at their next check."""
+    _shutdown_event.set()
+
+
+def signal_force_shutdown() -> None:
+    """Phase-2 shutdown: interrupt streaming waits within _SHUTDOWN_POLL_SLICE seconds."""
+    _force_shutdown_event.set()
+
+
+def is_shutting_down() -> bool:
+    """Return True once signal_shutdown() has been called."""
+    return _shutdown_event.is_set()
+
+
+def is_force_shutdown() -> bool:
+    """Return True once signal_force_shutdown() has been called."""
+    return _force_shutdown_event.is_set()
+
+
+def kill_session(session_id: str) -> None:
+    """Mark a specific session for immediate termination."""
+    with _kill_lock:
+        _session_kill_set.add(session_id)
+    logger.info("LLM session '%s' marked for termination.", session_id)
+
+
+def is_session_killed(session_id: str | None) -> bool:
+    """Return True if session_id is in the kill set."""
+    if not session_id:
+        return False
+    with _kill_lock:
+        return session_id in _session_kill_set
+
+
+def clear_killed_session(session_id: str) -> None:
+    """Remove a session from the kill set (e.g. after the thread has exited)."""
+    with _kill_lock:
+        _session_kill_set.discard(session_id)
 
 
 class PipelineAbortedError(Exception):
@@ -294,6 +347,7 @@ async def _stream_llm_response(
 
     Returns a reconstructed response dict in standard non-streaming shape.
     """
+    session_id = _ctx_session_id.get()
     stream_payload = {
         **payload,
         "stream": True,
@@ -333,6 +387,8 @@ async def _stream_llm_response(
                 while True:
                     if _shutdown_event.is_set() or _force_shutdown_event.is_set():
                         raise ShutdownError("Server is shutting down")
+                    if is_session_killed(session_id):
+                        raise SessionKilledError(f"Session '{session_id}' was killed")
 
                     # Slice the idle-timeout wait into _SHUTDOWN_POLL_SLICE-second
                     # windows so the shutdown flag is checked even during first-token
@@ -344,6 +400,8 @@ async def _stream_llm_response(
                     while elapsed < idle_timeout:
                         if _shutdown_event.is_set() or _force_shutdown_event.is_set():
                             raise ShutdownError("Server is shutting down")
+                        if is_session_killed(session_id):
+                            raise SessionKilledError(f"Session '{session_id}' was killed")
                         try:
                             line = await asyncio.wait_for(
                                 lines_aiter.__anext__(),
@@ -889,7 +947,22 @@ async def call_llm(
         # Acquire a concurrency slot.  Suspends this coroutine (without blocking
         # the event-loop thread) until the server has capacity for one more request.
         # The slot is held only for a single HTTP attempt and released in `finally`.
-        await _loop.run_in_executor(None, _sem.acquire)
+        # If a wall-clock deadline is set, use acquire(timeout=...) so the coroutine
+        # does not block past the deadline waiting in the semaphore queue.
+        _sem_acquired = False
+        if _call_deadline is not None:
+            _sem_wait = max(0.1, _call_deadline - time.monotonic())
+            _sem_acquired = await _loop.run_in_executor(
+                None, lambda: _sem.acquire(timeout=_sem_wait)
+            )
+            if not _sem_acquired:
+                raise RuntimeError(
+                    f"LLM call to {resolved_url} deadline exceeded waiting for "
+                    f"semaphore slot ({total_timeout_secs:.0f}s total_timeout_secs)."
+                )
+        else:
+            await _loop.run_in_executor(None, _sem.acquire)
+            _sem_acquired = True
 
         _retry_wait: "float | None" = None
         try:
@@ -1204,7 +1277,8 @@ async def call_llm(
 
         finally:
             # Always release the slot — even on raise — so other waiters can proceed.
-            _sem.release()
+            if _sem_acquired:
+                _sem.release()
 
         # Slot released.  Break on success (_retry_wait is None) or sleep before retry.
         if _retry_wait is None:

@@ -181,7 +181,7 @@ def create_search_cache(query: str, result_json: str, provider: str = 'brave') -
 
 def delete_search_cache(query: str, provider: str = 'brave') -> int:
     """Delete a SearchCache row by query+provider.
-    
+
     Returns the number of rows deleted (0 or 1).
     """
     db = SessionLocal()
@@ -199,3 +199,15 @@ def delete_search_cache(query: str, provider: str = 'brave') -> int:
         return 0
     finally:
         db.close()
+
+
+def get_last_search_time() -> "datetime | None":
+    """Return the created_at timestamp of the most recent SearchCache entry."""
+    db = SessionLocal()
+    try:
+        from sqlalchemy import desc
+        row = db.query(SearchCache).order_by(desc(SearchCache.created_at)).first()
+        return row.created_at if row else None
+    finally:
+        db.close()
+

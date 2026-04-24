@@ -58,7 +58,7 @@ REVIEW_SHELL_ALLOWLIST = [
 _REVIEW_ALLOWLIST_RE = [re.compile(p) for p in REVIEW_SHELL_ALLOWLIST]
 
 
-def run_shell_review(command: str, *, project_path: str | None = None) -> str:
+def run_shell_review(command: str, *, project_path: str | None = None, timeout: int | None = None) -> str:
     """Execute a shell command from the review runner allowlist only."""
     import subprocess
 
@@ -70,6 +70,8 @@ def run_shell_review(command: str, *, project_path: str | None = None) -> str:
             f"Allowed patterns: {', '.join(REVIEW_SHELL_ALLOWLIST)}"
         )
 
+    effective_timeout = timeout if timeout is not None else SHELL_TIMEOUT_SECONDS
+
     try:
         cwd = project_path or _task_git_cwd.get() or PROJECT_ROOT
         result = subprocess.run(
@@ -77,13 +79,16 @@ def run_shell_review(command: str, *, project_path: str | None = None) -> str:
             shell=True,
             capture_output=True,
             text=True,
-            timeout=SHELL_TIMEOUT_SECONDS,
+            timeout=effective_timeout,
             cwd=cwd,
         )
         output = result.stdout + result.stderr
         return output[:8000] if output else "(no output)"
     except subprocess.TimeoutExpired:
-        return f"ERROR: Command timed out after {SHELL_TIMEOUT_SECONDS}s"
+        return (
+            f"ERROR: Command timed out after {effective_timeout}s. "
+            "This may indicate a hang or high computational complexity."
+        )
     except Exception as e:
         return f"ERROR: {e}"
 

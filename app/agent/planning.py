@@ -341,6 +341,7 @@ class PlanningPipeline:
         max_context: int | None = None,
         run_row_id: int | None = None,
         project_name: str | None = None,
+        project_root: str | None = None,
     ):
         self.task_id = task_id
         self.task_title = task_title
@@ -353,6 +354,7 @@ class PlanningPipeline:
         self.max_context = max_context
         self.run_row_id = run_row_id
         self.project_name = project_name
+        self.project_root = project_root
         self._total_prompt = 0
         self._total_completion = 0
         # Set in run() after the survey, used by _stage_design_review
@@ -1405,6 +1407,7 @@ async def run_planning_pipeline(
         max_context=max_context,
         run_row_id=run_row_id,
         project_name=project_name,
+        project_root=project_path,
     )
     result = await pipeline.run()
     votes_list = [

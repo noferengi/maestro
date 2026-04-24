@@ -1555,6 +1555,7 @@ function _refreshJobIndicators(schedulerData) {
     _schedulerState = {
         active: schedulerData.active || [],
         queued: schedulerData.queued || [],
+        stopped: schedulerData.stopped || [],
     };
 
     // Build fast lookup maps: taskId → entry
@@ -1562,6 +1563,8 @@ function _refreshJobIndicators(schedulerData) {
     (_schedulerState.active || []).forEach(item => { activeMap[item.id] = item; });
     const queuedMap = {};
     (_schedulerState.queued || []).forEach(item => { queuedMap[item.id] = item; });
+    const stoppedMap = {};
+    (_schedulerState.stopped || []).forEach(item => { stoppedMap[item.id] = item; });
 
     // Walk all cached cards and update their indicator element.
     Object.keys(cardCache).forEach(taskId => {
@@ -1573,6 +1576,10 @@ function _refreshJobIndicators(schedulerData) {
             const llm = activeMap[taskId].llm_name || '';
             html = `<span class="ji-dot"></span><span class="ji-label">Running${llm ? ' \u00b7 ' + escapeHtml(llm) : ''}</span>`;
             el.className = 'card-job-indicator ji-running';
+        } else if (stoppedMap[taskId]) {
+            const reason = stoppedMap[taskId].reason || 'planning failed';
+            html = `<span class="ji-dot"></span><span class="ji-label">Stopped \u00b7 ${escapeHtml(reason)}</span>`;
+            el.className = 'card-job-indicator ji-stopped';
         } else if (queuedMap[taskId]) {
             const reason = queuedMap[taskId].reason || 'pending';
             html = `<span class="ji-dot"></span><span class="ji-label">Queued \u00b7 ${escapeHtml(reason)}</span>`;
@@ -1892,7 +1899,7 @@ async function saveNewProject() {
 function openEditProjectModal(name, path, description, llmId, budgetId) {
     document.getElementById('edit-project-original-name').value = name;
     document.getElementById('edit-project-modal-title').textContent = `Edit: ${name}`;
-    document.getElementById('edit-project-name-display').textContent = name;
+    document.getElementById('edit-project-name-input').value = name;
     document.getElementById('edit-project-path').value = path;
     document.getElementById('edit-project-description').value = description;
     document.getElementById('edit-project-error').style.display = 'none';
@@ -1909,7 +1916,8 @@ function closeEditProjectModal() {
 }
 
 async function saveEditProject() {
-    const name = document.getElementById('edit-project-original-name').value;
+    const originalName = document.getElementById('edit-project-original-name').value;
+    const newName = document.getElementById('edit-project-name-input').value.trim();
     const path = document.getElementById('edit-project-path').value.trim();
     const description = document.getElementById('edit-project-description').value.trim();
     const llmVal = document.getElementById('edit-project-llm-select').value;
@@ -1920,11 +1928,17 @@ async function saveEditProject() {
     const errEl = document.getElementById('edit-project-error');
     const warnEl = document.getElementById('edit-project-path-warn');
 
+    if (!newName) {
+        errEl.textContent = 'Project name is required.';
+        errEl.style.display = 'block';
+        return;
+    }
+
     try {
-        const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(name)}`, {
+        const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(originalName)}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ path, description, llm_id, budget_id, create_if_missing }),
+            body: JSON.stringify({ name: newName, path, description, llm_id, budget_id, create_if_missing }),
         });
         if (!resp.ok) {
             const err = await resp.json().catch(() => ({}));
@@ -1939,7 +1953,11 @@ async function saveEditProject() {
         }
         warnEl.style.display = 'none';
         closeEditProjectModal();
+        const wasActive = currentProject === originalName;
         await loadProjects();
+        if (wasActive && newName !== originalName) {
+            switchProject(newName);
+        }
     } catch (err) {
         errEl.textContent = `Network error: ${err.message}`;
         errEl.style.display = 'block';

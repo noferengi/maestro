@@ -295,6 +295,7 @@ class SubdivisionAgent:
 
         # Token budget enforcement
         self.token_budget = int((max_context or 100_000) * SUBDIVISION_CONTEXT_BUDGET_RATIO)
+        self._last_prompt_tokens = 0
         self._total_prompt_tokens = 0
         self._total_completion_tokens = 0
         self._budget_exceeded = False

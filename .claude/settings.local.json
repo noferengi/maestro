@@ -1,5 +1,4 @@
 {
-  "enableAllProjectMcpServers": true,
   "permissions": {
     "allow": [
       "Bash(ls:*)",
@@ -38,7 +37,11 @@
       "Bash(venv/Scripts/python.exe -m pytest app/tests/test_pip_agent_unit.py app/tests/test_pip_resolution_unit.py app/tests/test_pip_workflow.py -v --tb=short)",
       "Bash(venv/Scripts/python.exe -m pytest app/tests/ -v --tb=short -q)",
       "Bash(venv/Scripts/python.exe app/migrations/runner.py status)",
-      "Bash(venv/Scripts/python.exe app/migrations/runner.py migrate)"
+      "Bash(venv/Scripts/python.exe app/migrations/runner.py migrate)",
+      "mcp__maestro__get_scheduler_state",
+      "mcp__maestro__diagnose_task",
+      "mcp__maestro__restart_server"
     ]
-  }
+  },
+  "enableAllProjectMcpServers": true
 }

@@ -11,6 +11,7 @@ Verdict thresholds (confidence -> verdict):
     NEEDS_RESEARCH: [61, 75]
     POSSIBLE:       [76, 91]
     LIKELY:         [92, 100]
+    WARN:           [0, 100]  categorical — passes with noted concern, never blocks
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ class Verdict(Enum):
     LIKELY = "LIKELY"
     SUBDIVIDE_IDEA = "SUBDIVIDE_IDEA"
     CONDITIONAL_PASS = "CONDITIONAL_PASS"
+    WARN = "WARN"  # opinionated concern — passes with a note, never causes a retry
     TOO_LARGE = "TOO_LARGE"  # context window exceeded - synthesised internally, triggers subdivision
 
     @property
@@ -48,6 +50,7 @@ _VERDICT_RANGES: dict[Verdict, tuple[int, int]] = {
     Verdict.LIKELY: (92, 100),
     Verdict.SUBDIVIDE_IDEA: (0, 100),  # categorical signal, accepts any confidence
     Verdict.CONDITIONAL_PASS: (76, 100),  # passes with noted concerns
+    Verdict.WARN: (0, 100),  # categorical — opinionated concern, passes with note
     Verdict.TOO_LARGE: (100, 100),  # always 100% - synthesised on context overflow, never LLM-emitted
 }
 
@@ -104,7 +107,7 @@ class Vote:
 class TallyResult:
     """Aggregated result of all stage votes."""
 
-    outcome: str  # "passed" | "conditional_pass" | "rejected" | "needs_research" | "tie" | "subdivide"
+    outcome: str  # "passed" | "conditional_pass" | "rejected" | "needs_research" | "tie" | "subdivide" | "warned"
     votes: list[Vote]
     rejection_reasons: list[str] = field(default_factory=list)
     research_needed: list[str] = field(default_factory=list)
@@ -121,16 +124,20 @@ def tally_votes(votes: list[Vote]) -> TallyResult:
     Rules (evaluated in order):
         0. Majority of LLM stages vote SUBDIVIDE_IDEA (>=2 of 3) -> "subdivide".
         1. Any REJECTED vote -> "rejected" immediately.
-        2. Majority NOT_SUITABLE (>= ceil(n/2)+1 when n>=3, or >=2 when n<=3)
-           -> "rejected".
-        3. Any NEEDS_RESEARCH vote -> "needs_research".
-        4. Equal split of pass-ish vs fail-ish -> "tie".
-        5. Otherwise -> "passed".
+        2. NOT_SUITABLE votes are abstentions — excluded from quorum entirely.
+           If all votes are NOT_SUITABLE -> "passed" (no objections).
+        3. Any NEEDS_RESEARCH vote (from non-abstaining votes) -> "needs_research".
+        4. Equal split of pass-ish vs fail-ish (non-abstaining) -> "tie".
+        5. Otherwise -> "passed" (or "conditional_pass"/"warned" if CONDITIONAL_PASS/WARN votes present).
 
-    Categories for counting:
-        fail-ish:  REJECTED, NOT_SUITABLE
-        pass-ish:  POSSIBLE, LIKELY
+    Categories for counting (non-abstaining only):
+        fail-ish:  REJECTED
+        pass-ish:  POSSIBLE, LIKELY, CONDITIONAL_PASS, WARN
+        abstain:   NOT_SUITABLE (never counted toward quorum or retry thresholds)
         neutral:   NEEDS_RESEARCH (neither until resolved)
+
+    WARN is a non-blocking opinionated concern: it is pass-ish and never causes a retry,
+    but its justification is surfaced in conditional_pass_notes so the user can see it.
     """
     if not votes:
         logger.debug("Tally: 0 votes → outcome=rejected")
@@ -180,21 +187,17 @@ def tally_votes(votes: list[Vote]) -> TallyResult:
             total_completion_tokens=total_completion,
         )
 
-    # --- Rule 2: majority NOT_SUITABLE -> rejection ---
-    not_suitable_votes = [v for v in votes if v.verdict is Verdict.NOT_SUITABLE]
-    # Majority threshold: for 4 voters need 3+, for 3 voters need 2+, etc.
-    majority_threshold = (n // 2) + 1
-    if len(not_suitable_votes) >= majority_threshold:
-        logger.debug("Tally: %d votes → outcome=rejected (NOT_SUITABLE majority)", n)
-        reasons = [f"[{v.stage}] {v.justification}" for v in not_suitable_votes]
+    # --- Rule 2: NOT_SUITABLE = abstention ---
+    # Abstaining reviewers signal "this lens doesn't apply" — they are excluded from
+    # quorum so an off-topic reviewer can never block or retry a design.
+    voting_votes = [v for v in votes if v.verdict is not Verdict.NOT_SUITABLE]
+    n_abstain = n - len(voting_votes)
+    if not voting_votes:
+        logger.debug("Tally: all %d votes are NOT_SUITABLE (abstain) → outcome=passed", n)
         return TallyResult(
-            outcome="rejected",
+            outcome="passed",
             votes=votes,
-            rejection_reasons=reasons,
-            summary=(
-                f"Pipeline rejected: {len(not_suitable_votes)}/{n} stages "
-                f"voted NOT_SUITABLE (majority)."
-            ),
+            summary=f"Pipeline passed: all {n} reviewer(s) abstained (NOT_SUITABLE — not applicable).",
             total_prompt_tokens=total_prompt,
             total_completion_tokens=total_completion,
         )
@@ -203,7 +206,7 @@ def tally_votes(votes: list[Vote]) -> TallyResult:
     # Votes tagged source="research_agent_epilogue" are excluded: they indicate
     # "investigation budget was insufficient" and must not re-spawn an agent.
     research_votes = [
-        v for v in votes
+        v for v in voting_votes
         if v.verdict is Verdict.NEEDS_RESEARCH
         and (v.raw_response or {}).get("source") != "research_agent_epilogue"
     ]
@@ -222,33 +225,42 @@ def tally_votes(votes: list[Vote]) -> TallyResult:
             total_completion_tokens=total_completion,
         )
 
-    # --- Rules 4 & 5: tie vs passed ---
-    _FAIL_ISH = {Verdict.REJECTED, Verdict.NOT_SUITABLE}
-    _PASS_ISH = {Verdict.POSSIBLE, Verdict.LIKELY, Verdict.CONDITIONAL_PASS}
+    # --- Rules 4 & 5: tie vs passed (quorum computed from voting_votes only) ---
+    _FAIL_ISH = {Verdict.REJECTED}
+    _PASS_ISH = {Verdict.POSSIBLE, Verdict.LIKELY, Verdict.CONDITIONAL_PASS, Verdict.WARN}
 
-    fail_count = sum(1 for v in votes if v.verdict in _FAIL_ISH)
-    pass_count = sum(1 for v in votes if v.verdict in _PASS_ISH)
+    fail_count = sum(1 for v in voting_votes if v.verdict in _FAIL_ISH)
+    pass_count = sum(1 for v in voting_votes if v.verdict in _PASS_ISH)
+    n_effective = len(voting_votes)
 
     if fail_count == pass_count and fail_count > 0:
-        logger.debug("Tally: %d votes → outcome=tie", n)
+        logger.debug("Tally: %d effective votes → outcome=tie", n_effective)
         return TallyResult(
             outcome="tie",
             votes=votes,
-            summary=f"Pipeline tie: {pass_count} pass-ish vs {fail_count} fail-ish.",
+            summary=f"Pipeline tie: {pass_count} pass-ish vs {fail_count} fail-ish ({n_abstain} abstained).",
             total_prompt_tokens=total_prompt,
             total_completion_tokens=total_completion,
         )
 
-    conditional_votes = [v for v in votes if v.verdict is Verdict.CONDITIONAL_PASS]
-    outcome = "conditional_pass" if conditional_votes else "passed"
-    logger.debug("Tally: %d votes → outcome=%s", n, outcome)
-    cond_notes = [v.justification for v in conditional_votes]
+    conditional_votes = [v for v in voting_votes if v.verdict is Verdict.CONDITIONAL_PASS]
+    warn_votes = [v for v in voting_votes if v.verdict is Verdict.WARN]
+    if conditional_votes:
+        outcome = "conditional_pass"
+    elif warn_votes:
+        outcome = "warned"
+    else:
+        outcome = "passed"
+    logger.debug("Tally: %d effective votes → outcome=%s", n_effective, outcome)
+    cond_notes = [v.justification for v in conditional_votes] + [
+        f"[WARN — {v.stage}] {v.justification}" for v in warn_votes
+    ]
     return TallyResult(
         outcome=outcome,
         votes=votes,
-        summary=f"Pipeline {outcome}: {pass_count}/{n} stages voted favourably.",
+        summary=f"Pipeline {outcome}: {pass_count}/{n_effective} voting stages passed ({n_abstain} abstained).",
         total_prompt_tokens=total_prompt,
         total_completion_tokens=total_completion,
-        has_conditional_passes=bool(conditional_votes),
+        has_conditional_passes=bool(conditional_votes or warn_votes),
         conditional_pass_notes=cond_notes,
     )

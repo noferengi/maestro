@@ -335,9 +335,9 @@ class TestSchedulerDispatch:
         return mock_thread
 
     def test_truly_non_dispatchable_columns_never_spawn_threads(self):
-        """architecture, security, and completed are never in SCHEDULER_DISPATCHABLE_TYPES."""
+        """architecture and completed are never in SCHEDULER_DISPATCHABLE_TYPES."""
         from app.agent.scheduler import SCHEDULER_DISPATCHABLE_TYPES
-        for col_type in ("architecture", "security", "completed"):
+        for col_type in ("architecture", "completed"):
             assert col_type not in SCHEDULER_DISPATCHABLE_TYPES, \
                 f"'{col_type}' must not be auto-dispatchable"
             task = self._ready_task_dict(f"sched-skip-{col_type}", col_type)
@@ -349,7 +349,7 @@ class TestSchedulerDispatch:
         """All mid-pipeline stages must be in SCHEDULER_DISPATCHABLE_TYPES for
         orphan recovery after server restart."""
         from app.agent.scheduler import SCHEDULER_DISPATCHABLE_TYPES
-        for col_type in ("indev", "conceptual_review", "optimization", "full_review"):
+        for col_type in ("indev", "conceptual_review", "optimization", "security", "full_review"):
             assert col_type in SCHEDULER_DISPATCHABLE_TYPES, \
                 f"'{col_type}' must be auto-dispatchable (restart recovery)"
 
@@ -640,8 +640,8 @@ class TestTallyRules:
         result = tally_votes(votes)
         assert result.outcome == "rejected"
 
-    def test_rule2_majority_not_suitable_rejects(self):
-        """Majority NOT_SUITABLE -> rejected."""
+    def test_rule2_not_suitable_is_abstention(self):
+        """NOT_SUITABLE votes are abstentions — majority NOT_SUITABLE no longer rejects."""
         from app.agent.verdicts import tally_votes, Verdict
         votes = [
             self._vote(Verdict.NOT_SUITABLE, 55),
@@ -649,7 +649,8 @@ class TestTallyRules:
             self._vote(Verdict.POSSIBLE, 80),
         ]
         result = tally_votes(votes)
-        assert result.outcome == "rejected"
+        # 2 abstain, 1 POSSIBLE → only 1 effective vote → passed
+        assert result.outcome == "passed"
 
     def test_rule3_needs_research_triggers_research(self):
         """Any NEEDS_RESEARCH vote -> outcome needs_research."""
@@ -661,14 +662,8 @@ class TestTallyRules:
         result = tally_votes(votes)
         assert result.outcome == "needs_research"
 
-    def test_rule4_tie_triggers_tiebreaker(self):
-        """Equal pass/fail split with no REJECTED -> tie.
-
-        Rule 1 (any REJECTED -> rejected) fires before Rule 4, so the tie
-        scenario must use only NOT_SUITABLE (fail-ish) against pass-ish votes.
-        2 NOT_SUITABLE vs 2 LIKELY: majority threshold = (4//2)+1 = 3, so
-        Rule 2 doesn't fire; Rule 4 fires -> tie.
-        """
+    def test_rule4_not_suitable_no_longer_ties(self):
+        """NOT_SUITABLE is now an abstention, not fail-ish — 2 LIKELY + 2 NOT_SUITABLE → passed."""
         from app.agent.verdicts import tally_votes, Verdict
         votes = [
             self._vote(Verdict.LIKELY, 95),
@@ -677,7 +672,8 @@ class TestTallyRules:
             self._vote(Verdict.NOT_SUITABLE, 55),
         ]
         result = tally_votes(votes)
-        assert result.outcome == "tie"
+        # 2 abstain, 2 LIKELY effective → passed (not tie)
+        assert result.outcome == "passed"
 
     def test_rule5_majority_pass(self):
         """Clear majority of passing verdicts -> passed."""

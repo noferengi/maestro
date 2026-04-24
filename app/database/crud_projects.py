@@ -105,6 +105,43 @@ def upsert_project(
         db.close()
 
 
+def rename_project(old_name: str, new_name: str) -> "Project | None":
+    """
+    Rename a project and cascade the name change to all tables that store it
+    as a plain string (DreamerRun, ScopeSummary, ScopeSurveyJob).
+    Tasks are unaffected — they reference projects via project_id FK.
+    Returns the updated Project, or None on failure.
+    """
+    db = SessionLocal()
+    try:
+        project = db.query(Project).filter(Project.name == old_name).first()
+        if not project:
+            return None
+        if db.query(Project).filter(Project.name == new_name).first():
+            raise ValueError(f"A project named '{new_name}' already exists.")
+        project.name = new_name
+        # Cascade to string-keyed tables
+        from .models import DreamerRun, ScopeSummary, ScopeSurveyJob
+        db.query(DreamerRun).filter(DreamerRun.project_name == old_name).update(
+            {"project_name": new_name}, synchronize_session=False
+        )
+        db.query(ScopeSummary).filter(ScopeSummary.project_name == old_name).update(
+            {"project_name": new_name}, synchronize_session=False
+        )
+        db.query(ScopeSurveyJob).filter(ScopeSurveyJob.project_name == old_name).update(
+            {"project_name": new_name}, synchronize_session=False
+        )
+        db.commit()
+        db.refresh(project)
+        return project
+    except Exception as e:
+        db.rollback()
+        logger.error("Error renaming project '%s' → '%s': %s", old_name, new_name, e)
+        raise
+    finally:
+        db.close()
+
+
 def delete_project(name: str) -> bool:
     """Delete a project record and cancel any associated arch_gen jobs."""
     db = SessionLocal()

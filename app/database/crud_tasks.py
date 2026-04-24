@@ -671,7 +671,7 @@ def delete_task(task_id):
     is_active=True, so deactivated tasks disappear from every view.
     Cascades to the full descendant tree (via parent_task_id) so deleting
     a Big Idea also hides its sub-ideas and their sub-ideas.
-    Returns the number of tasks deactivated (>=1) or 0 if not found.
+    Returns the list of deactivated task IDs (non-empty) or [] if not found.
     """
     db = SessionLocal()
     try:
@@ -710,7 +710,7 @@ def delete_task(task_id):
                    synchronize_session=False))
 
         db.commit()
-        return len(ids_to_deactivate)
+        return ids_to_deactivate
     except Exception as e:
         db.rollback()
         logger.error("Error soft-deleting task %s: %s", task_id, e)
