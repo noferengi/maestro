@@ -51,20 +51,72 @@ _ANDROID_FRAMEWORK: frozenset[str] = frozenset({
 })
 
 
-def _is_primitive_or_stdlib(item: str) -> bool:
-    """Return True if a consumes entry looks like a stdlib/primitive false-positive."""
+def _is_primitive_or_stdlib(item: str, project_path: str | None = None) -> bool:
+    """Return True if a consumes entry looks like a stdlib/primitive false-positive.
+
+    Also returns True if the item corresponds to an existing file in the project,
+    meaning it's already satisfied on disk.
+    """
+    import os
     low = item.lower().strip()
-    if low.endswith(" type") or low.endswith(" module"):
-        return True
+    
+    # Noise words that suggest it's a reference to an existing entity
+    if low.endswith(" type") or low.endswith(" module") or low.endswith(" class") or low.endswith(" dataclass") or low.endswith(" enum") or low.endswith(" exception"):
+        # Strip the suffix and check if the base exists or is a primitive
+        base = low.rsplit(" ", 1)[0].strip()
+        if base in _PYTHON_BUILTINS or base in _KOTLIN_BUILTINS:
+            return True
+        # Continue to file check with the base
+        low = base
+
     if " for " in low:
         first = low.split(" for ")[0].strip()
         if first in _PYTHON_BUILTINS or first in _KOTLIN_BUILTINS:
             return True
+    
+    # Check if it's an existing file in the project
+    if project_path and os.path.isdir(project_path):
+        # item might be a path (src/models.py) or a dotted module (src.models)
+        # Try as direct path first
+        candidate_path = os.path.join(project_path, item)
+        if os.path.isfile(candidate_path):
+            return True
+        
+        # Try base (without "dataclass" etc)
+        candidate_base = os.path.join(project_path, low)
+        if os.path.isfile(candidate_base):
+            return True
+
+        # Try as dotted module (src.models -> src/models.py)
+        if "." in item and not item.endswith(".py"):
+            dotted_path = item.replace(".", "/") + ".py"
+            candidate_dotted = os.path.join(project_path, dotted_path)
+            if os.path.isfile(candidate_dotted):
+                return True
+        
+        # Heuristic: if it's a single word and we see it in the project (case-insensitive search)
+        # this is expensive, so we only do it for small items
+        if len(low) > 3 and " " not in low and "." not in low:
+            # We don't want to walk the whole tree here, but maybe check common dirs
+            for sub in ["src", "app", "lib"]:
+                search_dir = os.path.join(project_path, sub)
+                if os.path.isdir(search_dir):
+                    # Quick check for filename match
+                    for root, dirs, files in os.walk(search_dir):
+                        # Prune hidden dirs
+                        dirs[:] = [d for d in dirs if not d.startswith(".")]
+                        for f in files:
+                            if f.lower().startswith(low):
+                                return True
+                        if len(files) > 100: # safety break
+                            break
+
     normalized = (
         low.removeprefix("python ")
            .removeprefix("kotlin ")
            .removeprefix("android ")
     )
+    # Split by space and take first word (e.g. "CareLevel enum" -> "CareLevel")
     base = normalized.split(" ")[0].split(".")[0]
     return (
         base in _PYTHON_BUILTINS
@@ -106,6 +158,8 @@ class PlanningGate:
         llm_model: str | None = None,
         llm_id: int | None = None,
         budget_id: int | None = None,
+        project_path: str | None = None,
+        task_description: str = "",
     ):
         self.task_id = task_id
         self.plan = planning_result
@@ -115,12 +169,23 @@ class PlanningGate:
         self.llm_model = llm_model
         self.llm_id = llm_id
         self.budget_id = budget_id
+        self.project_path = project_path
+        self.task_description = task_description
 
     async def run(self) -> GateResult:
         """Execute all 7 checks and return the gate result."""
         from app.agent.llm_client import set_llm_session_context
         set_llm_session_context(AGENT_NAME)
         checks: list[GateCheck] = []
+
+        # Check 0a: Python namespace conflicts (module vs package collision)
+        checks.append(self._check_namespace_conflicts())
+
+        # Check 0b: CREATE targets that already exist on disk
+        checks.append(self._check_proposed_creates_exist())
+
+        # Check 0c: Design contradicts explicit spec constraints
+        checks.append(self._check_spec_compliance())
 
         # Check 1: Interface completeness
         checks.append(self._check_interface_completeness())
@@ -183,6 +248,170 @@ class PlanningGate:
         )
 
     # ------------------------------------------------------------------
+    # Check 0a: Python namespace conflicts
+    # ------------------------------------------------------------------
+
+    def _check_namespace_conflicts(self) -> GateCheck:
+        """Detect Python module/package namespace collisions in the file manifest.
+
+        Having both foo.py and foo/__init__.py in the same directory is a hard
+        Python conflict — the interpreter can only treat foo as one of them.
+        """
+        import os
+        from pathlib import Path
+
+        manifest = self.plan.get("file_manifest", [])
+        proposed_paths = {e.get("path", "") for e in manifest if e.get("path")}
+        conflicts: list[str] = []
+
+        project_root = Path(self.project_path) if self.project_path else None
+
+        for path in proposed_paths:
+            if not path.endswith(".py"):
+                continue
+            if path.endswith("/__init__.py"):
+                # If there's also a sibling module file: foo/__init__.py + foo.py
+                stem = path[: -len("/__init__.py")]
+                sibling_module = f"{stem}.py"
+                if sibling_module in proposed_paths:
+                    pass  # caught by the module-side loop below
+                elif project_root and (project_root / sibling_module).exists():
+                    conflicts.append(
+                        f"'{path}' conflicts with existing module '{sibling_module}' on disk"
+                    )
+            else:
+                # foo.py — check if foo/__init__.py is also proposed or on disk
+                stem = path[:-3]
+                pkg_init = f"{stem}/__init__.py"
+                if pkg_init in proposed_paths:
+                    conflicts.append(
+                        f"'{path}' and '{pkg_init}' cannot coexist (module vs package)"
+                    )
+                elif project_root and (project_root / stem).is_dir():
+                    conflicts.append(
+                        f"'{path}' conflicts with existing package directory '{stem}/' on disk"
+                    )
+
+        if conflicts:
+            return GateCheck(
+                name="namespace_conflicts",
+                passed=False,
+                hard_fail=True,
+                detail=(
+                    f"Python namespace collision(s) detected: {'; '.join(conflicts)}. "
+                    "A .py module and a same-named package directory cannot coexist."
+                ),
+            )
+        return GateCheck(
+            name="namespace_conflicts",
+            passed=True,
+            hard_fail=True,
+            detail="No Python namespace collisions.",
+        )
+
+    # ------------------------------------------------------------------
+    # Check 0b: CREATE targets that already exist on disk
+    # ------------------------------------------------------------------
+
+    def _check_proposed_creates_exist(self) -> GateCheck:
+        """Hard-fail when the plan proposes CREATE on files that already exist.
+
+        A design that proposes to create a file that is already on disk will
+        either overwrite existing work or produce a conflict.  The correct
+        action in that case is 'update' or 'verify', not 'create'.
+        """
+        from pathlib import Path
+
+        if not self.project_path:
+            return GateCheck(
+                name="create_target_exists",
+                passed=True,
+                hard_fail=True,
+                detail="No project path available; skipping disk check.",
+            )
+
+        manifest = self.plan.get("file_manifest", [])
+        collisions: list[str] = []
+
+        for entry in manifest:
+            if entry.get("action", "").lower() != "create":
+                continue
+            path = entry.get("path", "")
+            if not path:
+                continue
+            full = Path(self.project_path) / path
+            if full.exists():
+                collisions.append(path)
+
+        if collisions:
+            return GateCheck(
+                name="create_target_exists",
+                passed=False,
+                hard_fail=True,
+                detail=(
+                    f"Plan proposes CREATE on {len(collisions)} file(s) that already exist: "
+                    f"{', '.join(collisions[:5])}. "
+                    "Change action to 'update' or 'verify', or the Component Loop will conflict with existing work."
+                ),
+            )
+        return GateCheck(
+            name="create_target_exists",
+            passed=True,
+            hard_fail=True,
+            detail="No CREATE/exist collisions.",
+        )
+
+    # ------------------------------------------------------------------
+    # Check 0c: Spec compliance (design must not contradict task description)
+    # ------------------------------------------------------------------
+
+    _SPEC_CONTRADICTION_PAIRS: list[tuple[list[str], list[str], str]] = [
+        # (task_keywords, rationale_keywords, violation_message)
+        (["naive", "naive recursive"], ["iterative", "iteration", "memoiz"], "Task requests naive recursion but design uses iteration/memoization"),
+        (["no memoization", "without memoization"], ["lru_cache", "memoiz", "@cache"], "Task forbids memoization but design includes it"),
+        (["no caching", "without caching"], ["cache", "lru_cache", "redis", "memcach"], "Task forbids caching but design includes it"),
+        (["simple", "keep it simple"], ["abstract", "factory", "strategy pattern", "dependency injection"], "Task requests simplicity but design adds significant abstraction"),
+    ]
+
+    def _check_spec_compliance(self) -> GateCheck:
+        """Detect cases where the design_rationale contradicts explicit task constraints.
+
+        Only fires on clear keyword contradictions — this is deterministic pattern
+        matching, not an opinion check.  The LLM feasibility_recheck handles nuanced cases.
+        """
+        if not self.task_description:
+            return GateCheck(
+                name="spec_compliance",
+                passed=True,
+                hard_fail=True,
+                detail="No task description available; skipping spec compliance check.",
+            )
+
+        desc_lower = self.task_description.lower()
+        rationale_lower = self.plan.get("design_rationale", "").lower()
+        violations: list[str] = []
+
+        for task_kws, design_kws, message in self._SPEC_CONTRADICTION_PAIRS:
+            task_match = any(kw in desc_lower for kw in task_kws)
+            design_match = any(kw in rationale_lower for kw in design_kws)
+            if task_match and design_match:
+                violations.append(message)
+
+        if violations:
+            return GateCheck(
+                name="spec_compliance",
+                passed=False,
+                hard_fail=True,
+                detail=f"Design contradicts explicit task constraints: {'; '.join(violations)}.",
+            )
+        return GateCheck(
+            name="spec_compliance",
+            passed=True,
+            hard_fail=True,
+            detail="Design is consistent with task description constraints.",
+        )
+
+    # ------------------------------------------------------------------
     # Check 1: Interface completeness
     # ------------------------------------------------------------------
 
@@ -207,30 +436,85 @@ class PlanningGate:
             all_provides.update(provides)
             all_consumes.update(consumes)
 
+        # First pass: exact matches
         unresolved = all_consumes - all_provides
-        if unresolved:
-            filtered = {u for u in unresolved if _is_primitive_or_stdlib(u)}
-            real_unresolved = unresolved - filtered
-            if real_unresolved:
-                detail = f"Unresolved consumes: {', '.join(sorted(real_unresolved))}"
-                if filtered:
-                    detail += f" (auto-filtered stdlib/primitives: {', '.join(sorted(filtered))})"
-                return GateCheck(name="interface_completeness", passed=False, hard_fail=True, detail=detail)
+        if not unresolved:
+            return GateCheck(
+                name="interface_completeness",
+                passed=True,
+                hard_fail=True,
+                detail=f"{len(contracts)} contracts validated, all consumes resolved exactly.",
+            )
+
+        # Second pass: stdlib/primitive filtering
+        still_unresolved = set()
+        filtered_stdlib = set()
+        for u in unresolved:
+            if _is_primitive_or_stdlib(u, self.project_path):
+                filtered_stdlib.add(u)
+            else:
+                still_unresolved.add(u)
+        
+        if not still_unresolved:
             return GateCheck(
                 name="interface_completeness",
                 passed=True,
                 hard_fail=False,
-                detail=(
-                    f"Filtered {len(filtered)} stdlib/primitive consumes (not cross-task contracts): "
-                    f"{', '.join(sorted(filtered))}"
-                ),
+                detail=f"Filtered {len(filtered_stdlib)} stdlib/primitive consumes.",
             )
+
+        # Third pass: Fuzzy/Substring matching
+        # If a consumed item is a logical subset of a provided item, it's resolved.
+        # e.g. "Plant dataclass" matches "Plant dataclass with __post_init__ validation"
+        really_unresolved = set()
+        fuzzy_resolved = set()
+        
+        def normalize(s: str) -> str:
+            # Lowercase, remove non-alphanumeric, strip noise
+            import re
+            s = s.lower().strip()
+            # Remove " (v1.0)" or similar at the end
+            s = re.sub(r"\s*\(.*?\)$", "", s)
+            # Remove " with ...", " from ...", " for ..."
+            s = s.split(" with ")[0].split(" from ")[0].split(" for ")[0].strip()
+            # Remove trailing "s" (crude plural handling)
+            if s.endswith("s") and len(s) > 4:
+                s = s[:-1]
+            return s
+
+        norm_provides = {normalize(p): p for p in all_provides}
+        
+        for u in still_unresolved:
+            nu = normalize(u)
+            found = False
+            # Try normalized exact match
+            if nu in norm_provides:
+                found = True
+            else:
+                # Try substring match: is nu a substring of any normalized provide?
+                for np in norm_provides:
+                    if nu == np or (len(nu) > 3 and nu in np) or (len(np) > 3 and np in nu):
+                        found = True
+                        break
+            
+            if found:
+                fuzzy_resolved.add(u)
+            else:
+                really_unresolved.add(u)
+
+        if really_unresolved:
+            detail = f"Unresolved consumes (advisory): {', '.join(sorted(really_unresolved))}"
+            if filtered_stdlib or fuzzy_resolved:
+                detail += " (some entries were auto-filtered or fuzzy-matched)"
+            # Advisory only — the planning model can't reliably distinguish cross-module
+            # interfaces from function parameters. INDEV tests are the real arbiter.
+            return GateCheck(name="interface_completeness", passed=False, hard_fail=False, detail=detail)
 
         return GateCheck(
             name="interface_completeness",
             passed=True,
             hard_fail=True,
-            detail=f"{len(contracts)} contracts validated, all consumes resolved.",
+            detail=f"{len(contracts)} contracts validated, all consumes resolved (exact or fuzzy).",
         )
 
     # ------------------------------------------------------------------
@@ -238,9 +522,22 @@ class PlanningGate:
     # ------------------------------------------------------------------
 
     def _check_implementation_steps_present(self) -> GateCheck:
-        """Ensure the plan has at least one implementation step."""
+        """Ensure the plan has at least one implementation step, unless work is already done."""
         steps = self.plan.get("implementation_steps", [])
+        rationale = self.plan.get("design_rationale", "").lower()
+        
+        # Heuristics for "already complete"
+        already_done_keywords = ["already exist", "already complete", "already implemented", "no new files needed", "no implementation changes"]
+        is_already_done = any(k in rationale for k in already_done_keywords)
+
         if not steps:
+            if is_already_done:
+                return GateCheck(
+                    name="implementation_steps_present",
+                    passed=True,
+                    hard_fail=False,
+                    detail="No implementation steps defined, but rationale suggests work is already complete.",
+                )
             return GateCheck(
                 name="implementation_steps_present",
                 passed=False,
@@ -558,6 +855,7 @@ async def run_planning_gate(
     llm_id: int | None = None,
     budget_id: int | None = None,
     project_path: str | None = None,
+    task_description: str = "",
 ) -> dict:
     """Run the planning gate and return a result dict."""
     if project_path is not None:
@@ -572,6 +870,8 @@ async def run_planning_gate(
         llm_model=llm_model,
         llm_id=llm_id,
         budget_id=budget_id,
+        project_path=project_path,
+        task_description=task_description,
     )
     result = await gate.run()
     return {

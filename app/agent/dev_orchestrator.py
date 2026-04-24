@@ -19,6 +19,8 @@ from typing import Any
 
 from app.agent.config import (
     INDEV_COMPONENT_MAX_RETRIES,
+    INDEV_TEST_FIX_MAX_RETRIES,
+    INDEV_TEST_FIX_MAX_TURNS,
     PROJECT_ROOT,
     GIT_SAFETY_BRANCH_PREFIX,
 )
@@ -54,6 +56,7 @@ class DevOrchestrator:
         llm_id: int | None = None,
         budget_id: int | None = None,
         max_context: int = 0,
+        review_feedback: str | None = None,
     ):
         self.task_id = task_id
         self.plan = planning_result
@@ -63,6 +66,7 @@ class DevOrchestrator:
         self.llm_id = llm_id
         self.budget_id = budget_id
         self.max_context = max_context
+        self.review_feedback = review_feedback
 
     async def run(self) -> DevOrchestratorResult:
         """Execute all batches of components."""
@@ -75,6 +79,10 @@ class DevOrchestrator:
                 status="ERROR",
                 error_detail="No implementation steps in planning result.",
             )
+
+        # Bump run counter so this dispatch's results are isolated from prior runs.
+        from app.database import get_latest_dev_run_number
+        self._dev_run_number = get_latest_dev_run_number(self.task_id) + 1
 
         # Create branch
         try:
@@ -134,10 +142,15 @@ class DevOrchestrator:
                         batch_failed = True
 
                     # Store component result in DB
-                    self._store_component_result(result, batch_idx, i)
+                    self._store_component_result(result, batch_idx, i, self._dev_run_number)
 
             if batch_failed:
                 logger.warning("[dev_orch] Batch %d had failures, halting.", batch_idx + 1)
+                failed_components = [r for r in all_results if r.status not in ("ACCEPTED",)]
+                _lines = [f"Batch {batch_idx + 1}/{len(batches)} failed ({len(failed_components)} component(s)):"]
+                for _r in failed_components[:3]:
+                    _reason = _r.error_detail or _r.status
+                    _lines.append(f"  • {_r.component_name}: {_reason[:300]}")
                 return DevOrchestratorResult(
                     task_id=self.task_id,
                     status="REVERT_TO_DESIGN",
@@ -147,7 +160,7 @@ class DevOrchestrator:
                     files_changed=sorted(all_files),
                     prompt_tokens=total_prompt,
                     completion_tokens=total_completion,
-                    error_detail=f"Batch {batch_idx + 1} failed.",
+                    error_detail="\n".join(_lines),
                 )
 
             # Commit batch
@@ -158,7 +171,33 @@ class DevOrchestrator:
                 logger.warning("[dev_orch] Batch commit failed: %s", e)
 
         # Run full test suite
-        test_passed = await self._run_full_tests()
+        test_passed, test_output = await self._run_full_tests()
+
+        if not test_passed:
+            # Before demoting to planning, give the agent targeted fix attempts.
+            # This handles common cases like wrong base cases, off-by-one errors,
+            # or import issues that don't require redesigning anything.
+            for fix_attempt in range(1, INDEV_TEST_FIX_MAX_RETRIES + 1):
+                logger.info(
+                    "[dev_orch] Test suite failed — running test-fix loop %d/%d for task '%s'.",
+                    fix_attempt, INDEV_TEST_FIX_MAX_RETRIES, self.task_id,
+                )
+                fix_tokens_p, fix_tokens_c = await self._run_test_fix_loop(
+                    test_output, fix_attempt
+                )
+                total_prompt += fix_tokens_p
+                total_completion += fix_tokens_c
+                test_passed, test_output = await self._run_full_tests()
+                if test_passed:
+                    logger.info(
+                        "[dev_orch] Test-fix loop %d succeeded for task '%s'.",
+                        fix_attempt, self.task_id,
+                    )
+                    break
+                logger.warning(
+                    "[dev_orch] Test-fix loop %d still failing for task '%s'.",
+                    fix_attempt, self.task_id,
+                )
 
         return DevOrchestratorResult(
             task_id=self.task_id,
@@ -169,7 +208,10 @@ class DevOrchestrator:
             files_changed=sorted(all_files),
             prompt_tokens=total_prompt,
             completion_tokens=total_completion,
-            error_detail=None if test_passed else "Full test suite failed after all batches.",
+            error_detail=None if test_passed else (
+                f"Test suite failed after {INDEV_TEST_FIX_MAX_RETRIES} fix attempt(s).\n\n"
+                f"Last test output:\n{test_output}"
+            ),
         )
 
     def _build_batches(self, steps: list[dict]) -> list[list[dict]]:
@@ -252,11 +294,43 @@ class DevOrchestrator:
                 llm_id=self.llm_id,
                 budget_id=self.budget_id,
                 max_context=self.max_context,
+                review_feedback=self.review_feedback,
             )
             result = await loop.run()
 
             if result.status == "ACCEPTED":
                 return result
+                
+            if result.status == "TIMEOUT":
+                logger.info("[dev_orch] Component '%s' timed out. Triggering inline research.", component_name)
+                try:
+                    from app.agent.research import run_research
+                    research_question = (
+                        f"The implementation of component '{component_name}' is timing out during tests. "
+                        "Investigate the source code and the tests to identify any high-complexity algorithms "
+                        "(like naive Fibonacci) or infinite loops that might be causing the hang."
+                    )
+                    research_result = await run_research(
+                        question=research_question,
+                        context={"component": component_name, "step": self.step},
+                        task_id=self.task_id,
+                        llm_id=self.llm_id,
+                        budget_id=self.budget_id,
+                        llm_base_url=self.llm_base_url,
+                        llm_model=self.llm_model,
+                    )
+                    # Append findings to the review_feedback so the next retry (if any) sees it.
+                    findings_note = (
+                        f"\n\n[RESEARCH FINDINGS FOR TIMEOUT]\n"
+                        f"Verdict: {research_result.vote.get('verdict', 'unknown')}\n"
+                        f"Findings: {research_result.findings}"
+                    )
+                    if self.review_feedback:
+                        self.review_feedback += findings_note
+                    else:
+                        self.review_feedback = findings_note
+                except Exception as research_exc:
+                    logger.warning("[dev_orch] Inline research failed: %s", research_exc)
 
             if retry < INDEV_COMPONENT_MAX_RETRIES:
                 logger.info(
@@ -266,18 +340,124 @@ class DevOrchestrator:
 
         return result  # Last attempt result
 
-    async def _run_full_tests(self) -> bool:
-        """Run the full test suite and return True if passed."""
+    async def _run_full_tests(self) -> tuple[bool, str]:
+        """Run the full test suite. Returns (passed, output)."""
         from app.agent.tools import run_shell
         try:
-            output = run_shell("python -m pytest app/tests/ -x --tb=short -q")
-            return "failed" not in output.lower() and "error" not in output.lower()
+            output = run_shell("python -m pytest -x --tb=short -q 2>&1")
+            passed = "failed" not in output.lower() and "error" not in output.lower()
+            return passed, output[:6000]
         except Exception as e:
-            logger.warning("[dev_orch] Full test suite failed: %s", e)
-            return False
+            msg = f"Test runner error: {e}"
+            logger.warning("[dev_orch] %s", msg)
+            return False, msg
+
+    async def _run_test_fix_loop(
+        self, test_output: str, fix_attempt: int
+    ) -> tuple[int, int]:
+        """Agentic loop that reads failure output and makes targeted fixes.
+
+        Returns (prompt_tokens, completion_tokens) consumed during the loop.
+        Never raises — infrastructure errors are logged and the loop exits cleanly
+        so the caller can re-run the test suite and decide whether to demote.
+        """
+        from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
+        from app.agent.tools import dispatch_tool, TOOL_SCHEMAS
+
+        _FIX_TOOLS = {
+            "read_file", "read_file_harder", "count_lines",
+            "search_files", "find_files", "list_directory",
+            "write_file", "append_file",
+        }
+        tool_schemas = [s for s in TOOL_SCHEMAS if s["function"]["name"] in _FIX_TOOLS]
+
+        system_prompt = (
+            "You are a software developer. All implementation batches completed but the "
+            "test suite is still failing. Your job is to make the MINIMAL fix needed to "
+            "pass the tests — do not rewrite the implementation.\n\n"
+            "WORKFLOW:\n"
+            "1. Read the test failure output carefully to identify the root cause.\n"
+            "2. Read the relevant source file(s) to understand the current state.\n"
+            "3. Apply the smallest possible fix (e.g., wrong base case, missing import, "
+            "off-by-one error, wrong return value).\n"
+            "4. When done, output exactly: FIX_APPLIED: <one-line summary of what you changed>.\n"
+            "5. If you determine the failure requires a design change beyond a code fix, "
+            "output: NEEDS_REDESIGN: <reason>.\n\n"
+            "Do NOT rewrite whole files. Target the specific failing assertion."
+        )
+
+        messages: list[dict] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": (
+                f"Test-fix attempt {fix_attempt}/{INDEV_TEST_FIX_MAX_RETRIES}.\n\n"
+                f"Failing test output:\n```\n{test_output}\n```\n\n"
+                "Please identify the root cause and apply the minimal fix."
+            )},
+        ]
+
+        total_prompt = 0
+        total_completion = 0
+
+        try:
+            for turn in range(INDEV_TEST_FIX_MAX_TURNS):
+                if is_shutting_down():
+                    raise ShutdownError("shutting down")
+
+                response = await call_llm(
+                    messages,
+                    base_url=self.llm_base_url,
+                    model=self.llm_model,
+                    tools=tool_schemas,
+                    task_id=self.task_id,
+                    llm_id=self.llm_id,
+                    budget_id=self.budget_id,
+                    agent_name=f"DevOrchestrator[test-fix-{fix_attempt}]",
+                )
+                usage = response.get("usage", {})
+                total_prompt += usage.get("prompt_tokens", 0)
+                total_completion += usage.get("completion_tokens", 0)
+
+                choice = response.get("choices", [{}])[0]
+                msg = choice.get("message", {})
+                content = msg.get("content", "") or ""
+                tool_calls = msg.get("tool_calls") or []
+
+                messages.append(msg)
+
+                if "FIX_APPLIED:" in content or "NEEDS_REDESIGN:" in content:
+                    logger.info(
+                        "[dev_orch] test-fix-%d turn %d: %s",
+                        fix_attempt, turn + 1, content[:120],
+                    )
+                    break
+
+                if tool_calls:
+                    for tc in tool_calls:
+                        fn_name = tc["function"]["name"]
+                        fn_args_raw = tc["function"]["arguments"]
+                        fn_args = fn_args_raw if isinstance(fn_args_raw, dict) else json.loads(fn_args_raw)
+                        try:
+                            result_str = str(dispatch_tool(fn_name, fn_args))[:4000]
+                        except Exception as exc:
+                            result_str = f"Error: {exc}"
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": result_str,
+                        })
+                elif not content:
+                    break  # empty response — stop gracefully
+
+        except ShutdownError:
+            logger.info("[dev_orch] test-fix-%d interrupted by shutdown.", fix_attempt)
+        except Exception as exc:
+            logger.warning("[dev_orch] test-fix-%d loop error: %s", fix_attempt, exc)
+
+        return total_prompt, total_completion
 
     def _store_component_result(
-        self, result: ComponentLoopResult, batch_number: int, step_order: int
+        self, result: ComponentLoopResult, batch_number: int, step_order: int,
+        dev_run_number: int = 0,
     ) -> None:
         """Persist a component result to the database."""
         try:
@@ -287,6 +467,7 @@ class DevOrchestrator:
                 component_name=result.component_name,
                 step_order=step_order,
                 batch_number=batch_number,
+                dev_run_number=dev_run_number,
                 status=result.status,
                 files_changed=json.dumps(result.files_changed),
                 tests_passed=result.tests_passed,
@@ -314,6 +495,7 @@ async def run_dev_orchestrator(
     llm_id: int | None = None,
     budget_id: int | None = None,
     project_path: str | None = None,
+    review_feedback: str | None = None,
 ) -> dict:
     """Run the development orchestrator and return a result dict."""
     if project_path is not None:
@@ -336,6 +518,7 @@ async def run_dev_orchestrator(
         llm_id=llm_id,
         budget_id=budget_id,
         max_context=_max_context,
+        review_feedback=review_feedback,
     )
     result = await orch.run()
     return {

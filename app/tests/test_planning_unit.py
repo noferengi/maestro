@@ -12,6 +12,7 @@ import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from app.agent.planning_gate import PlanningGate
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -71,7 +72,7 @@ class TestAllChecksPass:
         with patch("app.agent.planning_gate.PLANNING_GATE_FEASIBILITY_RECHECK", False):
             result = _run(gate.run())
         assert result.passed is True
-        assert len(result.checks) == 7
+        assert len(result.checks) == 11
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +93,7 @@ class TestInterfaceCompleteness:
             result = _run(gate.run())
         check = _get_check(result, "interface_completeness")
         assert check.passed is False
-        assert check.hard_fail is True
+        assert check.hard_fail is False  # advisory-only: INDEV tests are the real arbiter
 
     def test_interface_resolved_consumes_pass(self):
         plan = {
@@ -316,6 +317,30 @@ class TestContextBudget:
 
 
 class TestRunPlanningGate:
+    def test_check_interface_completeness_existing_file_passes(self, tmp_path):
+        # Create a dummy project file
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        (src_dir / "existing.py").write_text("class Existing: pass")
+        
+        planning_result = {
+            "interface_contracts": [
+                {
+                    "component": "src/new_file.py",
+                    "provides": ["NewClass"],
+                    "consumes": [str(src_dir / "existing.py"), "src.existing"]
+                }
+            ]
+        }
+        
+        # Test direct _check_interface_completeness
+        # Use str(tmp_path) as project_path
+        gate = PlanningGate("test", planning_result, [], project_path=str(tmp_path))
+        check = gate._check_interface_completeness()
+        
+        assert check.passed
+        assert "Filtered" in check.detail or "all consumes resolved" in check.detail
+
     def test_run_planning_gate_returns_dict(self):
         from app.agent.planning_gate import run_planning_gate
 
@@ -330,7 +355,215 @@ class TestRunPlanningGate:
 
         assert "checks" in result
         assert isinstance(result["checks"], list)
-        assert len(result["checks"]) == 7
+        assert len(result["checks"]) == 11
         for check in result["checks"]:
             for field in ("name", "passed", "hard_fail", "detail"):
                 assert field in check, f"Missing field '{field}' in check {check['name']}"
+
+
+# ---------------------------------------------------------------------------
+# PlanningPipeline unit tests
+# ---------------------------------------------------------------------------
+
+import asyncio as _asyncio
+from unittest.mock import AsyncMock as _AsyncMock, patch as _patch
+
+
+def _run_async(coro):
+    loop = _asyncio.new_event_loop()
+    _asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def _make_pipeline(title="Write a function", description="A simple task."):
+    from app.agent.planning import PlanningPipeline
+    return PlanningPipeline(
+        task_id="test-task",
+        task_title=title,
+        task_description=description,
+        all_tasks=[],
+    )
+
+
+class TestFailedGenerationShortCircuit:
+    """failed_generation dummy from the judge must skip the reviewer panel."""
+
+    def test_reviewer_panel_skipped_when_all_designs_fail(self):
+        """When _stage_judge_designs returns failed_generation, _stage_design_review is not called."""
+        pipeline = _make_pipeline()
+        reviewer_calls: list = []
+
+        async def mock_survey(self):
+            return "SURVEY: empty greenfield project"
+
+        async def mock_generate(self, survey, best_of_n=None):
+            n = best_of_n or 5
+            return [{"error": "LLM timeout"} for _ in range(n)]
+
+        async def mock_review(self, design, survey):
+            reviewer_calls.append(design)
+            return []
+
+        async def mock_pitfall(self, design, survey):
+            return []
+
+        async def mock_consolidate(self, design, pitfalls, survey):
+            return design
+
+        with _patch.object(pipeline.__class__, "_stage_codebase_survey", mock_survey), \
+             _patch.object(pipeline.__class__, "_stage_design_generation", mock_generate), \
+             _patch.object(pipeline.__class__, "_stage_design_review", mock_review), \
+             _patch.object(pipeline.__class__, "_stage_pitfall_detection", mock_pitfall), \
+             _patch.object(pipeline.__class__, "_stage_consolidation", mock_consolidate), \
+             _patch("app.agent.planning.is_shutting_down", return_value=False), \
+             _patch("app.agent.planning.PlanningPipeline._store_result", return_value=None):
+            result = _run_async(pipeline.run())
+
+        assert reviewer_calls == [], (
+            "Reviewer panel must not be called when all design generation failed"
+        )
+
+    def test_failed_generation_recorded_as_rejected_vote(self):
+        """The failed_generation path injects a synthetic REJECTED vote so the loop retries."""
+        from app.agent.verdicts import Verdict
+        pipeline = _make_pipeline()
+
+        async def mock_survey(self):
+            return "SURVEY: empty project"
+
+        async def mock_generate(self, survey, best_of_n=None):
+            n = best_of_n or 5
+            return [{"error": "timeout"} for _ in range(n)]
+
+        async def mock_review(self, design, survey):
+            return []
+
+        async def mock_pitfall(self, design, survey):
+            return []
+
+        async def mock_consolidate(self, design, pitfalls, survey):
+            return design
+
+        with _patch.object(pipeline.__class__, "_stage_codebase_survey", mock_survey), \
+             _patch.object(pipeline.__class__, "_stage_design_generation", mock_generate), \
+             _patch.object(pipeline.__class__, "_stage_design_review", mock_review), \
+             _patch.object(pipeline.__class__, "_stage_pitfall_detection", mock_pitfall), \
+             _patch.object(pipeline.__class__, "_stage_consolidation", mock_consolidate), \
+             _patch("app.agent.planning.is_shutting_down", return_value=False), \
+             _patch("app.agent.planning.PlanningPipeline._store_result", return_value=None):
+            result = _run_async(pipeline.run())
+
+        # After all retries fail, the last review_votes should be the synthetic one
+        assert any(
+            v.verdict is Verdict.REJECTED
+            for v in result.review_votes
+        ), "Expected a synthetic REJECTED vote after failed generation"
+
+
+class TestComplexityClassifier:
+    """_is_simple_task() heuristics."""
+
+    def test_greenfield_keyword_simple(self):
+        from app.agent.planning import _is_simple_task
+        assert _is_simple_task("Build something", "A greenfield project") is True
+
+    def test_naive_keyword_simple(self):
+        from app.agent.planning import _is_simple_task
+        assert _is_simple_task("naive recursive Fibonacci", "Write a naive recursive function") is True
+
+    def test_short_description_simple(self):
+        from app.agent.planning import _is_simple_task
+        assert _is_simple_task("Add logging", "Add a log line.") is True
+
+    def test_long_complex_description_not_simple(self):
+        from app.agent.planning import _is_simple_task
+        long_desc = (
+            "Refactor the authentication middleware to support OAuth2 PKCE flows. "
+            "This involves updating the token validation pipeline, adding refresh-token "
+            "rotation, integrating with the existing session store, migrating existing "
+            "sessions gracefully, and updating the API documentation to reflect the "
+            "new authentication flow. Security review is required before merge."
+        )
+        assert _is_simple_task("OAuth2 PKCE refactor", long_desc) is False
+
+    def test_simple_task_gets_reduced_best_of_n(self):
+        """Simple tasks must use a smaller design pool in run()."""
+        from app.agent.planning import PlanningPipeline, PLANNING_BEST_OF_N
+        pipeline = _make_pipeline(
+            title="Write a recursive Fibonacci",
+            description="Write a naive recursive Fibonacci function in Python.",
+        )
+        generation_counts: list[int] = []
+
+        async def mock_survey(self):
+            return "SURVEY: empty project"
+
+        async def mock_generate(self, survey, best_of_n=None):
+            generation_counts.append(best_of_n or PLANNING_BEST_OF_N)
+            return [{"error": "timeout"} for _ in range(best_of_n or PLANNING_BEST_OF_N)]
+
+        async def mock_review(self, design, survey):
+            return []
+
+        async def mock_pitfall(self, design, survey):
+            return []
+
+        async def mock_consolidate(self, design, pitfalls, survey):
+            return design
+
+        with _patch.object(pipeline.__class__, "_stage_codebase_survey", mock_survey), \
+             _patch.object(pipeline.__class__, "_stage_design_generation", mock_generate), \
+             _patch.object(pipeline.__class__, "_stage_design_review", mock_review), \
+             _patch.object(pipeline.__class__, "_stage_pitfall_detection", mock_pitfall), \
+             _patch.object(pipeline.__class__, "_stage_consolidation", mock_consolidate), \
+             _patch("app.agent.planning.is_shutting_down", return_value=False), \
+             _patch("app.agent.planning.PlanningPipeline._store_result", return_value=None):
+            _run_async(pipeline.run())
+
+        assert all(n < PLANNING_BEST_OF_N for n in generation_counts), (
+            f"Simple task should use fewer than {PLANNING_BEST_OF_N} designs, got {generation_counts}"
+        )
+
+    def test_simple_task_uses_lite_reviewer_subset(self):
+        """Simple tasks must run fewer reviewers in _stage_design_review."""
+        from app.agent.planning import PlanningPipeline, _SIMPLE_TASK_REVIEWER_SUBSET
+        pipeline = _make_pipeline(
+            title="Write a recursive Fibonacci",
+            description="Write a naive recursive Fibonacci function.",
+        )
+        pipeline._is_simple = True  # force simple path
+
+        _MINIMAL_DESIGN = {
+            "design_rationale": "Simple recursive fib",
+            "file_manifest": [],
+            "implementation_steps": [],
+        }
+        reviewer_names_used: list[str] = []
+
+        original_call_llm_call = None
+
+        async def mock_call_llm(messages, **kwargs):
+            agent_name = kwargs.get("agent_name", "")
+            reviewer_names_used.append(agent_name)
+            return {
+                "choices": [{"message": {"content": '{"verdict":"LIKELY","confidence":95,"justification":"ok"}'}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 5},
+            }
+
+        with _patch("app.agent.planning.call_llm", mock_call_llm):
+            result = _run_async(pipeline._stage_design_review(_MINIMAL_DESIGN, "survey"))
+
+        full_reviewer_names = {r["name"] for r in [
+            {"name": "coupling_reviewer"}, {"name": "interface_reviewer"},
+            {"name": "testability_reviewer"}, {"name": "security_design_reviewer"},
+            {"name": "performance_reviewer"},
+        ]}
+        voted_verdicts = {v.stage for v in result}
+        skipped = full_reviewer_names - voted_verdicts
+        assert skipped, "Some reviewers should be skipped for simple tasks"
+        assert voted_verdicts.issubset(_SIMPLE_TASK_REVIEWER_SUBSET), (
+            f"Simple task should only use {_SIMPLE_TASK_REVIEWER_SUBSET}, got {voted_verdicts}"
+        )

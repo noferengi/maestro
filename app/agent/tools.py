@@ -57,6 +57,12 @@ _task_git_cwd: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "_task_git_cwd", default=None
 )
 
+# When True, read tools reject absolute paths that resolve outside effective_root.
+# Set only during the planning survey phase to prevent cross-project file reads.
+_restrict_reads_to_root: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_restrict_reads_to_root", default=False
+)
+
 _task_project_name: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "_task_project_name", default=None
 )
@@ -276,9 +282,18 @@ def _assert_safe_path(path: str) -> str:
     # Normalize mixed separators
     path = os.path.normpath(path)
     effective_root = _task_git_cwd.get() or PROJECT_ROOT
-    
+
     if os.path.isabs(path):
         resolved = os.path.realpath(path)
+        # Survey-phase restriction: reject absolute paths outside the project root so the
+        # planning survey cannot read files from unrelated projects on the same machine.
+        if _restrict_reads_to_root.get():
+            root_real = os.path.realpath(effective_root)
+            if not (resolved.startswith(root_real + os.sep) or resolved == root_real):
+                raise ValueError(
+                    f"Refusing to read outside project root {effective_root}; "
+                    "use a relative path instead."
+                )
     else:
         resolved = os.path.realpath(os.path.join(effective_root, path))
 
@@ -782,7 +797,15 @@ def read_file_harder(
     if end is not None and count is not None:
         return "ERROR: provide 'end' OR 'count', not both."
     if start is None:
-        req_start, req_end = 1, total
+        # Default: first ≤250 unserved lines
+        unserved = _next_unserved_range(norm, 1, total)
+        if unserved is None:
+            rel = os.path.relpath(safe_path, PROJECT_ROOT)
+            return (
+                f"ALREADY IN CONTEXT: all lines of '{rel}' have been served. "
+                f"Call read_file_harder('{rel}', start=N) to re-read a specific range."
+            )
+        req_start, req_end = unserved
     else:
         req_start = start
         if count is not None:
@@ -791,19 +814,29 @@ def read_file_harder(
             req_end = end
         else:
             req_end = start + _READ_FILE_MAX_LINES - 1
+    
+    # Clamp to actual file bounds
+    req_start = max(1, min(req_start, total))
+    req_end = max(req_start, min(req_end, total))
 
-    # Clip requested range to unserved lines (max 250)
-    unserved = _next_unserved_range(norm, req_start, min(req_end, total))
-    if unserved is None:
-        rel = os.path.relpath(safe_path, PROJECT_ROOT)
-        served = _get_prepped_files().get(norm, [])
-        next_hint = f" Next unserved: line {served[-1][1] + 1}." if served and served[-1][1] < total else ""
-        return (
-            f"ALREADY IN CONTEXT: lines {req_start}–{min(req_end, total)} of '{rel}' "
-            f"are already in this session (served: {_served_ranges_str(norm)}).{next_hint}"
-        )
+    # Capped at 250 lines per call
+    if req_end - req_start >= _READ_FILE_MAX_LINES:
+        req_end = req_start + _READ_FILE_MAX_LINES - 1
 
-    return _serve_file_lines(safe_path, unserved[0], unserved[1])
+    # Check if this exact range is already served
+    already_served = False
+    served_intervals = _get_prepped_files().get(norm, [])
+    for s, e in served_intervals:
+        if s <= req_start and e >= req_end:
+            already_served = True
+            break
+    
+    result = _serve_file_lines(safe_path, req_start, req_end)
+    if already_served:
+        header = f"(NOTE: lines {req_start}-{req_end} were already in context; repeating per request)\n"
+        return header + result
+    
+    return result
 
 
 def count_lines(path: str) -> str:
@@ -1152,6 +1185,10 @@ def git_create_branch(branch_name: str) -> str:
         )
     rc, out, err = _git_run(["git", "checkout", "-b", branch_name])
     if rc != 0:
+        if "already exists" in err:
+            rc2, cur, _ = _git_run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+            if rc2 == 0 and cur.strip() == branch_name:
+                return f"OK: branch '{branch_name}' already exists and is checked out."
         return f"ERROR: could not create branch '{branch_name}': {err}"
     return f"OK: created and checked out branch '{branch_name}'."
 
@@ -1183,6 +1220,55 @@ def git_checkout(branch: str) -> str:
     if rc != 0:
         return f"ERROR: git checkout '{branch}' failed: {err}"
     return f"OK: checked out '{branch}'."
+
+
+def git_restore(path: str) -> str:
+    """Restore a tracked file to its HEAD state, discarding all local changes.
+
+    Equivalent to `git restore <path>`. Use this to undo unintentional edits
+    to a file that should not have been modified. The file must be tracked by
+    git (i.e. it existed in the last commit).
+    """
+    try:
+        safe_path = _assert_safe_path(path)
+    except ValueError as exc:
+        return f"BLOCKED: {exc}"
+    rc, out, err = _git_run(["git", "restore", safe_path])
+    if rc != 0:
+        return f"ERROR: git restore '{path}' failed: {err or out}"
+    return f"OK: restored '{path}' to HEAD state."
+
+
+def git_add(path: str) -> str:
+    """Stage a specific file for the next commit.
+
+    Equivalent to `git add <path>`. Use this to stage individual files rather
+    than staging everything at once. The path must be inside the project root.
+    """
+    try:
+        safe_path = _assert_safe_write_path(path)
+    except ValueError as exc:
+        return f"BLOCKED: {exc}"
+    rc, out, err = _git_run(["git", "add", safe_path])
+    if rc != 0:
+        return f"ERROR: git add '{path}' failed: {err or out}"
+    return f"OK: staged '{path}'."
+
+
+def git_unstage(path: str) -> str:
+    """Unstage a file that was previously staged, keeping the working-tree changes.
+
+    Equivalent to `git restore --staged <path>`. Use this to remove a file
+    from the staging area without discarding the edits in the file itself.
+    """
+    try:
+        safe_path = _assert_safe_path(path)
+    except ValueError as exc:
+        return f"BLOCKED: {exc}"
+    rc, out, err = _git_run(["git", "restore", "--staged", safe_path])
+    if rc != 0:
+        return f"ERROR: git unstage '{path}' failed: {err or out}"
+    return f"OK: unstaged '{path}' (changes preserved in working tree)."
 
 
 # ---------------------------------------------------------------------------
@@ -1377,18 +1463,41 @@ def web_search(query: str, count: int = 5) -> str:
         raise ShutdownError("Server is shutting down")
 
     import json as _json
-    from app.database import get_search_cache, create_search_cache
-    from app.agent.config import BRAVE_API_KEY, SEARCH_PROVIDER
+    from datetime import datetime, timedelta, timezone
+    from app.database import get_search_cache, create_search_cache, get_last_search_time
+    from app.agent.config import BRAVE_API_KEY, TAVILY_API_KEY, SEARCH_PROVIDER
 
     # 1. Check local cache first
     q = query.strip()
-    cached = get_search_cache(q)
+    provider = SEARCH_PROVIDER.lower()
+    cached = get_search_cache(q, provider=provider)
     if cached:
-        logger.info("Search Cache HIT for query: '%s'", q)
+        logger.info("Search Cache HIT for query: '%s' (provider: %s)", q, provider)
         return cached.result_json
 
-    # 2. Cache miss - call the selected search provider
-    provider = SEARCH_PROVIDER.lower()
+    # 2. Rate limit check (only if we are about to make a REAL API call)
+    last_search = get_last_search_time()
+    if last_search:
+        # DB stores naive UTC, convert to timezone-aware UTC for comparison
+        if last_search.tzinfo is None:
+            last_search = last_search.replace(tzinfo=timezone.utc)
+        
+        now = datetime.now(timezone.utc)
+        diff = now - last_search
+        limit_minutes = 30
+        if diff < timedelta(minutes=limit_minutes):
+            wait_remaining = timedelta(minutes=limit_minutes) - diff
+            wait_secs = int(wait_remaining.total_seconds())
+            wait_mins = wait_secs // 60
+            wait_remainder_secs = wait_secs % 60
+            return (
+                f"ERROR: Rate limit exceeded for search provider '{provider}'. "
+                f"To respect our 1000 queries/month budget, we only allow one search every {limit_minutes} minutes. "
+                f"Please wait {wait_mins}m {wait_remainder_secs}s or use cached results. "
+                "Try refining your query or checking if a similar search was already done."
+            )
+
+    # 3. Cache miss - call the selected search provider
     search_results = []
 
     try:
@@ -1400,8 +1509,13 @@ def web_search(query: str, count: int = 5) -> str:
                 return "ERROR: BRAVE_API_KEY not set but search_provider='brave'. Web search is unavailable."
             logger.info("Search Cache MISS for query: '%s' - calling Brave Search API", q)
             search_results = _brave_search(q, count, BRAVE_API_KEY)
+        elif provider == "tavily":
+            if not TAVILY_API_KEY:
+                return "ERROR: TAVILY_API_KEY not set but search_provider='tavily'. Web search is unavailable."
+            logger.info("Search Cache MISS for query: '%s' - calling Tavily Search API", q)
+            search_results = _tavily_search(q, count, TAVILY_API_KEY)
         else:
-            return f"ERROR: Unknown search_provider '{provider}'. Supported: duckduckgo, brave."
+            return f"ERROR: Unknown search_provider '{provider}'. Supported: duckduckgo, brave, tavily."
 
         final_json = _json.dumps({"query": q, "provider": provider, "results": search_results}, indent=2)
 
@@ -1410,7 +1524,11 @@ def web_search(query: str, count: int = 5) -> str:
 
         return final_json
     except ImportError as e:
-        lib = "duckduckgo-search" if provider == "duckduckgo" else "brave"
+        lib = {
+            "duckduckgo": "duckduckgo-search",
+            "brave": "brave",
+            "tavily": "tavily-python"
+        }.get(provider, provider)
         return f"ERROR: '{lib}' python library not installed. Run 'pip install {lib}' to enable web search. (ImportError: {e})"
     except Exception as exc:
         return f"ERROR: {provider.capitalize()} search failed: {exc}"
@@ -1437,7 +1555,34 @@ def _brave_search(query: str, count: int, api_key: str) -> list[dict]:
     """Internal helper: execute search via Brave Search API."""
     from brave import Brave
     brave = Brave(api_key=api_key)
-    results = brave.search(q=query, count=min(count, 10))
+    # The brave-search python library might have a different API, 
+    # but we follow the established pattern.
+    raw_results = brave.search(q=query, count=min(count, 10))
+    # Standardize to our format
+    results = []
+    for r in raw_results:
+        results.append({
+            "title": r.get("title", "No Title"),
+            "url": r.get("url", "No URL"),
+            "description": r.get("description", "No Description"),
+        })
+    return results
+
+
+def _tavily_search(query: str, count: int, api_key: str) -> list[dict]:
+    """Internal helper: execute search via Tavily Search API."""
+    from tavily import TavilyClient
+    client = TavilyClient(api_key=api_key)
+    response = client.search(query=query, max_results=min(count, 15))
+    
+    results = []
+    for r in response.get("results", []):
+        results.append({
+            "title": r.get("title", "No Title"),
+            "url": r.get("url", "No URL"),
+            "description": r.get("content", "No Description"),
+        })
+    return results
 
     search_results = []
     if hasattr(results, 'web') and hasattr(results.web, 'results'):
@@ -1523,7 +1668,7 @@ def get_task(task_id: str) -> str:
         task = db.get_task(task_id)
         if task is None:
             return f"ERROR: Task '{task_id}' not found."
-        return json.dumps({
+        result = {
             "id": task.id,
             "title": task.title,
             "type": task.type,
@@ -1535,7 +1680,23 @@ def get_task(task_id: str) -> str:
             "position": task.position,
             "created_at": task.created_at.isoformat() if task.created_at else None,
             "updated_at": task.updated_at.isoformat() if task.updated_at else None,
-        }, indent=2)
+        }
+
+        # Enhance with planning result if available
+        try:
+            from app.database import get_latest_planning_result
+            planning = get_latest_planning_result(task_id)
+            if planning:
+                result["planning"] = {
+                    "file_manifest": json.loads(planning.file_manifest) if planning.file_manifest else [],
+                    "implementation_steps": json.loads(planning.implementation_steps) if planning.implementation_steps else [],
+                    "interface_contracts": json.loads(planning.interface_contracts) if planning.interface_contracts else [],
+                    "test_strategy": json.loads(planning.test_strategy) if planning.test_strategy else "",
+                }
+        except Exception as e:
+            logger.warning("[tools] failed to fetch planning result for task %s: %s", task_id, e)
+
+        return json.dumps(result, indent=2)
     except Exception as exc:
         return f"ERROR fetching task '{task_id}': {exc}"
 
@@ -1765,24 +1926,338 @@ def _run_shell_review_wrapper(command: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# In-dev allowlisted shell (test/lint runners only)
+# Named shell tool implementations (one tool per operation)
+# ---------------------------------------------------------------------------
+# These are the LLM-visible tools.  Each one hardcodes a specific command and
+# delegates to the stage-specific allowlisted runner below for venv/timeout
+# handling.  The LLM never needs to guess what's allowed — the tool name IS
+# the command.
+# ---------------------------------------------------------------------------
+
+def _make_py_cmd(base: str, cwd: str) -> str:
+    """Rewrite 'python' in base to the project venv's Python interpreter."""
+    from app.agent.worktree import venv_python as _vp
+    py = _vp(cwd)
+    if py != "python":
+        return re.sub(r"^python\b", py.replace("\\", "/"), base)
+    return base
+
+
+def _run_named_tool_cmd(cmd: str, stage: str = "indev") -> str:
+    """Route a hardcoded command through the appropriate stage runner."""
+    if stage == "indev":
+        return run_shell_indev(cmd)
+    if stage == "build":
+        return run_shell_build(cmd)
+    if stage == "deps":
+        return run_shell_deps(cmd)
+    if stage == "security":
+        from app.agent.security_review import run_shell_security
+        return run_shell_security(cmd)
+    return f"ERROR: unknown stage '{stage}'"
+
+
+# --- Testing / linting ---
+
+def run_pytest(path: str = ".", flags: str = "") -> str:
+    """Run pytest in the task's project directory.
+
+    path: file or directory to test (default: current directory).
+    flags: additional pytest flags (e.g. '-v', '-k test_foo', '--tb=short').
+    A per-test timeout of 300s is injected automatically unless pytest.ini already sets one.
+    """
+    cmd = f"python -m pytest {path}"
+    if flags:
+        cmd += f" {flags}"
+    return run_shell_indev(cmd)
+
+
+def run_mypy(path: str, flags: str = "") -> str:
+    """Run mypy type-checker on the given path.
+
+    path: file or package to type-check.
+    flags: additional mypy flags (e.g. '--strict', '--ignore-missing-imports').
+    """
+    cmd = f"python -m mypy {path}"
+    if flags:
+        cmd += f" {flags}"
+    return run_shell_indev(cmd)
+
+
+def run_ruff(path: str = ".", flags: str = "") -> str:
+    """Run ruff linter on the given path.
+
+    path: file or directory to lint (default: current directory).
+    flags: additional ruff flags (e.g. '--fix', '--select E,F').
+    """
+    cmd = f"python -m ruff check {path}"
+    if flags:
+        cmd += f" {flags}"
+    return run_shell_indev(cmd)
+
+
+def run_black_check(path: str = ".") -> str:
+    """Check code formatting with black (read-only, does not modify files).
+
+    path: file or directory to check (default: current directory).
+    Use write_file to apply black's suggested formatting manually.
+    """
+    return run_shell_indev(f"python -m black --check {path}")
+
+
+def run_unittest(args: str = "") -> str:
+    """Run the Python unittest test runner.
+
+    args: module, class, or method to run (e.g. 'tests.test_foo', or empty for discovery).
+    """
+    cmd = "python -m unittest"
+    if args:
+        cmd += f" {args}"
+    return run_shell_indev(cmd)
+
+
+def run_npm_test(args: str = "") -> str:
+    """Run npm test in the task's project directory.
+
+    args: additional arguments passed to the test runner.
+    """
+    cmd = "npm test"
+    if args:
+        cmd += f" {args}"
+    return run_shell_indev(cmd)
+
+
+def run_cargo_test(args: str = "") -> str:
+    """Run cargo test in the task's project directory.
+
+    args: additional arguments (e.g. '--release', '-- --nocapture').
+    """
+    cmd = "cargo test"
+    if args:
+        cmd += f" {args}"
+    return run_shell_indev(cmd)
+
+
+def run_go_test(path: str = "./...", flags: str = "") -> str:
+    """Run go test in the task's project directory.
+
+    path: package path to test (default: ./... for all packages).
+    flags: additional go test flags (e.g. '-v', '-run TestFoo').
+    """
+    cmd = f"go test {path}"
+    if flags:
+        cmd += f" {flags}"
+    return run_shell_indev(cmd)
+
+
+# --- Build ---
+
+def run_make(target: str, args: str = "") -> str:
+    """Run a make target in the task's project directory.
+
+    target: Makefile target (e.g. 'build', 'test', 'lint', 'all').
+    args: additional arguments to pass to make.
+    """
+    cmd = f"make {target}"
+    if args:
+        cmd += f" {args}"
+    return run_shell_build(cmd)
+
+
+def run_cargo_build(args: str = "") -> str:
+    """Build a Rust/Cargo project.
+
+    args: additional cargo build flags (e.g. '--release', '--features foo').
+    """
+    cmd = "cargo build"
+    if args:
+        cmd += f" {args}"
+    return run_shell_build(cmd)
+
+
+def run_go_build(args: str = "") -> str:
+    """Build a Go project.
+
+    args: additional go build flags (e.g. '-o bin/app', './cmd/...').
+    """
+    cmd = "go build"
+    if args:
+        cmd += f" {args}"
+    return run_shell_build(cmd)
+
+
+def run_npm_build(script: str = "build") -> str:
+    """Run an npm build script.
+
+    script: the npm script name (default: 'build'). Runs 'npm run <script>'.
+    """
+    return run_shell_build(f"npm run {script}")
+
+
+def run_tsc(args: str = "") -> str:
+    """Run the TypeScript compiler (tsc).
+
+    args: additional tsc flags (e.g. '--noEmit', '--watch').
+    """
+    cmd = "tsc"
+    if args:
+        cmd += f" {args}"
+    return run_shell_build(cmd)
+
+
+def run_gradle(target: str, args: str = "") -> str:
+    """Run a Gradle task.
+
+    target: Gradle task name (e.g. 'build', 'test', 'assemble').
+    args: additional Gradle flags.
+    """
+    cmd = f"gradle {target}"
+    if args:
+        cmd += f" {args}"
+    return run_shell_build(cmd)
+
+
+def run_mvn(goal: str, args: str = "") -> str:
+    """Run a Maven goal.
+
+    goal: Maven lifecycle phase or plugin goal (e.g. 'package', 'test', 'compile').
+    args: additional Maven flags (e.g. '-DskipTests', '-Dmaven.test.failure.ignore').
+    """
+    cmd = f"mvn {goal}"
+    if args:
+        cmd += f" {args}"
+    return run_shell_build(cmd)
+
+
+# --- Dependencies ---
+
+def run_pip_install(args: str) -> str:
+    """Install Python packages with pip.
+
+    args: pip install arguments (e.g. '-r requirements.txt', 'requests>=2.28', '-e .').
+    Call this after modifying requirements.txt or pyproject.toml.
+    """
+    return run_shell_deps(f"python -m pip install {args}")
+
+
+def run_npm_install(args: str = "") -> str:
+    """Install Node.js dependencies with npm.
+
+    args: additional npm install flags (e.g. '--save-dev', '--legacy-peer-deps').
+    Call this after modifying package.json.
+    """
+    cmd = "npm install"
+    if args:
+        cmd += f" {args}"
+    return run_shell_deps(cmd)
+
+
+def run_cargo_fetch() -> str:
+    """Fetch Rust/Cargo dependencies (cargo fetch).
+
+    Call this after modifying Cargo.toml before building.
+    """
+    return run_shell_deps("cargo fetch")
+
+
+# --- Security scanners ---
+
+def run_bandit(path: str = ".", args: str = "") -> str:
+    """Run the bandit Python security linter.
+
+    path: directory or file to scan (default: current directory).
+    args: additional bandit flags (e.g. '-ll', '-r', '--skip B101').
+    """
+    cmd = f"python -m bandit -r {path}"
+    if args:
+        cmd += f" {args}"
+    from app.agent.security_review import run_shell_security
+    return run_shell_security(cmd)
+
+
+def run_pip_audit() -> str:
+    """Audit installed Python packages for known vulnerabilities (pip-audit)."""
+    from app.agent.security_review import run_shell_security
+    return run_shell_security("python -m pip audit")
+
+
+def run_semgrep(path: str = ".", config: str = "auto") -> str:
+    """Run semgrep static analysis.
+
+    path: file or directory to scan (default: current directory).
+    config: semgrep config/ruleset (default: 'auto' for auto-detection).
+    """
+    from app.agent.security_review import run_shell_security
+    return run_shell_security(f"semgrep --config {config} {path}")
+
+
+def run_npm_audit() -> str:
+    """Run npm audit to check Node.js dependencies for vulnerabilities."""
+    from app.agent.security_review import run_shell_security
+    return run_shell_security("npm audit")
+
+
+# ---------------------------------------------------------------------------
+# Allowlisted shell runners — indev (test/lint), build, deps
+# (internal — not exposed in TOOL_SCHEMAS; named tools above delegate here)
 # ---------------------------------------------------------------------------
 
 _INDEV_ALLOWLIST_PATTERNS: list[str] = [
     r"^python\s+-m\s+pytest\b",
+    r"^python\s+-m\s+unittest\b",
     r"^python\s+-m\s+mypy\b",
     r"^python\s+-m\s+ruff\b",
     r"^python\s+-m\s+black\s+--check\b",
     r"^npm\s+test\b",
-    r"^npm\s+run\s+(?:test|build|lint|typecheck)\b",
+    r"^npm\s+run\s+(?:test|lint|typecheck)\b",
     r"^cargo\s+test\b",
     r"^go\s+test\b",
-    r"^make\s+(?:test|build|lint)\b",
+    r"^make\s+(?:test|lint|check)\b",
+    r"^ctest\b",
+    r"^gradle\s+test\b",
+    r"^\.\/gradlew\s+test\b",
+    r"^mvn\s+test\b",
 ]
 _INDEV_ALLOWLIST_RE = [re.compile(p) for p in _INDEV_ALLOWLIST_PATTERNS]
 
+_BUILD_ALLOWLIST_PATTERNS: list[str] = [
+    r"^cmake\b",
+    r"^make\b",
+    r"^ninja\b",
+    r"^cargo\s+build\b",
+    r"^go\s+build\b",
+    r"^npm\s+run\s+build\b",
+    r"^gradle\b",
+    r"^\.\/gradlew\b",
+    r"^mvn\s+(?:package|compile)\b",
+    r"^msbuild\b",
+    r"^bazel\s+build\b",
+    r"^xcodebuild\b",
+    r"^tsc\b",
+]
+_BUILD_ALLOWLIST_RE = [re.compile(p) for p in _BUILD_ALLOWLIST_PATTERNS]
 
-def run_shell_indev(command: str) -> str:
+_DEPS_ALLOWLIST_PATTERNS: list[str] = [
+    r"^python\s+-m\s+pip\s+install\b",
+    r"^npm\s+install\b",
+    r"^npm\s+ci\b",
+    r"^yarn\s+install\b",
+    r"^pnpm\s+install\b",
+    r"^cargo\s+(?:fetch|update)\b",
+    r"^go\s+mod\s+(?:download|tidy|vendor)\b",
+    r"^bundle\s+install\b",
+    r"^composer\s+install\b",
+    r"^mvn\s+dependency:resolve\b",
+    r"^gradle\s+dependencies\b",
+    r"^\.\/gradlew\s+dependencies\b",
+]
+_DEPS_ALLOWLIST_RE = [re.compile(p) for p in _DEPS_ALLOWLIST_PATTERNS]
+
+_BUILD_TIMEOUT_SECONDS = 300
+_DEPS_TIMEOUT_SECONDS = 600
+
+
+def run_shell_indev(command: str, timeout: int | None = None) -> str:
     """Execute an allowlisted development command in the task's project directory.
 
     Only commands matching _INDEV_ALLOWLIST_PATTERNS are permitted.
@@ -1800,21 +2275,169 @@ def run_shell_indev(command: str) -> str:
     if not allowed:
         return f"Command not in allowlist: {command}"
 
+    # Lazy env setup: detect project type and create venv/install deps if needed.
+    from app.agent.worktree import setup_test_environment, venv_python as _venv_python
+    setup_test_environment(cwd)
+
+    # Replace bare `python` with the project venv's Python so test runs are
+    # isolated from whatever interpreter happens to be on the system PATH.
+    _py = _venv_python(cwd)
+    if _py != "python":
+        command = re.sub(r"^python\b", _py.replace("\\", "/"), command)
+
+    # Use provided timeout or global default
+    effective_timeout = timeout if timeout is not None else SHELL_TIMEOUT_SECONDS
+
+    # Inject per-test timeout into pytest invocations so a single hanging test
+    # cannot block the process indefinitely — but only when no project-level
+    # pytest config already sets one (pytest.ini, pyproject.toml, setup.cfg).
+    if re.search(r"\bpytest\b", command) and "--timeout" not in command:
+        _has_timeout_config = False
+        for _cfg in ("pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"):
+            _cfg_path = os.path.join(cwd, _cfg)
+            if os.path.isfile(_cfg_path):
+                try:
+                    with open(_cfg_path) as _f:
+                        content = _f.read()
+                        if "timeout" in content:
+                            _has_timeout_config = True
+                            break
+                except OSError:
+                    pass
+        if not _has_timeout_config:
+            # Floor of 60s for the injected per-test timeout unless global is lower.
+            injected = max(60, effective_timeout // 2) if effective_timeout > 60 else effective_timeout
+            command = command.rstrip() + f" --timeout={injected}"
+
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             command,
             shell=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            timeout=SHELL_TIMEOUT_SECONDS,
             cwd=cwd,
         )
-        output = result.stdout + result.stderr
-        return output[:8000] if output else f"EXIT_CODE: {result.returncode}"
-    except subprocess.TimeoutExpired:
-        return f"ERROR: Command timed out after {SHELL_TIMEOUT_SECONDS} seconds."
+        try:
+            stdout, _ = proc.communicate(timeout=effective_timeout)
+        except subprocess.TimeoutExpired:
+            # On Windows, kill the entire process tree; on Unix, kill the group.
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True,
+                )
+            else:
+                proc.kill()
+            proc.communicate()
+            return (
+                f"ERROR: Command timed out after {effective_timeout}s. "
+                "This may indicate a hang, infinite loop, or high computational "
+                "complexity (e.g. O(2^n) Fibonacci) being tested with large inputs."
+            )
+        output = stdout or ""
+        rc = proc.returncode
+        result_str = output[:8000] if output else ""
+        return result_str if result_str else f"EXIT_CODE: {rc}"
     except Exception as exc:
         return f"ERROR running command: {exc}"
+
+
+def run_shell_build(command: str, timeout: int | None = None) -> str:
+    """Execute an allowlisted build command in the task's project directory.
+
+    Only commands matching _BUILD_ALLOWLIST_PATTERNS are permitted.
+    cwd is resolved from the per-task context (_task_git_cwd).
+    """
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return (
+            "ERROR: No task git working directory configured. "
+            "Call set_task_git_cwd(project_path) before using run_shell_build."
+        )
+
+    command = command.strip()
+    allowed = any(pat.match(command) for pat in _BUILD_ALLOWLIST_RE)
+    if not allowed:
+        return f"Command not in build allowlist: {command}"
+
+    from app.agent.worktree import setup_test_environment
+    setup_test_environment(cwd)
+
+    effective_timeout = timeout if timeout is not None else _BUILD_TIMEOUT_SECONDS
+
+    try:
+        proc = subprocess.Popen(
+            command, shell=True, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, cwd=cwd,
+        )
+        try:
+            stdout, _ = proc.communicate(timeout=effective_timeout)
+        except subprocess.TimeoutExpired:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+            else:
+                proc.kill()
+            proc.communicate()
+            return f"ERROR: Build timed out after {effective_timeout}s."
+        output = stdout or ""
+        rc = proc.returncode
+        result_str = output[:8000] if output else ""
+        return result_str if result_str else f"EXIT_CODE: {rc}"
+    except Exception as exc:
+        return f"ERROR running build: {exc}"
+
+
+def run_shell_deps(command: str, timeout: int | None = None) -> str:
+    """Install or update project dependencies using an allowlisted package manager command.
+
+    Only commands matching _DEPS_ALLOWLIST_PATTERNS are permitted (pip install,
+    npm install, cargo fetch, go mod download/tidy, etc.).
+    cwd is resolved from the per-task context (_task_git_cwd).
+    For Python projects, `python` is rewritten to the project venv's Python.
+    """
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return (
+            "ERROR: No task git working directory configured. "
+            "Call set_task_git_cwd(project_path) before using run_shell_deps."
+        )
+
+    command = command.strip()
+    allowed = any(pat.match(command) for pat in _DEPS_ALLOWLIST_RE)
+    if not allowed:
+        return f"Command not in deps allowlist: {command}"
+
+    # Ensure venv exists before pip commands attempt to install into it.
+    from app.agent.worktree import setup_test_environment, venv_python as _venv_python
+    setup_test_environment(cwd)
+
+    _py = _venv_python(cwd)
+    if _py != "python":
+        command = re.sub(r"^python\b", _py.replace("\\", "/"), command)
+
+    effective_timeout = timeout if timeout is not None else _DEPS_TIMEOUT_SECONDS
+
+    try:
+        proc = subprocess.Popen(
+            command, shell=True, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, cwd=cwd,
+        )
+        try:
+            stdout, _ = proc.communicate(timeout=effective_timeout)
+        except subprocess.TimeoutExpired:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+            else:
+                proc.kill()
+            proc.communicate()
+            return f"ERROR: Deps install timed out after {effective_timeout}s."
+        output = stdout or ""
+        rc = proc.returncode
+        result_str = output[:8000] if output else ""
+        return result_str if result_str else f"EXIT_CODE: {rc}"
+    except Exception as exc:
+        return f"ERROR running deps: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -1841,6 +2464,9 @@ TOOL_REGISTRY: dict[str, Any] = {
     "git_create_branch": git_create_branch,
     "git_commit": git_commit,
     "git_checkout": git_checkout,
+    "git_restore": git_restore,
+    "git_add": git_add,
+    "git_unstage": git_unstage,
     "get_task": get_task,
     "list_tasks": list_tasks,
     "update_task_status": update_task_status,
@@ -1857,6 +2483,34 @@ TOOL_REGISTRY: dict[str, Any] = {
     "run_shell_security": _run_shell_security_wrapper,
     "run_shell_review": _run_shell_review_wrapper,
     "run_shell_indev": run_shell_indev,
+    "run_shell_build": run_shell_build,
+    "run_shell_deps": run_shell_deps,
+    # Named testing tools
+    "run_pytest": run_pytest,
+    "run_mypy": run_mypy,
+    "run_ruff": run_ruff,
+    "run_black_check": run_black_check,
+    "run_unittest": run_unittest,
+    "run_npm_test": run_npm_test,
+    "run_cargo_test": run_cargo_test,
+    "run_go_test": run_go_test,
+    # Named build tools
+    "run_make": run_make,
+    "run_cargo_build": run_cargo_build,
+    "run_go_build": run_go_build,
+    "run_npm_build": run_npm_build,
+    "run_tsc": run_tsc,
+    "run_gradle": run_gradle,
+    "run_mvn": run_mvn,
+    # Named dependency tools
+    "run_pip_install": run_pip_install,
+    "run_npm_install": run_npm_install,
+    "run_cargo_fetch": run_cargo_fetch,
+    # Named security scanner tools
+    "run_bandit": run_bandit,
+    "run_pip_audit": run_pip_audit,
+    "run_semgrep": run_semgrep,
+    "run_npm_audit": run_npm_audit,
     "get_project_summary": get_project_summary,
     "get_directory_summary": get_directory_summary,
     "get_module_summary": get_module_summary,
@@ -2365,59 +3019,381 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    # ---- git file operations ----
     {
         "type": "function",
         "function": {
-            "name": "run_shell_security",
+            "name": "git_restore",
             "description": (
-                "Execute a shell command from the security scanner allowlist. "
-                "Only permits: bandit, safety, pip-audit, semgrep, trivy, grype, syft, trufflehog. "
-                "All other commands are blocked."
+                "Restore a tracked file to its HEAD state, discarding all local changes. "
+                "Use this to undo unintentional edits to a file that should not have been modified. "
+                "The file must be tracked by git (i.e. it existed in the last commit). "
+                "Does NOT affect staged files — use git_unstage first if the file is staged."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "The shell command to run (must match allowlist)."},
+                    "path": {"type": "string", "description": "Path to the file to restore (relative to project root)."},
                 },
-                "required": ["command"],
+                "required": ["path"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "run_shell_review",
+            "name": "git_add",
             "description": (
-                "Execute a shell command from the review runner allowlist. "
-                "Only permits: pytest, ruff, mypy, black --check, npm test, npm run lint. "
-                "All other commands are blocked."
+                "Stage a specific file for the next commit. "
+                "Use this to control exactly which files are included in a commit. "
+                "Prefer this over git_commit's auto-staging when you want to commit only a subset of changed files."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "The shell command to run (must match allowlist)."},
+                    "path": {"type": "string", "description": "Path to the file to stage (relative to project root)."},
                 },
-                "required": ["command"],
+                "required": ["path"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "run_shell_indev",
+            "name": "git_unstage",
             "description": (
-                "Execute an allowlisted development command in the task's project directory. "
-                "Permitted: python -m pytest, python -m mypy, python -m ruff, "
-                "python -m black --check, npm test, npm run (test|build|lint|typecheck), "
-                "cargo test, go test, make (test|build|lint). "
-                "All other commands are blocked. cwd is the task's project directory."
+                "Remove a file from the staging area without discarding working-tree changes. "
+                "Use this to correct an accidental git_add. The file's edits are preserved."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "The command to run (must match allowlist)."},
+                    "path": {"type": "string", "description": "Path to the file to unstage (relative to project root)."},
                 },
-                "required": ["command"],
+                "required": ["path"],
+            },
+        },
+    },
+    # ---- Named testing / linting tools ----
+    {
+        "type": "function",
+        "function": {
+            "name": "run_pytest",
+            "description": (
+                "Run pytest in the task's project directory. "
+                "The project venv's Python is used automatically. "
+                "A per-test timeout of 300s is injected unless pytest.ini already sets one."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File or directory to test (default: '.' for all tests)."},
+                    "flags": {"type": "string", "description": "Additional pytest flags (e.g. '-v', '-k test_foo', '--tb=short')."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_mypy",
+            "description": "Run mypy type-checker on the given path. The project venv's Python is used.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File or package to type-check."},
+                    "flags": {"type": "string", "description": "Additional mypy flags (e.g. '--strict', '--ignore-missing-imports')."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_ruff",
+            "description": "Run ruff linter on the given path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File or directory to lint (default: '.')."},
+                    "flags": {"type": "string", "description": "Additional ruff flags (e.g. '--fix', '--select E,F')."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_black_check",
+            "description": "Check code formatting with black (read-only — does not modify files).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File or directory to check (default: '.')."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_unittest",
+            "description": "Run Python unittest discovery or a specific test module/class/method.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "args": {"type": "string", "description": "Module, class, or method (e.g. 'tests.test_foo'). Leave empty for full discovery."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_npm_test",
+            "description": "Run npm test in the task's project directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "args": {"type": "string", "description": "Additional arguments to pass to the test runner."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_cargo_test",
+            "description": "Run cargo test in the task's project directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "args": {"type": "string", "description": "Additional cargo test flags (e.g. '--release', '-- --nocapture')."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_go_test",
+            "description": "Run go test in the task's project directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Package path to test (default: './...' for all packages)."},
+                    "flags": {"type": "string", "description": "Additional go test flags (e.g. '-v', '-run TestFoo')."},
+                },
+                "required": [],
+            },
+        },
+    },
+    # ---- Named build tools ----
+    {
+        "type": "function",
+        "function": {
+            "name": "run_make",
+            "description": "Run a Makefile target in the task's project directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "Makefile target (e.g. 'build', 'test', 'lint', 'all')."},
+                    "args": {"type": "string", "description": "Additional make arguments."},
+                },
+                "required": ["target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_cargo_build",
+            "description": "Build a Rust/Cargo project (cargo build).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "args": {"type": "string", "description": "Additional cargo build flags (e.g. '--release')."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_go_build",
+            "description": "Build a Go project (go build).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "args": {"type": "string", "description": "Additional go build flags (e.g. '-o bin/app', './cmd/...')."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_npm_build",
+            "description": "Run an npm build script (npm run <script>).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "script": {"type": "string", "description": "The npm script name (default: 'build')."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_tsc",
+            "description": "Run the TypeScript compiler (tsc).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "args": {"type": "string", "description": "Additional tsc flags (e.g. '--noEmit', '--watch')."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_gradle",
+            "description": "Run a Gradle task in the task's project directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "Gradle task name (e.g. 'build', 'test', 'assemble')."},
+                    "args": {"type": "string", "description": "Additional Gradle flags."},
+                },
+                "required": ["target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_mvn",
+            "description": "Run a Maven goal in the task's project directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string", "description": "Maven lifecycle phase or plugin goal (e.g. 'package', 'test', 'compile')."},
+                    "args": {"type": "string", "description": "Additional Maven flags (e.g. '-DskipTests')."},
+                },
+                "required": ["goal"],
+            },
+        },
+    },
+    # ---- Named dependency tools ----
+    {
+        "type": "function",
+        "function": {
+            "name": "run_pip_install",
+            "description": (
+                "Install Python packages with pip. "
+                "Call this after modifying requirements.txt or pyproject.toml. "
+                "Examples: run_pip_install('-r requirements.txt'), run_pip_install('requests>=2.28')."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "args": {"type": "string", "description": "pip install arguments (e.g. '-r requirements.txt', 'requests>=2.28', '-e .')."},
+                },
+                "required": ["args"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_npm_install",
+            "description": "Install Node.js dependencies (npm install). Call after modifying package.json.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "args": {"type": "string", "description": "Additional npm install flags (e.g. '--save-dev')."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_cargo_fetch",
+            "description": "Fetch Rust/Cargo dependencies (cargo fetch). Call after modifying Cargo.toml.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    # ---- Named security scanner tools ----
+    {
+        "type": "function",
+        "function": {
+            "name": "run_bandit",
+            "description": "Run the bandit Python security linter.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory or file to scan (default: '.')."},
+                    "args": {"type": "string", "description": "Additional bandit flags (e.g. '-ll', '--skip B101')."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_pip_audit",
+            "description": "Audit installed Python packages for known vulnerabilities (pip-audit).",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_semgrep",
+            "description": "Run semgrep static analysis.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File or directory to scan (default: '.')."},
+                    "config": {"type": "string", "description": "Semgrep config/ruleset (default: 'auto')."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_npm_audit",
+            "description": "Run npm audit to check Node.js dependencies for known vulnerabilities.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
             },
         },
     },
@@ -2426,10 +3402,13 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "web_search",
             "description": (
-                "Execute a web search using the Brave Search API. "
+                "Execute a web search using Tavily, DuckDuckGo, or Brave Search. "
                 "Returns a JSON string of results with titles, URLs, and snippets. "
-                "Requires BRAVE_API_KEY environment variable. Use this when you need "
-                "up-to-date information or to research unknown technologies/APIs."
+                "Preferred provider is configured in maestro.ini. "
+                "Requires TAVILY_API_KEY or BRAVE_API_KEY depending on provider. "
+                "To respect our 1000 queries/month budget, we only allow one search every 30 minutes. "
+                "Cached queries do not count against this limit and are returned immediately. "
+                "Use this only when you need up-to-date information or to research unknown technologies/APIs."
             ),
             "parameters": {
                 "type": "object",

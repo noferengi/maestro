@@ -28,6 +28,11 @@ import asyncio
 import logging
 import os
 import time
+from datetime import datetime, timezone as _tz
+
+
+def _now_utc() -> str:
+    return datetime.now(_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
 import threading
 from collections import defaultdict
 from typing import Any
@@ -44,6 +49,7 @@ from app.agent.config import (
     MAX_TOKENS_PER_TURN,
     SURVEY_VERDICT_MAX_TOKENS,
     SURVEY_SUMMARY_MAX_TOKENS,
+    PLANNING_SESSION_TIMEOUT_MINUTES,
 )
 from app.agent.llm_client import is_shutting_down, signal_shutdown, signal_force_shutdown, ShutdownError
 
@@ -56,6 +62,11 @@ AGENT_NAME = "Scheduler"
 
 # task_id -> threading.Thread for currently running loops
 _active_sessions: dict[str, threading.Thread] = {}
+_session_llm_ids: dict[str, int] = {}
+_session_titles: dict[str, str] = {}
+_session_types: dict[str, str] = {}
+_session_started_at: dict[str, float] = {}
+_session_ids: dict[str, str] = {}  # task_id -> llm_session_id
 _active_sessions_lock = threading.Lock()
 
 # session key -> llm_id for all active sessions (tasks, file summaries, research, recovery)
@@ -65,6 +76,17 @@ _session_llm_ids: dict[str, int] = {}
 # session key -> display title for background jobs (arch-gen, research, etc.)
 # Protected by _active_sessions_lock.
 _session_titles: dict[str, str] = {}
+
+# session key -> task type ("planning", "indev", etc.)
+# Protected by _active_sessions_lock.
+_session_types: dict[str, str] = {}
+
+# session key -> wall-clock start time (time.time())
+# Protected by _active_sessions_lock.
+_session_started_at: dict[str, float] = {}
+
+# Wall-clock limit for a single planning session before the scheduler force-expires it.
+_PLANNING_SESSION_TIMEOUT_SECS = PLANNING_SESSION_TIMEOUT_MINUTES * 60
 
 # Per-LLM active session count: llm_id -> count
 _llm_session_counts: dict[int, int] = defaultdict(int)
@@ -289,6 +311,12 @@ _REJECTION_RETRY_COOLDOWN = 300.0   # 5 min between retries
 # stranded-subdivision detector can break it into smaller pieces.
 _MAX_PLANNING_GATE_FAILURES = 5
 
+# task_id -> human-readable reason: planning exhausted all design retries without
+# producing a passing review.  Tasks in this dict are NOT re-dispatched by the
+# scheduler — they require a manual "Run Planning" trigger from the user.
+# Cleared by clear_planning_stopped() which is called from /run-planning endpoint.
+_planning_stopped: dict[str, str] = {}
+
 # Background job retry / rescue parameters.
 # Failed file-summary and research jobs are reset to 'pending' after these cooldowns
 # so they flow through the existing dispatch machinery on the next tick.
@@ -349,6 +377,14 @@ def start_scheduler() -> None:
             logger.info("Startup: cancelled %d oversized/log file summary job(s).", n)
     except Exception:
         logger.exception("Startup: cancel_bad_file_summary_jobs failed (non-fatal).")
+
+    # Prune orphaned worktrees from a crashed previous server run.
+    try:
+        from app.database import get_all_projects as _get_all_projects
+        from app.agent.worktree import prune_orphaned_worktrees
+        prune_orphaned_worktrees([p.path for p in _get_all_projects() if p.path])
+    except Exception:
+        logger.exception("startup: prune_orphaned_worktrees failed (non-fatal)")
 
     _scheduler_stop.clear()
     _scheduler_thread = threading.Thread(
@@ -432,6 +468,16 @@ def stop_scheduler(wait_for_sessions: bool = True, timeout: float = 60.0) -> Non
     logger.info("Scheduler stopped.")
 
 
+def clear_planning_stopped(task_id: str) -> None:
+    """Remove task_id from the planning-stopped set so the scheduler will re-dispatch it.
+
+    Called by the /run-planning endpoint when the user manually triggers a retry.
+    """
+    _planning_stopped.pop(task_id, None)
+    # Also clear any rejection cooldown so the retry dispatches immediately.
+    _rejection_cooldowns.pop(task_id, None)
+
+
 def get_scheduler_status() -> dict:
     """Return a snapshot of the scheduler's state with active/queued/blocked task details."""
     from app.agent.dag import DAGResolver
@@ -505,6 +551,7 @@ def get_scheduler_status() -> dict:
     active_list: list[dict] = []
     queued_list: list[dict] = []
     blocked_list: list[dict] = []
+    stopped_list: list[dict] = []
 
     task_by_id = {t.id: t for t in all_tasks}
 
@@ -571,7 +618,11 @@ def get_scheduler_status() -> dict:
             "llm_name": info["name"] if info else "(no LLM)",
         }
 
-        if tid in ready_ids:
+        if tid in _planning_stopped:
+            # Stopped after exhausting design retries — needs manual re-trigger.
+            entry["reason"] = _planning_stopped[tid]
+            stopped_list.append(entry)
+        elif tid in ready_ids:
             # Ready but not dispatched - determine why
             if not task.llm_id:
                 reason = "no_llm"
@@ -607,7 +658,7 @@ def get_scheduler_status() -> dict:
 
     # LLM capacities summary (only LLMs with tasks in our lists)
     seen_llm_ids = {
-        t["llm_id"] for t in active_list + queued_list + blocked_list
+        t["llm_id"] for t in active_list + queued_list + blocked_list + stopped_list
         if t.get("llm_id") is not None
     }
     llm_capacities = {}
@@ -645,6 +696,7 @@ def get_scheduler_status() -> dict:
         "active": active_list,
         "queued": queued_list,
         "blocked": blocked_list,
+        "stopped": stopped_list,
         "llm_capacities": llm_capacities,
     }
 
@@ -814,6 +866,11 @@ def _tick() -> None:
     # 0. Cleanup finished sessions (also removes from _session_llm_ids)
     _cleanup_finished()
 
+    # 0a'. Expire planning sessions that have exceeded the wall-clock timeout.
+    #      This frees LLM slots so other tasks can be dispatched, and re-queues
+    #      the timed-out task for a fresh run in the next tick.
+    _check_planning_timeouts()
+
     # 0a. Rescue stale background jobs: orphaned 'running' and cooled-down 'failed'
     #     file-summary and research jobs are reset to 'pending' so they flow through
     #     the dispatch phases below in this same tick.
@@ -887,22 +944,18 @@ def _tick() -> None:
         if task_type not in SCHEDULER_DISPATCHABLE_TYPES:
             continue
 
-        # For 'idea' tasks: skip exhausted tasks (human reset required), skip ones
-        # already successfully processed, and retry rejected ones after a cooldown.
+        # For 'idea' tasks: skip exhausted tasks (human reset required)
+        # and retry rejected ones after a cooldown.
         if task_type == "idea":
-            from app.database import get_transition_results, get_task as _get_task_dispatch
+            from app.database import get_task as _get_task_dispatch
             _db_task = _get_task_dispatch(task_id)
             if _db_task and _db_task.intake_exhausted_at:
                 continue  # Intake exhausted — human must reset via /reset-intake
-            existing = get_transition_results(task_id, transition="idea_to_planning")
-            if existing:
-                latest_outcome = existing[0].outcome
-                if latest_outcome in ("passed", "subdivide"):
-                    continue  # already handled - don't re-run intake
-                # Rejected / needs_research / etc.: retry after cooldown
-                if task_id in _rejection_cooldowns:
-                    if time.time() - _rejection_cooldowns[task_id] < _REJECTION_RETRY_COOLDOWN:
-                        continue
+
+            # Rejected / needs_research / etc.: retry after cooldown
+            if task_id in _rejection_cooldowns:
+                if time.time() - _rejection_cooldowns[task_id] < _REJECTION_RETRY_COOLDOWN:
+                    continue
 
         # Already running?
         with _active_sessions_lock:
@@ -924,6 +977,8 @@ def _tick() -> None:
         # Planning-gate rejection cooldown (5 min) — mirrors the intake rejection
         # cooldown so a task that keeps failing the gate doesn't spin hot.
         if task_type == "planning":
+            if task_id in _planning_stopped:
+                continue  # requires manual re-trigger via /run-planning
             if task_id in _rejection_cooldowns:
                 if time.time() - _rejection_cooldowns[task_id] < _REJECTION_RETRY_COOLDOWN:
                     continue
@@ -999,6 +1054,8 @@ def _tick() -> None:
         with _active_sessions_lock:
             _active_sessions[task_id] = thread
             _session_llm_ids[task_id] = llm.id
+            _session_types[task_id] = task_type
+            _session_started_at[task_id] = time.time()
         try:
             thread.start()
         except Exception:
@@ -1006,6 +1063,8 @@ def _tick() -> None:
             with _active_sessions_lock:
                 _active_sessions.pop(task_id, None)
                 _session_llm_ids.pop(task_id, None)
+                _session_types.pop(task_id, None)
+                _session_started_at.pop(task_id, None)
             with _llm_counts_lock:
                 _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
             # local tick counters (node_active_counts, _node_session_counts) aren't
@@ -2672,6 +2731,27 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
     Execute a single task in its own thread + event loop.
     Releases the LLM session slot when done.
     """
+    import uuid
+    from app.agent.llm_client import set_llm_session_context, clear_killed_session
+    session_id = str(uuid.uuid4())
+    set_llm_session_context(session_id)
+
+    with _active_sessions_lock:
+        _session_ids[task_id] = session_id
+
+    # Bootstrap: ensure git repo + venv exist before first worktree creation.
+    if project_path:
+        from app.agent.worktree import ensure_project_ready
+        ensure_project_ready(project_path)
+
+    # Worktree isolation: give each task its own git checkout.
+    worktree_path = project_path
+    if project_path:
+        from app.agent.worktree import setup_task_worktree
+        wt = setup_task_worktree(task_id, project_path)
+        if wt is not None:
+            worktree_path = wt
+
     try:
         llm_base_url = f"http://{llm.address}:{llm.port}/v1"
         llm_model = llm.model
@@ -2680,29 +2760,36 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
         budget_id = db_task.budget_id if db_task else None
 
         if task_type == "idea":
-            _run_intake(task_id, llm_base_url, llm_model, max_context, project_path)
+            _run_intake(task_id, llm_base_url, llm_model, max_context, worktree_path)
         elif task_type == "planning":
-            _run_planning_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
+            _run_planning_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
         elif task_type == "indev":
-            _run_dev_orchestrator_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
+            _run_dev_orchestrator_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
         elif task_type == "conceptual_review":
-            _run_conceptual_review_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
+            _run_conceptual_review_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
         elif task_type == "optimization":
-            _run_optimization_security_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
+            _run_optimization_security_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
         elif task_type == "security":
-            _run_security_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
+            _run_security_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
         elif task_type == "full_review":
-            _run_full_review_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
+            _run_full_review_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
         else:
-            _run_maestro_loop(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
+            _run_maestro_loop(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
     except ShutdownError:
         logger.info("Task '%s' dispatch aborted due to server shutdown.", task_id)
     except Exception:
         _failed_cooldowns[task_id] = time.time()
         logger.exception("Task '%s' failed in scheduler dispatch (cooldown %ds).", task_id, int(_FAIL_COOLDOWN_SECONDS))
     finally:
+        with _active_sessions_lock:
+            _session_ids.pop(task_id, None)
+        clear_killed_session(session_id)
+        
         with _llm_counts_lock:
             _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
+        if project_path and worktree_path != project_path:
+            from app.agent.worktree import teardown_task_worktree
+            teardown_task_worktree(task_id, project_path)
 
 
 def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
@@ -2970,6 +3057,16 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
     task = get_task(task_id)
     if not task:
         return
+
+    # RC4: Supersede any stale planning_results rows from prior runs so the new
+    # session starts clean.  The API path already does this in main.py; this call
+    # covers the scheduler-dispatched path which previously skipped it.
+    try:
+        from app.database import supersede_planning_results
+        supersede_planning_results(task_id)
+    except Exception:
+        logger.exception("[planning] Failed to supersede prior planning results for task '%s'.", task_id)
+
     all_tasks = [task_to_dict(t) for t in get_all_tasks()]
 
     _session_id = create_agent_session(
@@ -3016,6 +3113,44 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
             total_completion_tokens=_completion_tokens,
         )
 
+        if result.get("outcome") == "rejected":
+            # Circuit breaker: too many planning rejections
+            from app.database import get_transition_results as _gtr_plan
+            from app.agent.config import PLANNING_MAX_REJECTIONS as _MAX_PLANNING_REJECTIONS
+            rejections = _gtr_plan(task_id, transition="planning_to_indev") or []
+            fail_count = sum(1 for r in rejections if r.outcome == "rejected")
+            
+            if fail_count >= _MAX_PLANNING_REJECTIONS:
+                logger.warning(
+                    "[planning] Task '%s' rejected by review panel %d time(s) — "
+                    "demoting to IDEA for forced subdivision.",
+                    task_id, fail_count,
+                )
+                update_task(task_id, type="idea")
+                create_transition_result(
+                    task_id=task_id,
+                    transition="idea_to_planning",
+                    outcome="subdivide",
+                    vote_summary={
+                        "outcome": "subdivide",
+                        "forced": True,
+                        "reason": f"Forced after {fail_count} design review rejections",
+                        "votes": [],
+                    },
+                    total_prompt_tokens=0,
+                    total_completion_tokens=0,
+                )
+                _exit_summary = (
+                    f"Design review rejected {fail_count} time(s) — "
+                    "demoted to IDEA for forced subdivision."
+                )
+            else:
+                # Park the card — requires manual re-trigger via "Run Planning" button.
+                # Do not use _rejection_cooldowns (which would auto-retry after 5 min).
+                _stop_reason = f"Design review failed ({fail_count}/{_MAX_PLANNING_REJECTIONS} attempts)"
+                _planning_stopped[task_id] = _stop_reason
+                _exit_summary = _stop_reason + " — click Run Planning to retry."
+
         if result.get("outcome") == "passed":
             # 3. Run planning gate
             gate_result = loop.run_until_complete(
@@ -3029,6 +3164,7 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
                     llm_id=llm_id,
                     budget_id=budget_id,
                     project_path=project_path,
+                    task_description=task.description or "",
                 )
             )
             if gate_result.get("passed"):
@@ -3126,6 +3262,7 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
                                         llm_id=llm_id,
                                         budget_id=budget_id,
                                         project_path=project_path,
+                                        task_description=task.description or "",
                                     )
                                 )
                                 if gate_result2.get("passed"):
@@ -3365,6 +3502,35 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
         "test_strategy": json.loads(planning_result_obj.test_strategy or "[]"),
     }
 
+    # Fetch the most recent review rejection so the dev agent knows what to fix.
+    review_feedback: str | None = None
+    try:
+        from app.database import get_transition_results as _gtr_dev
+        _review_transitions = {"conceptual_to_optimization", "optimization_to_security",
+                                "security_to_full_review", "full_review_to_completed"}
+        for _tr in _gtr_dev(task_id):  # ordered desc by created_at
+            if _tr.outcome in ("rejected", "failed") and _tr.transition in _review_transitions:
+                _vs = _tr.vote_summary or {}
+                _lines = [f"[PRIOR REVIEW REJECTION — {_tr.transition}]"]
+                if isinstance(_vs, dict):
+                    if _vs.get("summary"):
+                        _lines.append(f"Summary: {_vs['summary']}")
+                    for _f in _vs.get("high_severity_findings", []):
+                        _lines.append(
+                            f"  HIGH [{_f.get('stage', '')}]: {_f.get('justification', '')[:500]}"
+                        )
+                    for _f in _vs.get("medium_severity_findings", []):
+                        _lines.append(
+                            f"  MEDIUM [{_f.get('stage', '')}]: {_f.get('justification', '')[:400]}"
+                        )
+                elif isinstance(_vs, str):
+                    _lines.append(_vs[:800])
+                review_feedback = "\n".join(_lines)
+                logger.info("[dev_orch] Loaded review feedback for task '%s': %s", task_id, _lines[0])
+                break
+    except Exception as _rf_exc:
+        logger.warning("[dev_orch] Could not load review feedback for '%s': %s", task_id, _rf_exc)
+
     _session_id = create_agent_session(
         task_id=task_id,
         agent_type="dev_orchestrator",
@@ -3388,6 +3554,7 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
                 llm_model=llm_model,
                 llm_id=llm_id,
                 budget_id=budget_id,
+                review_feedback=review_feedback,
             )
         )
         _prompt_tokens = result.get("prompt_tokens", 0)
@@ -3399,9 +3566,28 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
             logger.info("Task '%s' advanced to CONCEPTUAL REVIEW via scheduler.", task_id)
         else:
             _exit_reason = "rejected"
-            _exit_summary = result.get("error_detail") or "Dev orchestrator returned non-ACCEPTED status."
+            _error_detail = result.get("error_detail") or "Dev orchestrator returned non-ACCEPTED status."
+            _exit_summary = _error_detail[:300]
+            # Forward the test failure context to planning so the next design session
+            # knows exactly what broke and why — prevents the planner from repeating
+            # the same mistake without any signal about the previous INDEV failure.
+            _files_touched = result.get("files_changed", [])
+            _files_str = (", ".join(_files_touched[:8])) if _files_touched else "(none recorded)"
+            _failure_note = (
+                f"\n\n[PREVIOUS INDEV FAILURE — {_now_utc()}]\n"
+                f"{_error_detail[:1200]}\n"
+                f"Files touched before failure: {_files_str}"
+            )
+            try:
+                from app.database import get_task as _gt_indev, update_task as _ut_indev
+                _t = _gt_indev(task_id)
+                if _t:
+                    _new_desc = (_t.description or "") + _failure_note
+                    _ut_indev(task_id, description=_new_desc)
+            except Exception as _desc_exc:
+                logger.warning("[planning] Could not append failure note to task '%s': %s", task_id, _desc_exc)
             update_task(task_id, type="planning")
-            logger.info("Task '%s' reverted to PLANNING: %s", task_id, result.get("error_detail"))
+            logger.info("Task '%s' reverted to PLANNING: %s", task_id, _exit_summary)
     except ShutdownError:
         _exit_reason = "shutdown"
         _exit_summary = "Server shutdown during dev orchestrator."
@@ -3947,6 +4133,8 @@ def _cleanup_finished() -> None:
             del _active_sessions[tid]
             _session_llm_ids.pop(tid, None)
             _session_titles.pop(tid, None)
+            _session_types.pop(tid, None)
+            _session_started_at.pop(tid, None)
 
     # Re-sync _llm_session_counts from the ground truth (live threads + external registry)
     new_counts: dict[int, int] = defaultdict(int)
@@ -3965,6 +4153,132 @@ def _cleanup_finished() -> None:
     with _llm_counts_lock:
         _llm_session_counts.clear()
         _llm_session_counts.update(new_counts)
+
+
+def _check_planning_timeouts() -> None:
+    """Force-expire planning sessions that have exceeded the wall-clock limit.
+
+    The associated LLM session is killed via llm_client.kill_session(), which
+    causes in-flight call_llm() calls to abort immediately. The task is then
+    removed from _active_sessions so the scheduler can re-dispatch it.
+    """
+    from app.agent.llm_client import kill_session
+    now = time.time()
+    timed_out_sessions: list[tuple[str, int, str | None]] = []  # (task_id, llm_id, session_id)
+
+    with _active_sessions_lock:
+        for task_id, thread in list(_active_sessions.items()):
+            if not thread.is_alive():
+                continue
+            if _session_types.get(task_id) != "planning":
+                continue
+            started = _session_started_at.get(task_id, now)
+            if now - started >= _PLANNING_SESSION_TIMEOUT_SECS:
+                elapsed_min = int((now - started) / 60)
+                logger.warning(
+                    "[scheduler] Planning session for task '%s' has been running %d min "
+                    "(limit %d min) — killing LLM session and re-queuing.",
+                    task_id, elapsed_min, _PLANNING_SESSION_TIMEOUT_SECS // 60,
+                )
+                llm_id = _session_llm_ids.get(task_id)
+                session_id = _session_ids.get(task_id)
+                timed_out_sessions.append((task_id, llm_id, session_id))
+
+                if session_id:
+                    kill_session(session_id)
+
+                del _active_sessions[task_id]
+                _session_llm_ids.pop(task_id, None)
+                _session_types.pop(task_id, None)
+                _session_started_at.pop(task_id, None)
+                _session_titles.pop(task_id, None)
+                _session_ids.pop(task_id, None)
+
+    if not timed_out_sessions:
+        return
+
+    # Re-sync LLM counts after removing timed-out sessions.
+    with _llm_counts_lock:
+        for _, llm_id, _ in timed_out_sessions:
+            if llm_id is not None:
+                _llm_session_counts[llm_id] = max(0, _llm_session_counts[llm_id] - 1)
+
+    # Write a timeout audit record per expired task.
+    try:
+        from app.database import create_agent_session, close_agent_session
+        for task_id, llm_id, session_id in timed_out_sessions:
+            sid = create_agent_session(
+                task_id=task_id,
+                agent_type="planning",
+                llm_id=llm_id,
+                budget_id=None,
+                scheduler_reason="timeout",
+            )
+            close_agent_session(
+                sid,
+                exit_reason="planning_timeout",
+                exit_summary=(
+                    f"Session exceeded the {_PLANNING_SESSION_TIMEOUT_SECS // 60}-minute "
+                    "wall-clock limit; re-queued for dispatch."
+                ),
+            )
+    except Exception:
+        logger.exception("[scheduler] Failed to write timeout audit record.")
+
+
+def cancel_task_sessions(task_ids: list[str]) -> None:
+    """Kill active scheduler sessions for a list of soft-deleted task IDs.
+
+    Mirrors _check_planning_timeouts: kills the LLM session so the in-flight
+    call_llm() raises SessionKilledError (a ShutdownError subclass), removes
+    the task from _active_sessions to free the slot immediately, and calls
+    request_stop() for any running MaestroLoop (indev) tasks.
+    """
+    from app.agent.llm_client import kill_session as _kill_session
+    from app.agent.loop import request_stop
+
+    cancelled: list[tuple[str, int | None]] = []  # (task_id, llm_id)
+
+    with _active_sessions_lock:
+        for task_id in task_ids:
+            thread = _active_sessions.get(task_id)
+            if thread is None or not thread.is_alive():
+                continue
+
+            session_id = _session_ids.get(task_id)
+            llm_id = _session_llm_ids.get(task_id)
+            task_type = _session_types.get(task_id)
+
+            if session_id:
+                _kill_session(session_id)
+
+            del _active_sessions[task_id]
+            _session_llm_ids.pop(task_id, None)
+            _session_types.pop(task_id, None)
+            _session_started_at.pop(task_id, None)
+            _session_titles.pop(task_id, None)
+            _session_ids.pop(task_id, None)
+
+            cancelled.append((task_id, llm_id, task_type))
+            logger.info(
+                "[scheduler] Cancelled session for deleted task '%s' (type=%s).",
+                task_id, task_type,
+            )
+
+    if not cancelled:
+        return
+
+    # Free LLM capacity slots immediately.
+    with _llm_counts_lock:
+        for _, llm_id, _ in cancelled:
+            if llm_id is not None:
+                _llm_session_counts[llm_id] = max(0, _llm_session_counts[llm_id] - 1)
+
+    # For indev tasks, also cancel the asyncio task so the loop doesn't wait
+    # until its next LLM call to notice it was killed.
+    for task_id, _, task_type in cancelled:
+        if task_type == "indev":
+            request_stop(task_id)
 
 
 def _rescue_stale_jobs() -> None:

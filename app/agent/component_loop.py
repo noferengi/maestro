@@ -17,6 +17,7 @@ import collections
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -90,32 +91,88 @@ def _is_testable_component(file_list: list[str]) -> bool:
     return False
 
 
+_TEST_COMMAND_BY_TYPE: dict[str, str] = {
+    "python": "python -m pytest",
+    "node": "npm test",
+    "rust": "cargo test",
+    "go": "go test ./...",
+    "cpp": "make test",
+    "android": "./gradlew test",
+    "java": "mvn test",
+}
+
+
+def _get_test_command_hint() -> str:
+    """Return the appropriate test command for the current project type."""
+    from app.agent.tools import get_task_git_cwd
+    from app.agent.worktree import detect_project_type
+    cwd = get_task_git_cwd()
+    if cwd:
+        ptype = detect_project_type(cwd)
+        if ptype and ptype in _TEST_COMMAND_BY_TYPE:
+            return _TEST_COMMAND_BY_TYPE[ptype]
+    return "python -m pytest"
+
+
 def _is_test_command(fn_name: str, fn_args: dict) -> bool:
     """Return True if this tool call is running tests."""
-    if fn_name in ("run_shell_indev", "run_shell_review"):
+    if fn_name in ("run_shell_indev", "run_shell_review",
+                   "run_pytest", "run_unittest", "run_cargo_test",
+                   "run_go_test", "run_npm_test"):
+        if fn_name in ("run_pytest", "run_unittest", "run_cargo_test",
+                       "run_go_test", "run_npm_test"):
+            return True
         cmd = fn_args.get("command", "").lower()
-        return "pytest" in cmd or "unittest" in cmd
+        return any(kw in cmd for kw in ("pytest", "unittest", "cargo test", "go test", "npm test", "mvn test", "ctest", "gradlew test"))
     return False
 
 
 def _detect_test_outcome(output: str) -> str | None:
-    """Heuristic parse of pytest output. Returns 'passed', 'failed', or None."""
+    """Heuristic parse of test runner output. Returns 'passed', 'failed', 'timeout', or None."""
     lower = output.lower()
-    has_pytest = (
-        "passed" in lower or "failed" in lower or "error" in lower
-        or "pytest" in lower or "test session starts" in lower
-    )
-    if not has_pytest:
+    if "error: command timed out" in lower:
+        return "timeout"
+
+    # pytest
+    if "test session starts" in lower or "pytest" in lower:
+        has_failures = (
+            " failed" in lower or "failures" in lower
+            or " error" in lower or "errors" in lower
+            or "FAILED" in output
+        )
+        if has_failures:
+            return "failed"
+        if "passed" in lower:
+            return "passed"
         return None
-    has_failures = (
-        " failed" in lower or "failures" in lower
-        or " error" in lower or "errors" in lower
-        or "FAILED" in output
-    )
-    if has_failures:
-        return "failed"
-    if "passed" in lower:
+
+    # cargo test
+    if "test result:" in lower:
+        if "0 failed" in lower:
+            return "passed"
+        if "failed" in lower:
+            return "failed"
+        return None
+
+    # go test
+    if re.search(r"^ok\s+\S+", output, re.MULTILINE):
         return "passed"
+    if re.search(r"^FAIL\s+\S+", output, re.MULTILINE):
+        return "failed"
+
+    # npm / jest
+    if "tests passed" in lower or "test suites" in lower:
+        if "failed" in lower:
+            return "failed"
+        if "passed" in lower:
+            return "passed"
+
+    # ctest / make test
+    if "100% tests passed" in lower:
+        return "passed"
+    if "tests failed" in lower:
+        return "failed"
+
     return None
 
 
@@ -126,7 +183,7 @@ def _detect_test_outcome(output: str) -> str | None:
 @dataclass(slots=True)
 class ComponentLoopResult:
     component_name: str
-    status: str  # "ACCEPTED" | "REVERT_TO_DESIGN" | "MAX_TURNS" | "ERROR"
+    status: str  # "ACCEPTED" | "REVERT_TO_DESIGN" | "MAX_TURNS" | "ERROR" | "TIMEOUT"
     turns: int = 0
     files_changed: list[str] = field(default_factory=list)
     tests_passed: bool = False
@@ -156,6 +213,7 @@ class ComponentLoop:
         llm_id: int | None = None,
         budget_id: int | None = None,
         max_context: int = 0,
+        review_feedback: str | None = None,
     ):
         self.task_id = task_id
         self.component_name = component_name
@@ -167,6 +225,7 @@ class ComponentLoop:
         self.llm_id = llm_id
         self.budget_id = budget_id
         self.max_context = max_context
+        self.review_feedback = review_feedback
 
         # File write containment
         self.dispatcher = ComponentToolDispatcher(allowed_write_paths)
@@ -277,12 +336,13 @@ class ComponentLoop:
                             "[component] '%s' signaled ACCEPTED without passing tests - requesting test run",
                             self.component_name,
                         )
+                        test_cmd = _get_test_command_hint()
                         messages.append({
                             "role": "user",
                             "content": (
                                 "You signaled ACCEPTED but no passing test run was recorded. "
-                                "Please run the tests first:\n\n"
-                                "  run_shell_indev('python -m pytest <relevant test paths> -v')\n\n"
+                                "Please run the tests first (e.g. run_pytest('.', '-v') for Python, "
+                                "run_cargo_test() for Rust, run_go_test() for Go, run_npm_test() for Node). "
                                 "Then signal ACCEPTED once tests pass."
                             ),
                         })
@@ -370,6 +430,18 @@ class ComponentLoop:
                             self._tests_passed = True
                         elif test_outcome == "failed":
                             self._tests_passed = False
+                        elif test_outcome == "timeout":
+                            # Return immediately on timeout - this triggers a research agent
+                            # in the parent orchestrator to investigate the hang.
+                            return ComponentLoopResult(
+                                component_name=self.component_name,
+                                status="TIMEOUT",
+                                turns=turn + 1,
+                                files_changed=sorted(files_changed),
+                                error_detail=f"Test command timed out: {fn_args.get('command')}",
+                                prompt_tokens=self._total_prompt,
+                                completion_tokens=self._total_completion,
+                            )
 
                     # Track file changes
                     if fn_name in ("write_file", "append_file") and not result.startswith("ERROR"):
@@ -393,19 +465,44 @@ class ComponentLoop:
         )
 
     def _build_system_prompt(self) -> str:
-        return (
+        prompt = (
             "You are a focused component implementation agent for Project Maestro.\n"
             "Your job is to implement ONE specific component according to the plan.\n\n"
             "RULES:\n"
             "- Only write to files in your assigned manifest\n"
             "- Write tests for your component\n"
-            "- Run tests to verify your implementation using run_shell_indev('python -m pytest ...')\n"
+            "- Run tests using the named test tools: run_pytest, run_unittest, run_cargo_test, run_go_test, run_npm_test\n"
+            "- If your project needs a build step first: run_make, run_cargo_build, run_go_build, run_npm_build, run_tsc, run_gradle, run_mvn\n"
+            "- If you add dependencies to a manifest file, install them first: run_pip_install, run_npm_install, run_cargo_fetch\n"
+            "- To undo unintentional file edits: git_restore(path) restores to HEAD, git_unstage(path) removes from staging area\n"
             "- When done, output: {\"signal\": \"ACCEPTED\"}\n"
             "- If you cannot complete, output: {\"signal\": \"REVERT_TO_DESIGN\"}\n"
             "- Never hard-delete files. Use archive_file() for removal.\n"
             "- Work on the maestro/task-{id} branch.\n\n"
+            "TEST QUALITY RULES — strictly required:\n"
+            "- Tests must be fast. Every test must complete in under 5 seconds.\n"
+            "- Choose input sizes that respect the algorithm's complexity. For O(2^n) "
+            "algorithms (naive recursion, brute-force search), never test with n > 30. "
+            "For example, never write a test for Fibonacci(900) using a naive recursive "
+            "implementation; it will never complete. For O(n^2), stay under 10000 elements. "
+            "For O(n log n), under 1 million.\n"
+            "- Before writing a test for a large input, estimate the runtime: "
+            "if the algorithm is O(2^n), n=40 takes ~1 trillion operations — do not test it. "
+            "n=30 takes ~1 billion — borderline. n=20 takes ~1 million — fine.\n"
+            "- Never write a test whose purpose is 'verify this completes' for a slow input. "
+            "If the function has a documented max-input guard, test that the guard raises "
+            "an error — do NOT call the function with the guarded value and wait for it.\n"
+            "- Mock expensive external calls (network, disk, subprocesses). "
+            "Do not make real network requests in tests.\n\n"
             f"Planning Context:\n{self.planning_context[:4000]}\n"
         )
+        if self.review_feedback:
+            prompt += (
+                "\n\nIMPORTANT — THIS TASK WAS REJECTED BY A PRIOR REVIEW. "
+                "You MUST address the findings below before signaling ACCEPTED.\n"
+                f"{self.review_feedback}\n"
+            )
+        return prompt
 
     def _build_task_brief(self) -> str:
         return (

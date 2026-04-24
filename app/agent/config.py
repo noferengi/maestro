@@ -84,6 +84,7 @@ LLM_TIMEOUT_SECONDS: int = _getint("llm", "timeout_seconds", "MAESTRO_LLM_TIMEOU
 
 SEARCH_PROVIDER: str = _get("search", "provider", "MAESTRO_SEARCH_PROVIDER", "duckduckgo")
 BRAVE_API_KEY: str = _get("search", "brave_api_key", "BRAVE_API_KEY", "")
+TAVILY_API_KEY: str = _get("search", "tavily_api_key", "TAVILY_API_KEY", "")
 
 # ===========================================================================
 # Loop safety limits
@@ -97,7 +98,7 @@ MAX_TASK_RETRIES: int = _getint("loop", "max_task_retries", None, 3)
 # Shell
 # ===========================================================================
 
-SHELL_TIMEOUT_SECONDS: int = _getint("shell", "timeout_seconds", "MAESTRO_SHELL_TIMEOUT", 30)
+SHELL_TIMEOUT_SECONDS: int = _getint("shell", "timeout_seconds", "MAESTRO_SHELL_TIMEOUT", 600)
 
 # ===========================================================================
 # Filesystem paths
@@ -166,7 +167,7 @@ RESEARCH_CONTEXT_BUDGET_RATIO: float = _getfloat("intake", "context_budget_ratio
 TIEBREAKER_ENABLED: bool = _getbool("intake", "tiebreaker_enabled", None, True)
 
 RESEARCH_AGENT_TOOLS: list[str] = _getlist("intake", "research_agent_tools",
-    "web_search, read_file, read_file_harder, count_lines, "
+    "web_search, web_fetch, read_file, read_file_harder, count_lines, "
     "search_files, find_files, list_directory, "
     "git_status, git_diff, git_log, git_blame, git_show, "
     "get_task, list_tasks"
@@ -318,7 +319,9 @@ PLANNING_MAX_STEPS: int = _getint("planning", "max_steps", None, 6)
 PLANNING_MAX_CONSECUTIVE_FAILURES: int = _getint("planning", "max_consecutive_failures", None, 3)
 PLANNING_JUDGE_MAX_TOKENS: int = _getint("planning", "judge_max_tokens", None, 8192)
 PLANNING_MAX_DESIGN_RETRIES: int = _getint("planning", "max_design_retries", None, 3)
+PLANNING_MAX_REJECTIONS: int = _getint("planning", "max_rejections", None, 5)
 PLANNING_SURVEY_MAX_TURNS: int = _getint("planning", "survey_max_turns", None, 100)
+PLANNING_SESSION_TIMEOUT_MINUTES: int = _getint("planning", "session_timeout_minutes", None, 120)
 
 PLANNING_GATE_FEASIBILITY_RECHECK: bool = _getbool("planning_gate", "feasibility_recheck_enabled", None, True)
 PLANNING_GATE_CONTEXT_SAFETY_MARGIN: float = _getfloat("planning_gate", "context_safety_margin", None, 0.15)
@@ -330,15 +333,24 @@ PLANNING_GATE_CONTEXT_SAFETY_MARGIN: float = _getfloat("planning_gate", "context
 INDEV_COMPONENT_MAX_TURNS: int = _getint("indev", "component_max_turns", None, 100)
 INDEV_COMPONENT_MAX_RETRIES: int = _getint("indev", "component_max_retries", None, 2)
 INDEV_ENFORCE_FILE_CONTAINMENT: bool = _getbool("indev", "enforce_file_containment", None, True)
+# After all batches complete but the full test suite fails, try targeted test-fix
+# loops before demoting to PLANNING.  Each loop gets up to TEST_FIX_MAX_TURNS turns
+# to read the failure output, edit files, and re-run tests.
+INDEV_TEST_FIX_MAX_RETRIES: int = _getint("indev", "test_fix_max_retries", None, 2)
+INDEV_TEST_FIX_MAX_TURNS: int = _getint("indev", "test_fix_max_turns", None, 30)
 
 INDEV_AGENT_TOOLS: list[str] = _getlist("indev", "agent_tools",
     "read_file, read_file_harder, count_lines, write_file, append_file, list_directory, "
     "search_files, find_files, archive_file, "
     "git_status, git_diff, git_log, git_blame, git_show, "
-    "git_create_branch, git_commit, git_checkout, "
+    "git_create_branch, git_commit, git_checkout, git_restore, git_add, git_unstage, "
     "get_task, list_tasks, update_task_status, append_task_history, "
     "generate_architecture_doc, generate_mermaid_diagram, generate_interface_contract, "
-    "spawn_research_agent, record_benchmark, run_shell_indev, run_shell_security, run_shell_review"
+    "spawn_research_agent, record_benchmark, "
+    "run_pytest, run_mypy, run_ruff, run_black_check, run_unittest, "
+    "run_npm_test, run_cargo_test, run_go_test, "
+    "run_make, run_cargo_build, run_go_build, run_npm_build, run_tsc, run_gradle, run_mvn, "
+    "run_pip_install, run_npm_install, run_cargo_fetch"
 )
 
 # ===========================================================================
@@ -393,7 +405,8 @@ SECURITY_REVIEW_MAX_REVIEWER_TURNS: int = _getint("security_review", "reviewer_m
 
 SECURITY_REVIEWER_TOOLS: list[str] = _getlist("security_review", "reviewer_tools",
     "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "
-    "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks, run_shell_security"
+    "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks, "
+    "run_bandit, run_pip_audit, run_semgrep, run_npm_audit"
 )
 
 # ===========================================================================
@@ -407,7 +420,8 @@ FULL_REVIEW_MAX_REVIEWER_TURNS: int = _getint("full_review", "reviewer_max_turns
 
 FULL_REVIEW_CODE_QUALITY_TOOLS: list[str] = _getlist("full_review", "code_quality_reviewer_tools",
     "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "
-    "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks, run_shell_review"
+    "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks, "
+    "run_pytest, run_mypy, run_ruff, run_black_check"
 )
 FULL_REVIEW_FUNCTIONAL_TOOLS: list[str] = _getlist("full_review", "functional_reviewer_tools",
     "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "

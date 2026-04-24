@@ -46,6 +46,149 @@ AGENT_NAME = "Planning Pipeline"
 #
 # If PLANNING_BEST_OF_N > len(_DESIGN_PERSONAS), personas repeat round-robin.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Reviewer relevance — unit-test tasks only need a subset of the review panel.
+# Performance and security reviewers have no signal to give on "write N pytest
+# assertions for a dataclass"; running them wastes LLM slots and produces
+# NOT_SUITABLE verdicts (now treated as abstentions) or false REJECTED signals.
+# ---------------------------------------------------------------------------
+
+_UNIT_TEST_REVIEWER_SUBSET = frozenset({
+    "coupling_reviewer",
+    "interface_reviewer",
+    "testability_reviewer",
+})
+
+_UNIT_TEST_TITLE_PATTERNS = ("test_", "test ", "tests for", "testcare", "testplant", "testcreate", "testupdate", "testdelete")
+_UNIT_TEST_DESC_PATTERNS = ("@pytest", "def test_", "pytest.fixture", "assert ", "dataclass", " enum ", "unit test")
+
+
+def _is_unit_test_task(title: str, description: str) -> bool:
+    """Return True when heuristics indicate a pure unit-test writing task."""
+    title_l = title.lower()
+    if any(title_l.startswith(p) or p in title_l for p in _UNIT_TEST_TITLE_PATTERNS):
+        return True
+    desc_l = (description or "").lower()
+    return any(p in desc_l for p in _UNIT_TEST_DESC_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
+# Complexity classification — simple tasks get a lite reviewer panel and a
+# smaller design pool (2 proposals instead of 5).  This avoids the full
+# gauntlet for trivially-scoped greenfield scripts.
+# ---------------------------------------------------------------------------
+
+_SIMPLE_TASK_REVIEWER_SUBSET = frozenset({
+    "coupling_reviewer",
+    "testability_reviewer",
+})
+
+_SIMPLE_KEYWORDS = (
+    "greenfield", "simple", "naive", "single file", "single function",
+    "one function", "write a function", "add a function", "basic",
+    "minimal", "straightforward", "write a script", "small utility",
+)
+
+
+def _is_simple_task(title: str, description: str, survey: str = "") -> bool:
+    """Return True when heuristics indicate a low-complexity task.
+
+    Simple tasks skip the security/performance reviewers (they have nothing
+    to say about a 30-line function) and generate only 2 design proposals
+    instead of the full PLANNING_BEST_OF_N pool.
+    """
+    combined = (title + " " + (description or "")).lower()
+    if any(kw in combined for kw in _SIMPLE_KEYWORDS):
+        return True
+    # Short description almost always means narrow scope
+    if len(description or "") < 150:
+        return True
+    # Survey explicitly says empty/greenfield project
+    survey_l = (survey or "").lower()
+    if "greenfield" in survey_l or ("empty" in survey_l and "project" in survey_l):
+        return True
+    return False
+
+
+def _extract_spec_constraints(description: str) -> str:
+    """Extract explicit algorithmic/design constraints from a task description.
+
+    Returns a bulleted list of constraints to inject into the design prompt,
+    or an empty string if none are detected.
+    """
+    if not description:
+        return ""
+
+    desc_lower = description.lower()
+    constraints: list[str] = []
+
+    constraint_signals = [
+        ("naive recursive", "Algorithm must be naive recursive — no memoization, no iteration"),
+        ("naive recursion", "Algorithm must be naive recursive — no memoization, no iteration"),
+        ("no memoization", "Memoization is explicitly forbidden"),
+        ("without memoization", "Memoization is explicitly forbidden"),
+        ("no caching", "Caching is explicitly forbidden"),
+        ("without caching", "Caching is explicitly forbidden"),
+        ("simple recursive", "Algorithm must be simple/naive recursive"),
+        ("do not use", "Explicit exclusion present — see description"),
+        ("must not use", "Explicit exclusion present — see description"),
+        ("intentionally not", "Intentional design constraint present — see description"),
+        ("explicitly", "Explicit constraint present — see description"),
+        ("keep it simple", "Implementation must remain simple — no unnecessary abstractions"),
+        ("greenfield", "This is a greenfield project — start from scratch, minimal structure only"),
+    ]
+
+    for signal, label in constraint_signals:
+        if signal in desc_lower:
+            constraints.append(f"• {label}")
+
+    if not constraints:
+        return ""
+
+    return (
+        "The task description contains BINDING design constraints:\n"
+        + "\n".join(constraints)
+        + "\n\nYou MUST respect these constraints. Do not 'improve' the design beyond what is asked."
+    )
+
+
+def _scan_existing_files(project_root: str, survey_text: str) -> list[str]:
+    """Return a list of existing source files in the project root (up to 30).
+
+    Used to warn the design LLM that the project is not greenfield.
+    Skips hidden dirs, venv, __pycache__, node_modules.
+    """
+    import os
+
+    _SKIP_DIRS = frozenset({
+        "venv", ".venv", "env", "__pycache__", "node_modules", ".git",
+        ".archive", ".maestro-worktrees", "dist", "build", ".eggs",
+        "site-packages", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    })
+    found: list[str] = []
+
+    try:
+        for root, dirs, files in os.walk(project_root):
+            dirs[:] = [
+                d for d in dirs
+                if d not in _SKIP_DIRS and not d.startswith(".")
+            ]
+            rel_root = os.path.relpath(root, project_root)
+            for fname in files:
+                if fname.startswith("."):
+                    continue
+                rel = os.path.join(rel_root, fname).replace("\\", "/")
+                if rel.startswith("./"):
+                    rel = rel[2:]
+                found.append(rel)
+                if len(found) >= 30:
+                    return found
+    except Exception:
+        pass
+
+    return found
+
+
 _DESIGN_PERSONAS: list[tuple[str, str]] = [
     (
         "Correctness & Testability",
@@ -212,6 +355,9 @@ class PlanningPipeline:
         self.project_name = project_name
         self._total_prompt = 0
         self._total_completion = 0
+        # Set in run() after the survey, used by _stage_design_review
+        self._is_simple: bool = False
+        self._effective_best_of_n: int = PLANNING_BEST_OF_N
         # Lazily computed architecture context (cached on first access)
         self.__arch_ctx: str | None = None
 
@@ -239,25 +385,94 @@ class PlanningPipeline:
         # Stage 1: Codebase survey
         survey_summary = await self._stage_codebase_survey()
 
+        # Classify complexity after the survey so we can factor in the survey result.
+        # Unit-test tasks are already handled by their own reviewer subset; simple tasks
+        # get a reduced design pool (2 proposals) and a lighter reviewer panel.
+        self._is_simple = (
+            not _is_unit_test_task(self.task_title, self.task_description)
+            and _is_simple_task(self.task_title, self.task_description, survey_summary)
+        )
+        self._effective_best_of_n = 2 if self._is_simple else PLANNING_BEST_OF_N
+        if self._is_simple:
+            logger.info(
+                "[%s] Simple task detected — reducing design pool to %d and using lite reviewer panel.",
+                AGENT_NAME, self._effective_best_of_n,
+            )
+
+        # Inject demotion history so designers know why prior INDEV attempts failed.
+        # This supplements the failure notes already appended to task.description.
+        try:
+            from app.database import get_task as _get_task_for_history
+            _task_hist = _get_task_for_history(self.task_id)
+            if _task_hist and _task_hist.demotion_history:
+                _recent = _task_hist.demotion_history[-3:]
+                _hist_block = "\n\n[PRIOR INDEV FAILURES — consider before designing]\n"
+                for _d in _recent:
+                    _ts = _d.get("timestamp", "?")[:19]
+                    _reason = _d.get("reason", "?")
+                    _hist_block += f"  {_ts}: {_reason[:400]}\n"
+                survey_summary += _hist_block
+        except Exception:
+            pass
+
         # Retry loop for stages 2-3
         best_designs: list[dict] = []
         selected_index = 0
         review_votes: list[Vote] = []
         winning_design: dict = {}
         scope_verdict = ""
+        _pipeline_passed = False  # set to True when a review tally passes
 
         for attempt in range(PLANNING_MAX_DESIGN_RETRIES):
             if is_shutting_down():
                 raise ShutdownError("Server is shutting down")
 
             # Stage 2: Best-of-N design generation
-            designs = await self._stage_design_generation(survey_summary)
+            designs = await self._stage_design_generation(survey_summary, self._effective_best_of_n)
             best_designs = designs
+
+            # Warn when only some parallel design calls succeeded — the judge is
+            # picking from a degraded pool; surface this so the user can see why
+            # the plan might be weaker than expected.
+            valid_count = sum(1 for d in designs if "error" not in d and "parse_error" not in d)
+            if 0 < valid_count < self._effective_best_of_n:
+                _partial_warn = (
+                    f"[PARTIAL GENERATION on attempt {attempt + 1}]: "
+                    f"Only {valid_count}/{self._effective_best_of_n} design proposals succeeded. "
+                    "Selected design may not represent the best available option."
+                )
+                logger.warning("[%s] %s", AGENT_NAME, _partial_warn)
+                survey_summary += f"\n\n{_partial_warn}"
 
             # Judge selects winner
             selected_index, winning_design = await self._stage_judge_designs(
                 designs, survey_summary
             )
+
+            # Short-circuit: if every design generation call failed the judge returns a
+            # failed_generation dummy.  Running the reviewer panel on it wastes 5 LLM
+            # calls that will all REJECT for the same trivial reason.  Skip straight to
+            # the next retry attempt instead.
+            if winning_design.get("failed_generation"):
+                logger.warning(
+                    f"[{AGENT_NAME}] All designs failed on attempt %d/%d — "
+                    "skipping reviewer panel and retrying design generation.",
+                    attempt + 1, PLANNING_MAX_DESIGN_RETRIES,
+                )
+                if attempt < PLANNING_MAX_DESIGN_RETRIES - 1:
+                    survey_summary += (
+                        f"\n\n[DESIGN GENERATION FAILED on attempt {attempt+1}]: "
+                        "All parallel design calls timed out or errored. "
+                        "Try simpler designs with fewer files."
+                    )
+                # Force tally to rejected so the outer else-branch fires on the last attempt
+                review_votes = [Vote(
+                    stage="design_generation",
+                    verdict=Verdict.REJECTED,
+                    confidence=5,
+                    justification="All design generation calls failed (timeout/error). No design to review.",
+                )]
+                continue
 
             # Scope guard: if design is too broad, signal subdivision immediately
             scope_reason = self._check_scope(winning_design)
@@ -274,6 +489,7 @@ class PlanningPipeline:
                 )]
                 tally_votes(review_votes)  # noqa: F841 — called for side-effect logging
                 scope_verdict = scope_reason
+                _pipeline_passed = True  # scope triggers subdivision, not a failure
                 break  # No retry — redesigning won't shrink the task
 
             # Stage 3: Design review panel
@@ -281,9 +497,41 @@ class PlanningPipeline:
             review_votes = votes
 
             tally = tally_votes(votes)
-            if tally.outcome in ("passed", "conditional_pass", "subdivide"):
+            if tally.outcome in ("passed", "conditional_pass", "warned", "subdivide"):
                 logger.info(f"[{AGENT_NAME}] Design review finished on attempt %d: %s", attempt + 1, tally.outcome)
+                _pipeline_passed = True
                 break
+            elif tally.outcome == "needs_research":
+                logger.info(
+                    f"[{AGENT_NAME}] Design review needs research (attempt %d/%d): %s",
+                    attempt + 1, PLANNING_MAX_DESIGN_RETRIES, tally.summary,
+                )
+                # Trigger research agent inline to resolve the unknowns
+                from app.agent.research import run_research
+                research_question = f"Investigate design review unknowns: {tally.summary}"
+                research_context = {
+                    "task_title": self.task_title,
+                    "task_description": self.task_description,
+                    "design_rationale": winning_design.get("design_rationale", ""),
+                    "rejection_reasons": tally.rejection_reasons,
+                }
+                try:
+                    research_result = await run_research(
+                        question=research_question,
+                        context=research_context,
+                        task_id=self.task_id,
+                        llm_id=self.llm_id,
+                        budget_id=self.budget_id,
+                        llm_base_url=self.llm_base_url,
+                        llm_model=self.llm_model,
+                    )
+                    # Feed findings back into survey_summary for the next attempt
+                    survey_summary += f"\n\n[RESEARCH FINDINGS from attempt {attempt+1}]:\n{research_result.findings}"
+                    self._total_prompt += research_result.prompt_tokens
+                    self._total_completion += research_result.completion_tokens
+                except Exception as exc:
+                    logger.error(f"[{AGENT_NAME}] Inline research failed: %s", exc)
+                    survey_summary += f"\n\n[RESEARCH FAILED from attempt {attempt+1}]: {exc}"
             else:
                 logger.info(
                     f"[{AGENT_NAME}] Design rejected (attempt %d/%d): %s",
@@ -298,6 +546,15 @@ class PlanningPipeline:
             # Skip stages 4-5 — no point polishing a design that will be split
             pitfalls: list[dict] = []
             consolidated = winning_design
+        elif not _pipeline_passed:
+            # All design attempts were rejected — don't waste LLM calls on pitfall
+            # detection and consolidation for a design the reviewers already rejected.
+            logger.warning(
+                "[%s] All %d design attempts rejected — skipping stages 4-5, returning failure.",
+                AGENT_NAME, PLANNING_MAX_DESIGN_RETRIES,
+            )
+            pitfalls = []
+            consolidated = winning_design or {}
         else:
             # Stage 4: Pitfall detection
             pitfalls = await self._stage_pitfall_detection(winning_design, survey_summary)
@@ -310,7 +567,8 @@ class PlanningPipeline:
         # Build result
         result = self._build_result(
             consolidated, best_designs, selected_index,
-            review_votes, pitfalls, survey_summary
+            review_votes, pitfalls, survey_summary,
+            passed=_pipeline_passed,
         )
         result.scope_verdict = scope_verdict
         result.survey_summary = survey_summary
@@ -326,7 +584,7 @@ class PlanningPipeline:
 
     async def _stage_codebase_survey(self) -> str:
         """Run an agentic loop with read-only tools to survey the codebase."""
-        from app.agent.tools import dispatch_tool
+        from app.agent.tools import dispatch_tool, _restrict_reads_to_root as _survey_root_flag
 
         _arch = self._arch_ctx
         system_prompt = (
@@ -358,88 +616,114 @@ class PlanningPipeline:
 
         tool_schemas = _get_survey_tool_schemas()
         survey_result = ""
+        content = ""
         _ctx_warned: set[float] = set()
         _turn_warned: set[int] = set()
+        
+        # Repetition guard: track (tool_name, arguments_hash)
+        _tool_call_history: set[tuple[str, str]] = set()
 
-        for turn in range(PLANNING_SURVEY_MAX_TURNS):
-            if is_shutting_down():
-                raise ShutdownError("Server is shutting down")
+        # RC5: Restrict absolute-path reads to this project's root for the survey phase.
+        # Prevents the LLM from wandering into unrelated project trees on the same machine.
+        _root_token = _survey_root_flag.set(True)
+        try:
+            for turn in range(PLANNING_SURVEY_MAX_TURNS):
+                if is_shutting_down():
+                    raise ShutdownError("Server is shutting down")
 
-            # Context saturation check
-            if check_context_saturation(
-                response.get("usage", {}).get("prompt_tokens", 0) if turn > 0 else 0,
-                self.max_context or 0,
-                _ctx_warned,
-                messages,
-            ):
-                logger.warning("Planning survey context saturation (turn %d) - terminating", turn)
-                break
+                # Context saturation check
+                if check_context_saturation(
+                    response.get("usage", {}).get("prompt_tokens", 0) if turn > 0 else 0,
+                    self.max_context or 0,
+                    _ctx_warned,
+                    messages,
+                ):
+                    logger.warning("Planning survey context saturation (turn %d) - terminating", turn)
+                    break
 
-            # Turn saturation check
-            from app.agent.config import check_turn_saturation
-            if check_turn_saturation(
-                turn, PLANNING_SURVEY_MAX_TURNS, _turn_warned, messages
-            ):
-                # Turn nudge was injected
-                pass
+                # Turn saturation check
+                from app.agent.config import check_turn_saturation
+                if check_turn_saturation(
+                    turn, PLANNING_SURVEY_MAX_TURNS, _turn_warned, messages
+                ):
+                    pass
 
-            response = await call_llm(
-                messages,
-                base_url=self.llm_base_url,
-                model=self.llm_model,
-                tools=tool_schemas,
-                task_id=self.task_id,
-                llm_id=self.llm_id,
-                budget_id=self.budget_id,
-                agent_name=AGENT_NAME,
-            )
+                response = await call_llm(
+                    messages,
+                    base_url=self.llm_base_url,
+                    model=self.llm_model,
+                    tools=tool_schemas,
+                    task_id=self.task_id,
+                    llm_id=self.llm_id,
+                    budget_id=self.budget_id,
+                    agent_name=AGENT_NAME,
+                )
 
-            self._track_tokens(response)
+                self._track_tokens(response)
 
-            # Context saturation check
-            if check_context_saturation(
-                response.get("usage", {}).get("prompt_tokens", 0),
-                self.max_context or 0,
-                _ctx_warned,
-                messages,
-            ):
-                logger.warning(f"[{AGENT_NAME}] Survey context saturation (turn %d) - terminating", turn + 1)
-                break
-            choice = response.get("choices", [{}])[0]
-            msg = choice.get("message", {})
-            content = msg.get("content", "")
-            tool_calls = msg.get("tool_calls", [])
+                # Context saturation check
+                if check_context_saturation(
+                    response.get("usage", {}).get("prompt_tokens", 0),
+                    self.max_context or 0,
+                    _ctx_warned,
+                    messages,
+                ):
+                    logger.warning(f"[{AGENT_NAME}] Survey context saturation (turn %d) - terminating", turn + 1)
+                    break
+                choice = response.get("choices", [{}])[0]
+                msg = choice.get("message", {})
+                content = msg.get("content", "")
+                tool_calls = msg.get("tool_calls", [])
 
-            messages.append(msg)
+                messages.append(msg)
 
-            # Check for completion signal
-            if content and "SURVEY_COMPLETE:" in content:
-                survey_result = content.split("SURVEY_COMPLETE:", 1)[1].strip()
-                logger.info(f"[{AGENT_NAME}] Survey completed at turn %d/%d",
-                            turn + 1, PLANNING_SURVEY_MAX_TURNS)
-                break
+                # Check for completion signal
+                if content and "SURVEY_COMPLETE:" in content:
+                    survey_result = content.split("SURVEY_COMPLETE:", 1)[1].strip()
+                    logger.info(f"[{AGENT_NAME}] Survey completed at turn %d/%d",
+                                turn + 1, PLANNING_SURVEY_MAX_TURNS)
+                    break
 
-            # Dispatch tool calls
-            if tool_calls:
-                for tc in tool_calls:
-                    fn_name = tc["function"]["name"]
-                    fn_args = tc["function"]["arguments"] if isinstance(tc["function"]["arguments"], dict) else json.loads(tc["function"]["arguments"])
-                    try:
-                        result = dispatch_tool(fn_name, fn_args)
-                    except Exception as e:
-                        result = f"Error: {e}"
-                    result_str = str(result)[:4000]
-                    logger.debug(f"[{AGENT_NAME}] Survey turn %d: %s(%s) → %d chars",
-                                 turn + 1, fn_name,
-                                 ", ".join(f"{k}={v!r}" for k, v in fn_args.items()),
-                                 len(result_str))
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": result_str,
-                    })
-            elif not content:
-                break
+                # Dispatch tool calls
+                if tool_calls:
+                    for tc in tool_calls:
+                        fn_name = tc["function"]["name"]
+                        fn_args_raw = tc["function"]["arguments"]
+                        
+                        # Guard: Check for repeated tool calls with same args
+                        args_str = json.dumps(fn_args_raw, sort_keys=True)
+                        call_key = (fn_name, args_str)
+                        if call_key in _tool_call_history:
+                            logger.warning(
+                                f"[{AGENT_NAME}] Repetitive tool call detected: %s(%s). Breaking survey loop.",
+                                fn_name, args_str
+                            )
+                            survey_result = content or "Survey terminated due to tool call loop."
+                            break
+                        _tool_call_history.add(call_key)
+
+                        fn_args = fn_args_raw if isinstance(fn_args_raw, dict) else json.loads(fn_args_raw)
+                        try:
+                            result = dispatch_tool(fn_name, fn_args)
+                        except Exception as e:
+                            result = f"Error: {e}"
+                        result_str = str(result)[:4000]
+                        logger.debug(f"[{AGENT_NAME}] Survey turn %d: %s(%s) → %d chars",
+                                     turn + 1, fn_name,
+                                     ", ".join(f"{k}={v!r}" for k, v in fn_args.items()),
+                                     len(result_str))
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": result_str,
+                        })
+                    
+                    if survey_result: # Loop broken by guard
+                        break
+                elif not content:
+                    break
+        finally:
+            _survey_root_flag.reset(_root_token)
 
         if not survey_result:
             logger.warning(
@@ -456,8 +740,9 @@ class PlanningPipeline:
     # Stage 2: Best-of-N Design Generation
     # ------------------------------------------------------------------
 
-    async def _stage_design_generation(self, survey: str) -> list[dict]:
+    async def _stage_design_generation(self, survey: str, best_of_n: int | None = None) -> list[dict]:
         """Generate N design proposals in parallel, each from a distinct architect persona."""
+        n = best_of_n if best_of_n is not None else PLANNING_BEST_OF_N
         _arch = self._arch_ctx
         _format = (
             "Based on the codebase survey and task description, produce a detailed "
@@ -467,15 +752,17 @@ class PlanningPipeline:
             "- dependency_graph: dict mapping component -> [dependencies]\n"
             "- interface_contracts: list of {component, provides, consumes, invariants} — "
             "OPTIONAL for simple single-component tasks. "
-            "IMPORTANT: `consumes` MUST only list items that are DEFINED AND PROVIDED by another "
-            "component in THIS SAME PLAN. Do NOT put into `consumes`: language primitives "
-            "(String, Long, Int, Boolean, ByteArray, Any, Unit, str, int, float, bool, etc.), "
-            "stdlib/framework types (Flow, StateFlow, Context, ViewModel, datetime, etc.), "
-            "OR files/classes that already exist in the codebase as external imports. "
-            "Those are not cross-component contracts — they are language features or external "
-            "dependencies. If this task requires an artifact from another task, make that other "
-            "task a prerequisite, not a consumes entry. "
-            "Every item listed in `consumes` MUST resolve to a `provides` entry in the same plan.\n"
+            "\nCRITICAL interface_contracts rules:\n"
+            "1. ONLY list NEW or MODIFIED interfaces being introduced by this task.\n"
+            "2. DO NOT list existing project files, standard library modules, or third-party packages in 'provides'.\n"
+            "3. Any 'consumes' entry must be satisfied by a 'provides' entry in the SAME plan. "
+            "If it is an existing file already on disk, DO NOT list it in 'consumes' or 'provides'.\n"
+            "4. DO NOT put into `consumes`: language primitives (String, str, int, etc.), "
+            "stdlib/framework types (Flow, Context, datetime, etc.), "
+            "OR files/classes that already exist in the codebase. Those are not cross-component "
+            "contracts — they are language features or external dependencies.\n"
+            "5. If this task requires an artifact from another task, make that other task a "
+            "prerequisite, not a consumes entry.\n"
             "- test_strategy: list of {component, test_file, test_cases, fixtures} — "
             "name test subjects by component/class name (e.g. 'UserService'), not by filename\n"
             "- implementation_steps: list of {order, component, files, description, "
@@ -484,18 +771,46 @@ class PlanningPipeline:
             + (f"\n\n{_arch}" if _arch else "")
         )
 
+        # Warn the design LLM when existing files are present on disk — prevents
+        # it from proposing CREATE actions that collide with prior INDEV work.
+        _existing_files = _scan_existing_files(self.project_root, survey) if self.project_root else []
+        _greenfield_warning = ""
+        if _existing_files:
+            _greenfield_warning = (
+                "\n\n⚠ NON-GREENFIELD WARNING:\n"
+                "The following files already exist on disk. Do NOT propose creating them again "
+                "unless the task explicitly requires replacing them. If the existing implementation "
+                "already satisfies the task, say so in design_rationale and set all file_manifest "
+                "actions to 'verify' (not 'create'). Do NOT create a file at the same path as an "
+                "existing file and do NOT create a package directory (foo/__init__.py) if a module "
+                "foo.py already exists at that level.\n"
+                "Existing files:\n"
+                + "\n".join(f"  - {p}" for p in _existing_files[:20])
+            )
+
+        # Extract any binding spec constraints from the task description.
+        _spec_block = _extract_spec_constraints(self.task_description)
+
         user_msg = (
             f"Task: {self.task_title}\n"
             f"Description: {self.task_description}\n\n"
             f"Codebase Survey:\n{survey[:8000]}"
+            + _greenfield_warning
         )
 
         tasks = []
-        for i in range(PLANNING_BEST_OF_N):
+        for i in range(n):
             persona_label, persona_concern = _DESIGN_PERSONAS[i % len(_DESIGN_PERSONAS)]
+            _spec_suffix = (
+                "\n\n*** SPEC COMPLIANCE — BINDING CONSTRAINTS ***\n"
+                + _spec_block
+                + "\n*** END SPEC COMPLIANCE ***"
+            ) if _spec_block else ""
             system_prompt = (
                 f"You are a software architect. Primary concern: {persona_label}.\n"
-                f"{persona_concern}\n\n"
+                f"{persona_concern}"
+                + _spec_suffix
+                + "\n\n"
                 + _format
             )
             tasks.append(call_llm(
@@ -505,6 +820,7 @@ class PlanningPipeline:
                 ],
                 base_url=self.llm_base_url,
                 model=self.llm_model,
+                total_timeout_secs=600,
                 task_id=self.task_id,
                 llm_id=self.llm_id,
                 budget_id=self.budget_id,
@@ -541,8 +857,23 @@ class PlanningPipeline:
         """Use a judge LLM call to select the best design."""
         valid = [(i, d) for i, d in enumerate(designs) if "error" not in d and "parse_error" not in d]
         if not valid:
-            logger.warning(f"[{AGENT_NAME}] No valid designs, using first")
-            return 0, designs[0] if designs else {}
+            logger.warning(f"[{AGENT_NAME}] No valid designs generated.")
+            # Create a synthetic design that explicitly signals failure to reviewers
+            # or better, raise an error that triggers a retry or pause.
+            err_msg = "Design generation failed or produced invalid JSON. Check LLM logs."
+            for d in designs:
+                if "error" in d:
+                    err_msg = f"Design generation error: {d['error']}"
+                    break
+            
+            # We return a dummy design that will fail review but with a clear reason
+            dummy = {
+                "design_rationale": f"CRITICAL FAILURE: {err_msg}",
+                "file_manifest": [],
+                "implementation_steps": [],
+                "failed_generation": True
+            }
+            return 0, dummy
         if len(valid) == 1:
             return valid[0]
 
@@ -560,11 +891,12 @@ class PlanningPipeline:
                 f"  Files: {files_str}\n"
             )
 
-        try:
-            response = await call_llm(
+        async def _call_judge(prompt: str) -> tuple[str, str]:
+            """Returns (content, finish_reason)."""
+            resp = await call_llm(
                 [
                     {"role": "system", "content": "You are a design evaluator. Output only JSON. Be concise."},
-                    {"role": "user", "content": judge_prompt},
+                    {"role": "user", "content": prompt},
                 ],
                 base_url=self.llm_base_url,
                 model=self.llm_model,
@@ -574,9 +906,41 @@ class PlanningPipeline:
                 budget_id=self.budget_id,
                 agent_name=AGENT_NAME,
             )
-            self._track_tokens(response)
+            self._track_tokens(resp)
+            choice = resp.get("choices", [{}])[0]
+            return (
+                choice.get("message", {}).get("content", ""),
+                choice.get("finish_reason", ""),
+            )
 
-            content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+        try:
+            content, finish_reason = await _call_judge(judge_prompt)
+
+            # RC2: Judge hit max_tokens during chain-of-thought — retry with a
+            # stripped prompt (rationale only, no file lists) rather than triggering
+            # a full design retry round.
+            if not content and finish_reason == "length":
+                logger.warning(
+                    f"[{AGENT_NAME}] Judge hit max_tokens (finish_reason=length) — "
+                    "retrying with a shorter prompt."
+                )
+                short_prompt = (
+                    "Select the best design from these rationales. "
+                    "Output JSON: {\"selected_index\": <int>, \"justification\": \"...\"}.\n\n"
+                )
+                for orig_idx, design in valid:
+                    rationale = str(design.get("design_rationale", ""))[:150]
+                    short_prompt += f"Design {orig_idx}: {rationale}\n"
+                content, finish_reason = await _call_judge(short_prompt)
+
+            if not content:
+                logger.warning(
+                    f"[{AGENT_NAME}] Judge returned empty content (finish_reason=%s) — "
+                    "defaulting to first valid design %d.",
+                    finish_reason, valid[0][0],
+                )
+                return valid[0][0], designs[valid[0][0]]
+
             result, _ = json.JSONDecoder().raw_decode(content.lstrip())
             idx = int(result.get("selected_index", valid[0][0]))
             if idx < 0 or idx >= len(designs):
@@ -647,18 +1011,48 @@ class PlanningPipeline:
             },
         ]
 
+        # RC3: Skip off-topic reviewers for unit-test or simple tasks to avoid false
+        # REJECTED/NOT_SUITABLE signals from perspectives that have no signal to give.
+        if _is_unit_test_task(self.task_title, self.task_description):
+            reviewers = [r for r in reviewers if r["name"] in _UNIT_TEST_REVIEWER_SUBSET]
+            logger.info(
+                "[%s] Unit-test task detected — running %d reviewer(s): %s",
+                AGENT_NAME, len(reviewers), [r["name"] for r in reviewers],
+            )
+        elif self._is_simple:
+            reviewers = [r for r in reviewers if r["name"] in _SIMPLE_TASK_REVIEWER_SUBSET]
+            logger.info(
+                "[%s] Simple task — running %d reviewer(s): %s",
+                AGENT_NAME, len(reviewers), [r["name"] for r in reviewers],
+            )
+
         design_summary = json.dumps(design, indent=1, ensure_ascii=True)[:6000]
         _arch = self._arch_ctx
-        _arch_prefix = f"Task: {self.task_title}\n{_arch}\n\n" if _arch else f"Task: {self.task_title}\n\n"
+        _arch_prefix = (
+            f"Task: {self.task_title}\n"
+            f"Description: {self.task_description[:600]}\n"
+            + (f"{_arch}\n\n" if _arch else "\n")
+        )
+        _intent_rule = (
+            "\n\nIMPORTANT — Respect explicit task intent: If the task description "
+            "explicitly specifies an algorithm, approach, or design choice (e.g. 'naive "
+            "recursive', 'simple', 'intentionally not using X'), treat that as a binding "
+            "constraint set by the task author. Do NOT vote REJECTED on that basis. "
+            "Instead vote WARN and explain the tradeoff in your justification so the "
+            "author is informed but not blocked."
+        )
 
         reviewer_prompts = []
         for reviewer in reviewers:
             prompt = (
                 f"{_arch_prefix}"
-                f"You are reviewing a software design from the perspective of: {reviewer['focus']}\n\n"
+                f"You are reviewing a software design from the perspective of: {reviewer['focus']}"
+                f"{_intent_rule}\n\n"
                 f"Design:\n{design_summary}\n\n"
-                "Output JSON with: {\"verdict\": \"LIKELY|POSSIBLE|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED\", "
-                "\"confidence\": <0-100>, \"justification\": \"...\"}"
+                "Output JSON with: {\"verdict\": \"LIKELY|POSSIBLE|WARN|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED\", "
+                "\"confidence\": <0-100>, \"justification\": \"...\"}\n"
+                "Use WARN (not REJECTED) when your concern is an opinionated tradeoff that the "
+                "task description has already consciously made."
             )
             reviewer_prompts.append(prompt)
 
@@ -872,6 +1266,7 @@ class PlanningPipeline:
         self, consolidated: dict, all_designs: list[dict],
         selected_index: int, review_votes: list[Vote],
         pitfalls: list[dict], survey: str,
+        passed: bool = True,
     ) -> PlanningResult:
         # Parse file manifest
         file_manifest = []
@@ -928,7 +1323,7 @@ class PlanningPipeline:
             review_votes=review_votes,
             best_of_n_designs=all_designs,
             selected_design_index=selected_index,
-            confidence=80,
+            confidence=80 if passed else 0,
             prompt_tokens=self._total_prompt,
             completion_tokens=self._total_completion,
         )
