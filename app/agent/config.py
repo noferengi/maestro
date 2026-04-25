@@ -167,9 +167,9 @@ RESEARCH_CONTEXT_BUDGET_RATIO: float = _getfloat("intake", "context_budget_ratio
 TIEBREAKER_ENABLED: bool = _getbool("intake", "tiebreaker_enabled", None, True)
 
 RESEARCH_AGENT_TOOLS: list[str] = _getlist("intake", "research_agent_tools",
-    "web_search, web_fetch, read_file, read_file_harder, count_lines, "
-    "search_files, find_files, list_directory, "
-    "git_status, git_diff, git_log, git_blame, git_show, "
+    "web_search, web_fetch, read_file, read_file_harder, read_file_metadata, "
+    "read_last_output, find_in_files, find_files, read_list_dir, "
+    "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
     "get_task, list_tasks"
 )
 
@@ -185,16 +185,16 @@ SUBDIVISION_CONTEXT_BUDGET_RATIO: float = _getfloat("subdivision", "context_budg
 SUBDIVISION_CONTEXT_AWARE_TOOLS: bool = _getbool("subdivision", "context_aware_tools", None, True)
 
 SUBDIVISION_AGENT_TOOLS: list[str] = _getlist("subdivision", "subdivision_agent_tools",
-    "read_file, read_file_harder, count_lines, "
-    "search_files, find_files, list_directory, "
-    "git_status, git_diff, git_log, git_blame, git_show, "
+    "read_file, read_file_harder, read_file_metadata, "
+    "read_last_output, find_in_files, find_files, read_list_dir, "
+    "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
     "get_task, list_tasks"
 )
 
 SUBDIVISION_PLANNING_TOOLS: list[str] = _getlist("subdivision", "subdivision_planning_tools",
-    "generate_architecture_doc, generate_interface_contract, "
-    "generate_mermaid_diagram, spawn_research_agent, "
-    "list_directory, find_files, get_task, list_tasks"
+    "write_arch_doc, write_interface_contract, "
+    "write_mermaid, spawn_research_agent, "
+    "read_list_dir, find_files, get_task, list_tasks"
 )
 
 # ===========================================================================
@@ -340,17 +340,20 @@ INDEV_TEST_FIX_MAX_RETRIES: int = _getint("indev", "test_fix_max_retries", None,
 INDEV_TEST_FIX_MAX_TURNS: int = _getint("indev", "test_fix_max_turns", None, 30)
 
 INDEV_AGENT_TOOLS: list[str] = _getlist("indev", "agent_tools",
-    "read_file, read_file_harder, count_lines, write_file, append_file, list_directory, "
-    "search_files, find_files, archive_file, "
-    "git_status, git_diff, git_log, git_blame, git_show, "
-    "git_create_branch, git_commit, git_checkout, git_restore, git_add, git_unstage, "
-    "get_task, list_tasks, update_task_status, append_task_history, "
-    "generate_architecture_doc, generate_mermaid_diagram, generate_interface_contract, "
-    "spawn_research_agent, record_benchmark, "
-    "run_pytest, run_mypy, run_ruff, run_black_check, run_unittest, "
-    "run_npm_test, run_cargo_test, run_go_test, "
-    "run_make, run_cargo_build, run_go_build, run_npm_build, run_tsc, run_gradle, run_mvn, "
-    "run_pip_install, run_npm_install, run_cargo_fetch"
+    "read_file, read_file_harder, read_file_metadata, read_last_output, "
+    "write_file, append_file, read_list_dir, "
+    "find_in_files, find_files, find_symbol, find_callers, find_imports_of, write_archive, "
+    "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, read_diff_stat, "
+    "write_git_branch, write_git_commit, write_git_checkout, write_git_restore, "
+    "write_git_stage, write_git_unstage, write_git_stash, write_git_stash_pop, read_git_stash_list, "
+    "get_task, list_tasks, write_task_status, write_task_history, "
+    "write_arch_doc, write_mermaid, write_interface_contract, "
+    "spawn_research_agent, write_benchmark, "
+    "run_test_pytest, run_check_mypy, run_check_ruff, run_check_black, run_test_unittest, "
+    "run_test_npm, run_test_cargo, run_test_go, read_test_summary, "
+    "run_build_make, run_build_cargo, run_build_go, run_build_npm, run_build_tsc, "
+    "run_build_gradle, run_build_mvn, "
+    "run_deps_pip, run_deps_npm, run_deps_cargo"
 )
 
 # ===========================================================================
@@ -362,8 +365,10 @@ CONCEPTUAL_REVIEW_HIGH_SEVERITY_BLOCKS: bool = _getbool("conceptual_review", "hi
 CONCEPTUAL_REVIEW_RESEARCH_LIVES: int = _getint("conceptual_review", "research_agent_max_lives", None, 3)
 
 CONCEPTUAL_REVIEW_REVIEWER_TOOLS: list[str] = _getlist("conceptual_review", "reviewer_tools",
-    "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "
-    "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks"
+    "read_file, read_file_harder, read_file_metadata, read_last_output, "
+    "find_in_files, find_files, read_list_dir, "
+    "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
+    "get_task, list_tasks"
 )
 
 # ===========================================================================
@@ -378,8 +383,10 @@ OPTIMIZATION_MAX_REGRESSION_PCT: float = _getfloat("optimization", "max_regressi
 OPTIMIZATION_MAX_REVIEWER_TURNS: int = _getint("optimization", "reviewer_max_turns", None, 100)
 
 OPTIMIZATION_REVIEWER_TOOLS: list[str] = _getlist("optimization", "reviewer_tools",
-    "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "
-    "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks"
+    "read_file, read_file_harder, read_file_metadata, read_last_output, "
+    "find_in_files, find_files, read_list_dir, "
+    "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
+    "get_task, list_tasks"
 )
 
 OPTIMIZATION_COMPUTE_WEIGHT: float = _getfloat("optimization_weights", "compute_weight", None, 1.0)
@@ -404,9 +411,11 @@ SECURITY_REVIEW_RESEARCH_LIVES: int = _getint("security_review", "research_agent
 SECURITY_REVIEW_MAX_REVIEWER_TURNS: int = _getint("security_review", "reviewer_max_turns", None, 100)
 
 SECURITY_REVIEWER_TOOLS: list[str] = _getlist("security_review", "reviewer_tools",
-    "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "
-    "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks, "
-    "run_bandit, run_pip_audit, run_semgrep, run_npm_audit"
+    "read_file, read_file_harder, read_file_metadata, read_last_output, "
+    "find_in_files, find_files, read_list_dir, "
+    "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
+    "get_task, list_tasks, "
+    "run_audit_bandit, run_audit_pip, run_audit_semgrep, run_audit_npm"
 )
 
 # ===========================================================================
@@ -419,13 +428,17 @@ FULL_REVIEW_RESEARCH_LIVES: int = _getint("full_review", "research_agent_max_liv
 FULL_REVIEW_MAX_REVIEWER_TURNS: int = _getint("full_review", "reviewer_max_turns", None, 100)
 
 FULL_REVIEW_CODE_QUALITY_TOOLS: list[str] = _getlist("full_review", "code_quality_reviewer_tools",
-    "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "
-    "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks, "
-    "run_pytest, run_mypy, run_ruff, run_black_check"
+    "read_file, read_file_harder, read_file_metadata, read_last_output, "
+    "find_in_files, find_files, read_list_dir, "
+    "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
+    "get_task, list_tasks, "
+    "run_test_pytest, run_check_mypy, run_check_ruff, run_check_black, read_test_summary"
 )
 FULL_REVIEW_FUNCTIONAL_TOOLS: list[str] = _getlist("full_review", "functional_reviewer_tools",
-    "read_file, read_file_harder, count_lines, search_files, find_files, list_directory, "
-    "git_status, git_diff, git_log, git_blame, git_show, get_task, list_tasks"
+    "read_file, read_file_harder, read_file_metadata, read_last_output, "
+    "find_in_files, find_files, read_list_dir, "
+    "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
+    "get_task, list_tasks"
 )
 
 # ===========================================================================

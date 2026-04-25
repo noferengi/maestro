@@ -84,7 +84,7 @@ def test_record_benchmark_tool_success(tmp_path, monkeypatch):
     session.close()
 
     import app.agent.tools as tools_mod
-    result = tools_mod.record_benchmark(
+    result = tools_mod.write_benchmark(
         task_id="t-c",
         parent_task_id="t-p",
         benchmark_type="after",
@@ -96,7 +96,7 @@ def test_record_benchmark_tool_success(tmp_path, monkeypatch):
 def test_record_benchmark_tool_invalid_type(tmp_path, monkeypatch):
     """record_benchmark returns ERROR for invalid benchmark_type."""
     import app.agent.tools as tools_mod
-    result = tools_mod.record_benchmark(
+    result = tools_mod.write_benchmark(
         task_id="t-c",
         parent_task_id="t-p",
         benchmark_type="during",
@@ -108,7 +108,7 @@ def test_record_benchmark_tool_invalid_type(tmp_path, monkeypatch):
 def test_record_benchmark_tool_bad_json(tmp_path, monkeypatch):
     """record_benchmark returns ERROR for non-JSON metrics."""
     import app.agent.tools as tools_mod
-    result = tools_mod.record_benchmark(
+    result = tools_mod.write_benchmark(
         task_id="t-c",
         parent_task_id="t-p",
         benchmark_type="before",

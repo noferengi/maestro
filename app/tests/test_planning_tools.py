@@ -1,6 +1,6 @@
 """
-Tests for the planning tools: generate_architecture_doc,
-generate_mermaid_diagram, generate_interface_contract, spawn_research_agent.
+Tests for the planning tools: write_arch_doc,
+write_mermaid, write_interface_contract, spawn_research_agent.
 
 These tools now write to disk (.maestro/ subdirectory) rather than returning
 full content into the prompt, so tests use tmp_path + a git repo for isolation.
@@ -11,9 +11,9 @@ import os
 import subprocess
 import pytest
 from app.agent.tools import (
-    generate_architecture_doc,
-    generate_mermaid_diagram,
-    generate_interface_contract,
+    write_arch_doc,
+    write_mermaid,
+    write_interface_contract,
     spawn_research_agent,
     dispatch_tool,
     _task_git_cwd,
@@ -47,10 +47,10 @@ def isolated_project(tmp_path_factory):
 
 
 class TestGenerateArchitectureDoc:
-    """generate_architecture_doc writes to .maestro/architecture.md and returns a stub."""
+    """write_arch_doc writes to .maestro/architecture.md and returns a stub."""
 
     def test_basic_doc(self, isolated_project):
-        result = generate_architecture_doc(
+        result = write_arch_doc(
             title="My System",
             components=[
                 {"name": "API", "description": "REST API layer", "technology": "FastAPI"},
@@ -76,7 +76,7 @@ class TestGenerateArchitectureDoc:
         assert "--queries-->" in content
 
     def test_string_components(self, isolated_project):
-        result = generate_architecture_doc(
+        result = write_arch_doc(
             title="Simple",
             components=["Frontend", "Backend"],
             relationships=["Frontend -> Backend"],
@@ -88,7 +88,7 @@ class TestGenerateArchitectureDoc:
         assert "- Backend" in content
 
     def test_empty_components(self, isolated_project):
-        result = generate_architecture_doc(
+        result = write_arch_doc(
             title="Empty",
             components=[],
             relationships=[],
@@ -98,7 +98,7 @@ class TestGenerateArchitectureDoc:
         assert "# Architecture: Empty" in content
 
     def test_dispatch(self, isolated_project):
-        result = dispatch_tool("generate_architecture_doc", {
+        result = dispatch_tool("write_arch_doc", {
             "title": "Test",
             "components": ["A"],
             "relationships": [],
@@ -108,10 +108,10 @@ class TestGenerateArchitectureDoc:
 
 
 class TestGenerateMermaidDiagram:
-    """generate_mermaid_diagram writes to .maestro/diagrams/ and returns a stub."""
+    """write_mermaid writes to .maestro/diagrams/ and returns a stub."""
 
     def test_flowchart(self, isolated_project):
-        result = generate_mermaid_diagram("flowchart", "A --> B --> C")
+        result = write_mermaid("flowchart", "A --> B --> C")
         assert result.startswith("OK:")
         assert ".maestro/diagrams/flowchart.md" in result
 
@@ -121,37 +121,37 @@ class TestGenerateMermaidDiagram:
         assert "A --> B --> C" in content
 
     def test_sequence(self, isolated_project):
-        result = generate_mermaid_diagram("sequence", "Alice->>Bob: Hello")
+        result = write_mermaid("sequence", "Alice->>Bob: Hello")
         assert result.startswith("OK:")
         content = (isolated_project / ".maestro" / "diagrams" / "sequence.md").read_text()
         assert "sequenceDiagram" in content
 
     def test_class_diagram(self, isolated_project):
-        result = generate_mermaid_diagram("class", "class Animal")
+        result = write_mermaid("class", "class Animal")
         assert result.startswith("OK:")
         content = (isolated_project / ".maestro" / "diagrams" / "class.md").read_text()
         assert "classDiagram" in content
 
     def test_er_diagram(self, isolated_project):
-        result = generate_mermaid_diagram("er", "CUSTOMER ||--o{ ORDER : places")
+        result = write_mermaid("er", "CUSTOMER ||--o{ ORDER : places")
         assert result.startswith("OK:")
         content = (isolated_project / ".maestro" / "diagrams" / "er.md").read_text()
         assert "erDiagram" in content
 
     def test_invalid_type(self, isolated_project):
-        result = generate_mermaid_diagram("invalid_type", "A -> B")
+        result = write_mermaid("invalid_type", "A -> B")
         assert "ERROR" in result
         assert "Invalid diagram type" in result
 
     def test_already_has_directive(self, isolated_project):
-        result = generate_mermaid_diagram("flowchart", "flowchart LR\n  A --> B")
+        result = write_mermaid("flowchart", "flowchart LR\n  A --> B")
         assert result.startswith("OK:")
         content = (isolated_project / ".maestro" / "diagrams" / "flowchart.md").read_text()
         assert "```mermaid" in content
         assert content.count("flowchart") == 1  # no duplicate directive
 
     def test_dispatch(self, isolated_project):
-        result = dispatch_tool("generate_mermaid_diagram", {
+        result = dispatch_tool("write_mermaid", {
             "diagram_type": "flowchart",
             "definition": "X --> Y",
         })
@@ -160,10 +160,10 @@ class TestGenerateMermaidDiagram:
 
 
 class TestGenerateInterfaceContract:
-    """generate_interface_contract writes to .maestro/contracts/ and returns a stub."""
+    """write_interface_contract writes to .maestro/contracts/ and returns a stub."""
 
     def test_basic_contract(self, isolated_project):
-        result = generate_interface_contract(
+        result = write_interface_contract(
             component_name="AuthService",
             provides=[
                 {"name": "authenticate", "type": "function", "description": "Validates credentials"},
@@ -185,7 +185,7 @@ class TestGenerateInterfaceContract:
         assert data["consumes"][0]["source"] == "sub-0"
 
     def test_string_items(self, isolated_project):
-        result = generate_interface_contract(
+        result = write_interface_contract(
             component_name="Simple",
             provides=["endpoint_a", "endpoint_b"],
             consumes=["database"],
@@ -199,7 +199,7 @@ class TestGenerateInterfaceContract:
         assert data["consumes"][0]["name"] == "database"
 
     def test_empty_lists(self, isolated_project):
-        result = generate_interface_contract(
+        result = write_interface_contract(
             component_name="Standalone",
             provides=[],
             consumes=[],
@@ -213,7 +213,7 @@ class TestGenerateInterfaceContract:
         assert data["consumes"] == []
 
     def test_dispatch(self, isolated_project):
-        result = dispatch_tool("generate_interface_contract", {
+        result = dispatch_tool("write_interface_contract", {
             "component_name": "Test",
             "provides": ["x"],
             "consumes": [],

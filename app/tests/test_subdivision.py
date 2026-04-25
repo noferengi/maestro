@@ -409,7 +409,7 @@ class TestBigIdeaConfig:
     def test_planning_tools_loaded(self):
         from app.agent.config import SUBDIVISION_PLANNING_TOOLS
         assert isinstance(SUBDIVISION_PLANNING_TOOLS, list)
-        assert "generate_architecture_doc" in SUBDIVISION_PLANNING_TOOLS
+        assert "write_arch_doc" in SUBDIVISION_PLANNING_TOOLS
         assert "spawn_research_agent" in SUBDIVISION_PLANNING_TOOLS
 
 
@@ -470,20 +470,20 @@ class TestContextAwareToolSelection:
     def test_greenfield_gets_planning_tools(self):
         from app.agent.subdivide import _build_context_aware_schemas
         schemas, names = _build_context_aware_schemas(has_source=False)
-        assert "generate_architecture_doc" in names
+        assert "write_arch_doc" in names
         assert "spawn_research_agent" in names
-        assert "list_directory" in names
+        assert "read_list_dir" in names
         assert "find_files" in names
         # Codebase tools should NOT be present
         assert "read_file" not in names
-        assert "git_blame" not in names
+        assert "read_git_blame" not in names
 
     def test_existing_code_gets_all_tools(self):
         from app.agent.subdivide import _build_context_aware_schemas
         schemas, names = _build_context_aware_schemas(has_source=True)
-        assert "generate_architecture_doc" in names
+        assert "write_arch_doc" in names
         assert "read_file" in names
-        assert "git_status" in names
+        assert "read_git_status" in names
 
 
 class TestSubdivisionStrategyGuidance:

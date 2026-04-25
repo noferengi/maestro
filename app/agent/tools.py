@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import contextvars
 import glob as _glob
+import hashlib
 import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -65,6 +67,20 @@ _restrict_reads_to_root: contextvars.ContextVar[bool] = contextvars.ContextVar(
 
 _task_project_name: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "_task_project_name", default=None
+)
+
+# ---------------------------------------------------------------------------
+# Per-call output buffer — enables read_last_output slicing
+# ---------------------------------------------------------------------------
+# Maps task_id → last full (un-truncated) tool output, capped at 4 MiB.
+# "_sync" is used for synchronous dispatch_tool calls (single-threaded callers).
+_output_buffer: dict[str, str] = {}
+_output_buffer_lock = threading.Lock()
+_MAX_BUFFER_BYTES = 4 * 1024 * 1024  # 4 MiB per task
+
+# Stores the raw output of the most recent test run so read_test_summary can parse it.
+_last_test_output: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_last_test_output", default=""
 )
 
 
@@ -243,29 +259,6 @@ def get_task_git_cwd() -> str | None:
 
 LISTING_EXCLUDED_DIRS: set[str] = TOOL_LISTING_EXCLUDED_DIRS
 
-BLOCKED_PATTERNS: list[str] = [
-    r"rm\s+-[rRfF]",           # rm -rf / rm -fr etc.
-    r"del\s+/[sfSF]",          # del /s /f
-    r"rmdir\s+/[sS]",          # rmdir /s
-    r"shutil\.rmtree",         # Python rmtree in a shell string
-    r"os\.remove",             # Python os.remove in a shell string
-    r"os\.unlink",             # Python os.unlink in a shell string
-    r"format\s+[a-zA-Z]:",     # format C:
-    r"mkfs",                   # mkfs.*
-    r">\s*/dev/",              # redirect to /dev/
-    r"dd\s+if=",               # dd if= (disk destroyer)
-    r":\(\)\{",                # fork bomb :(){ :|:& };:
-    r"\.\./\.\./\.\.",         # deep path traversal ../../..
-    r"shutdown",               # shutdown / restart
-    r"reboot",
-    r"halt",
-    r"poweroff",
-    r"curl\s+.*\|\s*[sb]ash",  # curl | bash / curl | sh
-    r"wget\s+.*\|\s*[sb]ash",  # wget | bash / wget | sh
-    r"eval\s+\$\(",            # eval $(...) injection
-]
-
-_BLOCKED_RE = re.compile("|".join(BLOCKED_PATTERNS), re.IGNORECASE)
 
 
 def _assert_safe_path(path: str) -> str:
@@ -418,13 +411,6 @@ def _find_archived_copies(rel_path: str) -> list[str]:
     return found
 
 
-def _is_command_blocked(command: str) -> tuple[bool, str]:
-    """Return (blocked, reason) for a shell command string."""
-    match = _BLOCKED_RE.search(command)
-    if match:
-        logger.warning("Shell command blocked by pattern %r: %s", match.group(), command)
-        return True, f"Command contains blocked pattern: '{match.group()}'"
-    return False, ""
 
 
 # ---------------------------------------------------------------------------
@@ -448,24 +434,31 @@ def _is_gitignored(abs_path: str) -> bool:
 _MAX_TOOL_RESULT_CHARS = 200_000
 
 
-def _cap_tool_result(name: str, result: str) -> str:
-    """Truncate oversized tool results to prevent context-window overflow."""
+def _cap_tool_result(name: str, result: str, *, task_id: str = "_sync") -> str:
+    """Truncate oversized tool results and store full output in the per-task buffer."""
+    with _output_buffer_lock:
+        _output_buffer[task_id] = result[:_MAX_BUFFER_BYTES]
     if len(result) <= _MAX_TOOL_RESULT_CHARS:
         return result
     truncated = result[:_MAX_TOOL_RESULT_CHARS]
     cut = truncated.rfind("\n")
     if cut > _MAX_TOOL_RESULT_CHARS // 2:
         truncated = truncated[:cut]
+    total_lines = result.count("\n") + 1
+    shown_lines = truncated.count("\n") + 1
+    next_offset = shown_lines + 1
     logger.warning(
         "Tool '%s' returned %d chars — truncating to %d to prevent context overflow.",
         name, len(result), len(truncated),
     )
-    return (
-        truncated
-        + f"\n\n[TRUNCATED: result was {len(result):,} chars total; only first {len(truncated):,} chars shown. "
-        "This file is too large to read in full. Use `search_files` to find specific content "
-        "within it instead of calling `read_file` on the same path again.]"
+    footer = (
+        f"\n\n[TRUNCATED]\n"
+        f"total_chars={len(result):,}  shown_chars={len(truncated):,}\n"
+        f"total_lines={total_lines:,}    shown_lines={shown_lines:,}\n"
+        f"next_offset_lines={next_offset}\n"
+        f'hint="Use read_last_output(offset={next_offset}, limit=500) or read_last_output(grep=\'pattern\')"'
     )
+    return truncated + footer
 
 
 def _is_binary_path(abs_path: str) -> bool:
@@ -546,10 +539,7 @@ def _inline_small_file(abs_path: str) -> str:
 
 
 def write_file(path: str, content: str) -> str:
-    """
-    Write (overwrite) a file with the given content.
-    Auto-stages the file for git tracking after writing.
-    """
+    """[WRITE — files] Overwrite a file with the given content. Auto-stages for git. Reversible only via write_git_restore before commit. Path must be inside project root."""
     try:
         safe_path = _assert_safe_write_path(path)
     except ValueError as exc:
@@ -569,7 +559,7 @@ def write_file(path: str, content: str) -> str:
 
 
 def append_file(path: str, content: str) -> str:
-    """Append content to the end of a file (creates the file if absent)."""
+    """[WRITE — files] Append text to the end of a file (creates it if absent). Auto-stages for git. Path must be inside project root."""
     try:
         safe_path = _assert_safe_write_path(path)
     except ValueError as exc:
@@ -608,9 +598,8 @@ def _get_cached_summary_for_listing(abs_path: str) -> "str | None":
     return None
 
 
-def list_directory(path: str = ".") -> str:
-    """
-    List files and directories at the given path.
+def read_list_dir(path: str = ".") -> str:
+    """[READ] List files and directories at the given path. No state change.
 
     Maestro allows navigation of the entire PC. Files are shown with their
     cached summary if available. Entries are annotated but never hidden (except
@@ -705,14 +694,17 @@ def list_directory(path: str = ".") -> str:
     return "\n".join(lines) if lines else "(empty directory)"
 
 
-def search_files(pattern: str, directory: str = ".") -> str:
-    """
-    Ripgrep-style content search.
-    Returns matches in 'file:line_number: content' format (up to 200 results).
-    """
+def find_in_files(
+    pattern: str,
+    directory: str = ".",
+    head: int | None = None,
+    tail: int | None = None,
+    grep: str | None = None,
+) -> str:
+    """[READ] Ripgrep-style content search. Returns matches in 'file:line_number: content' format (up to 200 results). head/tail/grep filter output. No state change."""
     safe_dir = _assert_safe_path(directory)
     results: list[str] = []
-    
+
     try:
         compiled = re.compile(pattern, re.IGNORECASE)
     except re.error as exc:
@@ -736,33 +728,15 @@ def search_files(pattern: str, directory: str = ".") -> str:
                             results.append(f"{rel}:{lineno}: {line.rstrip()}")
                             if len(results) >= TOOL_MAX_SEARCH_RESULTS:
                                 results.append(f"... (truncated at {TOOL_MAX_SEARCH_RESULTS} results)")
-                                return "\n".join(results)
+                                raw = "\n".join(results)
+                                return _slice_output(raw, head=head, tail=tail, grep=grep)
             except OSError:
                 continue
 
-    return "\n".join(results) if results else "No matches found."
+    raw = "\n".join(results) if results else "No matches found."
+    return _slice_output(raw, head=head, tail=tail, grep=grep)
 
 
-def read_file_lines(path: str, start: int, end: int) -> str:
-    """Read a specific line range from a file (1-indexed, inclusive on both ends)."""
-    safe_path = _assert_safe_path(path)
-    if not os.path.isfile(safe_path):
-        return f"ERROR: '{path}' is not a file or does not exist."
-    if _is_binary_path(safe_path):
-        return f"ERROR: '{path}' is a binary file and cannot be read as text."
-    try:
-        with open(safe_path, "r", encoding="utf-8", errors="replace") as fh:
-            lines = fh.readlines()
-        total = len(lines)
-        # Clamp to actual file bounds
-        start = max(1, min(start, total))
-        end = max(start, min(end, total))
-        result_lines: list[str] = []
-        for i in range(start, end + 1):
-            result_lines.append(f"{i}: {lines[i - 1].rstrip()}")
-        return "\n".join(result_lines)
-    except OSError as exc:
-        return f"ERROR reading '{path}': {exc}"
 
 
 def read_file_harder(
@@ -839,20 +813,34 @@ def read_file_harder(
     return result
 
 
-def count_lines(path: str) -> str:
-    """Return the line count and byte size of a file without reading full content into the response."""
+def read_file_metadata(path: str) -> str:
+    """[READ] File size, modification time, sha256, line count, and binary flag. No state change."""
     safe_path = _assert_safe_path(path)
     if not os.path.isfile(safe_path):
         return f"ERROR: '{path}' is not a file or does not exist."
-    if _is_binary_path(safe_path):
-        return f"ERROR: '{path}' is a binary file; cannot count lines meaningfully."
     try:
-        byte_size = os.path.getsize(safe_path)
-        with open(safe_path, "r", encoding="utf-8", errors="replace") as fh:
-            line_count = sum(1 for _ in fh)
-        return f"{line_count} lines, {byte_size} bytes"
+        stat = Path(safe_path).stat()
+        byte_size = stat.st_size
+        mtime = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
+        is_bin = _is_binary_path(safe_path)
+        if is_bin:
+            sha = "n/a (binary)"
+            line_count = "n/a (binary)"
+        else:
+            with open(safe_path, "rb") as fh:
+                data = fh.read()
+            sha = hashlib.sha256(data).hexdigest()
+            line_count = data.count(b"\n") + (1 if data else 0)
+        return (
+            f"path={safe_path}\n"
+            f"size={byte_size} bytes\n"
+            f"mtime={mtime}\n"
+            f"sha256={sha}\n"
+            f"lines={line_count}\n"
+            f"binary={'yes' if is_bin else 'no'}"
+        )
     except OSError as exc:
-        return f"ERROR reading '{path}': {exc}"
+        return f"ERROR reading metadata for '{path}': {exc}"
 
 
 def find_files(glob_pattern: str, directory: str = ".") -> str:
@@ -881,10 +869,8 @@ def find_files(glob_pattern: str, directory: str = ".") -> str:
 # Safe archive (never hard-delete)
 # ---------------------------------------------------------------------------
 
-def archive_file(path: str, reason: str = "") -> str:
-    """
-    Safely 'delete' a file or directory by moving it into
-    .archive/<timestamp>/<original_relative_path>.
+def write_archive(path: str, reason: str = "") -> str:
+    """[WRITE — archive] Safely 'delete' a file by moving it to .archive/<timestamp>/. NEVER hard-deletes. Reversible: copy from the archive path shown in the return value.
 
     Safety guarantees:
     - NEVER calls shutil.rmtree, os.remove, os.unlink, or any destructive primitive.
@@ -920,12 +906,10 @@ def archive_file(path: str, reason: str = "") -> str:
             lines += [
                 "",
                 "To restore the most recent copy run:",
-                f'  run_shell(\'python -c "import shutil; '
-                f'shutil.copy(r\\"{archived[0]}\\", r\\"{safe_path}\\")"\')',
+                f'  python -c "import shutil; shutil.copy(r\\"{archived[0]}\\", r\\"{safe_path}\\")"',
                 "",
                 "To restore a directory tree (if a folder was archived) run:",
-                f'  run_shell(\'python -c "import shutil; '
-                f'shutil.copytree(r\\"{archived[0]}\\", r\\"{safe_path}\\")"\')',
+                f'  python -c "import shutil; shutil.copytree(r\\"{archived[0]}\\", r\\"{safe_path}\\")"',
             ]
             return "\n".join(lines)
         return f"ERROR: '{path}' does not exist - nothing to archive."
@@ -946,57 +930,44 @@ def archive_file(path: str, reason: str = "") -> str:
         with open(reason_file, "w", encoding="utf-8") as fh:
             fh.write(f"Archived at: {timestamp}\nReason: {reason}\n")
 
-    restore_cmd = (
-        f'python -c "import shutil; shutil.copy(r\\"{dest}\\", r\\"{safe_path}\\")"'
-    )
     return (
         f"OK: archived '{path}' -> '{dest}'.\n"
-        f"Restore with: run_shell('{restore_cmd}')"
+        f"Restore by copying: shutil.copy(r'{dest}', r'{safe_path}')"
     )
 
 
+
+
 # ---------------------------------------------------------------------------
-# Restricted shell
+# Output slicing helper (shared by read_git_diff, read_git_log, find_in_files)
 # ---------------------------------------------------------------------------
 
-# INTERNAL ONLY - not in TOOL_SCHEMAS. LLMs cannot call this.
-def run_shell(command: str, working_dir: str = ".") -> str:
-    """
-    Execute a shell command with safety restrictions.
-    - Blocks any command matching BLOCKED_PATTERNS.
-    - Enforces PROJECT_ROOT containment for the working directory.
-    - Hard 30-second timeout.
-    Returns stdout + stderr + exit code as a formatted string.
-    """
-    blocked, reason = _is_command_blocked(command)
-    if blocked:
-        return f"BLOCKED: {reason}"
-
-    try:
-        safe_cwd = _assert_safe_path(working_dir)
-    except ValueError as exc:
-        return f"BLOCKED: {exc}"
-
-    try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            cwd=safe_cwd,
-            capture_output=True,
-            text=True,
-            timeout=SHELL_TIMEOUT_SECONDS,
-        )
-        output_parts = []
-        if result.stdout:
-            output_parts.append(f"STDOUT:\n{result.stdout}")
-        if result.stderr:
-            output_parts.append(f"STDERR:\n{result.stderr}")
-        output_parts.append(f"EXIT_CODE: {result.returncode}")
-        return "\n".join(output_parts) if output_parts else f"EXIT_CODE: {result.returncode}"
-    except subprocess.TimeoutExpired:
-        return f"ERROR: Command timed out after {SHELL_TIMEOUT_SECONDS} seconds."
-    except Exception as exc:
-        return f"ERROR running shell command: {exc}"
+def _slice_output(
+    text: str,
+    *,
+    head: int | None = None,
+    tail: int | None = None,
+    grep: str | None = None,
+    offset: int | None = None,
+    limit: int | None = None,
+) -> str:
+    """Apply head/tail/grep/offset/limit filters to a multi-line string."""
+    lines = text.splitlines()
+    if offset is not None:
+        lines = lines[offset:]
+    if limit is not None:
+        lines = lines[:limit]
+    if grep:
+        try:
+            pat = re.compile(grep, re.IGNORECASE)
+            lines = [l for l in lines if pat.search(l)]
+        except re.error:
+            lines = [l for l in lines if grep in l]
+    if head is not None:
+        lines = lines[:head]
+    elif tail is not None:
+        lines = lines[-tail:]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1086,16 +1057,21 @@ def _git_run(args: list[str], cwd: str | None = None) -> tuple[int, str, str]:
         return 1, "", str(exc)
 
 
-def git_status() -> str:
-    """Return the current git status of the project."""
+def read_git_status() -> str:
+    """[READ] Return the current git status of the project. No state change."""
     rc, out, err = _git_run(["git", "status"])
     if rc != 0:
         return f"ERROR: git status failed: {err}"
     return out
 
 
-def git_diff(path: str | None = None) -> str:
-    """Return git diff (staged + unstaged). Optionally scoped to a path."""
+def read_git_diff(
+    path: str | None = None,
+    head: int | None = None,
+    tail: int | None = None,
+    grep: str | None = None,
+) -> str:
+    """[READ] Return git diff (staged + unstaged). Optionally scoped to a path. head/tail/grep filter output. No state change."""
     args = ["git", "diff", "HEAD"]
     if path:
         try:
@@ -1106,14 +1082,18 @@ def git_diff(path: str | None = None) -> str:
     rc, out, err = _git_run(args)
     if rc != 0:
         return f"ERROR: git diff failed: {err}"
-    return out or "(no changes)"
+    result = out or "(no changes)"
+    return _slice_output(result, head=head, tail=tail, grep=grep)
 
 
-def git_log(path: str | None = None, max_count: int = 20) -> str:
-    """
-    Return recent git log entries. Optionally scoped to a specific file path.
-    Read-only operation - safe for research agents.
-    """
+def read_git_log(
+    path: str | None = None,
+    max_count: int = 20,
+    head: int | None = None,
+    tail: int | None = None,
+    grep: str | None = None,
+) -> str:
+    """[READ] Return recent git log entries. Optionally scoped to a file. head/tail/grep filter output. No state change."""
     max_count = min(max(1, max_count), TOOL_MAX_GIT_LOG_ENTRIES)
     args = ["git", "log", f"--max-count={max_count}",
             "--format=%h %ai %an | %s"]
@@ -1127,14 +1107,12 @@ def git_log(path: str | None = None, max_count: int = 20) -> str:
     rc, out, err = _git_run(args)
     if rc != 0:
         return f"ERROR: git log failed: {err}"
-    return out or "(no log entries)"
+    result = out or "(no log entries)"
+    return _slice_output(result, head=head, tail=tail, grep=grep)
 
 
-def git_blame(path: str) -> str:
-    """
-    Return git blame output for a file, showing last-modified info per line.
-    Read-only operation - safe for research agents.
-    """
+def read_git_blame(path: str) -> str:
+    """[READ] Show git blame for a file (last-modified info per line). No state change."""
     try:
         safe_path = _assert_safe_path(path)
     except ValueError as exc:
@@ -1147,13 +1125,8 @@ def git_blame(path: str) -> str:
     return out or "(no blame output)"
 
 
-def git_show(ref: str, path: str | None = None) -> str:
-    """
-    Show a file's content at a specific git commit/ref, or show full commit
-    details (message + diffstat) when no path is given.
-    Read-only operation - safe for research agents.
-    """
-    # Validate ref: only allow safe characters
+def read_git_show(ref: str, path: str | None = None) -> str:
+    """[READ] Show a file at a git ref, or commit details (message + diffstat). No state change."""
     if not re.match(r'^[A-Za-z0-9\-_./~^@]+$', ref):
         return "ERROR: ref contains invalid characters. Only alphanumeric, -, _, ., /, ~, ^, @ are allowed."
     if path:
@@ -1161,7 +1134,6 @@ def git_show(ref: str, path: str | None = None) -> str:
             safe_path = _assert_safe_path(path)
         except ValueError as exc:
             return f"BLOCKED: {exc}"
-        # Convert to relative path from the task's working directory for git
         working_dir = _task_git_cwd.get() or PROJECT_ROOT
         rel_path = os.path.relpath(safe_path, working_dir).replace("\\", "/")
         args = ["git", "show", f"{ref}:{rel_path}"]
@@ -1173,11 +1145,8 @@ def git_show(ref: str, path: str | None = None) -> str:
     return out or "(no output)"
 
 
-def git_create_branch(branch_name: str) -> str:
-    """
-    Create and checkout a new branch.
-    Branch name must start with GIT_SAFETY_BRANCH_PREFIX ('maestro/task-').
-    """
+def write_git_branch(branch_name: str) -> str:
+    """[WRITE — git] Create and checkout a new branch. Branch name must start with 'maestro/task-'. Reversible only by switching branches."""
     if not branch_name.startswith(GIT_SAFETY_BRANCH_PREFIX):
         return (
             f"ERROR: Branch name must start with '{GIT_SAFETY_BRANCH_PREFIX}'. "
@@ -1193,9 +1162,8 @@ def git_create_branch(branch_name: str) -> str:
     return f"OK: created and checked out branch '{branch_name}'."
 
 
-def git_commit(message: str) -> str:
-    """Stage all tracked changes and create a commit with the given message."""
-    # Stage tracked modified files
+def write_git_commit(message: str) -> str:
+    """[WRITE — git] Stage all tracked changes and create a commit. Permanent record — reversible only via a revert commit."""
     _git_run(["git", "add", "-u"])
     rc, out, err = _git_run(["git", "commit", "-m", message])
     if rc != 0:
@@ -1205,16 +1173,14 @@ def git_commit(message: str) -> str:
     return f"OK: committed.\n{out}"
 
 
-def git_checkout(branch: str) -> str:
-    """
-    Checkout a branch. Only maestro/* branches and main/master are allowed.
-    """
-    allowed = branch.startswith(GIT_SAFETY_BRANCH_PREFIX) or branch in GIT_ALLOWED_BASE_BRANCHES
-    if not allowed:
+def write_git_checkout(branch: str) -> str:
+    """[WRITE — git] Checkout a branch. Only maestro/task-* branches are permitted — agents never leave their task branch."""
+    if not branch.startswith(GIT_SAFETY_BRANCH_PREFIX):
         logger.warning("Blocked git checkout to disallowed branch: %s", branch)
         return (
             f"ERROR: Checkout of '{branch}' is not permitted. "
-            f"Only 'maestro/task-*', 'main', and 'master' branches are allowed."
+            f"Only 'maestro/task-*' branches are allowed. "
+            "Agents in worktrees must stay on their assigned branch."
         )
     rc, out, err = _git_run(["git", "checkout", branch])
     if rc != 0:
@@ -1222,13 +1188,8 @@ def git_checkout(branch: str) -> str:
     return f"OK: checked out '{branch}'."
 
 
-def git_restore(path: str) -> str:
-    """Restore a tracked file to its HEAD state, discarding all local changes.
-
-    Equivalent to `git restore <path>`. Use this to undo unintentional edits
-    to a file that should not have been modified. The file must be tracked by
-    git (i.e. it existed in the last commit).
-    """
+def write_git_restore(path: str) -> str:
+    """[WRITE — git] Restore a tracked file to its HEAD state, DISCARDING all local changes. Irreversible for unsaved work."""
     try:
         safe_path = _assert_safe_path(path)
     except ValueError as exc:
@@ -1239,12 +1200,8 @@ def git_restore(path: str) -> str:
     return f"OK: restored '{path}' to HEAD state."
 
 
-def git_add(path: str) -> str:
-    """Stage a specific file for the next commit.
-
-    Equivalent to `git add <path>`. Use this to stage individual files rather
-    than staging everything at once. The path must be inside the project root.
-    """
+def write_git_stage(path: str) -> str:
+    """[WRITE — git] Stage a specific file for the next commit. Reversible via write_git_unstage."""
     try:
         safe_path = _assert_safe_write_path(path)
     except ValueError as exc:
@@ -1255,12 +1212,8 @@ def git_add(path: str) -> str:
     return f"OK: staged '{path}'."
 
 
-def git_unstage(path: str) -> str:
-    """Unstage a file that was previously staged, keeping the working-tree changes.
-
-    Equivalent to `git restore --staged <path>`. Use this to remove a file
-    from the staging area without discarding the edits in the file itself.
-    """
+def write_git_unstage(path: str) -> str:
+    """[WRITE — git] Remove a file from the staging area without discarding working-tree changes. Reversible via write_git_stage."""
     try:
         safe_path = _assert_safe_path(path)
     except ValueError as exc:
@@ -1269,6 +1222,32 @@ def git_unstage(path: str) -> str:
     if rc != 0:
         return f"ERROR: git unstage '{path}' failed: {err or out}"
     return f"OK: unstaged '{path}' (changes preserved in working tree)."
+
+
+def read_git_stash_list() -> str:
+    """[READ] List git stash entries. No state change."""
+    rc, out, err = _git_run(["git", "stash", "list"])
+    if rc != 0:
+        return f"ERROR: git stash list failed: {err}"
+    return out or "(no stash entries)"
+
+
+def write_git_stash(message: str) -> str:
+    """[WRITE — git] Stash tracked working-tree changes with a required message. Reversible via write_git_stash_pop."""
+    if not message.strip():
+        return "ERROR: A non-empty stash message is required."
+    rc, out, err = _git_run(["git", "stash", "push", "-m", message])
+    if rc != 0:
+        return f"ERROR: git stash failed: {err}"
+    return out or "OK: stash created."
+
+
+def write_git_stash_pop() -> str:
+    """[WRITE — git] Apply the most recent stash entry and remove it from the stash list."""
+    rc, out, err = _git_run(["git", "stash", "pop"])
+    if rc != 0:
+        return f"ERROR: git stash pop failed: {err}"
+    return out or "OK: stash applied and removed."
 
 
 # ---------------------------------------------------------------------------
@@ -1289,12 +1268,8 @@ def _import_db():
 # Planning tools (pure computation - no I/O, safe for any agent)
 # ---------------------------------------------------------------------------
 
-def generate_architecture_doc(title: str, components: list, relationships: list) -> str:
-    """
-    Produce a structured markdown architecture document and write it to
-    .maestro/architecture.md in the project root.  Returns a short stub
-    so the full document does not bloat the conversation context.
-    """
+def write_arch_doc(title: str, components: list, relationships: list) -> str:
+    """[WRITE — db] Write a structured markdown architecture document to .maestro/architecture.md. Returns a short stub."""
     lines = [f"# Architecture: {title}", ""]
 
     if components:
@@ -1339,12 +1314,8 @@ def generate_architecture_doc(title: str, components: list, relationships: list)
         return f"ERROR saving architecture doc: {exc}"
 
 
-def generate_mermaid_diagram(diagram_type: str, definition: str) -> str:
-    """
-    Validate and format a Mermaid diagram definition, then write it to
-    .maestro/diagrams/{diagram_type}.md in the project root.  Returns a
-    short stub so the diagram body does not bloat the conversation context.
-    """
+def write_mermaid(diagram_type: str, definition: str) -> str:
+    """[WRITE — db] Validate and write a Mermaid diagram to .maestro/diagrams/{type}.md. Valid types: flowchart, sequence, class, er, gantt, state, pie."""
     type_map = {
         "flowchart": "flowchart",
         "flow": "flowchart",
@@ -1382,12 +1353,8 @@ def generate_mermaid_diagram(diagram_type: str, definition: str) -> str:
         return f"ERROR saving mermaid diagram: {exc}"
 
 
-def generate_interface_contract(component_name: str, provides: list, consumes: list) -> str:
-    """
-    Define the API surface / interface contract for a component and write it
-    to .maestro/contracts/{component_name}.json in the project root.  Returns
-    a short stub so the contract body does not bloat the conversation context.
-    """
+def write_interface_contract(component_name: str, provides: list, consumes: list) -> str:
+    """[WRITE — db] Write an API interface contract to .maestro/contracts/{name}.json. Returns a short stub."""
     import json as _json
 
     contract = {
@@ -1425,12 +1392,8 @@ def generate_interface_contract(component_name: str, provides: list, consumes: l
         return f"ERROR saving interface contract: {exc}"
 
 
-def record_benchmark(task_id: str, parent_task_id: str, benchmark_type: str, metrics: str) -> str:
-    """
-    Record a before/after profiling benchmark for an optimization sub-task.
-    benchmark_type must be 'before' or 'after'.
-    metrics must be a JSON string: {test_duration_ms, memory_peak_mb, complexity_score, ...}
-    """
+def write_benchmark(task_id: str, parent_task_id: str, benchmark_type: str, metrics: str) -> str:
+    """[WRITE — db] Record a before/after profiling benchmark. benchmark_type: 'before'|'after'. metrics: JSON string with test_duration_ms, memory_peak_mb, complexity_score etc."""
     import json as _json
     if benchmark_type not in ("before", "after"):
         return "ERROR: benchmark_type must be 'before' or 'after'."
@@ -1733,12 +1696,8 @@ def list_tasks(project: str, column: str | None = None) -> str:
         return f"ERROR listing tasks: {exc}"
 
 
-def update_task_status(task_id: str, new_status: str) -> str:
-    """
-    Advance a task through the Kanban pipeline.
-    Valid transitions: PENDING->ACTIVE->VERIFYING->ACCEPTED / REJECTED.
-    Maps agent status names to Kanban column types.
-    """
+def write_task_status(task_id: str, new_status: str) -> str:
+    """[WRITE — db] Advance a task through the Kanban pipeline. Valid statuses: PENDING, ACTIVE, VERIFYING, ACCEPTED, REJECTED."""
     STATUS_TO_TYPE = {
         "PENDING": "planning",
         "ACTIVE": "indev",
@@ -1761,11 +1720,8 @@ def update_task_status(task_id: str, new_status: str) -> str:
         return f"ERROR updating task status: {exc}"
 
 
-def append_task_history(task_id: str, entry: str) -> str:
-    """
-    Append a proof-of-work entry to a task's history log.
-    entry should be a human-readable string describing what was done.
-    """
+def write_task_history(task_id: str, entry: str) -> str:
+    """[WRITE — db] Append a proof-of-work entry to a task's history log."""
     import json as _json
     try:
         db = _import_db()
@@ -1786,16 +1742,8 @@ def append_task_history(task_id: str, entry: str) -> str:
         return f"ERROR appending history: {exc}"
 
 
-def update_plan_fields(result_id: int, fields_json: str) -> str:
-    """
-    Patch specific fields on a planning_results row.
-
-    Allowed fields: interface_contracts, dependency_graph, file_manifest,
-    test_strategy, implementation_steps.
-
-    Each value in fields_json may be a JSON-encoded string or a native
-    Python object (list/dict) — both are accepted and stored as JSON text.
-    """
+def write_plan_fields(result_id: int, fields_json: str) -> str:
+    """[WRITE — db] Patch specific fields on a planning_results row. Allowed: interface_contracts, dependency_graph, file_manifest, test_strategy, implementation_steps."""
     import json as _json
     ALLOWED = {"interface_contracts", "dependency_graph", "file_manifest",
                "test_strategy", "implementation_steps"}
@@ -1910,28 +1858,11 @@ def list_scope_summaries(project: str | None = None, scope_type: str | None = No
 
 
 # ---------------------------------------------------------------------------
-# Allowlisted shell wrappers (delegate to pipeline modules)
-# ---------------------------------------------------------------------------
-
-def _run_shell_security_wrapper(command: str) -> str:
-    """Allowlisted shell for security scanning tools."""
-    from app.agent.security_review import run_shell_security
-    return run_shell_security(command)
-
-
-def _run_shell_review_wrapper(command: str) -> str:
-    """Allowlisted shell for review/test runner tools."""
-    from app.agent.full_review import run_shell_review
-    return run_shell_review(command)
-
-
-# ---------------------------------------------------------------------------
 # Named shell tool implementations (one tool per operation)
 # ---------------------------------------------------------------------------
-# These are the LLM-visible tools.  Each one hardcodes a specific command and
-# delegates to the stage-specific allowlisted runner below for venv/timeout
-# handling.  The LLM never needs to guess what's allowed — the tool name IS
-# the command.
+# Each named tool hardcodes a specific command and delegates to the
+# appropriate internal runner. The LLM never guesses what's allowed —
+# the tool name IS the command.
 # ---------------------------------------------------------------------------
 
 def _make_py_cmd(base: str, cwd: str) -> str:
@@ -1943,231 +1874,230 @@ def _make_py_cmd(base: str, cwd: str) -> str:
     return base
 
 
-def _run_named_tool_cmd(cmd: str, stage: str = "indev") -> str:
-    """Route a hardcoded command through the appropriate stage runner."""
-    if stage == "indev":
-        return run_shell_indev(cmd)
-    if stage == "build":
-        return run_shell_build(cmd)
-    if stage == "deps":
-        return run_shell_deps(cmd)
-    if stage == "security":
-        from app.agent.security_review import run_shell_security
-        return run_shell_security(cmd)
-    return f"ERROR: unknown stage '{stage}'"
-
-
 # --- Testing / linting ---
 
-def run_pytest(path: str = ".", flags: str = "") -> str:
-    """Run pytest in the task's project directory.
-
-    path: file or directory to test (default: current directory).
-    flags: additional pytest flags (e.g. '-v', '-k test_foo', '--tb=short').
-    A per-test timeout of 300s is injected automatically unless pytest.ini already sets one.
-    """
+def run_test_pytest(
+    path: str = ".",
+    flags: str = "",
+    head: int | None = None,
+    tail: int | None = None,
+    grep: str | None = None,
+) -> str:
+    """[RUN — sandbox] Run pytest. path: file or dir (default '.'). flags: extra pytest flags. Per-test timeout injected automatically. head/tail/grep filter output. No project-file mutation."""
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return "ERROR: No task git working directory configured."
     cmd = f"python -m pytest {path}"
     if flags:
         cmd += f" {flags}"
-    return run_shell_indev(cmd)
+    # Inject per-test timeout unless the project config already sets one.
+    if "--timeout" not in cmd:
+        _has_timeout_config = False
+        for _cfg in ("pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"):
+            _cfg_path = os.path.join(cwd, _cfg)
+            if os.path.isfile(_cfg_path):
+                try:
+                    with open(_cfg_path) as _f:
+                        if "timeout" in _f.read():
+                            _has_timeout_config = True
+                            break
+                except OSError:
+                    pass
+        if not _has_timeout_config:
+            injected = max(60, SHELL_TIMEOUT_SECONDS // 2) if SHELL_TIMEOUT_SECONDS > 60 else SHELL_TIMEOUT_SECONDS
+            cmd = cmd.rstrip() + f" --timeout={injected}"
+    timeout_msg = (
+        f"ERROR: Command timed out after {SHELL_TIMEOUT_SECONDS}s. "
+        "This may indicate a hang, infinite loop, or high computational complexity."
+    )
+    result = _execute_in_project(cmd, cwd, SHELL_TIMEOUT_SECONDS, timeout_msg, replace_python=True)
+    _last_test_output.set(result)
+    return _slice_output(result, head=head, tail=tail, grep=grep)
 
 
-def run_mypy(path: str, flags: str = "") -> str:
-    """Run mypy type-checker on the given path.
-
-    path: file or package to type-check.
-    flags: additional mypy flags (e.g. '--strict', '--ignore-missing-imports').
-    """
+def run_check_mypy(path: str, flags: str = "") -> str:
+    """[RUN — sandbox] Run mypy type-checker. path: file or package. flags: extra mypy flags. No project-file mutation."""
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return "ERROR: No task git working directory configured."
     cmd = f"python -m mypy {path}"
     if flags:
         cmd += f" {flags}"
-    return run_shell_indev(cmd)
+    return _execute_in_project(cmd, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: mypy timed out after {SHELL_TIMEOUT_SECONDS}s.", replace_python=True)
 
 
-def run_ruff(path: str = ".", flags: str = "") -> str:
-    """Run ruff linter on the given path.
-
-    path: file or directory to lint (default: current directory).
-    flags: additional ruff flags (e.g. '--fix', '--select E,F').
-    """
+def run_check_ruff(path: str = ".", flags: str = "") -> str:
+    """[RUN — sandbox] Run ruff linter. path: file or dir (default '.'). flags: extra ruff flags. No project-file mutation."""
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return "ERROR: No task git working directory configured."
     cmd = f"python -m ruff check {path}"
     if flags:
         cmd += f" {flags}"
-    return run_shell_indev(cmd)
+    return _execute_in_project(cmd, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: ruff timed out after {SHELL_TIMEOUT_SECONDS}s.", replace_python=True)
 
 
-def run_black_check(path: str = ".") -> str:
-    """Check code formatting with black (read-only, does not modify files).
+def run_check_black(path: str = ".") -> str:
+    """[RUN — sandbox] Check formatting with black (read-only — does not modify files). path: file or dir (default '.')."""
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return "ERROR: No task git working directory configured."
+    return _execute_in_project(f"python -m black --check {path}", cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: black timed out after {SHELL_TIMEOUT_SECONDS}s.", replace_python=True)
 
-    path: file or directory to check (default: current directory).
-    Use write_file to apply black's suggested formatting manually.
-    """
-    return run_shell_indev(f"python -m black --check {path}")
 
-
-def run_unittest(args: str = "") -> str:
-    """Run the Python unittest test runner.
-
-    args: module, class, or method to run (e.g. 'tests.test_foo', or empty for discovery).
-    """
+def run_test_unittest(args: str = "") -> str:
+    """[RUN — sandbox] Run Python unittest discovery or a specific test module/class/method. No project-file mutation."""
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return "ERROR: No task git working directory configured."
     cmd = "python -m unittest"
     if args:
         cmd += f" {args}"
-    return run_shell_indev(cmd)
+    return _execute_in_project(cmd, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: unittest timed out after {SHELL_TIMEOUT_SECONDS}s.", replace_python=True)
 
 
-def run_npm_test(args: str = "") -> str:
-    """Run npm test in the task's project directory.
-
-    args: additional arguments passed to the test runner.
-    """
+def run_test_npm(args: str = "") -> str:
+    """[RUN — sandbox] Run npm test. args: additional arguments for the test runner. No project-file mutation."""
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return "ERROR: No task git working directory configured."
     cmd = "npm test"
     if args:
         cmd += f" {args}"
-    return run_shell_indev(cmd)
+    return _execute_in_project(cmd, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: npm test timed out after {SHELL_TIMEOUT_SECONDS}s.")
 
 
-def run_cargo_test(args: str = "") -> str:
-    """Run cargo test in the task's project directory.
-
-    args: additional arguments (e.g. '--release', '-- --nocapture').
-    """
+def run_test_cargo(args: str = "") -> str:
+    """[RUN — sandbox] Run cargo test. args: extra cargo test flags. No project-file mutation."""
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return "ERROR: No task git working directory configured."
     cmd = "cargo test"
     if args:
         cmd += f" {args}"
-    return run_shell_indev(cmd)
+    return _execute_in_project(cmd, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: cargo test timed out after {SHELL_TIMEOUT_SECONDS}s.")
 
 
-def run_go_test(path: str = "./...", flags: str = "") -> str:
-    """Run go test in the task's project directory.
-
-    path: package path to test (default: ./... for all packages).
-    flags: additional go test flags (e.g. '-v', '-run TestFoo').
-    """
+def run_test_go(path: str = "./...", flags: str = "") -> str:
+    """[RUN — sandbox] Run go test. path: package path (default './...'). flags: extra go test flags. No project-file mutation."""
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return "ERROR: No task git working directory configured."
     cmd = f"go test {path}"
     if flags:
         cmd += f" {flags}"
-    return run_shell_indev(cmd)
+    return _execute_in_project(cmd, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: go test timed out after {SHELL_TIMEOUT_SECONDS}s.")
 
 
 # --- Build ---
 
-def run_make(target: str, args: str = "") -> str:
-    """Run a make target in the task's project directory.
-
-    target: Makefile target (e.g. 'build', 'test', 'lint', 'all').
-    args: additional arguments to pass to make.
-    """
+def run_build_make(target: str, args: str = "") -> str:
+    """[RUN — build] Run a Makefile target. target: e.g. 'build', 'test', 'all'. Creates build artifacts inside the project."""
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return "ERROR: No task git working directory configured."
     cmd = f"make {target}"
     if args:
         cmd += f" {args}"
-    return run_shell_build(cmd)
+    return _execute_in_project(cmd, cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: make timed out after {_BUILD_TIMEOUT_SECONDS}s.")
 
 
-def run_cargo_build(args: str = "") -> str:
-    """Build a Rust/Cargo project.
-
-    args: additional cargo build flags (e.g. '--release', '--features foo').
-    """
+def run_build_cargo(args: str = "") -> str:
+    """[RUN — build] Build a Rust/Cargo project (cargo build). Creates build artifacts inside the project."""
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return "ERROR: No task git working directory configured."
     cmd = "cargo build"
     if args:
         cmd += f" {args}"
-    return run_shell_build(cmd)
+    return _execute_in_project(cmd, cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: cargo build timed out after {_BUILD_TIMEOUT_SECONDS}s.")
 
 
-def run_go_build(args: str = "") -> str:
-    """Build a Go project.
-
-    args: additional go build flags (e.g. '-o bin/app', './cmd/...').
-    """
+def run_build_go(args: str = "") -> str:
+    """[RUN — build] Build a Go project (go build). Creates build artifacts inside the project."""
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return "ERROR: No task git working directory configured."
     cmd = "go build"
     if args:
         cmd += f" {args}"
-    return run_shell_build(cmd)
+    return _execute_in_project(cmd, cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: go build timed out after {_BUILD_TIMEOUT_SECONDS}s.")
 
 
-def run_npm_build(script: str = "build") -> str:
-    """Run an npm build script.
+def run_build_npm(script: str = "build") -> str:
+    """[RUN — build] Run an npm build script (npm run <script>). Creates build artifacts inside the project."""
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return "ERROR: No task git working directory configured."
+    return _execute_in_project(f"npm run {script}", cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: npm build timed out after {_BUILD_TIMEOUT_SECONDS}s.")
 
-    script: the npm script name (default: 'build'). Runs 'npm run <script>'.
-    """
-    return run_shell_build(f"npm run {script}")
 
-
-def run_tsc(args: str = "") -> str:
-    """Run the TypeScript compiler (tsc).
-
-    args: additional tsc flags (e.g. '--noEmit', '--watch').
-    """
+def run_build_tsc(args: str = "") -> str:
+    """[RUN — build] Run the TypeScript compiler (tsc). Creates build artifacts inside the project."""
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return "ERROR: No task git working directory configured."
     cmd = "tsc"
     if args:
         cmd += f" {args}"
-    return run_shell_build(cmd)
+    return _execute_in_project(cmd, cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: tsc timed out after {_BUILD_TIMEOUT_SECONDS}s.")
 
 
-def run_gradle(target: str, args: str = "") -> str:
-    """Run a Gradle task.
-
-    target: Gradle task name (e.g. 'build', 'test', 'assemble').
-    args: additional Gradle flags.
-    """
+def run_build_gradle(target: str, args: str = "") -> str:
+    """[RUN — build] Run a Gradle task. target: e.g. 'build', 'assemble'. Creates build artifacts inside the project."""
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return "ERROR: No task git working directory configured."
     cmd = f"gradle {target}"
     if args:
         cmd += f" {args}"
-    return run_shell_build(cmd)
+    return _execute_in_project(cmd, cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: gradle timed out after {_BUILD_TIMEOUT_SECONDS}s.")
 
 
-def run_mvn(goal: str, args: str = "") -> str:
-    """Run a Maven goal.
-
-    goal: Maven lifecycle phase or plugin goal (e.g. 'package', 'test', 'compile').
-    args: additional Maven flags (e.g. '-DskipTests', '-Dmaven.test.failure.ignore').
-    """
+def run_build_mvn(goal: str, args: str = "") -> str:
+    """[RUN — build] Run a Maven goal. goal: e.g. 'package', 'compile'. Creates build artifacts inside the project."""
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return "ERROR: No task git working directory configured."
     cmd = f"mvn {goal}"
     if args:
         cmd += f" {args}"
-    return run_shell_build(cmd)
+    return _execute_in_project(cmd, cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: mvn timed out after {_BUILD_TIMEOUT_SECONDS}s.")
 
 
 # --- Dependencies ---
 
-def run_pip_install(args: str) -> str:
-    """Install Python packages with pip.
+def run_deps_pip(args: str) -> str:
+    """[RUN — deps] Install Python packages with pip. MUTATES environment. args: e.g. '-r requirements.txt', 'requests>=2.28', '-e .'."""
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return "ERROR: No task git working directory configured."
+    return _execute_in_project(f"python -m pip install {args}", cwd, _DEPS_TIMEOUT_SECONDS, f"ERROR: pip install timed out after {_DEPS_TIMEOUT_SECONDS}s.", replace_python=True)
 
-    args: pip install arguments (e.g. '-r requirements.txt', 'requests>=2.28', '-e .').
-    Call this after modifying requirements.txt or pyproject.toml.
-    """
-    return run_shell_deps(f"python -m pip install {args}")
 
-
-def run_npm_install(args: str = "") -> str:
-    """Install Node.js dependencies with npm.
-
-    args: additional npm install flags (e.g. '--save-dev', '--legacy-peer-deps').
-    Call this after modifying package.json.
-    """
+def run_deps_npm(args: str = "") -> str:
+    """[RUN — deps] Install Node.js dependencies (npm install). MUTATES environment. Call after modifying package.json."""
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return "ERROR: No task git working directory configured."
     cmd = "npm install"
     if args:
         cmd += f" {args}"
-    return run_shell_deps(cmd)
+    return _execute_in_project(cmd, cwd, _DEPS_TIMEOUT_SECONDS, f"ERROR: npm install timed out after {_DEPS_TIMEOUT_SECONDS}s.")
 
 
-def run_cargo_fetch() -> str:
-    """Fetch Rust/Cargo dependencies (cargo fetch).
-
-    Call this after modifying Cargo.toml before building.
-    """
-    return run_shell_deps("cargo fetch")
+def run_deps_cargo() -> str:
+    """[RUN — deps] Fetch Rust/Cargo dependencies (cargo fetch). MUTATES environment. Call after modifying Cargo.toml."""
+    cwd = _task_git_cwd.get()
+    if cwd is None:
+        return "ERROR: No task git working directory configured."
+    return _execute_in_project("cargo fetch", cwd, _DEPS_TIMEOUT_SECONDS, f"ERROR: cargo fetch timed out after {_DEPS_TIMEOUT_SECONDS}s.")
 
 
 # --- Security scanners ---
 
-def run_bandit(path: str = ".", args: str = "") -> str:
-    """Run the bandit Python security linter.
-
-    path: directory or file to scan (default: current directory).
-    args: additional bandit flags (e.g. '-ll', '-r', '--skip B101').
-    """
+def run_audit_bandit(path: str = ".", args: str = "") -> str:
+    """[RUN — audit] Run bandit Python security linter. No project-file mutation. path: dir or file (default '.')."""
     cmd = f"python -m bandit -r {path}"
     if args:
         cmd += f" {args}"
@@ -2175,139 +2105,48 @@ def run_bandit(path: str = ".", args: str = "") -> str:
     return run_shell_security(cmd)
 
 
-def run_pip_audit() -> str:
-    """Audit installed Python packages for known vulnerabilities (pip-audit)."""
+def run_audit_pip() -> str:
+    """[RUN — audit] Audit installed Python packages for known vulnerabilities (pip-audit). No project-file mutation."""
     from app.agent.security_review import run_shell_security
     return run_shell_security("python -m pip audit")
 
 
-def run_semgrep(path: str = ".", config: str = "auto") -> str:
-    """Run semgrep static analysis.
-
-    path: file or directory to scan (default: current directory).
-    config: semgrep config/ruleset (default: 'auto' for auto-detection).
-    """
+def run_audit_semgrep(path: str = ".", config: str = "auto") -> str:
+    """[RUN — audit] Run semgrep static analysis. No project-file mutation. config: ruleset (default 'auto')."""
     from app.agent.security_review import run_shell_security
     return run_shell_security(f"semgrep --config {config} {path}")
 
 
-def run_npm_audit() -> str:
-    """Run npm audit to check Node.js dependencies for vulnerabilities."""
+def run_audit_npm() -> str:
+    """[RUN — audit] Run npm audit to check Node.js dependencies for vulnerabilities. No project-file mutation."""
     from app.agent.security_review import run_shell_security
     return run_shell_security("npm audit")
 
 
 # ---------------------------------------------------------------------------
-# Allowlisted shell runners — indev (test/lint), build, deps
-# (internal — not exposed in TOOL_SCHEMAS; named tools above delegate here)
+# Shared subprocess runner (internal — not exposed as a tool)
 # ---------------------------------------------------------------------------
-
-_INDEV_ALLOWLIST_PATTERNS: list[str] = [
-    r"^python\s+-m\s+pytest\b",
-    r"^python\s+-m\s+unittest\b",
-    r"^python\s+-m\s+mypy\b",
-    r"^python\s+-m\s+ruff\b",
-    r"^python\s+-m\s+black\s+--check\b",
-    r"^npm\s+test\b",
-    r"^npm\s+run\s+(?:test|lint|typecheck)\b",
-    r"^cargo\s+test\b",
-    r"^go\s+test\b",
-    r"^make\s+(?:test|lint|check)\b",
-    r"^ctest\b",
-    r"^gradle\s+test\b",
-    r"^\.\/gradlew\s+test\b",
-    r"^mvn\s+test\b",
-]
-_INDEV_ALLOWLIST_RE = [re.compile(p) for p in _INDEV_ALLOWLIST_PATTERNS]
-
-_BUILD_ALLOWLIST_PATTERNS: list[str] = [
-    r"^cmake\b",
-    r"^make\b",
-    r"^ninja\b",
-    r"^cargo\s+build\b",
-    r"^go\s+build\b",
-    r"^npm\s+run\s+build\b",
-    r"^gradle\b",
-    r"^\.\/gradlew\b",
-    r"^mvn\s+(?:package|compile)\b",
-    r"^msbuild\b",
-    r"^bazel\s+build\b",
-    r"^xcodebuild\b",
-    r"^tsc\b",
-]
-_BUILD_ALLOWLIST_RE = [re.compile(p) for p in _BUILD_ALLOWLIST_PATTERNS]
-
-_DEPS_ALLOWLIST_PATTERNS: list[str] = [
-    r"^python\s+-m\s+pip\s+install\b",
-    r"^npm\s+install\b",
-    r"^npm\s+ci\b",
-    r"^yarn\s+install\b",
-    r"^pnpm\s+install\b",
-    r"^cargo\s+(?:fetch|update)\b",
-    r"^go\s+mod\s+(?:download|tidy|vendor)\b",
-    r"^bundle\s+install\b",
-    r"^composer\s+install\b",
-    r"^mvn\s+dependency:resolve\b",
-    r"^gradle\s+dependencies\b",
-    r"^\.\/gradlew\s+dependencies\b",
-]
-_DEPS_ALLOWLIST_RE = [re.compile(p) for p in _DEPS_ALLOWLIST_PATTERNS]
 
 _BUILD_TIMEOUT_SECONDS = 300
 _DEPS_TIMEOUT_SECONDS = 600
 
 
-def run_shell_indev(command: str, timeout: int | None = None) -> str:
-    """Execute an allowlisted development command in the task's project directory.
-
-    Only commands matching _INDEV_ALLOWLIST_PATTERNS are permitted.
-    cwd is resolved from the per-task context (_task_git_cwd).
-    """
-    cwd = _task_git_cwd.get()
-    if cwd is None:
-        return (
-            "ERROR: No task git working directory configured. "
-            "Call set_task_git_cwd(project_path) before using run_shell_indev."
-        )
-
-    command = command.strip()
-    allowed = any(pat.match(command) for pat in _INDEV_ALLOWLIST_RE)
-    if not allowed:
-        return f"Command not in allowlist: {command}"
-
-    # Lazy env setup: detect project type and create venv/install deps if needed.
+def _execute_in_project(
+    command: str,
+    cwd: str,
+    timeout: int,
+    timeout_msg: str,
+    *,
+    replace_python: bool = False,
+) -> str:
+    """Run command in the project cwd. Sets up venv; optionally swaps bare python for project venv."""
     from app.agent.worktree import setup_test_environment, venv_python as _venv_python
     setup_test_environment(cwd)
 
-    # Replace bare `python` with the project venv's Python so test runs are
-    # isolated from whatever interpreter happens to be on the system PATH.
-    _py = _venv_python(cwd)
-    if _py != "python":
-        command = re.sub(r"^python\b", _py.replace("\\", "/"), command)
-
-    # Use provided timeout or global default
-    effective_timeout = timeout if timeout is not None else SHELL_TIMEOUT_SECONDS
-
-    # Inject per-test timeout into pytest invocations so a single hanging test
-    # cannot block the process indefinitely — but only when no project-level
-    # pytest config already sets one (pytest.ini, pyproject.toml, setup.cfg).
-    if re.search(r"\bpytest\b", command) and "--timeout" not in command:
-        _has_timeout_config = False
-        for _cfg in ("pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"):
-            _cfg_path = os.path.join(cwd, _cfg)
-            if os.path.isfile(_cfg_path):
-                try:
-                    with open(_cfg_path) as _f:
-                        content = _f.read()
-                        if "timeout" in content:
-                            _has_timeout_config = True
-                            break
-                except OSError:
-                    pass
-        if not _has_timeout_config:
-            # Floor of 60s for the injected per-test timeout unless global is lower.
-            injected = max(60, effective_timeout // 2) if effective_timeout > 60 else effective_timeout
-            command = command.rstrip() + f" --timeout={injected}"
+    if replace_python:
+        _py = _venv_python(cwd)
+        if _py != "python":
+            command = re.sub(r"^python\b", _py.replace("\\", "/"), command)
 
     try:
         proc = subprocess.Popen(
@@ -2319,9 +2158,8 @@ def run_shell_indev(command: str, timeout: int | None = None) -> str:
             cwd=cwd,
         )
         try:
-            stdout, _ = proc.communicate(timeout=effective_timeout)
+            stdout, _ = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            # On Windows, kill the entire process tree; on Unix, kill the group.
             if os.name == "nt":
                 subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
@@ -2330,11 +2168,7 @@ def run_shell_indev(command: str, timeout: int | None = None) -> str:
             else:
                 proc.kill()
             proc.communicate()
-            return (
-                f"ERROR: Command timed out after {effective_timeout}s. "
-                "This may indicate a hang, infinite loop, or high computational "
-                "complexity (e.g. O(2^n) Fibonacci) being tested with large inputs."
-            )
+            return timeout_msg
         output = stdout or ""
         rc = proc.returncode
         result_str = output[:8000] if output else ""
@@ -2343,101 +2177,194 @@ def run_shell_indev(command: str, timeout: int | None = None) -> str:
         return f"ERROR running command: {exc}"
 
 
-def run_shell_build(command: str, timeout: int | None = None) -> str:
-    """Execute an allowlisted build command in the task's project directory.
+# ---------------------------------------------------------------------------
+# New helper tools (Phase 1: additive additions)
+# ---------------------------------------------------------------------------
 
-    Only commands matching _BUILD_ALLOWLIST_PATTERNS are permitted.
-    cwd is resolved from the per-task context (_task_git_cwd).
+def read_last_output(
+    head: int | None = None,
+    tail: int | None = None,
+    grep: str | None = None,
+    offset: int | None = None,
+    limit: int | None = None,
+) -> str:
+    """[READ] Slice the previous tool call's full output without re-running it. No state change.
+
+    Uses the output buffer populated by the most recent tool call in this session.
+    head/tail/grep/offset/limit apply in this order: offset, limit, grep, head/tail.
     """
-    cwd = _task_git_cwd.get()
-    if cwd is None:
-        return (
-            "ERROR: No task git working directory configured. "
-            "Call set_task_git_cwd(project_path) before using run_shell_build."
-        )
+    with _output_buffer_lock:
+        buf = _output_buffer.get("_sync", "")
+    if not buf:
+        return "(no previous tool output in buffer)"
+    return _slice_output(buf, head=head, tail=tail, grep=grep, offset=offset, limit=limit)
 
-    command = command.strip()
-    allowed = any(pat.match(command) for pat in _BUILD_ALLOWLIST_RE)
-    if not allowed:
-        return f"Command not in build allowlist: {command}"
 
-    from app.agent.worktree import setup_test_environment
-    setup_test_environment(cwd)
-
-    effective_timeout = timeout if timeout is not None else _BUILD_TIMEOUT_SECONDS
-
+def read_diff_stat(since: str = "main") -> str:
+    """[READ] git diff --stat from <since> to HEAD, parsed into added/removed per file. No state change."""
+    effective_cwd = _task_git_cwd.get()
+    if not effective_cwd:
+        return "ERROR: No task git working directory configured."
     try:
-        proc = subprocess.Popen(
-            command, shell=True, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, cwd=cwd,
+        result = subprocess.run(
+            ["git", "diff", f"{since}..HEAD", "--stat"],
+            cwd=effective_cwd,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
-        try:
-            stdout, _ = proc.communicate(timeout=effective_timeout)
-        except subprocess.TimeoutExpired:
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
-            else:
-                proc.kill()
-            proc.communicate()
-            return f"ERROR: Build timed out after {effective_timeout}s."
-        output = stdout or ""
-        rc = proc.returncode
-        result_str = output[:8000] if output else ""
-        return result_str if result_str else f"EXIT_CODE: {rc}"
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        return f"No changes since '{since}'."
     except Exception as exc:
-        return f"ERROR running build: {exc}"
+        return f"Unable to compute diff stat: {exc}"
 
 
-def run_shell_deps(command: str, timeout: int | None = None) -> str:
-    """Install or update project dependencies using an allowlisted package manager command.
+# ---------------------------------------------------------------------------
+# Static analysis tools (backed by static_analysis.py tree-sitter parser)
+# ---------------------------------------------------------------------------
 
-    Only commands matching _DEPS_ALLOWLIST_PATTERNS are permitted (pip install,
-    npm install, cargo fetch, go mod download/tidy, etc.).
-    cwd is resolved from the per-task context (_task_git_cwd).
-    For Python projects, `python` is rewritten to the project venv's Python.
-    """
-    cwd = _task_git_cwd.get()
-    if cwd is None:
-        return (
-            "ERROR: No task git working directory configured. "
-            "Call set_task_git_cwd(project_path) before using run_shell_deps."
-        )
+_sa_cache: dict[str, Any] = {}  # project_root → ProjectAnalysis
+_sa_cache_lock = threading.Lock()
 
-    command = command.strip()
-    allowed = any(pat.match(command) for pat in _DEPS_ALLOWLIST_RE)
-    if not allowed:
-        return f"Command not in deps allowlist: {command}"
 
-    # Ensure venv exists before pip commands attempt to install into it.
-    from app.agent.worktree import setup_test_environment, venv_python as _venv_python
-    setup_test_environment(cwd)
-
-    _py = _venv_python(cwd)
-    if _py != "python":
-        command = re.sub(r"^python\b", _py.replace("\\", "/"), command)
-
-    effective_timeout = timeout if timeout is not None else _DEPS_TIMEOUT_SECONDS
-
+def _get_project_analysis():
+    """Return a cached ProjectAnalysis for the current task's project root."""
+    from app.agent.static_analysis import analyze_project, analysis_to_dict
+    root = _task_git_cwd.get()
+    if not root:
+        return None, "ERROR: No task git working directory configured."
+    with _sa_cache_lock:
+        if root in _sa_cache:
+            return _sa_cache[root], None
+    # Collect Python files
+    py_files: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune excluded dirs
+        dirnames[:] = [d for d in dirnames if d not in LISTING_EXCLUDED_DIRS and not d.startswith(".")]
+        for f in filenames:
+            if f.endswith(".py"):
+                py_files.append(os.path.join(dirpath, f))
+    if not py_files:
+        return None, "No .py files found in project root."
     try:
-        proc = subprocess.Popen(
-            command, shell=True, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, cwd=cwd,
-        )
-        try:
-            stdout, _ = proc.communicate(timeout=effective_timeout)
-        except subprocess.TimeoutExpired:
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
-            else:
-                proc.kill()
-            proc.communicate()
-            return f"ERROR: Deps install timed out after {effective_timeout}s."
-        output = stdout or ""
-        rc = proc.returncode
-        result_str = output[:8000] if output else ""
-        return result_str if result_str else f"EXIT_CODE: {rc}"
+        analysis = analyze_project(py_files)
+        with _sa_cache_lock:
+            _sa_cache[root] = analysis
+        return analysis, None
     except Exception as exc:
-        return f"ERROR running deps: {exc}"
+        return None, f"ERROR: static analysis failed: {exc}"
+
+
+def invalidate_sa_cache() -> None:
+    """Invalidate the static analysis cache for the current task root (called after write_file)."""
+    root = _task_git_cwd.get()
+    if root:
+        with _sa_cache_lock:
+            _sa_cache.pop(root, None)
+
+
+def find_symbol(name: str, kind: str = "any") -> str:
+    """[READ] Find function/class definitions by name using tree-sitter. kind: function|class|any. No state change."""
+    analysis, err = _get_project_analysis()
+    if err:
+        return err
+    results: list[str] = []
+    for path, file_analysis in analysis.files.items():
+        if kind in ("function", "any"):
+            for fn in file_analysis.functions:
+                if fn.name == name or name.lower() in fn.name.lower():
+                    results.append(f"{path}:{getattr(fn, 'line', '?')} function {fn.name}")
+        if kind in ("class", "any"):
+            for cls in file_analysis.classes:
+                if cls.name == name or name.lower() in cls.name.lower():
+                    results.append(f"{path}:{getattr(cls, 'line', '?')} class {cls.name}")
+                for method in getattr(cls, 'methods', []):
+                    if method.name == name or name.lower() in method.name.lower():
+                        results.append(f"{path}:{getattr(method, 'line', '?')} method {cls.name}.{method.name}")
+    return "\n".join(results) if results else f"No symbol '{name}' found (kind={kind})."
+
+
+def find_callers(symbol: str) -> str:
+    """[READ] Find files that import or likely call the given symbol, using the static analysis import graph. No state change."""
+    analysis, err = _get_project_analysis()
+    if err:
+        return err
+    results: list[str] = []
+    sym_lower = symbol.lower()
+    for path, file_analysis in analysis.files.items():
+        for imp in file_analysis.imports:
+            if sym_lower in imp.lower():
+                results.append(f"{path}: imports '{imp}'")
+    return "\n".join(results) if results else f"No import references to '{symbol}' found."
+
+
+def find_imports_of(module_path: str) -> str:
+    """[READ] Find all files that import the given module (by relative path or module name). No state change."""
+    analysis, err = _get_project_analysis()
+    if err:
+        return err
+    # Normalize: 'app/agent/tools.py' → 'app.agent.tools' or 'tools'
+    module_name = module_path.replace("/", ".").replace("\\", ".").rstrip(".py")
+    if module_name.endswith(".py"):
+        module_name = module_name[:-3]
+    results: list[str] = []
+    for path, file_analysis in analysis.files.items():
+        for imp in file_analysis.imports:
+            if module_name in imp:
+                results.append(f"{path}: imports '{imp}'")
+    # Also check reverse_imports graph if available
+    ri = getattr(analysis, "reverse_imports", {})
+    for key, importers in ri.items():
+        if module_name in key:
+            for importer in importers:
+                entry = f"{importer}: imports '{key}' (graph)"
+                if entry not in results:
+                    results.append(entry)
+    return "\n".join(results) if results else f"No imports of '{module_path}' found."
+
+
+def read_test_summary() -> str:
+    """[READ] Parse the most recent run_test_pytest output into {passed, failed, errors, failing_names}. No state change."""
+    output = _last_test_output.get("")
+    if not output:
+        return "No pytest output recorded. Run run_test_pytest first."
+    passed = failed = errors = 0
+    failing_names: list[str] = []
+    for line in output.splitlines():
+        if " passed" in line:
+            for part in line.split(","):
+                part = part.strip()
+                if "passed" in part:
+                    try:
+                        passed = int(part.split()[0])
+                    except (ValueError, IndexError):
+                        pass
+        if " failed" in line:
+            for part in line.split(","):
+                part = part.strip()
+                if "failed" in part:
+                    try:
+                        failed = int(part.split()[0])
+                    except (ValueError, IndexError):
+                        pass
+        if " error" in line.lower():
+            for part in line.split(","):
+                part = part.strip()
+                if "error" in part.lower():
+                    try:
+                        errors = int(part.split()[0])
+                    except (ValueError, IndexError):
+                        pass
+        if line.startswith("FAILED "):
+            failing_names.append(line[7:].strip())
+    import json as _json
+    return _json.dumps({
+        "passed": passed,
+        "failed": failed,
+        "errors": errors,
+        "failing_names": failing_names,
+    }, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -2445,72 +2372,87 @@ def run_shell_deps(command: str, timeout: int | None = None) -> str:
 # ---------------------------------------------------------------------------
 
 TOOL_REGISTRY: dict[str, Any] = {
+    # File read tools
     "read_file": read_file,
     "read_file_harder": read_file_harder,
-    "read_file_lines": read_file_lines,
-    "count_lines": count_lines,
+    "read_file_metadata": read_file_metadata,
+    "read_last_output": read_last_output,
+    # File write tools
     "write_file": write_file,
     "append_file": append_file,
-    "list_directory": list_directory,
-    "search_files": search_files,
+    "write_archive": write_archive,
+    # Directory / search tools
+    "read_list_dir": read_list_dir,
     "find_files": find_files,
-    "archive_file": archive_file,
-    "run_shell": run_shell,
-    "git_status": git_status,
-    "git_diff": git_diff,
-    "git_log": git_log,
-    "git_blame": git_blame,
-    "git_show": git_show,
-    "git_create_branch": git_create_branch,
-    "git_commit": git_commit,
-    "git_checkout": git_checkout,
-    "git_restore": git_restore,
-    "git_add": git_add,
-    "git_unstage": git_unstage,
+    "find_in_files": find_in_files,
+    # Static analysis helpers
+    "find_symbol": find_symbol,
+    "find_callers": find_callers,
+    "find_imports_of": find_imports_of,
+    # Git diff/stat helpers
+    "read_diff_stat": read_diff_stat,
+    # Test summary helper
+    "read_test_summary": read_test_summary,
+    # Git read tools
+    "read_git_status": read_git_status,
+    "read_git_diff": read_git_diff,
+    "read_git_log": read_git_log,
+    "read_git_blame": read_git_blame,
+    "read_git_show": read_git_show,
+    "read_git_stash_list": read_git_stash_list,
+    # Git write tools
+    "write_git_branch": write_git_branch,
+    "write_git_commit": write_git_commit,
+    "write_git_checkout": write_git_checkout,
+    "write_git_restore": write_git_restore,
+    "write_git_stage": write_git_stage,
+    "write_git_unstage": write_git_unstage,
+    "write_git_stash": write_git_stash,
+    "write_git_stash_pop": write_git_stash_pop,
+    # Task DB tools
     "get_task": get_task,
     "list_tasks": list_tasks,
-    "update_task_status": update_task_status,
-    "append_task_history": append_task_history,
-    "update_plan_fields": update_plan_fields,
+    "write_task_status": write_task_status,
+    "write_task_history": write_task_history,
+    "write_plan_fields": write_plan_fields,
+    # Web tools
     "web_search": web_search,
     "web_fetch": web_fetch,
-    "generate_architecture_doc": generate_architecture_doc,
-    "generate_mermaid_diagram": generate_mermaid_diagram,
-    "generate_interface_contract": generate_interface_contract,
+    # Architecture/planning write tools
+    "write_arch_doc": write_arch_doc,
+    "write_mermaid": write_mermaid,
+    "write_interface_contract": write_interface_contract,
+    "write_benchmark": write_benchmark,
+    # Research agents
     "spawn_research_agent": spawn_research_agent,
     "launch_research_agent": launch_research_agent,
-    "record_benchmark": record_benchmark,
-    "run_shell_security": _run_shell_security_wrapper,
-    "run_shell_review": _run_shell_review_wrapper,
-    "run_shell_indev": run_shell_indev,
-    "run_shell_build": run_shell_build,
-    "run_shell_deps": run_shell_deps,
-    # Named testing tools
-    "run_pytest": run_pytest,
-    "run_mypy": run_mypy,
-    "run_ruff": run_ruff,
-    "run_black_check": run_black_check,
-    "run_unittest": run_unittest,
-    "run_npm_test": run_npm_test,
-    "run_cargo_test": run_cargo_test,
-    "run_go_test": run_go_test,
-    # Named build tools
-    "run_make": run_make,
-    "run_cargo_build": run_cargo_build,
-    "run_go_build": run_go_build,
-    "run_npm_build": run_npm_build,
-    "run_tsc": run_tsc,
-    "run_gradle": run_gradle,
-    "run_mvn": run_mvn,
-    # Named dependency tools
-    "run_pip_install": run_pip_install,
-    "run_npm_install": run_npm_install,
-    "run_cargo_fetch": run_cargo_fetch,
-    # Named security scanner tools
-    "run_bandit": run_bandit,
-    "run_pip_audit": run_pip_audit,
-    "run_semgrep": run_semgrep,
-    "run_npm_audit": run_npm_audit,
+    # Test/lint (sandbox — no project mutation)
+    "run_test_pytest": run_test_pytest,
+    "run_check_mypy": run_check_mypy,
+    "run_check_ruff": run_check_ruff,
+    "run_check_black": run_check_black,
+    "run_test_unittest": run_test_unittest,
+    "run_test_npm": run_test_npm,
+    "run_test_cargo": run_test_cargo,
+    "run_test_go": run_test_go,
+    # Build tools (write build artifacts)
+    "run_build_make": run_build_make,
+    "run_build_cargo": run_build_cargo,
+    "run_build_go": run_build_go,
+    "run_build_npm": run_build_npm,
+    "run_build_tsc": run_build_tsc,
+    "run_build_gradle": run_build_gradle,
+    "run_build_mvn": run_build_mvn,
+    # Dependency tools (mutate environment)
+    "run_deps_pip": run_deps_pip,
+    "run_deps_npm": run_deps_npm,
+    "run_deps_cargo": run_deps_cargo,
+    # Security audit tools
+    "run_audit_bandit": run_audit_bandit,
+    "run_audit_pip": run_audit_pip,
+    "run_audit_semgrep": run_audit_semgrep,
+    "run_audit_npm": run_audit_npm,
+    # Survey/project summary tools
     "get_project_summary": get_project_summary,
     "get_directory_summary": get_directory_summary,
     "get_module_summary": get_module_summary,
@@ -2518,17 +2460,19 @@ TOOL_REGISTRY: dict[str, Any] = {
 }
 
 TOOL_SCHEMAS: list[dict] = [
+    # ---- File read tools ----
     {
         "type": "function",
         "function": {
             "name": "read_file",
             "description": (
-                "First call: returns a natural-language summary (LLM-generated, cached) plus "
+                "[READ] First call: returns a natural-language summary (LLM-generated, cached) plus "
                 "structural analysis: classes, functions, imports, and line ranges. "
                 "For tiny files (<= 25 lines) embeds raw content directly. "
                 "Each subsequent call on the same file serves the next 250 unserved source lines - "
                 "never repeating lines already in context. "
-                "Call repeatedly to page through a file, or use read_file_harder() for a specific range."
+                "Call repeatedly to page through a file, or use read_file_harder() for a specific range. "
+                "No state change."
             ),
             "parameters": {
                 "type": "object",
@@ -2544,11 +2488,11 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "read_file_harder",
             "description": (
-                "Read up to 250 source-code lines per call, never repeating lines already in context. "
+                "[READ] Read up to 250 source-code lines per call, never repeating lines already in context. "
                 "Omit start/end/count to get the next 250 unserved lines from line 1 forward. "
                 "Provide start (+ optionally end or count) to target a specific range - only the "
                 "unserved portion of that range is returned. "
-                "If read_file() has not been called first, it is called automatically."
+                "If read_file() has not been called first, it is called automatically. No state change."
             ),
             "parameters": {
                 "type": "object",
@@ -2565,24 +2509,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "read_file_lines",
-            "description": "Read a specific line range from a file (1-indexed, inclusive). Lines are returned prefixed with line numbers.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Path to the file (relative to project root or absolute)."},
-                    "start": {"type": "integer", "description": "First line number to read (1-indexed). Clamped to file bounds."},
-                    "end": {"type": "integer", "description": "Last line number to read (1-indexed, inclusive). Clamped to file bounds."},
-                },
-                "required": ["path", "start", "end"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "count_lines",
-            "description": "Return the line count and byte size of a file without reading the full content.",
+            "name": "read_file_metadata",
+            "description": "[READ] Return file size, modification time, sha256, line count, and binary flag. No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2595,8 +2523,29 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "read_last_output",
+            "description": (
+                "[READ] Slice the previous tool call's full output without re-running it. "
+                "Applies offset, limit, grep, head, tail in that order. No state change."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "head": {"type": "integer", "description": "Return only the first N lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N lines."},
+                    "grep": {"type": "string", "description": "Filter lines matching this regex/substring."},
+                    "offset": {"type": "integer", "description": "Skip first N lines before applying other filters."},
+                    "limit": {"type": "integer", "description": "Maximum number of lines to return after offset."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "write_file",
-            "description": "Write (overwrite) a file with the given content. The file is automatically staged for git.",
+            "description": "[WRITE — files] Overwrite a file with the given content. Auto-stages for git. Reversible only via write_git_restore before commit. Path must be inside project root.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2611,7 +2560,7 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "append_file",
-            "description": "Append text to the end of a file (creates the file if it does not exist).",
+            "description": "[WRITE — files] Append text to the end of a file (creates it if absent). Auto-stages for git. Path must be inside project root.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2625,8 +2574,24 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "list_directory",
-            "description": "List files and subdirectories at a given path.",
+            "name": "write_archive",
+            "description": "[WRITE — archive] Safely 'delete' a file by moving it to .archive/<timestamp>/. NEVER hard-deletes. Reversible: copy from the archive path in the return value.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path of the file to archive."},
+                    "reason": {"type": "string", "description": "Human-readable reason for archiving.", "default": ""},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    # ---- Directory / search tools ----
+    {
+        "type": "function",
+        "function": {
+            "name": "read_list_dir",
+            "description": "[READ] List files and subdirectories at a given path with annotations for gitignored/excluded/protected entries. No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2639,13 +2604,16 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "search_files",
-            "description": "Search file contents using a regex pattern. Returns file:line matches (up to 200).",
+            "name": "find_in_files",
+            "description": "[READ] Search file contents using a regex pattern. Returns file:line matches (up to 200). head/tail/grep filter output. No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "Regex pattern to search for."},
                     "directory": {"type": "string", "description": "Directory to search in.", "default": "."},
+                    "head": {"type": "integer", "description": "Return only the first N matches."},
+                    "tail": {"type": "integer", "description": "Return only the last N matches."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": ["pattern"],
             },
@@ -2655,7 +2623,7 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "find_files",
-            "description": "Find files by glob pattern (e.g. '*.py', 'test_*.py').",
+            "description": "[READ] Find files by glob pattern (e.g. '*.py', 'test_*.py'). No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2666,37 +2634,85 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    # ---- Static analysis helpers ----
     {
         "type": "function",
         "function": {
-            "name": "archive_file",
-            "description": (
-                "Safely 'delete' a file by moving it to .archive/<timestamp>/. "
-                "NEVER performs a hard delete. Use this instead of any rm/del command."
-            ),
+            "name": "find_symbol",
+            "description": "[READ] Find function/class definitions by name using tree-sitter. No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Path of the file to archive."},
-                    "reason": {"type": "string", "description": "Human-readable reason for archiving.", "default": ""},
+                    "name": {"type": "string", "description": "Symbol name or substring to search for."},
+                    "kind": {"type": "string", "description": "Symbol kind: 'function', 'class', or 'any' (default).", "default": "any"},
                 },
-                "required": ["path"],
+                "required": ["name"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "git_status",
-            "description": "Return the current git status of the project.",
+            "name": "find_callers",
+            "description": "[READ] Find files that import or reference a given symbol, using the static analysis import graph. No state change.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Symbol name to find references for."},
+                },
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_imports_of",
+            "description": "[READ] Find all files that import a given module (by relative path or module name). No state change.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "module_path": {"type": "string", "description": "Module relative path (e.g. 'app/agent/tools.py') or dotted module name."},
+                },
+                "required": ["module_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_diff_stat",
+            "description": "[READ] git diff --stat from <since> to HEAD, showing added/removed lines per file. No state change.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "since": {"type": "string", "description": "Base ref (branch, tag, or commit). Default: 'main'.", "default": "main"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_test_summary",
+            "description": "[READ] Parse the most recent run_test_pytest output into {passed, failed, errors, failing_names}. No state change.",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "git_diff",
-            "description": "Return git diff (staged + unstaged). Optionally scoped to a path.",
+            "name": "read_git_status",
+            "description": "[READ] Return the current git status of the project. No state change.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_git_diff",
+            "description": "[READ] Return git diff (staged + unstaged). Optionally scoped to a path. No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2709,8 +2725,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "git_log",
-            "description": "Return recent git log entries. Optionally scoped to a specific file. Read-only.",
+            "name": "read_git_log",
+            "description": "[READ] Return recent git log entries. Optionally scoped to a specific file. No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2724,8 +2740,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "git_blame",
-            "description": "Show git blame for a file (last-modified info per line). Read-only.",
+            "name": "read_git_blame",
+            "description": "[READ] Show git blame for a file (last-modified info per line). No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2738,8 +2754,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "git_show",
-            "description": "Show a file's content at a specific git ref, or show commit details (message + diffstat). Read-only.",
+            "name": "read_git_show",
+            "description": "[READ] Show a file's content at a specific git ref, or show commit details (message + diffstat). No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2753,8 +2769,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "git_create_branch",
-            "description": f"Create and checkout a new branch. Must be prefixed with '{GIT_SAFETY_BRANCH_PREFIX}'.",
+            "name": "write_git_branch",
+            "description": f"[WRITE — git] Create and checkout a new branch. Must be prefixed with '{GIT_SAFETY_BRANCH_PREFIX}'. Reversible via write_git_checkout to prior branch.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2767,8 +2783,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "git_commit",
-            "description": "Stage all tracked changes and create a git commit.",
+            "name": "write_git_commit",
+            "description": "[WRITE — git] Stage all tracked changes and create a git commit. Permanent record; reversible only via a subsequent revert commit.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2781,8 +2797,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "git_checkout",
-            "description": "Checkout a branch. Only maestro/* and main/master branches are permitted.",
+            "name": "write_git_checkout",
+            "description": "[WRITE — git] Checkout a maestro/task-* branch. Only maestro/task-* branches are permitted — agents in worktrees must stay on their assigned branch.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2796,7 +2812,7 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "get_task",
-            "description": "Fetch a Kanban task by ID. Returns a JSON object with all task fields.",
+            "description": "[READ] Fetch a Kanban task by ID. Returns a JSON object with all task fields. No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2810,7 +2826,7 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "list_tasks",
-            "description": "List task summaries for a project, optionally filtered by column. Read-only.",
+            "description": "[READ] List task summaries for a project, optionally filtered by column. No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2827,9 +2843,9 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "update_task_status",
+            "name": "write_task_status",
             "description": (
-                "Advance a task through the Kanban pipeline. "
+                "[WRITE — db] Advance a task through the Kanban pipeline. "
                 "Valid statuses: PENDING, ACTIVE, VERIFYING, ACCEPTED, REJECTED."
             ),
             "parameters": {
@@ -2849,8 +2865,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "append_task_history",
-            "description": "Append a proof-of-work entry to a task's history log.",
+            "name": "write_task_history",
+            "description": "[WRITE — db] Append a proof-of-work entry to a task's history log.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2865,10 +2881,10 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "generate_architecture_doc",
+            "name": "write_arch_doc",
             "description": (
-                "Produce a structured markdown architecture document from components and relationships. "
-                "Pure computation - stays in agent context, NOT written to disk."
+                "[WRITE — db] Produce a structured markdown architecture document from components and relationships "
+                "and persist it to the architecture task DB record."
             ),
             "parameters": {
                 "type": "object",
@@ -2892,9 +2908,9 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "generate_mermaid_diagram",
+            "name": "write_mermaid",
             "description": (
-                "Validate and format a Mermaid diagram. Returns formatted mermaid markup. "
+                "[WRITE — db] Validate and persist a Mermaid diagram. "
                 "Valid types: flowchart, sequence, class, er, gantt, state, pie."
             ),
             "parameters": {
@@ -2913,9 +2929,9 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "generate_interface_contract",
+            "name": "write_interface_contract",
             "description": (
-                "Define the API surface / interface contract between components. "
+                "[WRITE — db] Define and persist the API surface / interface contract between components. "
                 "Returns structured JSON describing what a component provides and consumes."
             ),
             "parameters": {
@@ -2942,7 +2958,7 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "spawn_research_agent",
             "description": (
-                "Launch a research agent to investigate a domain question. "
+                "[RUN — sandbox] Launch a research agent to investigate a domain question. "
                 "The agent has read-only codebase access and returns findings. "
                 "Use when you need domain knowledge about unfamiliar technologies."
             ),
@@ -2961,7 +2977,7 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "launch_research_agent",
             "description": (
-                "Schedule a research agent job through the Maestro scheduler and "
+                "[RUN — sandbox] Schedule a research agent job through the Maestro scheduler and "
                 "block until it completes. Unlike spawn_research_agent (which runs "
                 "inline), this releases the caller's LLM slot while waiting so the "
                 "scheduler can dispatch the research on the same endpoint without "
@@ -2991,11 +3007,11 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "record_benchmark",
+            "name": "write_benchmark",
             "description": (
-                "Record a before/after profiling benchmark for an optimization sub-task. "
+                "[WRITE — db] Record a before/after profiling benchmark for an optimization sub-task. "
                 "Call with benchmark_type='before' before making changes, and 'after' when done. "
-                "Run actual timed benchmarks using run_shell before recording - do NOT estimate. "
+                "Run actual timed benchmarks (run_test_pytest --benchmark or similar) before recording - do NOT estimate. "
                 "metrics must be a JSON string with the following keys: "
                 "test_duration_ms (float, required) - measured wall time in ms for scale_n items; "
                 "memory_peak_mb (float, required) - peak RSS during benchmark in MB; "
@@ -3023,12 +3039,11 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "git_restore",
+            "name": "write_git_restore",
             "description": (
-                "Restore a tracked file to its HEAD state, discarding all local changes. "
-                "Use this to undo unintentional edits to a file that should not have been modified. "
-                "The file must be tracked by git (i.e. it existed in the last commit). "
-                "Does NOT affect staged files — use git_unstage first if the file is staged."
+                "[WRITE — git] Restore a tracked file to its HEAD state, DISCARDING all local changes. "
+                "Irreversible for unsaved work. The file must be tracked by git. "
+                "Does NOT affect staged files — use write_git_unstage first if the file is staged."
             ),
             "parameters": {
                 "type": "object",
@@ -3042,11 +3057,11 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "git_add",
+            "name": "write_git_stage",
             "description": (
-                "Stage a specific file for the next commit. "
+                "[WRITE — git] Stage a specific file for the next commit. "
                 "Use this to control exactly which files are included in a commit. "
-                "Prefer this over git_commit's auto-staging when you want to commit only a subset of changed files."
+                "Reversible via write_git_unstage."
             ),
             "parameters": {
                 "type": "object",
@@ -3060,10 +3075,10 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "git_unstage",
+            "name": "write_git_unstage",
             "description": (
-                "Remove a file from the staging area without discarding working-tree changes. "
-                "Use this to correct an accidental git_add. The file's edits are preserved."
+                "[WRITE — git] Remove a file from the staging area without discarding working-tree changes. "
+                "Use this to correct an accidental write_git_stage. The file's edits are preserved."
             ),
             "parameters": {
                 "type": "object",
@@ -3074,21 +3089,56 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    # ---- Git stash tools ----
+    {
+        "type": "function",
+        "function": {
+            "name": "read_git_stash_list",
+            "description": "[READ] List git stash entries with index, message, and branch. No state change.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_git_stash",
+            "description": "[WRITE — git] Stash tracked working-tree changes with a required message. Reversible via write_git_stash_pop.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "Required stash description (e.g. 'WIP: refactor auth')."},
+                },
+                "required": ["message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_git_stash_pop",
+            "description": "[WRITE — git] Apply the most recent stash entry and remove it from the stash list. Does not drop or clear other entries.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
     # ---- Named testing / linting tools ----
     {
         "type": "function",
         "function": {
-            "name": "run_pytest",
+            "name": "run_test_pytest",
             "description": (
-                "Run pytest in the task's project directory. "
+                "[RUN — sandbox] Run pytest in the task's project directory. "
                 "The project venv's Python is used automatically. "
-                "A per-test timeout of 300s is injected unless pytest.ini already sets one."
+                "A per-test timeout of 300s is injected unless pytest.ini already sets one. "
+                "head/tail/grep filter output. Does not modify project files."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File or directory to test (default: '.' for all tests)."},
                     "flags": {"type": "string", "description": "Additional pytest flags (e.g. '-v', '-k test_foo', '--tb=short')."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": [],
             },
@@ -3097,8 +3147,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_mypy",
-            "description": "Run mypy type-checker on the given path. The project venv's Python is used.",
+            "name": "run_check_mypy",
+            "description": "[RUN — sandbox] Run mypy type-checker on the given path. The project venv's Python is used. Does not modify files.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3112,8 +3162,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_ruff",
-            "description": "Run ruff linter on the given path.",
+            "name": "run_check_ruff",
+            "description": "[RUN — sandbox] Run ruff linter on the given path. Check-only; does not modify files.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3127,8 +3177,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_black_check",
-            "description": "Check code formatting with black (read-only — does not modify files).",
+            "name": "run_check_black",
+            "description": "[RUN — sandbox] Check code formatting with black. Read-only — does not modify files.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3141,8 +3191,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_unittest",
-            "description": "Run Python unittest discovery or a specific test module/class/method.",
+            "name": "run_test_unittest",
+            "description": "[RUN — sandbox] Run Python unittest discovery or a specific test module/class/method. Does not modify project files.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3155,8 +3205,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_npm_test",
-            "description": "Run npm test in the task's project directory.",
+            "name": "run_test_npm",
+            "description": "[RUN — sandbox] Run npm test in the task's project directory. Does not modify project files.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3169,8 +3219,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_cargo_test",
-            "description": "Run cargo test in the task's project directory.",
+            "name": "run_test_cargo",
+            "description": "[RUN — sandbox] Run cargo test in the task's project directory. Does not modify project files.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3183,8 +3233,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_go_test",
-            "description": "Run go test in the task's project directory.",
+            "name": "run_test_go",
+            "description": "[RUN — sandbox] Run go test in the task's project directory. Does not modify project files.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3199,8 +3249,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_make",
-            "description": "Run a Makefile target in the task's project directory.",
+            "name": "run_build_make",
+            "description": "[RUN — build] Run a Makefile target in the task's project directory. May write build artifacts.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3214,8 +3264,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_cargo_build",
-            "description": "Build a Rust/Cargo project (cargo build).",
+            "name": "run_build_cargo",
+            "description": "[RUN — build] Build a Rust/Cargo project (cargo build). Writes build artifacts to target/.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3228,8 +3278,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_go_build",
-            "description": "Build a Go project (go build).",
+            "name": "run_build_go",
+            "description": "[RUN — build] Build a Go project (go build). Writes binary output inside the project.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3242,8 +3292,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_npm_build",
-            "description": "Run an npm build script (npm run <script>).",
+            "name": "run_build_npm",
+            "description": "[RUN — build] Run an npm build script (npm run <script>). Writes build artifacts inside the project.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3256,8 +3306,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_tsc",
-            "description": "Run the TypeScript compiler (tsc).",
+            "name": "run_build_tsc",
+            "description": "[RUN — build] Run the TypeScript compiler (tsc). Writes compiled output inside the project.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3270,8 +3320,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_gradle",
-            "description": "Run a Gradle task in the task's project directory.",
+            "name": "run_build_gradle",
+            "description": "[RUN — build] Run a Gradle task in the task's project directory. May write build artifacts.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3285,8 +3335,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_mvn",
-            "description": "Run a Maven goal in the task's project directory.",
+            "name": "run_build_mvn",
+            "description": "[RUN — build] Run a Maven goal in the task's project directory. May write build artifacts.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3301,11 +3351,11 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_pip_install",
+            "name": "run_deps_pip",
             "description": (
-                "Install Python packages with pip. "
-                "Call this after modifying requirements.txt or pyproject.toml. "
-                "Examples: run_pip_install('-r requirements.txt'), run_pip_install('requests>=2.28')."
+                "[RUN — deps] Install Python packages with pip. Mutates the venv environment. "
+                "Call after modifying requirements.txt or pyproject.toml. "
+                "Examples: run_deps_pip('-r requirements.txt'), run_deps_pip('requests>=2.28')."
             ),
             "parameters": {
                 "type": "object",
@@ -3319,8 +3369,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_npm_install",
-            "description": "Install Node.js dependencies (npm install). Call after modifying package.json.",
+            "name": "run_deps_npm",
+            "description": "[RUN — deps] Install Node.js dependencies (npm install). Mutates node_modules. Call after modifying package.json.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3333,8 +3383,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_cargo_fetch",
-            "description": "Fetch Rust/Cargo dependencies (cargo fetch). Call after modifying Cargo.toml.",
+            "name": "run_deps_cargo",
+            "description": "[RUN — deps] Fetch Rust/Cargo dependencies (cargo fetch). Mutates the local cargo registry cache. Call after modifying Cargo.toml.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -3346,8 +3396,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_bandit",
-            "description": "Run the bandit Python security linter.",
+            "name": "run_audit_bandit",
+            "description": "[RUN — audit] Run the bandit Python security linter. Read-only; does not modify project files.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3361,8 +3411,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_pip_audit",
-            "description": "Audit installed Python packages for known vulnerabilities (pip-audit).",
+            "name": "run_audit_pip",
+            "description": "[RUN — audit] Audit installed Python packages for known vulnerabilities (pip-audit). Read-only.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -3373,8 +3423,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_semgrep",
-            "description": "Run semgrep static analysis.",
+            "name": "run_audit_semgrep",
+            "description": "[RUN — audit] Run semgrep static analysis. Read-only; does not modify project files.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3388,8 +3438,8 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_npm_audit",
-            "description": "Run npm audit to check Node.js dependencies for known vulnerabilities.",
+            "name": "run_audit_npm",
+            "description": "[RUN — audit] Run npm audit to check Node.js dependencies for known vulnerabilities. Read-only.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -3402,7 +3452,7 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "web_search",
             "description": (
-                "Execute a web search using Tavily, DuckDuckGo, or Brave Search. "
+                "[READ] Execute a web search using Tavily, DuckDuckGo, or Brave Search. "
                 "Returns a JSON string of results with titles, URLs, and snippets. "
                 "Preferred provider is configured in maestro.ini. "
                 "Requires TAVILY_API_KEY or BRAVE_API_KEY depending on provider. "
@@ -3425,7 +3475,7 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "web_fetch",
             "description": (
-                "Fetch the content of a URL and return a text-only summary. "
+                "[READ] Fetch the content of a URL and return a text-only summary. "
                 "Strips HTML tags, scripts, and styles. Use this to read the full "
                 "content of a web page after finding interesting URLs in search results."
             ),
@@ -3442,7 +3492,7 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "get_project_summary",
-            "description": "Return the top-level project health summary if it exists and is fresh.",
+            "description": "[READ] Return the top-level project health summary if it exists and is fresh. No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3456,7 +3506,7 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "get_directory_summary",
-            "description": "Return the summary for a specific directory within the project.",
+            "description": "[READ] Return the summary for a specific directory within the project. No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3471,7 +3521,7 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "get_module_summary",
-            "description": "Return the summary for a logical module within the project.",
+            "description": "[READ] Return the summary for a logical module within the project. No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3486,7 +3536,7 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "list_scope_summaries",
-            "description": "List all available scope summaries (type, key, short_summary, freshness) for a project.",
+            "description": "[READ] List all available scope summaries (type, key, short_summary, freshness) for a project. No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3500,9 +3550,9 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "update_plan_fields",
+            "name": "write_plan_fields",
             "description": (
-                "Patch one or more fields on a planning_results row. "
+                "[WRITE — db] Patch one or more fields on a planning_results row. "
                 "Use this to make targeted corrections to interface_contracts, dependency_graph, "
                 "file_manifest, test_strategy, or implementation_steps. "
                 "Pass result_id (from the system prompt) and fields_json as a JSON object "
@@ -3540,12 +3590,12 @@ TOOL_SCHEMAS: list[dict] = [
 CORRECTION_AGENT_TOOLS: list[str] = [
     "read_file",
     "read_file_harder",
-    "search_files",
+    "find_in_files",
     "find_files",
-    "list_directory",
+    "read_list_dir",
     "get_task",
     "list_tasks",
-    "update_plan_fields",
+    "write_plan_fields",
 ]
 
 

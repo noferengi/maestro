@@ -21,13 +21,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from app.agent.tools import (
     _is_inside_maestro_repo,
     _git_run,
-    archive_file,
-    git_checkout,
-    git_commit,
-    git_create_branch,
-    git_diff,
-    git_log,
-    git_status,
+    write_archive,
+    write_git_checkout,
+    write_git_commit,
+    write_git_branch,
+    read_git_diff,
+    read_git_log,
+    read_git_status,
     set_task_git_cwd,
     _task_git_cwd,
 )
@@ -127,36 +127,35 @@ class TestGitToolsBlockedOnMaestroRepo:
     """Every git tool must refuse when task_git_cwd resolves to TheMaestro's repo."""
 
     def test_git_status_blocked(self, cwd_is_maestro):
-        result = git_status()
+        result = read_git_status()
         assert "BLOCKED" in result or "ERROR" in result
 
     def test_git_diff_blocked(self, cwd_is_maestro):
-        result = git_diff()
+        result = read_git_diff()
         assert "BLOCKED" in result or "ERROR" in result
 
     def test_git_log_blocked(self, cwd_is_maestro):
-        result = git_log()
+        result = read_git_log()
         assert "BLOCKED" in result or "ERROR" in result
 
     def test_git_commit_blocked(self, cwd_is_maestro):
-        """git_commit must not create a commit in TheMaestro's repo."""
-        result = git_commit("should never appear in TheMaestro history")
+        """write_git_commit must not create a commit in TheMaestro's repo."""
+        result = write_git_commit("should never appear in TheMaestro history")
         assert "BLOCKED" in result or "ERROR" in result
 
     def test_git_checkout_main_still_blocked(self, cwd_is_maestro):
-        """'main' is in the branch allowlist, but _git_run blocks before execution."""
-        result = git_checkout("main")
-        # Allowlist passes 'main'; _git_run's maestro guard fires next
+        """'main' is not in the branch allowlist; allowlist + _git_run guard both fire."""
+        result = write_git_checkout("main")
         assert "BLOCKED" in result or "ERROR" in result
 
     def test_git_checkout_maestro_branch_still_blocked(self, cwd_is_maestro):
         """Even a maestro/task-* branch is blocked when cwd is TheMaestro."""
-        result = git_checkout("maestro/task-99")
+        result = write_git_checkout("maestro/task-99")
         assert "BLOCKED" in result or "ERROR" in result
 
     def test_git_create_branch_blocked(self, cwd_is_maestro):
-        """git_create_branch must not create a branch in TheMaestro's repo."""
-        result = git_create_branch("maestro/task-999-test")
+        """write_git_branch must not create a branch in TheMaestro's repo."""
+        result = write_git_branch("maestro/task-999-test")
         assert "BLOCKED" in result or "ERROR" in result
 
 
@@ -166,7 +165,7 @@ class TestGitToolsBlockedOnMaestroRepo:
 
 class TestArchiveFileGitRejection:
     def test_archive_dot_git_directory_is_hard_rejected(self, monkeypatch, tmp_path):
-        """archive_file must unconditionally reject any path inside .git."""
+        """write_archive must unconditionally reject any path inside .git."""
         git_dir = tmp_path / ".git"
         git_dir.mkdir()
         target = git_dir / "COMMIT_EDITMSG"
@@ -175,7 +174,7 @@ class TestArchiveFileGitRejection:
         monkeypatch.setattr("app.agent.tools.PROJECT_ROOT", str(tmp_path))
         monkeypatch.setattr("app.agent.tools.ARCHIVE_DIR", str(tmp_path / ".archive"))
 
-        result = archive_file(str(target))
+        result = write_archive(str(target))
         assert "HARD REJECTION" in result or "BLOCKED" in result
 
     def test_archive_dot_git_root_is_hard_rejected(self, monkeypatch, tmp_path):
@@ -186,7 +185,7 @@ class TestArchiveFileGitRejection:
         monkeypatch.setattr("app.agent.tools.PROJECT_ROOT", str(tmp_path))
         monkeypatch.setattr("app.agent.tools.ARCHIVE_DIR", str(tmp_path / ".archive"))
 
-        result = archive_file(str(git_dir))
+        result = write_archive(str(git_dir))
         assert "HARD REJECTION" in result or "BLOCKED" in result
 
     def test_archive_already_archived_path_is_rejected(self, monkeypatch, tmp_path):
@@ -200,7 +199,7 @@ class TestArchiveFileGitRejection:
         monkeypatch.setattr("app.agent.tools.PROJECT_ROOT", str(tmp_path))
         monkeypatch.setattr("app.agent.tools.ARCHIVE_DIR", str(archive_dir))
 
-        result = archive_file(str(already_archived))
+        result = write_archive(str(already_archived))
         assert "HARD REJECTION" in result or "BLOCKED" in result or "already inside" in result.lower()
 
 
@@ -233,12 +232,12 @@ class TestNoActualGitMutationOnMaestroRepo:
         # All of these should be BLOCKED by the safety rail
         token = _task_git_cwd.set(PROJECT_ROOT)
         try:
-            git_status()
-            git_diff()
-            git_log()
-            git_commit("MUST NOT APPEAR")
-            git_checkout("main")
-            git_create_branch("maestro/task-safety-test")
+            read_git_status()
+            read_git_diff()
+            read_git_log()
+            write_git_commit("MUST NOT APPEAR")
+            write_git_checkout("main")
+            write_git_branch("maestro/task-safety-test")
         finally:
             _task_git_cwd.reset(token)
 
@@ -260,7 +259,7 @@ class TestNoActualGitMutationOnMaestroRepo:
         """git_commit('...') must not stage any changes to TheMaestro's index."""
         token = _task_git_cwd.set(PROJECT_ROOT)
         try:
-            git_commit("staging-test-must-be-blocked")
+            write_git_commit("staging-test-must-be-blocked")
         finally:
             _task_git_cwd.reset(token)
 

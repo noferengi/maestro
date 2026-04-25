@@ -49,8 +49,8 @@ class TestListDirectoryEnrichment:
             patch("app.agent.path_filter.get_ignored_paths", return_value=set()),
             patch("app.agent.project_snapshot._is_symlink_escaping", return_value=False),
         ):
-            from app.agent.tools import list_directory
-            result = list_directory(str(tmp_path))
+            from app.agent.tools import read_list_dir
+            result = read_list_dir(str(tmp_path))
 
         assert "foo.py" in result
         assert "Does something useful" in result
@@ -67,8 +67,8 @@ class TestListDirectoryEnrichment:
             patch("app.agent.path_filter.get_ignored_paths", return_value=set()),
             patch("app.agent.project_snapshot._is_symlink_escaping", return_value=False),
         ):
-            from app.agent.tools import list_directory
-            result = list_directory(str(tmp_path))
+            from app.agent.tools import read_list_dir
+            result = read_list_dir(str(tmp_path))
 
         assert "SUMMARY NOT AVAILABLE" in result
 
@@ -85,8 +85,8 @@ class TestListDirectoryEnrichment:
             patch("app.agent.path_filter.get_ignored_paths", return_value=set()),
             patch("app.agent.project_snapshot._is_symlink_escaping", return_value=False),
         ):
-            from app.agent.tools import list_directory
-            result = list_directory(str(tmp_path))
+            from app.agent.tools import read_list_dir
+            result = read_list_dir(str(tmp_path))
 
         assert "PROTECTED" in result
         assert ".git" in result
@@ -105,8 +105,8 @@ class TestListDirectoryEnrichment:
             patch("app.agent.path_filter.get_ignored_paths", return_value={str(secret)}),
             patch("app.agent.project_snapshot._is_symlink_escaping", return_value=False),
         ):
-            from app.agent.tools import list_directory
-            result = list_directory(str(tmp_path))
+            from app.agent.tools import read_list_dir
+            result = read_list_dir(str(tmp_path))
 
         assert "GITIGNORED" in result
         assert "secret_logic.py" in result
@@ -131,8 +131,8 @@ class TestListDirectoryEnrichment:
             patch("os.readlink", return_value="/outside/path"),
             patch("os.path.islink", return_value=True),
         ):
-            from app.agent.tools import list_directory
-            result = list_directory(str(tmp_path))
+            from app.agent.tools import read_list_dir
+            result = read_list_dir(str(tmp_path))
 
         assert "symlink escapes project" in result
 
@@ -149,8 +149,8 @@ class TestListDirectoryEnrichment:
             patch("app.agent.path_filter.get_ignored_paths", return_value=set()),
             patch("app.agent.project_snapshot._is_symlink_escaping", return_value=False),
         ):
-            from app.agent.tools import list_directory
-            result = list_directory(str(tmp_path))
+            from app.agent.tools import read_list_dir
+            result = read_list_dir(str(tmp_path))
 
         assert "venv" in result
         assert "AUTO-EXCLUDED" in result
@@ -170,8 +170,8 @@ class TestListDirectoryEnrichment:
             patch("app.agent.project_snapshot._is_symlink_escaping", return_value=False),
             patch("app.agent.llm_client.call_llm") as mock_llm,
         ):
-            from app.agent.tools import list_directory
-            list_directory(str(tmp_path))
+            from app.agent.tools import read_list_dir
+            read_list_dir(str(tmp_path))
 
         mock_llm.assert_not_called()
 

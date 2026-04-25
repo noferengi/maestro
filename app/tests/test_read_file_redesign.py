@@ -767,8 +767,8 @@ def test_update_task_status_maps_to_indev(tmp_path, monkeypatch):
     mock_db.update_task.return_value = mock_task
 
     with patch("app.agent.tools._import_db", return_value=mock_db):
-        from app.agent.tools import update_task_status
-        result = update_task_status("task-123", "ACTIVE")
+        from app.agent.tools import write_task_status
+        result = write_task_status("task-123", "ACTIVE")
 
     mock_db.update_task.assert_called_once_with("task-123", type="indev")
     assert "indev" in result
@@ -784,8 +784,8 @@ def test_update_task_status_maps_to_conceptual_review(tmp_path, monkeypatch):
     mock_db.update_task.return_value = mock_task
 
     with patch("app.agent.tools._import_db", return_value=mock_db):
-        from app.agent.tools import update_task_status
-        result = update_task_status("task-456", "VERIFYING")
+        from app.agent.tools import write_task_status
+        result = write_task_status("task-456", "VERIFYING")
 
     mock_db.update_task.assert_called_once_with("task-456", type="conceptual_review")
     assert "conceptual_review" in result
