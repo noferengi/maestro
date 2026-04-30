@@ -37,10 +37,10 @@ if dispatches:
     print(f"\n" + "="*80)
     print(f"  HTTP REQUEST COUNT FOR {task_id} (most recent dispatch)")
     print("="*80)
-    
+
     print(f"\nDispatch line: {idx}")
     print(f"Line content: {line}")
-    
+
     # Count HTTP requests after dispatch (within 1 hour)
     count = 0
     print(f"\nHTTP 200 OK requests after dispatch (within 1 hour):")
@@ -48,9 +48,9 @@ if dispatches:
         if "HTTP Request" in lines[i] and "200 OK" in lines[i]:
             count += 1
             print(f"  {count}: {lines[i].rstrip()}")
-    
+
     print(f"\nTotal HTTP 200 OK requests: {count}")
-    
+
     # Check for task advancement messages
     print(f"\nTask advancement messages after dispatch:")
     advancement_count = 0
@@ -58,9 +58,9 @@ if dispatches:
         if "advanced to" in lines[i].lower() and task_id in lines[i]:
             advancement_count += 1
             print(f"  {advancement_count}: {lines[i].rstrip()}")
-    
+
     print(f"\nTotal task advancement messages: {advancement_count}")
-    
+
     # Check for any errors
     print(f"\nHTTP errors after dispatch:")
     error_count = 0
@@ -68,5 +68,5 @@ if dispatches:
         if "HTTP" in lines[i] and ("Error" in lines[i] or "error" in lines[i]):
             error_count += 1
             print(f"  {error_count}: {lines[i].rstrip()}")
-    
+
     print(f"\nTotal HTTP errors: {error_count}")

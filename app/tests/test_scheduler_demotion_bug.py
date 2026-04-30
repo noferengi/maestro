@@ -52,14 +52,14 @@ class TestSchedulerDemotionBug:
         """
         task_id = "idea-fixed-1"
         ready = [{"id": task_id, "type": "idea", "position": 0, "prerequisites": []}]
-        
+
         fake_task = _fake_db_task(task_id=task_id, task_type="idea")
         fake_llm = _fake_llm(llm_id=1)
-        
+
         # Mock a previous successful transition
         mock_transition_result = MagicMock()
         mock_transition_result.outcome = "passed"
-        
+
         with patch("app.database.get_all_tasks", return_value=[]), \
              patch("app.agent.dag.DAGResolver") as MockDAG, \
              patch("app.database.get_task", return_value=fake_task), \
@@ -69,10 +69,10 @@ class TestSchedulerDemotionBug:
              patch("app.database.get_project_path", return_value="/tmp"), \
              patch("app.database.get_active_pip_resolution_jobs_for_task", return_value=[]), \
              patch("app.agent.scheduler.threading.Thread") as mock_thread_cls:
-            
+
             MockDAG.return_value.get_ready_tasks.return_value = ready
             mock_thread_cls.return_value.start = lambda: None
-            
+
             # We need to mock a lot of other things that _tick calls
             with patch("app.agent.scheduler._dispatch_file_summary_jobs", return_value=None), \
                  patch("app.agent.scheduler._dispatch_arch_gen_jobs", return_value=None), \
@@ -81,9 +81,9 @@ class TestSchedulerDemotionBug:
                  patch("app.agent.scheduler._dispatch_dreamer", return_value=None), \
                  patch("app.agent.scheduler._rescue_stale_jobs", return_value=None), \
                  patch("app.agent.scheduler._run_subdivision_recovery", return_value=None):
-                
+
                 sched_mod._tick()
-            
+
             # Expect it to be DISPATCHED
             mock_thread_cls.assert_called()
 
@@ -91,10 +91,10 @@ class TestSchedulerDemotionBug:
         """Verify that a normal IDEA task is dispatched."""
         task_id = "idea-ok-1"
         ready = [{"id": task_id, "type": "idea", "position": 0, "prerequisites": []}]
-        
+
         fake_task = _fake_db_task(task_id=task_id, task_type="idea")
         fake_llm = _fake_llm(llm_id=1)
-        
+
         with patch("app.database.get_all_tasks", return_value=[]), \
              patch("app.agent.dag.DAGResolver") as MockDAG, \
              patch("app.database.get_task", return_value=fake_task), \
@@ -104,10 +104,10 @@ class TestSchedulerDemotionBug:
              patch("app.database.get_project_path", return_value="/tmp"), \
              patch("app.database.get_active_pip_resolution_jobs_for_task", return_value=[]), \
              patch("app.agent.scheduler.threading.Thread") as mock_thread_cls:
-            
+
             MockDAG.return_value.get_ready_tasks.return_value = ready
             mock_thread_cls.return_value.start = lambda: None
-            
+
             with patch("app.agent.scheduler._dispatch_file_summary_jobs", return_value=None), \
                  patch("app.agent.scheduler._dispatch_arch_gen_jobs", return_value=None), \
                  patch("app.agent.scheduler._dispatch_scope_survey_jobs", return_value=None), \
@@ -115,8 +115,8 @@ class TestSchedulerDemotionBug:
                  patch("app.agent.scheduler._dispatch_dreamer", return_value=None), \
                  patch("app.agent.scheduler._rescue_stale_jobs", return_value=None), \
                  patch("app.agent.scheduler._run_subdivision_recovery", return_value=None):
-                
+
                 sched_mod._tick()
-            
+
             # Expect it to be dispatched
             mock_thread_cls.assert_called()

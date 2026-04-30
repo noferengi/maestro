@@ -79,9 +79,9 @@ def test_mark_scope_stale():
     """Verify we can mark a scope as stale."""
     project = "StaleProj"
     upsert_scope_summary(project, "directory", "dir1", "sum1", staleness_state="fresh")
-    
+
     mark_scope_stale(project, "directory", "dir1")
-    
+
     ss = get_scope_summary(project, "directory", "dir1")
     assert ss.staleness_state == "stale"
 
@@ -90,7 +90,7 @@ def test_enqueue_scope_survey_job_deduplication():
     project = "JobProj"
     s_type = "directory"
     key = "app"
-    
+
     job1 = enqueue_scope_survey_job(project, s_type, key, action="generate", priority=1.0)
     assert job1.status == "pending"
     assert job1.priority == 1.0
@@ -120,7 +120,7 @@ def test_get_and_update_survey_jobs():
 
     # Finish job
     update_scope_survey_job(job2.id, status="done", prompt_tokens=100, completion_tokens=50)
-    
+
     from app.database.session import SessionLocal
     from app.database.models import ScopeSurveyJob
     with SessionLocal() as db:

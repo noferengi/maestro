@@ -156,6 +156,17 @@ SIGNAL_REVERT: str = "REVERT_TO_DESIGN"
 SIGNAL_ACCEPTED: str = "ACCEPTED"
 SIGNAL_NEEDS_RESEARCH: str = "NEEDS_RESEARCH"
 SIGNAL_CONTEXT_TOO_LARGE: str = "CONTEXT_TOO_LARGE"
+SIGNAL_RESOLUTION_STALLED: str = "RESOLUTION_STALLED"
+SIGNAL_CORRECTION_STALLED: str = "CORRECTION_STALLED"
+SIGNAL_VERDICT_REJECTED: str = "VERDICT_REJECTED"
+SIGNAL_VERDICT_NEEDS_WORK: str = "VERDICT_NEEDS_WORK"
+
+SIGNAL_SURVEY_COMPLETE: str = "SURVEY_COMPLETE"
+SIGNAL_RESEARCH_COMPLETE: str = "RESEARCH_COMPLETE"
+SIGNAL_SUBDIVISION_COMPLETE: str = "SUBDIVISION_COMPLETE"
+SIGNAL_INTAKE_COMPLETE: str = "INTAKE_COMPLETE"
+SIGNAL_DESIGN_COMPLETE: str = "DESIGN_COMPLETE"
+SIGNAL_REVIEW_COMPLETE: str = "REVIEW_COMPLETE"
 
 # ===========================================================================
 # Intake pipeline settings
@@ -167,10 +178,11 @@ RESEARCH_CONTEXT_BUDGET_RATIO: float = _getfloat("intake", "context_budget_ratio
 TIEBREAKER_ENABLED: bool = _getbool("intake", "tiebreaker_enabled", None, True)
 
 RESEARCH_AGENT_TOOLS: list[str] = _getlist("intake", "research_agent_tools",
-    "web_search, web_fetch, read_file, read_file_harder, read_file_metadata, "
+    "web_search, web_fetch, read_file, read_file_metadata, "
     "read_last_output, find_in_files, find_files, read_list_dir, "
     "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
-    "get_task, list_tasks"
+    "get_task, list_tasks, "
+    "submit_work"
 )
 
 # ===========================================================================
@@ -185,16 +197,18 @@ SUBDIVISION_CONTEXT_BUDGET_RATIO: float = _getfloat("subdivision", "context_budg
 SUBDIVISION_CONTEXT_AWARE_TOOLS: bool = _getbool("subdivision", "context_aware_tools", None, True)
 
 SUBDIVISION_AGENT_TOOLS: list[str] = _getlist("subdivision", "subdivision_agent_tools",
-    "read_file, read_file_harder, read_file_metadata, "
+    "read_file, read_file_metadata, "
     "read_last_output, find_in_files, find_files, read_list_dir, "
     "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
-    "get_task, list_tasks"
+    "get_task, list_tasks, "
+    "submit_work"
 )
 
 SUBDIVISION_PLANNING_TOOLS: list[str] = _getlist("subdivision", "subdivision_planning_tools",
     "write_arch_doc, write_interface_contract, "
     "write_mermaid, spawn_research_agent, "
-    "read_list_dir, find_files, get_task, list_tasks"
+    "read_list_dir, find_files, get_task, list_tasks, "
+    "submit_work"
 )
 
 # ===========================================================================
@@ -268,11 +282,11 @@ def check_turn_saturation(
     """
     if not TURN_WARNING_ENABLED or max_turns <= 0:
         return False
-    
+
     remaining = max_turns - current_turn
     # Thresholds are "remaining turns"
     thresholds = [25, 5]
-    
+
     for t in thresholds:
         # If we have reached or dropped below the threshold, and haven't warned for it yet
         if remaining <= t and t not in warned_set:
@@ -340,7 +354,7 @@ INDEV_TEST_FIX_MAX_RETRIES: int = _getint("indev", "test_fix_max_retries", None,
 INDEV_TEST_FIX_MAX_TURNS: int = _getint("indev", "test_fix_max_turns", None, 30)
 
 INDEV_AGENT_TOOLS: list[str] = _getlist("indev", "agent_tools",
-    "read_file, read_file_harder, read_file_metadata, read_last_output, "
+    "read_file, read_file_metadata, read_last_output, "
     "write_file, append_file, read_list_dir, "
     "find_in_files, find_files, find_symbol, find_callers, find_imports_of, write_archive, "
     "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, read_diff_stat, "
@@ -353,7 +367,8 @@ INDEV_AGENT_TOOLS: list[str] = _getlist("indev", "agent_tools",
     "run_test_npm, run_test_cargo, run_test_go, read_test_summary, "
     "run_build_make, run_build_cargo, run_build_go, run_build_npm, run_build_tsc, "
     "run_build_gradle, run_build_mvn, "
-    "run_deps_pip, run_deps_npm, run_deps_cargo"
+    "run_deps_pip, run_deps_npm, run_deps_cargo, "
+    "submit_work"
 )
 
 # ===========================================================================
@@ -365,10 +380,11 @@ CONCEPTUAL_REVIEW_HIGH_SEVERITY_BLOCKS: bool = _getbool("conceptual_review", "hi
 CONCEPTUAL_REVIEW_RESEARCH_LIVES: int = _getint("conceptual_review", "research_agent_max_lives", None, 3)
 
 CONCEPTUAL_REVIEW_REVIEWER_TOOLS: list[str] = _getlist("conceptual_review", "reviewer_tools",
-    "read_file, read_file_harder, read_file_metadata, read_last_output, "
+    "read_file, read_file_metadata, read_last_output, "
     "find_in_files, find_files, read_list_dir, "
     "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
-    "get_task, list_tasks"
+    "get_task, list_tasks, "
+    "submit_work"
 )
 
 # ===========================================================================
@@ -383,10 +399,11 @@ OPTIMIZATION_MAX_REGRESSION_PCT: float = _getfloat("optimization", "max_regressi
 OPTIMIZATION_MAX_REVIEWER_TURNS: int = _getint("optimization", "reviewer_max_turns", None, 100)
 
 OPTIMIZATION_REVIEWER_TOOLS: list[str] = _getlist("optimization", "reviewer_tools",
-    "read_file, read_file_harder, read_file_metadata, read_last_output, "
+    "read_file, read_file_metadata, read_last_output, "
     "find_in_files, find_files, read_list_dir, "
     "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
-    "get_task, list_tasks"
+    "get_task, list_tasks, "
+    "submit_work"
 )
 
 OPTIMIZATION_COMPUTE_WEIGHT: float = _getfloat("optimization_weights", "compute_weight", None, 1.0)
@@ -411,11 +428,12 @@ SECURITY_REVIEW_RESEARCH_LIVES: int = _getint("security_review", "research_agent
 SECURITY_REVIEW_MAX_REVIEWER_TURNS: int = _getint("security_review", "reviewer_max_turns", None, 100)
 
 SECURITY_REVIEWER_TOOLS: list[str] = _getlist("security_review", "reviewer_tools",
-    "read_file, read_file_harder, read_file_metadata, read_last_output, "
+    "read_file, read_file_metadata, read_last_output, "
     "find_in_files, find_files, read_list_dir, "
     "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
     "get_task, list_tasks, "
-    "run_audit_bandit, run_audit_pip, run_audit_semgrep, run_audit_npm"
+    "run_audit_bandit, run_audit_pip, run_audit_semgrep, run_audit_npm, "
+    "submit_work"
 )
 
 # ===========================================================================
@@ -428,17 +446,19 @@ FULL_REVIEW_RESEARCH_LIVES: int = _getint("full_review", "research_agent_max_liv
 FULL_REVIEW_MAX_REVIEWER_TURNS: int = _getint("full_review", "reviewer_max_turns", None, 100)
 
 FULL_REVIEW_CODE_QUALITY_TOOLS: list[str] = _getlist("full_review", "code_quality_reviewer_tools",
-    "read_file, read_file_harder, read_file_metadata, read_last_output, "
+    "read_file, read_file_metadata, read_last_output, "
     "find_in_files, find_files, read_list_dir, "
     "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
     "get_task, list_tasks, "
-    "run_test_pytest, run_check_mypy, run_check_ruff, run_check_black, read_test_summary"
+    "run_test_pytest, run_check_mypy, run_check_ruff, run_check_black, read_test_summary, "
+    "submit_work"
 )
 FULL_REVIEW_FUNCTIONAL_TOOLS: list[str] = _getlist("full_review", "functional_reviewer_tools",
-    "read_file, read_file_harder, read_file_metadata, read_last_output, "
+    "read_file, read_file_metadata, read_last_output, "
     "find_in_files, find_files, read_list_dir, "
     "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
-    "get_task, list_tasks"
+    "get_task, list_tasks, "
+    "submit_work"
 )
 
 # ===========================================================================
@@ -552,7 +572,7 @@ DREAMER_STALL_TICKS: int     = _getint ("dreamer", "stall_ticks",          None,
 DREAMER_MAX_RESURRECTIONS: int = _getint("dreamer", "max_cards_to_resurrect", None,                   3)
 DREAMER_MAX_NEW_CARDS: int   = _getint ("dreamer", "max_new_cards",        None,                      2)
 DREAMER_DECIDE_MAX_TOKENS: int = _getint("dreamer", "decide_max_tokens",   None,                      8192)
-DREAMER_SURVEY_TOOLS: list[str] = _getlist("dreamer", "survey_tools", "get_project_summary, get_directory_summary, get_module_summary, list_scope_summaries")
+DREAMER_SURVEY_TOOLS: list[str] = _getlist("dreamer", "survey_tools", "get_project_summary, get_directory_summary, get_module_summary, list_scope_summaries, submit_work")
 
 # ===========================================================================
 # Arch Gen — architecture card population agent

@@ -245,7 +245,7 @@ def enqueue_file_summary(
             if b"\x00" in header:
                 logger.debug("enqueue_file_summary: skipping binary file '%s'", abs_path)
                 return "", "", 0
-            
+
             # If not binary, we need the full content for SHA1 and preview
             fh.seek(0)
             raw = fh.read()

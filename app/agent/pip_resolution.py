@@ -11,39 +11,34 @@ Lifecycle (driven by the scheduler):
      existing maestro/task-{id} branch.
   3. The agent exits when:
        a. It stops calling tools (requirements satisfied — natural completion).
-       b. It emits {"signal": "RESOLUTION_STALLED"} after repeated failures.
+       b. It calls submit_work(signal="RESOLUTION_STALLED") after repeated failures.
        c. max_turns is exceeded.
-  4. signal_completion(f"pip_resolution_{pip_id}") always fires on exit.
+  4. signal_completion(f"pip_resolution_{pip_id}") always fires on exit (in scheduler).
   5. The scheduler detects this signal, marks the job done, and re-dispatches
      the parent stage so the pre-flight can run again.
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
-from typing import Any
 
+from app.agent.agent_loop import AgentLoop
 from app.agent.config import (
     PIP_RESOLUTION_MAX_TURNS,
     GIT_SAFETY_BRANCH_PREFIX,
     INDEV_AGENT_TOOLS,
-    check_context_saturation,
 )
-from app.agent.json_utils import extract_json_block
-from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
-from app.agent.tools import async_dispatch_tool, build_tool_schemas
+from app.agent.llm_client import is_shutting_down
+from app.agent.tools import build_tool_schemas
 
 logger = logging.getLogger(__name__)
 AGENT_NAME = "PIP Resolution Agent"
-SIGNAL_STALLED = "RESOLUTION_STALLED"
 _MAX_CONSECUTIVE_ERRORS = 3
 
 _RESOLUTION_TOOL_SCHEMAS: list[dict] = build_tool_schemas(INDEV_AGENT_TOOLS)
 
 
-class PIPResolutionAgent:
+class PIPResolutionAgent(AgentLoop):
     """
     Targeted implementation agent that closes PIP quality gaps.
 
@@ -51,6 +46,8 @@ class PIPResolutionAgent:
     focused changes to satisfy the specific requirements from a PIP that
     failed the pre-flight gate.
     """
+
+    _agent_name = AGENT_NAME
 
     def __init__(
         self,
@@ -68,165 +65,28 @@ class PIPResolutionAgent:
         task_title: str = "",
         origin_stage: str = "",
     ) -> None:
-        self.task_id = task_id
+        super().__init__(
+            task_id=task_id,
+            llm_id=llm_id,
+            budget_id=budget_id,
+            max_turns=PIP_RESOLUTION_MAX_TURNS,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            max_context=max_context,
+        )
         self.pip_id = pip_id
         self.requirements = requirements
         self.research_findings = research_findings
         self.last_verification_findings = last_verification_findings
         self.project_root = project_root
-        self.llm_id = llm_id
-        self.budget_id = budget_id
-        self.llm_base_url = llm_base_url
-        self.llm_model = llm_model
-        self.max_context = max_context
         self.task_title = task_title
         self.origin_stage = origin_stage
 
-        self._messages: list[dict] = []
-        self._turn: int = 0
-        self._consecutive_errors: int = 0
-        self._no_tool_turns: int = 0
-        self._warnings_fired: set[float] = set()
-        self._turn_warnings_fired: set[int] = set()
-
     # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
-
-    async def run(self) -> dict:
-        """
-        Execute the resolution agent loop.
-
-        Returns {"status": "done" | "stalled" | "max_turns" | "error", "turns": int}.
-        "done"      — agent stopped calling tools (requirements satisfied).
-        "stalled"   — RESOLUTION_STALLED signal or consecutive tool failures.
-        "max_turns" — turn cap exceeded.
-        "error"     — server shutting down or unexpected exception.
-        """
-        from app.agent.llm_client import set_llm_session_context
-        set_llm_session_context(AGENT_NAME)
-        if is_shutting_down():
-            return {"status": "error", "turns": 0}
-
-        from app.agent.tools import set_task_git_cwd
-        if self.project_root:
-            set_task_git_cwd(self.project_root)
-
-        self._messages = self._build_messages()
-        max_turns = PIP_RESOLUTION_MAX_TURNS
-
-        while self._turn < max_turns:
-            self._turn += 1
-            logger.debug(
-                "[pip_resolution] pip %d task '%s' — turn %d/%d",
-                self.pip_id, self.task_id, self._turn, max_turns,
-            )
-
-            # Turn saturation check
-            from app.agent.config import check_turn_saturation
-            if check_turn_saturation(
-                self._turn, max_turns, self._turn_warnings_fired, self._messages
-            ):
-                # Turn nudge was injected
-                pass
-
-            # LLM call
-            try:
-                response = await self._call_llm(self._messages)
-            except ShutdownError:
-                logger.info("[pip_resolution] pip %d — shutdown requested.", self.pip_id)
-                return {"status": "error", "turns": self._turn}
-            except Exception as exc:
-                self._turn -= 1
-                self._consecutive_errors += 1
-                logger.error("[pip_resolution] pip %d LLM call failed: %s", self.pip_id, exc)
-                if self._consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
-                    logger.warning(
-                        "[pip_resolution] pip %d — %d consecutive LLM failures, stalling.",
-                        self.pip_id, _MAX_CONSECUTIVE_ERRORS,
-                    )
-                    return {"status": "stalled", "turns": self._turn}
-                self._messages.append({
-                    "role": "user",
-                    "content": f"[SYSTEM] LLM call failed: {exc}. Please continue.",
-                })
-                continue
-
-            assistant_message = response.get("choices", [{}])[0].get("message", {})
-            self._messages.append(assistant_message)
-
-            usage = response.get("usage", {})
-            self._maybe_inject_context_warning(usage.get("prompt_tokens", 0))
-
-            tool_calls = assistant_message.get("tool_calls") or []
-            content = assistant_message.get("content") or ""
-
-            # Dispatch tool calls
-            if tool_calls:
-                result_messages = await self._handle_tool_calls(tool_calls)
-                self._messages.extend(result_messages)
-                all_errors = all(
-                    m.get("content", "").startswith("ERROR")
-                    for m in result_messages
-                )
-                if all_errors:
-                    self._consecutive_errors += 1
-                    if self._consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
-                        logger.warning(
-                            "[pip_resolution] pip %d — %d consecutive tool errors, stalling.",
-                            self.pip_id, _MAX_CONSECUTIVE_ERRORS,
-                        )
-                        return {"status": "stalled", "turns": self._turn}
-                else:
-                    self._consecutive_errors = 0
-                    self._no_tool_turns = 0
-                continue
-
-            # No tool calls — check for RESOLUTION_STALLED signal
-            if content:
-                try:
-                    block = extract_json_block(content)
-                    if block:
-                        parsed = json.loads(block)
-                        if isinstance(parsed, dict) and parsed.get("signal") == SIGNAL_STALLED:
-                            logger.warning(
-                                "[pip_resolution] pip %d signalled RESOLUTION_STALLED.",
-                                self.pip_id,
-                            )
-                            return {"status": "stalled", "turns": self._turn}
-                except Exception:
-                    pass
-
-            # No tool calls, no stall signal — first time: nudge; second time: done
-            self._no_tool_turns += 1
-            if self._no_tool_turns >= 2:
-                logger.info(
-                    "[pip_resolution] pip %d — agent stopped calling tools after %d turns (done).",
-                    self.pip_id, self._turn,
-                )
-                return {"status": "done", "turns": self._turn}
-
-            self._messages.append({
-                "role": "user",
-                "content": (
-                    "[SYSTEM] No tool was called. Use your tools to make targeted changes "
-                    "that satisfy the PIP requirements, or emit "
-                    '{"signal": "RESOLUTION_STALLED"} if you cannot proceed.'
-                ),
-            })
-
-        logger.warning(
-            "[pip_resolution] pip %d — max_turns (%d) exceeded.",
-            self.pip_id, max_turns,
-        )
-        return {"status": "max_turns", "turns": self._turn}
-
-    # ------------------------------------------------------------------
-    # Message building
+    # AgentLoop interface
     # ------------------------------------------------------------------
 
     def _build_messages(self) -> list[dict]:
-        """Build the initial system prompt for the resolution agent."""
         from app.agent.project_snapshot import build_project_snapshot, build_architecture_context
         from app.database import get_task as _get_task
 
@@ -279,74 +139,71 @@ class PIPResolutionAgent:
             "Commit your changes with clear messages referencing the PIP requirement. "
             "Stop when you are confident every requirement above is satisfied.\n"
             "Do NOT expand scope beyond these requirements.\n"
-            f"After {_MAX_CONSECUTIVE_ERRORS} consecutive tool failures, stop and emit "
-            '{"signal": "RESOLUTION_STALLED"}.'
+            f"After {_MAX_CONSECUTIVE_ERRORS} consecutive tool failures, call:\n"
+            "  submit_work(signal='RESOLUTION_STALLED', summary='resolution exhausted',\n"
+            "              payload={'reason': 'consecutive tool failures',\n"
+            "                       'advice': 'try different approach'})\n"
+            "Do NOT output raw JSON with a signal key — use the submit_work tool call."
         )
 
         return [{"role": "system", "content": system_prompt}]
 
+    def _get_tool_schemas(self) -> list[dict]:
+        return _RESOLUTION_TOOL_SCHEMAS
+
+    async def _on_terminal(self) -> dict:
+        # RESOLUTION_STALLED signal from submit_work → stalled
+        return {"status": "stalled", "turns": self._turn}
+
+    async def _on_max_turns(self) -> dict:
+        logger.warning(
+            "[pip_resolution] pip %d — max_turns (%d) exceeded.",
+            self.pip_id, self.max_turns,
+        )
+        return {"status": "max_turns", "turns": self._turn}
+
+    async def _on_error(self, reason: str) -> dict:
+        logger.info("[pip_resolution] pip %d — stalled (error): %s", self.pip_id, reason)
+        return {"status": "stalled", "turns": self._turn}
+
+    async def _on_no_tool_call(self):
+        """Nudge once, then exit 'done' (requirements satisfied — agent stopped naturally)."""
+        self._no_tool_turns += 1
+        if self._no_tool_turns >= 2:
+            logger.info(
+                "[pip_resolution] pip %d — agent stopped calling tools after %d turns (done).",
+                self.pip_id, self._turn,
+            )
+            return {"status": "done", "turns": self._turn}
+        self._messages.append({
+            "role": "user",
+            "content": (
+                "[SYSTEM] No tool was called. Use your tools to make targeted changes "
+                "that satisfy the PIP requirements, or call "
+                "submit_work(signal='RESOLUTION_STALLED', summary='...') if you cannot proceed."
+            ),
+        })
+        return None
+
     # ------------------------------------------------------------------
-    # LLM call
+    # run() override for setup logic
     # ------------------------------------------------------------------
 
-    async def _call_llm(self, messages: list[dict]) -> dict:
-        return await call_llm(
-            messages,
-            base_url=self.llm_base_url,
-            model=self.llm_model,
-            tools=_RESOLUTION_TOOL_SCHEMAS,
-            tool_choice="auto",
-            task_id=self.task_id,
-            llm_id=self.llm_id,
-            budget_id=self.budget_id,
-            agent_name=AGENT_NAME,
+    async def run(self) -> dict:
+        from app.agent.llm_client import set_llm_session_context
+        set_llm_session_context(AGENT_NAME)
+
+        if is_shutting_down():
+            return {"status": "error", "turns": 0}
+
+        if self.project_root:
+            from app.agent.tools import set_task_git_cwd
+            set_task_git_cwd(self.project_root)
+
+        logger.debug(
+            "[pip_resolution] pip %d task '%s' — starting (%d max turns)",
+            self.pip_id, self.task_id, self.max_turns,
         )
 
-    # ------------------------------------------------------------------
-    # Tool dispatch
-    # ------------------------------------------------------------------
-
-    async def _handle_tool_calls(self, tool_calls: list) -> list[dict]:
-        result_messages = []
-        for tc in tool_calls:
-            tool_id = tc.get("id", "unknown")
-            function_block = tc.get("function", {})
-            name = function_block.get("name", "")
-            raw_args = function_block.get("arguments", "{}")
-            try:
-                arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-            except json.JSONDecodeError:
-                arguments = {}
-            try:
-                result = await async_dispatch_tool(
-                    name,
-                    arguments,
-                    task_id=self.task_id,
-                    llm_id=self.llm_id,
-                    budget_id=self.budget_id,
-                    llm_base_url=self.llm_base_url,
-                    llm_model=self.llm_model,
-                )
-            except Exception as exc:
-                result = f"ERROR: tool '{name}' raised: {exc}"
-            result_messages.append({
-                "role": "tool",
-                "tool_call_id": tool_id,
-                "content": str(result),
-            })
-        return result_messages
-
-    # ------------------------------------------------------------------
-    # Context warning injection
-    # ------------------------------------------------------------------
-
-    def _maybe_inject_context_warning(self, prompt_tokens: int) -> None:
-        if not self.max_context:
-            return
-        check_context_saturation(
-            prompt_tokens,
-            self.max_context,
-            self._warnings_fired,
-            self._messages,
-            terminate_threshold=0,
-        )
+        self._messages = self._build_messages()
+        return await self._run_loop()

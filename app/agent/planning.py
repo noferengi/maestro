@@ -307,10 +307,11 @@ class PlanningResult:
 # ---------------------------------------------------------------------------
 
 SURVEY_TOOLS = [
-    "read_file", "read_file_harder", "count_lines",
+    "read_file", "count_lines",
     "search_files", "find_files", "list_directory",
     "git_log", "git_blame",
     "get_task", "list_tasks",
+    "submit_work",
 ]
 
 
@@ -621,7 +622,7 @@ class PlanningPipeline:
         content = ""
         _ctx_warned: set[float] = set()
         _turn_warned: set[int] = set()
-        
+
         # Repetition guard: track (tool_name, arguments_hash)
         _tool_call_history: set[tuple[str, str]] = set()
 
@@ -691,7 +692,7 @@ class PlanningPipeline:
                     for tc in tool_calls:
                         fn_name = tc["function"]["name"]
                         fn_args_raw = tc["function"]["arguments"]
-                        
+
                         # Guard: Check for repeated tool calls with same args
                         args_str = json.dumps(fn_args_raw, sort_keys=True)
                         call_key = (fn_name, args_str)
@@ -719,7 +720,21 @@ class PlanningPipeline:
                             "tool_call_id": tc["id"],
                             "content": result_str,
                         })
-                    
+
+                        # Detect submit_work
+                        if fn_name == "submit_work":
+                            try:
+                                terminal_data = json.loads(result_str)
+                                if terminal_data.get("__maestro_terminal__") is True:
+                                    logger.info(f"[{AGENT_NAME}] Survey submit_work detected - signal=%s", terminal_data.get("signal"))
+                                    survey_result = terminal_data.get("summary", content)
+                                    break # Inner tool loop
+                            except (json.JSONDecodeError, ValueError):
+                                pass
+
+                        if survey_result:
+                            break  # Outer turn loop
+                        continue
                     if survey_result: # Loop broken by guard
                         break
                 elif not content:
@@ -743,38 +758,26 @@ class PlanningPipeline:
     # ------------------------------------------------------------------
 
     async def _stage_design_generation(self, survey: str, best_of_n: int | None = None) -> list[dict]:
-        """Generate N design proposals in parallel, each from a distinct architect persona."""
+        """Generate N design proposals in parallel using submit_work tool."""
         n = best_of_n if best_of_n is not None else PLANNING_BEST_OF_N
         _arch = self._arch_ctx
-        _format = (
+        
+        from app.agent.tools import TOOL_SCHEMAS
+        submit_work_schema = [s for s in TOOL_SCHEMAS if s["function"]["name"] == "submit_work"]
+
+        _instruction = (
             "Based on the codebase survey and task description, produce a detailed "
-            "implementation design. Output valid JSON with these keys:\n"
+            "implementation design by calling the `submit_work` tool.\n\n"
+            "Use signal='DESIGN_COMPLETE' and provide the following in the tool arguments:\n"
             "- design_rationale: string explaining the approach\n"
             "- file_manifest: list of {path, action, purpose, estimated_lines, depends_on}\n"
             "- dependency_graph: dict mapping component -> [dependencies]\n"
-            "- interface_contracts: list of {component, provides, consumes, invariants} — "
-            "OPTIONAL for simple single-component tasks. "
-            "\nCRITICAL interface_contracts rules:\n"
-            "1. ONLY list NEW or MODIFIED interfaces being introduced by this task.\n"
-            "2. DO NOT list existing project files, standard library modules, or third-party packages in 'provides'.\n"
-            "3. Any 'consumes' entry must be satisfied by a 'provides' entry in the SAME plan. "
-            "If it is an existing file already on disk, DO NOT list it in 'consumes' or 'provides'.\n"
-            "4. DO NOT put into `consumes`: language primitives (String, str, int, etc.), "
-            "stdlib/framework types (Flow, Context, datetime, etc.), "
-            "OR files/classes that already exist in the codebase. Those are not cross-component "
-            "contracts — they are language features or external dependencies.\n"
-            "5. If this task requires an artifact from another task, make that other task a "
-            "prerequisite, not a consumes entry.\n"
-            "- test_strategy: list of {component, test_file, test_cases, fixtures} — "
-            "name test subjects by component/class name (e.g. 'UserService'), not by filename\n"
-            "- implementation_steps: list of {order, component, files, description, "
-            "depends_on, estimated_context_tokens}\n"
-            "\nOutput ONLY the JSON object, no markdown fences."
-            + (f"\n\n{_arch}" if _arch else "")
+            "- interface_contracts: list of {component, provides, consumes, invariants}\n"
+            "- test_strategy: list of {component, test_file, test_cases, fixtures}\n"
+            "- implementation_steps: list of {order, component, files, description, depends_on, estimated_context_tokens}\n"
         )
 
-        # Warn the design LLM when existing files are present on disk — prevents
-        # it from proposing CREATE actions that collide with prior INDEV work.
+        # Warn the design LLM when existing files are present on disk
         _existing_files = _scan_existing_files(self.project_root, survey) if self.project_root else []
         _greenfield_warning = ""
         if _existing_files:
@@ -782,15 +785,12 @@ class PlanningPipeline:
                 "\n\n⚠ NON-GREENFIELD WARNING:\n"
                 "The following files already exist on disk. Do NOT propose creating them again "
                 "unless the task explicitly requires replacing them. If the existing implementation "
-                "already satisfies the task, say so in design_rationale and set all file_manifest "
-                "actions to 'verify' (not 'create'). Do NOT create a file at the same path as an "
-                "existing file and do NOT create a package directory (foo/__init__.py) if a module "
-                "foo.py already exists at that level.\n"
+                "already satisfies the task, set signal='ACCEPTED' and all file_manifest "
+                "actions to 'verify'.\n"
                 "Existing files:\n"
                 + "\n".join(f"  - {p}" for p in _existing_files[:20])
             )
 
-        # Extract any binding spec constraints from the task description.
         _spec_block = _extract_spec_constraints(self.task_description)
 
         user_msg = (
@@ -813,7 +813,8 @@ class PlanningPipeline:
                 f"{persona_concern}"
                 + _spec_suffix
                 + "\n\n"
-                + _format
+                + _instruction
+                + (f"\n\n{_arch}" if _arch else "")
             )
             tasks.append(call_llm(
                 [
@@ -822,6 +823,8 @@ class PlanningPipeline:
                 ],
                 base_url=self.llm_base_url,
                 model=self.llm_model,
+                tools=submit_work_schema,
+                tool_choice={"type": "function", "function": {"name": "submit_work"}},
                 total_timeout_secs=600,
                 task_id=self.task_id,
                 llm_id=self.llm_id,
@@ -842,12 +845,26 @@ class PlanningPipeline:
                 logger.warning(f"[{AGENT_NAME}] Design %d failed: %s", i, resp)
                 designs.append({"error": str(resp)})
                 continue
+            
             self._track_tokens(resp)
-            content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
-            try:
-                design, _ = json.JSONDecoder().raw_decode(content.lstrip())
-            except (json.JSONDecodeError, ValueError):
-                design = {"raw": content, "parse_error": True}
+            msg = resp.get("choices", [{}])[0].get("message", {})
+            tool_calls = msg.get("tool_calls", [])
+            
+            design = {}
+            if tool_calls:
+                tc = tool_calls[0]
+                try:
+                    args = tc.get("function", {}).get("arguments", "{}")
+                    design = json.loads(args) if isinstance(args, str) else args
+                except (json.JSONDecodeError, ValueError):
+                    design = {"raw": str(msg), "parse_error": True}
+            else:
+                content = msg.get("content", "")
+                try:
+                    design, _ = json.JSONDecoder().raw_decode(content.lstrip())
+                except (json.JSONDecodeError, ValueError):
+                    design = {"raw": content, "parse_error": True}
+            
             designs.append(design)
 
         logger.info(f"[{AGENT_NAME}] Generated %d designs", len(designs))
@@ -867,7 +884,7 @@ class PlanningPipeline:
                 if "error" in d:
                     err_msg = f"Design generation error: {d['error']}"
                     break
-            
+
             # We return a dummy design that will fail review but with a clear reason
             dummy = {
                 "design_rationale": f"CRITICAL FAILURE: {err_msg}",
@@ -881,7 +898,7 @@ class PlanningPipeline:
 
         judge_prompt = (
             "You are a design judge. Compare these design proposals and select the best one.\n"
-            "Output JSON with two keys: selected_index (integer, 0-based) and justification (string).\n\n"
+            "Respond with a JSON object with two keys: selected_index (integer, 0-based) and justification (string).\n\n"
         )
         for orig_idx, design in valid:
             rationale = str(design.get("design_rationale", ""))[:300]
@@ -928,7 +945,7 @@ class PlanningPipeline:
                 )
                 short_prompt = (
                     "Select the best design from these rationales. "
-                    "Output JSON: {\"selected_index\": <int>, \"justification\": \"...\"}.\n\n"
+                    "Respond with JSON: {\"selected_index\": <int>, \"justification\": \"...\"}.\n\n"
                 )
                 for orig_idx, design in valid:
                     rationale = str(design.get("design_rationale", ""))[:150]
@@ -1051,27 +1068,32 @@ class PlanningPipeline:
                 f"You are reviewing a software design from the perspective of: {reviewer['focus']}"
                 f"{_intent_rule}\n\n"
                 f"Design:\n{design_summary}\n\n"
-                "Output JSON with: {\"verdict\": \"LIKELY|POSSIBLE|WARN|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED\", "
-                "\"confidence\": <0-100>, \"justification\": \"...\"}\n"
-                "Use WARN (not REJECTED) when your concern is an opinionated tradeoff that the "
+                "Render your verdict by calling the `submit_work` tool.\n"
+                "Use signal='REVIEW_COMPLETE' and provide the following in the tool arguments:\n"
+                "- verdict: 'LIKELY' | 'POSSIBLE' | 'WARN' | 'NEEDS_RESEARCH' | 'NOT_SUITABLE' | 'REJECTED'\n"
+                "- confidence: <0-100>\n"
+                "- justification: '...'\n"
+                "\nUse WARN (not REJECTED) when your concern is an opinionated tradeoff that the "
                 "task description has already consciously made."
             )
             reviewer_prompts.append(prompt)
 
-        # Run reviewers sequentially to avoid LLM-slot starvation under concurrent sessions.
-        # Each reviewer gets up to 5 minutes; if it times out or errors, it contributes a
-        # POSSIBLE abstention (not NEEDS_RESEARCH, which would block tally Rule 3) so the
-        # remaining reviewers' real verdicts still count.
+        from app.agent.tools import TOOL_SCHEMAS
+        submit_work_schema = [s for s in TOOL_SCHEMAS if s["function"]["name"] == "submit_work"]
+
+        # Run reviewers sequentially
         responses = []
         for reviewer, prompt in zip(reviewers, reviewer_prompts):
             try:
                 resp = await call_llm(
                     [
-                        {"role": "system", "content": "You are a design reviewer. Output only JSON."},
+                        {"role": "system", "content": "You are a design reviewer. Call submit_work to finish."},
                         {"role": "user", "content": prompt},
                     ],
                     base_url=self.llm_base_url,
                     model=self.llm_model,
+                    tools=submit_work_schema,
+                    tool_choice={"type": "function", "function": {"name": "submit_work"}},
                     total_timeout_secs=300,
                     task_id=self.task_id,
                     llm_id=self.llm_id,
@@ -1089,8 +1111,6 @@ class PlanningPipeline:
             reviewer_name = reviewers[i]["name"]
             if isinstance(resp, Exception):
                 logger.warning(f"[{AGENT_NAME}] Reviewer '%s' unavailable: %s", reviewer_name, resp)
-                # Use POSSIBLE (abstain) rather than NEEDS_RESEARCH so tally Rule 3 doesn't
-                # block advancement when the failure is infrastructure (LLM busy), not content.
                 votes.append(Vote(
                     stage=reviewer_name,
                     verdict=Verdict.POSSIBLE,
@@ -1100,27 +1120,41 @@ class PlanningPipeline:
                 continue
 
             self._track_tokens(resp)
-            content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+            msg = resp.get("choices", [{}])[0].get("message", {})
+            tool_calls = msg.get("tool_calls", [])
+            
+            data = {}
+            if tool_calls:
+                tc = tool_calls[0]
+                try:
+                    args = tc.get("function", {}).get("arguments", "{}")
+                    data = json.loads(args) if isinstance(args, str) else args
+                except (json.JSONDecodeError, ValueError):
+                    data = {}
+            else:
+                content = msg.get("content", "")
+                try:
+                    data, _ = json.JSONDecoder().raw_decode(content.lstrip())
+                except (json.JSONDecodeError, ValueError):
+                    data = {}
+
+            verdict_str = str(data.get("verdict", "POSSIBLE")).upper()
             try:
-                data, _ = json.JSONDecoder().raw_decode(content.lstrip())
-                verdict_str = data.get("verdict", "POSSIBLE").upper()
                 verdict = Verdict(verdict_str)
-                confidence = int(data.get("confidence", 80))
-                # Clamp confidence to verdict range
-                lo, hi = verdict.confidence_range
-                confidence = max(lo, min(hi, confidence))
-                justification = data.get("justification", "")
-            except (json.JSONDecodeError, ValueError, KeyError):
+            except ValueError:
                 verdict = Verdict.POSSIBLE
-                confidence = 80
-                justification = content[:500]
+            
+            confidence = int(data.get("confidence", 80))
+            lo, hi = verdict.confidence_range
+            confidence = max(lo, min(hi, confidence))
+            justification = data.get("justification", msg.get("content", ""))
 
             votes.append(Vote(
                 stage=reviewer_name,
                 verdict=verdict,
                 confidence=confidence,
                 justification=justification,
-                raw_response=data if 'data' in dir() else None,
+                raw_response=data,
                 model=self.llm_model or "",
             ))
 
@@ -1168,29 +1202,51 @@ class PlanningPipeline:
         _arch = self._arch_ctx
         prompt = (
             (f"{_arch}\n\n" if _arch else "")
-            + "Analyze this design for potential pitfalls:\n"
+            + "Analyze this design for potential pitfalls by calling the `submit_work` tool.\n"
             f"{json.dumps(design, indent=1, ensure_ascii=True)[:4000]}\n\n"
             "Look for: edge cases, implicit dependencies, race conditions, "
             "state management issues, migration risks.\n"
-            "Output JSON: {\"pitfalls\": [{\"type\": \"...\", \"severity\": \"low|medium|high|critical\", \"detail\": \"...\"}]}"
+            "Use signal='REVIEW_COMPLETE' and provide the 'pitfalls' list in the tool arguments:\n"
+            "pitfalls=[{\"type\": \"...\", \"severity\": \"low|medium|high|critical\", \"detail\": \"...\"}]"
         )
+
+        from app.agent.tools import TOOL_SCHEMAS
+        submit_work_schema = [s for s in TOOL_SCHEMAS if s["function"]["name"] == "submit_work"]
 
         try:
             response = await call_llm(
                 [
-                    {"role": "system", "content": "You are a software quality analyst. Output only JSON."},
+                    {"role": "system", "content": "You are a software quality analyst. Call submit_work to finish."},
                     {"role": "user", "content": prompt},
                 ],
                 base_url=self.llm_base_url,
                 model=self.llm_model,
+                tools=submit_work_schema,
+                tool_choice={"type": "function", "function": {"name": "submit_work"}},
                 task_id=self.task_id,
                 llm_id=self.llm_id,
                 budget_id=self.budget_id,
                 agent_name=AGENT_NAME,
             )
             self._track_tokens(response)
-            content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
-            data, _ = json.JSONDecoder().raw_decode(content.lstrip())
+            msg = response.get("choices", [{}])[0].get("message", {})
+            tool_calls = msg.get("tool_calls", [])
+            
+            data = {}
+            if tool_calls:
+                tc = tool_calls[0]
+                try:
+                    args = tc.get("function", {}).get("arguments", "{}")
+                    data = json.loads(args) if isinstance(args, str) else args
+                except (json.JSONDecodeError, ValueError):
+                    data = {}
+            else:
+                content = msg.get("content", "")
+                try:
+                    data, _ = json.JSONDecoder().raw_decode(content.lstrip())
+                except (json.JSONDecodeError, ValueError):
+                    data = {}
+
             pitfalls.extend(data.get("pitfalls", []))
         except Exception as e:
             logger.warning(f"[{AGENT_NAME}] Pitfall LLM check failed: %s", e)
@@ -1204,7 +1260,7 @@ class PlanningPipeline:
     async def _stage_consolidation(
         self, design: dict, pitfalls: list[dict], survey: str
     ) -> dict:
-        """Merge the winning design with pitfall mitigations."""
+        """Merge the winning design with pitfall mitigations using submit_work."""
         if not pitfalls:
             return design
 
@@ -1213,28 +1269,50 @@ class PlanningPipeline:
             (f"{_arch}\n\n" if _arch else "")
             + "You have a winning design and identified pitfalls. "
             "Produce a consolidated final design that incorporates mitigations "
-            "for the identified pitfalls. Output the same JSON structure as the original design.\n\n"
+            "for the identified pitfalls by calling the `submit_work` tool.\n\n"
+            "Use signal='DESIGN_COMPLETE' and provide the full design JSON in the tool arguments.\n"
             f"Original design:\n{json.dumps(design, indent=1, ensure_ascii=True)[:4000]}\n\n"
             f"Pitfalls:\n{json.dumps(pitfalls, indent=1, ensure_ascii=True)[:2000]}"
         )
 
+        from app.agent.tools import TOOL_SCHEMAS
+        submit_work_schema = [s for s in TOOL_SCHEMAS if s["function"]["name"] == "submit_work"]
+
         try:
             response = await call_llm(
                 [
-                    {"role": "system", "content": "You are a software architect. Output only JSON."},
+                    {"role": "system", "content": "You are a software architect. Call submit_work to finish."},
                     {"role": "user", "content": prompt},
                 ],
                 base_url=self.llm_base_url,
                 model=self.llm_model,
+                tools=submit_work_schema,
+                tool_choice={"type": "function", "function": {"name": "submit_work"}},
                 task_id=self.task_id,
                 llm_id=self.llm_id,
                 budget_id=self.budget_id,
                 agent_name=AGENT_NAME,
             )
             self._track_tokens(response)
-            content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
-            result, _ = json.JSONDecoder().raw_decode(content.lstrip())
-            return result
+            msg = response.get("choices", [{}])[0].get("message", {})
+            tool_calls = msg.get("tool_calls", [])
+            
+            result = {}
+            if tool_calls:
+                tc = tool_calls[0]
+                try:
+                    args = tc.get("function", {}).get("arguments", "{}")
+                    result = json.loads(args) if isinstance(args, str) else args
+                except (json.JSONDecodeError, ValueError):
+                    result = {}
+            else:
+                content = msg.get("content", "")
+                try:
+                    result, _ = json.JSONDecoder().raw_decode(content.lstrip())
+                except (json.JSONDecodeError, ValueError):
+                    result = {}
+            
+            return result or design
         except Exception as e:
             logger.warning(f"[{AGENT_NAME}] Consolidation failed: %s. Using original design.", e)
             return design

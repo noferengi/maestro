@@ -64,12 +64,13 @@ class TestAssertSafePath:
             _task_git_cwd.reset(token)
 
     def test_contextvar_override_read_allows_outside(self, tmp_path):
-        """_assert_safe_path allows reads outside _task_git_cwd (reads are global)."""
+        """_assert_safe_path blocks reads outside _task_git_cwd (RC4 strict isolation)."""
         token = _task_git_cwd.set(str(tmp_path))
         try:
-            # Reading PROJECT_ROOT from a different project's context is allowed.
-            result = _assert_safe_path(PROJECT_ROOT)
-            assert os.path.isabs(result)
+            # RC4: Strict Isolation. When a task-specific root is set,
+            # reading outside it is blocked.
+            with pytest.raises(ValueError, match="Strict Isolation violation"):
+                _assert_safe_path(PROJECT_ROOT)
         finally:
             _task_git_cwd.reset(token)
 

@@ -1,7 +1,6 @@
 """
 Tests for the tiered file reading redesign:
-  - read_file() returns structural summary + marks file as prepped
-  - read_file_harder() requires prep, then returns source lines
+  - read_file() returns structural summary + marks file as prepped, then returns source lines
   - _prepped_files ContextVar isolation across async tasks
 """
 from __future__ import annotations
@@ -67,7 +66,7 @@ def test_read_file_nonpython_returns_summary(tmp_path):
     result = read_file(path)
 
     assert "== FILE:" in result
-    assert "read_file_harder" in result
+    assert "read_file" in result
 
 
 def test_read_file_missing(tmp_path):
@@ -92,23 +91,23 @@ def test_read_file_marks_prepped(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# read_file_harder without prep - returns summary, not source
+# read_file without prep - returns summary, not source
 # ---------------------------------------------------------------------------
 
-def test_read_file_harder_without_prep(tmp_path):
-    from app.agent.tools import read_file_harder
+def test_read_file_without_prep(tmp_path):
+    from app.agent.tools import read_file
 
     # File must be > 25 lines so auto-prep returns the structural summary header
     lines = ["def foo():", "    pass"] + [f"# comment {i}" for i in range(30)]
     path = _make_file(tmp_path, "\n".join(lines) + "\n")
-    result = read_file_harder(path, start=1)
+    result = read_file(path, start=1)
 
     # Should have returned the summary (auto-prep path)
     assert "== FILE:" in result
 
 
-def test_read_file_harder_with_prep_using_end(tmp_path):
-    from app.agent.tools import read_file, read_file_harder
+def test_read_file_with_prep_using_end(tmp_path):
+    from app.agent.tools import read_file
 
     # Use a large file (>25 lines) so read_file() returns structural summary,
     # not inline content - lines are NOT pre-served on the first call.
@@ -116,7 +115,7 @@ def test_read_file_harder_with_prep_using_end(tmp_path):
     path = _make_file(tmp_path, content, name="data.txt")
 
     read_file(path)  # prep step - structural summary only, no lines served
-    result = read_file_harder(path, start=2, end=4)
+    result = read_file(path, start=2, end=4)
 
     assert "2: line2" in result
     assert "3: line3" in result
@@ -125,14 +124,14 @@ def test_read_file_harder_with_prep_using_end(tmp_path):
     assert "line5" not in result
 
 
-def test_read_file_harder_start_count(tmp_path):
-    from app.agent.tools import read_file, read_file_harder
+def test_read_file_start_count(tmp_path):
+    from app.agent.tools import read_file
 
     content = "\n".join(f"line{i}" for i in range(1, 40)) + "\n"
     path = _make_file(tmp_path, content, name="data.txt")
 
     read_file(path)
-    result = read_file_harder(path, start=2, count=3)
+    result = read_file(path, start=2, count=3)
 
     assert "2: line2" in result
     assert "3: line3" in result
@@ -140,29 +139,29 @@ def test_read_file_harder_start_count(tmp_path):
     assert "line5" not in result
 
 
-def test_read_file_harder_no_args_serves_next_chunk(tmp_path):
-    """read_file_harder(path) with no start/end serves the next unserved chunk."""
-    from app.agent.tools import read_file, read_file_harder
+def test_read_file_no_args_serves_next_chunk(tmp_path):
+    """read_file(path) with no start/end serves the next unserved chunk."""
+    from app.agent.tools import read_file
 
     content = "\n".join(f"line{i}" for i in range(1, 40)) + "\n"
     path = _make_file(tmp_path, content, name="data.txt")
 
     read_file(path)  # structural summary only
-    result = read_file_harder(path)  # no args -> serve lines 1..N
+    result = read_file(path)  # no args -> serve lines 1..N
 
     assert "1: line1" in result
     assert "ERROR" not in result
 
 
-def test_read_file_harder_start_only_serves_250_from_start(tmp_path):
+def test_read_file_start_only_serves_250_from_start(tmp_path):
     """Providing only start (no end/count) serves up to 250 lines from that start."""
-    from app.agent.tools import read_file, read_file_harder
+    from app.agent.tools import read_file
 
     content = "\n".join(f"x{i}" for i in range(1, 400)) + "\n"
     path = _make_file(tmp_path, content, name="big.txt")
 
     read_file(path)
-    result = read_file_harder(path, start=10)
+    result = read_file(path, start=10)
 
     assert "10: x10" in result
     content_lines = [l for l in result.splitlines() if l and not l.startswith("==")]
@@ -170,13 +169,13 @@ def test_read_file_harder_start_only_serves_250_from_start(tmp_path):
     assert "ERROR" not in result
 
 
-def test_read_file_harder_rejects_both_end_and_count(tmp_path):
-    from app.agent.tools import read_file, read_file_harder
+def test_read_file_rejects_both_end_and_count(tmp_path):
+    from app.agent.tools import read_file
 
     path = _make_file(tmp_path, "a\nb\n", name="data.txt")
     read_file(path)
 
-    result = read_file_harder(path, start=1, end=2, count=2)
+    result = read_file(path, start=1, end=2, count=2)
     assert "ERROR" in result
 
 
@@ -213,7 +212,7 @@ def test_prepped_files_context_isolation(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 250-line cap on read_file_harder
+# 250-line cap on read_file
 # ---------------------------------------------------------------------------
 
 def _make_nline_file(tmp_path, n: int) -> str:
@@ -228,12 +227,12 @@ def _content_lines(result: str) -> list[str]:
 
 def test_250_line_cap_with_end(tmp_path):
     """Requesting more than 250 lines via 'end' is silently clamped."""
-    from app.agent.tools import read_file, read_file_harder
+    from app.agent.tools import read_file
 
     path = _make_nline_file(tmp_path, 400)
     read_file(path)
 
-    result = read_file_harder(path, start=1, end=400)
+    result = read_file(path, start=1, end=400)
     returned_lines = _content_lines(result)
     assert len(returned_lines) == 250
     assert returned_lines[0].startswith("1:")
@@ -242,25 +241,25 @@ def test_250_line_cap_with_end(tmp_path):
 
 def test_250_line_cap_with_count(tmp_path):
     """Requesting more than 250 lines via 'count' is silently clamped."""
-    from app.agent.tools import read_file, read_file_harder
+    from app.agent.tools import read_file
 
     path = _make_nline_file(tmp_path, 400)
     read_file(path)
 
-    result = read_file_harder(path, start=1, count=300)
+    result = read_file(path, start=1, count=300)
     returned_lines = _content_lines(result)
     assert len(returned_lines) == 250
 
 
 def test_sequential_calls_independent(tmp_path):
-    """Two sequential read_file_harder calls return their own ranges, no merging."""
-    from app.agent.tools import read_file, read_file_harder
+    """Two sequential read_file calls return their own ranges, no merging."""
+    from app.agent.tools import read_file
 
     path = _make_nline_file(tmp_path, 600)
     read_file(path)
 
-    first = read_file_harder(path, start=1, count=250)
-    second = read_file_harder(path, start=251, count=250)
+    first = read_file(path, start=1, count=250)
+    second = read_file(path, start=251, count=250)
 
     first_lines  = _content_lines(first)
     second_lines = _content_lines(second)

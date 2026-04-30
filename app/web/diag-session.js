@@ -306,14 +306,14 @@ function jumpToEntry(entryId, sessionGroup, targetMsgIdx = null) {
     document.querySelectorAll('.diag-turn-divider[data-entry-id]').forEach(el => {
         const eid      = parseInt(el.dataset.entryId, 10);
         const mIdx     = el.hasAttribute('data-msg-idx') ? parseInt(el.getAttribute('data-msg-idx'), 10) : null;
-        
+
         // Match entryId AND msgIdx if provided. Handle targetMsgIdx -1 as user prompt.
         const isAnchor = eid === entryId && (
             targetMsgIdx === null || 
             targetMsgIdx === mIdx || 
             (targetMsgIdx === -1 && mIdx !== 0 && mIdx !== null)
         );
-        
+
         el.classList.toggle('diag-turn-divider-anchor', isAnchor);
         el.classList.toggle('diag-turn-divider-other',  !isAnchor);
         if (isAnchor)                     { el.id = 'turn-anchor'; }

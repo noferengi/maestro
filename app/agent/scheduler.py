@@ -495,7 +495,7 @@ def get_scheduler_status() -> dict:
         }
         if active_llm_set:
             pinned_llm_id = next(iter(active_llm_set))
-    
+
     with _external_sessions_lock:
         external_sessions_snapshot = dict(_external_sessions)
         for lid in external_sessions_snapshot.values():
@@ -1769,7 +1769,7 @@ def _dispatch_scope_survey_jobs(
 
 def _run_scope_survey_job(job: Any, llm: Any) -> None:
     """Worker thread for a single scope survey job.
-    
+
     Implements recursive 'paging' for large scopes and bottom-up chaining.
     """
     from app.database import (
@@ -1790,7 +1790,7 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
         budget_id=job.budget_id,
         scheduler_reason="scheduler",
     )
-    
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -1840,7 +1840,7 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
                     summary=existing.summary, staleness_state="fresh", git_commit="HEAD"
                 )
                 update_scope_survey_job(job.id, status="done")
-            
+
             close_agent_session(_session_id, "completed", f"Staleness check: {verdict}")
             return
 
@@ -1905,7 +1905,7 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
                         "id": rel_path,
                         "text": f.short_summary or f.summary or ""
                     })
-        
+
         elif job.scope_type == "project":
             # Project summarizes Directories AND Modules
             all_scopes = list_scope_summaries(job.project_name)
@@ -2001,7 +2001,7 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
                     update_scope_survey_job(job.id, status="pending", priority=job.priority + 0.1)
                     close_agent_session(_session_id, "completed", "Waiting for Level 1 seeds")
                     return
-            
+
             update_scope_survey_job(job.id, status="done", error_message="No children found to summarize")
             close_agent_session(_session_id, "completed", "No children")
             return
@@ -2010,9 +2010,9 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
         # Use orchestrator to determine how many chars we can afford per child.
         total_limit = orchestrator.get_summary_context_limit(llm.max_context)
         per_child_limit = max(200, int(total_limit / max(1, len(children))))
-        
+
         child_block = "\n".join([f"- {c['id']}: {c['text'][:per_child_limit]}" for c in children])
-        
+
         if job.scope_type == "module_clustering":
             prompt = (
                 f"Given these file summaries for project '{job.project_name}', group them into 3-8 logical modules. "
@@ -2047,7 +2047,7 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
                     content = content.split("```json")[1].split("```")[0].strip()
                 elif "```" in content:
                     content = content.split("```")[1].split("```")[0].strip()
-                
+
                 modules = json.loads(content)
                 for m in modules:
                     upsert_scope_summary(
@@ -2078,7 +2078,7 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
                 short = parts[1].strip()
             else:
                 short = content.split(". ")[0] + "." if ". " in content else content[:200]
-            
+
             upsert_scope_summary(
                 project_name=job.project_name,
                 scope_type=job.scope_type,
@@ -2751,6 +2751,18 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
         wt = setup_task_worktree(task_id, project_path)
         if wt is not None:
             worktree_path = wt
+        else:
+            # RC4: Strict isolation. If we are a git repo but worktree creation failed,
+            # we MUST NOT fall back to the project_path for any mutation-heavy stage.
+            # Read-only or intake stages (idea) are less risky, but implementation/review
+            # stages perform git operations that pollute the root.
+            mutation_types = {"planning", "indev", "conceptual_review", "optimization", "security", "full_review"}
+            if task_type in mutation_types:
+                from app.agent.worktree import _is_git_repo
+                if _is_git_repo(project_path):
+                    logger.error("[scheduler] Strict isolation violation: could not create worktree for task '%s' type '%s'. Aborting dispatch to protect project root.", task_id, task_type)
+                    _failed_cooldowns[task_id] = time.time()
+                    return # Abort
 
     try:
         llm_base_url = f"http://{llm.address}:{llm.port}/v1"
@@ -2784,7 +2796,7 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
         with _active_sessions_lock:
             _session_ids.pop(task_id, None)
         clear_killed_session(session_id)
-        
+
         with _llm_counts_lock:
             _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
         if project_path and worktree_path != project_path:
@@ -3119,7 +3131,7 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
             from app.agent.config import PLANNING_MAX_REJECTIONS as _MAX_PLANNING_REJECTIONS
             rejections = _gtr_plan(task_id, transition="planning_to_indev") or []
             fail_count = sum(1 for r in rejections if r.outcome == "rejected")
-            
+
             if fail_count >= _MAX_PLANNING_REJECTIONS:
                 logger.warning(
                     "[planning] Task '%s' rejected by review panel %d time(s) — "

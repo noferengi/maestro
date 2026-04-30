@@ -19,7 +19,7 @@ def check_interface_completeness_fuzzy(plan):
 
     norm_provides = {normalize(p): p for p in all_provides}
     unresolved = []
-    
+
     for u in all_consumes:
         nu = normalize(u)
         found = False
@@ -32,7 +32,7 @@ def check_interface_completeness_fuzzy(plan):
                     break
         if not found:
             unresolved.append(u)
-            
+
     return len(unresolved) == 0, unresolved
 
 plan_99 = {

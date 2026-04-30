@@ -35,11 +35,11 @@ def is_ignored(path: str, project_root: str) -> bool:
     """
     abs_path = os.path.normpath(os.path.abspath(path))
     root_abs = os.path.normpath(os.path.abspath(project_root))
-    
+
     # 1. Check built-in exclusions (fast)
     rel_to_root = os.path.relpath(abs_path, root_abs)
     segments = rel_to_root.replace("\\", "/").split("/")
-    
+
     for seg in segments:
         if not seg: continue
         if seg in TOOL_LISTING_EXCLUDED_DIRS:
@@ -61,20 +61,20 @@ def filter_paths(paths: Iterable[str], project_root: str) -> list[str]:
     """
     root_abs = os.path.normpath(os.path.abspath(project_root))
     candidates = []
-    
+
     # Fast pass: built-in and hidden
     for p in paths:
         abs_p = os.path.normpath(os.path.abspath(p))
         rel_to_root = os.path.relpath(abs_p, root_abs)
         segments = rel_to_root.replace("\\", "/").split("/")
-        
+
         is_builtin_ignored = False
         for seg in segments:
             if not seg: continue
             if seg in TOOL_LISTING_EXCLUDED_DIRS or (seg.startswith(".") and seg not in (".env.example", ".gitignore", ".geminiignore")):
                 is_builtin_ignored = True
                 break
-        
+
         if not is_builtin_ignored:
             candidates.append(abs_p)
 
@@ -97,27 +97,27 @@ def get_ignored_paths(abs_paths: Iterable[str], project_root: str) -> Set[str]:
     """
     if not abs_paths:
         return set()
-    
+
     try:
         # Convert to relative paths for git check-ignore
         path_list = list(abs_paths)
         rel_paths = [os.path.relpath(p, project_root) for p in path_list]
-        
+
         # We use -z (null-terminated) for safety with spaces/special chars
         result = subprocess.run(
             ["git", "check-ignore", "--stdin", "-z"],
             input="\0".join(rel_paths).encode('utf-8') + b"\0",
             capture_output=True, cwd=project_root, timeout=10,
         )
-        
+
         if result.returncode not in (0, 1):
             return set()
-            
+
         ignored_rels = {r for r in result.stdout.decode('utf-8', errors='replace').split("\0") if r}
-        
+
         # Map back to absolute paths
         return {p for p, r in zip(path_list, rel_paths) if r in ignored_rels}
-        
+
     except Exception as exc:
         logger.debug("get_ignored_paths failed for %s: %s", project_root, exc)
         return set()
@@ -128,22 +128,22 @@ def get_ignored_paths(abs_paths: Iterable[str], project_root: str) -> Set[str]:
 
 def walk_safe(project_root: str):
     """A version of os.walk that respects all exclusion rules.
-    
+
     Yields (dirpath, dirnames, filenames) but prunes dirnames in-place
     to prevent descending into ignored directories.
     """
     root_abs = os.path.normpath(os.path.abspath(project_root))
-    
+
     for dirpath, dirnames, filenames in os.walk(root_abs):
         # 1. Built-in pruning (modifies dirnames in-place)
         dirnames[:] = [d for d in dirnames if d not in TOOL_LISTING_EXCLUDED_DIRS and not d.startswith(".")]
-        
+
         # 2. .gitignore pruning for directories
         if dirnames:
             abs_dirs = [os.path.join(dirpath, d) for d in dirnames]
             ignored_dirs = get_ignored_paths(abs_dirs, root_abs)
             dirnames[:] = [d for d, abs_d in zip(dirnames, abs_dirs) if abs_d not in ignored_dirs]
-            
+
         # 3. Filter filenames
         abs_files = [os.path.join(dirpath, f) for f in filenames]
         # Fast filter for hidden files first

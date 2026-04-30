@@ -299,18 +299,11 @@ def _resolve_llm_endpoint(task):
 
 
 def _setup_thread_context(task) -> str | None:
-    """Set _task_git_cwd for the current OS thread. Call once per pipeline runner."""
-    project_path = None
+    """Return the project path for a task. Side-effects removed in favor of worktree isolation."""
     if task and task.project:
         from app.database import get_project_path
-        from app.agent.tools import set_task_git_cwd
-        project_path = get_project_path(task.project)
-        set_task_git_cwd(project_path)
-        if project_path:
-            logger.debug("[thread] git cwd set to '%s' for task '%s'.", project_path, task.id)
-        else:
-            logger.warning("[thread] No project path for project '%s' (task '%s').", task.project, task.id)
-    return project_path
+        return get_project_path(task.project)
+    return None
 
 
 def _store_pipeline_result(task_id, result, budget_id):
@@ -940,6 +933,9 @@ def _run_intake_pipeline(task_id: str) -> None:
 @_pipeline_session
 def _run_planning_pipeline_bg(task_id: str) -> None:
     """Background runner for the planning pipeline."""
+    from app.agent.worktree import setup_task_worktree, teardown_task_worktree, _is_git_repo
+    worktree_path = None
+    project_path = None
     import asyncio
     from app.agent.planning import run_planning_pipeline
     from app.agent.planning_gate import run_planning_gate
@@ -948,122 +944,145 @@ def _run_planning_pipeline_bg(task_id: str) -> None:
     )
     from app.database.session import SessionLocal as _SL
 
-    task = get_task(task_id)
-    if not task:
-        return
-    project_path = _setup_thread_context(task)
-
-    llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
-    all_tasks = [task_to_dict(t) for t in (get_tasks_by_project(task.project) if task.project else get_all_tasks())]
-
-    # Lifecycle: supersede any stale active/in_progress rows, then create a
-    # fresh in_progress row so the Stage Journal can show "Pipeline running…"
-    # immediately rather than displaying the old stale result.
-    supersede_planning_results(task_id)
-    in_prog = create_planning_result(task_id, status='in_progress')
-    run_row_id = in_prog.id if in_prog else None
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     try:
-        # Run planning pipeline — _store_result inside will update run_row_id
-        # row to status='active' on success.
-        result = loop.run_until_complete(
-            run_planning_pipeline(
-                task_id=task_id,
-                task_title=task.title,
-                task_description=task.description or "",
-                all_tasks=all_tasks,
-                llm_base_url=llm_base_url,
-                llm_model=llm_model,
-                llm_id=task.llm_id,
-                budget_id=task.budget_id,
-                max_context=max_context,
-                project_path=project_path,
-                project_name=task.project,
-                run_row_id=run_row_id,
-            )
-        )
-    except ShutdownError:
-        logger.info("[planning] Pipeline for '%s' aborted due to server shutdown.", task_id)
-        return
-    except PipelineAbortedError as exc:
-        logger.warning(
-            "[planning] Task '%s' aborted due to infra error at stage '%s': %s — will retry.",
-            task_id, exc.stage, exc.cause,
-        )
+        task = get_task(task_id)
+        if not task:
+            return
+
+        project_path = get_project_path(task.project) if task.project else None
+        worktree_path = project_path
+
+        if project_path:
+            wt = setup_task_worktree(task_id, project_path)
+            if wt:
+                worktree_path = wt
+            elif _is_git_repo(project_path):
+                logger.error("[planning] Strict isolation violation: could not create worktree for task '%s'. Aborting.", task_id)
+                return
+
+        set_task_git_cwd(worktree_path)
+        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
+        all_tasks = [task_to_dict(t) for t in (get_tasks_by_project(task.project) if task.project else get_all_tasks())]
+
+        # Lifecycle: supersede any stale active/in_progress rows, then create a
+        # fresh in_progress row so the Stage Journal can show "Pipeline running…"
+        # immediately rather than displaying the old stale result.
+        supersede_planning_results(task_id)
+        in_prog = create_planning_result(task_id, status='in_progress')
+        run_row_id = in_prog.id if in_prog else None
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            _store_infra_abort_result(task_id, exc, budget_id=getattr(task, "budget_id", None),
-                                      transition="planning_to_indev")
-        except Exception:
-            pass
-        return
-    except Exception:
-        logger.exception("[planning] Pipeline for '%s' failed.", task_id)
-        return
-
-    try:
-        # Store transition result
-        _store_pipeline_result_generic(task_id, result, task.budget_id, "planning_to_indev")
-
-        if result.get("outcome") == "subdivide":
-            # Scope too large — demote to IDEA and trigger subdivision immediately
-            scope_reason = result.get("scope_reason", "Design scope too large.")
-            logger.info(
-                "[planning] Task '%s' scope too large — demoting to IDEA for subdivision. %s",
-                task_id, scope_reason,
-            )
-            _rejection_ctx = {
-                "reason": "planning_scope_too_large",
-                "scope_reason": scope_reason,
-                "design_rationale": result.get("design_rationale", ""),
-                "file_manifest": result.get("file_manifest", []),
-                "survey_summary": result.get("survey_summary", ""),
-            }
-            update_task(task_id, type="subdividing")
-            try:
-                _execute_subdivision(
-                    task,
-                    llm_base_url=llm_base_url,
-                    llm_model=llm_model,
-                    max_context=max_context,
-                    scope_vote=None,
-                    rejection_context=_rejection_ctx,
-                    loop=loop,
-                )
-            except Exception:
-                logger.exception("[planning] Subdivision after scope-fail failed for '%s'.", task_id)
-                update_task(task_id, type="idea")
-        elif result.get("outcome") == "passed":
-            # Run planning gate
-            gate_result = loop.run_until_complete(
-                run_planning_gate(
+            # Run planning pipeline — _store_result inside will update run_row_id
+            # row to status='active' on success.
+            result = loop.run_until_complete(
+                run_planning_pipeline(
                     task_id=task_id,
-                    planning_result=result,
+                    task_title=task.title,
+                    task_description=task.description or "",
                     all_tasks=all_tasks,
-                    max_context=max_context,
                     llm_base_url=llm_base_url,
                     llm_model=llm_model,
                     llm_id=task.llm_id,
                     budget_id=task.budget_id,
-                    project_path=project_path,
+                    max_context=max_context,
+                    project_path=worktree_path,
+                    project_name=task.project,
+                    run_row_id=run_row_id,
                 )
             )
-            # Persist gate check details so the UI can surface why a gate failed
-            pr_row = get_planning_result(task_id)
-            if pr_row:
-                _db = _SL()
+        except ShutdownError:
+            logger.info("[planning] Pipeline for '%s' aborted due to server shutdown.", task_id)
+            return
+        except PipelineAbortedError as exc:
+            logger.warning(
+                "[planning] Task '%s' aborted due to infra error at stage '%s': %s — will retry.",
+                task_id, exc.stage, exc.cause,
+            )
+            try:
+                _store_infra_abort_result(task_id, exc, budget_id=getattr(task, "budget_id", None),
+                                          transition="planning_to_indev")
+            except Exception:
+                pass
+            return
+        except Exception:
+            logger.exception("[planning] Pipeline for '%s' failed.", task_id)
+            return
+
+        try:
+            # Store transition result
+            _store_pipeline_result_generic(task_id, result, task.budget_id, "planning_to_indev")
+
+            if result.get("outcome") == "subdivide":
+                # Scope too large — demote to IDEA and trigger subdivision immediately
+                scope_reason = result.get("scope_reason", "Design scope too large.")
+                logger.info(
+                    "[planning] Task '%s' scope too large — demoting to IDEA for subdivision. %s",
+                    task_id, scope_reason,
+                )
+                _rejection_ctx = {
+                    "reason": "planning_scope_too_large",
+                    "scope_reason": scope_reason,
+                    "design_rationale": result.get("design_rationale", ""),
+                    "file_manifest": result.get("file_manifest", []),
+                    "survey_summary": result.get("survey_summary", ""),
+                }
+                update_task(task_id, type="subdividing")
                 try:
-                    update_planning_result(_db, pr_row.id,
-                                           gate_checks=json.dumps(gate_result.get("checks", [])))
-                finally:
-                    _db.close()
-            if gate_result.get("passed"):
-                update_task(task_id, type="indev")
-                logger.info("[planning] Task '%s' advanced to IN DEV.", task_id)
+                    _execute_subdivision(
+                        task,
+                        llm_base_url=llm_base_url,
+                        llm_model=llm_model,
+                        max_context=max_context,
+                        scope_vote=None,
+                        rejection_context=_rejection_ctx,
+                        loop=loop,
+                    )
+                except Exception:
+                    logger.exception("[planning] Subdivision after scope-fail failed for '%s'.", task_id)
+                    update_task(task_id, type="idea")
+            elif result.get("outcome") == "passed":
+                # Run planning gate
+                gate_result = loop.run_until_complete(
+                    run_planning_gate(
+                        task_id=task_id,
+                        planning_result=result,
+                        all_tasks=all_tasks,
+                        max_context=max_context,
+                        llm_base_url=llm_base_url,
+                        llm_model=llm_model,
+                        llm_id=task.llm_id,
+                        budget_id=task.budget_id,
+                        project_path=worktree_path,
+                    )
+                )
+                # Persist gate check details so the UI can surface why a gate failed
+                pr_row = get_planning_result(task_id)
+                if pr_row:
+                    _db = _SL()
+                    try:
+                        update_planning_result(_db, pr_row.id,
+                                               gate_checks=json.dumps(gate_result.get("checks", [])))
+                    finally:
+                        _db.close()
+                if gate_result.get("passed"):
+                    update_task(task_id, type="indev")
+                    logger.info("[planning] Task '%s' advanced to IN DEV.", task_id)
+                else:
+                    logger.warning("[planning] Task '%s' failed planning gate.", task_id)
+                    # Consecutive-failure safety valve: demote after too many failed runs
+                    from app.agent.config import PLANNING_MAX_CONSECUTIVE_FAILURES
+                    _total = _count_recent_failed_planning_runs(task_id, PLANNING_MAX_CONSECUTIVE_FAILURES)
+                    if _total >= PLANNING_MAX_CONSECUTIVE_FAILURES:
+                        logger.warning(
+                            "[planning] Task '%s' has failed planning %d time(s) — demoting to IDEA.",
+                            task_id, _total,
+                        )
+                        update_task(task_id, type="idea")
             else:
-                logger.warning("[planning] Task '%s' failed planning gate.", task_id)
-                # Consecutive-failure safety valve: demote after too many failed runs
+                logger.info("[planning] Task '%s' planning result: %s", task_id, result.get('outcome'))
+                # Consecutive-failure safety valve for non-passed outcomes (rejected etc.)
                 from app.agent.config import PLANNING_MAX_CONSECUTIVE_FAILURES
                 _total = _count_recent_failed_planning_runs(task_id, PLANNING_MAX_CONSECUTIVE_FAILURES)
                 if _total >= PLANNING_MAX_CONSECUTIVE_FAILURES:
@@ -1072,38 +1091,35 @@ def _run_planning_pipeline_bg(task_id: str) -> None:
                         task_id, _total,
                     )
                     update_task(task_id, type="idea")
-        else:
-            logger.info("[planning] Task '%s' planning result: %s", task_id, result.get('outcome'))
-            # Consecutive-failure safety valve for non-passed outcomes (rejected etc.)
-            from app.agent.config import PLANNING_MAX_CONSECUTIVE_FAILURES
-            _total = _count_recent_failed_planning_runs(task_id, PLANNING_MAX_CONSECUTIVE_FAILURES)
-            if _total >= PLANNING_MAX_CONSECUTIVE_FAILURES:
-                logger.warning(
-                    "[planning] Task '%s' has failed planning %d time(s) — demoting to IDEA.",
-                    task_id, _total,
-                )
-                update_task(task_id, type="idea")
+        except Exception as exc:
+            # Write the failure reason into the in_progress row so the Stage Journal
+            # shows "run failed: <reason>" instead of the old stale result.
+            if run_row_id is not None:
+                _db = _SL()
+                try:
+                    update_planning_result(
+                        _db, run_row_id,
+                        status='failed',
+                        error_message=str(exc)[:1000],
+                    )
+                finally:
+                    _db.close()
+            logger.exception("[planning] Pipeline for '%s' failed.", task_id)
+        finally:
+            loop.close()
     except Exception as exc:
-        # Write the failure reason into the in_progress row so the Stage Journal
-        # shows "run failed: <reason>" instead of the old stale result.
-        if run_row_id is not None:
-            _db = _SL()
-            try:
-                update_planning_result(
-                    _db, run_row_id,
-                    status='failed',
-                    error_message=str(exc)[:1000],
-                )
-            finally:
-                _db.close()
         logger.exception("[planning] Pipeline for '%s' failed.", task_id)
     finally:
-        loop.close()
+        if worktree_path and project_path and worktree_path != project_path:
+            teardown_task_worktree(task_id, project_path)
 
 
 @_pipeline_session
 def _run_dev_orchestrator_bg(task_id: str) -> None:
     """Background runner for the development orchestrator."""
+    from app.agent.worktree import setup_task_worktree, teardown_task_worktree, _is_git_repo
+    worktree_path = None
+    project_path = None
     try:
         import asyncio
         from app.agent.dev_orchestrator import run_dev_orchestrator
@@ -1111,8 +1127,19 @@ def _run_dev_orchestrator_bg(task_id: str) -> None:
         task = get_task(task_id)
         if not task:
             return
-        project_path = _setup_thread_context(task)
 
+        project_path = get_project_path(task.project) if task.project else None
+        worktree_path = project_path
+
+        if project_path:
+            wt = setup_task_worktree(task_id, project_path)
+            if wt:
+                worktree_path = wt
+            elif _is_git_repo(project_path):
+                logger.error("[indev] Strict isolation violation: could not create worktree for task '%s'. Aborting.", task_id)
+                return
+
+        set_task_git_cwd(worktree_path)
         llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
         planning_result_obj = get_planning_result(task_id)
 
@@ -1147,7 +1174,7 @@ def _run_dev_orchestrator_bg(task_id: str) -> None:
                     llm_model=llm_model,
                     llm_id=task.llm_id,
                     budget_id=task.budget_id,
-                    project_path=project_path,
+                    project_path=worktree_path,
                 )
             )
         except ShutdownError:
@@ -1168,6 +1195,9 @@ def _run_dev_orchestrator_bg(task_id: str) -> None:
             loop.close()
     except Exception as exc:
         logger.exception("[indev] Orchestrator for '%s' failed.", task_id)
+    finally:
+        if worktree_path and project_path and worktree_path != project_path:
+            teardown_task_worktree(task_id, project_path)
 
 
 @_pipeline_session
@@ -1244,6 +1274,9 @@ def _advance_to_optimization(task_id: str) -> None:
 @_pipeline_session
 def _run_optimization_only_bg(task_id: str) -> None:
     """On-demand: run only the optimization pipeline (no security)."""
+    from app.agent.worktree import setup_task_worktree, teardown_task_worktree, _is_git_repo
+    worktree_path = None
+    project_path = None
     try:
         import asyncio
         from app.agent.optimization import run_optimization_pipeline
@@ -1251,7 +1284,19 @@ def _run_optimization_only_bg(task_id: str) -> None:
         task = get_task(task_id)
         if not task:
             return
-        project_path = _setup_thread_context(task)
+
+        project_path = get_project_path(task.project) if task.project else None
+        worktree_path = project_path
+
+        if project_path:
+            wt = setup_task_worktree(task_id, project_path)
+            if wt:
+                worktree_path = wt
+            elif _is_git_repo(project_path):
+                logger.error("[optimization-only] Strict isolation violation: could not create worktree for task '%s'. Aborting.", task_id)
+                return
+
+        set_task_git_cwd(worktree_path)
         llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
 
         loop = asyncio.new_event_loop()
@@ -1265,7 +1310,7 @@ def _run_optimization_only_bg(task_id: str) -> None:
                     llm_model=llm_model,
                     llm_id=task.llm_id,
                     budget_id=task.budget_id,
-                    project_path=project_path,
+                    project_path=worktree_path,
                 )
             )
             logger.info("[optimization-only] Task '%s': %s", task_id, result.get('outcome'))
@@ -1280,11 +1325,17 @@ def _run_optimization_only_bg(task_id: str) -> None:
             loop.close()
     except Exception as exc:
         logger.exception("[optimization-only] Pipeline for '%s' failed.", task_id)
+    finally:
+        if worktree_path and project_path and worktree_path != project_path:
+            teardown_task_worktree(task_id, project_path)
 
 
 @_pipeline_session
 def _run_security_only_bg(task_id: str) -> None:
     """On-demand: run only the security review pipeline (no optimization)."""
+    from app.agent.worktree import setup_task_worktree, teardown_task_worktree, _is_git_repo
+    worktree_path = None
+    project_path = None
     try:
         import asyncio
         from app.agent.security_review import run_security_pipeline
@@ -1292,7 +1343,19 @@ def _run_security_only_bg(task_id: str) -> None:
         task = get_task(task_id)
         if not task:
             return
-        project_path = _setup_thread_context(task)
+
+        project_path = get_project_path(task.project) if task.project else None
+        worktree_path = project_path
+
+        if project_path:
+            wt = setup_task_worktree(task_id, project_path)
+            if wt:
+                worktree_path = wt
+            elif _is_git_repo(project_path):
+                logger.error("[security-only] Strict isolation violation: could not create worktree for task '%s'. Aborting.", task_id)
+                return
+
+        set_task_git_cwd(worktree_path)
         llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
 
         loop = asyncio.new_event_loop()
@@ -1306,7 +1369,7 @@ def _run_security_only_bg(task_id: str) -> None:
                     llm_model=llm_model,
                     llm_id=task.llm_id,
                     budget_id=task.budget_id,
-                    project_path=project_path,
+                    project_path=worktree_path,
                 )
             )
             _store_pipeline_result_generic(task_id, sec_result, task.budget_id, "security_review")
@@ -1330,11 +1393,17 @@ def _run_security_only_bg(task_id: str) -> None:
             loop.close()
     except Exception as exc:
         logger.exception("[security-only] Pipeline for '%s' failed.", task_id)
+    finally:
+        if worktree_path and project_path and worktree_path != project_path:
+            teardown_task_worktree(task_id, project_path)
 
 
 @_pipeline_session
 def _run_security_pipeline_bg(task_id: str) -> None:
     """Background runner for security + optimization pipelines."""
+    from app.agent.worktree import setup_task_worktree, teardown_task_worktree, _is_git_repo
+    worktree_path = None
+    project_path = None
     try:
         import asyncio
         from app.agent.optimization import run_optimization_pipeline
@@ -1343,8 +1412,19 @@ def _run_security_pipeline_bg(task_id: str) -> None:
         task = get_task(task_id)
         if not task:
             return
-        project_path = _setup_thread_context(task)
 
+        project_path = get_project_path(task.project) if task.project else None
+        worktree_path = project_path
+
+        if project_path:
+            wt = setup_task_worktree(task_id, project_path)
+            if wt:
+                worktree_path = wt
+            elif _is_git_repo(project_path):
+                logger.error("[security] Strict isolation violation: could not create worktree for task '%s'. Aborting.", task_id)
+                return
+
+        set_task_git_cwd(worktree_path)
         llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
 
         loop = asyncio.new_event_loop()
@@ -1359,7 +1439,7 @@ def _run_security_pipeline_bg(task_id: str) -> None:
                     llm_model=llm_model,
                     llm_id=task.llm_id,
                     budget_id=task.budget_id,
-                    project_path=project_path,
+                    project_path=worktree_path,
                 )
             )
             logger.info("[optimization] Task '%s': %s", task_id, opt_result.get('outcome'))
@@ -1373,7 +1453,7 @@ def _run_security_pipeline_bg(task_id: str) -> None:
                     llm_model=llm_model,
                     llm_id=task.llm_id,
                     budget_id=task.budget_id,
-                    project_path=project_path,
+                    project_path=worktree_path,
                 )
             )
             _store_pipeline_result_generic(task_id, sec_result, task.budget_id, "security_review")
@@ -1399,11 +1479,17 @@ def _run_security_pipeline_bg(task_id: str) -> None:
             loop.close()
     except Exception as exc:
         logger.exception("[security] Pipeline for '%s' failed.", task_id)
+    finally:
+        if worktree_path and project_path and worktree_path != project_path:
+            teardown_task_worktree(task_id, project_path)
 
 
 @_pipeline_session
 def _run_full_review_bg(task_id: str) -> None:
     """Background runner for full review pipeline."""
+    from app.agent.worktree import setup_task_worktree, teardown_task_worktree, _is_git_repo
+    worktree_path = None
+    project_path = None
     try:
         import asyncio
         from app.agent.full_review import run_full_review_pipeline
@@ -1411,8 +1497,19 @@ def _run_full_review_bg(task_id: str) -> None:
         task = get_task(task_id)
         if not task:
             return
-        project_path = _setup_thread_context(task)
 
+        project_path = get_project_path(task.project) if task.project else None
+        worktree_path = project_path
+
+        if project_path:
+            wt = setup_task_worktree(task_id, project_path)
+            if wt:
+                worktree_path = wt
+            elif _is_git_repo(project_path):
+                logger.error("[full_review] Strict isolation violation: could not create worktree for task '%s'. Aborting.", task_id)
+                return
+
+        set_task_git_cwd(worktree_path)
         llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
 
         loop = asyncio.new_event_loop()
@@ -1426,7 +1523,7 @@ def _run_full_review_bg(task_id: str) -> None:
                     llm_model=llm_model,
                     llm_id=task.llm_id,
                     budget_id=task.budget_id,
-                    project_path=project_path,
+                    project_path=worktree_path,
                 )
             )
             _store_pipeline_result_generic(task_id, result, task.budget_id, "full_review")
@@ -1434,10 +1531,10 @@ def _run_full_review_bg(task_id: str) -> None:
             if result.get("outcome") == "passed":
                 # Pushed to FINAL REVIEW (full_review column) - do a virtual merge test.
                 from app.agent.merge import execute_merge
-                
+
                 logger.info("[full_review] Task '%s' passed. Running virtual merge test.", task_id)
-                merge_test = execute_merge(task_id, project_path=project_path, dry_run=True)
-                
+                merge_test = execute_merge(task_id, project_path=worktree_path, dry_run=True)
+
                 if merge_test.status == "virtual_passed":
                     append_task_history(task_id, "ready_for_review", message="Full review passed. Virtual merge/test SUCCEEDED. Ready for final manual review and merge.")
                     logger.info("[full_review] Task '%s' virtual merge SUCCEEDED.", task_id)
@@ -1460,6 +1557,9 @@ def _run_full_review_bg(task_id: str) -> None:
             loop.close()
     except Exception as exc:
         logger.exception("[full_review] Pipeline for '%s' failed.", task_id)
+    finally:
+        if worktree_path and project_path and worktree_path != project_path:
+            teardown_task_worktree(task_id, project_path)
 
 
 def _execute_merge_bg(task_id: str) -> None:
@@ -2897,7 +2997,7 @@ def _trigger_project_prewarm(
     project_budget_id: "int | None" = None,
 ) -> None:
     """Trigger the tiered project survey process in a background thread.
-    
+
     This replaces the old flat file-summary prewarm with the new
     hierarchical SurveyOrchestrator approach.
     """
@@ -3882,7 +3982,7 @@ AGENT_TOOL_ACCESS: dict = {
     "ResearchAgent": {
         "description": "Lightweight read-only investigator spawned by the intake pipeline when votes need clarification. Limited lives, restricted tools.",
         "tools": [
-            "read_file", "read_file_harder", "count_lines",
+            "read_file", "count_lines",
             "search_files", "find_files", "list_directory",
             "git_status", "git_diff", "git_log", "git_blame", "git_show",
             "get_task", "list_tasks",
@@ -3899,7 +3999,7 @@ AGENT_TOOL_ACCESS: dict = {
     "SubdivisionAgent": {
         "description": "Decomposes oversized ideas into smaller sub-ideas when intake votes SUBDIVIDE_IDEA. Read-only tools, structured decomposition output.",
         "tools": [
-            "read_file", "read_file_harder", "count_lines",
+            "read_file", "count_lines",
             "search_files", "find_files", "list_directory",
             "git_status", "git_diff", "git_log", "git_blame", "git_show",
             "get_task", "list_tasks",
@@ -3927,11 +4027,11 @@ AGENT_TOOL_ACCESS: dict = {
     },
     "SecurityPipeline": {
         "description": "3 parallel security reviewer agents with veto power. Uses allowlisted security scanner shell.",
-        "tools": ["run_shell_security", "read_file", "read_file_harder", "search_files", "find_files", "list_directory"],
+        "tools": ["run_shell_security", "read_file", "search_files", "find_files", "list_directory"],
     },
     "FullReviewPipeline": {
         "description": "4-agent final review (functional, code quality, integration, UX). Uses allowlisted review runner shell.",
-        "tools": ["run_shell_review", "read_file", "read_file_harder", "search_files", "find_files", "list_directory"],
+        "tools": ["run_shell_review", "read_file", "search_files", "find_files", "list_directory"],
     },
     "MergeWorker": {
         "description": "Deterministic git merge workflow (no LLM). Verifies branch, merges --no-ff, runs test suite, pushes if configured.",
@@ -4600,17 +4700,17 @@ async def admin_restart():
     async def _exit_soon():
         # Wait a bit to ensure the HTTP response is sent before we block/drain
         await asyncio.sleep(0.5)
-        
+
         from app.agent.llm_client import signal_shutdown
         from app.agent.scheduler import stop_scheduler
-        
+
         logger.info("[admin] Gentle shutdown: waiting up to 55s for active LLM sessions to finish.")
         signal_shutdown()
-        
+
         # Total timeout 55s as requested for "gentle shutdown"
         # stop_scheduler already handles Phase 1/Phase 2 logging internally.
         stop_scheduler(wait_for_sessions=True, timeout=55.0)
-        
+
         logger.warning("[admin] Gentle shutdown complete — exiting process now.")
         os._exit(0)
 

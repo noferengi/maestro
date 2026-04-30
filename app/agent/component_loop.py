@@ -26,6 +26,12 @@ from app.agent.config import (
     INDEV_ENFORCE_FILE_CONTAINMENT,
     INDEV_AGENT_TOOLS,
     PROJECT_ROOT,
+    SIGNAL_ACCEPTED,
+    SIGNAL_REVERT,
+    SIGNAL_RESOLUTION_STALLED,
+    SIGNAL_CORRECTION_STALLED,
+    SIGNAL_VERDICT_REJECTED,
+    SIGNAL_VERDICT_NEEDS_WORK,
     check_context_saturation,
 )
 from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
@@ -232,6 +238,7 @@ class ComponentLoop:
         self._total_prompt = 0
         self._total_completion = 0
         self._tests_passed: bool = False
+        self._terminal_signal: dict | None = None
         # Repeat-tool-call circuit breaker: tracks last 4 (name, args_json) pairs
         self._recent_calls: collections.deque[tuple[str, str]] = collections.deque(maxlen=4)
         self._repeat_notice_count = 0
@@ -327,45 +334,6 @@ class ComponentLoop:
 
             messages.append(msg)
 
-            # Check for terminal signal
-            if content:
-                if '"signal": "ACCEPTED"' in content or '"signal":"ACCEPTED"' in content:
-                    component_files = self.step.get("files", [])
-                    if not self._tests_passed and _is_testable_component(component_files):
-                        logger.info(
-                            "[component] '%s' signaled ACCEPTED without passing tests - requesting test run",
-                            self.component_name,
-                        )
-                        test_cmd = _get_test_command_hint()
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                "You signaled ACCEPTED but no passing test run was recorded. "
-                                "Please run the tests first (e.g. run_pytest('.', '-v') for Python, "
-                                "run_cargo_test() for Rust, run_go_test() for Go, run_npm_test() for Node). "
-                                "Then signal ACCEPTED once tests pass."
-                            ),
-                        })
-                        continue
-                    return ComponentLoopResult(
-                        component_name=self.component_name,
-                        status="ACCEPTED",
-                        turns=turn + 1,
-                        files_changed=sorted(files_changed),
-                        tests_passed=self._tests_passed,
-                        prompt_tokens=self._total_prompt,
-                        completion_tokens=self._total_completion,
-                    )
-                if '"signal": "REVERT_TO_DESIGN"' in content or '"signal":"REVERT_TO_DESIGN"' in content:
-                    return ComponentLoopResult(
-                        component_name=self.component_name,
-                        status="REVERT_TO_DESIGN",
-                        turns=turn + 1,
-                        error_detail=content[:500],
-                        prompt_tokens=self._total_prompt,
-                        completion_tokens=self._total_completion,
-                    )
-
             # No content and no tool calls — nudge the model rather than
             # silently looping with an empty assistant message at the tail.
             # (An empty trailing assistant turn looks like a prefill request
@@ -375,9 +343,10 @@ class ComponentLoop:
                     "role": "user",
                     "content": (
                         "[SYSTEM] Your last response was empty. "
-                        "Please call a tool to make progress, or emit your "
-                        "final signal: {\"signal\": \"ACCEPTED\"} or "
-                        "{\"signal\": \"REVERT_TO_DESIGN\"}."
+                        "Please call a tool to make progress, or call "
+                        "submit_work(signal='ACCEPTED', summary='...') to complete. "
+                        "Do not output free-form prose or raw JSON as a terminal action — "
+                        "use the submit_work tool call."
                     ),
                 })
                 continue
@@ -423,6 +392,22 @@ class ComponentLoop:
 
                     result = self.dispatcher.dispatch(fn_name, fn_args)
 
+                    # Detect __maestro_terminal__ marker from submit_work
+                    if fn_name == "submit_work":
+                        try:
+                            terminal_data = json.loads(str(result))
+                            if terminal_data.get("__maestro_terminal__") is True:
+                                logger.info(
+                                    "[component] '%s': submit_work tool call — "
+                                    "signal=%s, summary='%s'",
+                                    self.component_name,
+                                    terminal_data.get("signal"),
+                                    terminal_data.get("summary", "")[:120],
+                                )
+                                self._terminal_signal = terminal_data
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+
                     # Track test outcomes
                     if _is_test_command(fn_name, fn_args):
                         test_outcome = _detect_test_outcome(str(result))
@@ -455,6 +440,46 @@ class ComponentLoop:
                         "content": str(result)[:4000],
                     })
 
+                # Check for terminal signal from submit_work tool call
+                if self._terminal_signal is not None:
+                    sig = self._terminal_signal.get("signal")
+                    if sig == "ACCEPTED":
+                        component_files = self.step.get("files", [])
+                        if not self._tests_passed and _is_testable_component(component_files):
+                            logger.info(
+                                "[component] '%s' submit_work(ACCEPTED) blocked — tests not passed",
+                                self.component_name,
+                            )
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    "You called submit_work(ACCEPTED) but no passing test run was recorded. "
+                                    "Please run the tests first (e.g. run_pytest('.', '-v') for Python, "
+                                    "run_cargo_test() for Rust, run_go_test() for Go, run_npm_test() for Node). "
+                                    "Then call submit_work(ACCEPTED) again once tests pass."
+                                ),
+                            })
+                            continue
+                        return ComponentLoopResult(
+                            component_name=self.component_name,
+                            status="ACCEPTED",
+                            turns=turn + 1,
+                            files_changed=sorted(files_changed),
+                            tests_passed=self._tests_passed,
+                            prompt_tokens=self._total_prompt,
+                            completion_tokens=self._total_completion,
+                        )
+                    if sig in ("REVERT_TO_DESIGN", "RESOLUTION_STALLED", "CORRECTION_STALLED",
+                               "VERDICT_REJECTED", "VERDICT_NEEDS_WORK"):
+                        return ComponentLoopResult(
+                            component_name=self.component_name,
+                            status="REVERT_TO_DESIGN",
+                            turns=turn + 1,
+                            error_detail=self._terminal_signal.get("summary", "Reverting to design."),
+                            prompt_tokens=self._total_prompt,
+                            completion_tokens=self._total_completion,
+                        )
+
         return ComponentLoopResult(
             component_name=self.component_name,
             status="MAX_TURNS",
@@ -475,8 +500,8 @@ class ComponentLoop:
             "- If your project needs a build step first: run_make, run_cargo_build, run_go_build, run_npm_build, run_tsc, run_gradle, run_mvn\n"
             "- If you add dependencies to a manifest file, install them first: run_pip_install, run_npm_install, run_cargo_fetch\n"
             "- To undo unintentional file edits: git_restore(path) restores to HEAD, git_unstage(path) removes from staging area\n"
-            "- When done, output: {\"signal\": \"ACCEPTED\"}\n"
-            "- If you cannot complete, output: {\"signal\": \"REVERT_TO_DESIGN\"}\n"
+            "- When done, call: submit_work(signal='ACCEPTED', summary='...')\n"
+            "- If you cannot complete, call: submit_work(signal='REVERT_TO_DESIGN', summary='...')\n"
             "- Never hard-delete files. Use archive_file() for removal.\n"
             "- Work on the maestro/task-{id} branch.\n\n"
             "TEST QUALITY RULES — strictly required:\n"

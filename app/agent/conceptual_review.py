@@ -35,12 +35,11 @@ from app.agent.config import (
     CONCEPTUAL_REVIEW_RESEARCH_LIVES,
     CONCEPTUAL_REVIEW_REVIEWER_TOOLS,
     PROJECT_ROOT,
-    check_context_saturation,
 )
-from app.agent.json_utils import extract_json_block
-from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
+from app.agent.agent_loop import ReviewerLoop
+from app.agent.llm_client import is_shutting_down, ShutdownError
 from app.agent.research import run_research
-from app.agent.tools import dispatch_tool, build_tool_schemas
+from app.agent.tools import build_tool_schemas
 from app.agent.verdicts import Vote, Verdict, tally_votes
 
 logger = logging.getLogger(__name__)
@@ -372,8 +371,8 @@ class ConceptualReviewPipeline:
         plan_summary: str, det_summary: str,
         extra_context: str = "",
     ) -> Vote:
-        """Run a single LLM reviewer using a mini-loop with tool access."""
-        prompt = (
+        """Run a single LLM reviewer using ReviewerLoop."""
+        user_prompt = (
             f"You are reviewing code from the perspective of: {focus}\n\n"
             f"Task description (authoritative user intent):\n{self.task_description}\n\n"
             "IMPORTANT: The task description above is the user's authoritative specification. "
@@ -387,114 +386,28 @@ class ConceptualReviewPipeline:
             f"Deterministic check results:\n{det_summary}\n\n"
             f"{extra_context}"
             "You may use tools to read code files before giving your verdict.\n\n"
-            "Output JSON: {\"verdict\": \"LIKELY|POSSIBLE|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED\", "
-            "\"confidence\": <0-100>, \"justification\": \"...\", "
-            "\"severity\": \"low|medium|high|critical\"}"
+            "When ready, call submit_work(signal='REVIEW_COMPLETE', summary='<one sentence>', "
+            "payload={'verdict': 'LIKELY|POSSIBLE|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED', "
+            "'confidence': <0-100>, 'justification': '...', "
+            "'severity': 'low|medium|high|critical'})"
         )
-
-        messages: list[dict] = [
-            {"role": "system", "content": "You are a code reviewer. Output your verdict as JSON when ready."},
-            {"role": "user", "content": prompt},
-        ]
-
-        max_turns = CONCEPTUAL_REVIEW_MAX_TURNS
-        _ctx_warned: set[float] = set()
-        _turn_warned: set[int] = set()
-
-        for turn in range(max_turns):
-            if is_shutting_down():
-                raise ShutdownError("Server is shutting down")
-
-            # Turn saturation check
-            from app.agent.config import check_turn_saturation
-            if check_turn_saturation(
-                turn, max_turns, _turn_warned, messages
-            ):
-                # Turn nudge was injected
-                pass
-
-            response = await call_llm(
-                messages,
-                base_url=self.llm_base_url,
-                model=self.llm_model,
-                tools=self._REVIEWER_SCHEMAS,
-                tool_choice="auto",
-                task_id=self.task_id,
-                llm_id=self.llm_id,
-                budget_id=self.budget_id,
-                agent_name=AGENT_NAME,
-            )
-
-            usage = response.get("usage", {})
-            prompt_tokens_this_call = usage.get("prompt_tokens", 0)
-            self._total_prompt += prompt_tokens_this_call
-            self._total_completion += usage.get("completion_tokens", 0)
-
-            # Context saturation check
-            if check_context_saturation(
-                prompt_tokens_this_call, self.max_context, _ctx_warned, messages
-            ):
-                logger.warning("[conceptual_review] Reviewer '%s' context saturation (turn %d) - terminating", name, turn + 1)
-                break
-
-            assistant_msg = response.get("choices", [{}])[0].get("message", {})
-            messages.append(assistant_msg)
-            tool_calls = assistant_msg.get("tool_calls") or []
-            content = assistant_msg.get("content") or ""
-
-            if tool_calls:
-                for tc in tool_calls:
-                    tc_result = dispatch_tool(
-                        tc["function"]["name"],
-                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
-                    )
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "name": tc["function"]["name"],
-                        "content": tc_result,
-                    })
-                continue
-
-            raw = extract_json_block(content)
-            if raw:
-                try:
-                    data = json.loads(raw)
-                    if "verdict" in data:
-                        verdict_str = data.get("verdict", "POSSIBLE").upper()
-                        verdict = Verdict(verdict_str)
-                        confidence = int(data.get("confidence", 80))
-                        lo, hi = verdict.confidence_range
-                        confidence = max(lo, min(hi, confidence))
-                        justification = data.get("justification", "")
-                        severity = data.get("severity", "medium")
-                        if severity in ("high", "critical"):
-                            justification = f"[{severity.upper()}] {justification}"
-                        return Vote(
-                            stage=name,
-                            verdict=verdict,
-                            confidence=confidence,
-                            justification=justification,
-                            model=self.llm_model or "",
-                        )
-                except (json.JSONDecodeError, ValueError):
-                    pass
-
-            turns_remaining = max_turns - turn - 1
-            if turns_remaining <= 2:
-                messages.append({
-                    "role": "user",
-                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Output your verdict as JSON now.",
-                })
-
-        # Fallback: turns exhausted
-        return Vote(
-            stage=name,
-            verdict=Verdict.NEEDS_RESEARCH,
-            confidence=65,
-            justification="Reviewer exhausted turns",
-            model=self.llm_model or "",
+        reviewer = ReviewerLoop(
+            stage_name=name,
+            system_prompt="You are a code reviewer. Call submit_work to finish.",
+            user_prompt=user_prompt,
+            tool_schemas=self._REVIEWER_SCHEMAS,
+            task_id=str(self.task_id),
+            llm_id=self.llm_id,
+            budget_id=self.budget_id,
+            max_turns=CONCEPTUAL_REVIEW_MAX_TURNS,
+            llm_base_url=self.llm_base_url,
+            llm_model=self.llm_model,
+            max_context=self.max_context,
         )
+        vote = await reviewer.run()
+        self._total_prompt += reviewer._total_prompt_tokens
+        self._total_completion += reviewer._total_completion_tokens
+        return vote
 
     # ------------------------------------------------------------------
     # Research agent dispatch (NEEDS_RESEARCH recovery)

@@ -35,13 +35,13 @@ The logic should check if the task has been demoted since its last intake. A sim
 # Proposed logic
 if task_type == "idea":
     # ... existing exhausted check ...
-    
+
     # Only skip if a session is ALREADY running (checked later)
     # or if we are in a REJECTION cooldown.
     if task_id in _rejection_cooldowns:
         if time.time() - _rejection_cooldowns[task_id] < _REJECTION_RETRY_COOLDOWN:
             continue
-    
+
     # Remove the check for previous 'passed'/'subdivide' outcomes
     # because if it's currently an IDEA, it needs to get out.
 ```

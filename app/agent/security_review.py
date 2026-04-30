@@ -30,7 +30,6 @@ from app.agent.config import (
     PROJECT_ROOT,
     check_context_saturation,
 )
-from app.agent.json_utils import extract_json_block
 from app.agent.tools import _task_git_cwd, dispatch_tool, build_tool_schemas, set_task_git_cwd
 from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
 from app.agent.research import run_research
@@ -339,19 +338,20 @@ class SecurityPipeline:
             f"Task being reviewed: {self.task_description}\n\n"
             "Analyze for security issues. You may use tools to inspect code files. "
             "For each finding, classify severity as critical/high/medium/low.\n\n"
-            "Output JSON: {\n"
-            "  \"verdict\": \"LIKELY|POSSIBLE|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED\",\n"
-            "  \"confidence\": <0-100>,\n"
-            "  \"justification\": \"...\",\n"
-            "  \"findings\": [{\"type\": \"...\", \"severity\": \"critical|high|medium|low\", "
-            "\"description\": \"...\", \"demotion_target\": \"development|planning|optimization\"}],\n"
-            "  \"critical_count\": 0,\n"
-            "  \"high_count\": 0\n"
-            "}"
+            "When ready, call submit_work(signal='REVIEW_COMPLETE', summary='<one sentence>', "
+            "payload={\n"
+            "  'verdict': 'LIKELY|POSSIBLE|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED',\n"
+            "  'confidence': <0-100>,\n"
+            "  'justification': '...',\n"
+            "  'findings': [{'type': '...', 'severity': 'critical|high|medium|low',\n"
+            "                'description': '...', 'demotion_target': 'development|planning|optimization'}],\n"
+            "  'critical_count': <int>,\n"
+            "  'high_count': <int>\n"
+            "})"
         )
 
         messages: list[dict] = [
-            {"role": "system", "content": "You are a security expert. Output your verdict as JSON when ready."},
+            {"role": "system", "content": "You are a security expert. Call submit_work to finish."},
             {"role": "user", "content": prompt},
         ]
 
@@ -405,46 +405,42 @@ class SecurityPipeline:
 
             if tool_calls:
                 for tc in tool_calls:
-                    tc_result = dispatch_tool(
-                        tc["function"]["name"],
-                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                    fn_name = tc["function"]["name"]
+                    fn_args = (
+                        json.loads(tc["function"]["arguments"])
+                        if isinstance(tc["function"]["arguments"], str)
+                        else tc["function"]["arguments"]
                     )
+                    tc_result = dispatch_tool(fn_name, fn_args)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
-                        "name": tc["function"]["name"],
+                        "name": fn_name,
                         "content": tc_result,
                     })
+                    if fn_name == "submit_work":
+                        try:
+                            terminal_data = json.loads(tc_result)
+                            if terminal_data.get("__maestro_terminal__") is True:
+                                logger.info(
+                                    "[%s] Reviewer '%s' submit_work detected - signal=%s",
+                                    AGENT_NAME, reviewer["type"], terminal_data.get("signal"),
+                                )
+                                return self._vote_from_submit_work(reviewer, terminal_data)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
                 continue
-
-            raw = extract_json_block(content)
-            if raw:
-                try:
-                    data = json.loads(raw)
-                    if "verdict" in data:
-                        verdict_str = data.get("verdict", "POSSIBLE").upper()
-                        verdict = Verdict(verdict_str)
-                        confidence = int(data.get("confidence", 80))
-                        lo, hi = verdict.confidence_range
-                        confidence = max(lo, min(hi, confidence))
-                        justification = data.get("justification", "")
-                        findings = data.get("findings", [])
-                        vote = Vote(
-                            stage=f"security_{reviewer['type']}",
-                            verdict=verdict,
-                            confidence=confidence,
-                            justification=justification,
-                            model=self.llm_model or "",
-                        )
-                        return vote, findings
-                except (json.JSONDecodeError, ValueError):
-                    pass
 
             turns_remaining = max_turns - turn - 1
             if turns_remaining <= 2:
                 messages.append({
                     "role": "user",
-                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Output JSON verdict now.",
+                    "content": (
+                        f"[SYSTEM] {turns_remaining} turns remaining. "
+                        "Call submit_work(signal='REVIEW_COMPLETE', summary='...', "
+                        "payload={'verdict': '...', 'confidence': N, 'justification': '...', "
+                        "'findings': [...]}) now."
+                    ),
                 })
 
         # Fallback: turns exhausted
@@ -502,6 +498,30 @@ class SecurityPipeline:
             )
 
         return "passed", f"All {len(votes)} security reviewers passed.", None
+
+    def _vote_from_submit_work(
+        self, reviewer: dict, terminal_data: dict
+    ) -> tuple[Vote, list[dict]]:
+        """Build a Vote + findings from a submit_work terminal_data dict."""
+        payload = terminal_data.get("payload", {})
+        verdict_str = str(payload.get("verdict", "POSSIBLE")).upper()
+        try:
+            verdict = Verdict(verdict_str)
+        except ValueError:
+            verdict = Verdict.POSSIBLE
+        confidence = int(payload.get("confidence", 80))
+        lo, hi = verdict.confidence_range
+        confidence = max(lo, min(hi, confidence))
+        justification = payload.get("justification", "")
+        findings = payload.get("findings", [])
+        vote = Vote(
+            stage=f"security_{reviewer['type']}",
+            verdict=verdict,
+            confidence=confidence,
+            justification=justification,
+            model=self.llm_model or "",
+        )
+        return vote, findings
 
     def _store_reviewer_result(
         self, vote: Vote, findings: list[dict], reviewer_type: str

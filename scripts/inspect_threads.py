@@ -19,7 +19,7 @@ def main():
     print("\n" + "="*70)
     print("  SCHEDULER THREAD INSPECTION")
     print("="*70)
-    
+
     # 1. Scheduler thread state
     print("\n[1] Scheduler Thread:")
     if _scheduler_thread is not None:
@@ -29,7 +29,7 @@ def main():
         print(f"    Name: {_scheduler_thread.name}")
     else:
         print("    Scheduler thread not started")
-    
+
     # 2. Active task sessions
     with _active_sessions_lock:
         print("\n[2] Active Task Sessions:")
@@ -45,7 +45,7 @@ def main():
                 print(f"        name={name}")
                 if alive:
                     print(f"        is_alive()={alive}")
-    
+
     # 3. Session LLM mapping
     print("\n[3] Session -> LLM Mapping:")
     with _active_sessions_lock:
@@ -53,18 +53,18 @@ def main():
             active_keys = set(_active_sessions.keys())
             session_llm_ids = dict(_session_llm_ids)
             llm_counts = dict(_llm_session_counts)
-    
+
     for key, llm_id in session_llm_ids.items():
         if key in active_keys:
             count = llm_counts.get(llm_id, 0)
             print(f"    {key} -> LLM {llm_id} (count={count})")
-    
+
     # 4. LLM counts
     print("\n[4] LLM Session Counts:")
     with _llm_counts_lock:
         for llm_id, count in _llm_session_counts.items():
             print(f"    LLM {llm_id}: {count}")
-    
+
     # 5. Thread stack traces for alive threads
     print("\n[5] Thread Stack Traces (alive threads only):")
     with _active_sessions_lock:
@@ -76,18 +76,18 @@ def main():
                         print(f"      {frame_summary}")
                 except Exception as e:
                     print(f"      Error: {e}")
-    
+
     # 6. Check if scheduler is stuck in a loop
     print("\n[6] Scheduler Loop Check:")
     print(f"    Expected tick interval: {SCHEDULER_TICK_INTERVAL}s")
-    
+
     # Check if scheduler is actively running
     print("\n[7] Scheduler Activity:")
     print("    Check server logs for scheduler debug messages:")
     print("    - '[scheduler] tick: dispatching task X'")
     print("    - '[scheduler] One-LLM policy: pinned to LLM N'")
     print("    - '[scheduler] Task X advanced to PLANNING'")
-    
+
     return _active_sessions, _session_llm_ids, _llm_session_counts
 
 if __name__ == "__main__":

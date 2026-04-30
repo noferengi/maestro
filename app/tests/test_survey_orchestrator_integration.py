@@ -44,7 +44,7 @@ def mock_job():
 def test_run_scope_survey_job_directory_success(mock_job, mock_llm, tmp_path):
     """Test successful directory summary generation."""
     project_root = str(tmp_path)
-    
+
     # Setup some file summaries in DB
     from app.database.models import FileSummary
     from app.database.session import SessionLocal
@@ -65,25 +65,25 @@ def test_run_scope_survey_job_directory_success(mock_job, mock_llm, tmp_path):
          patch("app.database.update_scope_survey_job") as mock_update_job, \
          patch("app.database.create_agent_session", return_value=1), \
          patch("app.database.close_agent_session"):
-        
+
         mock_call.return_value = {
             "content": "Full summary text.\nSHORT_SUMMARY: Short summary text."
         }
-        
+
         _run_scope_survey_job(mock_job, mock_llm)
-        
+
         # Verify LLM was called with file summary
         args, kwargs = mock_call.call_args
         prompt = kwargs["messages"][0]["content"]
         assert "Orchestrator logic." in prompt
         assert "app/agent/orchestrator.py" in prompt
-        
+
         # Verify scope summary was saved
         ss = get_scope_summary("TestProj", "directory", "app/agent")
         assert ss is not None
         assert ss.summary == "Full summary text."
         assert ss.short_summary == "Short summary text."
-        
+
         from unittest.mock import ANY
         # Verify job marked as done (it also passes prompt/completion tokens)
         mock_update_job.assert_any_call(mock_job.id, status="done", prompt_tokens=ANY, completion_tokens=ANY)
@@ -93,7 +93,7 @@ def test_run_scope_survey_job_partitioning(mock_job, mock_llm, tmp_path):
     project_root = str(tmp_path)
     mock_llm.max_context = 2000 # Small context to force partitioning
     # branching factor = max(3, int(1/0.1) - 2) = 8.
-    
+
     # Create 15 file summaries
     from app.database.models import FileSummary
     from app.database.session import SessionLocal
@@ -114,17 +114,17 @@ def test_run_scope_survey_job_partitioning(mock_job, mock_llm, tmp_path):
          patch("app.database.update_scope_survey_job") as mock_update_job, \
          patch("app.database.create_agent_session", return_value=1), \
          patch("app.database.close_agent_session"):
-        
+
         _run_scope_survey_job(mock_job, mock_llm)
-        
+
         # Should have enqueued 2 page jobs (15 files / 8 branching factor)
         assert mock_enqueue.call_count == 2
-        
+
         # enqueue_scope_survey_job(project_name, scope_type, scope_key, action='generate', ...)
         call0 = mock_enqueue.call_args_list[0]
         args, kwargs = call0
         assert args[1] == "directory_page"
         assert args[2] == "app/agent:page-1"
-        
+
         # Verify parent job marked as pending
         mock_update_job.assert_any_call(mock_job.id, status="pending", error_message="Waiting for 2 pages")

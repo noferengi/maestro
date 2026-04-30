@@ -25,6 +25,7 @@ from app.agent.config import (
     GIT_SAFETY_BRANCH_PREFIX,
 )
 from app.agent.component_loop import ComponentLoop, ComponentLoopResult
+from app.agent.llm_client import ShutdownError
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,8 @@ logger = logging.getLogger(__name__)
 class DevOrchestratorResult:
     task_id: str
     status: str  # "ACCEPTED" | "REVERT_TO_DESIGN" | "ERROR"
+    # REVERT_TO_DESIGN: agent explicitly signalled design is wrong → demote to planning
+    # ERROR: transient infrastructure failure (loops, LLM errors, ctx saturation) → stay in indev
     batches_completed: int = 0
     total_batches: int = 0
     component_results: list[ComponentLoopResult] = field(default_factory=list)
@@ -125,6 +128,11 @@ class DevOrchestrator:
             batch_failed = False
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
+                    # Server shutdown mid-batch is infrastructure failure, not code failure.
+                    # Re-raise so _run_indev_task's ShutdownError handler fires and the
+                    # task stays in INDEV instead of being demoted to planning.
+                    if isinstance(result, ShutdownError):
+                        raise result
                     comp_result = ComponentLoopResult(
                         component_name=batch[i].get("component", f"batch{batch_idx}_step{i}"),
                         status="ERROR",
@@ -151,9 +159,13 @@ class DevOrchestrator:
                 for _r in failed_components[:3]:
                     _reason = _r.error_detail or _r.status
                     _lines.append(f"  • {_r.component_name}: {_reason[:300]}")
+                # Only propagate REVERT_TO_DESIGN if the agent explicitly signalled it.
+                # Transient failures (loops, LLM errors, context saturation) use ERROR so
+                # the scheduler keeps the task in INDEV rather than demoting to planning.
+                _is_design_signal = any(r.status == "REVERT_TO_DESIGN" for r in failed_components)
                 return DevOrchestratorResult(
                     task_id=self.task_id,
-                    status="REVERT_TO_DESIGN",
+                    status="REVERT_TO_DESIGN" if _is_design_signal else "ERROR",
                     batches_completed=batch_idx,
                     total_batches=len(batches),
                     component_results=all_results,
@@ -182,11 +194,26 @@ class DevOrchestrator:
                     "[dev_orch] Test suite failed — running test-fix loop %d/%d for task '%s'.",
                     fix_attempt, INDEV_TEST_FIX_MAX_RETRIES, self.task_id,
                 )
-                fix_tokens_p, fix_tokens_c = await self._run_test_fix_loop(
+                fix_tokens_p, fix_tokens_c, signalled_redesign = await self._run_test_fix_loop(
                     test_output, fix_attempt
                 )
                 total_prompt += fix_tokens_p
                 total_completion += fix_tokens_c
+
+                if signalled_redesign:
+                    logger.warning("[dev_orch] Test-fix loop %d signalled NEEDS_REDESIGN.", fix_attempt)
+                    return DevOrchestratorResult(
+                        task_id=self.task_id,
+                        status="REVERT_TO_DESIGN",
+                        batches_completed=len(batches),
+                        total_batches=len(batches),
+                        component_results=all_results,
+                        files_changed=sorted(all_files),
+                        prompt_tokens=total_prompt,
+                        completion_tokens=total_completion,
+                        error_detail=f"Test-fix loop signalled redesign needed: {test_output[:500]}",
+                    )
+
                 test_passed, test_output = await self._run_full_tests()
                 if test_passed:
                     logger.info(
@@ -312,7 +339,7 @@ class DevOrchestrator:
                     )
                     research_result = await run_research(
                         question=research_question,
-                        context={"component": component_name, "step": self.step},
+                        context={"component": component_name, "step": step},
                         task_id=self.task_id,
                         llm_id=self.llm_id,
                         budget_id=self.budget_id,
@@ -354,22 +381,22 @@ class DevOrchestrator:
 
     async def _run_test_fix_loop(
         self, test_output: str, fix_attempt: int
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, bool]:
         """Agentic loop that reads failure output and makes targeted fixes.
 
-        Returns (prompt_tokens, completion_tokens) consumed during the loop.
+        Returns (prompt_tokens, completion_tokens, redesign_needed) consumed during the loop.
         Never raises — infrastructure errors are logged and the loop exits cleanly
         so the caller can re-run the test suite and decide whether to demote.
         """
         from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
-        from app.agent.tools import dispatch_tool, TOOL_SCHEMAS
+        from app.agent.tools import dispatch_tool, TOOL_SCHEMAS, build_tool_schemas
 
         _FIX_TOOLS = {
             "read_file", "count_lines",
             "search_files", "find_files", "list_directory",
             "write_file", "append_file",
         }
-        tool_schemas = [s for s in TOOL_SCHEMAS if s["function"]["name"] in _FIX_TOOLS]
+        tool_schemas = build_tool_schemas(list(_FIX_TOOLS) + ["submit_work"])
 
         system_prompt = (
             "You are a software developer. All implementation batches completed but the "
@@ -380,10 +407,11 @@ class DevOrchestrator:
             "2. Read the relevant source file(s) to understand the current state.\n"
             "3. Apply the smallest possible fix (e.g., wrong base case, missing import, "
             "off-by-one error, wrong return value).\n"
-            "4. When done, output exactly: FIX_APPLIED: <one-line summary of what you changed>.\n"
+            "4. When done, call the submit_work tool with signal='ACCEPTED'.\n"
             "5. If you determine the failure requires a design change beyond a code fix, "
-            "output: NEEDS_REDESIGN: <reason>.\n\n"
-            "Do NOT rewrite whole files. Target the specific failing assertion."
+            "call submit_work with signal='REVERT_TO_DESIGN'.\n\n"
+            "Do NOT rewrite whole files. Target the specific failing assertion.\n"
+            "No prose after calling submit_work."
         )
 
         messages: list[dict] = [
@@ -397,6 +425,7 @@ class DevOrchestrator:
 
         total_prompt = 0
         total_completion = 0
+        redesign_needed = False
 
         try:
             for turn in range(INDEV_TEST_FIX_MAX_TURNS):
@@ -408,6 +437,7 @@ class DevOrchestrator:
                     base_url=self.llm_base_url,
                     model=self.llm_model,
                     tools=tool_schemas,
+                    tool_choice="auto",
                     task_id=self.task_id,
                     llm_id=self.llm_id,
                     budget_id=self.budget_id,
@@ -424,36 +454,45 @@ class DevOrchestrator:
 
                 messages.append(msg)
 
-                if "FIX_APPLIED:" in content or "NEEDS_REDESIGN:" in content:
-                    logger.info(
-                        "[dev_orch] test-fix-%d turn %d: %s",
-                        fix_attempt, turn + 1, content[:120],
-                    )
-                    break
-
                 if tool_calls:
+                    terminal_found = False
                     for tc in tool_calls:
                         fn_name = tc["function"]["name"]
                         fn_args_raw = tc["function"]["arguments"]
                         fn_args = fn_args_raw if isinstance(fn_args_raw, dict) else json.loads(fn_args_raw)
                         try:
-                            result_str = str(dispatch_tool(fn_name, fn_args))[:4000]
+                            result_str = str(dispatch_tool(fn_name, fn_args))
+                            if "__maestro_terminal__" in result_str:
+                                terminal_found = True
+                                data = json.loads(result_str)
+                                if data.get("signal") == "REVERT_TO_DESIGN":
+                                    redesign_needed = True
                         except Exception as exc:
                             result_str = f"Error: {exc}"
+
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tc["id"],
-                            "content": result_str,
+                            "content": result_str[:4000],
                         })
+
+                    if terminal_found:
+                        break
                 elif not content:
                     break  # empty response — stop gracefully
+                else:
+                    # Nudge if no tool calls
+                    messages.append({
+                        "role": "user",
+                        "content": "[SYSTEM] You must call submit_work when your fix is applied or if a redesign is needed."
+                    })
 
         except ShutdownError:
             logger.info("[dev_orch] test-fix-%d interrupted by shutdown.", fix_attempt)
         except Exception as exc:
             logger.warning("[dev_orch] test-fix-%d loop error: %s", fix_attempt, exc)
 
-        return total_prompt, total_completion
+        return total_prompt, total_completion, redesign_needed
 
     def _store_component_result(
         self, result: ComponentLoopResult, batch_number: int, step_order: int,

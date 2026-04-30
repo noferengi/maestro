@@ -92,7 +92,7 @@ _last_test_output: contextvars.ContextVar[str] = contextvars.ContextVar(
 # A path being present (even with an empty interval list) means read_file()
 # has been called on it at least once.
 #
-# Maximum lines served per call - shared by both read_file and read_file_harder.
+# Maximum lines served per call - shared by read_file.
 _READ_FILE_MAX_LINES = 250
 
 _prepped_files: contextvars.ContextVar[dict[str, list[tuple[int, int]]] | None] = (
@@ -287,6 +287,16 @@ def _assert_safe_path(path: str) -> str:
                     f"Refusing to read outside project root {effective_root}; "
                     "use a relative path instead."
                 )
+
+        # RC4: Strict Isolation. If a task-specific root is set, we MUST NOT write 
+        # (or read if restricted) outside of it.
+        if effective_root != PROJECT_ROOT:
+            root_real = os.path.realpath(effective_root)
+            if not (resolved.startswith(root_real + os.sep) or resolved == root_real):
+                raise ValueError(
+                    f"Strict Isolation violation: refusing to touch path '{path}' "
+                    f"outside of task-specific root '{effective_root}'."
+                )
     else:
         resolved = os.path.realpath(os.path.join(effective_root, path))
 
@@ -474,15 +484,19 @@ def _is_binary_path(abs_path: str) -> bool:
 # File tools
 # ---------------------------------------------------------------------------
 
-def read_file(path: str) -> str:
-    """Read a file's structure: classes, functions, imports, and line ranges.
+def read_file(
+    path: str,
+    start: int | None = None,
+    end: int | None = None,
+    count: int | None = None,
+) -> str:
+    """Read up to 250 source-code lines per call, never repeating lines already in context.
 
-    Returns a structural summary instead of raw content on the first call.
-    Subsequent calls serve the next 250 unserved source lines.
-    Use read_file_harder() to read a specific line range.
+    Omit start/end/count to get the next 250 unserved lines from line 1 forward.
+    Provide start (+ optionally end or count) to target a specific range - only the
+    unserved portion of that range is returned, capped at 250 lines.
 
-    Note: async_dispatch_tool handles the LLM-summary path automatically.
-    This sync fallback always returns the structural summary only on first call.
+    If read_file() has not been called first, it is called automatically (auto-prep).
     """
     safe_path = _assert_safe_path(path)
     if not os.path.isfile(safe_path):
@@ -493,21 +507,73 @@ def read_file(path: str) -> str:
             "Binary files (databases, compiled bytecode, archives) must be inspected with "
             "appropriate non-text tools."
         )
+
+    # Auto-prep: show structural summary first if not yet done
+    if not _is_file_prepped(safe_path):
+        return _read_file_first_call(safe_path)
+
     norm = os.path.normpath(os.path.realpath(safe_path))
-    from app.agent.project_snapshot import _count_file_lines, build_file_summary
-    # Subsequent call - serve next unserved source lines
-    if norm in _get_prepped_files():
-        total = _count_file_lines(safe_path)
+    from app.agent.project_snapshot import _count_file_lines
+    total = _count_file_lines(safe_path)
+
+    # Validate: end and count are mutually exclusive
+    if end is not None and count is not None:
+        return "ERROR: provide 'end' OR 'count', not both."
+
+    if start is None:
+        # Default: first <=250 unserved lines
         unserved = _next_unserved_range(norm, 1, total)
         if unserved is None:
             rel = os.path.relpath(safe_path, PROJECT_ROOT)
             return (
                 f"ALREADY IN CONTEXT: all lines of '{rel}' have been served "
                 f"(ranges: {_served_ranges_str(norm)}). "
-                f"Call read_file_harder('{rel}', start=N) for a specific range."
+                f"Call read_file('{rel}', start=N) to re-read a specific range."
             )
-        return _serve_file_lines(safe_path, unserved[0], unserved[1])
-    # First call - structural summary
+        req_start, req_end = unserved
+    else:
+        req_start = start
+        if count is not None:
+            req_end = start + count - 1
+        elif end is not None:
+            req_end = end
+        else:
+            # start only: serve up to 250 lines from that start
+            req_end = start + _READ_FILE_MAX_LINES - 1
+
+    # Clamp to actual file bounds
+    req_start = max(1, min(req_start, total))
+    req_end = max(req_start, min(req_end, total))
+    # Capped at 250 lines per call
+    if req_end - req_start >= _READ_FILE_MAX_LINES:
+        req_end = req_start + _READ_FILE_MAX_LINES - 1
+
+    # Check if this exact range is already served
+    already_served = False
+    served_intervals = _get_prepped_files().get(norm, [])
+    for s, e in served_intervals:
+        if s <= req_start and e >= req_end:
+            already_served = True
+            break
+
+    result = _serve_file_lines(safe_path, req_start, req_end)
+    if already_served:
+        header = (
+            f"(NOTE: lines {req_start}-{req_end} were already in context; "
+            f"repeating per request)\n"
+        )
+        return header + result
+
+    return result
+
+
+def _read_file_first_call(safe_path: str) -> str:
+    """Handle the first call to read_file for a given path (auto-prep).
+
+    Returns a structural summary for large files, or raw content for tiny files.
+    """
+    norm = os.path.normpath(os.path.realpath(safe_path))
+    from app.agent.project_snapshot import _count_file_lines, build_file_summary
     _mark_file_prepped(safe_path)
     if _count_file_lines(safe_path) <= 25:
         result = _inline_small_file(safe_path)
@@ -735,82 +801,6 @@ def find_in_files(
 
     raw = "\n".join(results) if results else "No matches found."
     return _slice_output(raw, head=head, tail=tail, grep=grep)
-
-
-
-
-def read_file_harder(
-    path: str,
-    start: int | None = None,
-    end: int | None = None,
-    count: int | None = None,
-) -> str:
-    """Read up to 250 source-code lines per call, never repeating lines already in context.
-
-    Omit start/end/count to get the next 250 unserved lines from line 1 forward.
-    Provide start (+ optionally end or count) to target a specific range - only the
-    unserved portion of that range is returned, capped at 250 lines.
-
-    If read_file() has not been called first, it is called automatically.
-    """
-    safe_path = _assert_safe_path(path)
-    if not os.path.isfile(safe_path):
-        return f"ERROR: '{path}' is not a file or does not exist."
-    if _is_binary_path(safe_path):
-        return f"ERROR: '{path}' is a binary file and cannot be read as text."
-
-    # Auto-prep: show structural summary first if not yet done
-    if not _is_file_prepped(safe_path):
-        return read_file(path)
-
-    norm = os.path.normpath(os.path.realpath(safe_path))
-    from app.agent.project_snapshot import _count_file_lines
-    total = _count_file_lines(safe_path)
-
-    # Resolve requested range
-    if end is not None and count is not None:
-        return "ERROR: provide 'end' OR 'count', not both."
-    if start is None:
-        # Default: first ≤250 unserved lines
-        unserved = _next_unserved_range(norm, 1, total)
-        if unserved is None:
-            rel = os.path.relpath(safe_path, PROJECT_ROOT)
-            return (
-                f"ALREADY IN CONTEXT: all lines of '{rel}' have been served. "
-                f"Call read_file_harder('{rel}', start=N) to re-read a specific range."
-            )
-        req_start, req_end = unserved
-    else:
-        req_start = start
-        if count is not None:
-            req_end = start + count - 1
-        elif end is not None:
-            req_end = end
-        else:
-            req_end = start + _READ_FILE_MAX_LINES - 1
-    
-    # Clamp to actual file bounds
-    req_start = max(1, min(req_start, total))
-    req_end = max(req_start, min(req_end, total))
-
-    # Capped at 250 lines per call
-    if req_end - req_start >= _READ_FILE_MAX_LINES:
-        req_end = req_start + _READ_FILE_MAX_LINES - 1
-
-    # Check if this exact range is already served
-    already_served = False
-    served_intervals = _get_prepped_files().get(norm, [])
-    for s, e in served_intervals:
-        if s <= req_start and e >= req_end:
-            already_served = True
-            break
-    
-    result = _serve_file_lines(safe_path, req_start, req_end)
-    if already_served:
-        header = f"(NOTE: lines {req_start}-{req_end} were already in context; repeating per request)\n"
-        return header + result
-    
-    return result
 
 
 def read_file_metadata(path: str) -> str:
@@ -1444,7 +1434,7 @@ def web_search(query: str, count: int = 5) -> str:
         # DB stores naive UTC, convert to timezone-aware UTC for comparison
         if last_search.tzinfo is None:
             last_search = last_search.replace(tzinfo=timezone.utc)
-        
+
         now = datetime.now(timezone.utc)
         diff = now - last_search
         limit_minutes = 30
@@ -1500,7 +1490,7 @@ def web_search(query: str, count: int = 5) -> str:
 def _ddg_search(query: str, count: int) -> list[dict]:
     """Internal helper: execute search via duckduckgo_search library."""
     from duckduckgo_search import DDGS
-    
+
     results = []
     # DDGS.text() is the standard search method in duckduckgo_search 6.x/7.x
     with DDGS() as ddgs:
@@ -1537,7 +1527,7 @@ def _tavily_search(query: str, count: int, api_key: str) -> list[dict]:
     from tavily import TavilyClient
     client = TavilyClient(api_key=api_key)
     response = client.search(query=query, max_results=min(count, 15))
-    
+
     results = []
     for r in response.get("results", []):
         results.append({
@@ -1842,7 +1832,7 @@ def list_scope_summaries(project: str | None = None, scope_type: str | None = No
         scopes = db_list_scopes(p_name, scope_type=scope_type)
         if not scopes:
             return f"No scope summaries found for project '{p_name}'."
-        
+
         results = []
         for s in scopes:
             results.append({
@@ -2368,13 +2358,50 @@ def read_test_summary() -> str:
 
 
 # ---------------------------------------------------------------------------
+# submit_work — terminal signal tool
+# ---------------------------------------------------------------------------
+# When the LLM calls submit_work, the result contains a __maestro_terminal__
+# marker that MaestroLoop / ComponentLoop detect to exit the agent loop.
+# This is the PREFERRED way for agents to signal completion — not raw JSON
+# text blocks.
+#
+# Signal types:
+#   ACCEPTED              — work complete, verified (loop exits)
+#   REVERT_TO_DESIGN      — design flaw, cannot proceed (loop exits)
+#   RESOLUTION_STALLED    — PIP resolution exhausted (loop exits, treated as REVERT_TO_DESIGN)
+#   CORRECTION_STALLED    — planning correction exhausted (loop exits, treated as REVERT_TO_DESIGN)
+#   VERDICT_REJECTED      — review gate rejected, needs work (loop exits)
+#   VERDICT_NEEDS_WORK    — review found issues, not yet rejected (loop exits)
+#
+# Payload fields (all optional, agents include what's relevant):
+#   votes           — {"verdicts": [...], "threshold": N, "votes_for": N, "votes_against": N}
+#   verdict         — {"verdict": str, "confidence": N, "justification": str}
+#   review_results  — list of review agent results
+#   files_changed   — list of file paths modified
+#   tests_passed    — bool
+#   git_branch      — branch name
+#   reason          — one-sentence root cause (for REVERT/STALLED signals)
+#   advice          — what a re-attempt should do differently
+#   summary         — one-paragraph description of what was done
+
+def submit_work(signal: str, summary: str, payload: dict | None = None) -> str:
+    """[RUN] Call this when you are done. Exits the agent loop."""
+    import json as _json
+    return _json.dumps({
+        "__maestro_terminal__": True,
+        "signal": signal,
+        "summary": summary,
+        "payload": payload or {},
+    })
+
+
+# ---------------------------------------------------------------------------
 # Tool registry + schemas
 # ---------------------------------------------------------------------------
 
 TOOL_REGISTRY: dict[str, Any] = {
     # File read tools
     "read_file": read_file,
-    "read_file_harder": read_file_harder,
     "read_file_metadata": read_file_metadata,
     "read_last_output": read_last_output,
     # File write tools
@@ -2457,6 +2484,8 @@ TOOL_REGISTRY: dict[str, Any] = {
     "get_directory_summary": get_directory_summary,
     "get_module_summary": get_module_summary,
     "list_scope_summaries": list_scope_summaries,
+    # Terminal signal tool
+    "submit_work": submit_work,
 }
 
 TOOL_SCHEMAS: list[dict] = [
@@ -2469,38 +2498,19 @@ TOOL_SCHEMAS: list[dict] = [
                 "[READ] First call: returns a natural-language summary (LLM-generated, cached) plus "
                 "structural analysis: classes, functions, imports, and line ranges. "
                 "For tiny files (<= 25 lines) embeds raw content directly. "
-                "Each subsequent call on the same file serves the next 250 unserved source lines - "
+                "Each subsequent call serves the next 250 unserved source lines - "
                 "never repeating lines already in context. "
-                "Call repeatedly to page through a file, or use read_file_harder() for a specific range. "
+                "Omit start/end/count to get the next 250 unserved lines. "
+                "Provide start (+ optionally end or count) to target a specific range. "
                 "No state change."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Path to the file (relative to project root or absolute)."},
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file_harder",
-            "description": (
-                "[READ] Read up to 250 source-code lines per call, never repeating lines already in context. "
-                "Omit start/end/count to get the next 250 unserved lines from line 1 forward. "
-                "Provide start (+ optionally end or count) to target a specific range - only the "
-                "unserved portion of that range is returned. "
-                "If read_file() has not been called first, it is called automatically. No state change."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Path to the file (relative to project root or absolute)."},
-                    "start": {"type": "integer", "description": "Starting line number (1-indexed). Omit to continue from last served line."},
-                    "end": {"type": "integer", "description": "Ending line number (inclusive). Provide this OR count, not both."},
-                    "count": {"type": "integer", "description": "Number of lines from start. Provide this OR end, not both."},
+                    "start": {"type": "integer", "description": "Starting line number (1-indexed). Use with end or count, or alone to serve 250 lines from that point."},
+                    "end": {"type": "integer", "description": "Ending line number (1-indexed, inclusive). Mutually exclusive with count."},
+                    "count": {"type": "integer", "description": "Number of lines to read starting from start. Mutually exclusive with end."},
                 },
                 "required": ["path"],
             },
@@ -3580,6 +3590,61 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    # ---------------------------------------------------------------------------
+    # Terminal signal tool
+    # ---------------------------------------------------------------------------
+    {
+        "type": "function",
+        "function": {
+            "name": "submit_work",
+            "description": (
+                "[RUN] Call this tool when you are done with your work. "
+                "This is the ONLY correct way to signal completion — do NOT output "
+                "raw JSON blocks with a 'signal' key in your text response. "
+                "Use this tool call instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "signal": {
+                        "type": "string",
+                        "enum": [
+                            "ACCEPTED",
+                            "REVERT_TO_DESIGN",
+                            "RESOLUTION_STALLED",
+                            "CORRECTION_STALLED",
+                            "VERDICT_REJECTED",
+                            "VERDICT_NEEDS_WORK",
+                            "SURVEY_COMPLETE",
+                            "RESEARCH_COMPLETE",
+                            "SUBDIVISION_COMPLETE",
+                            "INTAKE_COMPLETE",
+                            "DESIGN_COMPLETE",
+                            "REVIEW_COMPLETE",
+                        ],
+                        "description": (
+                            "'ACCEPTED' — work complete and verified. "
+                            "'REVERT_TO_DESIGN' — design flaw, cannot proceed. "
+                            "'RESOLUTION_STALLED' — PIP resolution exhausted. "
+                            "'CORRECTION_STALLED' — planning correction exhausted. "
+                            "'VERDICT_REJECTED' — review gate rejected. "
+                            "'VERDICT_NEEDS_WORK' — review found issues. "
+                            "'REVIEW_COMPLETE' — reviewer verdict ready."
+                        ),
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "One-paragraph description of what was done or why reverting.",
+                    },
+                    "payload": {
+                        "type": "object",
+                        "description": "Optional structured results dict.",
+                    },
+                },
+                "required": ["signal", "summary"],
+            },
+        },
+    },
 ]
 
 
@@ -3589,13 +3654,13 @@ TOOL_SCHEMAS: list[dict] = [
 
 CORRECTION_AGENT_TOOLS: list[str] = [
     "read_file",
-    "read_file_harder",
     "find_in_files",
     "find_files",
     "read_list_dir",
     "get_task",
     "list_tasks",
     "write_plan_fields",
+    "submit_work",
 ]
 
 
@@ -3658,6 +3723,9 @@ async def async_dispatch_tool(
     """
     if name == "read_file":
         path = arguments.get("path", "")
+        start = arguments.get("start")
+        end = arguments.get("end")
+        count = arguments.get("count")
         safe_path = _assert_safe_path(path)
         if not os.path.isfile(safe_path):
             return f"ERROR: '{path}' is not a file or does not exist."
@@ -3676,37 +3744,30 @@ async def async_dispatch_tool(
 
         norm_path = os.path.normpath(os.path.realpath(safe_path))
         from app.agent.project_snapshot import _count_file_lines, async_build_file_summary
-        # Subsequent call - serve the next unserved 250-line chunk
-        if norm_path in _get_prepped_files():
-            total = _count_file_lines(safe_path)
-            unserved = _next_unserved_range(norm_path, 1, total)
-            if unserved is None:
-                rel = os.path.relpath(safe_path, PROJECT_ROOT)
-                return (
-                    f"ALREADY IN CONTEXT: all lines of '{rel}' have been served "
-                    f"(ranges: {_served_ranges_str(norm_path)}). "
-                    f"Call read_file_harder('{rel}', start=N) for a specific range."
-                )
-            return _serve_file_lines(safe_path, unserved[0], unserved[1])
-        # First call - LLM-enriched structural summary
-        _mark_file_prepped(safe_path)
-        if _count_file_lines(safe_path) <= 25:
-            result = _inline_small_file(safe_path)
-            try:
-                with open(safe_path, "r", encoding="utf-8", errors="replace") as fh:
-                    lc = sum(1 for _ in fh)
-                _record_served_range(norm_path, 1, lc)
-            except OSError:
-                pass
-            return result
-        result = await async_build_file_summary(
-            safe_path,
-            summary_length="brief",
-            task_id=task_id,
-            llm_id=llm_id,
-            budget_id=budget_id,
-        )
-        return _cap_tool_result("read_file", result)
+
+        if norm_path not in _get_prepped_files():
+            # First call - LLM-enriched structural summary
+            _mark_file_prepped(safe_path)
+            if _count_file_lines(safe_path) <= 25:
+                result = _inline_small_file(safe_path)
+                try:
+                    with open(safe_path, "r", encoding="utf-8", errors="replace") as fh:
+                        lc = sum(1 for _ in fh)
+                    _record_served_range(norm_path, 1, lc)
+                except OSError:
+                    pass
+                return result
+            result = await async_build_file_summary(
+                safe_path,
+                summary_length="brief",
+                task_id=task_id,
+                llm_id=llm_id,
+                budget_id=budget_id,
+            )
+            return _cap_tool_result("read_file", result)
+
+        # Subsequent call - delegate to read_file() which handles ranges
+        return read_file(path, start=start, end=end, count=count)
 
     if name in ("write_file", "append_file"):
         # Capture old summary BEFORE the write (file still has old content)

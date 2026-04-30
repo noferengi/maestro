@@ -374,12 +374,7 @@ async def _stream_llm_response(
         ) as response:
             if not response.is_success:
                 await response.aread()
-                snippet = response.text[:500] if response.text else "(empty body)"
-                logger.warning(
-                    "LLM stream to %s returned %d\nPayload:\n%s\nResponse: %s",
-                    url, response.status_code,
-                    _describe_payload(payload), snippet,
-                )
+                # Propagate silently — call_llm logs with agent name and retry context.
                 response.raise_for_status()
 
             lines_aiter = response.aiter_lines()
@@ -659,7 +654,7 @@ def _describe_payload(payload: dict) -> str:
         tool_calls = msg.get("tool_calls") or []
 
         tc_str = f" (tool_calls={len(tool_calls)})" if tool_calls else ""
-        
+
         if isinstance(content, str):
             flags: list[str] = []
             null_count = content.count("\x00")
@@ -685,6 +680,19 @@ def _describe_payload(payload: dict) -> str:
             lines.append(f"  [{i}] {role:<12} {tc_str or '(no content)'}")
 
     return "\n".join(lines)
+
+
+def _is_model_not_found(body: str) -> bool:
+    """Return True when a 400 response indicates the requested model is not loaded."""
+    b = body.lower()
+    return "not found" in b and "model" in b
+
+
+def _extract_model_name_from_error(body: str) -> str | None:
+    """Extract the model name from a 'model X not found' error body."""
+    import re as _re
+    m = _re.search(r"model '([^']+)' not found", body, _re.IGNORECASE)
+    return m.group(1) if m else None
 
 
 async def call_llm(
@@ -1223,13 +1231,52 @@ async def call_llm(
                     ) from exc
                 _retry_wait = wait + random.uniform(0, wait * 0.5)
             else:
-                # 4xx: genuine request error - propagate immediately.
-                logger.error(
-                    "%s LLM call to %s returned %d.\nPayload:\n%s\nResponse: %s",
-                    _agent_label, url, exc.response.status_code,
-                    _describe_payload(payload), exc.response.text[:300],
-                )
-                raise
+                body_text = exc.response.text or ""
+                if exc.response.status_code == 400 and _is_model_not_found(body_text):
+                    # Router misconfiguration: the model name in the DB doesn't match
+                    # what the LLM server has loaded.  This is an infra problem, not a
+                    # bad request — treat identically to ConnectError: cooperative backoff,
+                    # retry until the router recovers.  Never make an orchestration
+                    # decision (NEEDS_RESEARCH, pass/fail) based on this failure.
+                    _model_str = _extract_model_name_from_error(body_text) or resolved_model
+                    with _ep_lock:
+                        st = _endpoint_states.setdefault(resolved_url, _EndpointState())
+                        st.fail_count_connect += 1
+                        attempt = st.fail_count_connect
+                        if attempt <= _BACKOFF_FREE_TRIES:
+                            wait = _BACKOFF_BASE_DELAY
+                        else:
+                            wait = st.delay
+                            st.next_allowed = time.monotonic() + wait
+                            st.delay = min(st.delay * 2.0, _BACKOFF_MAX_DELAY)
+                    if attempt == 1:
+                        logger.warning(
+                            "%s LLM router error: model '%s' not found at %s — "
+                            "check LLM router configuration (will keep retrying).",
+                            _agent_label, _model_str, resolved_url,
+                        )
+                    elif attempt % 5 == 0:
+                        logger.warning(
+                            "%s Model '%s' still not found at %s (attempt %d), "
+                            "backing off %.0fs.",
+                            _agent_label, _model_str, resolved_url, attempt, wait,
+                        )
+                    _total_retry_count += 1
+                    if max_retries is not None and _total_retry_count >= max_retries:
+                        raise RuntimeError(
+                            f"LLM endpoint {resolved_url}: model '{_model_str}' not found "
+                            f"after {_total_retry_count} attempt(s) — "
+                            f"check router configuration."
+                        ) from exc
+                    _retry_wait = wait + random.uniform(0, wait * 0.5)
+                else:
+                    # Genuine 4xx: bad request (bad prompt format, invalid parameters).
+                    logger.error(
+                        "%s LLM call to %s returned %d.\nPayload:\n%s\nResponse: %s",
+                        _agent_label, url, exc.response.status_code,
+                        _describe_payload(payload), body_text[:300],
+                    )
+                    raise
 
         except httpx.ReadTimeout as exc:
             # Server alive but too slow to respond within the timeout window.

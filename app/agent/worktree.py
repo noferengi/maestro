@@ -201,13 +201,13 @@ def setup_task_worktree(task_id: str, project_path: str) -> str | None:
                 if line.startswith("worktree ") and os.path.normpath(line[len("worktree "):].strip()) == norm_wt_dir:
                     is_registered = True
                     break
-            
+
             if is_registered:
                 logger.info("[worktree] reusing existing registered worktree for task '%s'", task_id)
                 with _worktrees_lock:
                     _active_worktrees[task_id] = worktree_dir
                 return worktree_dir
-        
+
         # If exists but not registered, or registration check failed, try to clean it up
         logger.warning("[worktree] directory '%s' exists but is not registered; attempting removal", worktree_dir)
         import shutil
@@ -233,6 +233,24 @@ def setup_task_worktree(task_id: str, project_path: str) -> str | None:
             ["git", "worktree", "add", "-b", branch_name, worktree_dir, base],
             project_path,
         )
+
+    if rc != 0:
+        # Check if failure is due to branch being checked out elsewhere (likely the main project_path)
+        if "already checked out" in err:
+            logger.info("[worktree] branch '%s' already checked out; attempting to liberate from main repo", branch_name)
+            base = _resolve_base_branch(project_path)
+            if base:
+                # Force checkout the base branch in the main project path to free up the task branch
+                rc_lib, _, err_lib = _run(["git", "checkout", base], project_path)
+                if rc_lib == 0:
+                    logger.info("[worktree] liberated '%s' by switching main repo to '%s'", branch_name, base)
+                    # Retry worktree add
+                    if _branch_exists(project_path, branch_name):
+                        rc, _, err = _run(["git", "worktree", "add", worktree_dir, branch_name], project_path)
+                    else:
+                        rc, _, err = _run(["git", "worktree", "add", "-b", branch_name, worktree_dir, base], project_path)
+                else:
+                    logger.warning("[worktree] failed to liberate '%s': %s", branch_name, err_lib)
 
     if rc != 0:
         logger.error("[worktree] worktree add failed for '%s': %s", task_id, err)

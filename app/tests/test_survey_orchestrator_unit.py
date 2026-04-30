@@ -20,7 +20,7 @@ def test_compute_content_hash(so):
     h2 = so._compute_content_hash(["hash2", "hash1"])
     assert h1 == h2
     assert len(h1) == 40
-    
+
     h3 = so._compute_content_hash(["hash1"])
     assert h1 != h3
 
@@ -42,7 +42,7 @@ def test_ensure_project_surveyed_enqueues_jobs(so, tmp_path):
     """Verify that it enqueues jobs for missing summaries."""
     project_name = "TestProject"
     project_root = str(tmp_path)
-    
+
     # Create some files
     (tmp_path / "app").mkdir()
     (tmp_path / "app" / "main.py").write_text("print('hello')")
@@ -54,10 +54,10 @@ def test_ensure_project_surveyed_enqueues_jobs(so, tmp_path):
     with patch("app.agent.survey_orchestrator.get_scope_summary", return_value=None), \
          patch("app.agent.survey_orchestrator.enqueue_scope_survey_job") as mock_enqueue, \
          patch("app.agent.project_snapshot.prewarm_project_summaries") as mock_prewarm:
-        
+
         mock_prewarm.return_value = 2
         status = so.ensure_project_surveyed(project_name, project_root, llm_id=1, budget_id=1)
-        
+
         assert status["status"] == "initiated"
         assert status["files_prewarmed"] == 2
         # Should have enqueued jobs for:

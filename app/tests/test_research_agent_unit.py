@@ -70,6 +70,28 @@ def _verdict_json(verdict="LIKELY", confidence=95, findings="found it"):
     return f"```json\n{json.dumps(payload)}\n```"
 
 
+def _submit_work_resp(verdict="LIKELY", confidence=95, findings="found it",
+                      prompt_tokens=10, completion_tokens=5):
+    """Build an LLM response that calls submit_work with the given verdict payload."""
+    args = json.dumps({
+        "signal": "RESEARCH_COMPLETE",
+        "summary": findings,
+        "payload": {
+            "verdict": verdict,
+            "confidence": confidence,
+            "justification": "test justification",
+            "findings": findings,
+        },
+    })
+    tool_calls = [{
+        "id": "tc_submit",
+        "type": "function",
+        "function": {"name": "submit_work", "arguments": args},
+    }]
+    return _llm_resp("", tool_calls=tool_calls,
+                     prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+
+
 def _sequential_llm(*responses):
     """Return an async callable that yields responses in sequence (last repeats)."""
     idx = [0]
@@ -114,52 +136,6 @@ class TestBuildRestrictedSchemas:
         schemas = _build_restricted_schemas()
         names = {s["function"]["name"] for s in schemas}
         assert "run_shell" not in names
-
-
-# ===========================================================================
-# ResearchAgent._extract_vote
-# ===========================================================================
-
-class TestExtractVote:
-    def setup_method(self):
-        self.agent = ResearchAgent(question="test?", context={}, llm_id=1, budget_id=1)
-
-    def test_valid_verdict_json_returned(self):
-        result = self.agent._extract_vote(_verdict_json("LIKELY", 95))
-        assert result is not None
-        assert result["verdict"] == "LIKELY"
-        assert result["confidence"] == 95
-
-    def test_no_json_block_returns_none(self):
-        result = self.agent._extract_vote("I need to look at more files.")
-        assert result is None
-
-    def test_json_missing_verdict_key_returns_none(self):
-        content = '```json\n{"confidence": 80, "justification": "ok"}\n```'
-        result = self.agent._extract_vote(content)
-        assert result is None
-
-    def test_json_missing_confidence_key_returns_none(self):
-        content = '```json\n{"verdict": "LIKELY", "justification": "ok"}\n```'
-        result = self.agent._extract_vote(content)
-        assert result is None
-
-    def test_malformed_json_returns_none(self):
-        content = "```json\n{not valid json here}\n```"
-        result = self.agent._extract_vote(content)
-        assert result is None
-
-    def test_rejected_verdict_extracted(self):
-        result = self.agent._extract_vote(_verdict_json("REJECTED", 10))
-        assert result["verdict"] == "REJECTED"
-
-    def test_needs_research_verdict_extracted(self):
-        result = self.agent._extract_vote(_verdict_json("NEEDS_RESEARCH", 70))
-        assert result["verdict"] == "NEEDS_RESEARCH"
-
-    def test_not_suitable_verdict_extracted(self):
-        result = self.agent._extract_vote(_verdict_json("NOT_SUITABLE", 55))
-        assert result["verdict"] == "NOT_SUITABLE"
 
 
 # ===========================================================================
@@ -276,7 +252,7 @@ class TestHandleToolCalls:
 
 class TestResearchAgentRun:
     def test_immediate_verdict_terminates_on_life_1(self):
-        """When the LLM returns a verdict JSON on the first turn, run() returns immediately."""
+        """When the LLM calls submit_work on the first turn, run() returns immediately."""
         agent = ResearchAgent(
             question="feasible?",
             context={"task": "add logging"},
@@ -284,7 +260,7 @@ class TestResearchAgentRun:
             llm_id=1,
             budget_id=1,
         )
-        response = _llm_resp(_verdict_json("LIKELY", 95))
+        response = _submit_work_resp("LIKELY", 95)
         with patch("app.agent.research.call_llm", _sequential_llm(response)):
             result = _run(agent.run())
 
@@ -358,8 +334,8 @@ class TestResearchAgentRun:
             llm_id=1,
             budget_id=1,
         )
-        needs_research = _llm_resp(_verdict_json("NEEDS_RESEARCH", 70))
-        likely = _llm_resp(_verdict_json("LIKELY", 93))
+        needs_research = _submit_work_resp("NEEDS_RESEARCH", 70)
+        likely = _submit_work_resp("LIKELY", 93)
         with patch("app.agent.research.call_llm", _sequential_llm(needs_research, likely)):
             result = _run(agent.run())
 
@@ -375,7 +351,7 @@ class TestResearchAgentRun:
             llm_id=1,
             budget_id=1,
         )
-        rejected = _llm_resp(_verdict_json("REJECTED", 15))
+        rejected = _submit_work_resp("REJECTED", 15)
         with patch("app.agent.research.call_llm", _sequential_llm(rejected)):
             result = _run(agent.run())
 
@@ -391,7 +367,7 @@ class TestResearchAgentRun:
             llm_id=1,
             budget_id=1,
         )
-        response = _llm_resp(_verdict_json("LIKELY", 92), prompt_tokens=50, completion_tokens=25)
+        response = _submit_work_resp("LIKELY", 92, prompt_tokens=50, completion_tokens=25)
         with patch("app.agent.research.call_llm", _sequential_llm(response)):
             result = _run(agent.run())
 
@@ -425,7 +401,7 @@ class TestResearchAgentRun:
             call_count[0] += 1
             if call_count[0] == 1:
                 raise ConnectionError("LLM unreachable")
-            return _llm_resp(_verdict_json("POSSIBLE", 80))
+            return _submit_work_resp("POSSIBLE", 80)
 
         agent = ResearchAgent(
             question="q?",
@@ -677,7 +653,7 @@ class TestPostMortem:
                       "WHAT I AM SATISFIED WITH: file structure\n"
                       "WHAT I AM UNSATISFIED WITH: auth flow unclear\n"
                       "WHAT THE NEXT INVESTIGATOR SHOULD FOCUS ON: app/auth.py"),  # post-mortem
-            _llm_resp(_verdict_json("POSSIBLE", 80)),  # life 2, turn 1 - verdict
+            _submit_work_resp("POSSIBLE", 80),  # life 2, turn 1 - verdict
         ]
 
         async def mock_llm(*args, **kwargs):
@@ -713,7 +689,7 @@ class TestPostMortem:
         responses = [
             _llm_resp("Looking around."),       # life1 turn1
             _llm_resp(summary_text),             # life1 post-mortem
-            _llm_resp(_verdict_json("LIKELY", 93)),  # life2 turn1
+            _submit_work_resp("LIKELY", 93),    # life2 turn1
         ]
         idx = [0]
 
@@ -747,7 +723,7 @@ class TestPostMortem:
             if call_count[0] == 2:  # post-mortem call
                 raise ConnectionError("LLM unreachable")
             if call_count[0] == 3:
-                return _llm_resp(_verdict_json("POSSIBLE", 80))
+                return _submit_work_resp("POSSIBLE", 80)
             return _llm_resp("investigating...")
 
         agent = ResearchAgent(
@@ -771,7 +747,7 @@ class TestPostMortem:
 
         async def mock_llm(*args, **kwargs):
             call_count[0] += 1
-            return _llm_resp(_verdict_json("LIKELY", 95))
+            return _submit_work_resp("LIKELY", 95)
 
         agent = ResearchAgent(
             question="q?",
@@ -897,7 +873,7 @@ class TestContextOverflow:
             call_count[0] += 1
             if call_count[0] == 1:
                 raise Exception("Connection timeout")
-            return _llm_resp(_verdict_json("POSSIBLE", 80))
+            return _submit_work_resp("POSSIBLE", 80)
 
         agent = ResearchAgent(
             question="q?",
@@ -994,8 +970,8 @@ class TestContextSaturation:
         responses = [
             # Turn 1: high saturation but below terminate threshold, no verdict/tools
             _llm_resp("Still investigating.", prompt_tokens=76_000),
-            # Turn 2: render verdict
-            _llm_resp(_verdict_json("POSSIBLE", 80), prompt_tokens=10),
+            # Turn 2: render verdict via submit_work
+            _submit_work_resp("POSSIBLE", 80, prompt_tokens=10),
         ]
 
         async def mock_llm(*args, **kwargs):
@@ -1024,7 +1000,7 @@ class TestContextSaturation:
         responses = [
             _llm_resp("Investigating.", prompt_tokens=76_000),   # fires 75% warning
             _llm_resp("Still going.", prompt_tokens=76_000),     # 75% already warned
-            _llm_resp(_verdict_json("LIKELY", 93), prompt_tokens=10),
+            _submit_work_resp("LIKELY", 93, prompt_tokens=10),
         ]
 
         async def mock_llm(*args, **kwargs):
@@ -1062,8 +1038,8 @@ class TestContextSaturation:
             _llm_resp("Still investigating.", prompt_tokens=96_000),
             # Life 1 post-mortem call
             _llm_resp("WHAT I INVESTIGATED: nothing\nWHAT I FOUND: little"),
-            # Life 2, turn 1: render verdict
-            _llm_resp(_verdict_json("POSSIBLE", 80), prompt_tokens=10),
+            # Life 2, turn 1: render verdict via submit_work
+            _submit_work_resp("POSSIBLE", 80, prompt_tokens=10),
         ]
 
         async def mock_llm(*args, **kwargs):
@@ -1098,7 +1074,7 @@ class TestContextSaturation:
             if call_count[0] == 1:
                 # Very high token count - would terminate if saturation were enabled
                 return _llm_resp("Still investigating.", prompt_tokens=999_999)
-            return _llm_resp(_verdict_json("LIKELY", 93), prompt_tokens=10)
+            return _submit_work_resp("LIKELY", 93, prompt_tokens=10)
 
         agent = ResearchAgent(
             question="q?",

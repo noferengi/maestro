@@ -78,7 +78,7 @@ function buildCtxBar(entryId) {
             const pp = fullEntries[i].prompt_cost || 0;
             const prevPp = i > 0 ? (fullEntries[i - 1].prompt_cost || 0) : 0;
             setupDelta += (pp - prevPp);
-            
+
             const msgs = Array.isArray(fullEntries[i].prompt_data) ? fullEntries[i].prompt_data : [];
             const prevMsgs = i > 0 ? (Array.isArray(fullEntries[i-1].prompt_data) ? fullEntries[i-1].prompt_data : []) : [];
             const newMsgs = msgs.slice(prevMsgs.length);
@@ -101,7 +101,7 @@ function buildCtxBar(entryId) {
             // Conceptual Segment 0 — highlightable as a single block
             const isSelectedInSetup = idx < firstToolIdx;
             const cur = isSelectedInSetup ? ' ctx-seg-current' : '';
-            
+
             segHtml += `<div class="ctx-seg ${cur} ctx-seg-merged-setup" ` +
                        `style="flex-grow:${gTotal}; display:flex" ` +
                        `data-fe-idx="0" data-merged-end="${firstToolIdx - 1}">` +

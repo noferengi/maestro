@@ -139,48 +139,42 @@ def test_count_pending_research_jobs(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# MaestroLoop signal extraction
+# MaestroLoop terminal signal detection (via _dispatch_tools)
+# _extract_signal was removed; terminal detection is now fully in AgentLoop._dispatch_tools.
+# See test_submit_work_terminal.py for comprehensive coverage.
 # ---------------------------------------------------------------------------
 
-def test_extract_signal_accepts_needs_research():
-    """_extract_signal must recognise the NEEDS_RESEARCH signal."""
-    import sys
-    sys.path.insert(0, str(os.path.join(os.path.dirname(__file__), "..", "..")))
-
+def test_terminal_signal_set_by_dispatch_tools():
+    """_dispatch_tools must set _terminal_signal when submit_work returns __maestro_terminal__."""
+    import asyncio
+    import unittest.mock as mock
     from app.agent.loop import MaestroLoop
+
     loop = MaestroLoop.__new__(MaestroLoop)
     loop.task_id = "task-x"
+    loop.llm_id = None
+    loop.budget_id = None
+    loop.llm_base_url = "http://localhost:8008/v1"
+    loop.llm_model = "test"
+    loop._git_branch = None
+    loop._files_changed = []
+    loop._terminal_signal = None
 
-    content = json.dumps({
-        "signal": "NEEDS_RESEARCH",
-        "task_id": "task-x",
-        "question": "How does X work?",
-        "context": "Some context",
+    terminal_json = json.dumps({
+        "__maestro_terminal__": True,
+        "signal": "ACCEPTED",
+        "summary": "done",
+        "payload": {},
     })
-    parsed = loop._extract_signal(content)
-    assert parsed is not None
-    assert parsed["signal"] == "NEEDS_RESEARCH"
+    tool_calls = [{
+        "id": "tc1",
+        "function": {"name": "submit_work", "arguments": json.dumps({"signal": "ACCEPTED", "summary": "done"})},
+    }]
+    with mock.patch("app.agent.agent_loop.async_dispatch_tool", return_value=terminal_json):
+        asyncio.run(loop._dispatch_tools(tool_calls))
 
-
-def test_extract_signal_accepts_accepted():
-    from app.agent.loop import MaestroLoop
-    loop = MaestroLoop.__new__(MaestroLoop)
-    loop.task_id = "task-x"
-
-    content = json.dumps({"signal": "ACCEPTED", "task_id": "task-x", "summary": "done"})
-    parsed = loop._extract_signal(content)
-    assert parsed is not None
-    assert parsed["signal"] == "ACCEPTED"
-
-
-def test_extract_signal_ignores_unknown():
-    from app.agent.loop import MaestroLoop
-    loop = MaestroLoop.__new__(MaestroLoop)
-    loop.task_id = "task-x"
-
-    content = json.dumps({"signal": "UNKNOWN_SIGNAL", "task_id": "task-x"})
-    parsed = loop._extract_signal(content)
-    assert parsed is None
+    assert loop._terminal_signal is not None
+    assert loop._terminal_signal["signal"] == "ACCEPTED"
 
 
 # ---------------------------------------------------------------------------

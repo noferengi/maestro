@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from app.agent.llm_client import is_shutting_down, ShutdownError
+
 logger = logging.getLogger(__name__)
 AGENT_NAME = "Dreamer"
 
@@ -399,6 +401,7 @@ class DreamerAgent:
         """
         from app.agent.llm_client import call_llm, extract_text_response
         from app.agent.config import DREAMER_DECIDE_MAX_TOKENS
+        from app.agent.tools import build_tool_schemas, dispatch_tool
 
         rf = research_findings or {}
 
@@ -436,16 +439,16 @@ class DreamerAgent:
             "You are the Dreamer — an autonomous project resurrection agent.\n"
             "Your job is to analyse stalled and failed tasks in a software project "
             "and propose concrete actions to unblock them.\n\n"
-            "Output a single JSON object with exactly these fields:\n"
-            "  tasks_to_resurrect  — list of objects; each has:\n"
-            "      task_id (string), new_title (string), new_description (string, concrete),\n"
-            "      reentry_stage (one of: idea | planning | indev)\n"
-            "  tasks_to_research   — list of task_id strings whose failure root-cause\n"
-            "      needs deeper investigation before retrying\n"
-            "  new_cards           — list of objects: {title, description, rationale}\n\n"
+            "To submit your plan, call the submit_work tool with:\n"
+            "payload={\n"
+            "  \"tasks_to_resurrect\": [{\"task_id\": \"...\", \"new_title\": \"...\", \"new_description\": \"...\", \"reentry_stage\": \"idea|planning|indev\"}],\n"
+            "  \"tasks_to_research\": [\"task_id\", ...],\n"
+            "  \"new_cards\": [{\"title\": \"...\", \"description\": \"...\", \"rationale\": \"...\"}]\n"
+            "}\n\n"
             "Limits: max 5 resurrections, max 3 new_cards.\n"
             "new_description must be focused and concrete — not a copy of the original."
-            f"{research_guidance}"
+            f"{research_guidance}\n"
+            "No prose after calling submit_work."
         )
 
         user_msg = (
@@ -454,8 +457,10 @@ class DreamerAgent:
             f"{arch_block}\n"
             "Stalled / failed tasks:\n\n"
             f"{failed_block}\n"
-            "Generate the DreamerPlan JSON now."
+            "Generate the DreamerPlan now."
         )
+
+        tool_schemas = build_tool_schemas(["submit_work"])
 
         try:
             response = await call_llm(
@@ -469,17 +474,36 @@ class DreamerAgent:
                 budget_id=self.budget_id,
                 max_tokens=DREAMER_DECIDE_MAX_TOKENS,
                 agent_name="Dreamer",
-                response_format={"type": "json_object"},
+                tools=tool_schemas,
+                tool_choice="auto",
             )
-            raw = extract_text_response(response)
+
+            assistant_msg = response.get("choices", [{}])[0].get("message", {})
+            tool_calls = assistant_msg.get("tool_calls") or []
+
+            data = None
+            if tool_calls:
+                for tc in tool_calls:
+                    tc_result = dispatch_tool(
+                        tc["function"]["name"],
+                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                    )
+                    if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
+                        data = json.loads(tc_result).get("payload")
+                        break
+
+            if data is None:
+                raw = assistant_msg.get("content", "{}")
+                from app.agent.json_utils import extract_json_block as _ejb
+                candidate = _ejb(raw) if raw.strip() else None
+                if candidate:
+                    data = json.loads(candidate)
+                elif raw.strip():
+                    data, _ = json.JSONDecoder().raw_decode(raw.lstrip())
+                else:
+                    data = {}
         except Exception as exc:
             logger.warning("[Dreamer] LLM call failed: %s — using empty plan.", exc)
-            raw = "{}"
-
-        try:
-            data, _ = json.JSONDecoder().raw_decode(raw.lstrip()) if raw.strip() else ({}, 0)
-        except Exception:
-            logger.warning("[Dreamer] Plan JSON parse failed (raw=%d chars): %.400s", len(raw), raw)
             data = {}
 
         return DreamerPlan(
@@ -540,6 +564,8 @@ class DreamerAgent:
             "work that would be valuable, feasible, and not yet tracked.\n\n"
             "You have access to survey tools to explore the project's health and organization. "
             "Use them to understand the project before making your final proposal.\n\n"
+            "To submit your new cards, call the submit_work tool with:\n"
+            "payload={\"new_cards\": [{\"title\": \"...\", \"description\": \"...\", \"rationale\": \"...\"}]}\n\n"
             "Focus on:\n"
             "  1. Features or improvements clearly present in the codebase but untracked\n"
             "  2. Obvious gaps or natural next steps given the project's current state\n"
@@ -548,11 +574,7 @@ class DreamerAgent:
             "  - If the project is too sparse to determine intent, output new_cards: []\n"
             "  - new_cards descriptions must be concrete and actionable\n"
             "  - Max 3 cards\n\n"
-            "Output a single JSON object with exactly these fields:\n"
-            "  tasks_to_resurrect  — always []\n"
-            "  tasks_to_research   — always []\n"
-            "  new_cards           — list of {title, description, rationale}\n\n"
-            "Provide your final answer as a JSON block. No prose before or after the JSON."
+            "No prose after calling submit_work."
         )
 
         messages = [
@@ -560,7 +582,8 @@ class DreamerAgent:
             {"role": "user",   "content": f"Project: {self.project}\n{arch_block}{deleted_block}\nSurvey this project and propose up to 3 new idea cards."}
         ]
 
-        tool_schemas = build_tool_schemas(DREAMER_SURVEY_TOOLS)
+        # Include submit_work in survey tools
+        tool_schemas = build_tool_schemas(DREAMER_SURVEY_TOOLS + ["submit_work"])
 
         # Set context for tools
         _task_project_name.set(self.project)
@@ -568,10 +591,12 @@ class DreamerAgent:
 
         # Multi-turn loop (max 100 turns)
         max_turns = 100
-        raw = "{}"
         _turn_warned: set[int] = set()
 
         for turn in range(max_turns):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
+
             # Turn saturation check
             from app.agent.config import check_turn_saturation
             if check_turn_saturation(
@@ -590,52 +615,78 @@ class DreamerAgent:
                     max_tokens=DREAMER_DECIDE_MAX_TOKENS,
                     agent_name="Dreamer",
                     tools=tool_schemas,
+                    tool_choice="auto",
                 )
             except Exception as exc:
                 logger.warning("[Dreamer] Survey LLM call failed on turn %d: %s", turn, exc)
                 break
 
-            msg = response.get("message") or {}
+            msg = response.get("choices", [{}])[0].get("message", {})
             messages.append(msg)
 
-            if not msg.get("tool_calls"):
-                raw = msg.get("content") or "{}"
-                break
+            tool_calls = msg.get("tool_calls") or []
+            if tool_calls:
+                for tc in tool_calls:
+                    t_id = tc["id"]
+                    t_name = tc["function"]["name"]
+                    t_args = json.loads(tc["function"]["arguments"])
 
-            for tc in msg["tool_calls"]:
-                t_id = tc["id"]
-                t_name = tc["function"]["name"]
-                t_args = json.loads(tc["function"]["arguments"])
+                    result = await async_dispatch_tool(
+                        t_name, t_args,
+                        llm_id=self.llm_id, budget_id=self.budget_id,
+                        llm_base_url=self.llm_base_url, llm_model=self.llm_model
+                    )
+                    messages.append({"role": "tool", "tool_call_id": t_id, "name": t_name, "content": result})
 
-                result = await async_dispatch_tool(
-                    t_name, t_args,
-                    llm_id=self.llm_id, budget_id=self.budget_id,
-                    llm_base_url=self.llm_base_url, llm_model=self.llm_model
-                )
-                messages.append({"role": "tool", "tool_call_id": t_id, "name": t_name, "content": result})
+                    # Check for terminal signal from submit_work
+                    if isinstance(result, str) and "__maestro_terminal__" in result:
+                        try:
+                            data = json.loads(result)
+                            payload = data.get("payload", {})
+                            return DreamerPlan(
+                                tasks_to_resurrect=[],
+                                tasks_to_research=[],
+                                new_cards=payload.get("new_cards") or [],
+                            )
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                continue
 
-        try:
-            candidate = extract_json_block(raw) if raw.strip() else None
-            if candidate:
-                data = json.loads(candidate)
-            elif raw.strip():
-                # Try simple cleaning for stubborn LLMs
-                cleaned = raw.strip()
-                if cleaned.startswith("```"):
-                    cleaned = cleaned.split("\n", 1)[1].rsplit("\n", 1)[0]
-                data = json.loads(cleaned)
-            else:
-                data = {}
-        except Exception:
-            logger.warning(
-                "[Dreamer] Survey JSON parse failed (raw=%d chars): %.400s", len(raw), raw,
-            )
-            data = {}
+            # Fallback for content
+            raw = msg.get("content") or "{}"
+            try:
+                from app.agent.json_utils import extract_json_block as _ejb
+                candidate = _ejb(raw) if raw.strip() else None
+                if candidate:
+                    data = json.loads(candidate)
+                elif raw.strip():
+                    # Try simple cleaning for stubborn LLMs
+                    cleaned = raw.strip()
+                    if cleaned.startswith("```"):
+                        cleaned = cleaned.split("\n", 1)[1].rsplit("\n", 1)[0]
+                    data = json.loads(cleaned)
+                else:
+                    data = {}
+
+                if data and "new_cards" in data:
+                    return DreamerPlan(
+                        tasks_to_resurrect=[],
+                        tasks_to_research=[],
+                        new_cards=data.get("new_cards") or [],
+                    )
+            except Exception:
+                pass
+
+            # Nudge if no tool calls and no clear JSON in content
+            messages.append({
+                "role": "user",
+                "content": "[SYSTEM] You must call submit_work to output your discovered cards when ready."
+            })
 
         return DreamerPlan(
             tasks_to_resurrect=[],
             tasks_to_research=[],
-            new_cards=data.get("new_cards") or [],
+            new_cards=[],
         )
 
     # ------------------------------------------------------------------

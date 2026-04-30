@@ -174,32 +174,35 @@ Use `spawn_research_agent` when you need domain knowledge about unfamiliar techn
 7. Estimated scope should be "small" or "medium" - if you'd estimate "large",
    the sub-idea itself may need further decomposition.
 
-== OUTPUT FORMAT ==
-When you are ready, output ONLY this JSON object (no markdown fences, no extra text):
-
-{{
-  "sub_ideas": [
-    {{
-      "title": "Short descriptive title",
-      "description": "Full description of what this sub-idea entails",
-      "prerequisites": ["sub-0"],
-      "estimated_scope": "small" | "medium",
-      "rationale": "Why this is a coherent, independent unit of work",
-      "provides": [ {{ "name": "...", "type": "...", "description": "..." }} ],
-      "consumes": [ {{ "name": "...", "type": "...", "source": "sub-N" }} ]
-    }}
-  ],
-  "interface_contracts": [
-    {{
-      "component": "sub-0 title",
-      "provides": [ {{ "name": "...", "type": "..." }} ],
-      "consumes": [ {{ "name": "...", "type": "...", "source": "sub-N" }} ]
-    }}
-  ],
-  "decomposition_rationale": "Why you chose this particular decomposition strategy",
-  "coverage_check": "How the sub-ideas together cover the entire original task",
-  "confidence": 85
-}}
+== TERMINAL ACTION ==
+When you are ready, call the `submit_work` tool:
+```python
+submit_work(
+    signal="SUBDIVISION_COMPLETE",
+    summary="Decomposition summary and architectural rationale",
+    sub_ideas=[
+      {
+        "title": "Short descriptive title",
+        "description": "Full description of what this sub-idea entails",
+        "prerequisites": ["sub-0"],
+        "estimated_scope": "small" | "medium",
+        "rationale": "Why this is a coherent, independent unit of work",
+        "provides": [ { "name": "...", "type": "...", "description": "..." } ],
+        "consumes": [ { "name": "...", "type": "...", "source": "sub-N" } ]
+      }
+    ],
+    interface_contracts=[
+      {
+        "component": "sub-0 title",
+        "provides": [ { "name": "...", "type": "..." } ],
+        "consumes": [ { "name": "...", "type": "...", "source": "sub-N" } ]
+      }
+    ],
+    decomposition_rationale="Why you chose this particular decomposition strategy",
+    coverage_check="How the sub-ideas together cover the entire original task",
+    confidence=85
+)
+```
 
 == CONTEXT BUDGET ==
 Your total token budget is ~{token_budget} tokens ({budget_pct}% of {max_context}).
@@ -210,11 +213,12 @@ Plan tool calls efficiently.
 - Do NOT attempt to write or modify any files.
 - Focus on evidence from the actual code (if available) and sound architectural reasoning.
 - If you cannot confidently decompose the task, set confidence below 50 and explain why.
+- You MUST use `submit_work` to finish.
 """
 
 _CODEBASE_TOOLS_AVAILABLE = """\
 **Codebase tools** (project has existing source code):
-- `read_file`, `read_file_harder`, `count_lines`, `search_files`
+- `read_file`, `count_lines`, `search_files`
 - `git_status`, `git_diff`, `git_log`, `git_blame`, `git_show`
 Use these to understand the current code structure before deciding how to split the task."""
 
@@ -299,6 +303,7 @@ class SubdivisionAgent:
         self._total_prompt_tokens = 0
         self._total_completion_tokens = 0
         self._budget_exceeded = False
+        self._terminal_signal: dict | None = None
 
     async def run(self) -> SubdivisionResult:
         """Execute the subdivision agent and return decomposed sub-ideas."""
@@ -415,6 +420,13 @@ class SubdivisionAgent:
             if tool_calls and not self._budget_exceeded:
                 tool_results = await self._handle_tool_calls(tool_calls)
                 messages.extend(tool_results)
+
+                # Check for terminal signal from submit_work tool call
+                if self._terminal_signal is not None:
+                    # Treat the terminal signal payload as the raw output
+                    result = self._try_parse(json.dumps(self._terminal_signal))
+                    if result:
+                        return result
                 continue
 
             if tool_calls and self._budget_exceeded:
@@ -616,6 +628,19 @@ class SubdivisionAgent:
                     llm_base_url=self.llm_base_url,
                     llm_model=self.llm_model,
                 )
+
+            # Detect __maestro_terminal__ marker from submit_work
+            if name == "submit_work":
+                try:
+                    terminal_data = json.loads(str(result_content))
+                    if terminal_data.get("__maestro_terminal__") is True:
+                        logger.info(
+                            "Subdivision Agent: submit_work tool call — signal=%s",
+                            terminal_data.get("signal"),
+                        )
+                        self._terminal_signal = terminal_data
+                except (json.JSONDecodeError, ValueError):
+                    pass
 
             results.append({
                 "role": "tool",

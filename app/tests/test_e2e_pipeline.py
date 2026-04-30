@@ -80,34 +80,31 @@ def _mock_client_cls(mock_llm):
     return mock_cls
 
 
-def _sec_response_content(verdict: str, pt: int = 50, ct: int = 100) -> str:
-    """Build JSON string for a security reviewer LLM response."""
-    return json.dumps({
-        "verdict": verdict,
-        "confidence": 90 if verdict == "LIKELY" else 20,
-        "justification": "ok",
-        "findings": [],
-        "critical_count": 0,
-        "high_count": 0,
-    })
-
-
 def _make_security_mock_llm(*verdicts, pt=50, ct=100):
     """
-    Build a MockLLM with a fixed queue of security-formatted responses.
-    Each verdict string in *verdicts produces one queued response.
+    Build a MockLLM with a fixed queue of security-formatted submit_work tool-call responses.
+    Each verdict string produces one queued response via submit_work tool call.
     """
     from app.agent.mock_llm import MockLLM
 
-    ml = MockLLM(scenario="pass")  # bootstrap valid internal state
-    ml._response_queue = [
-        MockLLM._text_response(
-            _sec_response_content(v, pt=pt, ct=ct),
-            prompt_tokens=pt,
-            completion_tokens=ct,
+    def _sec_tc(verdict, prompt_tokens=pt, completion_tokens=ct):
+        payload = {
+            "verdict": verdict,
+            "confidence": 90 if verdict == "LIKELY" else 20,
+            "justification": "ok",
+            "findings": [],
+            "critical_count": 0,
+            "high_count": 0,
+        }
+        return MockLLM._tool_call_response(
+            "submit_work",
+            {"signal": "REVIEW_COMPLETE", "summary": f"sec: {verdict}", "payload": payload},
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
         )
-        for v in verdicts
-    ]
+
+    ml = MockLLM(scenario="pass")
+    ml._response_queue = [_sec_tc(v) for v in verdicts]
     ml._queue_index = 0
     return ml
 
@@ -379,35 +376,39 @@ _EMPTY_PLAN = {
 
 
 def _make_conceptual_mock_llm(*verdicts, pt=50, ct=100):
-    """Queue of conceptual reviewer LLM responses (one per verdict string)."""
+    """Queue of conceptual reviewer submit_work tool-call responses."""
     from app.agent.mock_llm import MockLLM
 
-    ml = MockLLM(scenario="pass")
-    ml._response_queue = [
-        MockLLM._text_response(
-            json.dumps({"verdict": v, "confidence": 90, "justification": "ok", "severity": "low"}),
+    def _cr_tc(verdict):
+        payload = {"verdict": verdict, "confidence": 90, "justification": "ok", "severity": "low"}
+        return MockLLM._tool_call_response(
+            "submit_work",
+            {"signal": "REVIEW_COMPLETE", "summary": f"cr: {verdict}", "payload": payload},
             prompt_tokens=pt,
             completion_tokens=ct,
         )
-        for v in verdicts
-    ]
+
+    ml = MockLLM(scenario="pass")
+    ml._response_queue = [_cr_tc(v) for v in verdicts]
     ml._queue_index = 0
     return ml
 
 
 def _make_full_review_mock_llm(*verdicts, pt=50, ct=100):
-    """Queue of full-review LLM responses (one per verdict string)."""
+    """Queue of full-review submit_work tool-call responses."""
     from app.agent.mock_llm import MockLLM
 
-    ml = MockLLM(scenario="pass")
-    ml._response_queue = [
-        MockLLM._text_response(
-            json.dumps({"verdict": v, "confidence": 90, "justification": "ok"}),
+    def _fr_tc(verdict):
+        payload = {"verdict": verdict, "confidence": 90, "justification": "ok"}
+        return MockLLM._tool_call_response(
+            "submit_work",
+            {"signal": "REVIEW_COMPLETE", "summary": f"fr: {verdict}", "payload": payload},
             prompt_tokens=pt,
             completion_tokens=ct,
         )
-        for v in verdicts
-    ]
+
+    ml = MockLLM(scenario="pass")
+    ml._response_queue = [_fr_tc(v) for v in verdicts]
     ml._queue_index = 0
     return ml
 
@@ -443,18 +444,20 @@ class TestConceptualReviewPipelineE2E:
         from app.agent.mock_llm import MockLLM
 
         ml = MockLLM(scenario="pass")
-        high_sev = json.dumps({
-            "verdict": "REJECTED",
-            "confidence": 20,
-            "justification": "critical issue",
-            "severity": "high",
-        })
-        ok = json.dumps({"verdict": "LIKELY", "confidence": 90, "justification": "ok", "severity": "low"})
+
+        def _tc(verdict, severity="low", confidence=90):
+            payload = {"verdict": verdict, "confidence": confidence,
+                       "justification": "ok", "severity": severity}
+            return MockLLM._tool_call_response(
+                "submit_work",
+                {"signal": "REVIEW_COMPLETE", "summary": f"cr: {verdict}", "payload": payload},
+            )
+
         ml._response_queue = [
-            MockLLM._text_response(high_sev),
-            MockLLM._text_response(ok),
-            MockLLM._text_response(ok),
-            MockLLM._text_response(ok),
+            _tc("REJECTED", severity="high", confidence=20),
+            _tc("LIKELY"),
+            _tc("LIKELY"),
+            _tc("LIKELY"),
         ]
         ml._queue_index = 0
         result = self._run_conceptual(ml)

@@ -24,26 +24,41 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 # ---------------------------------------------------------------------------
 
 
-def _llm_response(content_dict: dict, prompt_tokens: int = 50,
-                  completion_tokens: int = 100) -> dict:
-    return {
-        "choices": [{"message": {"content": json.dumps(content_dict)}}],
-        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
-        "model": "mock-model",
-    }
-
-
 def _sec_response(verdict: str, confidence: int = 90, justification: str = "ok",
-                  findings=None) -> dict:
+                  findings=None, prompt_tokens: int = 50,
+                  completion_tokens: int = 100) -> dict:
+    """Build a mock LLM response that calls submit_work with a security verdict."""
     findings = findings or []
-    return _llm_response({
+    payload = {
         "verdict": verdict,
         "confidence": confidence,
         "justification": justification,
         "findings": findings,
         "critical_count": sum(1 for f in findings if f.get("severity") == "critical"),
         "high_count": sum(1 for f in findings if f.get("severity") == "high"),
-    })
+    }
+    return {
+        "choices": [{
+            "message": {
+                "content": None,
+                "tool_calls": [{
+                    "id": "tc-sec",
+                    "type": "function",
+                    "function": {
+                        "name": "submit_work",
+                        "arguments": json.dumps({
+                            "signal": "REVIEW_COMPLETE",
+                            "summary": f"Security review: {verdict}",
+                            "payload": payload,
+                        }),
+                    },
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
+        "model": "mock-model",
+    }
 
 
 class _SequentialCallLLM:

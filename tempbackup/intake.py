@@ -44,6 +44,7 @@ from app.agent.config import (
 from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError, PipelineAbortedError
 from app.database import get_project_path
 from app.agent.verdicts import Verdict
+from app.agent.tools import build_tool_schemas, dispatch_tool
 
 logger = logging.getLogger(__name__)
 AGENT_NAME = "Intake Pipeline"
@@ -77,19 +78,20 @@ Analyze the task and determine:
 - Key areas of the codebase likely affected
 - Estimated effort category (trivial, minor, moderate, significant, major)
 
-Render your assessment by calling the `submit_work` tool.
-Use signal='INTAKE_COMPLETE' and provide the following in the tool arguments:
-- scope: 'small' | 'medium' | 'large' | 'epic'
-- complexity: <integer 1-10>
-- decomposition_needed: <boolean>
-- subtasks: [<string>, ...]
-- affected_areas: [<string>, ...]
-- effort: 'trivial' | 'minor' | 'moderate' | 'significant' | 'major'
-- verdict: {
+To complete your analysis, call the submit_work tool with:
+payload={
+  "scope": "small" | "medium" | "large" | "epic",
+  "complexity": <integer 1-10>,
+  "decomposition_needed": <boolean>,
+  "subtasks": [<string>, ...],
+  "affected_areas": [<string>, ...],
+  "effort": "trivial" | "minor" | "moderate" | "significant" | "major",
+  "vote": {
     "verdict": "POSSIBLE" | "LIKELY" | "NOT_SUITABLE" | "REJECTED" | "NEEDS_RESEARCH" | "SUBDIVIDE_IDEA",
     "confidence": <float 0.0-1.0>,
     "justification": "<one-paragraph explanation>"
   }
+}
 
 Verdict guidelines:
 - LIKELY: Task is well-defined, reasonable scope, clearly feasible.
@@ -97,9 +99,9 @@ Verdict guidelines:
 - NEEDS_RESEARCH: Task is too vague to assess - needs clarification before proceeding.
 - NOT_SUITABLE: Task is poorly scoped, too large without decomposition, or architecturally questionable.
 - REJECTED: Task is fundamentally unfeasible, contradictory, or harmful to the project.
-- SUBDIVIDE_IDEA: Task is fundamentally sound but too large to implement in a single context window. Should be decomposed into smaller pieces.
+- SUBDIVIDE_IDEA: Task is fundamentally sound but too large to implement in a single context window. Should be decomposed into smaller pieces. Only use when the task is good but genuinely too big - not vague (NEEDS_RESEARCH) or bad (REJECTED).
 
-You MUST use `submit_work` to finish.\
+No prose after calling submit_work.\
 """
 
 _FEASIBILITY_SYSTEM_PROMPT = """\
@@ -116,18 +118,19 @@ Your job is to assess:
 - What risks or edge cases should be considered.
 - Whether the codebase is in a state that can accommodate this change.
 
-Render your assessment by calling the `submit_work` tool.
-Use signal='INTAKE_COMPLETE' and provide the following in the tool arguments:
-- feasibility_rating: <float 0.0-1.0>
-- ambiguities: [<string>, ...]
-- external_dependencies: [<string>, ...]
-- risks: [<string>, ...]
-- codebase_readiness: 'ready' | 'needs_refactoring' | 'incompatible'
-- verdict: {
+To complete your analysis, call the submit_work tool with:
+payload={
+  "feasibility_rating": <float 0.0-1.0>,
+  "ambiguities": [<string>, ...],
+  "external_dependencies": [<string>, ...],
+  "risks": [<string>, ...],
+  "codebase_readiness": "ready" | "needs_refactoring" | "incompatible",
+  "vote": {
     "verdict": "POSSIBLE" | "LIKELY" | "NOT_SUITABLE" | "REJECTED" | "NEEDS_RESEARCH" | "SUBDIVIDE_IDEA",
     "confidence": <float 0.0-1.0>,
     "justification": "<one-paragraph explanation>"
   }
+}
 
 Verdict guidelines:
 - LIKELY: Codebase is ready, no major blockers, dependencies are available.
@@ -135,9 +138,9 @@ Verdict guidelines:
 - NEEDS_RESEARCH: Cannot determine feasibility - too many unknowns.
 - NOT_SUITABLE: Significant architectural incompatibilities or missing foundations.
 - REJECTED: Fundamentally impossible given the current system.
-- SUBDIVIDE_IDEA: Task is fundamentally sound but too large to implement in a single context window.
+- SUBDIVIDE_IDEA: Task is fundamentally sound but too large to implement in a single context window. Should be decomposed into smaller pieces. Only use when the task is good but genuinely too big - not vague (NEEDS_RESEARCH) or bad (REJECTED).
 
-You MUST use `submit_work` to finish.\
+No prose after calling submit_work.\
 """
 
 _CONFLICT_SYSTEM_PROMPT = """\
@@ -153,25 +156,26 @@ Your job is to detect:
 - Priority conflicts: tasks that should be done first as prerequisites.
 - Resource conflicts: tasks that compete for the same limited resources.
 
-Render your assessment by calling the `submit_work` tool.
-Use signal='INTAKE_COMPLETE' and provide the following in the tool arguments:
-- file_conflicts: [
+To complete your detection, call the submit_work tool with:
+payload={
+  "file_conflicts": [
     {"task_id": "<id>", "task_title": "<title>", "shared_files": [<string>, ...], "severity": "low" | "medium" | "high"}
-  ]
-- semantic_conflicts: [
+  ],
+  "semantic_conflicts": [
     {"task_id": "<id>", "task_title": "<title>", "overlap": "<description>", "severity": "low" | "medium" | "high"}
-  ]
-- priority_conflicts: [
+  ],
+  "priority_conflicts": [
     {"task_id": "<id>", "task_title": "<title>", "reason": "<why this should come first>"}
-  ]
-- resource_conflicts: [
+  ],
+  "resource_conflicts": [
     {"task_id": "<id>", "task_title": "<title>", "resource": "<what they compete for>"}
-  ]
-- verdict: {
+  ],
+  "vote": {
     "verdict": "POSSIBLE" | "LIKELY" | "NOT_SUITABLE" | "REJECTED" | "NEEDS_RESEARCH" | "SUBDIVIDE_IDEA",
     "confidence": <float 0.0-1.0>,
     "justification": "<one-paragraph explanation>"
   }
+}
 
 Verdict guidelines:
 - LIKELY: No significant conflicts detected; safe to proceed.
@@ -179,9 +183,9 @@ Verdict guidelines:
 - NEEDS_RESEARCH: Potential conflicts detected but need human review to resolve.
 - NOT_SUITABLE: High-severity conflicts that would cause integration problems.
 - REJECTED: Direct contradictions with active tasks that cannot be reconciled.
-- SUBDIVIDE_IDEA: Task is fundamentally sound but too large to implement in a single context window.
+- SUBDIVIDE_IDEA: Task is fundamentally sound but too large to implement in a single context window. Should be decomposed into smaller pieces. Only use when the task is good but genuinely too big - not vague (NEEDS_RESEARCH) or bad (REJECTED).
 
-You MUST use `submit_work` to finish.\
+No prose after calling submit_work.\
 """
 
 
@@ -444,22 +448,33 @@ class IntakePipeline:
 
     async def _call_llm(self, system_prompt: str, user_prompt: str) -> dict:
         """
-        Make a structured LLM call using submit_work tool and return results.
-        """
-        from app.agent.tools import TOOL_SCHEMAS
-        submit_work_schema = [s for s in TOOL_SCHEMAS if s["function"]["name"] == "submit_work"]
+        Make a structured LLM call via submit_work and return the parsed response.
 
+        Returns a dict with keys:
+          - content: parsed JSON object from the submit_work payload
+          - prompt_tokens: number of prompt tokens used
+          - completion_tokens: number of completion tokens used
+          - model: model identifier string
+
+        Raises httpx.HTTPStatusError on non-2xx responses.
+        Raises json.JSONDecodeError if the response is not valid JSON.
+        Raises httpx.TimeoutException on timeout.
+        """
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 
+        tool_schemas = build_tool_schemas(["submit_work"])
+
+        # Intake stages are single-call (no loop) for performance, but use tool-calling
+        # to signal completion.
         data = await call_llm(
             messages,
             base_url=self.llm_base_url,
             model=self.llm_model,
-            tools=submit_work_schema,
-            tool_choice={"type": "function", "function": {"name": "submit_work"}},
+            tools=tool_schemas,
+            tool_choice="auto",
             task_id=self.task_id,
             llm_id=self.llm_id,
             budget_id=self.budget_id,
@@ -468,23 +483,35 @@ class IntakePipeline:
 
         # Extract usage stats
         usage = data.get("usage", {})
-        msg = data["choices"][0]["message"]
-        tool_calls = msg.get("tool_calls", [])
+        assistant_msg = data.get("choices", [{}])[0].get("message", {})
+        tool_calls = assistant_msg.get("tool_calls") or []
 
-        parsed_content = {}
+        parsed_content = None
         if tool_calls:
-            tc = tool_calls[0]
+            for tc in tool_calls:
+                tc_result = dispatch_tool(
+                    tc["function"]["name"],
+                    json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                )
+                if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
+                    parsed_content = json.loads(tc_result).get("payload")
+                    break
+
+        if parsed_content is None:
+            # Fallback to content parsing if tool call was missed
+            raw_content = assistant_msg.get("content", "{}")
+            cleaned = raw_content.strip()
+            if cleaned.startswith("```"):
+                lines = cleaned.split("\n")
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].strip() == "```":
+                    lines = lines[:-1]
+                cleaned = "\n".join(lines)
             try:
-                args = tc.get("function", {}).get("arguments", "{}")
-                parsed_content = json.loads(args) if isinstance(args, str) else args
+                parsed_content, _ = json.JSONDecoder().raw_decode(cleaned.lstrip())
             except (json.JSONDecodeError, ValueError):
-                parsed_content = {"raw": str(msg), "parse_error": True}
-        else:
-            raw_content = msg.get("content", "")
-            try:
-                parsed_content, _ = json.JSONDecoder().raw_decode(raw_content.lstrip())
-            except (json.JSONDecodeError, ValueError):
-                parsed_content = {"raw": raw_content, "parse_error": True}
+                parsed_content = {}
 
         return {
             "content": parsed_content,
@@ -500,10 +527,13 @@ class IntakePipeline:
     def _extract_vote(self, stage: str, llm_result: dict) -> dict:
         """
         Extract and normalize a vote dict from an LLM response.
+
+        Ensures the vote has all required fields and that the verdict
+        is one of the valid values. Falls back to NEEDS_RESEARCH if
+        the LLM returned an unrecognized verdict.
         """
         content = llm_result["content"]
-        # In new submit_work standard, verdict is a top-level field in the tool call
-        raw_vote = content.get("verdict", {})
+        raw_vote = content.get("vote", {})
 
         verdict = raw_vote.get("verdict", VERDICT_NEEDS_RESEARCH)
         if verdict not in _VALID_VERDICTS:
@@ -516,9 +546,6 @@ class IntakePipeline:
         confidence = raw_vote.get("confidence", 0.5)
         if not isinstance(confidence, (int, float)):
             confidence = 0.5
-        # normalize to 0.0-1.0 if it came in as 0-100
-        if confidence > 1.0:
-            confidence = confidence / 100.0
         confidence = max(0.0, min(1.0, float(confidence)))
 
         return {

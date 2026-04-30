@@ -149,7 +149,7 @@ def delete_project(name: str) -> bool:
         project = db.query(Project).filter(Project.name == name).first()
         if not project:
             return False
-        
+
         # Cancel any background arch_gen jobs for this project
         from .models import ArchGenJob
         from datetime import datetime, timezone

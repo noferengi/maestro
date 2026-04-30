@@ -120,7 +120,7 @@ def get_file_summaries_for_project_root(project_root: str) -> "list[FileSummary]
 
 def delete_file_summary(sha1: str, filesize: int) -> int:
     """Delete a FileSummary row by sha1+filesize.
-    
+
     Returns the number of rows deleted (0 or 1).
     """
     db = SessionLocal()

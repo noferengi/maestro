@@ -917,7 +917,7 @@
                 }
                 const taskId = this.getAttribute('data-id');
                 const task = taskData[taskId];
-                
+
                 if (task && task.immutable) {
                     console.log(`Architecture task clicked (immutable): ${taskId}`);
                 } else if (task) {
@@ -931,7 +931,7 @@
         function openAddTaskModal(targetStatus) {
             currentTaskId = null;
             currentTargetStatus = targetStatus;
-            
+
             document.getElementById('modal-title').textContent = `Add Task: ${targetStatus.toUpperCase()}`;
             document.getElementById('task-title').value = '';
             document.getElementById('task-description').value = '';
@@ -944,7 +944,7 @@
         function showArchContentFields(targetStatus) {
                 const contentFields = document.getElementById('modal-content-fields');
                 const isArchitecture = targetStatus === 'architecture';
-    
+
                 if (isArchitecture) {
                     contentFields.style.display = 'block';
                     // Show fields based on project type
@@ -1016,7 +1016,7 @@
                         tests: document.getElementById('arch-content-tests').value
                     };
                 }
-                
+
                 console.log(`Task updated: ${currentTaskId}`);
             } else if (currentTargetStatus) {
                 // Check WIP limit before creating new task
@@ -1133,7 +1133,7 @@
 
         function moveTask(taskId, newStatus) {
             const task = taskData[taskId];
-            
+
             if (!task || task.immutable) {
                 console.log('Cannot move immutable architecture task');
                 return;

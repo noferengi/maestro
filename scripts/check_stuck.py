@@ -38,7 +38,7 @@ def check_stuck_jobs():
     print("\n--- LLM Session Counts (if possible to infer) ---")
     # This is in-memory in the scheduler, so we can't see it directly from DB 
     # unless we look at what's currently active in the task list and assume it matches.
-    
+
     conn.close()
 
 if __name__ == "__main__":

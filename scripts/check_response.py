@@ -35,7 +35,7 @@ for entry in entries:
     print(f"\n[{entry_id}] {created_at}")
     print(f"  Prompt length: {len(prompt_data) if prompt_data else 0}")
     print(f"  Response length: {len(response_data) if response_data else 0}")
-    
+
     # Try to parse JSON
     if response_data:
         try:

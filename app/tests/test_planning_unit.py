@@ -322,7 +322,7 @@ class TestRunPlanningGate:
         src_dir = tmp_path / "src"
         src_dir.mkdir()
         (src_dir / "existing.py").write_text("class Existing: pass")
-        
+
         planning_result = {
             "interface_contracts": [
                 {
@@ -332,12 +332,12 @@ class TestRunPlanningGate:
                 }
             ]
         }
-        
+
         # Test direct _check_interface_completeness
         # Use str(tmp_path) as project_path
         gate = PlanningGate("test", planning_result, [], project_path=str(tmp_path))
         check = gate._check_interface_completeness()
-        
+
         assert check.passed
         assert "Filtered" in check.detail or "all consumes resolved" in check.detail
 

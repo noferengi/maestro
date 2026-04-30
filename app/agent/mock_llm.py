@@ -91,7 +91,7 @@ _SCOPE_RESPONSE_PASS = {
     "subtasks": [],
     "affected_areas": ["app/agent/", "app/web/"],
     "effort": "moderate",
-    "vote": {
+    "verdict": {
         "verdict": "LIKELY",
         "confidence": 0.92,
         "justification": "Task is well-defined with clear scope.",
@@ -105,7 +105,7 @@ _SCOPE_RESPONSE_REJECTED = {
     "subtasks": ["too", "many", "things"],
     "affected_areas": ["everything"],
     "effort": "major",
-    "vote": {
+    "verdict": {
         "verdict": "REJECTED",
         "confidence": 0.15,
         "justification": "Task is fundamentally unfeasible.",
@@ -119,7 +119,7 @@ _SCOPE_RESPONSE_NEEDS_RESEARCH = {
     "subtasks": [],
     "affected_areas": ["unknown"],
     "effort": "significant",
-    "vote": {
+    "verdict": {
         "verdict": "NEEDS_RESEARCH",
         "confidence": 0.65,
         "justification": "Cannot determine scope without more investigation.",
@@ -132,7 +132,7 @@ _FEASIBILITY_RESPONSE_PASS = {
     "external_dependencies": [],
     "risks": ["minor test coverage gap"],
     "codebase_readiness": "ready",
-    "vote": {
+    "verdict": {
         "verdict": "POSSIBLE",
         "confidence": 0.80,
         "justification": "Codebase is ready, minor risks exist.",
@@ -144,7 +144,7 @@ _CONFLICT_RESPONSE_PASS = {
     "semantic_conflicts": [],
     "priority_conflicts": [],
     "resource_conflicts": [],
-    "vote": {
+    "verdict": {
         "verdict": "LIKELY",
         "confidence": 0.95,
         "justification": "No conflicts detected with existing tasks.",
@@ -159,7 +159,7 @@ _CONFLICT_RESPONSE_NOT_SUITABLE = {
     "semantic_conflicts": [],
     "priority_conflicts": [],
     "resource_conflicts": [],
-    "vote": {
+    "verdict": {
         "verdict": "NOT_SUITABLE",
         "confidence": 0.55,
         "justification": "High-severity file conflict with existing task.",
@@ -277,12 +277,12 @@ class MockLLM:
             # Need: Scope=LIKELY, Conflict=NOT_SUITABLE, Static=NOT_SUITABLE, Feasibility=POSSIBLE
             # That's 2 pass vs 2 fail -> tie
             scope_likely = dict(_SCOPE_RESPONSE_PASS)
-            scope_likely["vote"] = {"verdict": "LIKELY", "confidence": 0.93, "justification": "Looks good."}
+            scope_likely["verdict"] = {"verdict": "LIKELY", "confidence": 0.93, "justification": "Looks good."}
 
             conflict_ns = dict(_CONFLICT_RESPONSE_NOT_SUITABLE)
 
             feas_possible = dict(_FEASIBILITY_RESPONSE_PASS)
-            feas_possible["vote"] = {"verdict": "POSSIBLE", "confidence": 0.80, "justification": "Feasible."}
+            feas_possible["verdict"] = {"verdict": "POSSIBLE", "confidence": 0.80, "justification": "Feasible."}
 
             return [
                 self._text_response(json.dumps(scope_likely)),

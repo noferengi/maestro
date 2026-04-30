@@ -22,7 +22,7 @@ async function loadProjects() {
             opt.textContent = p.name;
             sel.appendChild(opt);
         });
-        
+
         // Auto-select if in URL
         const urlParams = new URLSearchParams(window.location.search);
         const p = urlParams.get('project');
@@ -38,18 +38,18 @@ async function loadProjects() {
 
 async function loadScopes() {
     if (!currentProject) return;
-    
+
     const tree = document.getElementById("scope-tree");
     tree.innerHTML = '<div class="loading">Loading scopes...</div>';
-    
+
     try {
         const r = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/scope-summaries?scope_type=${currentView === 'directory' ? 'directory' : 'module'}`);
         allScopes = await r.json();
-        
+
         // Also fetch project-level
         const r2 = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/scope-summaries?scope_type=project`);
         const projects = await r2.json();
-        
+
         renderTree(projects.concat(allScopes));
     } catch (e) {
         tree.innerHTML = `<div class="error">Error: ${e.message}</div>`;
@@ -59,7 +59,7 @@ async function loadScopes() {
 function renderTree(scopes) {
     const tree = document.getElementById("scope-tree");
     tree.innerHTML = "";
-    
+
     if (scopes.length === 0) {
         tree.innerHTML = '<div class="empty-state">No summaries found. Run a survey.</div>';
         return;
@@ -70,16 +70,16 @@ function renderTree(scopes) {
         item.className = "tree-item";
         item.dataset.type = s.scope_type;
         item.dataset.key = s.scope_key;
-        
+
         const label = document.createElement("span");
         label.className = "item-label";
         const icon = s.scope_type === 'project' ? '🏗️' : (s.scope_type === 'directory' ? '📁' : '📦');
         label.textContent = `${icon} ${s.scope_key}`;
-        
+
         const freshness = document.createElement("span");
         freshness.className = `freshness-badge ${s.staleness_state}`;
         freshness.textContent = s.staleness_state === 'fresh' ? '✓' : '○';
-        
+
         item.appendChild(label);
         item.appendChild(freshness);
         item.onclick = () => selectScope(s);
@@ -94,7 +94,7 @@ async function selectScope(scope) {
 
     const detail = document.getElementById("summary-detail");
     detail.innerHTML = '<div class="loading">Loading detail...</div>';
-    
+
     try {
         // Re-fetch fresh detail to be sure
         const r = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/scope-summaries/${scope.scope_type}/${encodeURIComponent(scope.scope_key)}`);
@@ -119,7 +119,7 @@ function renderDetail(s) {
                 <span>Last Updated: ${new Date(s.updated_at).toLocaleString()}</span>
             </div>
         </div>
-        
+
         <div class="summary-section">
             <h3>Health & Purpose</h3>
             <div class="summary-text">${s.summary.replace(/\n/g, '<br>')}</div>

@@ -43,7 +43,7 @@ Follow this exact sequence for every task:
       skip directory listing calls (list_directory(".") etc.).
     • Call get_task(task_id) to load the full task definition.
     • Read ARCHITECTURE.md and the nearest AGENTS.md to understand context.
-    • Use read_file() to inspect file structures, then read_file_harder() for
+    • Use read_file() to inspect file structures, then read_file() again for
       specific source sections you need.
     • Summarise your understanding in a brief internal note (not prose output -
       just a tool call to append_task_history with "ORIENT: <summary>").
@@ -56,8 +56,8 @@ Follow this exact sequence for every task:
 
   STEP 3 - IMPLEMENT
     • Execute the plan step by step.
-    • Always call read_file() to see a file's structure, then read_file_harder()
-      to read the specific sections you need before overwriting.
+    • Always call read_file() to see a file's structure, then read_file()
+      again to read the specific sections you need before overwriting.
     • Write one logical change at a time; commit after each coherent unit.
     • Branch naming: git_create_branch("{GIT_SAFETY_BRANCH_PREFIX}<task_id>").
 
@@ -128,14 +128,11 @@ S7. NEVER call tools that are not in your registered tool list.  Do not
   1. Stop all implementation work immediately.
   2. Call append_task_history(task_id, "FAILURE: <root cause summary>").
   3. Call update_task_status(task_id, "REJECTED").
-  4. Emit this exact JSON as your FINAL response (nothing else):
+  4. Call the submit_work tool to signal revert:
 
-     {{ 
-       "signal": "{SIGNAL_REVERT}",
-       "task_id": "<task_id>",
-       "reason": "<one sentence root cause>",
-       "advice": "<what a re-attempt should do differently>"
-     }} 
+     submit_work(signal="REVERT_TO_DESIGN", summary="<root cause>",
+                 reason="<one sentence root cause>",
+                 advice="<what a re-attempt should do differently>")
 
 • If a design flaw (not an implementation bug) is preventing progress,
   trigger the revert immediately without exhausting retries.  A design flaw
@@ -146,34 +143,43 @@ S7. NEVER call tools that are not in your registered tool list.  Do not
 ═══════════════════════════════════════════════════════════
  6. OUTPUT FORMAT - TERMINAL ACTIONS
 ═══════════════════════════════════════════════════════════
-Your final action must ALWAYS be one of the two JSON structures below.
+Your final action must ALWAYS be a call to the `submit_work` tool.
 Never end your turn with free-form prose as the terminal action.
 
-  A) TASK ACCEPTED:
-     {{ 
-       "signal": "{SIGNAL_ACCEPTED}",
-       "task_id": "<task_id>",
-       "summary": "<one-paragraph description of what was implemented>",
-       "files_changed": ["<path1>", "<path2>"],
-       "tests_passed": true,
-       "git_branch": "{GIT_SAFETY_BRANCH_PREFIX}<task_id>"
-     }} 
+  A) TASK ACCEPTED — call submit_work with:
+     submit_work(signal="ACCEPTED", summary="<one-paragraph description of what was implemented>",
+                 files_changed=["<path1>", "<path2>"], tests_passed=true,
+                 git_branch="{GIT_SAFETY_BRANCH_PREFIX}<task_id>")
 
-  B) TASK REVERTED (design flaw / exhausted retries):
-     {{ 
-       "signal": "{SIGNAL_REVERT}",
-       "task_id": "<task_id>",
-       "reason": "<root cause>",
-       "advice": "<guidance for re-attempt>"
-     }} 
+  B) TASK REVERTED (design flaw / exhausted retries) — call submit_work with:
+     submit_work(signal="REVERT_TO_DESIGN", summary="<root cause>",
+                 reason="<root cause>", advice="<guidance for re-attempt>")
 
-  C) NEEDS RESEARCH (non-terminal - loop continues after research):
-     {{ 
+  C) PIP RESOLUTION EXHAUSTED — call submit_work with:
+     submit_work(signal="RESOLUTION_STALLED", summary="<why resolution failed>",
+                 reason="<root cause>", advice="<what a re-attempt should try>")
+
+  D) PLANNING CORRECTION EXHAUSTED — call submit_work with:
+     submit_work(signal="CORRECTION_STALLED", summary="<why correction failed>",
+                 reason="<root cause>", advice="<what a re-attempt should try>")
+
+  E) REVIEW REJECTED — call submit_work with:
+     submit_work(signal="VERDICT_REJECTED", summary="<what failed review>",
+                 review_results=[{{"verdict": "...", "justification": "..."}}])
+
+  F) REVIEW NEEDS MORE WORK — call submit_work with:
+     submit_work(signal="VERDICT_NEEDS_WORK", summary="<issues found>",
+                 review_results=[{{"verdict": "...", "justification": "..."}}])
+
+  G) NEEDS RESEARCH (non-terminal — loop continues after research) — output
+     this JSON in text content (not via submit_work):
+
+     {{
        "signal": "NEEDS_RESEARCH",
        "task_id": "<task_id>",
        "question": "<specific investigation question>",
        "context": "<relevant context for the researcher>"
-     }} 
+     }}
      Use when you encounter an unknown that blocks progress.  A read-only
      research agent will investigate the question and return findings.  You
      will then continue with those findings injected into the conversation.
@@ -181,7 +187,7 @@ Never end your turn with free-form prose as the terminal action.
      existing tools - only use it when domain knowledge is genuinely missing.
 
 Tool calls are NOT terminal actions.  You may make as many tool calls as
-needed before emitting the terminal JSON.
+needed before emitting the terminal signal.
 
 ═══════════════════════════════════════════════════════════
  7. CONTEXT WINDOW DISCIPLINE

@@ -59,7 +59,7 @@ def _is_primitive_or_stdlib(item: str, project_path: str | None = None) -> bool:
     """
     import os
     low = item.lower().strip()
-    
+
     # Noise words that suggest it's a reference to an existing entity
     if low.endswith(" type") or low.endswith(" module") or low.endswith(" class") or low.endswith(" dataclass") or low.endswith(" enum") or low.endswith(" exception"):
         # Strip the suffix and check if the base exists or is a primitive
@@ -73,7 +73,7 @@ def _is_primitive_or_stdlib(item: str, project_path: str | None = None) -> bool:
         first = low.split(" for ")[0].strip()
         if first in _PYTHON_BUILTINS or first in _KOTLIN_BUILTINS:
             return True
-    
+
     # Check if it's an existing file in the project
     if project_path and os.path.isdir(project_path):
         # item might be a path (src/models.py) or a dotted module (src.models)
@@ -81,7 +81,7 @@ def _is_primitive_or_stdlib(item: str, project_path: str | None = None) -> bool:
         candidate_path = os.path.join(project_path, item)
         if os.path.isfile(candidate_path):
             return True
-        
+
         # Try base (without "dataclass" etc)
         candidate_base = os.path.join(project_path, low)
         if os.path.isfile(candidate_base):
@@ -93,7 +93,7 @@ def _is_primitive_or_stdlib(item: str, project_path: str | None = None) -> bool:
             candidate_dotted = os.path.join(project_path, dotted_path)
             if os.path.isfile(candidate_dotted):
                 return True
-        
+
         # Heuristic: if it's a single word and we see it in the project (case-insensitive search)
         # this is expensive, so we only do it for small items
         if len(low) > 3 and " " not in low and "." not in low:
@@ -454,7 +454,7 @@ class PlanningGate:
                 filtered_stdlib.add(u)
             else:
                 still_unresolved.add(u)
-        
+
         if not still_unresolved:
             return GateCheck(
                 name="interface_completeness",
@@ -468,7 +468,7 @@ class PlanningGate:
         # e.g. "Plant dataclass" matches "Plant dataclass with __post_init__ validation"
         really_unresolved = set()
         fuzzy_resolved = set()
-        
+
         def normalize(s: str) -> str:
             # Lowercase, remove non-alphanumeric, strip noise
             import re
@@ -483,7 +483,7 @@ class PlanningGate:
             return s
 
         norm_provides = {normalize(p): p for p in all_provides}
-        
+
         for u in still_unresolved:
             nu = normalize(u)
             found = False
@@ -496,7 +496,7 @@ class PlanningGate:
                     if nu == np or (len(nu) > 3 and nu in np) or (len(np) > 3 and np in nu):
                         found = True
                         break
-            
+
             if found:
                 fuzzy_resolved.add(u)
             else:
@@ -525,7 +525,7 @@ class PlanningGate:
         """Ensure the plan has at least one implementation step, unless work is already done."""
         steps = self.plan.get("implementation_steps", [])
         rationale = self.plan.get("design_rationale", "").lower()
-        
+
         # Heuristics for "already complete"
         already_done_keywords = ["already exist", "already complete", "already implemented", "no new files needed", "no implementation changes"]
         is_already_done = any(k in rationale for k in already_done_keywords)
@@ -746,7 +746,7 @@ class PlanningGate:
         prompt = (
             "Review this implementation plan for feasibility. Is it still viable?\n\n"
             f"Plan summary:\n{json.dumps(self.plan, indent=1)[:4000]}\n\n"
-            "Output JSON: {\"feasible\": true/false, \"concerns\": [\"...\"]}"
+            "Respond with a JSON object: {\"feasible\": true/false, \"concerns\": [\"...\"]}"
         )
         messages = [
             {"role": "system", "content": "You are a feasibility reviewer. Output only JSON."},

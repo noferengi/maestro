@@ -36,38 +36,38 @@ def _llm_response(content_dict: dict, prompt_tokens: int = 50,
 _SCOPE_PASS = {
     "scope": "medium", "complexity": 5, "decomposition_needed": False,
     "subtasks": [], "affected_areas": ["app/"], "effort": "moderate",
-    "vote": {"verdict": "LIKELY", "confidence": 0.93,
-             "justification": "Task is well-defined."},
+    "verdict": {"verdict": "LIKELY", "confidence": 0.93,
+                "justification": "Task is well-defined."},
 }
 _SCOPE_REJECTED = {
     "scope": "epic", "complexity": 10, "decomposition_needed": True,
     "subtasks": [], "affected_areas": [], "effort": "major",
-    "vote": {"verdict": "REJECTED", "confidence": 0.20,
-             "justification": "Task is fundamentally unfeasible."},
+    "verdict": {"verdict": "REJECTED", "confidence": 0.20,
+                "justification": "Task is fundamentally unfeasible."},
 }
 _SCOPE_SUBDIVIDE = {
     "scope": "epic", "complexity": 9, "decomposition_needed": True,
     "subtasks": [], "affected_areas": [], "effort": "major",
-    "vote": {"verdict": "SUBDIVIDE_IDEA", "confidence": 0.85,
-             "justification": "Too large - decompose first."},
+    "verdict": {"verdict": "SUBDIVIDE_IDEA", "confidence": 0.85,
+                "justification": "Too large - decompose first."},
 }
 _SCOPE_NEEDS_RESEARCH = {
     "scope": "large", "complexity": 7, "decomposition_needed": False,
     "subtasks": [], "affected_areas": ["unknown"], "effort": "significant",
-    "vote": {"verdict": "NEEDS_RESEARCH", "confidence": 0.65,
-             "justification": "Cannot determine scope."},
+    "verdict": {"verdict": "NEEDS_RESEARCH", "confidence": 0.65,
+                "justification": "Cannot determine scope."},
 }
 _CONFLICT_PASS = {
     "file_conflicts": [], "semantic_conflicts": [], "priority_conflicts": [],
     "resource_conflicts": [],
-    "vote": {"verdict": "LIKELY", "confidence": 0.95,
-             "justification": "No conflicts."},
+    "verdict": {"verdict": "LIKELY", "confidence": 0.95,
+                "justification": "No conflicts."},
 }
 _FEASIBILITY_PASS = {
     "feasibility_rating": 0.85, "ambiguities": [], "external_dependencies": [],
     "risks": [], "codebase_readiness": "ready",
-    "vote": {"verdict": "POSSIBLE", "confidence": 0.80,
-             "justification": "Codebase is ready."},
+    "verdict": {"verdict": "POSSIBLE", "confidence": 0.80,
+                "justification": "Codebase is ready."},
 }
 
 # Static analysis fallback vote (returned by the mocked stage)
@@ -413,8 +413,8 @@ class TestStaticAnalysisIntegration:
                                "decomposition_needed": False, "subtasks": [],
                                "affected_areas": [],  # Empty - triggers fallback
                                "effort": "moderate",
-                               "vote": {"verdict": "LIKELY", "confidence": 0.93,
-                                        "justification": "OK"}
+                               "verdict": {"verdict": "LIKELY", "confidence": 0.93,
+                                           "justification": "OK"}
                            }),
                            _llm_response(_CONFLICT_PASS),
                            _llm_response(_FEASIBILITY_PASS),

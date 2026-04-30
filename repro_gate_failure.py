@@ -30,7 +30,7 @@ def check_interface_completeness(plan):
         real_unresolved = unresolved - filtered
         if real_unresolved:
             return False, f"Unresolved: {real_unresolved}"
-    
+
     return True, "Passed"
 
 # Case from task-1776662046.990939

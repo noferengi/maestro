@@ -20,7 +20,7 @@ description = "Fix subdivision children positions to prevent scheduler starvatio
 def up(conn):
     """Apply the fix: set position=i for children within each parent group."""
     cursor = conn.cursor()
-    
+
     # Get all parents that have children
     cursor.execute("""
         SELECT DISTINCT parent_task_id
@@ -28,9 +28,9 @@ def up(conn):
         WHERE parent_task_id IS NOT NULL
         AND type = 'idea'
     """)
-    
+
     parents = [row[0] for row in cursor.fetchall()]
-    
+
     for parent_id in parents:
         # Get children ordered by created_at
         cursor.execute("""
@@ -40,9 +40,9 @@ def up(conn):
             AND type = 'idea'
             ORDER BY created_at, id
         """, (parent_id,))
-        
+
         children = [row[0] for row in cursor.fetchall()]
-        
+
         # Update each child with its index as position
         for i, child_id in enumerate(children):
             cursor.execute("""
@@ -50,23 +50,23 @@ def up(conn):
                 SET position = ?
                 WHERE id = ?
             """, (i, child_id))
-        
+
         print(f"Fixed {len(children)} children of {parent_id}")
-    
+
     conn.commit()
 
 
 def down(conn):
     """Revert: set all children back to position=0."""
     cursor = conn.cursor()
-    
+
     cursor.execute("""
         UPDATE tasks
         SET position = 0
         WHERE parent_task_id IS NOT NULL
         AND type = 'idea'
     """)
-    
+
     count = cursor.rowcount
     conn.commit()
     print(f"Reverted {count} children to position=0")

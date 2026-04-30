@@ -4,8 +4,8 @@ app/agent/loop.py
 The Wiggum Loop - core orchestration engine for a single Maestro task.
 
 MaestroLoop drives the LLM -> tool-call -> result -> LLM cycle until one of:
-  * The agent emits an ACCEPTED signal.
-  * The agent emits a REVERT_TO_DESIGN signal.
+  * The agent emits an ACCEPTED signal via submit_work.
+  * The agent emits a REVERT_TO_DESIGN signal via submit_work.
   * max_turns is exceeded.
   * MAX_CONSECUTIVE_ERRORS consecutive tool errors occur.
 """
@@ -16,8 +16,9 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
+from app.agent.agent_loop import AgentLoop
 from app.agent.config import (
     LLM_BASE_URL,
     LLM_MODEL,
@@ -28,13 +29,14 @@ from app.agent.config import (
     SIGNAL_REVERT,
     SIGNAL_NEEDS_RESEARCH,
     SIGNAL_CONTEXT_TOO_LARGE,
+    SIGNAL_RESOLUTION_STALLED,
+    SIGNAL_CORRECTION_STALLED,
+    SIGNAL_VERDICT_REJECTED,
+    SIGNAL_VERDICT_NEEDS_WORK,
     GIT_SAFETY_BRANCH_PREFIX,
     INDEV_AGENT_TOOLS,
-    check_context_saturation,
 )
-from app.agent.json_utils import extract_json_block
 from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
-from app.agent.system_prompt import MAESTRO_SYSTEM_PROMPT
 from app.agent.tools import TOOL_SCHEMAS, dispatch_tool, async_dispatch_tool, build_tool_schemas
 
 _INDEV_TOOL_SCHEMAS: list[dict] = build_tool_schemas(INDEV_AGENT_TOOLS)
@@ -89,7 +91,7 @@ def request_stop(task_id: str) -> bool:
 # Main loop class
 # ---------------------------------------------------------------------------
 
-class MaestroLoop:
+class MaestroLoop(AgentLoop):
     """
     Drives the LLM agent loop for a single Kanban task.
 
@@ -98,6 +100,8 @@ class MaestroLoop:
         loop = MaestroLoop(task_id="task-123")
         result = await loop.run()
     """
+
+    _agent_name = AGENT_NAME
 
     def __init__(
         self,
@@ -110,26 +114,228 @@ class MaestroLoop:
         budget_id: int | None = None,
         project_path: str | None = None,
     ) -> None:
-        self.task_id = task_id
-        self.max_turns = max_turns
-        self.llm_base_url = llm_base_url or LLM_BASE_URL
-        self.llm_model = llm_model or LLM_MODEL
-        self.max_context = max_context
-        self.llm_id = llm_id
-        self.budget_id = budget_id
+        super().__init__(
+            task_id=task_id,
+            llm_id=llm_id,
+            budget_id=budget_id,
+            max_turns=max_turns,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            max_context=max_context,
+        )
         self.project_path = project_path
-        self._messages: list[dict] = []
-        self._turn: int = 0
-        self._consecutive_errors: int = 0
         self._stop_requested: bool = False
         self._git_branch: str | None = None
         self._files_changed: list[str] = []
-        self._last_prompt_tokens: int = 0
-        self._warnings_fired: set[float] = set()
-        self._turn_warnings_fired: set[int] = set()
 
     # ------------------------------------------------------------------
-    # Public entry point
+    # AgentLoop interface
+    # ------------------------------------------------------------------
+
+    def _build_messages(self) -> list[dict]:
+        """Assemble [system_prompt, user_task_brief]."""
+        _project_path = self.project_path or None
+        snapshot_block = ""
+        if _project_path:
+            try:
+                from app.agent.project_snapshot import build_snapshot_with_summaries
+                from app.agent.config import SNAPSHOT_CONTEXT_RATIO
+                _snap_max = (
+                    int(self.max_context * SNAPSHOT_CONTEXT_RATIO)
+                    if self.max_context else None
+                )
+                snapshot_block = f"\n\n{build_snapshot_with_summaries(_project_path, max_tokens=_snap_max)}"
+            except Exception:
+                pass
+
+        arch_block = ""
+        pip_block = ""
+        try:
+            from app.database import get_task as _get_task, get_pips_for_task as _get_pips
+            from app.agent.project_snapshot import build_architecture_context
+            _task_rec = _get_task(self.task_id)
+            if _task_rec and _task_rec.project:
+                _arch = build_architecture_context(_task_rec.project, agent_type='loop')
+                if _arch:
+                    arch_block = f"\n\n{_arch}"
+
+                pips = _get_pips(self.task_id)
+                if pips:
+                    pip_block = "\n\n### HISTORICAL PERFORMANCE IMPROVEMENT PLANS (PIPs)\n"
+                    pip_block += "This task has previously failed review/optimization. You MUST satisfy ALL requirements below:\n"
+                    for i, pip in enumerate(pips):
+                        reqs = json.loads(pip.requirements)
+                        pip_block += f"\nPIP {i+1} (from {pip.origin_stage}, status: {pip.status}):\n"
+                        for req in reqs:
+                            pip_block += f"- {req}\n"
+        except Exception:
+            pass
+
+        from app.agent.system_prompt import MAESTRO_SYSTEM_PROMPT
+        return [
+            {"role": "system", "content": MAESTRO_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Your assigned task ID is: **{self.task_id}**"
+                    f"{snapshot_block}{arch_block}{pip_block}\n\n"
+                    f"Begin by calling get_task('{self.task_id}') to load the full "
+                    f"task definition, including the approved PLANNING result "
+                    f"(file_manifest, implementation_steps, interface_contracts). "
+                    f"Then follow the workflow in your system prompt.\n\n"
+                    f"Your first action should be to create a safety branch: "
+                    f"git_create_branch('{GIT_SAFETY_BRANCH_PREFIX}{self.task_id}').\n\n"
+                    f"Proceed."
+                ),
+            },
+        ]
+
+    def _get_tool_schemas(self) -> list[dict]:
+        return _INDEV_TOOL_SCHEMAS
+
+    async def _on_terminal(self) -> LoopResult:
+        """Convert a terminal signal dict into a LoopResult."""
+        signal_dict = self._terminal_signal
+        sig = signal_dict.get("signal")
+        payload = signal_dict.get("payload", {})
+
+        if sig == SIGNAL_ACCEPTED:
+            result = LoopResult(
+                task_id=self.task_id,
+                status="ACCEPTED",
+                turns=self._turn,
+                final_message=signal_dict.get("summary", "Task accepted."),
+                git_branch=payload.get("git_branch") or self._git_branch,
+                files_changed=payload.get("files_changed") or self._files_changed,
+            )
+        elif sig in (SIGNAL_RESOLUTION_STALLED, SIGNAL_CORRECTION_STALLED,
+                     SIGNAL_VERDICT_REJECTED, SIGNAL_VERDICT_NEEDS_WORK):
+            result = LoopResult(
+                task_id=self.task_id,
+                status="REVERT_TO_DESIGN",
+                turns=self._turn,
+                final_message=payload.get("reason", signal_dict.get("summary", "Reverting.")),
+                git_branch=self._git_branch,
+                error_detail=payload.get("advice"),
+            )
+        else:  # REVERT_TO_DESIGN
+            result = LoopResult(
+                task_id=self.task_id,
+                status="REVERT_TO_DESIGN",
+                turns=self._turn,
+                final_message=payload.get("reason", signal_dict.get("summary", "Reverting to design.")),
+                git_branch=self._git_branch,
+                error_detail=payload.get("advice"),
+            )
+
+        _LOOP_STATUS[self.task_id] = self._status_dict(result)
+        return result
+
+    async def _on_max_turns(self) -> LoopResult:
+        logger.warning("Task '%s' exceeded max turns (%d).", self.task_id, self.max_turns)
+        result = LoopResult(
+            task_id=self.task_id,
+            status="MAX_TURNS",
+            turns=self._turn,
+            final_message=f"Max turns ({self.max_turns}) exceeded without reaching a terminal state.",
+            git_branch=self._git_branch,
+            files_changed=self._files_changed,
+        )
+        _LOOP_STATUS[self.task_id] = self._status_dict(result)
+        return result
+
+    async def _on_error(self, reason: str) -> LoopResult:
+        result = LoopResult(
+            task_id=self.task_id,
+            status="ERROR",
+            turns=self._turn,
+            final_message=reason,
+            git_branch=self._git_branch,
+            error_detail=reason,
+        )
+        _LOOP_STATUS[self.task_id] = self._status_dict(result)
+        return result
+
+    async def _on_no_tool_call(self):
+        """MaestroLoop always nudges — never exits on idle turns."""
+        self._messages.append({
+            "role": "user",
+            "content": (
+                "[SYSTEM] You did not call any tool. "
+                "You must either call a tool to make progress or call "
+                "submit_work(signal='ACCEPTED', summary='...') to complete. "
+                "Do not output free-form prose or raw JSON as a terminal action — "
+                "use the submit_work tool call."
+            ),
+        })
+        return None  # always continue
+
+    # ------------------------------------------------------------------
+    # Tool dispatch override — git tracking + timeout research
+    # ------------------------------------------------------------------
+
+    async def _dispatch_tools(self, tool_calls: list) -> list[dict]:
+        result_messages = await super()._dispatch_tools(tool_calls)
+
+        # Track git branch creation and file writes
+        for tc in tool_calls:
+            function_block = tc.get("function", {})
+            name = function_block.get("name", "")
+            raw_args = function_block.get("arguments", "{}")
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except Exception:
+                args = {}
+            if name == "write_git_branch":
+                branch = args.get("branch_name", "")
+                if branch:
+                    self._git_branch = branch
+                    _LOOP_STATUS[self.task_id]["git_branch"] = branch
+            if name in ("write_file", "append_file"):
+                path = args.get("path", "")
+                if path and path not in self._files_changed:
+                    self._files_changed.append(path)
+
+        # Handle shell timeouts by triggering inline research
+        has_timeout = any(
+            "ERROR: Command timed out" in m.get("content", "")
+            for m in result_messages if m.get("role") == "tool"
+        )
+        if has_timeout:
+            logger.info(
+                "MaestroLoop detected shell timeout for task '%s' - triggering research.",
+                self.task_id,
+            )
+            research_signal = {
+                "signal": SIGNAL_NEEDS_RESEARCH,
+                "question": (
+                    "The last shell command timed out. Investigate the source code and tests "
+                    "to see if there is an infinite loop, a deadlock, or a high-complexity "
+                    "algorithm (like naive Fibonacci) being called with large inputs in a test."
+                ),
+                "context": "A shell command timed out during implementation.",
+            }
+            research_result = await self._handle_needs_research(research_signal)
+            # Replace the timeout error content so error counting doesn't trigger
+            for i, m in enumerate(result_messages):
+                if m.get("role") == "tool" and "ERROR: Command timed out" in m.get("content", ""):
+                    result_messages[i] = dict(m, content="[SYSTEM] Shell command timed out.")
+            # Append research findings as user message (will be extended to self._messages by base)
+            result_messages.append({
+                "role": "user",
+                "content": (
+                    "[SYSTEM] The shell command timed out, and a Research Agent was triggered to investigate.\n"
+                    f"Verdict: {research_result.get('verdict', 'unknown')}\n"
+                    f"Findings:\n{research_result.get('findings', 'No findings.')}\n\n"
+                    "Based on these findings, fix the implementation or the tests to avoid the timeout."
+                ),
+            })
+            self._consecutive_errors = 0
+
+        return result_messages
+
+    # ------------------------------------------------------------------
+    # run() override — registry management + CancelledError handling
     # ------------------------------------------------------------------
 
     async def run(self) -> LoopResult:
@@ -139,7 +345,7 @@ class MaestroLoop:
         """
         from app.agent.llm_client import set_llm_session_context
         set_llm_session_context(AGENT_NAME)
-        # Register in the global registry
+
         current_task = asyncio.current_task()
         _ACTIVE_LOOPS[self.task_id] = current_task
         _LOOP_STATUS[self.task_id] = {
@@ -154,8 +360,27 @@ class MaestroLoop:
             set_task_git_cwd(self.project_path)
             logger.info("Task '%s': git cwd set to '%s'.", self.task_id, self.project_path)
 
+        # Pre-warm file summaries for the project (fire-and-forget)
+        _project_root = self.project_path or PROJECT_ROOT
+        if self.llm_id is not None:
+            try:
+                from app.agent.project_snapshot import prewarm_project_summaries
+                import asyncio as _asyncio
+                await _asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: prewarm_project_summaries(
+                        _project_root,
+                        llm_id=self.llm_id,
+                        budget_id=self.budget_id,
+                        task_id=self.task_id,
+                    ),
+                )
+            except Exception as exc:
+                logger.warning("prewarm failed (non-fatal): %s", exc)
+
         try:
-            return await self._loop()
+            self._messages = self._build_messages()
+            return await self._run_loop()
         except asyncio.CancelledError:
             logger.info("Loop for task '%s' was cancelled.", self.task_id)
             result = LoopResult(
@@ -183,387 +408,11 @@ class MaestroLoop:
             _ACTIVE_LOOPS.pop(self.task_id, None)
 
     # ------------------------------------------------------------------
-    # Internal loop
-    # ------------------------------------------------------------------
-
-    async def _loop(self) -> LoopResult:
-        """Core Do-While iteration."""
-        if is_shutting_down():
-            raise ShutdownError("Server is shutting down")
-
-        # Pre-warm file summaries for the project (fire-and-forget)
-        _project_root = getattr(self, 'project_path', None) or PROJECT_ROOT
-        if getattr(self, 'llm_id', None) is not None:
-            try:
-                from app.agent.project_snapshot import prewarm_project_summaries
-                import asyncio as _asyncio
-                await _asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: prewarm_project_summaries(
-                        _project_root,
-                        llm_id=self.llm_id,
-                        budget_id=getattr(self, 'budget_id', None),
-                        task_id=self.task_id,
-                    ),
-                )
-            except Exception as exc:
-                logger.warning("prewarm failed (non-fatal): %s", exc)
-
-        # Seed the conversation with the task context
-        self._messages = self._build_messages()
-
-        while self._turn < self.max_turns:
-            self._turn += 1
-            _LOOP_STATUS[self.task_id]["turns"] = self._turn
-            logger.debug("Task '%s' - turn %d/%d", self.task_id, self._turn, self.max_turns)
-
-            # ── LLM call ──────────────────────────────────────────────
-            try:
-                response = await self._call_llm(self._messages)
-            except Exception as exc:
-                # Failed call does not count as a turn - roll back the increment.
-                self._turn -= 1
-                _LOOP_STATUS[self.task_id]["turns"] = self._turn
-                logger.error("LLM call failed on turn %d: %s", self._turn, exc)
-                self._consecutive_errors += 1
-                if self._check_failure_count():
-                    return self._revert_result(f"LLM call failed {MAX_CONSECUTIVE_ERRORS} times: {exc}")
-                # Append a synthetic error message and retry
-                self._messages.append({
-                    "role": "user",
-                    "content": f"[SYSTEM] LLM call failed: {exc}. Please continue.",
-                })
-                continue
-
-            # ── Parse response ─────────────────────────────────────────
-            assistant_message = response.get("choices", [{}])[0].get("message", {})
-            self._messages.append(assistant_message)
-
-            # ── Track token usage & inject context/turn warnings ───────
-            usage = response.get("usage", {})
-            self._last_prompt_tokens = usage.get("prompt_tokens", 0)
-            self._maybe_inject_context_warning()
-            self._maybe_inject_turn_warning()
-
-            tool_calls = assistant_message.get("tool_calls") or []
-            content = assistant_message.get("content") or ""
-
-            # ── Check for terminal / research signal in content ────────
-            signal = self._extract_signal(content)
-            if signal:
-                sig_type = signal.get("signal")
-                if sig_type in (SIGNAL_ACCEPTED, SIGNAL_REVERT):
-                    return self._handle_terminal(signal)
-                if sig_type == SIGNAL_NEEDS_RESEARCH:
-                    research_result = await self._handle_needs_research(signal)
-                    self._messages.append({
-                        "role": "user",
-                        "content": (
-                            "[SYSTEM] Research agent completed.\n"
-                            f"Verdict: {research_result.get('verdict', 'unknown')}\n"
-                            f"Findings:\n{research_result.get('findings', 'No findings.')}\n\n"
-                            "Continue your work incorporating these findings."
-                        ),
-                    })
-                    self._consecutive_errors = 0
-                    continue
-                if sig_type == SIGNAL_CONTEXT_TOO_LARGE:
-                    return self._revert_result(
-                        "Agent signalled CONTEXT_TOO_LARGE — task scope exceeds context budget."
-                    )
-
-            if tool_calls:
-                tool_result_messages = await self._handle_tool_calls(tool_calls)
-                self._messages.extend(tool_result_messages)
-                
-                # Check for timeouts in tool results
-                has_timeout = any(
-                    "ERROR: Command timed out" in msg.get("content", "")
-                    for msg in tool_result_messages
-                )
-                if has_timeout:
-                    logger.info("MaestroLoop detected shell timeout for task '%s' - triggering research.", self.task_id)
-                    research_signal = {
-                        "signal": SIGNAL_NEEDS_RESEARCH,
-                        "question": (
-                            "The last shell command timed out. Investigate the source code and tests "
-                            "to see if there is an infinite loop, a deadlock, or a high-complexity "
-                            "algorithm (like naive Fibonacci) being called with large inputs in a test."
-                        ),
-                        "context": "A shell command timed out during implementation."
-                    }
-                    research_result = await self._handle_needs_research(research_signal)
-                    self._messages.append({
-                        "role": "user",
-                        "content": (
-                            "[SYSTEM] The shell command timed out, and a Research Agent was triggered to investigate.\n"
-                            f"Verdict: {research_result.get('verdict', 'unknown')}\n"
-                            f"Findings:\n{research_result.get('findings', 'No findings.')}\n\n"
-                            "Based on these findings, fix the implementation or the tests to avoid the timeout."
-                        ),
-                    })
-                    # Reset consecutive errors since we've handled the timeout with research
-                    self._consecutive_errors = 0
-                    continue
-
-                # Reset consecutive error counter if any tool succeeded
-                if not all(
-                    msg.get("content", "").startswith("ERROR")
-                    for msg in tool_result_messages
-                ):
-                    self._consecutive_errors = 0
-                else:
-                    self._consecutive_errors += 1
-                    if self._check_failure_count():
-                        return self._revert_result(
-                            f"Tool calls failed {MAX_CONSECUTIVE_ERRORS} times consecutively."
-                        )
-                continue
-
-            # ── No tool calls and no signal - nudge the agent ─────────
-            if not tool_calls and not signal:
-                self._messages.append({
-                    "role": "user",
-                    "content": (
-                        "[SYSTEM] You did not call any tool and did not emit a terminal signal. "
-                        "You must either call a tool to make progress or emit your final JSON report. "
-                        "Do not output free-form prose as a terminal action."
-                    ),
-                })
-
-        # ── Max turns exceeded ─────────────────────────────────────────
-        logger.warning("Task '%s' exceeded max turns (%d).", self.task_id, self.max_turns)
-        result = LoopResult(
-            task_id=self.task_id,
-            status="MAX_TURNS",
-            turns=self._turn,
-            final_message=f"Max turns ({self.max_turns}) exceeded without reaching a terminal state.",
-            git_branch=self._git_branch,
-            files_changed=self._files_changed,
-        )
-        _LOOP_STATUS[self.task_id] = self._status_dict(result)
-        return result
-
-    # ------------------------------------------------------------------
-    # Message building
-    # ------------------------------------------------------------------
-
-    def _build_messages(self) -> list[dict]:
-        """
-        Assemble the initial message list:
-          [system_prompt, user_task_brief]
-        """
-        _project_path = getattr(self, 'project_path', None) or None
-        snapshot_block = ""
-        if _project_path:
-            try:
-                from app.agent.project_snapshot import build_snapshot_with_summaries
-                from app.agent.config import SNAPSHOT_CONTEXT_RATIO
-                _snap_max = (
-                    int(self.max_context * SNAPSHOT_CONTEXT_RATIO)
-                    if self.max_context else None
-                )
-                snapshot_block = f"\n\n{build_snapshot_with_summaries(_project_path, max_tokens=_snap_max)}"
-            except Exception:
-                pass
-
-        # Inject architecture context - look up the task's project by task_id
-        arch_block = ""
-        pip_block = ""
-        try:
-            from app.database import get_task as _get_task, get_pips_for_task as _get_pips
-            from app.agent.project_snapshot import build_architecture_context
-            _task_rec = _get_task(self.task_id)
-            if _task_rec and _task_rec.project:
-                _arch = build_architecture_context(_task_rec.project, agent_type='loop')
-                if _arch:
-                    arch_block = f"\n\n{_arch}"
-                
-                # Fetch PIPs for this task
-                pips = _get_pips(self.task_id)
-                if pips:
-                    pip_block = "\n\n### HISTORICAL PERFORMANCE IMPROVEMENT PLANS (PIPs)\n"
-                    pip_block += "This task has previously failed review/optimization. You MUST satisfy ALL requirements below:\n"
-                    for i, pip in enumerate(pips):
-                        reqs = json.loads(pip.requirements)
-                        pip_block += f"\nPIP {i+1} (from {pip.origin_stage}, status: {pip.status}):\n"
-                        for req in reqs:
-                            pip_block += f"- {req}\n"
-        except Exception:
-            pass
-
-        return [
-            {"role": "system", "content": MAESTRO_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Your assigned task ID is: **{self.task_id}**"
-                    f"{snapshot_block}{arch_block}{pip_block}\n\n"
-                    f"Begin by calling get_task('{self.task_id}') to load the full "
-                    f"task definition, including the approved PLANNING result "
-                    f"(file_manifest, implementation_steps, interface_contracts). "
-                    f"Then follow the workflow in your system prompt.\n\n"
-                    f"Your first action should be to create a safety branch: "
-                    f"git_create_branch('{GIT_SAFETY_BRANCH_PREFIX}{self.task_id}').\n\n"
-                    f"Proceed."
-                ),
-            },
-        ]
-
-    # ------------------------------------------------------------------
-    # Context window warnings
-    # ------------------------------------------------------------------
-
-    def _maybe_inject_context_warning(self) -> None:
-        """Inject a warning message if token usage crosses a threshold."""
-        if not self.max_context:
-            return
-        # terminate_threshold=0 disables hard termination - MaestroLoop uses its own signal system
-        check_context_saturation(
-            self._last_prompt_tokens,
-            self.max_context,
-            self._warnings_fired,
-            self._messages,
-            terminate_threshold=0,
-        )
-
-    def _maybe_inject_turn_warning(self) -> None:
-        """Inject a warning message if tool-call turns are running low."""
-        from app.agent.config import check_turn_saturation
-        check_turn_saturation(
-            self._turn,
-            self.max_turns,
-            self._turn_warnings_fired,
-            self._messages,
-        )
-
-    # ------------------------------------------------------------------
-    # LLM call
-    # ------------------------------------------------------------------
-
-    async def _call_llm(self, messages: list[dict]) -> dict:
-        """
-        POST to the OpenAI-compatible endpoint.
-        Returns the raw response dict.
-        Raises httpx.HTTPError on network failures.
-        """
-        return await call_llm(
-            messages,
-            base_url=self.llm_base_url,
-            model=self.llm_model,
-            tools=_INDEV_TOOL_SCHEMAS,
-            tool_choice="auto",
-            task_id=self.task_id,
-            llm_id=self.llm_id,
-            budget_id=self.budget_id,
-            agent_name=AGENT_NAME,
-        )
-
-    # ------------------------------------------------------------------
-    # Tool call handling
-    # ------------------------------------------------------------------
-
-    async def _handle_tool_calls(self, tool_calls: list) -> list[dict]:
-        """
-        Dispatch each tool call and return a list of tool-role messages
-        ready to be appended to the conversation.
-        Uses async_dispatch_tool so spawn_research_agent works properly.
-        """
-        result_messages: list[dict] = []
-
-        for tc in tool_calls:
-            tool_id = tc.get("id", "unknown")
-            function_block = tc.get("function", {})
-            name = function_block.get("name", "")
-            raw_args = function_block.get("arguments", "{}")
-
-            # Parse arguments JSON
-            try:
-                arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-            except json.JSONDecodeError as exc:
-                arguments = {}
-                logger.warning("Failed to parse tool arguments for '%s': %s", name, exc)
-
-            logger.debug("Dispatching tool '%s' with args: %s", name, arguments)
-
-            # Track git branch creation
-            if name == "git_create_branch":
-                branch = arguments.get("branch_name", "")
-                if branch:
-                    self._git_branch = branch
-                    _LOOP_STATUS[self.task_id]["git_branch"] = branch
-
-            # Track file writes for the final report
-            if name in ("write_file", "append_file"):
-                path = arguments.get("path", "")
-                if path and path not in self._files_changed:
-                    self._files_changed.append(path)
-
-            # Dispatch (async - handles spawn_research_agent correctly)
-            result_content = await async_dispatch_tool(
-                name, arguments,
-                task_id=self.task_id,
-                llm_id=self.llm_id,
-                budget_id=self.budget_id,
-                llm_base_url=self.llm_base_url,
-                llm_model=self.llm_model,
-            )
-
-            result_messages.append({
-                "role": "tool",
-                "tool_call_id": tool_id,
-                "name": name,
-                "content": result_content,
-            })
-
-        return result_messages
-
-    # ------------------------------------------------------------------
-    # Failure counting
-    # ------------------------------------------------------------------
-
-    def _check_failure_count(self) -> bool:
-        """
-        Return True if consecutive errors have reached the threshold,
-        triggering a REVERT_TO_DESIGN signal.
-        """
-        return self._consecutive_errors >= MAX_CONSECUTIVE_ERRORS
-
-    # ------------------------------------------------------------------
-    # Terminal signal extraction
-    # ------------------------------------------------------------------
-
-    def _extract_signal(self, content: str) -> dict | None:
-        """
-        Scan the assistant content for a JSON signal dict.
-        Recognizes ACCEPTED, REVERT_TO_DESIGN, and NEEDS_RESEARCH.
-        Returns the parsed dict if found, else None.
-        """
-        if not content:
-            return None
-        for attempt in [content, extract_json_block(content)]:
-            if not attempt:
-                continue
-            try:
-                parsed = json.loads(attempt.strip())
-                if isinstance(parsed, dict) and "signal" in parsed:
-                    sig = parsed["signal"]
-                    if sig in (SIGNAL_ACCEPTED, SIGNAL_REVERT, SIGNAL_NEEDS_RESEARCH, SIGNAL_CONTEXT_TOO_LARGE):
-                        return parsed
-            except (json.JSONDecodeError, ValueError):
-                continue
-        return None
-
-
-    # ------------------------------------------------------------------
-    # NEEDS_RESEARCH handler
+    # NEEDS_RESEARCH handler (inline research triggered by timeout)
     # ------------------------------------------------------------------
 
     async def _handle_needs_research(self, signal_dict: dict) -> dict:
-        """
-        Run a research agent inline, record the job, and return findings.
-        The loop continues after this - it is not a terminal action.
-        """
+        """Run a research agent inline and return findings."""
         from app.agent.research import run_research
         from app.database import create_research_job, update_research_job
 
@@ -574,7 +423,7 @@ class MaestroLoop:
             task_id=self.task_id,
             question=question,
             context=json.dumps({"question": question, "context": context_str}),
-            priority=0.0,  # inline = highest priority
+            priority=0.0,
             depth=0,
             llm_id=self.llm_id,
             budget_id=self.budget_id,
@@ -611,34 +460,8 @@ class MaestroLoop:
             return {"verdict": "ERROR", "findings": f"Research failed: {exc}"}
 
     # ------------------------------------------------------------------
-    # Terminal handlers
+    # Terminal handler helpers
     # ------------------------------------------------------------------
-
-    def _handle_terminal(self, signal_dict: dict) -> LoopResult:
-        """Convert a terminal signal dict into a LoopResult."""
-        sig = signal_dict.get("signal")
-
-        if sig == SIGNAL_ACCEPTED:
-            result = LoopResult(
-                task_id=self.task_id,
-                status="ACCEPTED",
-                turns=self._turn,
-                final_message=signal_dict.get("summary", "Task accepted."),
-                git_branch=signal_dict.get("git_branch") or self._git_branch,
-                files_changed=signal_dict.get("files_changed") or self._files_changed,
-            )
-        else:  # REVERT_TO_DESIGN
-            result = LoopResult(
-                task_id=self.task_id,
-                status="REVERT_TO_DESIGN",
-                turns=self._turn,
-                final_message=signal_dict.get("reason", "Reverting to design."),
-                git_branch=self._git_branch,
-                error_detail=signal_dict.get("advice"),
-            )
-
-        _LOOP_STATUS[self.task_id] = self._status_dict(result)
-        return result
 
     def _revert_result(self, reason: str) -> LoopResult:
         """Construct a REVERT_TO_DESIGN LoopResult for internal failure cases."""
@@ -651,10 +474,6 @@ class MaestroLoop:
         )
         _LOOP_STATUS[self.task_id] = self._status_dict(result)
         return result
-
-    # ------------------------------------------------------------------
-    # Status snapshot helper
-    # ------------------------------------------------------------------
 
     def _status_dict(self, result: LoopResult) -> dict:
         return {
