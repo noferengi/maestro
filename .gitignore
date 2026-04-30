@@ -59,3 +59,5 @@ logs/
 *.png
 
 /.maestro-worktrees/
+maestro.db
+tempbackup/
