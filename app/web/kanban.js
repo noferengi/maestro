@@ -407,17 +407,20 @@ const COLUMN_DISPLAY = {
     'subdividing': 'Ideas',
     'planning': 'Planning',
     'indev': 'In Development',
-    'conceptual_review': 'Concept Review',
-    'optimization': 'Optimization',
-    'security': 'Security',
-    'full_review': 'Full Review',
+    'conceptual_review': 'AI Review',
+    'optimization': 'AI Review',
+    'security': 'AI Review',
+    'full_review': 'Human Review',
     'completed': 'Completed',
 };
+
+// Backend stages that are visually merged into the "AI REVIEW" column.
+const AI_REVIEW_STAGES = ['conceptual_review', 'optimization', 'security'];
 
 // Returns the label for an advance button given a task's current type.
 function _advanceBtnLabel(taskType, hasRejections) {
     if (hasRejections) return 'Retry Pipeline';
-    if (taskType === 'full_review') return 'Merge to Completed';
+    if (taskType === 'full_review') return 'Approve & Merge';
     return 'Run Pipeline';
 }
 
@@ -768,6 +771,14 @@ function updateTaskCounts() {
             countElement.textContent = count;
         }
     });
+
+    // Aggregate count badge for the merged AI REVIEW column header.
+    const aiCount = AI_REVIEW_STAGES.reduce((sum, col) => {
+        const c = document.getElementById(`tasks-${col}`);
+        return sum + (c ? c.querySelectorAll('.task-card').length : 0);
+    }, 0);
+    const aiCountEl = document.getElementById('count-ai-review');
+    if (aiCountEl) aiCountEl.textContent = aiCount;
 }
 
 // ============================================
@@ -2719,6 +2730,12 @@ function createTaskCard(id, title, tags, owner, status) {
         subdivBadge = `<span class="subdivision-badge gen" title="Generation ${generation} sub-idea">Gen ${generation}</span>`;
     }
 
+    // Cached plan badge — shown on planning/idea cards with a valid cached result
+    let cachedPlanBadge = '';
+    if ((status === 'planning' || status === 'idea') && taskObj.has_cached_plan) {
+        cachedPlanBadge = '<span class="cached-plan-badge" title="Cached plan available — will skip re-planning and advance to INDEV instantly">&#9889; Cached</span>';
+    }
+
     // Big Idea badge and styling
     const isBigIdea = taskObj.is_big_idea;
     let bigIdeaBadge = '';
@@ -2756,6 +2773,7 @@ function createTaskCard(id, title, tags, owner, status) {
             ${tagsHtml}
             ${ownerHtml}
             ${intakeRetryBadge}
+            ${cachedPlanBadge}
         </div>
         ${pipRequirementsHtml}
         ${prereqHtml}
@@ -2765,7 +2783,8 @@ function createTaskCard(id, title, tags, owner, status) {
             <span class="toolbar-sep"></span>
             <button class="toolbar-btn" title="Research — run a research agent on this card" onclick="event.stopPropagation();openResearchDialog('${id}')">🔍</button>
             <button class="toolbar-btn" title="Subdivide — run subdivision agent on this card" onclick="event.stopPropagation();toolbarSubdivide('${id}')">✂</button>
-            <button class="toolbar-btn" title="Run Planning pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','planning')">📋</button>
+            <button class="toolbar-btn" title="Run Planning pipeline (uses cache if available)" onclick="event.stopPropagation();toolbarRunPipeline('${id}','planning')">📋</button>
+            <button class="toolbar-btn" title="Force Recompute Plan — bypass cache, recompute with prior failure context" onclick="event.stopPropagation();toolbarForceRecompute('${id}')">&#x1F504;</button>
             <button class="toolbar-btn" title="Run Conceptual Review pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','review')">👁</button>
             <button class="toolbar-btn" title="Run Optimization pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','optimization')">⚡</button>
             <button class="toolbar-btn" title="Run Security pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','security')">🔒</button>
@@ -2850,7 +2869,27 @@ function createTaskCard(id, title, tags, owner, status) {
             childBtn.onclick = (e) => { e.stopPropagation(); viewChildren(id); };
             actionsDiv.appendChild(childBtn);
         }
-    } else if (status === 'planning' || status === 'indev' || status === 'conceptual_review' || status === 'optimization' || status === 'security' || status === 'full_review') {
+    } else if (status === 'full_review') {
+        const actionsDiv = card.querySelector('.task-actions');
+        const mergeBtn = document.createElement('button');
+        mergeBtn.className = 'action-btn action-btn-advance';
+        mergeBtn.textContent = 'Accept & Merge';
+        mergeBtn.onclick = async (e) => {
+            e.stopPropagation();
+            if (!await showConfirm('Accept & Merge',
+                `Run the git merge pipeline for "${task.title}" and mark it COMPLETED?`,
+                'Accept & Merge')) return;
+            const r = await fetch(`${API_BASE}/tasks/${id}/merge`, { method: 'POST' });
+            const d = await r.json().catch(() => ({}));
+            if (r.ok) {
+                showToast('Merge pipeline started.', 'success');
+                await loadTasksFromDatabase();
+            } else {
+                showToast(d.detail || 'Merge failed.', 'error');
+            }
+        };
+        actionsDiv.appendChild(mergeBtn);
+    } else if (status === 'planning' || status === 'indev' || status === 'conceptual_review' || status === 'optimization' || status === 'security') {
         const actionsDiv = card.querySelector('.task-actions');
         const advanceBtn = document.createElement('button');
         advanceBtn.className = 'action-btn action-btn-advance';
@@ -2868,6 +2907,7 @@ function createTaskCard(id, title, tags, owner, status) {
     } else if (status === 'completed') {
         const viewBtn = card.querySelector('.task-actions');
         viewBtn.innerHTML = `<button class="action-btn" onclick="viewTaskHistory('${id}')">View Proof</button>
+                             <button class="action-btn action-btn-warn" onclick="unmergeTask('${id}')">Unmerge</button>
                              <button class="action-btn action-btn-danger" onclick="deleteTask('${id}')">Delete</button>`;
     } else if (status === 'architecture') {
         const editBtn = card.querySelector('.task-actions');
@@ -3731,56 +3771,9 @@ async function moveTask(taskId, newStatus) {
             currentContainer.removeChild(currentCard);
         }
 
-        const actions = currentCard.querySelector('.task-actions');
-        const ready = canTaskAdvance(taskId);
-        if (newStatus === 'planning') {
-            actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
-                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
-                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'indev')">Move to IN DEVELOPMENT</button>` : '');
-        } else if (newStatus === 'indev') {
-            actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
-                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
-                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'conceptual_review')">Move to CONCEPTUAL REVIEW</button>` : '');
-        } else if (newStatus === 'conceptual_review') {
-            actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
-                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
-                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'optimization')">Move to OPTIMIZATION</button>` : '');
-        } else if (newStatus === 'optimization') {
-            actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
-                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
-                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'security')">Move to SECURITY</button>` : '');
-        } else if (newStatus === 'security') {
-            actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
-                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
-                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'full_review')">Move to FINAL REVIEW</button>` : '');
-        } else if (newStatus === 'full_review') {
-            actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
-                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
-                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'completed')">Move to COMPLETED</button>` : '');
-        } else if (newStatus === 'completed') {
-            actions.innerHTML = `<button class="action-btn" onclick="viewTaskHistory('${taskId}')">View Proof</button>
-                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`;
-        }
-
-        if (newContainer) {
-            newContainer.appendChild(currentCard);
-        }
-
-        updateTaskCount(currentStatus);
-        updateTaskCount(newStatus);
-
-        console.log(`Task ${taskId} moved from ${currentStatus} to ${newStatus}`);
     }
 
-    // Auto-move from indev to conceptual_review after 15 seconds
-    if (newStatus === 'indev') {
-        setTimeout(async () => {
-            if (taskData[taskId]) {
-                await moveTask(taskId, 'conceptual_review');
-                console.log(`Auto-move: Task ${taskId} moved to conceptual_review after 15 seconds`);
-            }
-        }, 15000);
-    }
+    await loadTasksFromDatabase();
 }
 
 // ============================================
@@ -4970,10 +4963,10 @@ const MAP_COLUMN_LABELS = {
     idea:              'IDEAS MAP',
     planning:          'PLANNING MAP',
     indev:             'IN DEVELOPMENT MAP',
-    conceptual_review: 'CONCEPTUAL REVIEW MAP',
-    optimization:      'OPTIMIZATION MAP',
-    security:          'SECURITY MAP',
-    full_review:       'FINAL REVIEW MAP',
+    conceptual_review: 'AI REVIEW MAP — CONCEPT',
+    optimization:      'AI REVIEW MAP — OPTIMIZATION',
+    security:          'AI REVIEW MAP — SECURITY',
+    full_review:       'HUMAN REVIEW MAP',
     completed:         'COMPLETED MAP',
 };
 
@@ -5829,6 +5822,24 @@ async function toolbarStopAgent(taskId) {
     }
 }
 
+async function unmergeTask(taskId) {
+    const task = taskData[taskId];
+    const label = task ? task.title : taskId;
+    if (!await showConfirm(
+        'Unmerge Task',
+        `This will run "git revert" on the merge commit and move "${label}" back to Human Review. Continue?`,
+        'Unmerge'
+    )) return;
+    const resp = await fetch(`${API_BASE}/tasks/${taskId}/unmerge`, { method: 'POST' });
+    const d = await resp.json().catch(() => ({}));
+    if (resp.ok) {
+        showToast(`Unmerged — moved to Human Review. ${d.git || ''}`, 'success');
+        await loadTasksFromDatabase();
+    } else {
+        showToast(d.detail || 'Unmerge failed.', 'error');
+    }
+}
+
 async function toolbarDemote(taskId) {
     const task = taskData[taskId];
     const label = task ? task.type : taskId;
@@ -5915,6 +5926,34 @@ async function toolbarRunPipeline(taskId, pipeline) {
         showToast(`${label} pipeline started.`, 'success');
     } else {
         showToast(d.detail || `${label} pipeline failed to start.`, 'error');
+    }
+}
+
+async function toolbarForceRecompute(taskId) {
+    // Set cache_mode to force_with_context, then trigger the planning pipeline.
+    // The pipeline will recompute from scratch while injecting context from prior failures.
+    try {
+        const modeResp = await fetch(`${API_BASE}/tasks/${taskId}/cache-mode`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode: 'force_with_context' }),
+        });
+        if (!modeResp.ok) {
+            const d = await modeResp.json().catch(() => ({}));
+            showToast(d.detail || 'Failed to set recompute mode.', 'error');
+            return;
+        }
+        const planResp = await fetch(`${API_BASE}/tasks/${taskId}/run-planning`, { method: 'POST' });
+        const d = await planResp.json().catch(() => ({}));
+        if (planResp.ok) {
+            showToast('Recomputing plan (with prior failure context)...', 'success');
+            setCardProcessing(taskId, true);
+            startTransitionPolling(taskId, new Date().toISOString());
+        } else {
+            showToast(d.detail || 'Failed to start planning pipeline.', 'error');
+        }
+    } catch (err) {
+        showToast('Force recompute failed: ' + err.message, 'error');
     }
 }
 

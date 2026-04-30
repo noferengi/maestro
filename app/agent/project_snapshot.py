@@ -440,7 +440,7 @@ def build_file_summary(path: str, summary_length: str = "none") -> str:
             logger.debug("tree-sitter unavailable for summary of %s: %s", path, exc)
             parts.append("\n(tree-sitter analysis unavailable - showing metadata only)")
 
-    parts.append(f"\n--> Use read_file_harder(path, start=N, end=N) to read source code.")
+    parts.append(f"\n--> Use read_file(path, start=N, end=N) to read source code.")
 
     result = "\n".join(parts)
     _file_summary_cache[cache_key] = result

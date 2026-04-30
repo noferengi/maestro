@@ -98,7 +98,7 @@ class DreamerAgent:
         self.budget_id    = budget_id
         self.llm_base_url = llm_base_url
         self.llm_model    = llm_model
-        
+
         from app.agent.survey_orchestrator import SurveyOrchestrator
         self.orchestrator = SurveyOrchestrator()
 
@@ -477,10 +477,10 @@ class DreamerAgent:
                 tools=tool_schemas,
                 tool_choice="auto",
             )
-            
+
             assistant_msg = response.get("choices", [{}])[0].get("message", {})
             tool_calls = assistant_msg.get("tool_calls") or []
-            
+
             data = None
             if tool_calls:
                 for tc in tool_calls:
@@ -491,7 +491,7 @@ class DreamerAgent:
                     if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
                         data = json.loads(tc_result).get("payload")
                         break
-            
+
             if data is None:
                 raw = assistant_msg.get("content", "{}")
                 from app.agent.json_utils import extract_json_block as _ejb
@@ -581,10 +581,10 @@ class DreamerAgent:
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": f"Project: {self.project}\n{arch_block}{deleted_block}\nSurvey this project and propose up to 3 new idea cards."}
         ]
-        
+
         # Include submit_work in survey tools
         tool_schemas = build_tool_schemas(DREAMER_SURVEY_TOOLS + ["submit_work"])
-        
+
         # Set context for tools
         _task_project_name.set(self.project)
         _task_git_cwd.set(self.project_path)
@@ -623,14 +623,14 @@ class DreamerAgent:
 
             msg = response.get("choices", [{}])[0].get("message", {})
             messages.append(msg)
-            
+
             tool_calls = msg.get("tool_calls") or []
             if tool_calls:
                 for tc in tool_calls:
                     t_id = tc["id"]
                     t_name = tc["function"]["name"]
                     t_args = json.loads(tc["function"]["arguments"])
-                    
+
                     result = await async_dispatch_tool(
                         t_name, t_args,
                         llm_id=self.llm_id, budget_id=self.budget_id,
@@ -667,7 +667,7 @@ class DreamerAgent:
                     data = json.loads(cleaned)
                 else:
                     data = {}
-                
+
                 if data and "new_cards" in data:
                     return DreamerPlan(
                         tasks_to_resurrect=[],

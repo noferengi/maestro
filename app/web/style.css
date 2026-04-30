@@ -461,12 +461,20 @@ body {
 .task-card.review { border-left-color: #fd7e14; }
 .task-card.completed { border-left-color: #198754; }
 
-/* New 9-column layout colors */
+/* Column colors */
 .column#column-indev .column-header { border-bottom-color: #0d6efd; }
-.column#column-conceptual_review .column-header { border-bottom-color: #20c997; }
-.column#column-optimization .column-header { border-bottom-color: #6610f2; }
-.column#column-security .column-header { border-bottom-color: #e83e8c; }
+.column#column-ai-review .column-header { border-bottom-color: #e83e8c; }
 .column#column-full_review .column-header { border-bottom-color: #fd7e14; }
+
+/* AI REVIEW grouped column: three tasks-containers scroll as one pool */
+.column.column-group {
+    overflow-y: auto;
+}
+.column.column-group .tasks-container {
+    flex: 0 0 auto;
+    overflow-y: visible;
+    min-height: 8px;
+}
 
 .task-card.indev { border-left: 4px solid #0d6efd; }
 .task-card.conceptual_review { border-left: 4px solid #20c997; }
@@ -652,6 +660,14 @@ body {
 
 .action-btn-danger:hover {
     background: #f8d7da;
+}
+
+.action-btn-warn {
+    color: #856404;
+}
+
+.action-btn-warn:hover {
+    background: #fff3cd;
 }
 
 /* Advance button styling */
@@ -1525,6 +1541,19 @@ body {
     margin-left: 0.4rem;
     vertical-align: middle;
     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: #fff;
+    letter-spacing: 0.3px;
+}
+
+.cached-plan-badge {
+    display: inline-block;
+    font-size: 0.6rem;
+    font-weight: 700;
+    padding: 0.1rem 0.45rem;
+    border-radius: 8px;
+    margin-left: 0.3rem;
+    vertical-align: middle;
+    background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
     color: #fff;
     letter-spacing: 0.3px;
 }

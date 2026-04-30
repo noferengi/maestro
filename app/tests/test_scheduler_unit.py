@@ -530,7 +530,7 @@ class TestNewDispatcherRouting:
         with _llm_counts_lock:
             _llm_session_counts[31] = 1
 
-        with patch("app.agent.scheduler._run_optimization_security_task") as mock_fn, \
+        with patch("app.agent.scheduler._run_optimization_task") as mock_fn, \
              patch("app.agent.scheduler._run_maestro_loop") as mock_loop:
             _run_task("t-opt", "optimization", llm, db_task, None)
 
@@ -613,37 +613,18 @@ class TestRunConceptualReviewTask:
 
 
 # ===========================================================================
-# _run_optimization_security_task unit tests
+# _run_optimization_task unit tests
 # ===========================================================================
 
-class TestRunOptimizationSecurityTask:
+class TestRunOptimizationTask:
     _OPT_PASS = {
         "outcome": "optimized",
         "total_prompt_tokens": 10,
         "total_completion_tokens": 20,
     }
-    _SEC_PASS = {
-        "outcome": "passed",
-        "demotion_target": None,
-        "summary": "",
-        "total_prompt_tokens": 0,
-        "total_completion_tokens": 0,
-    }
 
-    def _common_patches(self, task_id, sec_result):
-        """Return list of patch context managers for shared fixtures."""
-        return [
-            patch("app.database.get_task", return_value=_fake_db_task(task_id=task_id, task_type="optimization")),
-            patch("app.database.create_transition_result", MagicMock()),
-            patch("app.agent.tools.set_task_git_cwd", MagicMock()),
-            patch("app.agent.optimization.run_optimization_pipeline",
-                  return_value=self._OPT_PASS),
-            patch("app.agent.security_review.run_security_pipeline",
-                  return_value=sec_result),
-        ]
-
-    def test_advances_to_full_review_on_security_pass(self):
-        from app.agent.scheduler import _run_optimization_security_task
+    def test_advances_to_security_on_pass(self):
+        from app.agent.scheduler import _run_optimization_task
 
         updated_types = []
 
@@ -656,15 +637,65 @@ class TestRunOptimizationSecurityTask:
              patch("app.database.create_transition_result", MagicMock()), \
              patch("app.agent.tools.set_task_git_cwd", MagicMock()), \
              patch("app.agent.optimization.run_optimization_pipeline",
-                   return_value=self._OPT_PASS), \
+                   return_value=self._OPT_PASS):
+            _run_optimization_task("opt-1", "http://localhost:8008/v1", "model")
+
+        assert "security" in updated_types
+
+    def test_demotes_to_indev_on_exception(self):
+        from app.agent.scheduler import _run_optimization_task
+
+        updated_types = []
+
+        def _capture(task_id, **kwargs):
+            if "type" in kwargs:
+                updated_types.append(kwargs["type"])
+
+        with patch("app.database.get_task", return_value=_fake_db_task(task_id="opt-x")), \
+             patch("app.database.update_task", side_effect=_capture), \
+             patch("app.database.create_transition_result", MagicMock()), \
+             patch("app.agent.tools.set_task_git_cwd", MagicMock()), \
+             patch("app.agent.optimization.run_optimization_pipeline",
+                   side_effect=RuntimeError("pipeline crash")):
+            _run_optimization_task("opt-x", "http://localhost:8008/v1", "model")
+
+        assert "indev" in updated_types
+
+
+# ===========================================================================
+# _run_security_task unit tests
+# ===========================================================================
+
+class TestRunSecurityTask:
+    _SEC_PASS = {
+        "outcome": "passed",
+        "demotion_target": None,
+        "summary": "",
+        "total_prompt_tokens": 0,
+        "total_completion_tokens": 0,
+    }
+
+    def test_advances_to_full_review_on_security_pass(self):
+        from app.agent.scheduler import _run_security_task
+
+        updated_types = []
+
+        def _capture(task_id, **kwargs):
+            if "type" in kwargs:
+                updated_types.append(kwargs["type"])
+
+        with patch("app.database.get_task", return_value=_fake_db_task(task_id="sec-1", task_type="security")), \
+             patch("app.database.update_task", side_effect=_capture), \
+             patch("app.database.create_transition_result", MagicMock()), \
+             patch("app.agent.tools.set_task_git_cwd", MagicMock()), \
              patch("app.agent.security_review.run_security_pipeline",
                    return_value=self._SEC_PASS):
-            _run_optimization_security_task("opt-1", "http://localhost:8008/v1", "model")
+            _run_security_task("sec-1", "http://localhost:8008/v1", "model")
 
         assert "full_review" in updated_types
 
     def test_demotes_on_security_rejected(self):
-        from app.agent.scheduler import _run_optimization_security_task
+        from app.agent.scheduler import _run_security_task
 
         updated_types = []
 
@@ -675,22 +706,20 @@ class TestRunOptimizationSecurityTask:
         sec_fail = {"outcome": "rejected", "demotion_target": "indev",
                     "summary": "vuln found", "total_prompt_tokens": 0, "total_completion_tokens": 0}
 
-        with patch("app.database.get_task", return_value=_fake_db_task(task_id="opt-2")), \
+        with patch("app.database.get_task", return_value=_fake_db_task(task_id="sec-2")), \
              patch("app.database.update_task", side_effect=_capture), \
              patch("app.database.create_transition_result", MagicMock()), \
              patch("app.agent.tools.set_task_git_cwd", MagicMock()), \
-             patch("app.agent.optimization.run_optimization_pipeline",
-                   return_value=self._OPT_PASS), \
              patch("app.agent.security_review.run_security_pipeline",
                    return_value=sec_fail), \
              patch("app.agent.scheduler._record_demotion_inline", MagicMock()):
-            _run_optimization_security_task("opt-2", "http://localhost:8008/v1", "model")
+            _run_security_task("sec-2", "http://localhost:8008/v1", "model")
 
         assert "indev" in updated_types
         assert "full_review" not in updated_types
 
     def test_demotion_target_respected(self):
-        from app.agent.scheduler import _run_optimization_security_task
+        from app.agent.scheduler import _run_security_task
 
         updated_types = []
 
@@ -703,34 +732,30 @@ class TestRunOptimizationSecurityTask:
             "summary": "", "total_prompt_tokens": 0, "total_completion_tokens": 0,
         }
 
-        with patch("app.database.get_task", return_value=_fake_db_task(task_id="opt-3")), \
+        with patch("app.database.get_task", return_value=_fake_db_task(task_id="sec-3")), \
              patch("app.database.update_task", side_effect=_capture), \
              patch("app.database.create_transition_result", MagicMock()), \
              patch("app.agent.tools.set_task_git_cwd", MagicMock()), \
-             patch("app.agent.optimization.run_optimization_pipeline",
-                   return_value=self._OPT_PASS), \
              patch("app.agent.security_review.run_security_pipeline",
                    return_value=sec_opt_demotion), \
              patch("app.agent.scheduler._record_demotion_inline", MagicMock()):
-            _run_optimization_security_task("opt-3", "http://localhost:8008/v1", "model")
+            _run_security_task("sec-3", "http://localhost:8008/v1", "model")
 
         assert "optimization" in updated_types
         assert "full_review" not in updated_types
 
     def test_transition_result_recorded(self):
-        from app.agent.scheduler import _run_optimization_security_task
+        from app.agent.scheduler import _run_security_task
 
         mock_create_tr = MagicMock()
 
-        with patch("app.database.get_task", return_value=_fake_db_task(task_id="opt-4")), \
+        with patch("app.database.get_task", return_value=_fake_db_task(task_id="sec-4")), \
              patch("app.database.update_task", MagicMock()), \
              patch("app.database.create_transition_result", mock_create_tr), \
              patch("app.agent.tools.set_task_git_cwd", MagicMock()), \
-             patch("app.agent.optimization.run_optimization_pipeline",
-                   return_value=self._OPT_PASS), \
              patch("app.agent.security_review.run_security_pipeline",
                    return_value=self._SEC_PASS):
-            _run_optimization_security_task("opt-4", "http://localhost:8008/v1", "model")
+            _run_security_task("sec-4", "http://localhost:8008/v1", "model")
 
         mock_create_tr.assert_called_once()
         call_kwargs = mock_create_tr.call_args.kwargs
@@ -770,8 +795,7 @@ class TestRunFullReviewTask:
              patch("app.agent.tools.set_task_git_cwd", MagicMock()), \
              patch("app.agent.full_review.run_full_review_pipeline",
                    return_value=self._FR_FAIL), \
-             patch("app.agent.scheduler._record_demotion_inline", mock_record), \
-             patch("app.agent.scheduler._check_completion_rollup_inline", MagicMock()):
+             patch("app.agent.scheduler._record_demotion_inline", mock_record):
             _run_full_review_task("fr-1", "http://localhost:8008/v1", "model")
 
         assert "indev" in updated_types
@@ -887,98 +911,6 @@ class TestRunFullReviewTask:
         assert mock_append.call_args[0][1] == "merge_test_failed"
         assert "indev" not in updated_types
 
-
-# ===========================================================================
-# _check_completion_rollup_inline unit tests
-# ===========================================================================
-
-class TestCheckCompletionRollupInline:
-    def _rollup_task(self, task_id, parent_task_id=None, task_type="completed"):
-        t = MagicMock()
-        t.id = task_id
-        t.type = task_type
-        t.parent_task_id = parent_task_id
-        return t
-
-    def test_no_parent_is_noop(self):
-        from app.agent.scheduler import _check_completion_rollup_inline
-
-        task = self._rollup_task("t1", parent_task_id=None)
-        mock_update = MagicMock()
-
-        with patch("app.database.get_task", return_value=task), \
-             patch("app.database.update_task", mock_update):
-            _check_completion_rollup_inline("t1")
-
-        mock_update.assert_not_called()
-
-    def test_not_all_children_done_noop(self):
-        from app.agent.scheduler import _check_completion_rollup_inline
-
-        task = self._rollup_task("t1", parent_task_id="p1")
-        parent = self._rollup_task("p1", parent_task_id=None)
-        child_done = self._rollup_task("t1", task_type="completed")
-        child_indev = self._rollup_task("t2", task_type="indev")
-        mock_update = MagicMock()
-
-        def _get_task(task_id):
-            return {"t1": task, "p1": parent}.get(task_id)
-
-        with patch("app.database.get_task", side_effect=_get_task), \
-             patch("app.database.get_active_child_tasks", return_value=[child_done, child_indev]), \
-             patch("app.database.update_task", mock_update):
-            _check_completion_rollup_inline("t1")
-
-        mock_update.assert_not_called()
-
-    def test_all_children_completed_marks_parent(self):
-        from app.agent.scheduler import _check_completion_rollup_inline
-
-        task = self._rollup_task("t1", parent_task_id="p1")
-        parent = self._rollup_task("p1", parent_task_id=None)
-        child1 = self._rollup_task("t1", task_type="completed")
-        child2 = self._rollup_task("t2", task_type="completed")
-        mock_update = MagicMock()
-
-        def _get_task(task_id):
-            return {"t1": task, "p1": parent}.get(task_id)
-
-        with patch("app.database.get_task", side_effect=_get_task), \
-             patch("app.database.get_active_child_tasks", return_value=[child1, child2]), \
-             patch("app.database.update_task", mock_update):
-            _check_completion_rollup_inline("t1")
-
-        mock_update.assert_called_once_with("p1", type="completed")
-
-    def test_recursive_grandparent_rollup(self):
-        from app.agent.scheduler import _check_completion_rollup_inline
-
-        task = self._rollup_task("t1", parent_task_id="p1")
-        parent = self._rollup_task("p1", parent_task_id="gp1")
-        grandparent = self._rollup_task("gp1", parent_task_id=None)
-        child_of_p = [self._rollup_task("t1", task_type="completed")]
-        child_of_gp = [self._rollup_task("p1", task_type="completed")]
-        mock_update = MagicMock()
-
-        def _get_task(task_id):
-            return {"t1": task, "p1": parent, "gp1": grandparent}.get(task_id)
-
-        def _get_children(parent_id):
-            if parent_id == "p1":
-                return child_of_p
-            if parent_id == "gp1":
-                return child_of_gp
-            return []
-
-        with patch("app.database.get_task", side_effect=_get_task), \
-             patch("app.database.get_active_child_tasks", side_effect=_get_children), \
-             patch("app.database.update_task", mock_update):
-            _check_completion_rollup_inline("t1")
-
-        assert mock_update.call_count == 2
-        update_ids = [c.args[0] for c in mock_update.call_args_list]
-        assert "p1" in update_ids
-        assert "gp1" in update_ids
 
 
 # ===========================================================================

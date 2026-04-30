@@ -199,7 +199,7 @@ class DevOrchestrator:
                 )
                 total_prompt += fix_tokens_p
                 total_completion += fix_tokens_c
-                
+
                 if signalled_redesign:
                     logger.warning("[dev_orch] Test-fix loop %d signalled NEEDS_REDESIGN.", fix_attempt)
                     return DevOrchestratorResult(
@@ -327,7 +327,7 @@ class DevOrchestrator:
 
             if result.status == "ACCEPTED":
                 return result
-                
+
             if result.status == "TIMEOUT":
                 logger.info("[dev_orch] Component '%s' timed out. Triggering inline research.", component_name)
                 try:
@@ -469,13 +469,13 @@ class DevOrchestrator:
                                     redesign_needed = True
                         except Exception as exc:
                             result_str = f"Error: {exc}"
-                        
+
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tc["id"],
                             "content": result_str[:4000],
                         })
-                    
+
                     if terminal_found:
                         break
                 elif not content:

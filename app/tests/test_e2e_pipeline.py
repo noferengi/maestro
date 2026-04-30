@@ -92,6 +92,26 @@ def _sec_response_content(verdict: str, pt: int = 50, ct: int = 100) -> str:
     })
 
 
+def _submit_work_response(verdict: str, pt: int = 50, ct: int = 5):
+    """Build a submit_work tool-call response for security/conceptual/full-review pipelines."""
+    from app.agent.mock_llm import MockLLM
+    signal = "REVERT_TO_DESIGN" if verdict == "REJECTED" else "ACCEPTED"
+    return MockLLM._tool_call_response(
+        "submit_work",
+        {
+            "signal": signal,
+            "summary": "ok",
+            "payload": {
+                "verdict": verdict,
+                "confidence": 90 if verdict == "LIKELY" else 20,
+                "findings": [],
+            },
+        },
+        prompt_tokens=pt,
+        completion_tokens=ct,
+    )
+
+
 def _make_security_mock_llm(*verdicts, pt=50, ct=100):
     """
     Build a MockLLM with a fixed queue of security-formatted responses.
@@ -101,11 +121,7 @@ def _make_security_mock_llm(*verdicts, pt=50, ct=100):
 
     ml = MockLLM(scenario="pass")  # bootstrap valid internal state
     ml._response_queue = [
-        MockLLM._text_response(
-            _sec_response_content(v, pt=pt, ct=ct),
-            prompt_tokens=pt,
-            completion_tokens=ct,
-        )
+        _submit_work_response(v, pt=pt, ct=ct)
         for v in verdicts
     ]
     ml._queue_index = 0
@@ -384,11 +400,7 @@ def _make_conceptual_mock_llm(*verdicts, pt=50, ct=100):
 
     ml = MockLLM(scenario="pass")
     ml._response_queue = [
-        MockLLM._text_response(
-            json.dumps({"verdict": v, "confidence": 90, "justification": "ok", "severity": "low"}),
-            prompt_tokens=pt,
-            completion_tokens=ct,
-        )
+        _submit_work_response(v, pt=pt, ct=ct)
         for v in verdicts
     ]
     ml._queue_index = 0
@@ -401,11 +413,7 @@ def _make_full_review_mock_llm(*verdicts, pt=50, ct=100):
 
     ml = MockLLM(scenario="pass")
     ml._response_queue = [
-        MockLLM._text_response(
-            json.dumps({"verdict": v, "confidence": 90, "justification": "ok"}),
-            prompt_tokens=pt,
-            completion_tokens=ct,
-        )
+        _submit_work_response(v, pt=pt, ct=ct)
         for v in verdicts
     ]
     ml._queue_index = 0
@@ -443,18 +451,11 @@ class TestConceptualReviewPipelineE2E:
         from app.agent.mock_llm import MockLLM
 
         ml = MockLLM(scenario="pass")
-        high_sev = json.dumps({
-            "verdict": "REJECTED",
-            "confidence": 20,
-            "justification": "critical issue",
-            "severity": "high",
-        })
-        ok = json.dumps({"verdict": "LIKELY", "confidence": 90, "justification": "ok", "severity": "low"})
         ml._response_queue = [
-            MockLLM._text_response(high_sev),
-            MockLLM._text_response(ok),
-            MockLLM._text_response(ok),
-            MockLLM._text_response(ok),
+            _submit_work_response("REJECTED"),
+            _submit_work_response("LIKELY"),
+            _submit_work_response("LIKELY"),
+            _submit_work_response("LIKELY"),
         ]
         ml._queue_index = 0
         result = self._run_conceptual(ml)
@@ -561,7 +562,8 @@ class TestSchedulerFullChainE2E:
     def test_full_chain_conceptual_to_full_review(self):
         from app.agent.scheduler import (
             _run_conceptual_review_task,
-            _run_optimization_security_task,
+            _run_optimization_task,
+            _run_security_task,
         )
 
         updated_types = []
@@ -594,9 +596,11 @@ class TestSchedulerFullChainE2E:
                                  "total_prompt_tokens": 0, "total_completion_tokens": 0}), \
              patch("app.agent.scheduler._record_demotion_inline", MagicMock()):
             _run_conceptual_review_task("chain-t", "http://localhost:8008/v1", "model")
-            _run_optimization_security_task("chain-t", "http://localhost:8008/v1", "model")
+            _run_optimization_task("chain-t", "http://localhost:8008/v1", "model")
+            _run_security_task("chain-t", "http://localhost:8008/v1", "model")
 
         assert "optimization" in updated_types
+        assert "security" in updated_types
         assert "full_review" in updated_types
 
     def test_full_chain_merge_virtual_passed_records_ready_for_review(self):
@@ -626,7 +630,7 @@ class TestSchedulerFullChainE2E:
         assert mock_append.call_args[0][1] == "ready_for_review"
 
     def test_full_chain_security_failure_stops_chain(self):
-        from app.agent.scheduler import _run_optimization_security_task
+        from app.agent.scheduler import _run_security_task
 
         updated_types = []
 
@@ -636,19 +640,16 @@ class TestSchedulerFullChainE2E:
 
         mock_record = MagicMock()
 
-        with patch("app.database.get_task", return_value=_fake_db_task_e2e(task_id="sec-fail")), \
+        with patch("app.database.get_task", return_value=_fake_db_task_e2e(task_id="sec-fail", task_type="security")), \
              patch("app.database.update_task", side_effect=_capture), \
              patch("app.database.create_transition_result", MagicMock()), \
              patch("app.agent.tools.set_task_git_cwd", MagicMock()), \
-             patch("app.agent.optimization.run_optimization_pipeline",
-                   return_value={"outcome": "optimized",
-                                 "total_prompt_tokens": 0, "total_completion_tokens": 0}), \
              patch("app.agent.security_review.run_security_pipeline",
                    return_value={"outcome": "rejected", "demotion_target": "indev",
                                  "summary": "vuln found",
                                  "total_prompt_tokens": 0, "total_completion_tokens": 0}), \
              patch("app.agent.scheduler._record_demotion_inline", mock_record):
-            _run_optimization_security_task("sec-fail", "http://localhost:8008/v1", "model")
+            _run_security_task("sec-fail", "http://localhost:8008/v1", "model")
 
         assert "indev" in updated_types
         mock_record.assert_called_once()

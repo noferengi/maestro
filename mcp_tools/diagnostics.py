@@ -8,13 +8,69 @@ from .helpers import (
 )
 
 
-def diagnose_task(task_id: str) -> dict:
+def _infer_phase(task_id: str, conn) -> str:
+    """Infer current pipeline sub-phase from the last budget entry's agent_name."""
+    last = conn.execute(
+        "SELECT agent_name, tool_calls FROM budget_entries "
+        "WHERE task_id=? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not last:
+        return "waiting_for_llm_slot"
+    name = last["agent_name"] or ""
+    has_tools = bool(last["tool_calls"] and last["tool_calls"] not in ("[]", "null", ""))
+    if "[" in name:
+        return "design_sub_agents"
+    if "Planning Pipeline" in name:
+        return "surveying" if has_tools else "consolidating"
+    if "Component Loop" in name:
+        return "implementing"
+    if "PlanningCorrection" in name or "planning_correction" in name.lower():
+        return "correcting"
+    return "running"
+
+
+def _latest_planning_result(task_id: str, conn) -> dict | None:
+    """Return latest non-superseded planning result, falling back to latest overall."""
+    pr = conn.execute(
+        "SELECT id, status, correction_attempts, gate_checks, created_at "
+        "FROM planning_results WHERE task_id=? AND status != 'superseded' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not pr:
+        pr = conn.execute(
+            "SELECT id, status, correction_attempts, gate_checks, created_at "
+            "FROM planning_results WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    if not pr:
+        return None
+    raw_checks = parse_json_field(pr["gate_checks"])
+    return {
+        "result_id": pr["id"],
+        "status": pr["status"],
+        "correction_attempts": pr["correction_attempts"],
+        "gate_checks": raw_checks if isinstance(raw_checks, list) else [],
+        "created_at": pr["created_at"],
+    }
+
+
+def diagnose_task(task_id: str, since_entry_id: int = None) -> dict:
     """
     Complete diagnostic snapshot for a single task.
 
-    Returns current type, active/recent agent sessions, last 15 budget entries
-    with finish_reason pre-extracted, planning gate history, correction agent
-    history, and an activity_status summary. Replaces 4+ separate DB queries.
+    Returns current type, active/recent agent sessions (each with a
+    current_phase field inferred from the last LLM call), last 15 budget
+    entries with finish_reason pre-extracted, planning gate history,
+    correction agent history, cycle_counts rollup, and an activity_status
+    summary. Replaces 4+ separate DB queries.
+
+    since_entry_id: when provided, returns a lightweight delta instead of
+    the full snapshot. Only budget entries with id > since_entry_id are
+    returned (as new_budget_entries). Static sections (gate_history,
+    transitions, recent_sessions, correction_sessions) are omitted. Useful
+    for polling loops where re-reading unchanged history wastes context.
+    The response includes delta=True so the caller can distinguish.
     """
     conn = get_conn()
     try:
@@ -35,15 +91,73 @@ def diagnose_task(task_id: str) -> dict:
             "prerequisites": parse_json_field(task_row["prerequisites"]),
         }
 
-        # Active sessions (no ended_at)
+        # Active sessions — with inferred current_phase
         active_rows = conn.execute(
             "SELECT agent_type, started_at FROM agent_sessions "
             "WHERE task_id=? AND ended_at IS NULL ORDER BY id DESC",
             (task_id,),
         ).fetchall()
-        active_sessions = [dict(r) for r in active_rows]
+        active_sessions = []
+        for r in active_rows:
+            session = dict(r)
+            session["current_phase"] = _infer_phase(task_id, conn)
+            active_sessions.append(session)
 
-        # Recent completed sessions (last 10)
+        # Budget trace — delta or full
+        if since_entry_id is not None:
+            budget_rows = conn.execute(
+                "SELECT id, agent_name, prompt_cost, generation_cost, response_data, created_at "
+                "FROM budget_entries WHERE task_id=? AND id > ? ORDER BY id DESC",
+                (task_id, since_entry_id),
+            ).fetchall()
+        else:
+            budget_rows = conn.execute(
+                "SELECT id, agent_name, prompt_cost, generation_cost, response_data, created_at "
+                "FROM budget_entries WHERE task_id=? ORDER BY id DESC LIMIT 15",
+                (task_id,),
+            ).fetchall()
+        budget_trace = []
+        for b in budget_rows:
+            fields = extract_response_fields(b["response_data"])
+            budget_trace.append({
+                "id": b["id"],
+                "agent_name": b["agent_name"],
+                "prompt_cost": b["prompt_cost"],
+                "generation_cost": b["generation_cost"],
+                "created_at": b["created_at"],
+                **fields,
+            })
+
+        # Activity status — always reflects all-time last entry (not just delta window)
+        if active_sessions:
+            last_any = (
+                budget_trace[0] if budget_trace else
+                conn.execute(
+                    "SELECT created_at FROM budget_entries WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+            )
+            if last_any:
+                t = last_any["created_at"] if isinstance(last_any, dict) else last_any["created_at"]
+                activity_status = f"active — last LLM call at {t}"
+            else:
+                activity_status = "active — no budget entries yet (survey or waiting for slot)"
+        else:
+            activity_status = "idle"
+
+        # Delta mode — slim response, skip static sections
+        if since_entry_id is not None:
+            return {
+                "delta": True,
+                "since_entry_id": since_entry_id,
+                "task": {"id": task["id"], "title": task["title"], "type": task["type"]},
+                "active_sessions": active_sessions,
+                "planning": _latest_planning_result(task_id, conn),
+                "new_budget_entries": budget_trace,
+                "activity_status": activity_status,
+            }
+
+        # Full mode
         recent_rows = conn.execute(
             "SELECT agent_type, exit_reason, exit_summary, started_at, ended_at "
             "FROM agent_sessions WHERE task_id=? AND ended_at IS NOT NULL "
@@ -52,24 +166,6 @@ def diagnose_task(task_id: str) -> dict:
         ).fetchall()
         recent_sessions = [dict(r) for r in recent_rows]
 
-        # Latest planning_result
-        pr = conn.execute(
-            "SELECT id, status, correction_attempts, gate_checks, created_at "
-            "FROM planning_results WHERE task_id=? ORDER BY id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        planning = None
-        if pr:
-            raw_checks = parse_json_field(pr["gate_checks"])
-            planning = {
-                "result_id": pr["id"],
-                "status": pr["status"],
-                "correction_attempts": pr["correction_attempts"],
-                "gate_checks": raw_checks if isinstance(raw_checks, list) else [],
-                "created_at": pr["created_at"],
-            }
-
-        # Gate transition history (last 5)
         gate_rows = conn.execute(
             "SELECT outcome, vote_summary, created_at FROM transition_results "
             "WHERE task_id=? AND transition='planning_gate' ORDER BY id DESC LIMIT 5",
@@ -84,7 +180,6 @@ def diagnose_task(task_id: str) -> dict:
                 "checks": checks,
             })
 
-        # All transition history (last 8, for full pipeline picture)
         tr_rows = conn.execute(
             "SELECT transition, outcome, substr(vote_summary, 1, 300), created_at "
             "FROM transition_results WHERE task_id=? ORDER BY id DESC LIMIT 8",
@@ -95,25 +190,6 @@ def diagnose_task(task_id: str) -> dict:
             for r in tr_rows
         ]
 
-        # Budget trace (last 15, finish_reason extracted)
-        budget_rows = conn.execute(
-            "SELECT id, agent_name, prompt_cost, generation_cost, response_data, created_at "
-            "FROM budget_entries WHERE task_id=? ORDER BY id DESC LIMIT 15",
-            (task_id,),
-        ).fetchall()
-        budget_trace = []
-        for b in budget_rows:
-            fields = extract_response_fields(b["response_data"])
-            budget_trace.append({
-                "id": b["id"],
-                "agent_name": b["agent_name"],
-                "prompt_cost": b["prompt_cost"],
-                "generation_cost": b["generation_cost"],
-                "created_at": b["created_at"],
-                **fields,
-            })
-
-        # Correction agent sessions
         corr_rows = conn.execute(
             "SELECT exit_reason, exit_summary, started_at, ended_at "
             "FROM agent_sessions WHERE task_id=? AND agent_type='planning_correction' "
@@ -122,25 +198,24 @@ def diagnose_task(task_id: str) -> dict:
         ).fetchall()
         correction_sessions = [dict(r) for r in corr_rows]
 
-        # Activity status
-        if active_sessions:
-            if budget_trace:
-                last_entry_time = budget_trace[0]["created_at"]
-                activity_status = f"active — last LLM call at {last_entry_time}"
-            else:
-                activity_status = "active — no budget entries yet (survey or waiting for slot)"
-        else:
-            activity_status = "idle"
+        # Cycle counts — completed sessions grouped by agent_type
+        cycle_rows = conn.execute(
+            "SELECT agent_type, COUNT(*) AS count FROM agent_sessions "
+            "WHERE task_id=? AND ended_at IS NOT NULL GROUP BY agent_type ORDER BY count DESC",
+            (task_id,),
+        ).fetchall()
+        cycle_counts = {r["agent_type"]: r["count"] for r in cycle_rows}
 
         return {
             "task": task,
             "active_sessions": active_sessions,
             "recent_sessions": recent_sessions,
             "transitions": transitions,
-            "planning": planning,
+            "planning": _latest_planning_result(task_id, conn),
             "gate_history": gate_history,
             "budget_trace": budget_trace,
             "correction_sessions": correction_sessions,
+            "cycle_counts": cycle_counts,
             "activity_status": activity_status,
         }
     finally:

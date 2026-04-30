@@ -26,13 +26,10 @@ from app.agent.config import (
     PROJECT_ROOT,
     SIGNAL_ACCEPTED,
     SIGNAL_REVERT,
-    SIGNAL_NEEDS_RESEARCH,
-    SIGNAL_CONTEXT_TOO_LARGE,
     GIT_SAFETY_BRANCH_PREFIX,
     INDEV_AGENT_TOOLS,
     check_context_saturation,
 )
-from app.agent.json_utils import extract_json_block
 from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
 from app.agent.system_prompt import MAESTRO_SYSTEM_PROMPT
 from app.agent.tools import TOOL_SCHEMAS, dispatch_tool, async_dispatch_tool, build_tool_schemas
@@ -216,6 +213,9 @@ class MaestroLoop:
             self._turn += 1
             _LOOP_STATUS[self.task_id]["turns"] = self._turn
             logger.debug("Task '%s' - turn %d/%d", self.task_id, self._turn, self.max_turns)
+            
+            # Reset terminal signal for this turn
+            self._terminal_signal = None
 
             # ── LLM call ──────────────────────────────────────────────
             try:
@@ -248,33 +248,13 @@ class MaestroLoop:
             tool_calls = assistant_message.get("tool_calls") or []
             content = assistant_message.get("content") or ""
 
-            # ── Check for terminal / research signal in content ────────
-            signal = self._extract_signal(content)
-            if signal:
-                sig_type = signal.get("signal")
-                if sig_type in (SIGNAL_ACCEPTED, SIGNAL_REVERT):
-                    return self._handle_terminal(signal)
-                if sig_type == SIGNAL_NEEDS_RESEARCH:
-                    research_result = await self._handle_needs_research(signal)
-                    self._messages.append({
-                        "role": "user",
-                        "content": (
-                            "[SYSTEM] Research agent completed.\n"
-                            f"Verdict: {research_result.get('verdict', 'unknown')}\n"
-                            f"Findings:\n{research_result.get('findings', 'No findings.')}\n\n"
-                            "Continue your work incorporating these findings."
-                        ),
-                    })
-                    self._consecutive_errors = 0
-                    continue
-                if sig_type == SIGNAL_CONTEXT_TOO_LARGE:
-                    return self._revert_result(
-                        "Agent signalled CONTEXT_TOO_LARGE — task scope exceeds context budget."
-                    )
-
             if tool_calls:
                 tool_result_messages = await self._handle_tool_calls(tool_calls)
                 self._messages.extend(tool_result_messages)
+                
+                # Check for terminal signal from submit_work tool call
+                if hasattr(self, "_terminal_signal") and self._terminal_signal:
+                    return self._handle_terminal(self._terminal_signal)
                 
                 # Check for timeouts in tool results
                 has_timeout = any(
@@ -282,27 +262,16 @@ class MaestroLoop:
                     for msg in tool_result_messages
                 )
                 if has_timeout:
-                    logger.info("MaestroLoop detected shell timeout for task '%s' - triggering research.", self.task_id)
-                    research_signal = {
-                        "signal": SIGNAL_NEEDS_RESEARCH,
-                        "question": (
-                            "The last shell command timed out. Investigate the source code and tests "
-                            "to see if there is an infinite loop, a deadlock, or a high-complexity "
-                            "algorithm (like naive Fibonacci) being called with large inputs in a test."
-                        ),
-                        "context": "A shell command timed out during implementation."
-                    }
-                    research_result = await self._handle_needs_research(research_signal)
+                    logger.info("MaestroLoop detected shell timeout for task '%s'.", self.task_id)
                     self._messages.append({
                         "role": "user",
                         "content": (
-                            "[SYSTEM] The shell command timed out, and a Research Agent was triggered to investigate.\n"
-                            f"Verdict: {research_result.get('verdict', 'unknown')}\n"
-                            f"Findings:\n{research_result.get('findings', 'No findings.')}\n\n"
-                            "Based on these findings, fix the implementation or the tests to avoid the timeout."
+                            "[SYSTEM] The last shell command timed out. "
+                            "Call spawn_research_agent to investigate the source code and tests "
+                            "for infinite loops, deadlocks, or high-complexity algorithms called "
+                            "with large inputs. Then fix the implementation based on the findings."
                         ),
                     })
-                    # Reset consecutive errors since we've handled the timeout with research
                     self._consecutive_errors = 0
                     continue
 
@@ -320,13 +289,13 @@ class MaestroLoop:
                         )
                 continue
 
-            # ── No tool calls and no signal - nudge the agent ─────────
-            if not tool_calls and not signal:
+            # ── No tool calls — nudge the agent ───────────────────────
+            if not tool_calls:
                 self._messages.append({
                     "role": "user",
                     "content": (
                         "[SYSTEM] You did not call any tool and did not emit a terminal signal. "
-                        "You must either call a tool to make progress or emit your final JSON report. "
+                        "The ONLY way to complete your task is by calling the 'submit_work' tool. "
                         "Do not output free-form prose as a terminal action."
                     ),
                 })
@@ -509,6 +478,16 @@ class MaestroLoop:
                 llm_model=self.llm_model,
             )
 
+            # Check for terminal signal from submit_work
+            if isinstance(result_content, str) and "__maestro_terminal__" in result_content:
+                try:
+                    terminal_data = json.loads(result_content)
+                    if terminal_data.get("__maestro_terminal__"):
+                        # We store the terminal signal to be picked up by the main loop
+                        self._terminal_signal = terminal_data
+                except Exception:
+                    pass
+
             result_messages.append({
                 "role": "tool",
                 "tool_call_id": tool_id,
@@ -528,87 +507,6 @@ class MaestroLoop:
         triggering a REVERT_TO_DESIGN signal.
         """
         return self._consecutive_errors >= MAX_CONSECUTIVE_ERRORS
-
-    # ------------------------------------------------------------------
-    # Terminal signal extraction
-    # ------------------------------------------------------------------
-
-    def _extract_signal(self, content: str) -> dict | None:
-        """
-        Scan the assistant content for a JSON signal dict.
-        Recognizes ACCEPTED, REVERT_TO_DESIGN, and NEEDS_RESEARCH.
-        Returns the parsed dict if found, else None.
-        """
-        if not content:
-            return None
-        for attempt in [content, extract_json_block(content)]:
-            if not attempt:
-                continue
-            try:
-                parsed = json.loads(attempt.strip())
-                if isinstance(parsed, dict) and "signal" in parsed:
-                    sig = parsed["signal"]
-                    if sig in (SIGNAL_ACCEPTED, SIGNAL_REVERT, SIGNAL_NEEDS_RESEARCH, SIGNAL_CONTEXT_TOO_LARGE):
-                        return parsed
-            except (json.JSONDecodeError, ValueError):
-                continue
-        return None
-
-
-    # ------------------------------------------------------------------
-    # NEEDS_RESEARCH handler
-    # ------------------------------------------------------------------
-
-    async def _handle_needs_research(self, signal_dict: dict) -> dict:
-        """
-        Run a research agent inline, record the job, and return findings.
-        The loop continues after this - it is not a terminal action.
-        """
-        from app.agent.research import run_research
-        from app.database import create_research_job, update_research_job
-
-        question = signal_dict.get("question", "What do I need to investigate?")
-        context_str = signal_dict.get("context", "")
-
-        job = create_research_job(
-            task_id=self.task_id,
-            question=question,
-            context=json.dumps({"question": question, "context": context_str}),
-            priority=0.0,  # inline = highest priority
-            depth=0,
-            llm_id=self.llm_id,
-            budget_id=self.budget_id,
-        )
-
-        try:
-            if job:
-                update_research_job(job.id, status="running")
-            result = await run_research(
-                question=question,
-                context={"question": question, "task_context": context_str},
-                task_id=self.task_id,
-                llm_id=self.llm_id,
-                budget_id=self.budget_id,
-                llm_base_url=self.llm_base_url,
-                llm_model=self.llm_model,
-            )
-            if job:
-                update_research_job(
-                    job.id, status="completed",
-                    verdict=json.dumps(result.vote),
-                    findings=result.findings,
-                    lives_used=result.lives_used,
-                    prompt_tokens=result.prompt_tokens,
-                    completion_tokens=result.completion_tokens,
-                )
-            return result.vote | {"findings": result.findings}
-        except Exception as exc:
-            logger.exception(
-                "Research job failed for task '%s': %s", self.task_id, exc
-            )
-            if job:
-                update_research_job(job.id, status="failed", findings=str(exc))
-            return {"verdict": "ERROR", "findings": f"Research failed: {exc}"}
 
     # ------------------------------------------------------------------
     # Terminal handlers

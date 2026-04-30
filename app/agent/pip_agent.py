@@ -46,15 +46,18 @@ Focus on:
 2. Preventing regressions related to these failures.
 3. Structural or quality improvements that were missing.
 
-Format your response as a JSON object with a single key "requirements" containing an array of strings.
-Example:
-{{
-  "requirements": [
-    "Ensure all error paths in the authentication controller log at level ERROR.",
-    "Implement unit tests covering the edge case of empty JWT payloads.",
-    "Refactor the session middleware to use a thread-safe connection pool."
-  ]
-}}
+To complete your report, call the submit_work tool with:
+submit_work(
+  signal="ACCEPTED",
+  summary="<one-line summary of the PIP>",
+  payload={{
+    "requirements": [
+      "Ensure all error paths in the authentication controller log at level ERROR.",
+      "Implement unit tests covering the edge case of empty JWT payloads.",
+      "Refactor the session middleware to use a thread-safe connection pool."
+    ]
+  }}
+)
 """
 
 PIP_PREFLIGHT_PROMPT = """
@@ -74,14 +77,18 @@ Has this PIP requirement been meaningfully addressed in the code and/or document
 Be rigorous. A requirement is only satisfied if there is concrete evidence in the diff
 or current snapshot — not just intent or comments.
 
-Respond with JSON only:
-{{
-  "outcome": "passed" or "failed",
-  "summary": "One sentence verdict.",
-  "findings": [
-    {{"requirement": "...", "status": "satisfied" or "missing", "detail": "..."}}
-  ]
-}}
+To complete your verification, call the submit_work tool with:
+submit_work(
+  signal="ACCEPTED",
+  summary="<one-sentence verdict>",
+  payload={{
+    "outcome": "passed" or "failed",
+    "summary": "One sentence verdict.",
+    "findings": [
+      {{"requirement": "...", "status": "satisfied" or "missing", "detail": "..."}}
+    ]
+  }}
+)
 """
 
 
@@ -158,15 +165,40 @@ async def generate_pip(
         reason=reason,
     )
 
+    from app.agent.tools import build_tool_schemas, dispatch_tool
+    pip_tools = build_tool_schemas(["submit_work"])
+
     try:
-        response_text, stats = await call_llm(
+        response, stats = await call_llm(
             messages=[{"role": "user", "content": prompt}],
             llm_id=llm_id or task.llm_id,
             budget_id=budget_id or task.budget_id,
-            response_format={"type": "json_object"},
+            tools=pip_tools,
+            tool_choice="auto",
         )
 
-        data = json.loads(response_text)
+        assistant_msg = response.get("choices", [{}])[0].get("message", {})
+        tool_calls = assistant_msg.get("tool_calls") or []
+        
+        data = None
+        if tool_calls:
+            for tc in tool_calls:
+                tc_result = dispatch_tool(
+                    tc["function"]["name"],
+                    json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                )
+                if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
+                    data = json.loads(tc_result).get("payload")
+                    break
+        
+        if data is None:
+            # Fallback
+            from app.agent.llm_client import extract_text_response
+            response_text = extract_text_response(response)
+            from app.agent.json_utils import extract_json_block
+            raw = extract_json_block(response_text) or response_text
+            data = json.loads(raw)
+
         requirements = json.dumps(data.get("requirements", []))
 
         pip = create_pip(
@@ -216,14 +248,39 @@ async def _check_single_pip(
         snapshot=snapshot,
     )
 
+    from app.agent.tools import build_tool_schemas, dispatch_tool
+    pip_tools = build_tool_schemas(["submit_work"])
+
     try:
-        response_text, _ = await call_llm(
+        response, _ = await call_llm(
             messages=[{"role": "user", "content": prompt}],
             llm_id=llm_id,
             budget_id=budget_id,
-            response_format={"type": "json_object"},
+            tools=pip_tools,
+            tool_choice="auto",
         )
-        data = json.loads(response_text)
+
+        assistant_msg = response.get("choices", [{}])[0].get("message", {})
+        tool_calls = assistant_msg.get("tool_calls") or []
+        
+        data = None
+        if tool_calls:
+            for tc in tool_calls:
+                tc_result = dispatch_tool(
+                    tc["function"]["name"],
+                    json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                )
+                if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
+                    data = json.loads(tc_result).get("payload")
+                    break
+        
+        if data is None:
+            # Fallback
+            from app.agent.llm_client import extract_text_response
+            response_text = extract_text_response(response)
+            from app.agent.json_utils import extract_json_block
+            raw = extract_json_block(response_text) or response_text
+            data = json.loads(raw)
         return {
             "pip_id": pip.id,
             "outcome": data.get("outcome", "failed"),

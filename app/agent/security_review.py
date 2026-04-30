@@ -339,19 +339,16 @@ class SecurityPipeline:
             f"Task being reviewed: {self.task_description}\n\n"
             "Analyze for security issues. You may use tools to inspect code files. "
             "For each finding, classify severity as critical/high/medium/low.\n\n"
-            "Output JSON: {\n"
-            "  \"verdict\": \"LIKELY|POSSIBLE|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED\",\n"
-            "  \"confidence\": <0-100>,\n"
-            "  \"justification\": \"...\",\n"
-            "  \"findings\": [{\"type\": \"...\", \"severity\": \"critical|high|medium|low\", "
-            "\"description\": \"...\", \"demotion_target\": \"development|planning|optimization\"}],\n"
-            "  \"critical_count\": 0,\n"
-            "  \"high_count\": 0\n"
-            "}"
+            "To complete your review, call the submit_work tool with:\n"
+            "- signal: 'ACCEPTED' if the implementation is secure, or 'REJECTED' if there are critical vulnerabilities.\n"
+            "- summary: Your justification.\n"
+            "- payload: {\"verdict\": \"LIKELY|POSSIBLE|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED\", "
+            "\"confidence\": <0-100>, \"findings\": [{\"type\": \"...\", \"severity\": \"critical|high|medium|low\", "
+            "\"description\": \"...\", \"demotion_target\": \"development|planning|optimization\"}]}"
         )
 
         messages: list[dict] = [
-            {"role": "system", "content": "You are a security expert. Output your verdict as JSON when ready."},
+            {"role": "system", "content": "You are a security expert. Use submit_work to output your verdict when ready."},
             {"role": "user", "content": prompt},
         ]
 
@@ -415,36 +412,36 @@ class SecurityPipeline:
                         "name": tc["function"]["name"],
                         "content": tc_result,
                     })
-                continue
 
-            raw = extract_json_block(content)
-            if raw:
-                try:
-                    data = json.loads(raw)
-                    if "verdict" in data:
-                        verdict_str = data.get("verdict", "POSSIBLE").upper()
-                        verdict = Verdict(verdict_str)
-                        confidence = int(data.get("confidence", 80))
-                        lo, hi = verdict.confidence_range
-                        confidence = max(lo, min(hi, confidence))
-                        justification = data.get("justification", "")
-                        findings = data.get("findings", [])
-                        vote = Vote(
-                            stage=f"security_{reviewer['type']}",
-                            verdict=verdict,
-                            confidence=confidence,
-                            justification=justification,
-                            model=self.llm_model or "",
-                        )
-                        return vote, findings
-                except (json.JSONDecodeError, ValueError):
-                    pass
+                    # Check for terminal signal from submit_work
+                    if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
+                        try:
+                            data = json.loads(tc_result)
+                            payload = data.get("payload", {})
+                            verdict_str = payload.get("verdict", "POSSIBLE").upper()
+                            verdict = Verdict(verdict_str)
+                            confidence = int(payload.get("confidence", 80))
+                            lo, hi = verdict.confidence_range
+                            confidence = max(lo, min(hi, confidence))
+                            justification = data.get("summary", "")
+                            findings = payload.get("findings", [])
+                            vote = Vote(
+                                stage=f"security_{reviewer['type']}",
+                                verdict=verdict,
+                                confidence=confidence,
+                                justification=justification,
+                                model=self.llm_model or "",
+                            )
+                            return vote, findings
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                continue
 
             turns_remaining = max_turns - turn - 1
             if turns_remaining <= 2:
                 messages.append({
                     "role": "user",
-                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Output JSON verdict now.",
+                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Call submit_work with your verdict now.",
                 })
 
         # Fallback: turns exhausted

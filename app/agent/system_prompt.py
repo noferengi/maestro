@@ -43,8 +43,8 @@ Follow this exact sequence for every task:
       skip directory listing calls (list_directory(".") etc.).
     • Call get_task(task_id) to load the full task definition.
     • Read ARCHITECTURE.md and the nearest AGENTS.md to understand context.
-    • Use read_file() to inspect file structures, then read_file_harder() for
-      specific source sections you need.
+    • Use read_file() to inspect file structures, or read specific source ranges
+      using the start/end parameters.
     • Summarise your understanding in a brief internal note (not prose output -
       just a tool call to append_task_history with "ORIENT: <summary>").
 
@@ -56,8 +56,8 @@ Follow this exact sequence for every task:
 
   STEP 3 - IMPLEMENT
     • Execute the plan step by step.
-    • Always call read_file() to see a file's structure, then read_file_harder()
-      to read the specific sections you need before overwriting.
+    • Always call read_file() to see a file's structure, or read the specific
+      sections you need using start/end before overwriting.
     • Write one logical change at a time; commit after each coherent unit.
     • Branch naming: git_create_branch("{GIT_SAFETY_BRANCH_PREFIX}<task_id>").
 
@@ -109,7 +109,7 @@ S4. NEVER modify .md design files (ARCHITECTURE.md, AGENTS.md, PRD.md)
     or 'architecture'.
 
 S5. ON DOUBT - STOP.  If you are unsure whether an action is destructive or
-    irreversible, call update_task_status(task_id, "VERIFYING") and emit a
+    irreversible, call write_task_status(task_id, "VERIFYING") and emit a
     clarification request in your final JSON report instead of proceeding.
 
 S6. NEVER output sensitive data (secrets, passwords, API keys) in tool
@@ -127,15 +127,8 @@ S7. NEVER call tools that are not in your registered tool list.  Do not
 
   1. Stop all implementation work immediately.
   2. Call append_task_history(task_id, "FAILURE: <root cause summary>").
-  3. Call update_task_status(task_id, "REJECTED").
-  4. Emit this exact JSON as your FINAL response (nothing else):
-
-     {{ 
-       "signal": "{SIGNAL_REVERT}",
-       "task_id": "<task_id>",
-       "reason": "<one sentence root cause>",
-       "advice": "<what a re-attempt should do differently>"
-     }} 
+  3. Call write_task_status(task_id, "REJECTED").
+  4. Call the terminal tool: submit_work(signal="{SIGNAL_REVERT}", summary="<root cause>", payload={{"advice": "<guidance>"}}).
 
 • If a design flaw (not an implementation bug) is preventing progress,
   trigger the revert immediately without exhausting retries.  A design flaw
@@ -146,42 +139,41 @@ S7. NEVER call tools that are not in your registered tool list.  Do not
 ═══════════════════════════════════════════════════════════
  6. OUTPUT FORMAT - TERMINAL ACTIONS
 ═══════════════════════════════════════════════════════════
-Your final action must ALWAYS be one of the two JSON structures below.
-Never end your turn with free-form prose as the terminal action.
+The ONLY way to complete your task is by calling the **submit_work** tool.
+Never end your session with free-form prose or raw JSON blocks.
 
   A) TASK ACCEPTED:
-     {{ 
-       "signal": "{SIGNAL_ACCEPTED}",
-       "task_id": "<task_id>",
-       "summary": "<one-paragraph description of what was implemented>",
-       "files_changed": ["<path1>", "<path2>"],
-       "tests_passed": true,
-       "git_branch": "{GIT_SAFETY_BRANCH_PREFIX}<task_id>"
-     }} 
+     submit_work(
+       signal="{SIGNAL_ACCEPTED}",
+       summary="<one-paragraph description of what was implemented>",
+       payload={{
+         "files_changed": ["<path1>", "<path2>"],
+         "tests_passed": true,
+         "git_branch": "{GIT_SAFETY_BRANCH_PREFIX}<task_id>"
+       }}
+     )
 
   B) TASK REVERTED (design flaw / exhausted retries):
-     {{ 
-       "signal": "{SIGNAL_REVERT}",
-       "task_id": "<task_id>",
-       "reason": "<root cause>",
-       "advice": "<guidance for re-attempt>"
-     }} 
+     submit_work(
+       signal="{SIGNAL_REVERT}",
+       summary="<root cause>",
+       payload={{"advice": "<guidance for re-attempt>"}}
+     )
 
-  C) NEEDS RESEARCH (non-terminal - loop continues after research):
-     {{ 
-       "signal": "NEEDS_RESEARCH",
-       "task_id": "<task_id>",
-       "question": "<specific investigation question>",
-       "context": "<relevant context for the researcher>"
-     }} 
+  C) NEEDS RESEARCH (non-terminal — loop continues after research):
+     spawn_research_agent(
+       question="<specific investigation question>",
+       context="<relevant context for the researcher>"
+     )
      Use when you encounter an unknown that blocks progress.  A read-only
-     research agent will investigate the question and return findings.  You
-     will then continue with those findings injected into the conversation.
-     Do NOT emit NEEDS_RESEARCH for questions you can answer with your
-     existing tools - only use it when domain knowledge is genuinely missing.
+     research agent will investigate and return findings inline.  You will
+     then continue with those findings injected into the conversation.
+     Do NOT use this for questions you can answer with your existing tools —
+     only use it when domain knowledge is genuinely missing.
 
-Tool calls are NOT terminal actions.  You may make as many tool calls as
-needed before emitting the terminal JSON.
+Tool calls are normally NOT terminal actions, but **submit_work** is the
+EXPLICIT terminal tool.  You may make as many other tool calls as needed 
+before calling submit_work to finish.
 
 ═══════════════════════════════════════════════════════════
  7. CONTEXT WINDOW DISCIPLINE

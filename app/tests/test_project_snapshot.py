@@ -139,7 +139,7 @@ def test_build_file_summary_python():
     assert "== FILE:" in result
     assert "MyClass" in result
     assert "standalone_func" in result
-    assert "read_file_harder" in result  # hint at bottom
+    assert "read_file" in result  # hint at bottom
 
 
 def test_build_file_summary_nonpython():
@@ -151,7 +151,7 @@ def test_build_file_summary_nonpython():
 
     assert "== FILE:" in result
     assert "notes.txt" in result
-    assert "read_file_harder" in result
+    assert "read_file" in result
 
 
 def test_build_file_summary_missing():

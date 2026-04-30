@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timezone
 from collections import defaultdict
 from pathlib import Path
-from .helpers import get_conn, extract_response_fields
+from .helpers import get_conn, extract_response_fields, parse_gate_checks
 
 _INI_PATH = Path(__file__).parent.parent / "maestro.ini"
 
@@ -252,6 +252,22 @@ def monitor(
     # --- pattern analysis ---
     patterns = _analyze_patterns(new_budget_entries, open_sessions, type_changes, cfg)
 
+    # --- inline diagnostics for all flagged tasks ---
+    flagged_ids: set[str] = set()
+    for flag_list in patterns.values():
+        for item in flag_list:
+            if "task_id" in item:
+                flagged_ids.add(item["task_id"])
+
+    inline_diagnostics: dict[str, dict] = {}
+    if flagged_ids:
+        conn = get_conn()
+        try:
+            for tid in flagged_ids:
+                inline_diagnostics[tid] = _compact_task_diagnosis(tid, conn)
+        finally:
+            conn.close()
+
     # summary line
     parts = []
     if session_completions:
@@ -285,8 +301,47 @@ def monitor(
             "stuck_candidates": stuck_candidates,
         },
         "patterns": patterns,
+        "inline_diagnostics": inline_diagnostics,
         "summary": summary,
     }
+
+
+def _compact_task_diagnosis(task_id: str, conn) -> dict:
+    """Minimal snapshot for a flagged task. Included inline in monitor reports."""
+    last_session = conn.execute(
+        "SELECT agent_type, exit_reason, exit_summary FROM agent_sessions "
+        "WHERE task_id=? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    last_entry = conn.execute(
+        "SELECT agent_name, response_data, created_at FROM budget_entries "
+        "WHERE task_id=? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    gate_row = conn.execute(
+        "SELECT outcome, vote_summary FROM transition_results "
+        "WHERE task_id=? AND transition='planning_gate' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+
+    result: dict = {}
+    if last_session:
+        summary = (last_session["exit_summary"] or "")[:150]
+        result["last_exit"] = f"{last_session['exit_reason']}: {summary}".rstrip(": ")
+    if last_entry:
+        fields = extract_response_fields(last_entry["response_data"])
+        result["last_llm_agent"] = last_entry["agent_name"]
+        result["last_llm_at"] = last_entry["created_at"]
+        result["last_finish_reason"] = fields.get("finish_reason", "")
+        preview = fields.get("content_preview") or fields.get("reasoning_preview", "")
+        if preview:
+            result["last_content"] = preview[:150]
+    if gate_row and gate_row["outcome"] == "rejected":
+        checks = parse_gate_checks(gate_row["vote_summary"])
+        failing = [c["name"] for c in checks if not c.get("passed")]
+        if failing:
+            result["gate_failing_checks"] = failing
+    return result
 
 
 def _analyze_patterns(

@@ -47,9 +47,9 @@ class TestToolRestrictions:
     def test_research_agent_tools_list(self):
         """RESEARCH_AGENT_TOOLS contains only read-only tools."""
         expected = {
-            "read_file", "read_file_harder", "count_lines",
-            "search_files", "find_files", "list_directory",
-            "git_status", "git_diff", "git_log", "git_blame", "git_show",
+            "web_search", "read_file", "read_file_metadata",
+            "read_last_output", "find_in_files", "find_files", "list_directory",
+            "read_git_status", "read_git_diff", "read_git_log", "read_git_blame", "read_git_show",
             "get_task", "list_tasks",
         }
         assert set(RESEARCH_AGENT_TOOLS) == expected
@@ -86,16 +86,16 @@ class TestToolRestrictions:
             )
 
     def test_git_read_tools_in_research_tools(self):
-        """git_status, git_diff, git_log, git_blame ARE in the restricted set.
+        """read_git_status, read_git_diff, read_git_log, read_git_blame ARE in the restricted set.
 
         Per user requirements, research agents should use dedicated git
         tools rather than run_shell for git operations. The restricted
         set includes these read-only git tools.
         """
-        assert "git_status" in RESEARCH_AGENT_TOOLS
-        assert "git_diff" in RESEARCH_AGENT_TOOLS
-        assert "git_log" in RESEARCH_AGENT_TOOLS
-        assert "git_blame" in RESEARCH_AGENT_TOOLS
+        assert "read_git_status" in RESEARCH_AGENT_TOOLS
+        assert "read_git_diff" in RESEARCH_AGENT_TOOLS
+        assert "read_git_log" in RESEARCH_AGENT_TOOLS
+        assert "read_git_blame" in RESEARCH_AGENT_TOOLS
 
     def test_task_mutation_tools_not_in_research_tools(self):
         """Task mutation tools are NOT available to research agents."""
@@ -344,8 +344,7 @@ class TestContextBuilding:
         )
         agent._accumulated_findings = ["finding1"]
         ctx = agent._build_life_context(3)
-        assert "must render a verdict" in ctx
-
+        assert "MUST render a verdict" in ctx
 
 # ===================================================================
 # Research agent integration tests (with mock LLM)
@@ -404,7 +403,7 @@ class TestResearchAgentWithMockLLM:
     async def test_exhaust_lives_returns_not_suitable(
         self, mock_llm_exhaust_lives, sample_task_context
     ):
-        """When all lives are exhausted, NOT_SUITABLE fallback is returned."""
+        """When all lives are exhausted, NEEDS_RESEARCH is returned by the mock."""
         agent = ResearchAgent(
             question="Is this feasible?",
             context=sample_task_context,
@@ -414,7 +413,7 @@ class TestResearchAgentWithMockLLM:
         with _llm_patch(mock_llm_exhaust_lives):
             result = await agent.run()
 
-        assert result.vote["verdict"] == "NOT_SUITABLE"
+        assert result.vote["verdict"] == "NEEDS_RESEARCH"
         assert result.lives_used == 2
 
     async def test_tool_call_then_verdict(self, sample_task_context):
@@ -574,10 +573,10 @@ class TestToolDispatchForRestrictedSet:
         result = dispatch_tool("list_directory", {"path": "."})
         assert "FILE" in result or "DIR" in result
 
-    def test_dispatch_search_files(self):
-        """dispatch_tool('search_files', ...) searches file contents."""
+    def test_dispatch_find_in_files(self):
+        """dispatch_tool('find_in_files', ...) searches file contents."""
         from app.agent.tools import dispatch_tool
-        result = dispatch_tool("search_files", {"pattern": "FastAPI", "directory": "."})
+        result = dispatch_tool("find_in_files", {"pattern": "FastAPI", "directory": "."})
         # Should find FastAPI reference in main.py or pyproject.toml
         assert isinstance(result, str)
 
@@ -589,18 +588,18 @@ class TestToolDispatchForRestrictedSet:
         # Should find at least some .py files
         assert ".py" in result or "No files" in result
 
-    def test_dispatch_git_status(self):
-        """dispatch_tool('git_status', ...) returns git status."""
+    def test_dispatch_read_git_status(self):
+        """dispatch_tool('read_git_status', ...) returns git status."""
         from app.agent.tools import dispatch_tool
-        result = dispatch_tool("git_status", {})
+        result = dispatch_tool("read_git_status", {})
         assert isinstance(result, str)
         # Should return something from git (branch info, status, etc.)
         assert len(result) > 0
 
-    def test_dispatch_git_diff(self):
-        """dispatch_tool('git_diff', ...) returns diff output."""
+    def test_dispatch_read_git_diff(self):
+        """dispatch_tool('read_git_diff', ...) returns diff output."""
         from app.agent.tools import dispatch_tool
-        result = dispatch_tool("git_diff", {})
+        result = dispatch_tool("read_git_diff", {})
         assert isinstance(result, str)
 
     def test_dispatch_unknown_tool(self):

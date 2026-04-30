@@ -149,6 +149,11 @@ def _extract_spec_constraints(description: str) -> str:
         "The task description contains BINDING design constraints:\n"
         + "\n".join(constraints)
         + "\n\nYou MUST respect these constraints. Do not 'improve' the design beyond what is asked."
+        + "\n\nIf the existing codebase already uses a forbidden approach (e.g. memoization exists"
+        " but is forbidden), write design_rationale to describe ONLY the target implementation."
+        " One sentence naming what you are replacing is fine (e.g. 'Replaces the existing"
+        " memoized implementation with naive recursion.'). After that, describe the target"
+        " design only — do not repeat the forbidden approach name."
     )
 
 
@@ -307,7 +312,7 @@ class PlanningResult:
 # ---------------------------------------------------------------------------
 
 SURVEY_TOOLS = [
-    "read_file", "read_file_harder", "count_lines",
+    "read_file", "count_lines",
     "search_files", "find_files", "list_directory",
     "git_log", "git_blame",
     "get_task", "list_tasks",
@@ -342,6 +347,7 @@ class PlanningPipeline:
         run_row_id: int | None = None,
         project_name: str | None = None,
         project_root: str | None = None,
+        prior_failure_context: list | None = None,
     ):
         self.task_id = task_id
         self.task_title = task_title
@@ -355,6 +361,7 @@ class PlanningPipeline:
         self.run_row_id = run_row_id
         self.project_name = project_name
         self.project_root = project_root
+        self.prior_failure_context = prior_failure_context or []
         self._total_prompt = 0
         self._total_completion = 0
         # Set in run() after the survey, used by _stage_design_review
@@ -416,6 +423,24 @@ class PlanningPipeline:
                 survey_summary += _hist_block
         except Exception:
             pass
+
+        # Inject prior planning attempt failures so the design stage avoids repeated mistakes.
+        if self.prior_failure_context:
+            try:
+                _fail_block = "\n\n[PRIOR PLANNING ATTEMPT FAILURES — do not repeat these approaches]\n"
+                for i, _f in enumerate(self.prior_failure_context, 1):
+                    _fail_block += f"\n  Attempt {i} ({_f.get('created_at', '?')}):\n"
+                    failing = _f.get('gate_checks') or []
+                    if failing:
+                        _fail_block += f"    Gate failures: {', '.join(c.get('name', '?') for c in failing)}\n"
+                    if _f.get('error_message'):
+                        _fail_block += f"    Error: {_f['error_message'][:200]}\n"
+                    pitfalls = _f.get('pitfalls_identified') or []
+                    if pitfalls:
+                        _fail_block += f"    Pitfalls: {str(pitfalls)[:300]}\n"
+                survey_summary += _fail_block
+            except Exception:
+                pass
 
         # Retry loop for stages 2-3
         best_designs: list[dict] = []
@@ -746,15 +771,24 @@ class PlanningPipeline:
         """Generate N design proposals in parallel, each from a distinct architect persona."""
         n = best_of_n if best_of_n is not None else PLANNING_BEST_OF_N
         _arch = self._arch_ctx
+        from app.agent.tools import build_tool_schemas, dispatch_tool
+        _gate_tools = build_tool_schemas(["submit_work"])
+
         _format = (
             "Based on the codebase survey and task description, produce a detailed "
-            "implementation design. Output valid JSON with these keys:\n"
-            "- design_rationale: string explaining the approach\n"
-            "- file_manifest: list of {path, action, purpose, estimated_lines, depends_on}\n"
-            "- dependency_graph: dict mapping component -> [dependencies]\n"
-            "- interface_contracts: list of {component, provides, consumes, invariants} — "
-            "OPTIONAL for simple single-component tasks. "
-            "\nCRITICAL interface_contracts rules:\n"
+            "implementation design.\n\n"
+            "To complete your design, call the submit_work tool with:\n"
+            "- signal: 'ACCEPTED'\n"
+            "- summary: A brief summary of your design rationale.\n"
+            "- payload: {\n"
+            "    \"design_rationale\": \"string explaining the approach\",\n"
+            "    \"file_manifest\": \"list of {path, action, purpose, estimated_lines, depends_on}\",\n"
+            "    \"dependency_graph\": \"dict mapping component -> [dependencies]\",\n"
+            "    \"interface_contracts\": \"list of {component, provides, consumes, invariants}\",\n"
+            "    \"test_strategy\": \"list of {component, test_file, test_cases, fixtures}\",\n"
+            "    \"implementation_steps\": \"list of {order, component, files, description, depends_on, estimated_context_tokens}\"\n"
+            "}\n\n"
+            "CRITICAL rules:\n"
             "1. ONLY list NEW or MODIFIED interfaces being introduced by this task.\n"
             "2. DO NOT list existing project files, standard library modules, or third-party packages in 'provides'.\n"
             "3. Any 'consumes' entry must be satisfied by a 'provides' entry in the SAME plan. "
@@ -765,11 +799,9 @@ class PlanningPipeline:
             "contracts — they are language features or external dependencies.\n"
             "5. If this task requires an artifact from another task, make that other task a "
             "prerequisite, not a consumes entry.\n"
-            "- test_strategy: list of {component, test_file, test_cases, fixtures} — "
-            "name test subjects by component/class name (e.g. 'UserService'), not by filename\n"
-            "- implementation_steps: list of {order, component, files, description, "
-            "depends_on, estimated_context_tokens}\n"
-            "\nOutput ONLY the JSON object, no markdown fences."
+            "6. Name test subjects by component/class name (e.g. 'UserService'), not by filename.\n"
+            "7. implementation_steps must be incremental. Each step must name a component.\n"
+            "8. DO NOT output free-form prose after calling submit_work."
             + (f"\n\n{_arch}" if _arch else "")
         )
 
@@ -822,6 +854,8 @@ class PlanningPipeline:
                 ],
                 base_url=self.llm_base_url,
                 model=self.llm_model,
+                tools=_gate_tools,
+                tool_choice="auto",
                 total_timeout_secs=600,
                 task_id=self.task_id,
                 llm_id=self.llm_id,
@@ -843,11 +877,30 @@ class PlanningPipeline:
                 designs.append({"error": str(resp)})
                 continue
             self._track_tokens(resp)
-            content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
-            try:
-                design, _ = json.JSONDecoder().raw_decode(content.lstrip())
-            except (json.JSONDecodeError, ValueError):
-                design = {"raw": content, "parse_error": True}
+            
+            assistant_msg = resp.get("choices", [{}])[0].get("message", {})
+            tool_calls = assistant_msg.get("tool_calls") or []
+            
+            design = None
+            if tool_calls:
+                for tc in tool_calls:
+                    tc_result = dispatch_tool(
+                        tc["function"]["name"],
+                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                    )
+                    if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
+                        data = json.loads(tc_result)
+                        design = data.get("payload")
+                        break
+            
+            if design is None:
+                # Fallback to free-form if they missed the tool (unlikely with system prompt nudge)
+                content = assistant_msg.get("content", "")
+                try:
+                    design, _ = json.JSONDecoder().raw_decode(content.lstrip())
+                except (json.JSONDecodeError, ValueError):
+                    design = {"raw": content, "parse_error": True}
+            
             designs.append(design)
 
         logger.info(f"[{AGENT_NAME}] Generated %d designs", len(designs))
@@ -881,7 +934,8 @@ class PlanningPipeline:
 
         judge_prompt = (
             "You are a design judge. Compare these design proposals and select the best one.\n"
-            "Output JSON with two keys: selected_index (integer, 0-based) and justification (string).\n\n"
+            "To output your selection, call the submit_work tool with:\n"
+            "payload={\"selected_index\": <int>, \"justification\": \"...\"}\n\n"
         )
         for orig_idx, design in valid:
             rationale = str(design.get("design_rationale", ""))[:300]
@@ -893,15 +947,20 @@ class PlanningPipeline:
                 f"  Files: {files_str}\n"
             )
 
-        async def _call_judge(prompt: str) -> tuple[str, str]:
-            """Returns (content, finish_reason)."""
+        from app.agent.tools import build_tool_schemas, dispatch_tool
+        judge_tools = build_tool_schemas(["submit_work"])
+
+        async def _call_judge(prompt: str) -> tuple[dict | None, str]:
+            """Returns (payload, finish_reason)."""
             resp = await call_llm(
                 [
-                    {"role": "system", "content": "You are a design evaluator. Output only JSON. Be concise."},
+                    {"role": "system", "content": "You are a design evaluator. Use submit_work to output your result. Be concise."},
                     {"role": "user", "content": prompt},
                 ],
                 base_url=self.llm_base_url,
                 model=self.llm_model,
+                tools=judge_tools,
+                tool_choice="auto",
                 max_tokens=PLANNING_JUDGE_MAX_TOKENS,
                 task_id=self.task_id,
                 llm_id=self.llm_id,
@@ -909,42 +968,60 @@ class PlanningPipeline:
                 agent_name=AGENT_NAME,
             )
             self._track_tokens(resp)
-            choice = resp.get("choices", [{}])[0]
-            return (
-                choice.get("message", {}).get("content", ""),
-                choice.get("finish_reason", ""),
-            )
+            
+            assistant_msg = resp.get("choices", [{}])[0].get("message", {})
+            tool_calls = assistant_msg.get("tool_calls") or []
+            
+            payload = None
+            if tool_calls:
+                for tc in tool_calls:
+                    tc_result = dispatch_tool(
+                        tc["function"]["name"],
+                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                    )
+                    if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
+                        payload = json.loads(tc_result).get("payload")
+                        break
+            
+            if payload is None:
+                # Fallback
+                content = assistant_msg.get("content", "")
+                try:
+                    payload, _ = json.JSONDecoder().raw_decode(content.lstrip())
+                except (json.JSONDecodeError, ValueError):
+                    payload = None
+
+            return payload, resp.get("choices", [{}])[0].get("finish_reason", "")
 
         try:
-            content, finish_reason = await _call_judge(judge_prompt)
+            payload, finish_reason = await _call_judge(judge_prompt)
 
             # RC2: Judge hit max_tokens during chain-of-thought — retry with a
             # stripped prompt (rationale only, no file lists) rather than triggering
             # a full design retry round.
-            if not content and finish_reason == "length":
+            if payload is None and finish_reason == "length":
                 logger.warning(
                     f"[{AGENT_NAME}] Judge hit max_tokens (finish_reason=length) — "
                     "retrying with a shorter prompt."
                 )
                 short_prompt = (
                     "Select the best design from these rationales. "
-                    "Output JSON: {\"selected_index\": <int>, \"justification\": \"...\"}.\n\n"
+                    "Call submit_work with payload={\"selected_index\": <int>, \"justification\": \"...\"}.\n\n"
                 )
                 for orig_idx, design in valid:
                     rationale = str(design.get("design_rationale", ""))[:150]
                     short_prompt += f"Design {orig_idx}: {rationale}\n"
-                content, finish_reason = await _call_judge(short_prompt)
+                payload, finish_reason = await _call_judge(short_prompt)
 
-            if not content:
+            if payload is None:
                 logger.warning(
-                    f"[{AGENT_NAME}] Judge returned empty content (finish_reason=%s) — "
+                    f"[{AGENT_NAME}] Judge failed to provide selection — "
                     "defaulting to first valid design %d.",
-                    finish_reason, valid[0][0],
+                    valid[0][0],
                 )
                 return valid[0][0], designs[valid[0][0]]
 
-            result, _ = json.JSONDecoder().raw_decode(content.lstrip())
-            idx = int(result.get("selected_index", valid[0][0]))
+            idx = int(payload.get("selected_index", valid[0][0]))
             if idx < 0 or idx >= len(designs):
                 idx = valid[0][0]
         except ShutdownError:
@@ -1051,8 +1128,6 @@ class PlanningPipeline:
                 f"You are reviewing a software design from the perspective of: {reviewer['focus']}"
                 f"{_intent_rule}\n\n"
                 f"Design:\n{design_summary}\n\n"
-                "Output JSON with: {\"verdict\": \"LIKELY|POSSIBLE|WARN|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED\", "
-                "\"confidence\": <0-100>, \"justification\": \"...\"}\n"
                 "Use WARN (not REJECTED) when your concern is an opinionated tradeoff that the "
                 "task description has already consciously made."
             )
@@ -1063,15 +1138,20 @@ class PlanningPipeline:
         # POSSIBLE abstention (not NEEDS_RESEARCH, which would block tally Rule 3) so the
         # remaining reviewers' real verdicts still count.
         responses = []
+        from app.agent.tools import build_tool_schemas, dispatch_tool
+        reviewer_tools = build_tool_schemas(["submit_work"])
+
         for reviewer, prompt in zip(reviewers, reviewer_prompts):
             try:
                 resp = await call_llm(
                     [
-                        {"role": "system", "content": "You are a design reviewer. Output only JSON."},
-                        {"role": "user", "content": prompt},
+                        {"role": "system", "content": "You are a design reviewer. Use submit_work to output your verdict when ready."},
+                        {"role": "user", "content": prompt + "\n\nTo complete your review, call the submit_work tool with:\nsignal='ACCEPTED' or 'REJECTED'\npayload={'verdict': 'LIKELY|POSSIBLE|WARN|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED', 'confidence': <0-100>, 'justification': '...'}"},
                     ],
                     base_url=self.llm_base_url,
                     model=self.llm_model,
+                    tools=reviewer_tools,
+                    tool_choice="auto",
                     total_timeout_secs=300,
                     task_id=self.task_id,
                     llm_id=self.llm_id,
@@ -1100,27 +1180,43 @@ class PlanningPipeline:
                 continue
 
             self._track_tokens(resp)
-            content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
-            try:
-                data, _ = json.JSONDecoder().raw_decode(content.lstrip())
-                verdict_str = data.get("verdict", "POSSIBLE").upper()
-                verdict = Verdict(verdict_str)
-                confidence = int(data.get("confidence", 80))
-                # Clamp confidence to verdict range
-                lo, hi = verdict.confidence_range
-                confidence = max(lo, min(hi, confidence))
-                justification = data.get("justification", "")
-            except (json.JSONDecodeError, ValueError, KeyError):
-                verdict = Verdict.POSSIBLE
-                confidence = 80
-                justification = content[:500]
+            
+            assistant_msg = resp.get("choices", [{}])[0].get("message", {})
+            tool_calls = assistant_msg.get("tool_calls") or []
+            
+            data = None
+            if tool_calls:
+                for tc in tool_calls:
+                    tc_result = dispatch_tool(
+                        tc["function"]["name"],
+                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                    )
+                    if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
+                        data = json.loads(tc_result).get("payload")
+                        break
+            
+            if data is None:
+                # Fallback
+                content = assistant_msg.get("content", "")
+                try:
+                    data, _ = json.JSONDecoder().raw_decode(content.lstrip())
+                except (json.JSONDecodeError, ValueError, KeyError):
+                    data = {"verdict": "POSSIBLE", "confidence": 80, "justification": content[:500]}
+
+            verdict_str = data.get("verdict", "POSSIBLE").upper()
+            verdict = Verdict(verdict_str)
+            confidence = int(data.get("confidence", 80))
+            # Clamp confidence to verdict range
+            lo, hi = verdict.confidence_range
+            confidence = max(lo, min(hi, confidence))
+            justification = data.get("justification", "")
 
             votes.append(Vote(
                 stage=reviewer_name,
                 verdict=verdict,
                 confidence=confidence,
                 justification=justification,
-                raw_response=data if 'data' in dir() else None,
+                raw_response=data,
                 model=self.llm_model or "",
             ))
 
@@ -1172,25 +1268,49 @@ class PlanningPipeline:
             f"{json.dumps(design, indent=1, ensure_ascii=True)[:4000]}\n\n"
             "Look for: edge cases, implicit dependencies, race conditions, "
             "state management issues, migration risks.\n"
-            "Output JSON: {\"pitfalls\": [{\"type\": \"...\", \"severity\": \"low|medium|high|critical\", \"detail\": \"...\"}]}"
+            "To output pitfalls, call the submit_work tool with:\n"
+            "payload={\"pitfalls\": [{\"type\": \"...\", \"severity\": \"low|medium|high|critical\", \"detail\": \"...\"}]}"
         )
+
+        from app.agent.tools import build_tool_schemas, dispatch_tool
+        pitfall_tools = build_tool_schemas(["submit_work"])
 
         try:
             response = await call_llm(
                 [
-                    {"role": "system", "content": "You are a software quality analyst. Output only JSON."},
+                    {"role": "system", "content": "You are a software quality analyst. Use submit_work to output pitfalls when ready."},
                     {"role": "user", "content": prompt},
                 ],
                 base_url=self.llm_base_url,
                 model=self.llm_model,
+                tools=pitfall_tools,
+                tool_choice="auto",
                 task_id=self.task_id,
                 llm_id=self.llm_id,
                 budget_id=self.budget_id,
                 agent_name=AGENT_NAME,
             )
             self._track_tokens(response)
-            content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
-            data, _ = json.JSONDecoder().raw_decode(content.lstrip())
+            
+            assistant_msg = response.get("choices", [{}])[0].get("message", {})
+            tool_calls = assistant_msg.get("tool_calls") or []
+            
+            data = None
+            if tool_calls:
+                for tc in tool_calls:
+                    tc_result = dispatch_tool(
+                        tc["function"]["name"],
+                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                    )
+                    if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
+                        data = json.loads(tc_result).get("payload")
+                        break
+            
+            if data is None:
+                # Fallback
+                content = assistant_msg.get("content", "")
+                data, _ = json.JSONDecoder().raw_decode(content.lstrip())
+            
             pitfalls.extend(data.get("pitfalls", []))
         except Exception as e:
             logger.warning(f"[{AGENT_NAME}] Pitfall LLM check failed: %s", e)
@@ -1213,27 +1333,50 @@ class PlanningPipeline:
             (f"{_arch}\n\n" if _arch else "")
             + "You have a winning design and identified pitfalls. "
             "Produce a consolidated final design that incorporates mitigations "
-            "for the identified pitfalls. Output the same JSON structure as the original design.\n\n"
+            "for the identified pitfalls. Use the submit_work tool to output the result.\n\n"
             f"Original design:\n{json.dumps(design, indent=1, ensure_ascii=True)[:4000]}\n\n"
             f"Pitfalls:\n{json.dumps(pitfalls, indent=1, ensure_ascii=True)[:2000]}"
         )
 
+        from app.agent.tools import build_tool_schemas, dispatch_tool
+        consol_tools = build_tool_schemas(["submit_work"])
+
         try:
             response = await call_llm(
                 [
-                    {"role": "system", "content": "You are a software architect. Output only JSON."},
+                    {"role": "system", "content": "You are a software architect. Use submit_work to output the final design."},
                     {"role": "user", "content": prompt},
                 ],
                 base_url=self.llm_base_url,
                 model=self.llm_model,
+                tools=consol_tools,
+                tool_choice="auto",
                 task_id=self.task_id,
                 llm_id=self.llm_id,
                 budget_id=self.budget_id,
                 agent_name=AGENT_NAME,
             )
             self._track_tokens(response)
-            content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
-            result, _ = json.JSONDecoder().raw_decode(content.lstrip())
+            
+            assistant_msg = response.get("choices", [{}])[0].get("message", {})
+            tool_calls = assistant_msg.get("tool_calls") or []
+            
+            result = None
+            if tool_calls:
+                for tc in tool_calls:
+                    tc_result = dispatch_tool(
+                        tc["function"]["name"],
+                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                    )
+                    if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
+                        result = json.loads(tc_result).get("payload")
+                        break
+            
+            if result is None:
+                # Fallback
+                content = assistant_msg.get("content", "")
+                result, _ = json.JSONDecoder().raw_decode(content.lstrip())
+            
             return result
         except Exception as e:
             logger.warning(f"[{AGENT_NAME}] Consolidation failed: %s. Using original design.", e)
@@ -1390,6 +1533,7 @@ async def run_planning_pipeline(
     project_path: str | None = None,
     project_name: str | None = None,
     run_row_id: int | None = None,
+    prior_failure_context: list | None = None,
 ) -> dict:
     """Run the full planning pipeline and return a result dict."""
     if project_path is not None:
@@ -1408,6 +1552,7 @@ async def run_planning_pipeline(
         run_row_id=run_row_id,
         project_name=project_name,
         project_root=project_path,
+        prior_failure_context=prior_failure_context,
     )
     result = await pipeline.run()
     votes_list = [

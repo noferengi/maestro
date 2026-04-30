@@ -1,5 +1,5 @@
 """
-Pytest configuration for TheMaestro migration tests.
+Pytest configuration for TheMaestro migration tests and research agent tests.
 
 Sets up test database and environment variables for isolated testing.
 """
@@ -87,6 +87,45 @@ def subdivision_migration():
     """Load the subdivision support migration for testing."""
     from app.migrations.test_framework import load_migration
     return load_migration("app/migrations/versions/0010_add_subdivision_support.py")
+
+
+# ---------------------------------------------------------------------------
+# Research Agent Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def sample_task_context():
+    return {
+        "task_id": "task-42",
+        "title": "Add WebSocket support",
+        "project": "Maestro",
+        "description": "Implement real-time updates using WebSockets.",
+    }
+
+@pytest.fixture
+def mock_llm_pass():
+    from app.agent.mock_llm import MockLLM
+    return MockLLM(scenario="pass")
+
+@pytest.fixture
+def mock_llm_fail():
+    from app.agent.mock_llm import MockLLM
+    return MockLLM(scenario="fail")
+
+@pytest.fixture
+def mock_llm_needs_research():
+    from app.agent.mock_llm import MockLLM
+    return MockLLM(scenario="needs_research")
+
+@pytest.fixture
+def mock_llm_exhaust_lives():
+    from app.agent.mock_llm import MockLLM
+    return MockLLM(scenario="exhaust_lives")
+
+@pytest.fixture
+def mock_llm_not_suitable():
+    from app.agent.mock_llm import MockLLM
+    return MockLLM(scenario="not_suitable")
 
 
 # ---------------------------------------------------------------------------

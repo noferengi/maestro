@@ -21,6 +21,7 @@ transaction in the pipeline orchestrators).  All other functions open and
 close their own sessions.
 """
 
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -262,6 +263,99 @@ def get_latest_planning_result(task_id: str):
                 .filter(PlanningResult.task_id == task_id)
                 .order_by(PlanningResult.created_at.desc())
                 .first())
+    finally:
+        db.close()
+
+
+def get_reusable_planning_result(task_id: str, content_hash: str):
+    """Return the most recent planning result whose spec hash matches and gate passed.
+
+    Used by the planning cache gate to skip re-planning when the task spec is
+    unchanged and the last run already cleared the gate.
+    """
+    db = SessionLocal()
+    try:
+        return (db.query(PlanningResult)
+                .filter(
+                    PlanningResult.task_id == task_id,
+                    PlanningResult.content_hash == content_hash,
+                    PlanningResult.was_gate_passed == 1,
+                    PlanningResult.status.in_(['active', 'superseded']),
+                )
+                .order_by(PlanningResult.created_at.desc())
+                .first())
+    finally:
+        db.close()
+
+
+def get_prior_failure_context(task_id: str, limit: int = 5) -> list:
+    """Return summaries of recent failed planning attempts for injection into new runs.
+
+    Each item: {created_at, gate_checks (failing only), pitfalls_identified, error_message}.
+    Only rows that actually had problems are returned.
+    """
+    db = SessionLocal()
+    try:
+        rows = (db.query(PlanningResult)
+                .filter(
+                    PlanningResult.task_id == task_id,
+                    PlanningResult.status.in_(['superseded', 'failed']),
+                )
+                .order_by(PlanningResult.created_at.desc())
+                .limit(limit * 4)
+                .all())
+        result = []
+        for row in rows:
+            gate_checks = json.loads(row.gate_checks) if row.gate_checks else []
+            failing = [c for c in gate_checks if not c.get('passed')]
+            pitfalls = json.loads(row.pitfalls_identified) if row.pitfalls_identified else []
+            if not failing and not row.error_message and not pitfalls:
+                continue
+            result.append({
+                'created_at': str(row.created_at)[:19],
+                'gate_checks': failing,
+                'pitfalls_identified': pitfalls[:3] if pitfalls else [],
+                'error_message': row.error_message,
+            })
+            if len(result) >= limit:
+                break
+        return result
+    finally:
+        db.close()
+
+
+def mark_gate_passed(result_id: int, content_hash: str = None) -> None:
+    """Set was_gate_passed=1 on a planning result after its gate checks pass.
+
+    Also stores the content_hash if provided, enabling future cache hits for the
+    same task spec.
+    """
+    db = SessionLocal()
+    try:
+        row = db.query(PlanningResult).filter(PlanningResult.id == result_id).first()
+        if row:
+            row.was_gate_passed = 1
+            if content_hash:
+                row.content_hash = content_hash
+            db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error("Error marking gate passed for result %d: %s", result_id, e)
+    finally:
+        db.close()
+
+
+def restore_planning_result(result_id: int) -> None:
+    """Restore a superseded planning result to active status (cache hit path)."""
+    db = SessionLocal()
+    try:
+        row = db.query(PlanningResult).filter(PlanningResult.id == result_id).first()
+        if row:
+            row.status = 'active'
+            db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error("Error restoring planning result %d: %s", result_id, e)
     finally:
         db.close()
 

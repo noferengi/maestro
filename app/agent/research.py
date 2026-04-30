@@ -208,23 +208,25 @@ conflicts. You have read-only access to the codebase via tools. You cannot modif
 - git_diff(path?): Show git diff (optionally scoped to a file)
 - git_log(path?, max_count?): Show recent git history (optionally scoped to a file)
 - git_blame(path): Show git blame for a file
+- submit_work(signal, summary, payload): Submit your final verdict (TERMINAL — call this to finish)
 
 == YOUR WORKFLOW ==
 1. Read the investigation question and context carefully.
 2. Use your tools to gather evidence from the codebase.
-3. When you have enough information, render your verdict as a JSON object.
+3. When you have enough information, call submit_work to submit your verdict.
 
 == OUTPUT FORMAT ==
-When you are ready to render your verdict, output ONLY this JSON (no other text):
-
-```json
-{
-  "verdict": "REJECTED" | "NOT_SUITABLE" | "NEEDS_RESEARCH" | "POSSIBLE" | "LIKELY",
-  "confidence": <integer 0-100>,
-  "justification": "<one paragraph explaining your findings and reasoning>",
-  "findings": "<summary of what you discovered during investigation>"
-}
-```
+To submit your verdict, call the submit_work tool with:
+submit_work(
+  signal="ACCEPTED",
+  summary="<one-paragraph summary of your investigation>",
+  payload={
+    "verdict": "REJECTED" | "NOT_SUITABLE" | "NEEDS_RESEARCH" | "POSSIBLE" | "LIKELY",
+    "confidence": <integer 0-100>,
+    "justification": "<one paragraph explaining your findings and reasoning>",
+    "findings": "<summary of what you discovered during investigation>"
+  }
+)
 
 Confidence ranges:
 - REJECTED: [0, 50] - fundamental blocker found
@@ -236,7 +238,7 @@ Confidence ranges:
 == RULES ==
 - Be thorough but efficient. You have limited turns.
 - Do NOT attempt to write or modify any files.
-- Do NOT output free-form prose as your final action - always end with the JSON verdict.
+- The ONLY way to complete your task is by calling `submit_work`.
 - If you cannot determine feasibility, say so honestly with NEEDS_RESEARCH.
 - Focus on evidence from the actual code, not assumptions.
 """
@@ -431,30 +433,17 @@ class ResearchAgent:
             accumulated = "No findings were recorded."
         context_snippet = json.dumps(self.context, indent=1)[:2000]
 
-        system_prompt = (
-            "/no_think\n"
-            "You are a Research Agent. ALL research turns have been exhausted. "
-            "You cannot use any tools. You MUST render a final verdict RIGHT NOW "
-            "based solely on the accumulated findings below.\n\n"
-            "Output ONLY this JSON object - key order MUST be exactly: grade, justification, verdict.\n"
-            "{ \n"
-            '  "grade": <integer 0-10000 representing investigation quality in hundredths of a percent, e.g. 9258 = 92.58%>,\n'
-            '  "justification": "<your synthesis of the evidence - no double-quote characters>",\n'
-            '  "verdict": "<REJECTED|NOT_SUITABLE|POSSIBLE|LIKELY|NEEDS_RESEARCH>"\n'
-            "} \n\n"
-            "Use NEEDS_RESEARCH only if the investigation budget was genuinely insufficient "
-            "to reach a conclusion.  Use a lower grade for lower-quality investigations."
-        )
-
         user_msg = (
             f"Original question: {self.question}\n\n"
             f"Context:\n{context_snippet}\n\n"
             f"Accumulated findings from {self.max_lives} research lives:\n{accumulated}\n\n"
-            "Render your final verdict now."
+            "To complete your research, call the submit_work tool with:\n"
+            "payload={\"verdict\": \"REJECTED|NOT_SUITABLE|POSSIBLE|LIKELY|NEEDS_RESEARCH\", "
+            "\"grade\": 0-10000, \"justification\": \"...\"}"
         )
 
         messages = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": "You are a research analyst. Use submit_work to output your final verdict."},
             {"role": "user", "content": user_msg},
         ]
 
@@ -559,7 +548,7 @@ class ResearchAgent:
             if budget_exceeded:
                 messages.append({
                     "role": "user",
-                    "content": "[SYSTEM] TOKEN BUDGET EXCEEDED. Render your JSON verdict now. No more tool calls.",
+                    "content": "[SYSTEM] TOKEN BUDGET EXCEEDED. Call submit_work with your verdict now. No more tool calls.",
                 })
 
             # LLM call
@@ -704,7 +693,7 @@ class ResearchAgent:
                     "role": "user",
                     "content": (
                         "[SYSTEM] You did not call any tool and did not render a verdict. "
-                        "Either call a tool to investigate further, or output your JSON verdict."
+                        "Either call a tool to investigate further, or call submit_work with your verdict."
                     ),
                 })
 
@@ -879,10 +868,18 @@ class ResearchAgent:
     # ------------------------------------------------------------------
 
     def _extract_vote(self, content: str) -> dict | None:
-        """Try to extract a verdict JSON from the assistant's content."""
+        """Try to extract a verdict JSON from the assistant's content.
+
+        NOTE: This is a fallback path. Agents should be using submit_work() instead.
+        A WARNING is logged whenever this fallback is triggered.
+        """
         raw = extract_json_block(content)
         if raw is None:
             return None
+        logger.warning(
+            "Research agent emitted raw JSON instead of calling submit_work. "
+            "Please ensure agents are instructed to use the submit_work tool call."
+        )
         try:
             parsed = json.loads(raw.strip())
             if isinstance(parsed, dict) and "verdict" in parsed and "confidence" in parsed:
@@ -910,23 +907,24 @@ Research Agent, you are NOT asked for a feasibility verdict — just comprehensi
 - git_diff(path?): Show git diff (optionally scoped to a file)
 - git_log(path?, max_count?): Show recent git history (optionally scoped to a file)
 - git_blame(path): Show git blame for a file
+- submit_work(signal, summary, payload): Submit your final report
 
 == YOUR WORKFLOW ==
 1. Read the investigation question carefully.
 2. Use tools to explore the codebase and gather concrete evidence.
-3. When you have enough information, produce a structured JSON report.
+3. When you have enough information, call submit_work with your report in the payload.
 
 == OUTPUT FORMAT ==
-When ready, output a JSON block with this exact structure:
-```json
-{
+To submit your report, call the submit_work tool with:
+payload={
   "answer": "<direct answer to the question in 1-3 sentences>",
   "key_findings": ["<finding 1>", "<finding 2>", "..."],
   "evidence": ["<file:line or quote 1>", "<evidence 2>", "..."],
   "gaps": ["<unanswered question 1>", "..."],
   "recommendation": "<what should be done next, if anything>"
 }
-```
+
+No prose after calling submit_work.
 
 == RULES ==
 - Be specific: cite exact file paths, function names, and line numbers.

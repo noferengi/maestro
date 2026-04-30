@@ -40,7 +40,8 @@
       "Bash(venv/Scripts/python.exe app/migrations/runner.py migrate)",
       "mcp__maestro__get_scheduler_state",
       "mcp__maestro__diagnose_task",
-      "mcp__maestro__restart_server"
+      "mcp__maestro__restart_server",
+      "Bash(sqlite3 *)"
     ]
   },
   "enableAllProjectMcpServers": true

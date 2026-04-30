@@ -216,15 +216,17 @@ class OptimizationPipeline:
             "Step 7 - Determine if this optimization targets a real measured bottleneck "
             "(is_premature=false) or an assumed one (is_premature=true).\n"
             "Step 8 - Determine if this resolves known tech debt (tech_debt_resolved=true/false).\n\n"
-            "Output JSON:\n"
-            "{\"test_duration_ms\": 0, \"memory_peak_mb\": 0, \"dep_count\": 0, \"hotspots\": [], "
+            "To complete your report, call the submit_work tool with:\n"
+            "- signal: 'ACCEPTED'\n"
+            "- summary: A brief summary of your findings.\n"
+            "- payload: {\"test_duration_ms\": 0, \"memory_peak_mb\": 0, \"dep_count\": 0, \"hotspots\": [], "
             "\"complexity_score\": 0, \"big_o_class\": \"O(n)\", \"scale_n\": 10000, "
             "\"readability_cost\": 0.0, \"is_premature\": false, \"tech_debt_resolved\": false, "
             "\"notes\": \"\"}"
         )
 
         messages: list[dict] = [
-            {"role": "system", "content": "You are a performance profiler. Output your report as JSON when ready."},
+            {"role": "system", "content": "You are a performance profiler. Use submit_work to output your report when ready."},
             {"role": "user", "content": prompt},
         ]
 
@@ -278,22 +280,23 @@ class OptimizationPipeline:
                         "name": tc["function"]["name"],
                         "content": tc_result,
                     })
-                continue
 
-            raw = extract_json_block(content)
-            if raw:
-                try:
-                    data = json.loads(raw)
-                    if isinstance(data, dict) and ("test_duration_ms" in data or "complexity_score" in data or "big_o_class" in data or "error" in data):
-                        return data
-                except (json.JSONDecodeError, ValueError):
-                    pass
+                    # Check for terminal signal from submit_work
+                    if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
+                        try:
+                            data = json.loads(tc_result)
+                            payload = data.get("payload", {})
+                            if isinstance(payload, dict) and ("test_duration_ms" in payload or "complexity_score" in payload or "big_o_class" in payload or "error" in payload):
+                                return payload
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                continue
 
             turns_remaining = max_turns - turn - 1
             if turns_remaining <= 2:
                 messages.append({
                     "role": "user",
-                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Output JSON profiling report now.",
+                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Call submit_work with your profiling report now.",
                 })
 
         return {"error": "Profiler exhausted turns"}
@@ -312,14 +315,14 @@ class OptimizationPipeline:
             f"Task: {self.task_description}\n"
             f"Baseline: {json.dumps(baseline, indent=1)[:2000]}\n\n"
             "You may use tools to inspect code files.\n\n"
-            "Propose optimizations. Output JSON: "
-            "{\"lens\": \"...\", \"proposals\": [{\"description\": \"...\", "
+            "To submit your proposals, call the submit_work tool with:\n"
+            "payload={\"lens\": \"...\", \"proposals\": [{\"description\": \"...\", "
             "\"estimated_improvement_pct\": 0, \"risk\": \"low|medium|high\", "
             "\"implementation_steps\": [\"...\"]}]}"
         )
 
         messages: list[dict] = [
-            {"role": "system", "content": "You are an optimization expert. Output your proposals as JSON when ready."},
+            {"role": "system", "content": "You are an optimization expert. Use submit_work to output your proposals when ready."},
             {"role": "user", "content": prompt},
         ]
 
@@ -373,22 +376,23 @@ class OptimizationPipeline:
                         "name": tc["function"]["name"],
                         "content": tc_result,
                     })
-                continue
 
-            raw = extract_json_block(content)
-            if raw:
-                try:
-                    data = json.loads(raw)
-                    if isinstance(data, dict) and "lens" in data:
-                        return data
-                except (json.JSONDecodeError, ValueError):
-                    pass
+                    # Check for terminal signal from submit_work
+                    if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
+                        try:
+                            data = json.loads(tc_result)
+                            payload = data.get("payload", {})
+                            if isinstance(payload, dict) and "lens" in payload:
+                                return payload
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                continue
 
             turns_remaining = max_turns - turn - 1
             if turns_remaining <= 2:
                 messages.append({
                     "role": "user",
-                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Output JSON proposals now.",
+                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Call submit_work with your proposals now.",
                 })
 
         return None
@@ -424,7 +428,7 @@ class OptimizationPipeline:
     async def _run_single_judge(self, judge_prompt: str) -> dict | None:
         """Run a single optimization judge using a mini-loop."""
         messages: list[dict] = [
-            {"role": "system", "content": "You are an optimization judge. Output your verdict as JSON when ready."},
+            {"role": "system", "content": "You are an optimization judge. Use submit_work to output your verdict when ready."},
             {"role": "user", "content": judge_prompt},
         ]
 
@@ -478,22 +482,23 @@ class OptimizationPipeline:
                         "name": tc["function"]["name"],
                         "content": tc_result,
                     })
-                continue
 
-            raw = extract_json_block(content)
-            if raw:
-                try:
-                    data = json.loads(raw)
-                    if isinstance(data, dict) and "winner_index" in data:
-                        return data
-                except (json.JSONDecodeError, ValueError):
-                    pass
+                    # Check for terminal signal from submit_work
+                    if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
+                        try:
+                            data = json.loads(tc_result)
+                            payload = data.get("payload", {})
+                            if isinstance(payload, dict) and "winner_index" in payload:
+                                return payload
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                continue
 
             turns_remaining = max_turns - turn - 1
             if turns_remaining <= 2:
                 messages.append({
                     "role": "user",
-                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Output JSON judgment now.",
+                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Call submit_work with your judgment now.",
                 })
 
         return None
@@ -521,8 +526,8 @@ class OptimizationPipeline:
             if extra_context:
                 p += f"\n{extra_context}\n"
             p += (
-                "\nOutput JSON: {\"scores\": [{\"index\": 0, \"score\": 0, \"rationale\": \"...\"}], "
-                "\"winner_index\": 0}"
+                "\nTo submit your judgment, call the submit_work tool with:\n"
+                "payload={\"scores\": [{\"index\": 0, \"score\": 0, \"rationale\": \"...\"}], \"winner_index\": 0}"
             )
             return p
 

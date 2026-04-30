@@ -222,7 +222,7 @@ Two `ContextVar`s in the agent system need explicit reset between tests:
 ### `_prepped_files` (app.agent.tools)
 
 Tracks which files the agent has "prepped" (called `read_file()` on) in the current task
-context. Must be reset between tests — otherwise a `read_file_harder()` call in test B will
+context. Must be reset between tests — otherwise another `read_file()` call in test B will
 see files prepped by test A.
 
 ```python

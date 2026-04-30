@@ -72,7 +72,7 @@ class TestAllChecksPass:
         with patch("app.agent.planning_gate.PLANNING_GATE_FEASIBILITY_RECHECK", False):
             result = _run(gate.run())
         assert result.passed is True
-        assert len(result.checks) == 11
+        assert len(result.checks) == 10
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +355,7 @@ class TestRunPlanningGate:
 
         assert "checks" in result
         assert isinstance(result["checks"], list)
-        assert len(result["checks"]) == 11
+        assert len(result["checks"]) == 10
         for check in result["checks"]:
             for field in ("name", "passed", "hard_fail", "detail"):
                 assert field in check, f"Missing field '{field}' in check {check['name']}"

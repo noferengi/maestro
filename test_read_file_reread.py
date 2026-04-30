@@ -5,7 +5,7 @@ import logging
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("test_read_file_harder")
+logger = logging.getLogger("test_read_file")
 
 import app.agent.tools as tools
 
@@ -22,7 +22,7 @@ def _make_test_file(path: str, n_lines: int = 30) -> None:
 
 
 def test_served_range_recorded_after_first_read():
-    """read_file_harder records the served range in the ContextVar dict."""
+    """read_file records the served range in the ContextVar dict."""
     _reset_prepped()
     test_file = os.path.abspath("_test_reread_tmp.txt")
     _make_test_file(test_file, n_lines=30)
@@ -35,7 +35,7 @@ def test_served_range_recorded_after_first_read():
         assert tools._get_prepped_files()[norm] == [], "No ranges should be served yet"
 
         # Serve lines 1-10
-        result = tools.read_file_harder(test_file, start=1, end=10)
+        result = tools.read_file(test_file, start=1, end=10)
         assert "Line 1" in result and "Line 10" in result, f"Expected content, got: {result[:200]}"
         assert "NOTE:" not in result, "Should not have NOTE on first read"
 
@@ -54,9 +54,9 @@ def test_reread_same_range_returns_note():
     _make_test_file(test_file, n_lines=30)
     try:
         tools.read_file(test_file)
-        tools.read_file_harder(test_file, start=1, end=10)  # first serve
+        tools.read_file(test_file, start=1, end=10)  # first serve
 
-        result = tools.read_file_harder(test_file, start=1, end=10)  # re-read
+        result = tools.read_file(test_file, start=1, end=10)  # re-read
         assert "NOTE:" in result and "already in context" in result, (
             f"Expected NOTE for re-read. Got: {result[:200]}"
         )
@@ -74,10 +74,10 @@ def test_partial_overlap_no_note():
     try:
         norm = os.path.normpath(os.path.realpath(test_file))
         tools.read_file(test_file)
-        tools.read_file_harder(test_file, start=1, end=10)  # serve (1, 10)
+        tools.read_file(test_file, start=1, end=10)  # serve (1, 10)
 
         # (5, 15) extends past 10 — not fully covered → no NOTE
-        result = tools.read_file_harder(test_file, start=5, end=15)
+        result = tools.read_file(test_file, start=5, end=15)
         assert "NOTE:" not in result, (
             f"Should NOT have NOTE for partially-new range (5-15). Got: {result[:200]}"
         )

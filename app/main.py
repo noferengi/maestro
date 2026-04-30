@@ -25,7 +25,7 @@ from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
 import asyncio
 import json
 import threading
@@ -356,26 +356,6 @@ def _store_infra_abort_result(task_id: str, exc: "PipelineAbortedError", budget_
     )
 
 
-def _count_recent_failed_planning_runs(task_id: str, limit: int = 3) -> int:
-    """Return the count of the most-recent `limit` planning_results rows for this task.
-
-    Used as a safety valve: if there are already `limit` completed rows and the task
-    is still in planning (never advanced to indev), the caller can demote to IDEA.
-    """
-    from app.database.session import SessionLocal as _SL
-    from app.database.models import PlanningResult as _PlanningResult
-    db = _SL()
-    try:
-        rows = (
-            db.query(_PlanningResult)
-            .filter(_PlanningResult.task_id == task_id)
-            .order_by(_PlanningResult.created_at.desc())
-            .limit(limit)
-            .all()
-        )
-        return len(rows)
-    finally:
-        db.close()
 
 
 def _execute_subdivision(task, llm_base_url, llm_model, max_context, scope_vote, rejection_context, loop):
@@ -722,7 +702,8 @@ def _pipeline_session(func):
         "_run_planning_pipeline_bg": "planning",
         "_run_review_pipeline_bg": "conceptual_review",
         "_run_security_only_bg": "security",
-        "_run_full_review_bg": "full_review",
+        "_run_security_pipeline_bg": "optimization",
+        "_run_full_review_bg": "security",
         "_run_loop_bg": "maestro_loop",
         "_run_intake_bg": "intake",
     }
@@ -953,6 +934,44 @@ def _run_planning_pipeline_bg(task_id: str) -> None:
         return
     project_path = _setup_thread_context(task)
 
+    # --- Planning cache gate ---
+    _content_hash = None
+    try:
+        from hashlib import sha256 as _sha256
+        _content_hash = _sha256(f"{task.title}||{task.description or ''}".encode()).hexdigest()
+    except Exception:
+        pass
+
+    _cache_mode = getattr(task, 'cache_mode', None) or 'normal'
+    if _cache_mode == 'normal' and _content_hash:
+        try:
+            from app.database import get_reusable_planning_result, restore_planning_result
+            _cached = get_reusable_planning_result(task_id, _content_hash)
+            if _cached:
+                supersede_planning_results(task_id)
+                restore_planning_result(_cached.id)
+                update_task(task_id, type='indev')
+                logger.info(
+                    "[planning] Cache HIT task '%s' — reusing plan %d, skipping pipeline.",
+                    task_id, _cached.id,
+                )
+                return
+        except Exception:
+            logger.exception("[planning] Cache gate check failed for '%s' — running full pipeline.", task_id)
+    elif _cache_mode in ('force_with_context', 'force_fresh'):
+        try:
+            update_task(task_id, cache_mode='normal')
+        except Exception:
+            pass
+
+    _prior_failures = []
+    if _cache_mode != 'force_fresh':
+        try:
+            from app.database import get_prior_failure_context
+            _prior_failures = get_prior_failure_context(task_id)
+        except Exception:
+            pass
+
     llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
     all_tasks = [task_to_dict(t) for t in (get_tasks_by_project(task.project) if task.project else get_all_tasks())]
 
@@ -982,6 +1001,7 @@ def _run_planning_pipeline_bg(task_id: str) -> None:
                 project_path=project_path,
                 project_name=task.project,
                 run_row_id=run_row_id,
+                prior_failure_context=_prior_failures,
             )
         )
     except ShutdownError:
@@ -1059,30 +1079,19 @@ def _run_planning_pipeline_bg(task_id: str) -> None:
                 finally:
                     _db.close()
             if gate_result.get("passed"):
+                # Mark the planning result as gate-passed so future runs can reuse it.
+                if pr_row:
+                    try:
+                        from app.database import mark_gate_passed
+                        mark_gate_passed(pr_row.id, _content_hash)
+                    except Exception:
+                        pass
                 update_task(task_id, type="indev")
                 logger.info("[planning] Task '%s' advanced to IN DEV.", task_id)
             else:
                 logger.warning("[planning] Task '%s' failed planning gate.", task_id)
-                # Consecutive-failure safety valve: demote after too many failed runs
-                from app.agent.config import PLANNING_MAX_CONSECUTIVE_FAILURES
-                _total = _count_recent_failed_planning_runs(task_id, PLANNING_MAX_CONSECUTIVE_FAILURES)
-                if _total >= PLANNING_MAX_CONSECUTIVE_FAILURES:
-                    logger.warning(
-                        "[planning] Task '%s' has failed planning %d time(s) — demoting to IDEA.",
-                        task_id, _total,
-                    )
-                    update_task(task_id, type="idea")
         else:
             logger.info("[planning] Task '%s' planning result: %s", task_id, result.get('outcome'))
-            # Consecutive-failure safety valve for non-passed outcomes (rejected etc.)
-            from app.agent.config import PLANNING_MAX_CONSECUTIVE_FAILURES
-            _total = _count_recent_failed_planning_runs(task_id, PLANNING_MAX_CONSECUTIVE_FAILURES)
-            if _total >= PLANNING_MAX_CONSECUTIVE_FAILURES:
-                logger.warning(
-                    "[planning] Task '%s' has failed planning %d time(s) — demoting to IDEA.",
-                    task_id, _total,
-                )
-                update_task(task_id, type="idea")
     except Exception as exc:
         # Write the failure reason into the in_progress row so the Stage Journal
         # shows "run failed: <reason>" instead of the old stale result.
@@ -1312,8 +1321,7 @@ def _run_security_only_bg(task_id: str) -> None:
             _store_pipeline_result_generic(task_id, sec_result, task.budget_id, "security_review")
             if sec_result.get("outcome") == "passed":
                 update_task(task_id, type="security")
-                update_task(task_id, type="full_review")
-                logger.info("[security-only] Task '%s' advanced to FULL REVIEW.", task_id)
+                logger.info("[security-only] Task '%s' advanced to SECURITY.", task_id)
             else:
                 demotion = sec_result.get("demotion_target", "indev")
                 update_task(task_id, type=demotion)
@@ -1334,10 +1342,55 @@ def _run_security_only_bg(task_id: str) -> None:
 
 @_pipeline_session
 def _run_security_pipeline_bg(task_id: str) -> None:
-    """Background runner for security + optimization pipelines."""
+    """Advance handler for OPTIMIZATION cards: run optimization, advance to security on pass."""
     try:
         import asyncio
         from app.agent.optimization import run_optimization_pipeline
+
+        task = get_task(task_id)
+        if not task:
+            return
+        project_path = _setup_thread_context(task)
+
+        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            opt_result = loop.run_until_complete(
+                run_optimization_pipeline(
+                    task_id=task_id,
+                    task_description=task.description or "",
+                    llm_base_url=llm_base_url,
+                    llm_model=llm_model,
+                    llm_id=task.llm_id,
+                    budget_id=task.budget_id,
+                    project_path=project_path,
+                )
+            )
+            _store_pipeline_result_generic(task_id, opt_result, task.budget_id, "optimization")
+            logger.info("[optimization] Task '%s': %s", task_id, opt_result.get('outcome'))
+
+            update_task(task_id, type="security")
+            logger.info("[optimization] Task '%s' advanced to SECURITY.", task_id)
+        except ShutdownError:
+            logger.info("[optimization] Pipeline for '%s' aborted due to server shutdown.", task_id)
+        except PipelineAbortedError as exc:
+            logger.warning("[optimization] Task '%s' aborted at stage '%s': %s — will retry.",
+                           task_id, exc.stage, exc.cause)
+        except Exception:
+            logger.exception("[optimization] Pipeline for '%s' failed.", task_id)
+        finally:
+            loop.close()
+    except Exception as exc:
+        logger.exception("[optimization] Pipeline for '%s' failed.", task_id)
+
+
+@_pipeline_session
+def _run_full_review_bg(task_id: str) -> None:
+    """Advance handler for SECURITY cards: run security, advance to full_review on pass."""
+    try:
+        import asyncio
         from app.agent.security_review import run_security_pipeline
 
         task = get_task(task_id)
@@ -1350,21 +1403,6 @@ def _run_security_pipeline_bg(task_id: str) -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            # Run optimization first
-            opt_result = loop.run_until_complete(
-                run_optimization_pipeline(
-                    task_id=task_id,
-                    task_description=task.description or "",
-                    llm_base_url=llm_base_url,
-                    llm_model=llm_model,
-                    llm_id=task.llm_id,
-                    budget_id=task.budget_id,
-                    project_path=project_path,
-                )
-            )
-            logger.info("[optimization] Task '%s': %s", task_id, opt_result.get('outcome'))
-
-            # Then run security review
             sec_result = loop.run_until_complete(
                 run_security_pipeline(
                     task_id=task_id,
@@ -1379,8 +1417,6 @@ def _run_security_pipeline_bg(task_id: str) -> None:
             _store_pipeline_result_generic(task_id, sec_result, task.budget_id, "security_review")
 
             if sec_result.get("outcome") == "passed":
-                update_task(task_id, type="security")
-                # Auto-advance past security to full_review
                 update_task(task_id, type="full_review")
                 logger.info("[security] Task '%s' advanced to FULL REVIEW.", task_id)
             else:
@@ -1402,11 +1438,12 @@ def _run_security_pipeline_bg(task_id: str) -> None:
 
 
 @_pipeline_session
-def _run_full_review_bg(task_id: str) -> None:
-    """Background runner for full review pipeline."""
+def _run_full_review_only_bg(task_id: str) -> None:
+    """On-demand: run only the full review pipeline (no security, no stage advancement)."""
     try:
         import asyncio
         from app.agent.full_review import run_full_review_pipeline
+        from app.agent.merge import execute_merge
 
         task = get_task(task_id)
         if not task:
@@ -1418,7 +1455,7 @@ def _run_full_review_bg(task_id: str) -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            result = loop.run_until_complete(
+            fr_result = loop.run_until_complete(
                 run_full_review_pipeline(
                     task_id=task_id,
                     task_description=task.description or "",
@@ -1429,15 +1466,11 @@ def _run_full_review_bg(task_id: str) -> None:
                     project_path=project_path,
                 )
             )
-            _store_pipeline_result_generic(task_id, result, task.budget_id, "full_review")
+            _store_pipeline_result_generic(task_id, fr_result, task.budget_id, "full_review")
 
-            if result.get("outcome") == "passed":
-                # Pushed to FINAL REVIEW (full_review column) - do a virtual merge test.
-                from app.agent.merge import execute_merge
-                
+            if fr_result.get("outcome") == "passed":
                 logger.info("[full_review] Task '%s' passed. Running virtual merge test.", task_id)
                 merge_test = execute_merge(task_id, project_path=project_path, dry_run=True)
-                
                 if merge_test.status == "virtual_passed":
                     append_task_history(task_id, "ready_for_review", message="Full review passed. Virtual merge/test SUCCEEDED. Ready for final manual review and merge.")
                     logger.info("[full_review] Task '%s' virtual merge SUCCEEDED.", task_id)
@@ -1445,9 +1478,9 @@ def _run_full_review_bg(task_id: str) -> None:
                     append_task_history(task_id, "merge_test_failed", message=f"Full review passed, but VIRTUAL MERGE FAILED: {merge_test.status}. Detail: {merge_test.error_detail}")
                     logger.warning("[full_review] Task '%s' virtual merge FAILED: %s", task_id, merge_test.status)
             else:
-                demotion = result.get("demotion_target", "indev")
+                demotion = fr_result.get("demotion_target", "indev")
                 update_task(task_id, type=demotion)
-                _record_demotion(task_id, "full_review", demotion, result.get("summary", ""))
+                _record_demotion(task_id, "full_review", demotion, fr_result.get("summary", ""))
                 logger.warning("[full_review] Task '%s' demoted to %s.", task_id, demotion)
         except ShutdownError:
             logger.info("[full_review] Pipeline for '%s' aborted due to server shutdown.", task_id)
@@ -1560,7 +1593,7 @@ ADVANCE_HANDLERS = {
     "conceptual_review": "_advance_to_optimization",
     "optimization": "_run_security_pipeline_bg",
     "security": "_run_full_review_bg",
-    "full_review": "_execute_merge_bg",
+    # "full_review": "_execute_merge_bg",  # DISABLED: Requires manual review/merge
 }
 
 
@@ -2744,6 +2777,19 @@ def _check_completion_rollup(task_id: str):
 # Helper Functions
 # ============================================
 
+def _check_has_cached_plan(task) -> bool:
+    """Return True if a reusable planning result exists for this task's current spec."""
+    if getattr(task, 'type', None) not in ('planning', 'idea'):
+        return False
+    try:
+        from hashlib import sha256
+        from app.database import get_reusable_planning_result
+        content_hash = sha256(f"{task.title}||{task.description or ''}".encode()).hexdigest()
+        return get_reusable_planning_result(task.id, content_hash) is not None
+    except Exception:
+        return False
+
+
 def task_to_dict(task):
     """Convert SQLAlchemy Task model to dictionary"""
     llm_obj = getattr(task, 'llm_ref', None)
@@ -2811,6 +2857,8 @@ def task_to_dict(task):
             if task.type == "idea"
             else 0
         ),
+        "cache_mode": getattr(task, "cache_mode", "normal") or "normal",
+        "has_cached_plan": _check_has_cached_plan(task),
     }
 
 
@@ -3882,7 +3930,7 @@ AGENT_TOOL_ACCESS: dict = {
     "ResearchAgent": {
         "description": "Lightweight read-only investigator spawned by the intake pipeline when votes need clarification. Limited lives, restricted tools.",
         "tools": [
-            "read_file", "read_file_harder", "count_lines",
+            "read_file", "count_lines",
             "search_files", "find_files", "list_directory",
             "git_status", "git_diff", "git_log", "git_blame", "git_show",
             "get_task", "list_tasks",
@@ -3899,7 +3947,7 @@ AGENT_TOOL_ACCESS: dict = {
     "SubdivisionAgent": {
         "description": "Decomposes oversized ideas into smaller sub-ideas when intake votes SUBDIVIDE_IDEA. Read-only tools, structured decomposition output.",
         "tools": [
-            "read_file", "read_file_harder", "count_lines",
+            "read_file", "count_lines",
             "search_files", "find_files", "list_directory",
             "git_status", "git_diff", "git_log", "git_blame", "git_show",
             "get_task", "list_tasks",
@@ -3927,11 +3975,11 @@ AGENT_TOOL_ACCESS: dict = {
     },
     "SecurityPipeline": {
         "description": "3 parallel security reviewer agents with veto power. Uses allowlisted security scanner shell.",
-        "tools": ["run_shell_security", "read_file", "read_file_harder", "search_files", "find_files", "list_directory"],
+        "tools": ["run_shell_security", "read_file", "search_files", "find_files", "list_directory"],
     },
     "FullReviewPipeline": {
         "description": "4-agent final review (functional, code quality, integration, UX). Uses allowlisted review runner shell.",
-        "tools": ["run_shell_review", "read_file", "read_file_harder", "search_files", "find_files", "list_directory"],
+        "tools": ["run_shell_review", "read_file", "search_files", "find_files", "list_directory"],
     },
     "MergeWorker": {
         "description": "Deterministic git merge workflow (no LLM). Verifies branch, merges --no-ff, runs test suite, pushes if configured.",
@@ -4345,14 +4393,50 @@ def pin_task(task_id: str):
     return task_to_dict(updated)
 
 
+class RunPlanningRequest(BaseModel):
+    force: bool = False   # recompute with prior failure context injected
+    fresh: bool = False   # recompute with no prior context at all
+
+
+class CacheModeRequest(BaseModel):
+    mode: str  # 'normal' | 'force_with_context' | 'force_fresh'
+
+
+@app.post("/api/tasks/{task_id}/cache-mode", response_model=dict)
+def set_task_cache_mode(task_id: str, body: CacheModeRequest):
+    """Set the planning cache mode for a task.
+
+    normal            — reuse cached planning result if spec unchanged (default)
+    force_with_context — skip cache, recompute but inject prior failure context
+    force_fresh        — skip cache, recompute with no prior context
+    """
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    valid = {'normal', 'force_with_context', 'force_fresh'}
+    if body.mode not in valid:
+        raise HTTPException(status_code=400, detail=f"mode must be one of {valid}")
+    update_task(task_id, cache_mode=body.mode)
+    return {"task_id": task_id, "cache_mode": body.mode}
+
+
 @app.post("/api/tasks/{task_id}/run-planning", response_model=dict)
-def run_planning_on_demand(task_id: str):
-    """Manually trigger the planning pipeline for a task (any stage)."""
+def run_planning_on_demand(task_id: str, body: Optional[RunPlanningRequest] = None):
+    """Manually trigger the planning pipeline for a task (any stage).
+
+    Optional body:
+      force=true  — bypass cache, recompute with prior failure context
+      fresh=true  — bypass cache, recompute with no prior data
+    """
     task = get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     if not task.llm_id or not task.budget_id:
         raise HTTPException(status_code=400, detail="Task needs an LLM endpoint and budget assigned.")
+    if body and body.fresh:
+        update_task(task_id, cache_mode='force_fresh')
+    elif body and body.force:
+        update_task(task_id, cache_mode='force_with_context')
     # Clear stopped state so the scheduler (and status API) no longer shows this as stopped.
     from app.agent.scheduler import clear_planning_stopped
     clear_planning_stopped(task_id)
@@ -4542,6 +4626,53 @@ def run_merge_manually(task_id: str):
         raise HTTPException(status_code=404, detail="Task not found")
     _start_bg(_execute_merge_bg, task_id)
     return {"task_id": task_id, "status": "STARTED", "pipeline": "merge"}
+
+
+@app.post("/api/tasks/{task_id}/unmerge", response_model=dict)
+def unmerge_task(task_id: str):
+    """Revert a completed merged task: git revert the merge commit and move back to full_review."""
+    import subprocess as _subprocess
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.type != "completed":
+        raise HTTPException(status_code=400, detail=f"Task is '{task.type}', not 'completed'")
+
+    mr = get_merge_record(task_id)
+    if not mr or not mr.merge_commit_sha:
+        # No merge record — just move the card back without touching git
+        _record_demotion(task_id, from_stage="completed", to_stage="full_review", reason="manual unmerge (no merge record)")
+        updated = update_task(task_id, type="full_review")
+        return {**task_to_dict(updated), "git": "skipped — no merge record found"}
+
+    sha = mr.merge_commit_sha
+
+    from app.database import get_project_path
+    project_path = get_project_path(task.project) if task.project else None
+
+    def _git(*args):
+        r = _subprocess.run(
+            ["git"] + list(args),
+            capture_output=True, text=True, timeout=30,
+            cwd=project_path,
+        )
+        return r.returncode, (r.stdout + r.stderr).strip()
+
+    # Ensure we are on main/master before reverting
+    rc, _ = _git("checkout", "main")
+    if rc != 0:
+        rc, _ = _git("checkout", "master")
+        if rc != 0:
+            raise HTTPException(status_code=500, detail="Cannot checkout main/master branch")
+
+    rc, out = _git("revert", "-m", "1", "--no-edit", sha)
+    if rc != 0:
+        raise HTTPException(status_code=500, detail=f"git revert failed: {out[:500]}")
+
+    _record_demotion(task_id, from_stage="completed", to_stage="full_review", reason=f"manual unmerge — reverted {sha[:8]}")
+    updated = update_task(task_id, type="full_review")
+    append_task_history(task_id, "unmerged", message=f"Merge commit {sha[:8]} reverted. Moved back to Human Review.")
+    return {**task_to_dict(updated), "git": f"reverted {sha[:8]}"}
 
 
 @app.get("/api/agent/tasks/ready", response_model=List[dict])

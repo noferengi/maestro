@@ -232,11 +232,11 @@ class TestHandleToolCalls:
         assert "not available" in results[0]["content"] or "ERROR" in results[0]["content"]
 
     def test_allowed_tool_dispatched(self):
-        """read_list_dir is in RESEARCH_AGENT_TOOLS - it should be dispatched."""
+        """list_directory is in RESEARCH_AGENT_TOOLS - it should be dispatched."""
         tool_calls = [{
             "id": "tc3",
             "function": {
-                "name": "read_list_dir",
+                "name": "list_directory",
                 "arguments": json.dumps({"path": PROJECT_ROOT}),
             },
         }]

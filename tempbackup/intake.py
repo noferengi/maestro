@@ -485,7 +485,7 @@ class IntakePipeline:
         usage = data.get("usage", {})
         assistant_msg = data.get("choices", [{}])[0].get("message", {})
         tool_calls = assistant_msg.get("tool_calls") or []
-        
+
         parsed_content = None
         if tool_calls:
             for tc in tool_calls:
@@ -496,7 +496,7 @@ class IntakePipeline:
                 if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
                     parsed_content = json.loads(tc_result).get("payload")
                     break
-        
+
         if parsed_content is None:
             # Fallback to content parsing if tool call was missed
             raw_content = assistant_msg.get("content", "{}")

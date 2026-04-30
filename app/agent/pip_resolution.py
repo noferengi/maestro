@@ -11,7 +11,7 @@ Lifecycle (driven by the scheduler):
      existing maestro/task-{id} branch.
   3. The agent exits when:
        a. It stops calling tools (requirements satisfied — natural completion).
-       b. It emits {"signal": "RESOLUTION_STALLED"} after repeated failures.
+       b. It calls submit_work(signal="RESOLUTION_STALLED") after repeated failures.
        c. max_turns is exceeded.
   4. signal_completion(f"pip_resolution_{pip_id}") always fires on exit.
   5. The scheduler detects this signal, marks the job done, and re-dispatches
@@ -31,7 +31,6 @@ from app.agent.config import (
     INDEV_AGENT_TOOLS,
     check_context_saturation,
 )
-from app.agent.json_utils import extract_json_block
 from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
 from app.agent.tools import async_dispatch_tool, build_tool_schemas
 
@@ -88,6 +87,7 @@ class PIPResolutionAgent:
         self._no_tool_turns: int = 0
         self._warnings_fired: set[float] = set()
         self._turn_warnings_fired: set[int] = set()
+        self._terminal_signal: dict | None = None
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -163,8 +163,17 @@ class PIPResolutionAgent:
 
             # Dispatch tool calls
             if tool_calls:
+                self._terminal_signal = None
                 result_messages = await self._handle_tool_calls(tool_calls)
                 self._messages.extend(result_messages)
+
+                if self._terminal_signal and self._terminal_signal.get("signal") == SIGNAL_STALLED:
+                    logger.warning(
+                        "[pip_resolution] pip %d signalled RESOLUTION_STALLED via submit_work.",
+                        self.pip_id,
+                    )
+                    return {"status": "stalled", "turns": self._turn}
+
                 all_errors = all(
                     m.get("content", "").startswith("ERROR")
                     for m in result_messages
@@ -182,22 +191,7 @@ class PIPResolutionAgent:
                     self._no_tool_turns = 0
                 continue
 
-            # No tool calls — check for RESOLUTION_STALLED signal
-            if content:
-                try:
-                    block = extract_json_block(content)
-                    if block:
-                        parsed = json.loads(block)
-                        if isinstance(parsed, dict) and parsed.get("signal") == SIGNAL_STALLED:
-                            logger.warning(
-                                "[pip_resolution] pip %d signalled RESOLUTION_STALLED.",
-                                self.pip_id,
-                            )
-                            return {"status": "stalled", "turns": self._turn}
-                except Exception:
-                    pass
-
-            # No tool calls, no stall signal — first time: nudge; second time: done
+            # No tool calls — first time: nudge; second time: done
             self._no_tool_turns += 1
             if self._no_tool_turns >= 2:
                 logger.info(
@@ -210,8 +204,8 @@ class PIPResolutionAgent:
                 "role": "user",
                 "content": (
                     "[SYSTEM] No tool was called. Use your tools to make targeted changes "
-                    "that satisfy the PIP requirements, or emit "
-                    '{"signal": "RESOLUTION_STALLED"} if you cannot proceed.'
+                    "that satisfy the PIP requirements, or call "
+                    'submit_work(signal="RESOLUTION_STALLED", summary="<reason>") if you cannot proceed.'
                 ),
             })
 
@@ -279,8 +273,8 @@ class PIPResolutionAgent:
             "Commit your changes with clear messages referencing the PIP requirement. "
             "Stop when you are confident every requirement above is satisfied.\n"
             "Do NOT expand scope beyond these requirements.\n"
-            f"After {_MAX_CONSECUTIVE_ERRORS} consecutive tool failures, stop and emit "
-            '{"signal": "RESOLUTION_STALLED"}.'
+            f"After {_MAX_CONSECUTIVE_ERRORS} consecutive tool failures, call "
+            'submit_work(signal="RESOLUTION_STALLED", summary="<root cause>") to signal you cannot proceed.'
         )
 
         return [{"role": "system", "content": system_prompt}]
@@ -329,10 +323,20 @@ class PIPResolutionAgent:
                 )
             except Exception as exc:
                 result = f"ERROR: tool '{name}' raised: {exc}"
+
+            result_str = str(result)
+            if "__maestro_terminal__" in result_str:
+                try:
+                    terminal_data = json.loads(result_str)
+                    if terminal_data.get("__maestro_terminal__"):
+                        self._terminal_signal = terminal_data
+                except Exception:
+                    pass
+
             result_messages.append({
                 "role": "tool",
                 "tool_call_id": tool_id,
-                "content": str(result),
+                "content": result_str,
             })
         return result_messages
 

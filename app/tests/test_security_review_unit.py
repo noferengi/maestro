@@ -35,15 +35,34 @@ def _llm_response(content_dict: dict, prompt_tokens: int = 50,
 
 def _sec_response(verdict: str, confidence: int = 90, justification: str = "ok",
                   findings=None) -> dict:
+    """Build a submit_work tool-call response for a security reviewer."""
     findings = findings or []
-    return _llm_response({
-        "verdict": verdict,
-        "confidence": confidence,
-        "justification": justification,
-        "findings": findings,
-        "critical_count": sum(1 for f in findings if f.get("severity") == "critical"),
-        "high_count": sum(1 for f in findings if f.get("severity") == "high"),
-    })
+    confidence = max(0, min(100, confidence))
+    return {
+        "choices": [{
+            "message": {
+                "content": None,
+                "tool_calls": [{
+                    "id": "tc_sec",
+                    "type": "function",
+                    "function": {
+                        "name": "submit_work",
+                        "arguments": json.dumps({
+                            "signal": "ACCEPTED" if verdict != "REJECTED" else "REVERT_TO_DESIGN",
+                            "summary": justification,
+                            "payload": {
+                                "verdict": verdict,
+                                "confidence": confidence,
+                                "findings": findings,
+                            },
+                        }),
+                    },
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+        "usage": {"prompt_tokens": 50, "completion_tokens": 5},
+    }
 
 
 class _SequentialCallLLM:
