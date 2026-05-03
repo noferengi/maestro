@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Project Maestro — a Kanban board with an agentic LLM orchestration backend. The board is the UI face of a "Wiggum Loop": a Do-While that drives a local LLM through Design → Implement → Test → Verify cycles until all DAG task nodes reach ACCEPTED. Tasks transition IDEA → PLANNING → INDEV → CONCEPTUAL_REVIEW → OPTIMIZATION → SECURITY → FULL_REVIEW → COMPLETED, gated by a multi-stage intake pipeline with LLM voting.
 
+**See `ARCHITECTURE.md`** for the full system reference: pipeline stages, compute resource model (LLM Endpoints + Compute Nodes), scheduler tick lifecycle, all agent types, planning pipeline deep-dive, git worktree isolation, safety layers, and data schema overview. **See `PRD.md`** for the product roadmap and feature specs.
+
 ## MCP server — primary diagnostic interface
 
 A `maestro` MCP server is registered in `.mcp.json` and enabled via `.claude/settings.local.json`.
@@ -105,8 +107,8 @@ Board is at `http://localhost:8000/`. LLM endpoints are configurable per-task vi
 
 ```bash
 venv/Scripts/python.exe -m pytest app/tests/ -v
-venv/Scripts/python.exe -m pytest app/tests/test_repl.py -v      # single file
-venv/Scripts/python.exe -m pytest app/tests/test_repl.py -k "test_name" -v  # single test
+venv/Scripts/python.exe -m pytest app/tests/test_planning_unit.py -v      # single file
+venv/Scripts/python.exe -m pytest app/tests/test_planning_unit.py -k "test_name" -v  # single test
 ```
 
 ## Database migrations
@@ -154,7 +156,7 @@ For stuck planning tasks use `diagnose_task(task_id)` — covers budget traces, 
 
 ### Backend (`app/`)
 - `main.py` — FastAPI app. All routes. Mounts static files from `app/web/`. On startup calls `init_db()` + `seed_sample_tasks()` (skips seeding if data exists). Quick-action endpoints: `/demote`, `/set-stage`, `/clone`, `/pin`, `/run-planning`, `/run-review`, `/run-security`, `/run-full-review`. Task serialization (`_task_to_dict`) always includes a `"pips"` array. `sync_update_llm_with_cache` / `sync_delete_llm_with_cache` call `invalidate_llm_cache` after LLM record mutations so stale context/capacity state is flushed immediately.
-- `database.py` — SQLAlchemy models + all DB CRUD functions. `delete_task()` is a **soft-delete**: sets `is_active=False` on the target and all descendants via BFS. All read queries filter `is_active=True`. `upsert_project()` uses `...` (Ellipsis) sentinel for `llm_id`/`budget_id` — pass Ellipsis to leave unchanged, None to clear. PIP CRUD and resolution job CRUD are in `crud_tasks.py`. `pip_status_at_stage(pip, stage)` derives status at read time — no stored status column.
+- `database/` — DB package. `models.py` has SQLAlchemy ORM definitions. `__init__.py` re-exports the main CRUD surface. Specialized modules: `crud_pipeline.py` (planning/review/component results), `crud_tasks.py` (task + PIP CRUD), `crud_sessions.py` (agent sessions), `crud_infra.py` (LLMs, budgets, compute nodes), `crud_jobs.py` (research + file-summary jobs), `crud_costs.py` (budget entries + expenses), `crud_projects.py`, `crud_files.py`, `crud_dreamer.py`, `crud_survey.py`, `crud_inbox.py`, `session.py` (SQLAlchemy session factory). `delete_task()` is a **soft-delete**: sets `is_active=False` on the target and all descendants via BFS. All read queries filter `is_active=True`. `upsert_project()` uses `...` (Ellipsis) sentinel for `llm_id`/`budget_id` — pass Ellipsis to leave unchanged, None to clear. `pip_status_at_stage(pip, stage)` derives status at read time — no stored status column.
 - `migrations/runner.py` — standalone sqlite3 migration engine, no SQLAlchemy dependency.
 
 ### Agent system (`app/agent/`)
@@ -172,6 +174,7 @@ INI file with sections: `[intake]`, `[subdivision]`, `[capacity]`, `[context_war
 - `[subdivision]` — max_depth, max_retries_per_level, max_total_sub_ideas, subdivision_agent_tools, `context_budget_ratio` (default 0.60). Both `subdivision_agent_tools` and `subdivision_planning_tools` include `web_search` for domain research during decomposition.
 - `[search]` — `provider` (duckduckgo | brave, default duckduckgo), `brave_api_key` (required only if provider=brave). Env overrides: `MAESTRO_SEARCH_PROVIDER`, `BRAVE_API_KEY`.
 - `[pip]` — `resolution_max_turns` (default: 20, max turns for `PIPResolutionAgent` before it auto-stalls).
+- `[monitor]` — `duration_seconds` (default: 300, blocking window for `mcp__maestro__monitor()`).
 
 ### Data flow
 Tasks are per-project. Switching projects calls `loadTasksFromDatabase()` which re-fetches `/api/projects/{name}/tasks` and fully rebuilds `taskData`. `renderTasksFromDatabase()` groups tasks by type, sorts each group by `position`, appends pipeline cards to their column containers, and calls `renderArchBar()` to rebuild the architecture bar. Architecture tasks (`type='architecture'`) are excluded from the pipeline columns array and rendered only in the arch bar. Drag-and-drop reorder POSTs to `/api/tasks/{id}/reorder`, then re-fetches the full project task list to get authoritative positions before re-rendering. When `columnMapActive` is true, `reconcile()` only refreshes `taskData` and skips DOM reconciliation.
@@ -214,6 +217,16 @@ GET    /api/tasks/{id}/subdivision-records — audit trail of subdivision attemp
 GET    /api/diagnostics/tasks             — tasks with LLM activity + synthetic __file_summaries__ row
 GET    /api/projects/{name}/arch-gen-jobs — pending/running arch gen jobs [{id, category, status, created_at, retry_count}]
 GET    /api/tasks/{id}/pips               — full PIP list with verification history per PIP (for PIP detail modal)
+GET    /api/tasks/{id}/stage-summary      — rolled-up stage status (planning gate, component counts, review outcomes)
+GET    /api/tasks/{id}/planning-result    — full planning_result row (file_manifest, steps, interface_contracts, gate_checks, etc.)
+GET    /api/tasks/{id}/component-status   — list of component_results rows for this task
+GET    /api/tasks/{id}/optimization-status — latest optimization pipeline outcome
+GET    /api/tasks/{id}/security-status    — list of security reviewer verdicts
+GET    /api/tasks/{id}/full-review-status — list of full-review verdicts
+GET    /api/tasks/{id}/merge-status       — branch name + merge_commit_sha if merged
+GET    /api/tasks/{id}/diff               — git diff for the task branch (method, branch, stat, diff text, truncated flag)
+GET    /api/tasks/{id}/research-jobs      — research jobs associated with this task
+GET    /api/tasks/{id}/transition-status  — full transition history with per-run vote detail (powers Stage Journal transitions section)
 ```
 
 ## Safety rules (for the agent tools)
