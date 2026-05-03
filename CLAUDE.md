@@ -43,6 +43,9 @@ five pattern flags: `rapid_cycling`, `token_limited`, `zombie_sessions`, `stage_
 
 | Goal | Tool |
 |---|---|
+| **Orient at session start** | `get_project_health(project?)` — stage counts, active sessions, spend, demotions, pending merges |
+| How many LLM slots are free right now? | `get_capacity_status()` — per-node/LLM used/free/total table |
+| What's ready to merge? | `list_pending_merges(project?)` — completed tasks with no merge_commit_sha |
 | Watch activity over time | `monitor()` — blocks N seconds, returns diff report + pattern flags |
 | Why is task X stuck? | `diagnose_task(task_id)` — one call, complete picture |
 | What's running right now? | `get_scheduler_state()` (DB) + `get_scheduler_api_status()` (live API) |
@@ -125,6 +128,13 @@ migrate.bat reset       # DESTRUCTIVE: drop everything, re-migrate, re-seed
 Or directly: `venv/Scripts/python.exe app/migrations/runner.py <command>`
 
 Migrations live in `app/migrations/versions/` as `NNNN_description.py`. Never edit an existing migration — always add a new one. Each exposes `up(conn)`, `down(conn)`, and `description`.
+
+To scaffold the next migration file automatically:
+
+```bash
+venv/Scripts/python.exe scripts/create_migration.py "your migration name"
+# prints the path of the created file, e.g. app/migrations/versions/0055_your_migration_name.py
+```
 
 **Full schema reference:** See `CLAUDE_SCHEMA.md` in the project root — every table, column, type, nullability, and default value.
 

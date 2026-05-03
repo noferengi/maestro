@@ -1,6 +1,42 @@
 # TheMaestro — Product Requirements Document
 
-> **Living document.** Edit in-place. Update status badges as work ships. Add new sections at the bottom of each theme; never reorder shipped items. Last substantive revision: 2026-05-02.
+> **Living document.** Edit in-place. Update status badges as work ships. Add new sections at the bottom of each theme; never reorder shipped items. Last substantive revision: 2026-05-03.
+
+---
+
+## Immediate Backlog
+
+*Items identified as high-value and not yet planned elsewhere. Pick up from here before starting new themes.*
+
+### B.1 Operational Runbook — `RUNBOOK.md`
+
+`PLANNED` · Priority: **P1**
+
+A lookup table of the ten most common stuck-card patterns: symptom → likely cause → fix command. The MCP `diagnose_task` surfaces the data; knowing what to do with it requires experience that currently lives only in the operator's head. Format: a short markdown table plus one paragraph per pattern. Target: any new session should be able to resolve any common failure in under 2 minutes without prior context.
+
+Patterns to cover at minimum:
+- `activity_status: idle` on a session marked running → zombie after server restart
+- `finish_reason: length` on a planning budget entry → max_tokens too low for reasoning model
+- Planning gate hard-fail "CREATE targets exist" → stale plan, file created since plan was written
+- Task stuck in `subdividing` type → subdivision agent exited without writing children
+- `rapid_cycling` monitor flag → PIP loop, resolution failing and re-demoting
+- Gate soft-fail on interface completeness → fuzzy match missing, needs `patch_planning_fields`
+- Research job stuck in `running` → server restarted mid-research, needs manual reset to `pending`
+- `tool_call_storms` monitor flag → agent in a read loop, needs `stop_agent` + demotion
+- Budget exhausted mid-run → task in error state, budget needs top-up or reallocation
+- Orphaned worktree after crash → `prune_orphaned_worktrees` doesn't fire, manual `git worktree prune`
+
+---
+
+### B.2 `preview_dispatch()` MCP Tool
+
+`PLANNED` · Priority: **P2**
+
+Dry-run the scheduler tick without dispatching anything. Returns what *would* be dispatched: task ID, title, target LLM, estimated token cost, and why each other ready task was skipped (capacity, cooldown, PIP gate, etc.).
+
+Useful for reasoning about ordering and capacity before flipping the scheduler on, and for debugging "why didn't my card dispatch?" without staring at logs.
+
+Implementation: replicate the `_tick()` logic in read-only mode — same DAG resolution, same capacity checks, same cooldown filters — but instead of calling `_run_task()`, collect the decisions into a report. No DB writes. Lives in `mcp_tools/diagnostics.py`.
 
 ---
 

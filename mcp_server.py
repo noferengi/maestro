@@ -16,6 +16,9 @@ Tools:
     maestro__find_stuck_tasks       — tasks with open session + no recent LLM call
     maestro__get_planning_result    — full plan content (interface_contracts etc.)
     maestro__run_inspect_cards      — escape hatch: run inspect_cards.py sections
+    maestro__get_capacity_status    — per-node/LLM slot utilisation (free/used/total)
+    maestro__list_pending_merges    — completed tasks not yet merged to main
+    maestro__get_project_health     — cold-start briefing: stages, sessions, spend, demotions
 
   Action (write):
     maestro__append_task_description  — add context to task description
@@ -53,6 +56,9 @@ from mcp_tools.diagnostics import (
     find_stuck_tasks,
     get_planning_result,
     run_inspect_cards,
+    get_capacity_status,
+    list_pending_merges,
+    get_project_health,
 )
 from mcp_tools.actions import (
     append_task_description,
@@ -82,6 +88,9 @@ mcp.tool()(get_agent_sessions)
 mcp.tool()(find_stuck_tasks)
 mcp.tool()(get_planning_result)
 mcp.tool()(run_inspect_cards)
+mcp.tool()(get_capacity_status)
+mcp.tool()(list_pending_merges)
+mcp.tool()(get_project_health)
 
 # --- Live API tool ---
 mcp.tool()(get_scheduler_api_status)

@@ -512,6 +512,288 @@ def get_planning_result(task_id: str) -> dict | None:
         conn.close()
 
 
+def get_capacity_status() -> dict:
+    """
+    Current LLM slot utilisation across all compute nodes.
+
+    Returns a per-node, per-LLM breakdown of used/free/total sessions so
+    you can answer "how many slots are free right now?" in one call.
+    Active session counts are read from open agent_sessions rows; the
+    connection is read-only so it never blocks the running server.
+    """
+    conn = get_conn()
+    try:
+        nodes = conn.execute(
+            "SELECT id, name, max_parallel_sessions, max_loaded_models "
+            "FROM compute_nodes ORDER BY name"
+        ).fetchall()
+
+        llms = conn.execute(
+            "SELECT id, address, port, model, max_context, parallel_sessions, compute_node_id "
+            "FROM llms ORDER BY compute_node_id, id"
+        ).fetchall()
+
+        # Count open sessions per llm_id
+        session_counts = {}
+        for row in conn.execute(
+            "SELECT llm_id, COUNT(*) AS cnt FROM agent_sessions "
+            "WHERE ended_at IS NULL AND llm_id IS NOT NULL GROUP BY llm_id"
+        ).fetchall():
+            session_counts[row["llm_id"]] = row["cnt"]
+
+        # Group LLMs by node
+        llms_by_node: dict[int | None, list] = {}
+        for llm in llms:
+            nid = llm["compute_node_id"]
+            llms_by_node.setdefault(nid, []).append(llm)
+
+        result_nodes = []
+        total_free = 0
+        total_capacity = 0
+
+        # Nodes with LLMs attached
+        for node in nodes:
+            nid = node["id"]
+            node_llms = llms_by_node.pop(nid, [])
+            node_used = sum(session_counts.get(l["id"], 0) for l in node_llms)
+            node_cap = node["max_parallel_sessions"]
+            node_free = max(0, node_cap - node_used)
+            models_active = sum(1 for l in node_llms if session_counts.get(l["id"], 0) > 0)
+
+            endpoints = []
+            for llm in node_llms:
+                used = session_counts.get(llm["id"], 0)
+                cap = llm["parallel_sessions"]
+                free = max(0, cap - used)
+                total_free += free
+                total_capacity += cap
+                endpoints.append({
+                    "llm_id": llm["id"],
+                    "endpoint": f"{llm['address']}:{llm['port']}",
+                    "model": llm["model"],
+                    "max_context": llm["max_context"],
+                    "sessions_used": used,
+                    "sessions_free": free,
+                    "sessions_total": cap,
+                    "status": "FULL" if free == 0 else f"{free} free",
+                })
+
+            result_nodes.append({
+                "node_id": nid,
+                "node_name": node["name"],
+                "node_sessions_used": node_used,
+                "node_sessions_total": node_cap,
+                "node_models_active": models_active,
+                "node_models_max": node["max_loaded_models"],
+                "llm_endpoints": endpoints,
+            })
+
+        # Unassigned LLMs (no compute_node_id)
+        orphan_llms = llms_by_node.get(None, [])
+        if orphan_llms:
+            endpoints = []
+            for llm in orphan_llms:
+                used = session_counts.get(llm["id"], 0)
+                cap = llm["parallel_sessions"]
+                free = max(0, cap - used)
+                total_free += free
+                total_capacity += cap
+                endpoints.append({
+                    "llm_id": llm["id"],
+                    "endpoint": f"{llm['address']}:{llm['port']}",
+                    "model": llm["model"],
+                    "max_context": llm["max_context"],
+                    "sessions_used": used,
+                    "sessions_free": free,
+                    "sessions_total": cap,
+                    "status": "FULL" if free == 0 else f"{free} free",
+                })
+            result_nodes.append({
+                "node_id": None,
+                "node_name": "(no compute node)",
+                "node_sessions_used": sum(session_counts.get(l["id"], 0) for l in orphan_llms),
+                "node_sessions_total": sum(l["parallel_sessions"] for l in orphan_llms),
+                "node_models_active": None,
+                "node_models_max": None,
+                "llm_endpoints": endpoints,
+            })
+
+        return {
+            "nodes": result_nodes,
+            "summary": {
+                "total_slots_free": total_free,
+                "total_slots_used": total_capacity - total_free,
+                "total_slots": total_capacity,
+                "status": "IDLE" if total_capacity - total_free == 0
+                          else ("FULL" if total_free == 0 else "ACTIVE"),
+            },
+        }
+    finally:
+        conn.close()
+
+
+def list_pending_merges(project: str = None) -> list:
+    """
+    All COMPLETED tasks whose work has not yet been merged to main.
+
+    A task is "pending merge" when it has type='completed' and either has no
+    merge_record row or its merge_record.merge_commit_sha is NULL.
+    Returns task_id, title, project, branch_name, and accepted_at.
+    Optionally filter by project name.
+    """
+    conn = get_conn()
+    try:
+        query = """
+            SELECT t.id, t.title, p.name AS project, t.updated_at AS accepted_at,
+                   mr.branch_name, mr.merge_commit_sha, mr.status AS merge_status
+            FROM tasks t
+            LEFT JOIN projects p ON t.project_id = p.id
+            LEFT JOIN merge_records mr ON mr.task_id = t.id
+            WHERE t.is_active = 1
+              AND t.type = 'completed'
+              AND (mr.id IS NULL OR mr.merge_commit_sha IS NULL)
+        """
+        params: list = []
+        if project:
+            query += " AND p.name = ?"
+            params.append(project)
+        query += " ORDER BY t.updated_at DESC"
+
+        rows = conn.execute(query, params).fetchall()
+        result = []
+        for r in rows:
+            branch = r["branch_name"] or f"maestro/task-{r['id']}"
+            result.append({
+                "task_id": r["id"],
+                "title": r["title"],
+                "project": r["project"],
+                "branch": branch,
+                "accepted_at": r["accepted_at"],
+                "merge_status": r["merge_status"] or "no_record",
+            })
+        return result
+    finally:
+        conn.close()
+
+
+def get_project_health(project: str = None) -> dict:
+    """
+    Cold-start briefing for a project (or all projects if project=None).
+
+    Returns:
+    - Stage distribution: card counts per pipeline stage
+    - Active sessions: tasks currently running
+    - Recent demotions: tasks demoted in the last 24 hours
+    - Pending merges: count of completed-but-unmerged tasks
+    - Budget spend: total token cost (µ¢) in the last 7 days
+    - Stuck candidates: open sessions with no LLM activity in >10 min
+    """
+    conn = get_conn()
+    try:
+        proj_filter = ""
+        params: list = []
+        if project:
+            proj_filter = " AND p.name = ?"
+            params.append(project)
+
+        # Stage distribution
+        stage_rows = conn.execute(
+            "SELECT t.type, COUNT(*) AS cnt "
+            "FROM tasks t LEFT JOIN projects p ON t.project_id = p.id "
+            f"WHERE t.is_active = 1{proj_filter} "
+            "GROUP BY t.type ORDER BY t.type",
+            params,
+        ).fetchall()
+        stage_dist = {r["type"]: r["cnt"] for r in stage_rows}
+
+        # Active sessions
+        active_rows = conn.execute(
+            "SELECT s.task_id, t.title, t.type, p.name AS project, s.agent_type, s.started_at "
+            "FROM agent_sessions s "
+            "JOIN tasks t ON s.task_id = t.id "
+            "LEFT JOIN projects p ON t.project_id = p.id "
+            f"WHERE s.ended_at IS NULL{proj_filter.replace('p.name', 'p.name')} "
+            "AND s.id = (SELECT MAX(id) FROM agent_sessions WHERE task_id = s.task_id AND ended_at IS NULL) "
+            "ORDER BY s.started_at DESC",
+            params,
+        ).fetchall()
+        active_sessions = [dict(r) for r in active_rows]
+
+        # Recent demotions (last 24 h) — tasks whose demotion_count > 0 and updated recently
+        demotion_rows = conn.execute(
+            "SELECT t.id, t.title, t.type, p.name AS project, t.demotion_count, t.updated_at "
+            "FROM tasks t LEFT JOIN projects p ON t.project_id = p.id "
+            f"WHERE t.is_active = 1 AND t.demotion_count > 0{proj_filter} "
+            "AND t.updated_at >= datetime('now', '-1 day') "
+            "ORDER BY t.updated_at DESC",
+            params,
+        ).fetchall()
+        recent_demotions = [dict(r) for r in demotion_rows]
+
+        # Pending merges count
+        merge_query = (
+            "SELECT COUNT(*) AS cnt FROM tasks t "
+            "LEFT JOIN projects p ON t.project_id = p.id "
+            "LEFT JOIN merge_records mr ON mr.task_id = t.id "
+            f"WHERE t.is_active = 1 AND t.type = 'completed'"
+            f"{proj_filter} AND (mr.id IS NULL OR mr.merge_commit_sha IS NULL)"
+        )
+        pending_merges = conn.execute(merge_query, params).fetchone()["cnt"]
+
+        # Budget spend last 7 days (microcents)
+        spend_row = conn.execute(
+            "SELECT COALESCE(SUM(e.total_cost_microcents), 0) AS total "
+            "FROM expenses e "
+            "JOIN tasks t ON e.task_id = t.id "
+            "LEFT JOIN projects p ON t.project_id = p.id "
+            f"WHERE e.created_at >= datetime('now', '-7 days'){proj_filter}",
+            params,
+        ).fetchone()
+        spend_microcents = spend_row["total"] if spend_row else 0
+        spend_dollars = round(spend_microcents / 100_000_000, 4)
+
+        # Stuck candidates: open session, no budget entry in last 10 min
+        stuck = []
+        for row in active_rows:
+            tid = row["task_id"]
+            last_entry = conn.execute(
+                "SELECT created_at FROM budget_entries WHERE task_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            if last_entry is None:
+                stuck.append({"task_id": tid, "title": row["title"],
+                               "idle_minutes": None, "note": "no LLM calls yet"})
+                continue
+            try:
+                from datetime import datetime, timezone
+                last_dt = datetime.fromisoformat(last_entry["created_at"].replace(" ", "T"))
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=timezone.utc)
+                age_min = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
+                if age_min > 10:
+                    stuck.append({"task_id": tid, "title": row["title"],
+                                  "idle_minutes": round(age_min, 1),
+                                  "note": "open session, no LLM call in >10 min"})
+            except Exception:
+                pass
+
+        scope = project or "all projects"
+        return {
+            "scope": scope,
+            "stage_distribution": stage_dist,
+            "active_sessions": active_sessions,
+            "active_count": len(active_sessions),
+            "recent_demotions_24h": recent_demotions,
+            "pending_merges": pending_merges,
+            "budget_spend_7d_microcents": spend_microcents,
+            "budget_spend_7d_dollars": spend_dollars,
+            "stuck_candidates": stuck,
+        }
+    finally:
+        conn.close()
+
+
 def run_inspect_cards(section: str = "", extra_args: str = "") -> str:
     """
     Run scripts/inspect_cards.py and return its stdout output.
