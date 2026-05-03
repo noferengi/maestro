@@ -1,258 +1,742 @@
-# **PRD - The Maestro Task List**
+# TheMaestro — Product Requirements Document
 
-This document outlines the implementation requirements for **The Maestro**, an agentic orchestration system that drives a locally-hosted LLM through sandboxed Design → Implement → Test → Verify cycles. The core promise: **a dumb coding agent can run in a loop, and one bad run can never destroy the project or poison future runs.**
-
-Every item below is grounded in the current codebase state as of 2026-03-14. Items marked `[x]` have working code. Items marked `[~]` have partial/scaffolded code. Items marked `[ ]` are not yet started.
+> **Living document.** Edit in-place. Update status badges as work ships. Add new sections at the bottom of each theme; never reorder shipped items. Last substantive revision: 2026-05-02.
 
 ---
 
-## **1. The Sandbox — Nothing Gets Destroyed**
+## Vision
 
-*The #1 priority. This is why the project exists. Qwen CLI deleted an entire project because it had raw shell access. That can never happen here.*
+**TheMaestro is an agentic software factory.** It takes human intent — expressed as IDEA cards on a Kanban board — and drives a fleet of locally-hosted LLMs through a closed-loop pipeline: Design → Implement → Test → Verify → Accept. The human sets direction and approves decisions. The machines do the work.
 
-### 1.1 Tool-Only Execution (No Raw Shell for Agents)
+The north star: **a non-engineer with a clear idea and a good GPU should be able to ship production-quality software.** Not a prototype. Not a script. Software with tests, security review, a DAG of well-ordered changes, and a git history that documents every decision.
 
-- [x] **Tool Registry:** 16 tools with OpenAI JSON schemas in `app/agent/tools.py`. All agent actions go through `dispatch_tool()`.
-- [x] **Shell Blocklist:** `run_shell()` rejects `rm -rf`, `del /s`, `format`, `dd`, fork bombs, `curl|bash`, deep `../` traversal, and 15+ other destructive patterns via compiled regex.
-- [x] **Path Containment:** `_assert_safe_path()` resolves every path and rejects anything outside `PROJECT_ROOT`.
-- [ ] **Allowlist Mode for Shell:** Replace the blocklist with a strict allowlist. Only permit: `python -m pytest`, `python -m pylint`, `git` (read-only subcommands), `pip list`, `cat`, `head`, `wc`. Everything else is rejected by default. The blocklist catches known bad patterns but misses creative destruction — an allowlist is the only way to be truly safe.
-- [ ] **No `shell=True`:** Refactor `run_shell()` to use `subprocess.run(shlex.split(command))` instead of `shell=True`. Shell injection via semicolons, pipes, or backticks is currently possible despite the blocklist (e.g., `echo hello; rm -rf /` where the `rm` portion doesn't match the pattern because of the semicolon splitting). Splitting the command first and running without a shell eliminates this entire class of attack.
-- [ ] **Filesystem Write Journaling:** Before every `write_file()` call, snapshot the file's current content to `.journal/<timestamp>/<path>` (similar to `.archive/` but for overwrites, not deletes). This creates a git-bisect-style undo trail that survives even if the agent corrupts git history on its branch.
-
-### 1.2 Soft-Delete / Archive System
-
-- [x] **`archive_file()`:** Moves files to `.archive/YYYY-MM-DD_HH-MM-SS/<relative_path>` with an optional `_reason.txt` sidecar. Never calls `os.remove`, `shutil.rmtree`, or any hard-delete primitive.
-- [x] **Agent System Prompt:** Instructs the agent to use `archive_file` instead of any delete command.
-- [ ] **Archive Restore Tool:** Add a `restore_file(archive_path)` tool so the agent (or the user via the UI) can undo an archive without manual file surgery.
-- [ ] **Archive Browser in UI:** A panel in the board that lists archived files with timestamps and reasons, with a one-click restore button.
-
-### 1.3 Git Isolation
-
-- [x] **Branch Enforcement:** `git_create_branch()` requires the `maestro/task-` prefix. `git_checkout()` blocks anything that isn't `maestro/*`, `main`, or `master`.
-- [x] **Auto-Staging:** `write_file()` and `append_file()` call `git add` after every write.
-- [ ] **Worktree Isolation:** Run each agent loop in a `git worktree` so the agent operates on a physically separate copy of the repo. If the agent corrupts its worktree, the main working tree is untouched. On success, merge the worktree branch back to main. On failure, delete the worktree — no cleanup needed.
-- [ ] **Force-Push Block:** Add `--force`, `-f` (in push context), and `push.*main` to the shell blocklist. The agent must never be able to rewrite shared history.
-- [ ] **Auto-Push on Accept:** When a task reaches ACCEPTED, automatically `git push origin maestro/task-{id}` so the branch exists on the remote even if the local machine dies. Requires a configured remote.
-- [ ] **Pre-Run Snapshot:** Before launching any agent loop, create a lightweight tag `maestro/pre-run/{task_id}/{timestamp}` on the current HEAD. This is the "last known good" state. If the run goes sideways, `git reset --hard` to this tag restores everything.
+The secondary north star: **nothing gets destroyed.** Every action is reversible. No agent can corrupt the project, overwrite unrelated work, or bypass review. Safety is architectural, not advisory.
 
 ---
 
-## **2. The Loop Engine — Run a Dumb Agent Safely**
+## How to Use This Document
 
-*The Wiggum Loop exists and works. The gaps are in run isolation, context management, and connecting the loop to the board UI.*
-
-### 2.1 Core Loop (The Wiggum)
-
-- [x] **MaestroLoop Class:** Async Do-While in `app/agent/loop.py`. Drives the LLM→tool-call→result→LLM cycle.
-- [x] **Turn Cap:** `MAX_TURNS=100` in config. Terminates runaway loops.
-- [x] **Consecutive Error Circuit Breaker:** After 3 consecutive tool errors, emits `REVERT_TO_DESIGN` and halts.
-- [x] **Terminal Signals:** Agent emits `{"signal": "ACCEPTED"}` or `{"signal": "REVERT_TO_DESIGN"}` as structured JSON to end the loop.
-- [x] **Status Registry:** `_ACTIVE_LOOPS` and `_LOOP_STATUS` dicts power the `/api/agent/status/{task_id}` endpoint.
-- [ ] **Run Isolation — One Loop, One World:** Each `MaestroLoop` run should:
-  1. Create a git worktree for its branch.
-  2. Set `PROJECT_ROOT` for that run to the worktree path.
-  3. Run all tool calls against the worktree, not the main repo.
-  4. On ACCEPTED: merge worktree branch → main, push, delete worktree.
-  5. On REVERT/ERROR/MAX_TURNS: delete worktree. Main repo is untouched.
-  This ensures one bad run cannot corrupt the state that the next run starts from.
-
-### 2.2 Context Window Management
-
-- [x] **Turn Cap:** Prevents unbounded context growth.
-- [x] **System Prompt Discipline:** Tells the agent not to re-read files already in context, to summarize before large operations, and to bail early if approaching the turn limit.
-- [ ] **Message Compression:** When the conversation exceeds 80% of the model's context window (estimated by token count), compress older tool results to summaries. Keep the system prompt, the last 10 messages, and all tool call names/results-as-one-liners. Discard full file contents from early reads.
-- [ ] **Sliding Window with Checkpoints:** Every 25 turns, write a checkpoint summary to the task history (`append_task_history`). If context must be truncated, the agent can re-orient from the last checkpoint instead of re-reading everything.
-
-### 2.3 Multi-Model Support
-
-- [x] **Config-Driven Endpoint:** `LLM_BASE_URL` and `LLM_MODEL` are environment variables. Can point to any OpenAI-compatible server.
-- [ ] **Per-Task Model Override:** Add an `llm` field to the task schema (JSON: `{endpoint, model, temperature}`). When set, the loop uses that model instead of the global default. This lets you run small tasks on a fast 9B model and hard tasks on an 80B model.
-- [ ] **Model Roster in UI:** A settings panel listing configured LLM endpoints (localhost:8008, localhost:8009, etc.) with model name, context window size, and a "test connection" button. Tasks can be assigned to a model from a dropdown.
+- Status badges: `SHIPPED` · `IN PROGRESS` · `PLANNED` · `IDEA` · `DEFERRED`
+- Items with no assignee are open for pickup.
+- Specs for PLANNED items live in the **Feature Specifications** section at the bottom.
+- When an item ships, mark it `SHIPPED`, add a one-line note on what was built, and do not remove it — the document is a record of decisions, not just a task list.
 
 ---
 
-## **3. The Board — Wire the Loop to the UI**
+## Current State (as of 2026-05-02)
 
-*The Kanban board is functional for manual task management. The agent backend is scaffolded but not yet controllable from the UI.*
+Everything listed here has working code in the repository.
 
-### 3.1 Existing Board Features
+### Pipeline
 
-- [x] Five columns: ARCHITECTURE, PLANNING, DEVELOPMENT, REVIEW, COMPLETED.
-- [x] Per-project task isolation with project tabs.
-- [x] Task CRUD: create, edit, delete, move between columns.
-- [x] Drag-and-drop reorder within columns (ghost placeholder UX).
-- [x] Auto-refresh polling (5-second interval).
-- [x] Proof-of-work timeline (task history view).
-- [x] Database-backed persistence (SQLite + SQLAlchemy + custom migration runner).
+| Stage | What Happens | Status |
+|---|---|---|
+| IDEA | Human-authored card enters the queue | `SHIPPED` |
+| Intake | Research agent resolves unknowns; LLM panel votes to accept or reject | `SHIPPED` |
+| PLANNING | 5-stage pipeline: survey → best-of-5 design → review panel → pitfall detection → consolidation | `SHIPPED` |
+| Planning Gate | 7 deterministic + 1 LLM check before plan is accepted | `SHIPPED` |
+| INDEV | Component-level dev orchestrator; parallel batch execution; test-fix loop | `SHIPPED` |
+| CONCEPTUAL_REVIEW | LLM panel reviews implementation quality | `SHIPPED` |
+| OPTIMIZATION | LLM suggests and applies performance improvements | `SHIPPED` |
+| SECURITY | Bandit + pip-audit + semgrep + LLM security reviewer | `SHIPPED` |
+| FULL_REVIEW | Final LLM panel; gates on LIKELY/POSSIBLE majority | `SHIPPED` |
+| COMPLETED | Task accepted; branch ready to merge | `SHIPPED` |
 
-### 3.2 Agent Controls in the Board
+### Scheduler
 
-- [~] **API Endpoints Exist:** `POST /api/agent/run/{task_id}`, `GET /api/agent/status/{task_id}`, `POST /api/agent/stop/{task_id}`, `GET /api/agent/tasks/ready`. All wired in `app/main.py`.
-- [ ] **"Run with Maestro" Button:** Add a button to each PLANNING/DEVELOPMENT card that calls `POST /api/agent/run/{task_id}`. Show a spinner while the loop is active.
-- [ ] **Live Status Panel:** When an agent loop is running, show a collapsible panel at the bottom of the board with: current turn count, git branch, last tool call name, last tool result (truncated), and a STOP button.
-- [ ] **Agent Log Stream:** WebSocket or SSE endpoint that streams tool call events in real-time. The status panel subscribes to this stream. Much better than polling for UX.
-- [ ] **REVERT_TO_DESIGN Reaction:** When the loop emits REVERT, automatically move the task back to PLANNING and display the `advice` field in a toast notification so the user knows what went wrong.
-- [ ] **ACCEPTED Reaction:** When the loop emits ACCEPTED, move the task to COMPLETED, display the summary, and show the git branch name with a "merge to main" button.
+- DAG-aware push scheduler; ticks every 5 s; topological sort for readiness `SHIPPED`
+- Multi-level capacity enforcement: per-LLM session cap, per-compute-node model cap `SHIPPED`
+- Budget pre-flight check (microcent tracking, worst-case cost estimate per dispatch) `SHIPPED`
+- Cooldown throttling: 60 s on failure, 5 min on rejection, 5 min project-level `SHIPPED`
+- One-LLM-at-a-time policy (llama.cpp architecture constraint) `SHIPPED`
+- PIP resolution guard: blocks re-dispatch while remediation is in flight `SHIPPED`
+- Planning session timeout: expires hung sessions, re-queues task `SHIPPED`
+- Worktree cleanup on startup: prunes orphaned git worktrees from crashed runs `SHIPPED`
 
-### 3.3 Board Improvements
+### Safety
 
-- [ ] **Prerequisites Editor:** The `prerequisites` column exists in the DB schema. Add a multi-select in the task edit modal that lets users pick prerequisite task IDs. The DAGResolver already computes readiness from this field.
-- [ ] **DAG Visualization:** A simple directed graph view (vis.js or d3-dag) showing task dependency arrows. Clicking a node opens the task. Ready tasks glow green.
-- [ ] **Rename / Delete Projects:** Tab context menu with rename and delete (soft-delete — archive all tasks, don't drop them).
-- [ ] **Cross-Column Drag:** Allow dragging cards between columns (not just reordering within a column). The reorder API already accepts a `type` field for column changes.
+- Worktree isolation: each task runs in `.maestro-worktrees/{task_id}/` on `maestro/task-{id}` branch `SHIPPED`
+- Write-path containment: agents cannot write outside project root, venv, node_modules, .git, gitignored paths `SHIPPED`
+- Archive-not-delete: `archive_file()` moves to `.archive/YYYY-MM-DD_HH-MM-SS/` — no hard deletes `SHIPPED`
+- Shell blocklist: rejects rm -rf, format, dd, fork bombs, curl|bash, deep traversal `SHIPPED`
+- Named shell tools: one tool per operation (run_pytest, run_mypy, run_ruff, etc.) — no raw shell for agents `SHIPPED`
+- Consecutive error circuit breaker: 3 failures → REVERT_TO_DESIGN `SHIPPED`
+- Git safety rails: agents cannot checkout non-maestro branches, cannot touch TheMaestro's own repo `SHIPPED`
 
----
+### Observability
 
-## **4. Safety Layers — Defense in Depth**
-
-*The lesson from the Qwen incident: one layer of protection is not enough. The system needs multiple independent safety layers so that if any one fails, the others still hold.*
-
-### Layer 1: Tool-Level Constraints (exists)
-- [x] Path containment, shell blocklist, archive-not-delete, branch enforcement.
-- [ ] Upgrade to shell allowlist (see 1.1).
-- [ ] Upgrade to no `shell=True` (see 1.1).
-
-### Layer 2: Git-Level Isolation (partially exists)
-- [x] Agent works on `maestro/task-*` branches only.
-- [ ] Worktree isolation (see 1.3).
-- [ ] Pre-run snapshot tags (see 1.3).
-- [ ] Auto-push on accept (see 1.3).
-
-### Layer 3: Loop-Level Circuit Breakers (exists)
-- [x] 3 consecutive errors → REVERT_TO_DESIGN.
-- [x] 150-turn hard cap.
-- [x] External stop via `POST /api/agent/stop/{task_id}`.
-
-### Layer 4: Write Journaling (not started)
-- [ ] Every `write_file` snapshots the previous content before overwriting.
-- [ ] Every `archive_file` records what was moved and why.
-- [ ] Journal is append-only and lives outside the agent's writable path.
-
-### Layer 5: Remote Persistence (not started)
-- [ ] Auto-push branches to remote on ACCEPTED.
-- [ ] Periodic push of `.journal/` and `.archive/` to a separate backup remote or branch.
-- [ ] The remote is the last line of defense — even if the local machine is wiped, the work survives.
+- Stage Journal modal: per-card view of every pipeline artifact (diffs, votes, gate checks, pitfalls, component results) `SHIPPED`
+- Tabbed file diff viewer with fullscreen toggle `SHIPPED`
+- Diagnostics viewer: every LLM call, prompt, response, tool use, token cost, context bar `SHIPPED`
+- MCP server (`maestro` tool set): monitor, diagnose_task, get_budget_trace, find_stuck_tasks, etc. `SHIPPED`
+- Budget tracking: per-task, per-session, per-LLM microcent spend with aggregated summaries `SHIPPED`
 
 ---
 
-## **5. Dual-Artifact System — Design Controls Code**
+## Theme 1 — IDEA Card Authoring
 
-*Markdown is the ground truth. Code is derived from it. The agent cannot invent requirements.*
-
-### 5.1 Blueprint Layer
-
-- [x] **ARCHITECTURE.md:** Global system design (exists, manually maintained).
-- [~] **AGENTS.md:** Folder-level design spec (file exists, schema not standardized).
-- [ ] **AGENTS.md Schema:** Define a required structure: `## Purpose`, `## Inputs`, `## Outputs`, `## Constraints`, `## Acceptance Criteria`. The planning agent writes these; the coding agent reads them.
-- [ ] **Design Validator Gate:** Before a task moves from PLANNING to DEVELOPMENT, an LLM call checks: "Does the AGENTS.md for this task's scope contain enough detail to implement?" If not, the task stays in PLANNING with feedback.
-
-### 5.2 Implementation Guardrails
-
-- [x] **System Prompt Rule S4:** Agent cannot modify `.md` design files unless the task type is `planning` or `architecture`.
-- [ ] **CodeSync Monitor:** After a task is ACCEPTED, diff the implementation against the relevant AGENTS.md. Flag any files that were changed but not mentioned in the design doc.
-- [ ] **Post-Merge Design Update:** After merging a completed task branch, auto-generate a summary of what changed and append it to AGENTS.md in the affected directories.
+*The quality of the output is gated by the quality of the input. Right now, a 10-word IDEA card and a 10-paragraph IDEA card go through the same pipeline. The machine does its best with what it has. This theme makes the input better.*
 
 ---
 
-## **6. Verification & Checkpointing**
+### 1.1 Intent Clarification — LLM-Assisted Description Rewrite
 
-### 6.1 Commit Discipline
+`PLANNED` · Priority: **P0** · Spec: [§FS-1.1](#fs-11-intent-clarification)
 
-- [x] **Auto-stage on write:** `write_file()` calls `git add` after every write.
-- [x] **`git_commit` tool:** Agent can commit with a message.
-- [ ] **Commit Gate:** The loop should verify that `git status` is clean before emitting ACCEPTED. No uncommitted changes allowed in the final state.
-- [ ] **Commit Message Enforcement:** Reject commit messages that don't match the format `feat(task-{id}): <what> — <why>` or `fix(task-{id}): ...`.
+When a user saves a new IDEA card (or edits an existing one), the system triggers a one-shot LLM rewrite of the description. The user sees the original and the suggested version side-by-side and chooses to accept, edit, or discard the suggestion. Only after this approval step does the card become available for pipeline dispatch.
 
-### 6.2 Test Verification
+**Why this matters:** The planning pipeline's 5-stage design process, the gate checks, and the implementation agent all depend on the description as their source of truth. A vague description produces a vague plan. A plan that doesn't match the user's intent demotes and retries, burning tokens and time. Front-loading clarity is the highest-leverage improvement in the entire system.
 
-- [x] **`run_shell` for pytest:** Agent can run `python -m pytest -x -q`.
-- [ ] **Mandatory Test Pass:** The loop should refuse to emit ACCEPTED unless the last `run_shell` call to pytest returned `EXIT_CODE: 0`. Currently this is honor-system — the system prompt asks the agent to test, but nothing enforces it.
-- [ ] **Test Coverage Gate:** After tests pass, run `pytest --cov` and require > 60% coverage on files changed by the task. Store the coverage number in the task history.
-
-### 6.3 Remote Continuity
-
-- [ ] **Auto-Push on Accept:** `git push origin maestro/task-{id}` after ACCEPTED (see 1.3).
-- [ ] **Milestone Push:** Every 5 accepted tasks, push main to remote. This is the "I can sleep at night" guarantee.
-- [ ] **Backup Rotation:** Keep the last 10 `.archive/` snapshots. Older ones get pushed to a `maestro/archive` branch on the remote and pruned locally.
+**Title policy:** The LLM is instructed to preserve the original title verbatim. The user spent cognitive effort on that title; it's how they'll recognize the card on the board. The LLM *may* append a short clarifying subtitle in `[brackets]` if the title is ambiguous, but the original string must appear first, unchanged. If the user wants a retitle, they can do it manually.
 
 ---
 
-## **7. Agent Specialization (Phase 2)**
+### 1.2 Prerequisites UI — Visual DAG Wiring
 
-*Start with a single general-purpose coding agent. Specialize later once the loop and safety layers are proven.*
+`PLANNED` · Priority: **P1** · Spec: [§FS-1.2](#fs-12-prerequisites-ui)
 
-### 7.1 Phase 1: Single Agent (current)
+No UI currently exists for setting `prerequisites`. The DAG is wired either by the subdivision agent (automatically) or not at all (human-created IDEA cards). This means human-authored work is dispatched without dependency ordering unless the user manually edits the DB.
 
-- [x] **System Prompt:** `MAESTRO_SYSTEM_PROMPT` in `app/agent/system_prompt.py`. Covers orient → plan → implement → test → verify workflow.
-- [x] **Tool Access:** All 16 tools available.
-- [ ] **Tool Subsetting:** Add a `tool_profile` field to config. Profiles like `"coding"` (no .md writes), `"planning"` (no source writes), `"readonly"` (only read/search/list tools). The loop passes only the allowed tool schemas to the LLM.
+Add a **prerequisite selector** to the task edit modal: a searchable multi-select showing all tasks in the current project. Below the selector, a mini DAG visualization (SVG, lightweight) shows the dependency chain so the user can see the effect of their selections before saving.
 
-### 7.2 Phase 2: Specialized Agents
-
-- [ ] **Planning Agent:** Writes AGENTS.md, manages DAG. Tools: read all, write .md only, DAG tools.
-- [ ] **Coding Agent:** Writes source and tests. Tools: read all, write source only, shell (pytest/lint only), git.
-- [ ] **Debugging Agent:** Read-only. Runs tests and static analysis. Produces structured diagnostic reports.
-- [ ] **Research Agent:** Read-only + web search (MCP). Produces context summaries for other agents.
-
-### 7.3 Phase 3: Multi-Agent Orchestration
-
-- [ ] **Agent Handoff Protocol:** When the coding agent emits REVERT, the orchestrator spawns a planning agent with the `advice` field as input. When the planning agent updates AGENTS.md, spawn a new coding agent.
-- [ ] **Parallel Task Execution:** Run multiple independent tasks simultaneously (one worktree per task). The DAGResolver already identifies which tasks are ready and have no shared prerequisites.
+Also add drag-to-connect to the Column Map view: hovering over a node reveals connection handles; dragging from one node to another creates a prerequisite edge.
 
 ---
 
-## **8. LLM Engine Support**
+### 1.3 Acceptance Criteria Extraction
 
-*The system is designed for locally-hosted models via llama.cpp's OpenAI-compatible API. But it should also work with any provider that speaks the same protocol.*
+`PLANNED` · Priority: **P1** · Spec: [§FS-1.3](#fs-13-acceptance-criteria-extraction)
 
-- [x] **llama.cpp Integration:** Config points to `localhost:8008/v1`. Works with OmniCoder 9B (Qwen 3.5 base).
-- [ ] **Model Registry:** A config file (`models.json`) listing available models with their endpoint, context window size, and capabilities (tool-call support, code-specific training, etc.).
-- [ ] **Adaptive Turn Budget:** Set `MAX_TURNS` based on model capability. A 9B model gets 50 turns on simple tasks. An 80B model gets 150.
-- [ ] **Qwen 3 Coder Next 80B Profile:** When running large models with strong instruction following, relax the "nudge" messages (the `[SYSTEM] You did not call any tool` messages) and increase `MAX_TOKENS_PER_TURN` to 8192.
-- [ ] **Ollama / vLLM / Exo Support:** As long as the server exposes `/v1/chat/completions` with tool-call support, it should work. Document tested configurations.
+The Intent Clarification step (1.1) produces a rewritten description. This step goes further: it extracts a **structured acceptance criteria list** from the description and stores it as a separate field on the task record.
 
----
+These criteria become:
+- The seed for PIPs (Performance Improvement Plans) if the card is demoted
+- The pass/fail checklist for the FULL_REVIEW stage
+- Pre-hoc test stubs injected into the component loop agent's initial context
 
-## **Implementation Priority Order**
-
-This is the recommended build sequence. Each phase makes the system meaningfully safer or more useful.
-
-### Sprint 1: Make the Loop Launchable from the UI
-1. "Run with Maestro" button on task cards.
-2. Live status panel with turn count and stop button.
-3. ACCEPTED/REVERT reactions (auto-move task, show feedback).
-
-### Sprint 2: Harden the Sandbox
-4. Shell allowlist (replace blocklist).
-5. Eliminate `shell=True`.
-6. Write journaling (snapshot before overwrite).
-7. Force-push block in shell patterns.
-
-### Sprint 3: Run Isolation
-8. Git worktree per agent run.
-9. Pre-run snapshot tags.
-10. Auto-push on ACCEPTED.
-
-### Sprint 4: Context & Multi-Model
-11. Message compression at 80% context.
-12. Per-task model override (llm field in schema).
-13. Model roster in UI.
-
-### Sprint 5: Design-Code Synchronization
-14. AGENTS.md standardized schema.
-15. Design validator gate.
-16. Prerequisites editor in task modal.
-
-### Sprint 6: Agent Specialization
-17. Tool profiles (coding/planning/readonly subsets).
-18. Planning agent with separate system prompt.
-19. Agent handoff protocol (REVERT → planning agent → coding agent).
+This closes the loop between what the user wanted and what the machine verifies.
 
 ---
 
-## **Notes**
+### 1.4 Cross-Task Conflict Prediction at Card Creation
 
-* **Maestro Loop:** The system persists until all DAG nodes reach ACCEPTED.
-* **Dual-Artifact Integrity:** Source Code must always be a derivative of the Markdown design.
-* **Failure Protocol:** After 3 implementation failures, the system triggers REVERT_TO_DESIGN.
-* **The Prime Directive:** No agent action can destroy data. Files are archived, not deleted. Writes are journaled. Branches are isolated. The remote is the last resort backup.
+`IDEA` · Priority: **P2**
+
+When a user creates or edits a card, run a lightweight analysis against currently active and pending cards:
+1. Search file manifests of active INDEV/PLANNING tasks for overlap with likely files (inferred from description keywords)
+2. If overlap found, surface a warning: *"Task #42 (currently in INDEV) is likely to modify `src/auth.py`. Consider making that task a prerequisite, or note the intended coordination."*
+3. User can dismiss, add a prerequisite, or add a note to the description
+
+This is advisory, not blocking — but it prevents the most common source of merge conflicts.
+
+---
+
+### 1.5 IDEA Card Templates
+
+`IDEA` · Priority: **P3**
+
+Certain task patterns recur: "add an API endpoint," "add a database migration," "add a UI feature," "write tests for module X." A template system stamps a group of pre-wired IDEA cards from a pattern, with prerequisites already set.
+
+Templates are stored as JSON in the project (or globally). The "New Card" modal offers a "Use Template" option. The user fills in template variables (endpoint name, table name, etc.) and gets a ready-to-run subtree.
+
+---
+
+## Theme 2 — Cross-Task Coordination
+
+*Multiple cards can be active simultaneously. Currently they are blind to each other's pending changes. This theme makes them aware.*
+
+---
+
+### 2.1 Pending-Change Awareness Injection
+
+`PLANNED` · Priority: **P1** · Spec: [§FS-2.1](#fs-21-pending-change-awareness-injection)
+
+**The gap:** Agent A is modifying `src/auth.py`. Agent B starts and also plans to modify `src/auth.py`. Neither knows about the other. Both will succeed. The conflict surfaces at merge time, not at run time.
+
+**The fix:** At dispatch time, for each task being launched, query the DB for all tasks whose status is `completed` or `full_review` and which have a non-null `merge_commit_sha = NULL` (accepted but not yet merged). For each such task that has a file manifest overlapping with the current task's file manifest, inject a read-only summary into the agent's initial context:
+
+```
+⚠ PENDING UNMERGED CHANGES:
+  Task #42 "Add OAuth middleware" (ACCEPTED, not yet merged)
+  Modified files: src/auth.py, src/middleware.py, tests/test_auth.py
+  To read the pending version of src/auth.py:
+    read_git_show("maestro/task-42", "src/auth.py")
+  Treat these as the effective current state of those files.
+```
+
+The agent already has `read_git_show()` with ref support — it can read any branch. No new tool needed. This is a ~30-line change to `loop.py` and a DB query helper.
+
+---
+
+### 2.2 File Claim Registry
+
+`PLANNED` · Priority: **P2** · Spec: [§FS-2.2](#fs-22-file-claim-registry)
+
+At planning-gate acceptance time, register all files in the task's `file_manifest` as claimed by that task in a `file_claims` DB table (`task_id`, `file_path`, `claimed_at`, `released_at`). Claims are released when the task is merged or demoted.
+
+At dispatch time, the scheduler checks the claim registry:
+- If a ready task's manifest overlaps with an active claim, inject a coordination warning (as in 2.1) — but do not block dispatch
+- If the overlap is with a task that is currently INDEV (not just accepted), flag it as a soft conflict and suggest deferring
+
+This is advisory. The DAG prerequisite system is the hard enforcement mechanism. File claims are the early-warning system.
+
+---
+
+### 2.3 Merge-Readiness Queue
+
+`IDEA` · Priority: **P2**
+
+Add a visual "merge queue" section to the board: all COMPLETED tasks whose branches have not yet been merged to main, sorted by acceptance time. Each entry shows: task title, branch name, files changed, merge conflicts (detected via `git merge-tree --write-tree` dry-run), and a "Merge" button.
+
+When a task is merged, release its file claims (2.2) and update sibling tasks' pending-change injections.
+
+---
+
+### 2.4 Automatic Prerequisite Suggestion from File Overlap
+
+`IDEA` · Priority: **P3**
+
+When a card moves into PLANNING and the planning gate produces a `file_manifest`, automatically suggest adding any currently-active tasks that share files as prerequisites. Present as a toast: *"Task #42 is modifying 2 of the same files. Add as prerequisite?"*
+
+---
+
+## Theme 3 — Planning Quality
+
+*The planning pipeline is the most important stage. A good plan makes everything downstream faster, cheaper, and more accurate.*
+
+---
+
+### 3.1 Spec Constraint Hardening
+
+`SHIPPED` — Planning gate extracts binding constraints from description and injects them into design prompts. LLM feasibility check verifies implementation steps don't violate constraints.
+
+---
+
+### 3.2 Incremental Planning Cache
+
+`PLANNED` · Priority: **P2**
+
+When a card is demoted from INDEV back to PLANNING, the codebase survey (20 agent turns) and most of the design work are still valid. Only the part that caused the failure needs rethinking.
+
+Cache the planning survey result keyed on `(project_file_tree_hash, task_description_hash)`. On re-plan, if the cache hit is valid (project files haven't changed significantly), skip the survey phase and use cached context. Estimated savings: 30–50% of re-planning token cost.
+
+---
+
+### 3.3 Test Stub Generation from Acceptance Criteria
+
+`PLANNED` · Priority: **P2** · Depends on: [1.3](#13-acceptance-criteria-extraction)
+
+Once acceptance criteria are extracted (1.3), generate test stub files before the dev loop starts. The component loop agent receives concrete tests to satisfy rather than inferring them from the description. This is the TDD model applied to the agentic pipeline.
+
+The planning agent writes stub test files to the task's worktree as part of plan consolidation. The dev agent sees red tests on day 1 and must make them green. No more honor-system "please write tests."
+
+---
+
+### 3.4 Architecture Constraint Awareness in Subdivision
+
+`SHIPPED` — Subdivision agent receives architecture card context filtered by `ARCH_CATEGORY_RELEVANCE['subdivision']`.
+
+---
+
+### 3.5 Adaptive Reviewer Panel Size
+
+`IDEA` · Priority: **P3**
+
+Currently the design review panel is hardcoded at 5 reviewers (with simple tasks skipping 2). Instead, scale the panel based on:
+- Estimated complexity (file count, step count, number of external dependencies)
+- Risk profile (security-sensitive files, database migrations, public API changes)
+- Available LLM capacity
+
+High-risk changes get 7 reviewers. Trivial changes (single-file test additions) get 2. This reduces token waste on simple tasks and increases scrutiny on dangerous ones.
+
+---
+
+## Theme 4 — Development Quality
+
+*The dev loop is where code gets written. This theme makes the code better and the verification more trustworthy.*
+
+---
+
+### 4.1 Pre-hoc Test Stubs
+
+`PLANNED` · Priority: **P2** · See [3.3](#33-test-stub-generation-from-acceptance-criteria)
+
+---
+
+### 4.2 Test Evidence in Stage Journal
+
+`IN PROGRESS` · Priority: **P1**
+
+The Stage Journal currently shows component status (done/failed/running) but not test output. A developer reviewing an accepted card cannot see which tests passed, what coverage was achieved, or what the pytest output was.
+
+Add a **Tests** section to the Stage Journal that shows:
+- Test run summary (pass/fail count, coverage %)
+- Failed test names and truncated output (if any)
+- Files with zero coverage (if coverage data available)
+- Whether the test-fix loop was triggered, and how many attempts it took
+
+This requires storing test output in the `component_results` table (currently only stores `status`, `turns_used`, `files_changed`). Add `test_output` (text, nullable) and `coverage_pct` (float, nullable) columns via migration.
+
+---
+
+### 4.3 Mandatory Test Pass Gate
+
+`PLANNED` · Priority: **P1**
+
+The loop currently relies on the agent's initiative to run tests before submitting. An agent under context pressure may skip this. Add a hard gate: the dev orchestrator verifies `git status` is clean and the last recorded test run returned exit code 0 before accepting a component as done. If tests have not been run since the last write, force a test run.
+
+---
+
+### 4.4 Component Retry on Partial Failure
+
+`SHIPPED` — Test-fix loop retries 3× with 20-turn budget. `INDEV_TEST_FIX_MAX_RETRIES = 3`.
+
+---
+
+### 4.5 Cross-Component Interface Verification
+
+`IDEA` · Priority: **P3**
+
+After all components in a batch complete, run an automated interface contract check: verify that each component's provided interfaces match what consuming components expect, using the `interface_contracts` from the planning result as the source of truth. Flag mismatches before the review stage.
+
+---
+
+## Theme 5 — Observability & Transparency
+
+*The system should be legible. A human reviewing the board should be able to understand exactly why any card is in its current state, what the agent did, and what evidence supports acceptance.*
+
+---
+
+### 5.1 Stage Journal Improvements — Tabbed Diff, Fullscreen, Light Transitions
+
+`SHIPPED` — Tabbed per-file diff viewer, fullscreen toggle, light-themed transition cards with colored left-border per outcome, 600-char vote justifications.
+
+---
+
+### 5.2 Test Evidence Section in Stage Journal
+
+`PLANNED` · Priority: **P1** · See [4.2](#42-test-evidence-in-stage-journal)
+
+---
+
+### 5.3 Timeline View
+
+`IDEA` · Priority: **P2**
+
+A horizontal timeline for each card showing every pipeline stage transition with timestamps, duration, and the decision that caused the transition (vote outcome, gate check result, user action). Makes it easy to see "this card spent 4 hours in planning because the gate failed twice on interface completeness."
+
+---
+
+### 5.4 Project Velocity Dashboard
+
+`IDEA` · Priority: **P3**
+
+A project-level stats page showing:
+- Cards per stage (current snapshot)
+- Average time per stage over last 30 days
+- Token cost by stage and by LLM
+- Demotion rate by stage (cards that were rejected at each gate)
+- Test pass rate on first attempt vs. after fix loop
+
+This is the operational heartbeat of the factory.
+
+---
+
+### 5.5 Archive Browser in UI
+
+`PLANNED` · Priority: **P2**
+
+The `.archive/` directory is the soft-delete safety net. Currently it's invisible in the UI. Add a panel (accessible from the project settings or a toolbar button) that lists archived files with timestamps, the task that archived them, and a one-click restore. Makes the safety guarantee visible and actionable.
+
+---
+
+## Theme 6 — Multi-LLM & Scale
+
+*Today the system runs one LLM at a time on one machine. This theme opens the ceiling.*
+
+---
+
+### 6.1 Multi-LLM Load Balancing
+
+`PLANNED` · Priority: **P2** · Spec: [§FS-6.1](#fs-61-multi-llm-load-balancing)
+
+The scheduler's capacity model already tracks multiple LLMs and compute nodes. The one-LLM-at-a-time policy is a llama.cpp constraint, not an architectural one. When a stateless inference server (vLLM, TGI, Ollama parallel mode) is configured, the scheduler should dispatch to the least-loaded available LLM simultaneously rather than serializing.
+
+Expected throughput improvement: roughly linear with the number of LLM slots, up to the DAG's parallelism ceiling.
+
+---
+
+### 6.2 Compute Node Management
+
+`SHIPPED` — Compute nodes table, per-node capacity config, node-aware dispatch.
+
+---
+
+### 6.3 Model Card System
+
+`PLANNED` · Priority: **P2**
+
+LLM endpoints currently have: name, base_url, model, max_context, parallel_sessions. Add:
+- `strengths`: array of tags (`["coding", "reasoning", "security"]`)
+- `cost_per_1k_tokens`: for budget reporting
+- `supports_tool_calls`: boolean (some smaller models can't reliably use JSON tool schemas)
+- `preferred_stages`: which pipeline stages this model should be routed to
+
+The scheduler uses `preferred_stages` to route: planning to the strongest reasoning model, security review to the model tagged "security," component dev to the fastest coding model. Better resource allocation without manual per-task LLM assignment.
+
+---
+
+### 6.4 Remote Inference Support
+
+`IDEA` · Priority: **P3**
+
+The system currently assumes local inference. For tasks that benefit from a stronger model, allow routing to a remote OpenAI-compatible API (Claude API, OpenAI, Groq, etc.) with:
+- Per-project budget cap (don't accidentally spend $100 on one card)
+- Fallback to local if remote is unavailable
+- Clear labeling in the Stage Journal when a remote model was used
+
+---
+
+## Theme 7 — Safety Hardening
+
+*The current safety model is strong. This theme closes the remaining gaps.*
+
+---
+
+### 7.1 Shell Allowlist
+
+`PLANNED` · Priority: **P2**
+
+Replace the shell blocklist with a strict allowlist. The current blocklist catches known-bad patterns but misses creative destruction (semicolon splitting, environment variable expansion, etc.). An allowlist is the only way to be truly safe.
+
+Named shell tools (run_pytest, run_mypy, etc.) are already the primary mechanism. The generic `run_shell` command is now only available to specific pipeline stages that need it. Long-term goal: eliminate `run_shell` entirely from agent-accessible tools.
+
+---
+
+### 7.2 Write Journaling
+
+`PLANNED` · Priority: **P2**
+
+Before every `write_file()` call, snapshot the previous file content to `.journal/{task_id}/{timestamp}/{path}`. This is a git-bisect-style undo trail that survives even if the agent corrupts its branch. Journal files are append-only and live outside the agent's writable path.
+
+Different from `.archive/`: archive is for deliberate deletes. Journal is for overwrites — the file still exists but its previous content is preserved.
+
+---
+
+### 7.3 Pre-Run Snapshot Tags
+
+`PLANNED` · Priority: **P2**
+
+Before launching any agent loop, create a lightweight git tag `maestro/pre-run/{task_id}/{timestamp}` on the current HEAD of the task's worktree branch. If the run goes sideways, `git reset --hard` to this tag restores everything without worrying about individual file recovery.
+
+---
+
+### 7.4 Auto-Push on Accept
+
+`PLANNED` · Priority: **P2**
+
+When a task reaches ACCEPTED, automatically `git push origin maestro/task-{id}`. The remote is the last line of defense. If the local machine dies between acceptance and merge, the work survives. Requires a configured remote (skipped gracefully if none).
+
+---
+
+### 7.5 Archive Restore Tool
+
+`PLANNED` · Priority: **P3**
+
+Add a `restore_file(archive_path, target_path=None)` tool that reverses `archive_file()`. Available to agents and to the UI (Archive Browser, 5.5). Currently recovery requires manual file surgery.
+
+---
+
+## Theme 8 — IDEA Card to Merge — Full Flow Tightening
+
+*End-to-end UX improvements that make the system feel like a product, not a prototype.*
+
+---
+
+### 8.1 Card Status Indicators
+
+`SHIPPED` — Stage footer badges on each card show pipeline substage, gate result, component counts, session activity.
+
+---
+
+### 8.2 One-Click Pipeline Triggers
+
+`SHIPPED` — Run Planning, Run Review, Run Security, Run Full Review buttons on cards.
+
+---
+
+### 8.3 Merge Button on COMPLETED Cards
+
+`PLANNED` · Priority: **P1**
+
+COMPLETED cards have an accepted branch. The only remaining step is merging to main. Add a "Merge to main" button on completed cards that:
+1. Runs `git merge --no-ff maestro/task-{id}` (no fast-forward so the branch boundary is visible in history)
+2. Updates `merge_commit_sha` on the task record
+3. Releases file claims (2.2)
+4. Optionally deletes the task's worktree and branch
+5. Shows a diff stat of what was merged
+
+---
+
+### 8.4 Demotion Reason UI
+
+`SHIPPED` — Demotion history visible in Stage Journal transition section with colored left-border per outcome.
+
+---
+
+### 8.5 Card Clone & Reattempt
+
+`SHIPPED` — Clone button creates duplicate IDEA in same project.
+
+---
+
+### 8.6 Bulk Operations
+
+`IDEA` · Priority: **P3**
+
+Checkboxes on cards to select multiple; bulk operations: move to stage, assign LLM, set budget, archive. Useful when cleaning up a stalled project or reassigning work after a model change.
+
+---
+
+## Feature Specifications
+
+*Detailed specs for PLANNED items. When a feature ships, mark the spec SHIPPED and note what diverged.*
+
+---
+
+### FS-1.1 Intent Clarification
+
+**Status:** `PLANNED`
+
+**Trigger:** User clicks "Save" on a new IDEA card, or clicks "Clarify" on an existing one.
+
+**Flow:**
+
+1. Modal shows a loading state ("Thinking about your idea…")
+2. System makes a single LLM call (no tools, no turns — just one generation) with the prompt:
+
+   ```
+   You are helping a software engineer clarify a task description before it enters
+   an automated development pipeline. The pipeline works best when descriptions are:
+   - Specific about what success looks like (acceptance criteria)
+   - Clear about what is explicitly NOT included (scope boundaries)
+   - Explicit about any technical constraints (language, framework, approach)
+   - Structured so an LLM can extract a file manifest from it
+
+   The user's original title: {title}
+   The user's original description: {description}
+
+   Rewrite the description to be clearer and more complete. Structure it as:
+
+   **Goal:** [one sentence — what this card accomplishes]
+
+   **Acceptance Criteria:**
+   - [specific, testable condition]
+   - [specific, testable condition]
+   ...
+
+   **Out of Scope:** [what this card explicitly does NOT do]
+
+   **Constraints:** [any technical constraints, or "None"]
+
+   Rules:
+   - Do NOT change the title. If the title needs disambiguation, append [clarification]
+     after the original title, but reproduce the original verbatim first.
+   - Do NOT invent requirements. Only make explicit what is implicit in the description.
+   - If the description is already clear and specific, you may return it unchanged.
+   - Keep the rewrite concise. Do not pad.
+   ```
+
+3. Modal shows the original and the rewritten description side by side, or stacked on mobile.
+4. User has three actions:
+   - **Accept** — saves the rewritten description to the task record
+   - **Edit** — opens the rewritten description in an editable textarea; user tweaks and saves
+   - **Keep Original** — discards the suggestion, saves the original description
+5. Optionally: a "Suggest a title" link (collapsed by default) that reveals a title suggestion. The original title is pre-filled and the suggestion is shown as a diff. The user chooses which to keep. Title changes do not auto-apply.
+
+**Card enters the dispatch queue only after this step completes.** If the user closes the modal without choosing, the card is saved as a draft (not dispatchable) with a badge "Needs clarification."
+
+**Model selection:** Uses the project's default LLM, or the cheapest/fastest configured LLM tagged for `intake` stage. One call, ~500 tokens. This is cheap enough to always run.
+
+**Fallback:** If the LLM call fails, the user is shown the original description with a "Clarification failed — save anyway?" prompt. Always recoverable.
+
+**New field required:** `description_original` (text, nullable) — stores the user's raw input before clarification. Allows diffing "what the user typed" vs "what the pipeline saw" if a card goes wrong. Migration required.
+
+**New field required:** `clarification_status` (text, default `'none'`) — values: `none` (no clarification run), `pending` (clarification triggered, not yet approved), `approved` (rewrite accepted), `kept_original` (user kept original), `skipped` (user bypassed). Used by the scheduler to gate dispatch.
+
+---
+
+### FS-1.2 Prerequisites UI
+
+**Status:** `PLANNED`
+
+**In create/edit modal:**
+- New "Prerequisites" section below description
+- Searchable multi-select: type to filter tasks by title or ID; shows pipeline stage badge next to each result
+- Selected prerequisites shown as chips with a remove button
+- Below the chips: a static SVG mini-graph (4-column compact layout) showing the dependency chain — what the selected tasks depend on, and what currently depends on them
+- Warning displayed if a circular dependency would be created (client-side check: walk the existing prerequisite graph)
+
+**In Column Map:**
+- Hover a node → show 4 connection handles (N/S/E/W)
+- Drag from a handle to another node → creates prerequisite edge (target ← source)
+- Drag from a handle to empty space → cancels
+- Right-click an existing arrow → context menu with "Remove prerequisite"
+- Changes persist immediately via `PUT /api/tasks/{id}` with updated `prerequisites` array
+
+---
+
+### FS-1.3 Acceptance Criteria Extraction
+
+**Status:** `PLANNED`
+
+**When:** During the Intent Clarification step (FS-1.1), after the user approves the rewrite.
+
+**How:** Parse the approved description for the `**Acceptance Criteria:**` section (produced by the rewrite prompt). Store as a JSON array of strings in a new `acceptance_criteria` column on the task record.
+
+**If the description was not rewritten** (user kept original, or no clarification ran): run a second lightweight LLM call that only extracts acceptance criteria from the raw description. This call is fire-and-forget; it doesn't block the UI.
+
+**Downstream use:**
+1. Planning gate: inject acceptance criteria as required behaviors the plan must address
+2. Full review stage: reviewers are given the criteria and asked to verify each one is met
+3. Stage Journal: "Acceptance Criteria" section shows each criterion with a pass/fail badge populated from the full review votes
+
+---
+
+### FS-2.1 Pending-Change Awareness Injection
+
+**Status:** `PLANNED`
+
+**Where:** `app/agent/loop.py`, in `_build_initial_context()` (or equivalent init function).
+
+**Query:** At dispatch time, before building the initial message:
+
+```python
+def _get_pending_sibling_changes(task_id: str, project_id: int, file_manifest: list[str]) -> list[dict]:
+    """
+    Returns accepted-but-unmerged sibling tasks whose file manifests overlap
+    with the current task's file manifest.
+    """
+    # Query: tasks in same project, type in (completed, full_review),
+    #        merge_commit_sha IS NULL, id != task_id
+    # For each: check if file_manifest overlap with current task's manifest
+    # Return: [{task_id, title, branch, overlapping_files}]
+```
+
+**Injection format** (added to the initial system message):
+
+```
+⚠ PENDING UNMERGED CHANGES IN THIS PROJECT:
+The following tasks have been accepted but not yet merged to main.
+Their changes are on separate branches. Treat them as the effective
+current state of those files — do not overwrite their work.
+
+• Task #42 "Add OAuth middleware" (branch: maestro/task-42)
+  Pending modifications: src/auth.py, src/middleware.py, tests/test_auth.py
+  → read_git_show("maestro/task-42", "src/auth.py") to read the pending version
+
+• Task #38 "Refactor user model" (branch: maestro/task-38)
+  Pending modifications: app/models/user.py, app/database/migrations/0052_user_refactor.py
+  → read_git_show("maestro/task-38", "app/models/user.py") to read the pending version
+
+If you modify any of these files, coordinate with the pending changes above.
+```
+
+**No new tools needed.** `read_git_show` already accepts arbitrary refs.
+
+**Gating:** Only inject if overlapping files are found. Zero-overhead for tasks with no sibling conflicts.
+
+---
+
+### FS-2.2 File Claim Registry
+
+**Status:** `PLANNED`
+
+**New table: `file_claims`**
+
+```sql
+CREATE TABLE file_claims (
+    id          INTEGER PRIMARY KEY,
+    task_id     TEXT NOT NULL,
+    file_path   TEXT NOT NULL,
+    claimed_at  TEXT NOT NULL,  -- ISO timestamp
+    released_at TEXT,           -- NULL = still active
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+);
+CREATE INDEX idx_file_claims_active ON file_claims(task_id, released_at)
+    WHERE released_at IS NULL;
+```
+
+**Claim creation:** When a planning result is gate-approved, insert one row per file in `file_manifest`. Done in `planning_gate.py` after all checks pass.
+
+**Claim release:** When a task is merged (merge_commit_sha set) or demoted below INDEV (plan invalidated), delete or set `released_at` on all active claims for that task.
+
+**Scheduler integration:** In the readiness check, add a soft-conflict warning (not a hard block) when a ready task's manifest overlaps with active claims. Log the warning; inject via FS-2.1 mechanism if the task is dispatched.
+
+---
+
+### FS-6.1 Multi-LLM Load Balancing
+
+**Status:** `PLANNED`
+
+**Precondition:** A stateless inference backend configured that can handle concurrent requests (vLLM, TGI, Ollama with `--parallel` flag, or multiple llama.cpp instances on different ports).
+
+**Scheduler change:** Replace the one-LLM-at-a-time gate with a routing policy:
+
+```python
+def _select_llm_for_task(task, available_llms):
+    """
+    Returns the best available LLM for this task, or None if all are at capacity.
+    Priority: task.llm_id > project.llm_id > stage-preferred LLM > least-loaded LLM
+    """
+```
+
+The existing per-LLM `parallel_sessions` cap and per-node `max_parallel_sessions` cap are already enforced. The only change is removing the "one model loaded at a time" serialization that was forced by llama.cpp's single-model limitation.
+
+**No DB schema changes required.** The LLM table already has everything needed.
+
+---
+
+## Architecture Constraints
+
+*Known limits that shape every decision. Update this section when a constraint is lifted.*
+
+| Constraint | Root Cause | Workaround | Resolution Path |
+|---|---|---|---|
+| One LLM active at a time | llama.cpp loads one model into VRAM | Configure multiple llama.cpp instances on separate ports | Switch to vLLM or Ollama parallel mode (FS-6.1) |
+| SQLite single-writer | SQLite WAL mode, no replication | All DB writes go through the FastAPI server (single process) | Acceptable until >10 concurrent agents; Postgres migration path exists |
+| Local inference only | No remote API integration | Manual per-task LLM override | Theme 6 remote inference (6.4) |
+| No cross-project isolation | File tools restricted by path only | Agents stay on their project root by convention | Capability-based security model (future) |
+| Worktree branch not stored in DB | Branch derived from task_id at runtime | Always `maestro/task-{id}` | Not a problem; keep derived |
+
+---
+
+## Success Metrics
+
+*How we know the system is getting better, not just bigger.*
+
+| Metric | Current Baseline | Target |
+|---|---|---|
+| Cards accepted on first INDEV attempt (no demotion) | ~40% (estimated) | >65% |
+| Average planning gate passes on first attempt | ~60% (estimated) | >80% |
+| Token cost per accepted card | Unknown (not tracked) | <500K tokens for medium complexity |
+| Time from IDEA → COMPLETED (calendar time) | ~2-4 hours | <90 min for medium complexity |
+| Merge conflicts on branch merge | Unknown | Zero (via file claims + pending awareness) |
+| User-edited clarification rate (1.1) | N/A (not built) | >40% (cards with at least one edit) |
+| Stage Journal open rate per accepted card | Unknown | >70% (humans reviewing machine work) |
+
+---
+
+## Decision Log
+
+*Decisions made, and why. Reference this before reopening closed questions.*
+
+| Date | Decision | Rationale |
+|---|---|---|
+| 2026-03 | Named shell tools replace generic `run_shell` for agents | Blocklist approach misses creative destruction; per-operation tools are the only safe design |
+| 2026-03 | Worktree isolation per task (not per session) | Prevents agent crashes from corrupting the main working tree; enables parallel tasks |
+| 2026-03 | One-LLM-at-a-time as initial policy | llama.cpp constraint; scheduler model already supports multi-LLM for when the constraint is lifted |
+| 2026-04 | Planning gate is deterministic + 1 LLM call (not all-LLM) | Deterministic checks (interface completeness, circular deps) are cheaper and more reliable than LLM checks for structural properties |
+| 2026-04 | PIPs are post-hoc (generated on demotion) not pre-hoc | Acceptance criteria extraction (1.3) will migrate these to pre-hoc; PIPs then become the enforcement mechanism for pre-stated criteria |
+| 2026-05 | Title preservation is policy in Intent Clarification (1.1) | Users use titles for identification; silent retitles break mental models; suggestions are opt-in |
+| 2026-05 | Pending-change awareness is injection, not locking | Locking creates deadlocks; injection + agent reasoning is more robust and already has the tool infrastructure (`read_git_show`) |
