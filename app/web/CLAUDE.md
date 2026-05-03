@@ -38,6 +38,12 @@ Key patterns:
 - New task default LLM is pre-populated from the current project's `llm_id`
 - `populateProjectLlmSelect(elementId, selectedId)` and `populateProjectBudgetSelect(elementId, selectedId)` — shared helpers for project-level dropdowns
 
+Stage Journal functions (all global, called from inline `onclick` attributes):
+- `_parseDiffFiles(diffText)` — splits a unified diff string into `[{name, path, html}]` per file; detects `diff --git` boundaries and renders each file's hunks as an HTML table with line numbers and `+`/`-`/` ` row classes
+- `_renderDiff(diffText)` — calls `_parseDiffFiles()`. Single-file diffs return the raw table HTML; multi-file diffs return tab+panel HTML (`.sj-diff-tabs` + `.sj-diff-panels`). The caller detects the return value and wraps accordingly.
+- `_sjSelectDiffTab(tabEl, idx)` — switches the active tab/panel pair; walks up to `.sj-diff-tabs`, finds its sibling `.sj-diff-panels`, and toggles `.active` on both sets
+- `_sjToggleFullscreen()` — toggles `.sj-fullscreen` on `#sj-modal-inner`; swaps the expand button icon between `⛶` (enter) and `✕` (exit)
+
 #### Architecture Bar (`#arch-bar`)
 
 A dark navy band spanning the full board width above the pipeline columns. Architecture cards are stored as `type='architecture'` tasks in the DB and rendered **only** here — never in kanban columns.
@@ -87,6 +93,29 @@ as a paginated collection (← older · N of M · newer →).
 - **Regeneration** — "Regenerate" keeps the modal open, injects a synthetic `{status: 'generating'}` placeholder as set 1, starts `_startChildrenPoller(taskId)`. The poller (500ms) watches `GET /api/tasks/{id}/subdivision-records` until the newest record leaves `generating` status, then stops and re-renders.
 - `_viewChildrenState = { taskId, records, childMap, idx }` — records sorted newest-first.
 - `_childrenPollerTimer` — `setInterval` ID; stopped by `_stopChildrenPoller()`.
+
+#### Stage Journal Modal
+
+Clicking the "Stage Journal" button on any task card opens a per-task modal (`#stage-journal-modal`) that consolidates all pipeline artifacts: planning gate checks, component results, code diff, security/optimization/review verdicts, and intake transitions.
+
+**Key DOM IDs:**
+- `#stage-journal-modal` — outer modal overlay
+- `#sj-modal-inner` — inner modal container; receives the `.sj-fullscreen` class when expanded
+- `#sj-expand-btn` — fullscreen toggle button; calls `_sjToggleFullscreen()`
+
+**Diff viewer (tabbed for multi-file diffs):**
+When the task branch has changes against multiple files, `_renderDiff()` returns tab+panel HTML instead of a plain table. The caller wraps it in `.diff-viewer` and injects it. Tabs use `.sj-diff-tab` elements; clicking a tab calls `_sjSelectDiffTab(this, idx)`. Each panel is a `.sj-diff-panel`; the active pair share the `.active` class. Single-file diffs skip the tab bar entirely.
+
+**Fullscreen mode:**
+`_sjToggleFullscreen()` adds/removes `.sj-fullscreen` on `#sj-modal-inner`. In fullscreen the modal expands to 98vw × 97vh; the diff viewer height grows to `calc(97vh - 200px)`.
+
+**Transition run cards (`.sj-txn-run`):**
+Each pipeline transition attempt gets a light-background card with a left-border colour variant indicating outcome:
+- `.sj-txn-run--accepted` — green left border (`#198754`)
+- `.sj-txn-run--passed` — blue left border (`#0d6efd`)
+- `.sj-txn-run--rejected` — red left border + faint red background; narrative text rendered in dark red
+
+Vote justifications are truncated at 600 characters (was 300).
 
 **`style.css`** — All board styles.
 
@@ -303,6 +332,35 @@ rather than squeezing when turns are too narrow.
 - `.col-bold` — bold (totals)
 - `.col-llm` — truncated LLM name column
 - `.diag-turn-anchor-row` — blue-tinted row for the selected turn
+
+### Stage Journal classes (`style.css`)
+
+**Diff tab bar:**
+
+| Class | Purpose |
+|---|---|
+| `.sj-diff-tabs` | Flex container for tab buttons; sits above `.sj-diff-panels` |
+| `.sj-diff-tab` | Individual file tab; `cursor: pointer`; muted background |
+| `.sj-diff-tab.active` | Active tab; white background + bottom border highlight |
+| `.sj-diff-panels` | Container for all `.sj-diff-panel` children |
+| `.sj-diff-panel` | Hidden by default (`display: none`); single file's diff table |
+| `.sj-diff-panel.active` | Shown (`display: block`) when its tab is selected |
+
+**Fullscreen / expand:**
+
+| Class | Purpose |
+|---|---|
+| `.sj-fullscreen` | Applied to `#sj-modal-inner`; expands modal to 98vw × 97vh |
+| `.sj-expand-btn` | Absolute-positioned button in the modal header; calls `_sjToggleFullscreen()` |
+
+**Transition run cards:**
+
+| Class | Purpose |
+|---|---|
+| `.sj-txn-run` | Base card; light `#f8f9fa` background, `#dee2e6` border, `4px solid #adb5bd` left stripe |
+| `.sj-txn-run--accepted` | Green left border (`#198754`) |
+| `.sj-txn-run--passed` | Blue left border (`#0d6efd`) |
+| `.sj-txn-run--rejected` | Red left border (`#dc3545`) + faint red tint; narrative text in dark red (`#842029`) |
 
 ---
 
