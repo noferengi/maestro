@@ -26,6 +26,7 @@ import sqlite3
 import importlib.util
 import os
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -126,7 +127,7 @@ def create_temp_db() -> tuple[Path, sqlite3.Connection]:
 # Migration execution
 # ---------------------------------------------------------------------------
 
-def execute_migration(conn: sqlite3.Connection, migration: Any, direction: str = "up") -> None:
+def execute_migration(conn: sqlite3.Connection, migration: Any, direction: str = "up", migration_id: str | None = None) -> None:
     """
     Execute the up() or down() function of a loaded migration.
 
@@ -134,19 +135,34 @@ def execute_migration(conn: sqlite3.Connection, migration: Any, direction: str =
         conn: SQLite database connection
         migration: Loaded migration module
         direction: "up" to run up(), "down" to run down()
+        migration_id: NNNN prefix to record in schema_migrations (auto-derived from
+                      migration.__name__ if not provided)
 
     Raises:
         ValueError: If direction is not "up" or "down"
         AttributeError: If the migration module doesn't have the requested function
     """
+    if migration_id is None and hasattr(migration, "__name__"):
+        stem = migration.__name__
+        migration_id = stem.split("_")[0] if "_" in stem else stem
+
     if direction == "up":
         if not hasattr(migration, "up"):
             raise AttributeError(f"Migration module missing 'up' function: {migration}")
         migration.up(conn)
+        if migration_id:
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_migrations (migration_id, applied_at) VALUES (?, ?)",
+                (migration_id, datetime.now(timezone.utc).isoformat())
+            )
+            conn.commit()
     elif direction == "down":
         if not hasattr(migration, "down"):
             raise AttributeError(f"Migration module missing 'down' function: {migration}")
         migration.down(conn)
+        if migration_id:
+            conn.execute("DELETE FROM schema_migrations WHERE migration_id = ?", (migration_id,))
+            conn.commit()
     else:
         raise ValueError(f"Invalid direction: {direction}. Must be 'up' or 'down'")
 
@@ -419,3 +435,10 @@ def test_migration_rollback_safe(
 
     finally:
         conn.close()
+
+
+# Prevent pytest from collecting these helper functions as test cases
+# when they are imported into a test module by name.
+test_migration_isolation.__test__ = False
+test_migration_creates_expected_tables.__test__ = False
+test_migration_rollback_safe.__test__ = False

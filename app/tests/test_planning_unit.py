@@ -72,7 +72,7 @@ class TestAllChecksPass:
         with patch("app.agent.planning_gate.PLANNING_GATE_FEASIBILITY_RECHECK", False):
             result = _run(gate.run())
         assert result.passed is True
-        assert len(result.checks) == 11
+        assert len(result.checks) == 10
 
 
 # ---------------------------------------------------------------------------
@@ -241,13 +241,29 @@ class TestFeasibilityRecheck:
     def test_feasibility_recheck_enabled_llm_pass(self):
         gate = _make_gate()
         feasibility_response = {
-            "choices": [
-                {
-                    "message": {
-                        "content": json.dumps({"feasible": True, "concerns": []})
-                    }
-                }
-            ],
+            "choices": [{
+                "message": {
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "tc-feas",
+                        "type": "function",
+                        "function": {
+                            "name": "submit_work",
+                            "arguments": json.dumps({
+                                "signal": "ACCEPTED",
+                                "summary": "Feasibility check passed",
+                                "payload": {
+                                    "feasible": True,
+                                    "spec_violation": False,
+                                    "spec_violation_detail": "",
+                                    "concerns": [],
+                                },
+                            }),
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
             "usage": {"prompt_tokens": 50, "completion_tokens": 100},
         }
         mock_call = AsyncMock(return_value=feasibility_response)
@@ -355,7 +371,7 @@ class TestRunPlanningGate:
 
         assert "checks" in result
         assert isinstance(result["checks"], list)
-        assert len(result["checks"]) == 11
+        assert len(result["checks"]) == 10
         for check in result["checks"]:
             for field in ("name", "passed", "hard_fail", "detail"):
                 assert field in check, f"Missing field '{field}' in check {check['name']}"

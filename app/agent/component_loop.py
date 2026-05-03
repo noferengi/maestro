@@ -26,15 +26,9 @@ from app.agent.config import (
     INDEV_ENFORCE_FILE_CONTAINMENT,
     INDEV_AGENT_TOOLS,
     PROJECT_ROOT,
-    SIGNAL_ACCEPTED,
-    SIGNAL_REVERT,
-    SIGNAL_RESOLUTION_STALLED,
-    SIGNAL_CORRECTION_STALLED,
-    SIGNAL_VERDICT_REJECTED,
-    SIGNAL_VERDICT_NEEDS_WORK,
     check_context_saturation,
 )
-from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
+from app.agent.llm_client import call_llm, is_shutting_down, sanitize_user_content, ShutdownError
 from app.agent.tools import dispatch_tool, TOOL_SCHEMAS, _assert_safe_path, build_tool_schemas, get_task_git_cwd
 
 _INDEV_TOOL_SCHEMAS: list[dict] = build_tool_schemas(INDEV_AGENT_TOOLS)
@@ -122,12 +116,10 @@ def _get_test_command_hint() -> str:
 
 def _is_test_command(fn_name: str, fn_args: dict) -> bool:
     """Return True if this tool call is running tests."""
-    if fn_name in ("run_shell_indev", "run_shell_review",
-                   "run_pytest", "run_unittest", "run_cargo_test",
-                   "run_go_test", "run_npm_test"):
-        if fn_name in ("run_pytest", "run_unittest", "run_cargo_test",
-                       "run_go_test", "run_npm_test"):
-            return True
+    if fn_name in ("run_test_pytest", "run_test_unittest", "run_test_cargo",
+                   "run_test_go", "run_test_npm"):
+        return True
+    if fn_name in ("run_shell_indev", "run_shell_review"):
         cmd = fn_args.get("command", "").lower()
         return any(kw in cmd for kw in ("pytest", "unittest", "cargo test", "go test", "npm test", "mvn test", "ctest", "gradlew test"))
     return False
@@ -238,10 +230,10 @@ class ComponentLoop:
         self._total_prompt = 0
         self._total_completion = 0
         self._tests_passed: bool = False
-        self._terminal_signal: dict | None = None
         # Repeat-tool-call circuit breaker: tracks last 4 (name, args_json) pairs
         self._recent_calls: collections.deque[tuple[str, str]] = collections.deque(maxlen=4)
         self._repeat_notice_count = 0
+        self._context_flushes = 0  # how many times we've reset to fresh context
 
     async def run(self) -> ComponentLoopResult:
         """Run the component implementation loop."""
@@ -295,7 +287,7 @@ class ComponentLoop:
                 if consecutive_errors >= 3:
                     return ComponentLoopResult(
                         component_name=self.component_name,
-                        status="REVERT_TO_DESIGN",
+                        status="ERROR",
                         turns=turn + 1,
                         error_detail=f"3 consecutive LLM failures: {e}",
                         prompt_tokens=self._total_prompt,
@@ -319,7 +311,7 @@ class ComponentLoop:
                 )
                 return ComponentLoopResult(
                     component_name=self.component_name,
-                    status="REVERT_TO_DESIGN",
+                    status="ERROR",
                     turns=turn + 1,
                     files_changed=sorted(files_changed),
                     error_detail="Context saturation limit reached - terminating component loop.",
@@ -343,10 +335,9 @@ class ComponentLoop:
                     "role": "user",
                     "content": (
                         "[SYSTEM] Your last response was empty. "
-                        "Please call a tool to make progress, or call "
-                        "submit_work(signal='ACCEPTED', summary='...') to complete. "
-                        "Do not output free-form prose or raw JSON as a terminal action — "
-                        "use the submit_work tool call."
+                        "Please call a tool to make progress. "
+                        "To finish: call submit_work(signal='ACCEPTED', summary='...'). "
+                        "To abort: call submit_work(signal='REVERT_TO_DESIGN', summary='...')."
                     ),
                 })
                 continue
@@ -371,12 +362,26 @@ class ComponentLoop:
                             self.component_name, fn_name, repeat_count, self._repeat_notice_count,
                         )
                         if self._repeat_notice_count >= 2:
+                            if self._context_flushes < 1:
+                                logger.warning(
+                                    "[component] '%s' context flush after repeated loop on %s — resetting to fresh context.",
+                                    self.component_name, fn_name,
+                                )
+                                messages = [
+                                    {"role": "system", "content": system_prompt},
+                                    {"role": "user", "content": self._build_task_brief()},
+                                ]
+                                self._recent_calls.clear()
+                                self._repeat_notice_count = 0
+                                consecutive_errors = 0
+                                self._context_flushes += 1
+                                break  # skip remaining tool_calls; outer turn loop continues fresh
                             return ComponentLoopResult(
                                 component_name=self.component_name,
-                                status="REVERT_TO_DESIGN",
+                                status="ERROR",
                                 turns=turn + 1,
                                 files_changed=sorted(files_changed),
-                                error_detail=f"repeat_tool_call_circuit_breaker: {fn_name} called identically {repeat_count}+ times",
+                                error_detail=f"repeat_tool_call_circuit_breaker: {fn_name} called identically {repeat_count}+ times (post-flush)",
                                 prompt_tokens=self._total_prompt,
                                 completion_tokens=self._total_completion,
                             )
@@ -386,25 +391,52 @@ class ComponentLoop:
                                 f"SYSTEM NOTICE: You have called {fn_name}({json.dumps(fn_args)}) "
                                 f"{repeat_count} times with identical arguments. "
                                 "The tool's output will not change on further repeats. Either take a different "
-                                "action, read a different file, or emit a final signal (ACCEPTED / REVERT_TO_DESIGN)."
+                                "action, read a different file, or call submit_work to finish."
                             ),
                         })
 
                     result = self.dispatcher.dispatch(fn_name, fn_args)
 
-                    # Detect __maestro_terminal__ marker from submit_work
-                    if fn_name == "submit_work":
+                    # Detect submit_work terminal signal
+                    if "__maestro_terminal__" in result:
                         try:
-                            terminal_data = json.loads(str(result))
-                            if terminal_data.get("__maestro_terminal__") is True:
-                                logger.info(
-                                    "[component] '%s': submit_work tool call — "
-                                    "signal=%s, summary='%s'",
-                                    self.component_name,
-                                    terminal_data.get("signal"),
-                                    terminal_data.get("summary", "")[:120],
-                                )
-                                self._terminal_signal = terminal_data
+                            terminal_data = json.loads(result)
+                            if terminal_data.get("__maestro_terminal__"):
+                                sig = terminal_data.get("signal", "")
+                                if sig == "ACCEPTED":
+                                    component_files = self.step.get("files", [])
+                                    if not self._tests_passed and _is_testable_component(component_files):
+                                        logger.info(
+                                            "[component] '%s' called submit_work(ACCEPTED) without passing tests",
+                                            self.component_name,
+                                        )
+                                        messages.append({
+                                            "role": "tool",
+                                            "tool_call_id": tc["id"],
+                                            "content": (
+                                                "You called submit_work(ACCEPTED) but no passing test run was recorded. "
+                                                "Run tests first, then call submit_work again."
+                                            ),
+                                        })
+                                        continue
+                                    return ComponentLoopResult(
+                                        component_name=self.component_name,
+                                        status="ACCEPTED",
+                                        turns=turn + 1,
+                                        files_changed=sorted(files_changed),
+                                        tests_passed=self._tests_passed,
+                                        prompt_tokens=self._total_prompt,
+                                        completion_tokens=self._total_completion,
+                                    )
+                                elif sig == "REVERT_TO_DESIGN":
+                                    return ComponentLoopResult(
+                                        component_name=self.component_name,
+                                        status="REVERT_TO_DESIGN",
+                                        turns=turn + 1,
+                                        error_detail=terminal_data.get("summary", "")[:500],
+                                        prompt_tokens=self._total_prompt,
+                                        completion_tokens=self._total_completion,
+                                    )
                         except (json.JSONDecodeError, ValueError):
                             pass
 
@@ -440,46 +472,6 @@ class ComponentLoop:
                         "content": str(result)[:4000],
                     })
 
-                # Check for terminal signal from submit_work tool call
-                if self._terminal_signal is not None:
-                    sig = self._terminal_signal.get("signal")
-                    if sig == "ACCEPTED":
-                        component_files = self.step.get("files", [])
-                        if not self._tests_passed and _is_testable_component(component_files):
-                            logger.info(
-                                "[component] '%s' submit_work(ACCEPTED) blocked — tests not passed",
-                                self.component_name,
-                            )
-                            messages.append({
-                                "role": "user",
-                                "content": (
-                                    "You called submit_work(ACCEPTED) but no passing test run was recorded. "
-                                    "Please run the tests first (e.g. run_pytest('.', '-v') for Python, "
-                                    "run_cargo_test() for Rust, run_go_test() for Go, run_npm_test() for Node). "
-                                    "Then call submit_work(ACCEPTED) again once tests pass."
-                                ),
-                            })
-                            continue
-                        return ComponentLoopResult(
-                            component_name=self.component_name,
-                            status="ACCEPTED",
-                            turns=turn + 1,
-                            files_changed=sorted(files_changed),
-                            tests_passed=self._tests_passed,
-                            prompt_tokens=self._total_prompt,
-                            completion_tokens=self._total_completion,
-                        )
-                    if sig in ("REVERT_TO_DESIGN", "RESOLUTION_STALLED", "CORRECTION_STALLED",
-                               "VERDICT_REJECTED", "VERDICT_NEEDS_WORK"):
-                        return ComponentLoopResult(
-                            component_name=self.component_name,
-                            status="REVERT_TO_DESIGN",
-                            turns=turn + 1,
-                            error_detail=self._terminal_signal.get("summary", "Reverting to design."),
-                            prompt_tokens=self._total_prompt,
-                            completion_tokens=self._total_completion,
-                        )
-
         return ComponentLoopResult(
             component_name=self.component_name,
             status="MAX_TURNS",
@@ -496,14 +488,14 @@ class ComponentLoop:
             "RULES:\n"
             "- Only write to files in your assigned manifest\n"
             "- Write tests for your component\n"
-            "- Run tests using the named test tools: run_pytest, run_unittest, run_cargo_test, run_go_test, run_npm_test\n"
+            "- Run tests using the named test tools: run_test_pytest, run_test_unittest, run_test_cargo, run_test_go, run_test_npm\n"
             "- If your project needs a build step first: run_make, run_cargo_build, run_go_build, run_npm_build, run_tsc, run_gradle, run_mvn\n"
             "- If you add dependencies to a manifest file, install them first: run_pip_install, run_npm_install, run_cargo_fetch\n"
             "- To undo unintentional file edits: git_restore(path) restores to HEAD, git_unstage(path) removes from staging area\n"
-            "- When done, call: submit_work(signal='ACCEPTED', summary='...')\n"
-            "- If you cannot complete, call: submit_work(signal='REVERT_TO_DESIGN', summary='...')\n"
+            "- When done: call submit_work(signal='ACCEPTED', summary='<what you implemented>')\n"
+            "- If you cannot complete: call submit_work(signal='REVERT_TO_DESIGN', summary='<reason>')\n"
             "- Never hard-delete files. Use archive_file() for removal.\n"
-            "- Work on the maestro/task-{id} branch.\n\n"
+            "- You are already checked out on your assigned maestro/task branch — do not switch branches.\n\n"
             "TEST QUALITY RULES — strictly required:\n"
             "- Tests must be fast. Every test must complete in under 5 seconds.\n"
             "- Choose input sizes that respect the algorithm's complexity. For O(2^n) "
@@ -519,22 +511,22 @@ class ComponentLoop:
             "an error — do NOT call the function with the guarded value and wait for it.\n"
             "- Mock expensive external calls (network, disk, subprocesses). "
             "Do not make real network requests in tests.\n\n"
-            f"Planning Context:\n{self.planning_context[:4000]}\n"
+            f"Planning Context:\n{sanitize_user_content(self.planning_context[:4000])}\n"
         )
         if self.review_feedback:
             prompt += (
                 "\n\nIMPORTANT — THIS TASK WAS REJECTED BY A PRIOR REVIEW. "
-                "You MUST address the findings below before signaling ACCEPTED.\n"
-                f"{self.review_feedback}\n"
+                "You MUST address the findings below before calling submit_work(signal='ACCEPTED').\n"
+                f"{sanitize_user_content(self.review_feedback)}\n"
             )
         return prompt
 
     def _build_task_brief(self) -> str:
         return (
-            f"Component: {self.component_name}\n"
-            f"Description: {self.step.get('description', '')}\n"
+            f"Component: {sanitize_user_content(self.component_name)}\n"
+            f"Description: {sanitize_user_content(self.step.get('description', ''))}\n"
             f"Files: {json.dumps(self.step.get('files', []))}\n"
             f"Dependencies: {json.dumps(self.step.get('depends_on', []))}\n\n"
             "Implement this component now. Write the code, write tests, run them, "
-            "then signal ACCEPTED when done."
+            "then call submit_work(signal='ACCEPTED') when done."
         )

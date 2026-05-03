@@ -67,7 +67,11 @@ def test_run_scope_survey_job_directory_success(mock_job, mock_llm, tmp_path):
          patch("app.database.close_agent_session"):
 
         mock_call.return_value = {
-            "content": "Full summary text.\nSHORT_SUMMARY: Short summary text."
+            "message": {
+                "content": "Full summary text.\nSHORT_SUMMARY: Short summary text.",
+            },
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
         }
 
         _run_scope_survey_job(mock_job, mock_llm)

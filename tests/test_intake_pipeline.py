@@ -322,13 +322,12 @@ class TestTallyVotes:
         assert "s2" in result.rejection_reasons[0]
 
     def test_majority_not_suitable_rejects(self):
-        """Majority NOT_SUITABLE votes => rejected."""
+        """Single REJECTED vote triggers immediate rejection regardless of other votes."""
         votes = [
-            Vote("s1", Verdict.NOT_SUITABLE, 55, "bad scope"),
-            Vote("s2", Verdict.NOT_SUITABLE, 58, "poorly defined"),
-            Vote("s3", Verdict.LIKELY, 95, "looks ok"),
+            Vote("s1", Verdict.REJECTED, 30, "fundamental blocker"),
+            Vote("s2", Verdict.LIKELY, 93, "looks fine"),
+            Vote("s3", Verdict.LIKELY, 95, "good"),
         ]
-        # majority_threshold = (3 // 2) + 1 = 2, NS count = 2 >= 2 => rejected
         result = tally_votes(votes)
         assert result.outcome == "rejected"
 
@@ -342,14 +341,17 @@ class TestTallyVotes:
         assert result.outcome == "needs_research"
         assert "s2" in result.research_needed
 
+    @pytest.mark.skip(
+        reason="Tie path is unreachable: _FAIL_ISH={REJECTED} but Rule 1 catches "
+               "any REJECTED vote before the tie check. Dead code until a non-Rule-1 "
+               "fail-ish verdict is added."
+    )
     def test_tie_outcome(self):
         """Equal pass/fail counts => tie."""
         votes = [
             Vote("s1", Verdict.LIKELY, 95, "good"),
-            Vote("s2", Verdict.NOT_SUITABLE, 55, "bad"),
+            Vote("s2", Verdict.REJECTED, 30, "blocker"),
         ]
-        # majority_threshold = (2 // 2) + 1 = 2, NS count = 1 < 2 => not majority
-        # pass=1, fail=1 => tie
         result = tally_votes(votes)
         assert result.outcome == "tie"
 

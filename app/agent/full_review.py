@@ -33,8 +33,9 @@ from app.agent.config import (
     SHELL_TIMEOUT_SECONDS,
     check_context_saturation,
 )
+from app.agent.json_utils import extract_json_block
 from app.agent.tools import _task_git_cwd, dispatch_tool, build_tool_schemas
-from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
+from app.agent.llm_client import call_llm, is_shutting_down, sanitize_user_content, ShutdownError
 from app.agent.verdicts import Vote, Verdict, tally_votes
 
 logger = logging.getLogger(__name__)
@@ -245,20 +246,21 @@ class FullReviewPipeline:
 
     async def _run_reviewer(self, reviewer: dict) -> Vote:
         """Run a single reviewer agent using a mini-loop with tool access."""
-        stage_name = f"review_{reviewer['type']}"
         prompt = (
             f"You are a final reviewer ({reviewer['type']}).\n"
             f"Focus: {reviewer['focus']}\n\n"
-            f"Task: {self.task_description}\n"
+            f"Task: {sanitize_user_content(self.task_description)}\n"
             f"Files changed: {json.dumps(self.files_changed[:20])}\n\n"
             "You may use tools to read code files before giving your verdict.\n\n"
-            "When ready, call submit_work(signal='REVIEW_COMPLETE', summary='<one sentence>', "
-            "payload={'verdict': 'LIKELY|POSSIBLE|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED', "
-            "'confidence': <0-100>, 'justification': '...'})"
+            "To complete your review, call the submit_work tool with:\n"
+            "- signal: 'ACCEPTED' if the implementation is correct, or 'REJECTED' if there are defects.\n"
+            "- summary: Your justification.\n"
+            "- payload: {\"verdict\": \"LIKELY|POSSIBLE|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED\", "
+            "\"confidence\": <0-100>}"
         )
 
         messages: list[dict] = [
-            {"role": "system", "content": "You are a code reviewer. Call submit_work to submit your verdict."},
+            {"role": "system", "content": "You are a code reviewer. Use submit_work to output your verdict when ready."},
             {"role": "user", "content": prompt},
         ]
 
@@ -271,8 +273,13 @@ class FullReviewPipeline:
             if is_shutting_down():
                 raise ShutdownError("Server is shutting down")
 
+            # Turn saturation check
             from app.agent.config import check_turn_saturation
-            check_turn_saturation(turn, max_turns, _turn_warned, messages)
+            if check_turn_saturation(
+                turn, max_turns, _turn_warned, messages
+            ):
+                # Turn nudge was injected
+                pass
 
             response = await call_llm(
                 messages,
@@ -291,80 +298,69 @@ class FullReviewPipeline:
             self._total_prompt += prompt_tokens_this_call
             self._total_completion += usage.get("completion_tokens", 0)
 
+            # Context saturation check
             if check_context_saturation(
                 prompt_tokens_this_call, self.max_context, _ctx_warned, messages
             ):
                 logger.warning(
-                    "[%s] Reviewer '%s' context saturation (turn %d) - terminating",
-                    AGENT_NAME, reviewer["type"], turn + 1,
+                    f"[{AGENT_NAME}] Reviewer '%s' context saturation (turn %d) - terminating",
+                    reviewer["type"], turn + 1,
                 )
                 break
 
             assistant_msg = response.get("choices", [{}])[0].get("message", {})
             messages.append(assistant_msg)
             tool_calls = assistant_msg.get("tool_calls") or []
+            content = assistant_msg.get("content") or ""
 
             if tool_calls:
                 for tc in tool_calls:
-                    fn_name = tc["function"]["name"]
-                    fn_args = (
-                        json.loads(tc["function"]["arguments"])
-                        if isinstance(tc["function"]["arguments"], str)
-                        else tc["function"]["arguments"]
+                    tc_result = dispatch_tool(
+                        tc["function"]["name"],
+                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
                     )
-                    tc_result = dispatch_tool(fn_name, fn_args)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
-                        "name": fn_name,
+                        "name": tc["function"]["name"],
                         "content": tc_result,
                     })
-                    if fn_name == "submit_work":
+
+                    # Check for terminal signal from submit_work
+                    if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
                         try:
-                            terminal_data = json.loads(tc_result)
-                            if terminal_data.get("__maestro_terminal__") is True:
-                                payload = terminal_data.get("payload", {})
-                                return self._vote_from_payload(payload, stage_name)
+                            data = json.loads(tc_result)
+                            payload = data.get("payload", {})
+                            verdict_str = payload.get("verdict", "POSSIBLE").upper()
+                            verdict = Verdict(verdict_str)
+                            confidence = int(payload.get("confidence", 80))
+                            lo, hi = verdict.confidence_range
+                            confidence = max(lo, min(hi, confidence))
+                            justification = data.get("summary", "")
+                            return Vote(
+                                stage=f"review_{reviewer['type']}",
+                                verdict=verdict,
+                                confidence=confidence,
+                                justification=justification,
+                                model=self.llm_model or "",
+                            )
                         except (json.JSONDecodeError, ValueError):
                             pass
                 continue
 
-            # No tool calls — nudge
             turns_remaining = max_turns - turn - 1
             if turns_remaining <= 2:
                 messages.append({
                     "role": "user",
-                    "content": (
-                        f"[SYSTEM] {turns_remaining} turns remaining. "
-                        "Call submit_work(signal='REVIEW_COMPLETE', summary='...', "
-                        "payload={'verdict': '...', 'confidence': N, 'justification': '...'}) now."
-                    ),
+                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Call submit_work with your verdict now.",
                 })
 
+        # Fallback: turns exhausted
         return Vote(
-            stage=stage_name,
+            stage=f"review_{reviewer['type']}",
             verdict=Verdict.NEEDS_RESEARCH,
             confidence=65,
             justification="Reviewer exhausted turns",
-            model=self.llm_model or "",
-        )
-
-    def _vote_from_payload(self, payload: dict, stage: str) -> Vote:
-        """Build a Vote from a submit_work payload dict."""
-        verdict_str = str(payload.get("verdict", "POSSIBLE")).upper()
-        try:
-            verdict = Verdict(verdict_str)
-        except ValueError:
-            verdict = Verdict.POSSIBLE
-        confidence = int(payload.get("confidence", 80))
-        lo, hi = verdict.confidence_range
-        confidence = max(lo, min(hi, confidence))
-        justification = payload.get("justification", "")
-        return Vote(
-            stage=stage,
-            verdict=verdict,
-            confidence=confidence,
-            justification=justification,
             model=self.llm_model or "",
         )
 

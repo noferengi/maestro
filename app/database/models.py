@@ -138,6 +138,7 @@ class Task(Base):
     map_y = Column(Float, nullable=True)   # Saved 2D canvas Y position (Column Map View)
     is_active = Column(Boolean, nullable=False, default=True)  # False = soft-deleted (hidden everywhere)
     intake_exhausted_at = Column(String, nullable=True)  # Set when scheduler gives up retrying intake
+    cache_mode = Column(String, nullable=False, default='normal')  # normal | force_with_context | force_fresh
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -286,6 +287,8 @@ class PlanningResult(Base):
     selection_justification = Column(Text, nullable=True)
     gate_checks = Column(Text, nullable=True)   # JSON: [{name, passed, hard_fail, detail}]
     error_message = Column(Text, nullable=True)  # set on status='failed' rows
+    content_hash = Column(String, nullable=True)   # SHA256(title || description) at run time
+    was_gate_passed = Column(Integer, nullable=False, default=0)  # 1 = gate passed; enables cache reuse
     confidence = Column(Integer, default=0)
     prompt_tokens = Column(Integer, default=0)
     completion_tokens = Column(Integer, default=0)

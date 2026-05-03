@@ -53,7 +53,7 @@ async def test_dreamer_uses_survey_tool(dreamer):
     # 2nd turn: LLM returns final JSON
     mock_responses = [
         {
-            "message": {
+            "choices": [{"message": {
                 "role": "assistant",
                 "tool_calls": [{
                     "id": "call_1",
@@ -63,13 +63,13 @@ async def test_dreamer_uses_survey_tool(dreamer):
                         "arguments": "{}"
                     }
                 }]
-            }
+            }}]
         },
         {
-            "message": {
+            "choices": [{"message": {
                 "role": "assistant",
                 "content": '{"new_cards": [{"title": "New Idea", "description": "...", "rationale": "..."}]}'
-            }
+            }}]
         }
     ]
 

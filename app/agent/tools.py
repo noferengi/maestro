@@ -92,7 +92,7 @@ _last_test_output: contextvars.ContextVar[str] = contextvars.ContextVar(
 # A path being present (even with an empty interval list) means read_file()
 # has been called on it at least once.
 #
-# Maximum lines served per call - shared by read_file.
+# Maximum lines served per call - shared by both read_file.
 _READ_FILE_MAX_LINES = 250
 
 _prepped_files: contextvars.ContextVar[dict[str, list[tuple[int, int]]] | None] = (
@@ -260,6 +260,15 @@ def get_task_git_cwd() -> str | None:
 LISTING_EXCLUDED_DIRS: set[str] = TOOL_LISTING_EXCLUDED_DIRS
 
 
+def _effective_archive_dir() -> str:
+    """Return the .archive directory for the currently active project root.
+
+    Always project-local: each project keeps its own soft-delete tombstone at
+    <project_root>/.archive rather than in Maestro's central directory.
+    """
+    effective_root = _task_git_cwd.get() or PROJECT_ROOT
+    return os.path.join(effective_root, ".archive")
+
 
 def _assert_safe_path(path: str) -> str:
     """
@@ -287,18 +296,19 @@ def _assert_safe_path(path: str) -> str:
                     f"Refusing to read outside project root {effective_root}; "
                     "use a relative path instead."
                 )
-
-        # RC4: Strict Isolation. If a task-specific root is set, we MUST NOT write 
-        # (or read if restricted) outside of it.
-        if effective_root != PROJECT_ROOT:
-            root_real = os.path.realpath(effective_root)
-            if not (resolved.startswith(root_real + os.sep) or resolved == root_real):
-                raise ValueError(
-                    f"Strict Isolation violation: refusing to touch path '{path}' "
-                    f"outside of task-specific root '{effective_root}'."
-                )
     else:
         resolved = os.path.realpath(os.path.join(effective_root, path))
+
+    # RC4 strict isolation: when a task root is set, block reads outside it
+    task_root = _task_git_cwd.get()
+    if task_root:
+        task_root_real = os.path.realpath(task_root)
+        if not (resolved == task_root_real or
+                resolved.startswith(task_root_real + os.sep)):
+            raise ValueError(
+                f"Strict Isolation violation: cannot read '{path}' "
+                f"outside task root '{task_root}'"
+            )
 
     # Protect .git directories everywhere
     # Case-insensitive check on Windows for safety.
@@ -307,11 +317,14 @@ def _assert_safe_path(path: str) -> str:
         logger.warning("Blocked access to git internal path: %s", resolved)
         raise ValueError(f"HARD REJECTION: '{path}' touches a .git directory. Access to git internals is blocked.")
 
-    # Protect .archive (Maestro's soft-delete tombstone)
-    archive_abs = os.path.realpath(ARCHIVE_DIR).lower()
-    if norm_path == archive_abs or norm_path.startswith(archive_abs + os.sep):
-        logger.warning("Blocked access to Maestro archive: %s", resolved)
-        raise ValueError(f"REJECTION: '{path}' is inside the Maestro archive. This folder is managed by the system.")
+    # Protect .archive directories (both Maestro's central archive and the effective
+    # project's local archive).  Agents must never read inside these; they are
+    # managed exclusively by archive_file / move_file / patch_file.
+    for _archive_candidate in (ARCHIVE_DIR, _effective_archive_dir()):
+        archive_abs = os.path.realpath(_archive_candidate).lower()
+        if norm_path == archive_abs or norm_path.startswith(archive_abs + os.sep):
+            logger.warning("Blocked access to archive directory: %s", resolved)
+            raise ValueError(f"REJECTION: '{path}' is inside an archive directory. This folder is managed by the system.")
 
     return resolved
 
@@ -328,11 +341,11 @@ def _assert_archivable(path: str) -> str:
     Raises ValueError with a descriptive message on any violation.
     """
     safe = _assert_safe_path(path)
-    archive_root = os.path.realpath(ARCHIVE_DIR)
+    archive_root = os.path.realpath(_effective_archive_dir())
 
     # Note: _assert_safe_path already protects .git and .archive internals.
     # We only need to check if the path IS the archive root itself here.
-    if safe == os.path.realpath(archive_root):
+    if safe == archive_root:
         raise ValueError("HARD REJECTION: Cannot archive the archive root itself.")
 
     return safe
@@ -400,13 +413,13 @@ def _assert_safe_write_path(path: str) -> str:
     return resolved
 
 
-def _find_archived_copies(rel_path: str) -> list[str]:
+def _find_archived_copies(rel_path: str, archive_dir: str | None = None) -> list[str]:
     """
-    Scan ARCHIVE_DIR for all previously archived copies of rel_path.
-    rel_path must be relative to PROJECT_ROOT.
+    Scan the project-local archive for all previously archived copies of rel_path.
+    rel_path must be relative to the effective project root.
     Returns a list of absolute paths ordered most-recent first.
     """
-    archive_root = os.path.realpath(ARCHIVE_DIR)
+    archive_root = os.path.realpath(archive_dir or _effective_archive_dir())
     if not os.path.isdir(archive_root):
         return []
     found: list[str] = []
@@ -490,13 +503,13 @@ def read_file(
     end: int | None = None,
     count: int | None = None,
 ) -> str:
-    """Read up to 250 source-code lines per call, never repeating lines already in context.
+    """Read a file's structure or source code. Capped at 250 lines per call.
 
-    Omit start/end/count to get the next 250 unserved lines from line 1 forward.
-    Provide start (+ optionally end or count) to target a specific range - only the
-    unserved portion of that range is returned, capped at 250 lines.
+    FIRST CALL (no range): Returns a structural summary (classes, functions, imports).
+    SUBSEQUENT CALLS (no range): Serves the NEXT 250 unserved lines automatically.
+    TARGETED READ: Provide 'start' (+ optionally 'end' or 'count') to read a specific range.
 
-    If read_file() has not been called first, it is called automatically (auto-prep).
+    Small files (≤ 25 lines) are always shown in full on the first call.
     """
     safe_path = _assert_safe_path(path)
     if not os.path.isfile(safe_path):
@@ -504,31 +517,41 @@ def read_file(
     if _is_binary_path(safe_path):
         return (
             f"ERROR: '{path}' is a binary file (contains null bytes) and cannot be read as text. "
-            "Binary files (databases, compiled bytecode, archives) must be inspected with "
-            "appropriate non-text tools."
+            "Binary files must be inspected with appropriate non-text tools."
         )
 
-    # Auto-prep: show structural summary first if not yet done
-    if not _is_file_prepped(safe_path):
-        return _read_file_first_call(safe_path)
-
     norm = os.path.normpath(os.path.realpath(safe_path))
-    from app.agent.project_snapshot import _count_file_lines
+    from app.agent.project_snapshot import _count_file_lines, build_file_summary
     total = _count_file_lines(safe_path)
 
-    # Validate: end and count are mutually exclusive
+    # 1. Structural Summary Phase
+    # If this is the first time seeing the file and NO specific range was requested,
+    # show the summary (or the whole file if it is tiny).
+    if not _is_file_prepped(safe_path) and start is None and end is None and count is None:
+        _mark_file_prepped(safe_path)
+        if total <= 25:
+            result = _inline_small_file(safe_path)
+            _record_served_range(norm, 1, total)
+            return result
+        return build_file_summary(safe_path)
+
+    # 2. Source Reading Phase
+    # Ensure file is marked as prepped if a range was requested immediately
+    if not _is_file_prepped(safe_path):
+        _mark_file_prepped(safe_path)
+
     if end is not None and count is not None:
         return "ERROR: provide 'end' OR 'count', not both."
 
     if start is None:
-        # Default: first <=250 unserved lines
+        # Default: first ≤250 unserved lines
         unserved = _next_unserved_range(norm, 1, total)
         if unserved is None:
             rel = os.path.relpath(safe_path, PROJECT_ROOT)
             return (
                 f"ALREADY IN CONTEXT: all lines of '{rel}' have been served "
                 f"(ranges: {_served_ranges_str(norm)}). "
-                f"Call read_file('{rel}', start=N) to re-read a specific range."
+                f"To re-read a range, call read_file('{rel}', start=N)."
             )
         req_start, req_end = unserved
     else:
@@ -538,12 +561,12 @@ def read_file(
         elif end is not None:
             req_end = end
         else:
-            # start only: serve up to 250 lines from that start
             req_end = start + _READ_FILE_MAX_LINES - 1
 
     # Clamp to actual file bounds
     req_start = max(1, min(req_start, total))
     req_end = max(req_start, min(req_end, total))
+
     # Capped at 250 lines per call
     if req_end - req_start >= _READ_FILE_MAX_LINES:
         req_end = req_start + _READ_FILE_MAX_LINES - 1
@@ -558,34 +581,10 @@ def read_file(
 
     result = _serve_file_lines(safe_path, req_start, req_end)
     if already_served:
-        header = (
-            f"(NOTE: lines {req_start}-{req_end} were already in context; "
-            f"repeating per request)\n"
-        )
+        header = f"(NOTE: lines {req_start}-{req_end} were already in context; repeating per request)\n"
         return header + result
 
     return result
-
-
-def _read_file_first_call(safe_path: str) -> str:
-    """Handle the first call to read_file for a given path (auto-prep).
-
-    Returns a structural summary for large files, or raw content for tiny files.
-    """
-    norm = os.path.normpath(os.path.realpath(safe_path))
-    from app.agent.project_snapshot import _count_file_lines, build_file_summary
-    _mark_file_prepped(safe_path)
-    if _count_file_lines(safe_path) <= 25:
-        result = _inline_small_file(safe_path)
-        # Whole file shown inline - record all lines as served
-        try:
-            with open(safe_path, "r", encoding="utf-8", errors="replace") as fh:
-                lc = sum(1 for _ in fh)
-            _record_served_range(norm, 1, lc)
-        except OSError:
-            pass
-        return result
-    return build_file_summary(safe_path)
 
 
 _SMALL_FILE_HEADER = "== FILE (full content): {path} =="
@@ -605,21 +604,34 @@ def _inline_small_file(abs_path: str) -> str:
 
 
 def write_file(path: str, content: str) -> str:
-    """[WRITE — files] Overwrite a file with the given content. Auto-stages for git. Reversible only via write_git_restore before commit. Path must be inside project root."""
+    """[WRITE — files] Overwrite a file with the given content. Auto-stages for git. If the file already exists, a pre-overwrite copy is archived to the project's .archive/. Path must be inside project root."""
     try:
         safe_path = _assert_safe_write_path(path)
     except ValueError as exc:
         return f"ERROR: {exc}"
     if os.path.exists(safe_path) and _is_binary_path(safe_path):
         return f"ERROR: '{path}' is a binary file; refusing to overwrite with text content."
+
+    archived_msg = ""
+    if os.path.isfile(safe_path):
+        effective_root = _task_git_cwd.get() or PROJECT_ROOT
+        rel_path = os.path.relpath(os.path.realpath(safe_path), os.path.realpath(effective_root))
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+        archive_dest = os.path.join(_effective_archive_dir(), timestamp, rel_path)
+        try:
+            os.makedirs(os.path.dirname(archive_dest), exist_ok=True)
+            shutil.copy2(safe_path, archive_dest)
+            archived_msg = f" Pre-overwrite copy archived to '{archive_dest}'."
+        except OSError as exc:
+            return f"ERROR: could not archive pre-overwrite copy of '{path}': {exc}"
+
     try:
         os.makedirs(os.path.dirname(safe_path), exist_ok=True)
         with open(safe_path, "w", encoding="utf-8") as fh:
             fh.write(content)
         _invalidate_prepped_cache(safe_path)
-        # Stage for git
         _git_run(["git", "add", safe_path])
-        return f"OK: wrote {len(content)} chars to '{path}' and staged for git."
+        return f"OK: wrote {len(content)} chars to '{path}' and staged for git.{archived_msg}"
     except OSError as exc:
         return f"ERROR writing '{path}': {exc}"
 
@@ -643,6 +655,99 @@ def append_file(path: str, content: str) -> str:
         return f"ERROR appending to '{path}': {exc}"
 
 
+def patch_file(path: str, old_str: str, new_str: str) -> str:
+    """[WRITE — files] Replace an exact string in a file. old_str must appear exactly once.
+    Auto-stages for git. Path must be inside project root.
+    Use this instead of write_file when making targeted edits — avoids full-file rewrites.
+    """
+    try:
+        safe_path = _assert_safe_write_path(path)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+    if not os.path.isfile(safe_path):
+        return f"ERROR: '{path}' does not exist. Use write_file to create new files."
+    if _is_binary_path(safe_path):
+        return f"ERROR: '{path}' is a binary file; cannot patch."
+    try:
+        with open(safe_path, "r", encoding="utf-8", errors="replace") as fh:
+            original = fh.read()
+    except OSError as exc:
+        return f"ERROR reading '{path}': {exc}"
+    count = original.count(old_str)
+    if count == 0:
+        # Detailed diagnostics for common whitespace/line-ending mismatches
+        msg = [f"ERROR: old_str not found in '{path}'."]
+        
+        # 1. Check for basic presence of the text ignoring whitespace
+        import re
+        def _canonical(s): return re.sub(r"\s+", "", s)
+        if _canonical(old_str) in _canonical(original):
+            msg.append("HINT: The text exists but whitespace/indentation does not match exactly.")
+            if "\t" in old_str or "\t" in original:
+                old_has_tabs = "\t" in old_str
+                file_has_tabs = "\t" in original
+                if old_has_tabs != file_has_tabs:
+                    msg.append(f"DIAGNOSTIC: Your string {'has' if old_has_tabs else 'lacks'} TABS, but the file {'has' if file_has_tabs else 'lacks'} them.")
+            
+            # Find the closest match to show the user what they missed
+            lines = original.splitlines()
+            old_lines = old_str.splitlines()
+            if old_lines:
+                first_line_clean = old_lines[0].strip()
+                for i, line in enumerate(lines, 1):
+                    if first_line_clean in line:
+                        msg.append(f"DIAGNOSTIC: Found similar text on line {i}:")
+                        msg.append(f"  FILE: '{line.replace('\t', '\\t')}'")
+                        msg.append(f"  YOUR: '{old_lines[0].replace('\t', '\\t')}'")
+                        break
+        else:
+            msg.append("HINT: The text was not found even after ignoring whitespace. Please call read_file() again to verify the content.")
+        
+        msg.append("Check whitespace, indentation, and line endings (\\n vs \\r\\n).")
+        return "\n".join(msg)
+    if count > 1:
+        return (
+            f"ERROR: old_str appears {count} times in '{path}' — patch is ambiguous. "
+            "Extend old_str to include more surrounding context so it matches exactly once."
+        )
+    # Locate the line range of old_str and verify those lines have been served.
+    char_offset = original.index(old_str)
+    start_line = original[:char_offset].count("\n") + 1
+    end_line = start_line + old_str.count("\n")
+    norm = os.path.normpath(os.path.realpath(safe_path))
+    unserved = _next_unserved_range(norm, start_line, end_line)
+    if unserved is not None:
+        return (
+            f"ERROR: lines {start_line}-{end_line} of '{path}' have not been read yet. "
+            f"Call read_file('{path}', start={start_line}, end={end_line}) first "
+            "so the exact text is in your context before patching."
+        )
+    # Archive a copy of the pre-patch file before making any changes.
+    effective_root = _task_git_cwd.get() or PROJECT_ROOT
+    rel_path = os.path.relpath(os.path.realpath(safe_path), os.path.realpath(effective_root))
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+    archive_dest = os.path.join(_effective_archive_dir(), timestamp, rel_path)
+    try:
+        os.makedirs(os.path.dirname(archive_dest), exist_ok=True)
+        shutil.copy2(safe_path, archive_dest)
+    except OSError as exc:
+        return f"ERROR: could not archive pre-patch copy of '{path}': {exc}"
+
+    patched = original.replace(old_str, new_str, 1)
+    try:
+        with open(safe_path, "w", encoding="utf-8") as fh:
+            fh.write(patched)
+    except OSError as exc:
+        return f"ERROR writing '{path}': {exc}"
+    _invalidate_prepped_cache(safe_path)
+    _git_run(["git", "add", safe_path])
+    lines_changed = new_str.count("\n") - old_str.count("\n")
+    return (
+        f"OK: patched '{path}' (lines {start_line}-{end_line}, net {lines_changed:+d} lines). "
+        f"Staged for git. Pre-patch copy archived to '{archive_dest}'."
+    )
+
+
 def _get_cached_summary_for_listing(abs_path: str) -> "str | None":
     """Sync DB lookup for a file's cached summary.
 
@@ -664,7 +769,7 @@ def _get_cached_summary_for_listing(abs_path: str) -> "str | None":
     return None
 
 
-def read_list_dir(path: str = ".") -> str:
+def list_directory(path: str = ".") -> str:
     """[READ] List files and directories at the given path. No state change.
 
     Maestro allows navigation of the entire PC. Files are shown with their
@@ -685,7 +790,7 @@ def read_list_dir(path: str = ".") -> str:
 
     effective_root = _task_git_cwd.get() or PROJECT_ROOT
     root_real = os.path.realpath(effective_root)
-    archive_real = os.path.realpath(ARCHIVE_DIR)
+    archive_real = os.path.realpath(_effective_archive_dir())
 
     try:
         entries = sorted(os.listdir(safe_path))
@@ -803,6 +908,10 @@ def find_in_files(
     return _slice_output(raw, head=head, tail=tail, grep=grep)
 
 
+
+
+
+
 def read_file_metadata(path: str) -> str:
     """[READ] File size, modification time, sha256, line count, and binary flag. No state change."""
     safe_path = _assert_safe_path(path)
@@ -841,7 +950,7 @@ def find_files(glob_pattern: str, directory: str = ".") -> str:
     safe_dir = _assert_safe_path(directory)
     full_pattern = os.path.join(safe_dir, "**", glob_pattern)
     matches = _glob.glob(full_pattern, recursive=True)
-    _archive_real = os.path.realpath(ARCHIVE_DIR)
+    _archive_real = os.path.realpath(_effective_archive_dir())
     # Filter out excluded directories and the root archive tree
     filtered = [
         m for m in matches
@@ -879,12 +988,14 @@ def write_archive(path: str, reason: str = "") -> str:
     except ValueError as exc:
         return f"BLOCKED: {exc}"
 
-    root_real = os.path.realpath(PROJECT_ROOT)
+    effective_root = _task_git_cwd.get() or PROJECT_ROOT
+    root_real = os.path.realpath(effective_root)
     rel_path = os.path.relpath(safe_path, root_real)
+    local_archive_dir = _effective_archive_dir()
 
     if not os.path.exists(safe_path):
         # Check if this path was previously archived - emit undelete guide
-        archived = _find_archived_copies(rel_path)
+        archived = _find_archived_copies(rel_path, local_archive_dir)
         if archived:
             lines = [
                 f"ERROR: '{path}' does not exist - it was previously archived.",
@@ -904,8 +1015,8 @@ def write_archive(path: str, reason: str = "") -> str:
             return "\n".join(lines)
         return f"ERROR: '{path}' does not exist - nothing to archive."
 
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    dest = os.path.join(ARCHIVE_DIR, timestamp, rel_path)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+    dest = os.path.join(local_archive_dir, timestamp, rel_path)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
 
     try:
@@ -926,6 +1037,48 @@ def write_archive(path: str, reason: str = "") -> str:
     )
 
 
+def move_file(src: str, dst: str) -> str:
+    """[WRITE — files] Move or rename a file within the project.
+    If dst already exists, a copy is archived to .archive/ before being overwritten.
+    Auto-stages both paths for git. Path must be inside project root.
+    """
+    try:
+        safe_src = _assert_safe_write_path(src)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+    if not os.path.isfile(safe_src):
+        return f"ERROR: source '{src}' does not exist or is not a file."
+    try:
+        safe_dst = _assert_safe_write_path(dst)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+
+    archived_msg = ""
+    if os.path.exists(safe_dst):
+        effective_root = _task_git_cwd.get() or PROJECT_ROOT
+        rel_dst = os.path.relpath(os.path.realpath(safe_dst), os.path.realpath(effective_root))
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+        archive_dest = os.path.join(_effective_archive_dir(), timestamp, rel_dst)
+        os.makedirs(os.path.dirname(archive_dest), exist_ok=True)
+        try:
+            shutil.copy2(safe_dst, archive_dest)
+            archived_msg = f" (overwrote '{dst}', copy archived to '{archive_dest}')"
+        except OSError as exc:
+            return f"ERROR: could not archive existing '{dst}': {exc}"
+
+    dst_dir = os.path.dirname(safe_dst)
+    if dst_dir:
+        os.makedirs(dst_dir, exist_ok=True)
+    try:
+        shutil.move(safe_src, safe_dst)
+    except OSError as exc:
+        return f"ERROR: move failed: {exc}"
+
+    _invalidate_prepped_cache(safe_src)
+    _invalidate_prepped_cache(safe_dst)
+    _git_run(["git", "rm", "--cached", "--force", "-q", safe_src])
+    _git_run(["git", "add", safe_dst])
+    return f"OK: moved '{src}' -> '{dst}'{archived_msg}. Staged for git."
 
 
 # ---------------------------------------------------------------------------
@@ -1190,54 +1343,39 @@ def write_git_restore(path: str) -> str:
     return f"OK: restored '{path}' to HEAD state."
 
 
-def write_git_stage(path: str) -> str:
-    """[WRITE — git] Stage a specific file for the next commit. Reversible via write_git_unstage."""
-    try:
-        safe_path = _assert_safe_write_path(path)
-    except ValueError as exc:
-        return f"BLOCKED: {exc}"
-    rc, out, err = _git_run(["git", "add", safe_path])
-    if rc != 0:
-        return f"ERROR: git add '{path}' failed: {err or out}"
-    return f"OK: staged '{path}'."
 
 
-def write_git_unstage(path: str) -> str:
-    """[WRITE — git] Remove a file from the staging area without discarding working-tree changes. Reversible via write_git_stage."""
-    try:
-        safe_path = _assert_safe_path(path)
-    except ValueError as exc:
-        return f"BLOCKED: {exc}"
-    rc, out, err = _git_run(["git", "restore", "--staged", safe_path])
-    if rc != 0:
-        return f"ERROR: git unstage '{path}' failed: {err or out}"
-    return f"OK: unstaged '{path}' (changes preserved in working tree)."
+def submit_work(signal: str, summary: str, payload: dict | None = None) -> str:
+    """[FINISH] The ONLY way to complete a task. Signals that your work is done.
 
+    signal: 'ACCEPTED' (task complete), 'REVERT_TO_DESIGN' (task impossible/needs re-plan),
+            'SUBDIVIDE' (needs further breakdown), 'PLAN_UPDATED' (correction complete).
+    summary: A concise final report of work done or justification for the signal.
+    payload: Optional dictionary for agent-specific data (e.g., test results, sub-task lists).
+    """
+    # This tool is a 'terminal' tool. It doesn't perform I/O, it returns a
+    # special marker that the loop orchestrator (MaestroLoop) intercepts.
+    import json
 
-def read_git_stash_list() -> str:
-    """[READ] List git stash entries. No state change."""
-    rc, out, err = _git_run(["git", "stash", "list"])
-    if rc != 0:
-        return f"ERROR: git stash list failed: {err}"
-    return out or "(no stash entries)"
+    # Detect suspicious payload patterns that suggest the agent tried to output
+    # raw JSON instead of using structured tool-call parameters.
+    if payload:
+        for key in ("raw_json", "json_response", "json_output", "raw_response"):
+            if key in payload:
+                logger.warning(
+                    "submit_work called with suspicious payload key '%s' — "
+                    "this suggests the agent emitted raw JSON text instead of using "
+                    "structured tool-call parameters. Prefer passing data as native dict values.",
+                    key,
+                )
+                break
 
-
-def write_git_stash(message: str) -> str:
-    """[WRITE — git] Stash tracked working-tree changes with a required message. Reversible via write_git_stash_pop."""
-    if not message.strip():
-        return "ERROR: A non-empty stash message is required."
-    rc, out, err = _git_run(["git", "stash", "push", "-m", message])
-    if rc != 0:
-        return f"ERROR: git stash failed: {err}"
-    return out or "OK: stash created."
-
-
-def write_git_stash_pop() -> str:
-    """[WRITE — git] Apply the most recent stash entry and remove it from the stash list."""
-    rc, out, err = _git_run(["git", "stash", "pop"])
-    if rc != 0:
-        return f"ERROR: git stash pop failed: {err}"
-    return out or "OK: stash applied and removed."
+    return json.dumps({
+        "__maestro_terminal__": True,
+        "signal": signal,
+        "summary": summary,
+        "payload": payload or {}
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -1434,7 +1572,7 @@ def web_search(query: str, count: int = 5) -> str:
         # DB stores naive UTC, convert to timezone-aware UTC for comparison
         if last_search.tzinfo is None:
             last_search = last_search.replace(tzinfo=timezone.utc)
-
+        
         now = datetime.now(timezone.utc)
         diff = now - last_search
         limit_minutes = 30
@@ -1490,7 +1628,7 @@ def web_search(query: str, count: int = 5) -> str:
 def _ddg_search(query: str, count: int) -> list[dict]:
     """Internal helper: execute search via duckduckgo_search library."""
     from duckduckgo_search import DDGS
-
+    
     results = []
     # DDGS.text() is the standard search method in duckduckgo_search 6.x/7.x
     with DDGS() as ddgs:
@@ -1527,7 +1665,7 @@ def _tavily_search(query: str, count: int, api_key: str) -> list[dict]:
     from tavily import TavilyClient
     client = TavilyClient(api_key=api_key)
     response = client.search(query=query, max_results=min(count, 15))
-
+    
     results = []
     for r in response.get("results", []):
         results.append({
@@ -1687,14 +1825,21 @@ def list_tasks(project: str, column: str | None = None) -> str:
 
 
 def write_task_status(task_id: str, new_status: str) -> str:
-    """[WRITE — db] Advance a task through the Kanban pipeline. Valid statuses: PENDING, ACTIVE, VERIFYING, ACCEPTED, REJECTED."""
+    """[WRITE — db] Advance a task through the Kanban pipeline. Valid statuses: PENDING, ACTIVE, VERIFYING, REJECTED."""
     STATUS_TO_TYPE = {
         "PENDING": "planning",
         "ACTIVE": "indev",
         "VERIFYING": "conceptual_review",
-        "ACCEPTED": "completed",
+        # "ACCEPTED" is intentionally absent — routes through review pipeline via submit_work
         "REJECTED": "planning",
     }
+    if new_status == "ACCEPTED":
+        return (
+            "ERROR: 'ACCEPTED' is not valid here. "
+            "To signal task completion, call the submit_work tool with signal='ACCEPTED'. "
+            "This routes through the full review pipeline (conceptual_review → optimization → "
+            "security → full_review) before the task can reach completed."
+        )
     if new_status not in STATUS_TO_TYPE:
         return (
             f"ERROR: '{new_status}' is not a valid status. "
@@ -1733,9 +1878,9 @@ def write_task_history(task_id: str, entry: str) -> str:
 
 
 def write_plan_fields(result_id: int, fields_json: str) -> str:
-    """[WRITE — db] Patch specific fields on a planning_results row. Allowed: interface_contracts, dependency_graph, file_manifest, test_strategy, implementation_steps."""
+    """[WRITE — db] Patch specific fields on a planning_results row. Allowed: design_rationale, interface_contracts, dependency_graph, file_manifest, test_strategy, implementation_steps."""
     import json as _json
-    ALLOWED = {"interface_contracts", "dependency_graph", "file_manifest",
+    ALLOWED = {"design_rationale", "interface_contracts", "dependency_graph", "file_manifest",
                "test_strategy", "implementation_steps"}
     try:
         fields = _json.loads(fields_json) if isinstance(fields_json, str) else fields_json
@@ -1832,7 +1977,7 @@ def list_scope_summaries(project: str | None = None, scope_type: str | None = No
         scopes = db_list_scopes(p_name, scope_type=scope_type)
         if not scopes:
             return f"No scope summaries found for project '{p_name}'."
-
+        
         results = []
         for s in scopes:
             results.append({
@@ -2358,44 +2503,6 @@ def read_test_summary() -> str:
 
 
 # ---------------------------------------------------------------------------
-# submit_work — terminal signal tool
-# ---------------------------------------------------------------------------
-# When the LLM calls submit_work, the result contains a __maestro_terminal__
-# marker that MaestroLoop / ComponentLoop detect to exit the agent loop.
-# This is the PREFERRED way for agents to signal completion — not raw JSON
-# text blocks.
-#
-# Signal types:
-#   ACCEPTED              — work complete, verified (loop exits)
-#   REVERT_TO_DESIGN      — design flaw, cannot proceed (loop exits)
-#   RESOLUTION_STALLED    — PIP resolution exhausted (loop exits, treated as REVERT_TO_DESIGN)
-#   CORRECTION_STALLED    — planning correction exhausted (loop exits, treated as REVERT_TO_DESIGN)
-#   VERDICT_REJECTED      — review gate rejected, needs work (loop exits)
-#   VERDICT_NEEDS_WORK    — review found issues, not yet rejected (loop exits)
-#
-# Payload fields (all optional, agents include what's relevant):
-#   votes           — {"verdicts": [...], "threshold": N, "votes_for": N, "votes_against": N}
-#   verdict         — {"verdict": str, "confidence": N, "justification": str}
-#   review_results  — list of review agent results
-#   files_changed   — list of file paths modified
-#   tests_passed    — bool
-#   git_branch      — branch name
-#   reason          — one-sentence root cause (for REVERT/STALLED signals)
-#   advice          — what a re-attempt should do differently
-#   summary         — one-paragraph description of what was done
-
-def submit_work(signal: str, summary: str, payload: dict | None = None) -> str:
-    """[RUN] Call this when you are done. Exits the agent loop."""
-    import json as _json
-    return _json.dumps({
-        "__maestro_terminal__": True,
-        "signal": signal,
-        "summary": summary,
-        "payload": payload or {},
-    })
-
-
-# ---------------------------------------------------------------------------
 # Tool registry + schemas
 # ---------------------------------------------------------------------------
 
@@ -2407,9 +2514,11 @@ TOOL_REGISTRY: dict[str, Any] = {
     # File write tools
     "write_file": write_file,
     "append_file": append_file,
+    "patch_file": patch_file,
+    "move_file": move_file,
     "write_archive": write_archive,
     # Directory / search tools
-    "read_list_dir": read_list_dir,
+    "list_directory": list_directory,
     "find_files": find_files,
     "find_in_files": find_in_files,
     # Static analysis helpers
@@ -2426,16 +2535,11 @@ TOOL_REGISTRY: dict[str, Any] = {
     "read_git_log": read_git_log,
     "read_git_blame": read_git_blame,
     "read_git_show": read_git_show,
-    "read_git_stash_list": read_git_stash_list,
     # Git write tools
     "write_git_branch": write_git_branch,
     "write_git_commit": write_git_commit,
     "write_git_checkout": write_git_checkout,
     "write_git_restore": write_git_restore,
-    "write_git_stage": write_git_stage,
-    "write_git_unstage": write_git_unstage,
-    "write_git_stash": write_git_stash,
-    "write_git_stash_pop": write_git_stash_pop,
     # Task DB tools
     "get_task": get_task,
     "list_tasks": list_tasks,
@@ -2479,13 +2583,13 @@ TOOL_REGISTRY: dict[str, Any] = {
     "run_audit_pip": run_audit_pip,
     "run_audit_semgrep": run_audit_semgrep,
     "run_audit_npm": run_audit_npm,
+    # Terminal tool
+    "submit_work": submit_work,
     # Survey/project summary tools
     "get_project_summary": get_project_summary,
     "get_directory_summary": get_directory_summary,
     "get_module_summary": get_module_summary,
     "list_scope_summaries": list_scope_summaries,
-    # Terminal signal tool
-    "submit_work": submit_work,
 }
 
 TOOL_SCHEMAS: list[dict] = [
@@ -2495,22 +2599,18 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "read_file",
             "description": (
-                "[READ] First call: returns a natural-language summary (LLM-generated, cached) plus "
-                "structural analysis: classes, functions, imports, and line ranges. "
-                "For tiny files (<= 25 lines) embeds raw content directly. "
-                "Each subsequent call serves the next 250 unserved source lines - "
-                "never repeating lines already in context. "
-                "Omit start/end/count to get the next 250 unserved lines. "
-                "Provide start (+ optionally end or count) to target a specific range. "
-                "No state change."
+                "[READ] Read a file's structure or source code. Capped at 250 lines per call. "
+                "FIRST CALL (no range): Returns structural summary (classes, functions, etc.) or full content if file <= 25 lines. "
+                "SUBSEQUENT CALLS (no range): Serves the NEXT 250 unserved lines automatically. "
+                "TARGETED READ: Provide 'start' (+ optionally 'end' or 'count') to read a specific range. No state change."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Path to the file (relative to project root or absolute)."},
-                    "start": {"type": "integer", "description": "Starting line number (1-indexed). Use with end or count, or alone to serve 250 lines from that point."},
-                    "end": {"type": "integer", "description": "Ending line number (1-indexed, inclusive). Mutually exclusive with count."},
-                    "count": {"type": "integer", "description": "Number of lines to read starting from start. Mutually exclusive with end."},
+                    "start": {"type": "integer", "description": "Starting line number (1-indexed). Omit to get summary (first call) or next chunk."},
+                    "end": {"type": "integer", "description": "Ending line number (inclusive). Provide this OR count, not both."},
+                    "count": {"type": "integer", "description": "Number of lines from start. Provide this OR end, not both."},
                 },
                 "required": ["path"],
             },
@@ -2584,6 +2684,39 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "patch_file",
+            "description": (
+                "[WRITE — files] Replace an exact string in a file. "
+                "REQUIRES the specific lines being edited to have been served by read_file() — enforced. "
+                "old_str must match exactly once — extend it with more surrounding lines if ambiguous. "
+                "Fails with a clear error if old_str appears 0 or 2+ times. "
+                "Prefer this over write_file for any targeted edit: avoids full-file rewrites and the "
+                "silent regressions they cause. Auto-stages for git. Path must be inside project root."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file to patch."},
+                    "old_str": {
+                        "type": "string",
+                        "description": (
+                            "Exact text to find and replace. Must appear exactly once in the file. "
+                            "Include enough surrounding context (blank lines, function signatures) "
+                            "to be unambiguous. Whitespace and indentation must match precisely."
+                        ),
+                    },
+                    "new_str": {
+                        "type": "string",
+                        "description": "Replacement text. May be empty string to delete old_str.",
+                    },
+                },
+                "required": ["path", "old_str", "new_str"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "write_archive",
             "description": "[WRITE — archive] Safely 'delete' a file by moving it to .archive/<timestamp>/. NEVER hard-deletes. Reversible: copy from the archive path in the return value.",
             "parameters": {
@@ -2596,11 +2729,31 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "move_file",
+            "description": (
+                "[WRITE — files] Move or rename a file within the project. "
+                "Renaming is just a move with a different name at the same directory level. "
+                "If dst already exists, it is archived to .archive/ before being overwritten — never hard-deleted. "
+                "Auto-stages both the old and new paths for git. Both paths must be inside project root."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "src": {"type": "string", "description": "Current path of the file to move."},
+                    "dst": {"type": "string", "description": "Destination path (including filename). May be a rename, a relocation, or both."},
+                },
+                "required": ["src", "dst"],
+            },
+        },
+    },
     # ---- Directory / search tools ----
     {
         "type": "function",
         "function": {
-            "name": "read_list_dir",
+            "name": "list_directory",
             "description": "[READ] List files and subdirectories at a given path with annotations for gitignored/excluded/protected entries. No state change.",
             "parameters": {
                 "type": "object",
@@ -3053,7 +3206,7 @@ TOOL_SCHEMAS: list[dict] = [
             "description": (
                 "[WRITE — git] Restore a tracked file to its HEAD state, DISCARDING all local changes. "
                 "Irreversible for unsaved work. The file must be tracked by git. "
-                "Does NOT affect staged files — use write_git_unstage first if the file is staged."
+                "Does NOT affect already-staged files — commit or reset the index first if needed."
             ),
             "parameters": {
                 "type": "object",
@@ -3062,72 +3215,6 @@ TOOL_SCHEMAS: list[dict] = [
                 },
                 "required": ["path"],
             },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_git_stage",
-            "description": (
-                "[WRITE — git] Stage a specific file for the next commit. "
-                "Use this to control exactly which files are included in a commit. "
-                "Reversible via write_git_unstage."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Path to the file to stage (relative to project root)."},
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_git_unstage",
-            "description": (
-                "[WRITE — git] Remove a file from the staging area without discarding working-tree changes. "
-                "Use this to correct an accidental write_git_stage. The file's edits are preserved."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Path to the file to unstage (relative to project root)."},
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    # ---- Git stash tools ----
-    {
-        "type": "function",
-        "function": {
-            "name": "read_git_stash_list",
-            "description": "[READ] List git stash entries with index, message, and branch. No state change.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_git_stash",
-            "description": "[WRITE — git] Stash tracked working-tree changes with a required message. Reversible via write_git_stash_pop.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "message": {"type": "string", "description": "Required stash description (e.g. 'WIP: refactor auth')."},
-                },
-                "required": ["message"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_git_stash_pop",
-            "description": "[WRITE — git] Apply the most recent stash entry and remove it from the stash list. Does not drop or clear other entries.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
     # ---- Named testing / linting tools ----
@@ -3563,8 +3650,8 @@ TOOL_SCHEMAS: list[dict] = [
             "name": "write_plan_fields",
             "description": (
                 "[WRITE — db] Patch one or more fields on a planning_results row. "
-                "Use this to make targeted corrections to interface_contracts, dependency_graph, "
-                "file_manifest, test_strategy, or implementation_steps. "
+                "Use this to make targeted corrections to design_rationale, interface_contracts, "
+                "dependency_graph, file_manifest, test_strategy, or implementation_steps. "
                 "Pass result_id (from the system prompt) and fields_json as a JSON object "
                 "mapping field names to their corrected values. "
                 "Call once with all corrections — do not call multiple times."
@@ -3580,68 +3667,13 @@ TOOL_SCHEMAS: list[dict] = [
                         "type": "string",
                         "description": (
                             "JSON object mapping field name(s) to corrected value(s). "
-                            "Allowed keys: interface_contracts, dependency_graph, file_manifest, "
-                            "test_strategy, implementation_steps. "
+                            "Allowed keys: design_rationale, interface_contracts, dependency_graph, "
+                            "file_manifest, test_strategy, implementation_steps. "
                             'Example: {"interface_contracts": [...corrected list...]}'
                         ),
                     },
                 },
                 "required": ["result_id", "fields_json"],
-            },
-        },
-    },
-    # ---------------------------------------------------------------------------
-    # Terminal signal tool
-    # ---------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "submit_work",
-            "description": (
-                "[RUN] Call this tool when you are done with your work. "
-                "This is the ONLY correct way to signal completion — do NOT output "
-                "raw JSON blocks with a 'signal' key in your text response. "
-                "Use this tool call instead."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "signal": {
-                        "type": "string",
-                        "enum": [
-                            "ACCEPTED",
-                            "REVERT_TO_DESIGN",
-                            "RESOLUTION_STALLED",
-                            "CORRECTION_STALLED",
-                            "VERDICT_REJECTED",
-                            "VERDICT_NEEDS_WORK",
-                            "SURVEY_COMPLETE",
-                            "RESEARCH_COMPLETE",
-                            "SUBDIVISION_COMPLETE",
-                            "INTAKE_COMPLETE",
-                            "DESIGN_COMPLETE",
-                            "REVIEW_COMPLETE",
-                        ],
-                        "description": (
-                            "'ACCEPTED' — work complete and verified. "
-                            "'REVERT_TO_DESIGN' — design flaw, cannot proceed. "
-                            "'RESOLUTION_STALLED' — PIP resolution exhausted. "
-                            "'CORRECTION_STALLED' — planning correction exhausted. "
-                            "'VERDICT_REJECTED' — review gate rejected. "
-                            "'VERDICT_NEEDS_WORK' — review found issues. "
-                            "'REVIEW_COMPLETE' — reviewer verdict ready."
-                        ),
-                    },
-                    "summary": {
-                        "type": "string",
-                        "description": "One-paragraph description of what was done or why reverting.",
-                    },
-                    "payload": {
-                        "type": "object",
-                        "description": "Optional structured results dict.",
-                    },
-                },
-                "required": ["signal", "summary"],
             },
         },
     },
@@ -3656,11 +3688,10 @@ CORRECTION_AGENT_TOOLS: list[str] = [
     "read_file",
     "find_in_files",
     "find_files",
-    "read_list_dir",
+    "list_directory",
     "get_task",
     "list_tasks",
     "write_plan_fields",
-    "submit_work",
 ]
 
 
@@ -3726,36 +3757,25 @@ async def async_dispatch_tool(
         start = arguments.get("start")
         end = arguments.get("end")
         count = arguments.get("count")
+        
         safe_path = _assert_safe_path(path)
         if not os.path.isfile(safe_path):
             return f"ERROR: '{path}' is not a file or does not exist."
         if _is_binary_path(safe_path):
             return (
                 f"ERROR: '{path}' is a binary file (contains null bytes) and cannot be read as text. "
-                "Binary files (databases, compiled bytecode, archives) must be inspected with "
-                "appropriate non-text tools."
-            )
-        if _is_gitignored(safe_path):
-            return (
-                f"ERROR: '{path}' is in .gitignore and should not have been traversed. "
-                "Files which have been designated to be untracked should not be modified by the system,"
-                "and will be ignored by tools."
+                "Binary files must be inspected with appropriate non-text tools."
             )
 
         norm_path = os.path.normpath(os.path.realpath(safe_path))
         from app.agent.project_snapshot import _count_file_lines, async_build_file_summary
-
-        if norm_path not in _get_prepped_files():
-            # First call - LLM-enriched structural summary
+        
+        # FIRST CALL (no range): returns summary (or small file)
+        if not _is_file_prepped(safe_path) and start is None and end is None and count is None:
             _mark_file_prepped(safe_path)
             if _count_file_lines(safe_path) <= 25:
                 result = _inline_small_file(safe_path)
-                try:
-                    with open(safe_path, "r", encoding="utf-8", errors="replace") as fh:
-                        lc = sum(1 for _ in fh)
-                    _record_served_range(norm_path, 1, lc)
-                except OSError:
-                    pass
+                _record_served_range(norm_path, 1, _count_file_lines(safe_path))
                 return result
             result = await async_build_file_summary(
                 safe_path,
@@ -3766,8 +3786,9 @@ async def async_dispatch_tool(
             )
             return _cap_tool_result("read_file", result)
 
-        # Subsequent call - delegate to read_file() which handles ranges
-        return read_file(path, start=start, end=end, count=count)
+        # OTHERWISE: use the sync implementation for range logic
+        # It handles paged reads (no range) and targeted reads correctly.
+        return dispatch_tool(name, arguments)
 
     if name in ("write_file", "append_file"):
         # Capture old summary BEFORE the write (file still has old content)

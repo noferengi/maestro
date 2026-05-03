@@ -27,6 +27,9 @@ def up(conn):
 
 def down(conn):
     # SQLite does not support DROP COLUMN — recreate without the columns.
+    # Drop the view first; SQLite validates views that reference budget_entries
+    # during the rename, so it must be absent while the table swap is in progress.
+    conn.execute("DROP VIEW IF EXISTS budget_token_totals")
     conn.execute("""
         CREATE TABLE budget_entries_backup AS
         SELECT id, llm_id, budget_id, task_id,
@@ -36,6 +39,15 @@ def down(conn):
     """)
     conn.execute("DROP TABLE budget_entries")
     conn.execute("ALTER TABLE budget_entries_backup RENAME TO budget_entries")
+    conn.execute("""
+        CREATE VIEW IF NOT EXISTS budget_token_totals AS
+        SELECT budget_id,
+               COUNT(*)                           AS total_entries,
+               SUM(prompt_cost)                   AS total_prompt_tokens,
+               SUM(generation_cost)               AS total_completion_tokens,
+               SUM(prompt_cost + generation_cost) AS total_tokens
+        FROM budget_entries GROUP BY budget_id
+    """)
 
 
 description = "Add session_id and agent_name to budget_entries for diagnostics grouping"

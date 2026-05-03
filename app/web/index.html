@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kanban Board - TheMaestro</title>
-    <link rel="stylesheet" href="/static/style.css?v=32">
-    <script src="/static/kanban.js?v=54"></script>
+    <link rel="stylesheet" href="/static/style.css?v=36">
+    <script src="/static/kanban.js?v=59"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -131,41 +131,24 @@
                 </div>
             </div>
 
-            <!-- CONCEPTUAL REVIEW Column -->
-            <div class="column" id="column-conceptual_review">
-                <div class="column-header" onclick="openColumnMap('conceptual_review')" title="Click to open Conceptual Review Map">
-                    <span class="column-title">CONCEPTUAL REVIEW</span>
-                    <span class="task-count" id="count-conceptual_review">0</span>
+            <!-- AI REVIEW Column (conceptual_review + optimization + security combined) -->
+            <div class="column column-group" id="column-ai-review">
+                <div class="column-header" onclick="openColumnMap('conceptual_review')" title="Click to open AI Review Map">
+                    <span class="column-title">AI REVIEW</span>
+                    <span class="task-count" id="count-ai-review">0</span>
                 </div>
                 <div class="tasks-container" id="tasks-conceptual_review" onclick="handleTasksContainerClick(event,'conceptual_review')">
-                    <!-- Tasks will be rendered from database -->
-                </div>
-            </div>
-
-            <!-- OPTIMIZATION Column -->
-            <div class="column" id="column-optimization">
-                <div class="column-header" onclick="openColumnMap('optimization')" title="Click to open Optimization Map">
-                    <span class="column-title">OPTIMIZATION</span>
-                    <span class="task-count" id="count-optimization">0</span>
                 </div>
                 <div class="tasks-container" id="tasks-optimization" onclick="handleTasksContainerClick(event,'optimization')">
-                </div>
-            </div>
-
-            <!-- SECURITY Column -->
-            <div class="column" id="column-security">
-                <div class="column-header" onclick="openColumnMap('security')" title="Click to open Security Map">
-                    <span class="column-title">SECURITY</span>
-                    <span class="task-count" id="count-security">0</span>
                 </div>
                 <div class="tasks-container" id="tasks-security" onclick="handleTasksContainerClick(event,'security')">
                 </div>
             </div>
 
-            <!-- FULL REVIEW Column -->
+            <!-- HUMAN REVIEW Column -->
             <div class="column" id="column-full_review">
-                <div class="column-header" onclick="openColumnMap('full_review')" title="Click to open Final Review Map">
-                    <span class="column-title">FINAL REVIEW</span>
+                <div class="column-header" onclick="openColumnMap('full_review')" title="Click to open Human Review Map">
+                    <span class="column-title">HUMAN REVIEW</span>
                     <span class="task-count" id="count-full_review">0</span>
                 </div>
                 <div class="tasks-container" id="tasks-full_review" onclick="handleTasksContainerClick(event,'full_review')">
@@ -871,9 +854,10 @@
 
     <!-- Stage Journal Modal -->
     <div class="modal-overlay" id="stage-journal-modal">
-        <div class="modal" style="width:860px;max-height:88vh;display:flex;flex-direction:column">
+        <div class="modal" id="sj-modal-inner" style="width:860px;max-height:88vh;display:flex;flex-direction:column">
             <div class="modal-header">
                 <h2 class="modal-title" id="sj-title">Stage Journal</h2>
+                <button class="sj-expand-btn" id="sj-expand-btn" title="Toggle fullscreen" onclick="_sjToggleFullscreen()">&#x26F6;</button>
                 <button class="close-btn" onclick="closeStageJournal()">&times;</button>
             </div>
             <div class="modal-body" id="sj-body" style="overflow-y:auto;flex:1;padding:1rem 1.25rem">

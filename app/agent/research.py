@@ -40,7 +40,7 @@ from app.agent.config import (
     check_context_saturation,
 )
 from app.agent.json_utils import extract_json_block
-from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError, ContextTooLargeError
+from app.agent.llm_client import call_llm, is_shutting_down, sanitize_user_content, ShutdownError, ContextTooLargeError
 from app.agent.tools import TOOL_SCHEMAS, TOOL_REGISTRY, dispatch_tool, LISTING_EXCLUDED_DIRS
 from app.database import get_llm
 
@@ -208,26 +208,25 @@ conflicts. You have read-only access to the codebase via tools. You cannot modif
 - git_diff(path?): Show git diff (optionally scoped to a file)
 - git_log(path?, max_count?): Show recent git history (optionally scoped to a file)
 - git_blame(path): Show git blame for a file
+- submit_work(signal, summary, payload): Submit your final verdict (TERMINAL — call this to finish)
 
 == YOUR WORKFLOW ==
 1. Read the investigation question and context carefully.
 2. Use your tools to gather evidence from the codebase.
-3. When you have enough information, render your verdict by calling the `submit_work` tool.
+3. When you have enough information, call submit_work to submit your verdict.
 
-== TERMINAL ACTION ==
-When you are ready to render your verdict, call the `submit_work` tool:
-```python
+== OUTPUT FORMAT ==
+To submit your verdict, call the submit_work tool with:
 submit_work(
-    signal="RESEARCH_COMPLETE",
-    summary="One-paragraph explanation of your reasoning and evidence",
-    verdict={
-        "verdict": "REJECTED" | "NOT_SUITABLE" | "NEEDS_RESEARCH" | "POSSIBLE" | "LIKELY",
-        "confidence": <0-100>,
-        "justification": "...",
-        "findings": "..."
-    }
+  signal="ACCEPTED",
+  summary="<one-paragraph summary of your investigation>",
+  payload={
+    "verdict": "REJECTED" | "NOT_SUITABLE" | "NEEDS_RESEARCH" | "POSSIBLE" | "LIKELY",
+    "confidence": <integer 0-100>,
+    "justification": "<one paragraph explaining your findings and reasoning>",
+    "findings": "<summary of what you discovered during investigation>"
+  }
 )
-```
 
 Confidence ranges:
 - REJECTED: [0, 50] - fundamental blocker found
@@ -239,7 +238,7 @@ Confidence ranges:
 == RULES ==
 - Be thorough but efficient. You have limited turns.
 - Do NOT attempt to write or modify any files.
-- You MUST use `submit_work` to finish. Do NOT output free-form prose as your final action.
+- The ONLY way to complete your task is by calling `submit_work`.
 - If you cannot determine feasibility, say so honestly with NEEDS_RESEARCH.
 - Focus on evidence from the actual code, not assumptions.
 """
@@ -265,34 +264,27 @@ You will receive:
 - git_diff(path?): Show git diff (optionally scoped to a file)
 - git_log(path?, max_count?): Show recent git history (optionally scoped to a file)
 - git_blame(path): Show git blame for a file
-- submit_work(signal, summary, verdict): TERMINAL TOOL
 
 == YOUR WORKFLOW ==
 1. Read each voter's justification carefully. Identify where they disagree.
 2. Use tools to gather evidence that resolves the disagreement.
-3. Render your deciding verdict by calling the `submit_work` tool.
+3. Render your deciding verdict based on evidence, not opinion.
 
-== TERMINAL ACTION ==
-When ready, call `submit_work`:
-```python
-submit_work(
-    signal="RESEARCH_COMPLETE",
-    summary="Deciding reasoning citing evidence",
-    verdict={
-        "verdict": "REJECTED" | "NOT_SUITABLE" | "NEEDS_RESEARCH" | "POSSIBLE" | "LIKELY",
-        "confidence": <0-100>,
-        "justification": "...",
-        "findings": "...",
-        "resolved_disagreements": ["..."]
-    }
-)
+== OUTPUT FORMAT ==
+```json
+{
+  "verdict": "REJECTED" | "NOT_SUITABLE" | "NEEDS_RESEARCH" | "POSSIBLE" | "LIKELY",
+  "confidence": <integer 0-100>,
+  "justification": "<explain which voter was correct and why, citing evidence>",
+  "findings": "<summary of investigation>",
+  "resolved_disagreements": ["<point 1>", "<point 2>"]
+}
 ```
 
 == RULES ==
 - You MUST pick a side. Do not return NEEDS_RESEARCH unless you genuinely cannot find evidence.
 - Cite specific files, line numbers, or code patterns as evidence.
 - Be concise but thorough.
-- You MUST use `submit_work` to finish.
 """
 
 
@@ -351,7 +343,6 @@ class ResearchAgent:
         self._accumulated_summaries: list[str] = []  # post-mortem per exhausted life
         self._total_prompt_tokens = 0
         self._total_completion_tokens = 0
-        self._terminal_signal: dict | None = None
 
     async def run(self) -> ResearchResult:
         """Execute the research agent across all lives. Returns a ResearchResult."""
@@ -442,30 +433,17 @@ class ResearchAgent:
             accumulated = "No findings were recorded."
         context_snippet = json.dumps(self.context, indent=1)[:2000]
 
-        system_prompt = (
-            "/no_think\n"
-            "You are a Research Agent. ALL research turns have been exhausted. "
-            "You cannot use any tools. You MUST render a final verdict RIGHT NOW "
-            "based solely on the accumulated findings below.\n\n"
-            "Output ONLY this JSON object - key order MUST be exactly: grade, justification, verdict.\n"
-            "{ \n"
-            '  "grade": <integer 0-10000 representing investigation quality in hundredths of a percent, e.g. 9258 = 92.58%>,\n'
-            '  "justification": "<your synthesis of the evidence - no double-quote characters>",\n'
-            '  "verdict": "<REJECTED|NOT_SUITABLE|POSSIBLE|LIKELY|NEEDS_RESEARCH>"\n'
-            "} \n\n"
-            "Use NEEDS_RESEARCH only if the investigation budget was genuinely insufficient "
-            "to reach a conclusion.  Use a lower grade for lower-quality investigations."
-        )
-
         user_msg = (
-            f"Original question: {self.question}\n\n"
-            f"Context:\n{context_snippet}\n\n"
-            f"Accumulated findings from {self.max_lives} research lives:\n{accumulated}\n\n"
-            "Render your final verdict now."
+            f"Original question: {sanitize_user_content(self.question)}\n\n"
+            f"Context:\n{sanitize_user_content(context_snippet)}\n\n"
+            f"Accumulated findings from {self.max_lives} research lives:\n{sanitize_user_content(accumulated)}\n\n"
+            "To complete your research, call the submit_work tool with:\n"
+            "payload={\"verdict\": \"REJECTED|NOT_SUITABLE|POSSIBLE|LIKELY|NEEDS_RESEARCH\", "
+            "\"grade\": 0-10000, \"justification\": \"...\"}"
         )
 
         messages = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": "You are a research analyst. Use submit_work to output your final verdict."},
             {"role": "user", "content": user_msg},
         ]
 
@@ -570,7 +548,7 @@ class ResearchAgent:
             if budget_exceeded:
                 messages.append({
                     "role": "user",
-                    "content": "[SYSTEM] TOKEN BUDGET EXCEEDED. Render your JSON verdict now. No more tool calls.",
+                    "content": "[SYSTEM] TOKEN BUDGET EXCEEDED. Call submit_work with your verdict now. No more tool calls.",
                 })
 
             # LLM call
@@ -640,6 +618,17 @@ class ResearchAgent:
             tool_calls = assistant_message.get("tool_calls") or []
             content = assistant_message.get("content") or ""
 
+            # Check for verdict in content
+            vote = self._extract_vote(content)
+            if vote:
+                return LifeResult(
+                    findings=vote.get("findings", ""),
+                    vote=vote,
+                    turns_used=turns_used,
+                    prompt_tokens=life_prompt_tokens,
+                    completion_tokens=life_completion_tokens,
+                )
+
             # If the LLM self-reported CONTEXT_TOO_LARGE, exit immediately without
             # dispatching the tool calls — they would only grow an already-oversized context.
             if content and '"CONTEXT_TOO_LARGE"' in content:
@@ -660,43 +649,54 @@ class ResearchAgent:
                     completion_tokens=life_completion_tokens,
                 )
 
-            # Dispatch tool calls (suppress non-terminal calls if budget exceeded)
+            # Dispatch tool calls (suppress if budget exceeded - force verdict path)
             if tool_calls:
                 if budget_exceeded:
-                    # Allow submit_work through (terminal tool); block all others.
-                    results = []
+                    # Always dispatch submit_work — it's the exit mechanism.
+                    # Block all other tools and return error results.
+                    tool_results = []
                     for tc in tool_calls:
-                        name = tc.get("function", {}).get("name", "")
+                        name = tc.get("function", {}).get("name", "unknown")
                         if name == "submit_work":
-                            results.extend(self._handle_tool_calls([tc]))
+                            raw_args = tc.get("function", {}).get("arguments", "{}")
+                            try:
+                                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                            except json.JSONDecodeError:
+                                args = {}
+                            result_content = dispatch_tool("submit_work", args)
                         else:
-                            results.append({
-                                "role": "tool",
-                                "tool_call_id": tc.get("id", "unknown"),
-                                "name": name,
-                                "content": "ERROR: Token budget exceeded. No tool calls allowed. Render your verdict now.",
-                            })
-                    messages.extend(results)
+                            result_content = "ERROR: Token budget exceeded. No tool calls allowed. Render your verdict now."
+                        tool_results.append({
+                            "role": "tool",
+                            "tool_call_id": tc.get("id", "unknown"),
+                            "name": name,
+                            "content": result_content,
+                        })
                 else:
                     tool_results = self._handle_tool_calls(tool_calls)
-                    messages.extend(tool_results)
-
-                # Check for terminal signal from submit_work tool call
-                if self._terminal_signal is not None:
-                    payload = self._terminal_signal.get("payload", {})
-                    vote = {
-                        **payload,
-                        "signal": self._terminal_signal.get("signal", ""),
-                    }
-                    if not vote.get("findings"):
-                        vote["findings"] = self._terminal_signal.get("summary", "")
-                    return LifeResult(
-                        findings=vote.get("findings", ""),
-                        vote=vote,
-                        turns_used=turns_used,
-                        prompt_tokens=life_prompt_tokens,
-                        completion_tokens=life_completion_tokens,
-                    )
+                for tr in tool_results:
+                    result_str = tr.get("content", "")
+                    if isinstance(result_str, str) and "__maestro_terminal__" in result_str:
+                        try:
+                            data = json.loads(result_str)
+                            payload = data.get("payload", {})
+                            terminal_vote = {
+                                "verdict": payload.get("verdict", "NOT_SUITABLE"),
+                                "confidence": payload.get("confidence", 55),
+                                "justification": payload.get("justification", ""),
+                                "findings": payload.get("findings", data.get("summary", "")),
+                            }
+                            messages.extend(tool_results)
+                            return LifeResult(
+                                findings=terminal_vote["findings"],
+                                vote=terminal_vote,
+                                turns_used=turns_used,
+                                prompt_tokens=life_prompt_tokens,
+                                completion_tokens=life_completion_tokens,
+                            )
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+                messages.extend(tool_results)
                 continue
 
             # Context saturation check - only reached when no verdict and no tool calls
@@ -717,13 +717,13 @@ class ResearchAgent:
                 # Turn nudge was injected
                 pass
 
-            # No tool calls — nudge
-            if not tool_calls:
+            # No tool calls and no verdict - nudge
+            if not tool_calls and not vote:
                 messages.append({
                     "role": "user",
                     "content": (
                         "[SYSTEM] You did not call any tool and did not render a verdict. "
-                        "Either call a tool to investigate further, or call submit_work to submit your verdict."
+                        "Either call a tool to investigate further, or call submit_work with your verdict."
                     ),
                 })
 
@@ -809,14 +809,14 @@ class ResearchAgent:
                     if _task_rec and _task_rec.project:
                         _arch = build_architecture_context(_task_rec.project, agent_type='research')
                         if _arch:
-                            parts.append(_arch)
+                            parts.append(sanitize_user_content(_arch))
                 except Exception:
                     pass
 
-            parts.append(f"## Investigation Question\n{self.question}")
-            parts.append(f"\n## Context\n```json\n{json.dumps(self.context, indent=2, default=str)}\n```")
+            parts.append(f"## Investigation Question\n{sanitize_user_content(self.question)}")
+            parts.append(f"\n## Context\n```json\n{sanitize_user_content(json.dumps(self.context, indent=2, default=str))}\n```")
         else:
-            parts = [f"## Investigation Question (continued - life {life_num}/{self.max_lives})\n{self.question}"]
+            parts = [f"## Investigation Question (continued - life {life_num}/{self.max_lives})\n{sanitize_user_content(self.question)}"]
             parts.append("\n## Previous Investigation Findings")
             for i, (findings, summary) in enumerate(
                 zip_longest(self._accumulated_findings, self._accumulated_summaries, fillvalue=""),
@@ -824,7 +824,7 @@ class ResearchAgent:
             ):
                 parts.append(f"\n### Life {i} of {self.max_lives}")
                 # Prefer the structured post-mortem summary over the raw findings line
-                parts.append(summary if summary else findings)
+                parts.append(sanitize_user_content(summary if summary else findings))
 
             # Surface the last "still unresolved" section as a direct focus hint
             last_summary = self._accumulated_summaries[-1] if self._accumulated_summaries else ""
@@ -879,23 +879,10 @@ class ResearchAgent:
             except json.JSONDecodeError:
                 arguments = {}
 
-            if name not in RESEARCH_AGENT_TOOLS:
+            if name not in RESEARCH_AGENT_TOOLS and name != "submit_work":
                 result_content = f"ERROR: Tool '{name}' is not available to the research agent. Available: {RESEARCH_AGENT_TOOLS}"
             else:
                 result_content = dispatch_tool(name, arguments)
-
-            # Detect __maestro_terminal__ marker from submit_work
-            if name == "submit_work":
-                try:
-                    terminal_data = json.loads(str(result_content))
-                    if terminal_data.get("__maestro_terminal__") is True:
-                        logger.info(
-                            "Research Agent: submit_work tool call — signal=%s",
-                            terminal_data.get("signal"),
-                        )
-                        self._terminal_signal = terminal_data
-                except (json.JSONDecodeError, ValueError):
-                    pass
 
             results.append({
                 "role": "tool",
@@ -906,8 +893,30 @@ class ResearchAgent:
 
         return results
 
-    # (vote extraction via text fallback was removed; terminal detection is
-    # exclusively via submit_work tool call — see _handle_tool_calls)
+    # ------------------------------------------------------------------
+    # Vote extraction
+    # ------------------------------------------------------------------
+
+    def _extract_vote(self, content: str) -> dict | None:
+        """Try to extract a verdict JSON from the assistant's content.
+
+        NOTE: This is a fallback path. Agents should be using submit_work() instead.
+        A WARNING is logged whenever this fallback is triggered.
+        """
+        raw = extract_json_block(content)
+        if raw is None:
+            return None
+        logger.warning(
+            "Research agent emitted raw JSON instead of calling submit_work. "
+            "Please ensure agents are instructed to use the submit_work tool call."
+        )
+        try:
+            parsed = json.loads(raw.strip())
+            if isinstance(parsed, dict) and "verdict" in parsed and "confidence" in parsed:
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -928,34 +937,30 @@ Research Agent, you are NOT asked for a feasibility verdict — just comprehensi
 - git_diff(path?): Show git diff (optionally scoped to a file)
 - git_log(path?, max_count?): Show recent git history (optionally scoped to a file)
 - git_blame(path): Show git blame for a file
+- submit_work(signal, summary, payload): Submit your final report
 
 == YOUR WORKFLOW ==
 1. Read the investigation question carefully.
 2. Use tools to explore the codebase and gather concrete evidence.
-3. When you have enough information, produce a structured JSON report by calling the `submit_work` tool.
+3. When you have enough information, call submit_work with your report in the payload.
 
-== TERMINAL ACTION ==
-When ready, call the `submit_work` tool:
-```python
-submit_work(
-    signal="RESEARCH_COMPLETE",
-    summary="Direct answer to the question in 1-3 sentences",
-    report={
-        "answer": "...",
-        "key_findings": ["finding 1", "finding 2"],
-        "evidence": ["file:line or quote"],
-        "gaps": ["unanswered questions"],
-        "recommendation": "..."
-    }
-)
-```
+== OUTPUT FORMAT ==
+To submit your report, call the submit_work tool with:
+payload={
+  "answer": "<direct answer to the question in 1-3 sentences>",
+  "key_findings": ["<finding 1>", "<finding 2>", "..."],
+  "evidence": ["<file:line or quote 1>", "<evidence 2>", "..."],
+  "gaps": ["<unanswered question 1>", "..."],
+  "recommendation": "<what should be done next, if anything>"
+}
+
+No prose after calling submit_work.
 
 == RULES ==
 - Be specific: cite exact file paths, function names, and line numbers.
 - Do not pad the report with obvious filler. Quality over quantity.
 - If you cannot find enough information, say so explicitly in `gaps`.
 - Do NOT include a "verdict" field — this is an investigation, not a vote.
-- You MUST use `submit_work` to finish.
 """
 
 
@@ -1020,7 +1025,6 @@ class InvestigationAgent:
         self._accumulated_findings: list[str] = []
         self._total_prompt_tokens = 0
         self._total_completion_tokens = 0
-        self._terminal_signal: dict | None = None
 
     async def run(self) -> InvestigationResult:
         """Execute investigation across up to max_lives. Returns InvestigationResult."""
@@ -1207,10 +1211,6 @@ class InvestigationAgent:
                             "content": result_content,
                         })
                     messages.extend(results)
-
-                # Check for terminal signal from submit_work tool call
-                if self._terminal_signal is not None:
-                    return self._terminal_signal, turns_used, life_prompt_tokens, life_completion_tokens, content
                 continue
 
             # Saturation check

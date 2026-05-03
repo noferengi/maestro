@@ -397,7 +397,10 @@ class TestRunPipPreflight:
 
         with patch("app.agent.pip_agent.call_llm",
                    new_callable=AsyncMock,
-                   return_value=(passed_response, {})), \
+                   return_value={
+                       "choices": [{"message": {"content": passed_response, "tool_calls": None}}],
+                       "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                   }), \
              patch("app.agent.pip_agent.build_project_snapshot", return_value="(snap)"):
             result = _run(run_pip_preflight(task_id, "conceptual_review", 1, 1, None))
 
@@ -431,7 +434,10 @@ class TestRunPipPreflight:
 
         with patch("app.agent.pip_agent.call_llm",
                    new_callable=AsyncMock,
-                   return_value=(failed_response, {})), \
+                   return_value={
+                       "choices": [{"message": {"content": failed_response, "tool_calls": None}}],
+                       "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                   }), \
              patch("app.agent.pip_agent.build_project_snapshot", return_value="(snap)"):
             result = _run(run_pip_preflight(task_id, "optimization", 1, 1, None))
 

@@ -47,7 +47,7 @@ import logging
 import os
 from typing import Any
 
-from app.agent.llm_client import is_shutting_down, ShutdownError
+from app.agent.llm_client import is_shutting_down, sanitize_user_content, ShutdownError
 
 logger = logging.getLogger(__name__)
 AGENT_NAME = "File Summary Agent"
@@ -350,7 +350,7 @@ async def execute_file_summary(
                     _task_rec.project, agent_type='file_summary'
                 )
                 if _arch:
-                    _arch_preamble = f"{_arch}\n\n"
+                    _arch_preamble = f"{sanitize_user_content(_arch)}\n\n"
         except Exception:
             pass
 
@@ -388,8 +388,8 @@ async def execute_file_summary(
         prompt = (
             f"{_arch_preamble}"
             f"A source file has been modified.\n\n"
-            f"Previous summary: {previous_summary}\n\n"
-            f"Current contents of {basename}:\n```\n{content_snippet}\n```\n\n"
+            f"Previous summary: {sanitize_user_content(previous_summary)}\n\n"
+            f"Current contents of {basename}:\n```\n{sanitize_user_content(content_snippet)}\n```\n\n"
             f"Update the summary to reflect any significant changes. "
             f"If the substance is unchanged you may reuse the previous summary verbatim.\n\n"
             + _DUAL_FORMAT
@@ -408,7 +408,7 @@ async def execute_file_summary(
         prompt = (
             f"{_arch_preamble}"
             f"Analyze this source file.\n\n"
-            f"File: {basename}\n\n```\n{file_content}\n```\n\n"
+            f"File: {basename}\n\n```\n{sanitize_user_content(file_content)}\n```\n\n"
             + _DUAL_FORMAT
         )
         raw_text, pp, cp = await _call(prompt)
@@ -446,7 +446,7 @@ async def execute_file_summary(
                 f"(chars {w_start + 1}-{w_end} of {len(file_content)}) "
                 f"in 2-3 sentences. Focus on the critical information flow: "
                 f"what enters, what is decided or transformed, and what exits.\n\n"
-                f"```\n{window_text}\n```"
+                f"```\n{sanitize_user_content(window_text)}\n```"
             )
             section_text, pp, cp = await _call(prompt)
             total_prompt += pp
@@ -463,10 +463,10 @@ async def execute_file_summary(
             f"{_arch_preamble}"
             f"You have read {basename} ({len(file_content):,} chars) in "
             f"{window_count} overlapping windows. Window summaries:\n\n"
-            f"{summaries_block}\n\n"
+            f"{sanitize_user_content(summaries_block)}\n\n"
         )
         if len(file_content) <= _ROLLUP_MAX_CHARS:
-            rollup_prompt += f"Full file contents:\n```\n{file_content}\n```\n\n"
+            rollup_prompt += f"Full file contents:\n```\n{sanitize_user_content(file_content)}\n```\n\n"
         rollup_prompt += _DUAL_FORMAT
 
         raw_text, pp, cp = await _call(rollup_prompt)

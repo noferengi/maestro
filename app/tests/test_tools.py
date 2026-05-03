@@ -9,9 +9,8 @@ Covers:
 5. Side-effect tag coverage — every schema description starts with [READ/RUN/WRITE]
 6. No-shell assertion — run_shell, run_shell_indev, run_shell_build, run_shell_deps absent
 7. No-read-lines assertion — read_file_lines absent
-8. Stash tools roundtrip (write_git_stash → read_git_stash_list → write_git_stash_pop)
-9. find_in_files head/tail/grep params
-10. run_test_pytest head/tail/grep params (patched shell)
+8. find_in_files head/tail/grep params
+9. run_test_pytest head/tail/grep params (patched shell)
 """
 
 import os
@@ -336,43 +335,6 @@ class TestNoReadFileLines:
         with open(config_path) as f:
             source = f.read()
         assert "read_file_lines" not in source
-
-
-# ---------------------------------------------------------------------------
-# 8. Stash tools roundtrip
-# ---------------------------------------------------------------------------
-
-class TestStashRoundtrip:
-    def test_stash_list_pop(self, tmp_path):
-        from app.agent.tools import write_git_stash, read_git_stash_list, write_git_stash_pop
-
-        # Set up a real git repo with a tracked file
-        subprocess.run(["git", "init", str(tmp_path)], capture_output=True)
-        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(tmp_path), capture_output=True)
-        subprocess.run(["git", "config", "user.name", "T"], cwd=str(tmp_path), capture_output=True)
-        f = tmp_path / "file.py"
-        f.write_text("x = 1\n")
-        subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
-        subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), capture_output=True)
-
-        # Make a tracked change
-        f.write_text("x = 2\n")
-
-        token = _task_git_cwd.set(str(tmp_path))
-        try:
-            stash_result = write_git_stash("test-stash-message")
-            assert "ERROR" not in stash_result
-
-            list_result = read_git_stash_list()
-            assert "test-stash-message" in list_result or "stash@{0}" in list_result
-
-            pop_result = write_git_stash_pop()
-            assert "ERROR" not in pop_result
-
-            # File should be back to x = 2
-            assert f.read_text() == "x = 2\n"
-        finally:
-            _task_git_cwd.reset(token)
 
 
 # ---------------------------------------------------------------------------

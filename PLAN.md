@@ -1,226 +1,88 @@
-# Maestro — Plan
+# Test Suite Fix Plan
 
-## Context
+## What was done
 
-Three tasks have been stuck in `planning` type across two projects (AndroidStreetPass,
-Garden). Root causes identified and two bugs fixed this session (judge `max_tokens` too
-low; reviewers running in parallel causing starvation). A third bug — `PlanningCorrectionAgent`
-never triggered because all prior sessions died in server restarts before reaching the gate
-— is in-flight. Current planning sessions are the first to run with the correction code live.
-52 migrations applied, 690 tests passing.
+### Fixed (confirmed passing)
+1. **`app/agent/pip_agent.py`** — Production bug: `response, stats = await call_llm(...)` unpacked a dict as a tuple (getting string keys). Fixed to `response = await call_llm(...)` + `stats = response.get("usage", {})`. Same fix in `_check_single_pip`.
+
+2. **`app/tests/test_pip_agent_unit.py`** — Mock returns were `(json_string, stats)` tuples. Fixed all mocks to return proper `{"choices": [...], "usage": {...}}` dicts.
+
+3. **`app/tests/test_intake_pipeline.py`** — Mock response dicts used `"verdict"` as outer key but `intake._extract_vote()` looks for `"vote"`. Fixed all top-level constants and one inline dict. Added `_patch_static(pipeline)` to `test_static_analysis_fallback_when_no_affected_areas` to prevent filesystem scan + research agent activation.
+
+4. **`app/tests/test_pip_resolution_unit.py`** — Tests patched nonexistent `app.agent.agent_loop.call_llm` / `async_dispatch_tool`. Fixed to `app.agent.pip_resolution.call_llm` and `app.agent.pip_resolution.async_dispatch_tool`.
+
+5. **`app/tests/test_scheduler_unit.py`** — `TestRunOptimizationTask::test_demotes_to_indev_on_exception` hit `_record_demotion_inline` → `asyncio.run(generate_pip(...))` → real HTTP to localhost:8008. Fixed by adding `patch("app.agent.scheduler._record_demotion_inline", MagicMock())`.
+
+### Key operational finding
+Bash tool hangs when tests produce large log output (thousands of research agent error lines overflow the pipe buffer). Mitigation: always append `2>&1 | grep -v "^ERROR\|^WARNING\|^INFO" | tail -N` to pytest commands.
 
 ---
 
-## In-flight / immediate
+## Current state
 
-**Three planning sessions are actively running.** They started at 07:13 UTC and are working
-through the design cycle. They need to complete and hit the gate (expected ~30-90 min from
-session start) before the correction agent path can be tested. Do NOT restart the server
-while these are running.
+`venv/Scripts/python.exe -m pytest app/tests/ tests/ -q --tb=no --timeout=15` runs in ~20s with no hangs: **785 pass, 33 fail, 15 errors**.
 
-**After they hit the gate:**
+---
 
-1. Check for `planning_correction` agent sessions:
+## Remaining failures (33 failed, 15 errors)
+
+### Group 1 — `app/tests/test_research_agent_unit.py` (12 failures)
+**Symptom**: verdict comes back `NOT_SUITABLE` instead of `LIKELY`. The test mocks `app.agent.research.call_llm` correctly and builds responses that call `submit_work` with `signal="RESEARCH_COMPLETE"`. The agent isn't processing the `submit_work` tool call into a verdict.
+**Likely cause**: `dispatch_tool("submit_work", ...)` is not patched, so it runs the real implementation; or the research agent's tool-call handling path changed and `RESEARCH_COMPLETE` signal is no longer extracted this way.
+**Files**: `app/tests/test_research_agent_unit.py` (~line 250+), `app/agent/research.py` (tool call / verdict extraction path).
+
+### Group 2 — `app/tests/test_submit_work_terminal.py` (5 failures)
+**Symptom**: `AttributeError: 'MaestroLoop' object has no attribute '_dispatch_tools'`. Tests call `await loop._dispatch_tools(tool_calls)` but the method was renamed or removed.
+**Fix**: Find current tool-dispatch method name in `app/agent/loop.py` and update the test.
+**Files**: `app/agent/loop.py` (search for tool dispatch), `app/tests/test_submit_work_terminal.py`.
+
+### Group 3 — `app/tests/test_e2e_pipeline.py` (2 failures)
+**Symptom**: `outcome == "passed"` instead of `"rejected"`. The `MockLLM` intake scenarios in `app/agent/mock_llm.py` use `"verdict"` as the outer key (e.g. `_SCOPE_RESPONSE_REJECTED["verdict"] = {...}`) but `intake._extract_vote()` looks for `"vote"`.
+**Fix**: In `mock_llm.py`, rename `"verdict"` → `"vote"` in all `_SCOPE_RESPONSE_*`, `_FEASIBILITY_RESPONSE_*`, `_CONFLICT_RESPONSE_*` dicts (lines ~87–167).
+
+### Group 4 — `app/tests/test_pip_workflow.py` (1 failure)
+`test_preflight_all_passed_writes_verification_rows`: likely same call_llm mock format issue as pip_agent_unit. Check mock return values in this test.
+
+### Group 5 — `app/tests/test_planning_unit.py` (1 failure)
+`TestFeasibilityRecheck::test_feasibility_recheck_enabled_llm_pass`: likely call_llm mock format or `"verdict"` vs `"vote"` key issue.
+
+### Group 6 — `app/tests/test_survey_orchestrator_integration.py` (1 failure)
+Unknown — needs traceback. Run: `pytest app/tests/test_survey_orchestrator_integration.py -v --tb=short --timeout=10 2>&1 | grep -v "^ERROR\|^WARNING" | tail -20`
+
+### Group 7 — `app/tests/test_tools_safety.py` (1 failure)
+`TestAssertSafePath::test_contextvar_override_read_allows_outside`: ContextVar test failure. Needs traceback.
+
+### Group 8 — `tests/test_intake_pipeline.py` (2 failures + 12 errors)
+Different file from `app/tests/test_intake_pipeline.py`. Located in `tests/` directory.
+- 2 failures: `TestTallyVotes` — likely vote-tallying logic, independent of LLM format.
+- 12 errors: `TestStageExecutionOrder`, `TestNeedsResearchHandling`, `TestTieHandling`, `TestFullPipelineWithMockLLM` — probably import or fixture errors. Check `tests/conftest.py` and the test file's imports.
+
+### Group 9 — `tests/test_migrations.py` (8 failures + 3 errors)
+Migration framework tests — likely pre-existing, unrelated to current work. Low priority unless specifically requested.
+
+---
+
+## Recommended fix order
+
+1. **`app/agent/mock_llm.py`** — `"verdict"` → `"vote"` in intake scenario dicts (fixes Group 3, likely also Group 5)
+2. **`app/agent/loop.py`** → **`app/tests/test_submit_work_terminal.py`** — find current method name, fix test (fixes Group 2)
+3. **`app/tests/test_research_agent_unit.py`** — diagnose submit_work / RESEARCH_COMPLETE signal path (fixes Group 1, 12 tests)
+4. **`app/tests/test_pip_workflow.py`** — fix call_llm mock format (Group 4)
+5. **`tests/test_intake_pipeline.py`** — check errors (Group 8)
+6. Groups 6, 7, 9 — investigate individually
+
+---
+
+## Resume commands
+
 ```bash
-venv/Scripts/python.exe -c "
-import sqlite3
-conn = sqlite3.connect('data/kanban.db')
-print(conn.execute(\"SELECT task_id, agent_type, exit_reason, exit_summary, started_at FROM agent_sessions WHERE agent_type='planning_correction' ORDER BY id DESC LIMIT 5\").fetchall())
-"
+# Check overall state (fast)
+venv/Scripts/python.exe -m pytest app/tests/ tests/ -q --tb=no --timeout=15 --no-header 2>&1 | grep -v "^ERROR\|^WARNING\|^INFO" | tail -5
+
+# Targeted runs per group
+venv/Scripts/python.exe -m pytest app/tests/test_submit_work_terminal.py -q --tb=short --timeout=10 --no-header 2>&1 | grep -v "^ERROR\|^WARNING\|^INFO" | tail -20
+
+venv/Scripts/python.exe -m pytest app/tests/test_research_agent_unit.py::TestResearchAgentRun::test_immediate_verdict_terminates_on_life_1 -v --tb=short --timeout=10 2>&1 | grep -v "^ERROR\|^WARNING\|^INFO" | tail -20
+
+venv/Scripts/python.exe -m pytest app/tests/test_e2e_pipeline.py -v --tb=short --timeout=10 2>&1 | grep -v "^ERROR\|^WARNING\|^INFO" | tail -20
 ```
-
-2. If correction sessions appear with `exit_reason='corrected'` → gate re-runs → task
-   should advance to `type='indev'`. Verify via board or:
-```bash
-venv/Scripts/python.exe scripts/inspect_cards.py scheduler
-```
-
-3. If correction sessions appear with `exit_reason='stalled'` → go to Plan item 2.
-
-4. If no correction sessions appear despite gate failures → debug trigger at
-   `scheduler.py:3089`; check logs for `[planning_correction]` prefix.
-
----
-
-## Pending features / fixes
-
-### 1. Fix task descriptions to stop design review failures
-
-These are the fastest fix and unblock the design review immediately.
-
-**Task: SQL Migration - Basic Table Structure**  
-The LLM designs a simplified users table that removes `password_hash`, `is_active`,
-`last_login_at`. Security reviewer rejects it every time. Fix: edit the task description
-via the board UI or directly in DB:
-
-```python
-import sqlite3
-conn = sqlite3.connect('data/kanban.db')
-conn.execute("""
-    UPDATE tasks SET description = description ||
-    '\n\nIMPORTANT: The existing migration at migrations/001_create_users_table.sql is ' ||
-    'authoritative. Preserve ALL existing columns (including password_hash, is_active, ' ||
-    'last_login_at). Only add new columns if the task requires them.'
-    WHERE id = 'task-1776559187.604922'
-""")
-conn.commit()
-conn.close()
-```
-
-**Task: Create Supporting Types (PacketPayload and PacketMetadata)**  
-`PacketMetadata.kt` already exists at
-`core/models/src/main/java/com/androidstreetpass/core/models/PacketMetadata.kt`. The
-interface reviewer flags a scope mismatch every time. Fix: update task description to scope
-to PacketPayload only:
-
-```python
-conn.execute("""
-    UPDATE tasks SET description = description ||
-    '\n\nSCOPE NOTE: PacketMetadata already exists at ' ||
-    'core/models/src/main/java/com/androidstreetpass/core/models/PacketMetadata.kt. ' ||
-    'DO NOT create it again. Focus exclusively on creating PacketPayload.'
-    WHERE id = 'task-1776548777.749239'
-""")
-```
-
-Do these DB edits, then the next planning session will pick up the updated descriptions.
-
----
-
-### 2. If correction agent stalls: soften `interface_completeness` to soft fail
-
-**Trigger:** `planning_correction` sessions exist but all have `exit_reason='stalled'`, and
-gate keeps failing with `interface_completeness`.
-
-**File:** `app/agent/planning_gate.py`
-
-Find the `interface_completeness` check (around line 162-167):
-```python
-return GateCheck(
-    name="interface_completeness",
-    passed=False,
-    hard_fail=True,                   # ← change this to False
-    detail=f"Unresolved consumes: {', '.join(sorted(unresolved))}",
-)
-```
-
-Change `hard_fail=True` → `hard_fail=False`. This makes it a warning, not a blocker.
-The gate will still log the failure and record it in `gate_checks`, but `hard_failures`
-list in scheduler will be empty → correction agent won't attempt it → task advances to
-INDEV anyway. The INDEV agent can deal with actual missing interfaces at implementation time.
-
-**Note:** This is a trade-off. Keeping it as hard fail is architecturally cleaner — the
-correction agent is the intended fix. Only soften if the correction agent consistently
-stalls after multiple attempts.
-
----
-
-### 3. Call `supersede_planning_results` at start of each planning run
-
-**Problem:** Each planning run creates a new `planning_results` row with `status='active'`
-but old rows are never superseded. Multiple `status='active'` rows exist per task.
-`get_planning_result()` returns the latest by timestamp so logic is correct, but the table
-accumulates stale rows.
-
-**File:** `app/agent/scheduler.py`, function `_run_planning_task` (around line 2988)
-
-Add before `run_planning_pipeline(...)`:
-```python
-from app.database import supersede_planning_results
-supersede_planning_results(task_id)
-```
-
-This is already defined in `app/database/crud_pipeline.py:225` — just needs to be called.
-
----
-
-### 4. Arch bar: Populate deduplication
-
-**Problem:** clicking ⚡ Populate twice creates duplicate `arch_gen_jobs` for the same
-category.
-
-**File:** `app/main.py`, function `populate_arch()`
-
-After collecting `missing` categories, before creating jobs:
-```python
-from app.database import SessionLocal
-from app.database.models import ArchGenJob
-db = SessionLocal()
-already_queued = {
-    j.category for j in db.query(ArchGenJob)
-    .filter(
-        ArchGenJob.project == project_name,
-        ArchGenJob.status.in_(['pending', 'running']),
-    ).all()
-}
-db.close()
-missing = [c for c in missing if c not in already_queued]
-if not missing:
-    return {"queued": 0, "categories": []}
-```
-
----
-
-### 5. Arch bar: Populate prewarm gate
-
-**Problem:** if no file summaries exist for the project, every arch_gen_job silently fails.
-
-**File:** `app/main.py`, function `populate_arch()`
-
-After resolving `project`, before creating jobs:
-```python
-from app.database import get_file_summaries_for_project_root
-summaries = get_file_summaries_for_project_root(project.path or "")
-if not summaries:
-    raise HTTPException(
-        status_code=409,
-        detail=(
-            "No file summaries found for this project. "
-            "Set a project path and run a prewarm first."
-        )
-    )
-```
-
----
-
-### 6. Arch bar: Regenerate single arch card
-
-**Goal:** ↻ Regen button on each arch card's hover toolbar replaces it with a freshly
-generated one.
-
-**Backend** — `app/main.py`:
-```python
-@app.post("/api/projects/{project_name}/regen-arch-card")
-def regen_arch_card(project_name: str, body: dict):
-    category = body.get("category")
-    if not category:
-        raise HTTPException(status_code=400, detail="category required")
-    from app.database import get_all_tasks, delete_task
-    tasks = [t for t in get_all_tasks() if t.project == project_name and t.type == 'architecture']
-    for t in tasks:
-        content = json.loads(t.content or '{}') if isinstance(t.content, str) else (t.content or {})
-        if content.get('category') == category:
-            delete_task(t.id)
-    llm_id, budget_id = _pick_prewarm_resources(project_name)
-    from app.database import create_arch_gen_job
-    create_arch_gen_job(project_name, category, llm_id=llm_id, budget_id=budget_id)
-    return {"queued": 1, "category": category}
-```
-
-**Frontend** — `app/web/kanban.js`, in `renderArchBar()` where card toolbar is built, add
-a ↻ button that calls `fetch('/api/projects/' + currentProject + '/regen-arch-card',
-{method:'POST', body: JSON.stringify({category})})` then calls `loadArchGenJobs()`.
-
----
-
-## Execution order
-
-1. **NOW:** Wait for current planning sessions to complete and hit the gate (monitor via
-   `inspect_cards.py activity --hours 1`).
-2. **After gate hit:** Check for `planning_correction` sessions (Step 0 above). If they
-   appear and pass → tasks should advance to INDEV. Done.
-3. **If stuck:** Apply task description fixes (Plan item 1) to stop design review failures,
-   restart sessions.
-4. **If correction agent stalls repeatedly:** Soften `interface_completeness` to soft fail
-   (Plan item 2).
-5. **When planning tasks are flowing:** Apply Plan items 3-6 as quality-of-life improvements.

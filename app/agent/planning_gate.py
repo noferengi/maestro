@@ -1,9 +1,12 @@
 """
 app/agent/planning_gate.py
 --------------------------
-7-check due diligence gate for PLANNING -> IN DEV transition.
+Due diligence gate for PLANNING -> IN DEV transition.
 
-All checks are deterministic except #6 (LLM feasibility re-check).
+All checks are deterministic except the LLM feasibility re-check, which also
+handles spec-compliance detection (whether the design implements a forbidden
+approach). Spec compliance is intentionally LLM-evaluated — keyword matching
+is too brittle to distinguish "removes memoization" from "uses memoization".
 Results stored in transition_results with transition="planning_to_indev".
 """
 
@@ -59,7 +62,7 @@ def _is_primitive_or_stdlib(item: str, project_path: str | None = None) -> bool:
     """
     import os
     low = item.lower().strip()
-
+    
     # Noise words that suggest it's a reference to an existing entity
     if low.endswith(" type") or low.endswith(" module") or low.endswith(" class") or low.endswith(" dataclass") or low.endswith(" enum") or low.endswith(" exception"):
         # Strip the suffix and check if the base exists or is a primitive
@@ -73,7 +76,7 @@ def _is_primitive_or_stdlib(item: str, project_path: str | None = None) -> bool:
         first = low.split(" for ")[0].strip()
         if first in _PYTHON_BUILTINS or first in _KOTLIN_BUILTINS:
             return True
-
+    
     # Check if it's an existing file in the project
     if project_path and os.path.isdir(project_path):
         # item might be a path (src/models.py) or a dotted module (src.models)
@@ -81,7 +84,7 @@ def _is_primitive_or_stdlib(item: str, project_path: str | None = None) -> bool:
         candidate_path = os.path.join(project_path, item)
         if os.path.isfile(candidate_path):
             return True
-
+        
         # Try base (without "dataclass" etc)
         candidate_base = os.path.join(project_path, low)
         if os.path.isfile(candidate_base):
@@ -93,7 +96,7 @@ def _is_primitive_or_stdlib(item: str, project_path: str | None = None) -> bool:
             candidate_dotted = os.path.join(project_path, dotted_path)
             if os.path.isfile(candidate_dotted):
                 return True
-
+        
         # Heuristic: if it's a single word and we see it in the project (case-insensitive search)
         # this is expensive, so we only do it for small items
         if len(low) > 3 and " " not in low and "." not in low:
@@ -183,9 +186,6 @@ class PlanningGate:
 
         # Check 0b: CREATE targets that already exist on disk
         checks.append(self._check_proposed_creates_exist())
-
-        # Check 0c: Design contradicts explicit spec constraints
-        checks.append(self._check_spec_compliance())
 
         # Check 1: Interface completeness
         checks.append(self._check_interface_completeness())
@@ -362,56 +362,6 @@ class PlanningGate:
         )
 
     # ------------------------------------------------------------------
-    # Check 0c: Spec compliance (design must not contradict task description)
-    # ------------------------------------------------------------------
-
-    _SPEC_CONTRADICTION_PAIRS: list[tuple[list[str], list[str], str]] = [
-        # (task_keywords, rationale_keywords, violation_message)
-        (["naive", "naive recursive"], ["iterative", "iteration", "memoiz"], "Task requests naive recursion but design uses iteration/memoization"),
-        (["no memoization", "without memoization"], ["lru_cache", "memoiz", "@cache"], "Task forbids memoization but design includes it"),
-        (["no caching", "without caching"], ["cache", "lru_cache", "redis", "memcach"], "Task forbids caching but design includes it"),
-        (["simple", "keep it simple"], ["abstract", "factory", "strategy pattern", "dependency injection"], "Task requests simplicity but design adds significant abstraction"),
-    ]
-
-    def _check_spec_compliance(self) -> GateCheck:
-        """Detect cases where the design_rationale contradicts explicit task constraints.
-
-        Only fires on clear keyword contradictions — this is deterministic pattern
-        matching, not an opinion check.  The LLM feasibility_recheck handles nuanced cases.
-        """
-        if not self.task_description:
-            return GateCheck(
-                name="spec_compliance",
-                passed=True,
-                hard_fail=True,
-                detail="No task description available; skipping spec compliance check.",
-            )
-
-        desc_lower = self.task_description.lower()
-        rationale_lower = self.plan.get("design_rationale", "").lower()
-        violations: list[str] = []
-
-        for task_kws, design_kws, message in self._SPEC_CONTRADICTION_PAIRS:
-            task_match = any(kw in desc_lower for kw in task_kws)
-            design_match = any(kw in rationale_lower for kw in design_kws)
-            if task_match and design_match:
-                violations.append(message)
-
-        if violations:
-            return GateCheck(
-                name="spec_compliance",
-                passed=False,
-                hard_fail=True,
-                detail=f"Design contradicts explicit task constraints: {'; '.join(violations)}.",
-            )
-        return GateCheck(
-            name="spec_compliance",
-            passed=True,
-            hard_fail=True,
-            detail="Design is consistent with task description constraints.",
-        )
-
-    # ------------------------------------------------------------------
     # Check 1: Interface completeness
     # ------------------------------------------------------------------
 
@@ -454,7 +404,7 @@ class PlanningGate:
                 filtered_stdlib.add(u)
             else:
                 still_unresolved.add(u)
-
+        
         if not still_unresolved:
             return GateCheck(
                 name="interface_completeness",
@@ -468,7 +418,7 @@ class PlanningGate:
         # e.g. "Plant dataclass" matches "Plant dataclass with __post_init__ validation"
         really_unresolved = set()
         fuzzy_resolved = set()
-
+        
         def normalize(s: str) -> str:
             # Lowercase, remove non-alphanumeric, strip noise
             import re
@@ -483,7 +433,7 @@ class PlanningGate:
             return s
 
         norm_provides = {normalize(p): p for p in all_provides}
-
+        
         for u in still_unresolved:
             nu = normalize(u)
             found = False
@@ -496,7 +446,7 @@ class PlanningGate:
                     if nu == np or (len(nu) > 3 and nu in np) or (len(np) > 3 and np in nu):
                         found = True
                         break
-
+            
             if found:
                 fuzzy_resolved.add(u)
             else:
@@ -525,7 +475,7 @@ class PlanningGate:
         """Ensure the plan has at least one implementation step, unless work is already done."""
         steps = self.plan.get("implementation_steps", [])
         rationale = self.plan.get("design_rationale", "").lower()
-
+        
         # Heuristics for "already complete"
         already_done_keywords = ["already exist", "already complete", "already implemented", "no new files needed", "no implementation changes"]
         is_already_done = any(k in rationale for k in already_done_keywords)
@@ -736,25 +686,75 @@ class PlanningGate:
     # ------------------------------------------------------------------
 
     async def _check_feasibility(self) -> tuple[GateCheck, int, int, bool]:
-        """LLM confirms plan is still viable. Retries up to 3 times with exponential backoff.
+        """LLM confirms plan is feasible and respects explicit task constraints.
+
+        Combines general feasibility with spec-compliance detection — the LLM is better
+        placed than keyword matching to judge whether a plan *implements* a forbidden
+        approach vs. merely *mentions* it while describing what it replaces.
+
+        A confirmed spec violation is returned as hard_fail=True.
+        General feasibility concerns are soft-fail only.
 
         Returns (GateCheck, prompt_tokens, completion_tokens, llm_check_unavailable).
         llm_check_unavailable=True means all retries failed and the check was skipped.
         """
         from app.agent.llm_client import call_llm, extract_text_response
 
+        task_desc_block = (
+            f"TASK DESCRIPTION:\n{self.task_description[:1500]}\n\n"
+            if self.task_description else ""
+        )
+        # Strip pitfalls/advisory fields — they describe risks NOT being implemented and
+        # confuse the spec checker into treating "we won't use X" as "we implement X".
+        spec_plan = {
+            "design_rationale": self.plan.get("design_rationale", ""),
+            "file_manifest": [
+                {"path": f.get("path"), "action": f.get("action"), "purpose": f.get("purpose")}
+                for f in self.plan.get("file_manifest", [])
+            ],
+            "implementation_steps": [
+                {"component": s.get("component"), "description": s.get("description")}
+                for s in self.plan.get("implementation_steps", [])
+            ],
+        }
         prompt = (
-            "Review this implementation plan for feasibility. Is it still viable?\n\n"
-            f"Plan summary:\n{json.dumps(self.plan, indent=1)[:4000]}\n\n"
-            "Respond with a JSON object: {\"feasible\": true/false, \"concerns\": [\"...\"]}"
+            f"{task_desc_block}"
+            f"PLAN (implementation fields only):\n{json.dumps(spec_plan, indent=1)[:3000]}\n\n"
+            "Review the plan above on two dimensions:\n\n"
+            "1. FEASIBILITY — is the plan technically sound and achievable?\n\n"
+            "2. SPEC COMPLIANCE — does the plan's actual implementation use an approach "
+            "the task explicitly forbids?\n"
+            "   CRITICAL RULES:\n"
+            "   - Read ONLY the file_manifest actions and implementation_steps descriptions "
+            "to judge what the code will DO. Ignore any mentions of approaches being "
+            "avoided, replaced, warned about, or listed as risks — those are advisory notes.\n"
+            "   - 'action: verify' means checking existing code — it is NOT implementing anything.\n"
+            "   - A plan that says 'replace X with Y' implements Y, not X. Only flag if Y "
+            "is the forbidden approach.\n"
+            "   - If the implementation_steps say 'naive recursion' or 'fib(n-1) + fib(n-2)', "
+            "that IS compliant with a naive-recursion requirement — do NOT flag it.\n\n"
+            "To complete your review, call the submit_work tool with:\n"
+            "{\n"
+            '  "signal": "ACCEPTED",\n'
+            '  "summary": "Your justification",\n'
+            '  "payload": {\n'
+            '    "feasible": true/false,\n'
+            '    "spec_violation": true/false,\n'
+            '    "spec_violation_detail": "which constraint is violated and how" or "",\n'
+            '    "concerns": ["concern 1", ...]\n'
+            '  }\n'
+            "}"
         )
         messages = [
-            {"role": "system", "content": "You are a feasibility reviewer. Output only JSON."},
+            {"role": "system", "content": "You are a feasibility and spec-compliance reviewer. Use submit_work to output your result when ready."},
             {"role": "user", "content": prompt},
         ]
 
         max_attempts = 3
         last_error: Exception | None = None
+
+        from app.agent.tools import build_tool_schemas, dispatch_tool
+        gate_tools = build_tool_schemas(["submit_work"])
 
         for attempt in range(1, max_attempts + 1):
             if is_shutting_down():
@@ -765,7 +765,8 @@ class PlanningGate:
                     messages,
                     base_url=self.llm_base_url,
                     model=self.llm_model,
-                    response_format={"type": "json_object"},
+                    tools=gate_tools,
+                    tool_choice="auto",
                     task_id=self.task_id,
                     llm_id=self.llm_id,
                     budget_id=self.budget_id,
@@ -775,17 +776,45 @@ class PlanningGate:
                 pt = usage.get("prompt_tokens", 0)
                 ct = usage.get("completion_tokens", 0)
 
-                content = extract_text_response(response)
-                data, _ = json.JSONDecoder().raw_decode(content.lstrip())
-                feasible = data.get("feasible", True)
-                concerns = data.get("concerns", [])
+                assistant_msg = response.get("choices", [{}])[0].get("message", {})
+                tool_calls = assistant_msg.get("tool_calls") or []
 
-                return GateCheck(
-                    name="feasibility_recheck",
-                    passed=feasible,
-                    hard_fail=False,
-                    detail=f"{'Feasible' if feasible else 'Concerns'}: {'; '.join(concerns) if concerns else 'none'}",
-                ), pt, ct, False
+                if not tool_calls:
+                    messages.append(assistant_msg)
+                    messages.append({"role": "user", "content": "You must call submit_work to output your result."})
+                    continue
+
+                for tc in tool_calls:
+                    tc_result = dispatch_tool(
+                        tc["function"]["name"],
+                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                    )
+
+                    if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
+                        data = json.loads(tc_result)
+                        payload = data.get("payload", {})
+                        feasible = payload.get("feasible", True)
+                        spec_violation = payload.get("spec_violation", False)
+                        spec_detail = payload.get("spec_violation_detail", "")
+                        concerns = payload.get("concerns", [])
+
+                        if spec_violation:
+                            detail = f"Spec violation: {spec_detail}"
+                            if concerns:
+                                detail += f"; {'; '.join(concerns)}"
+                            return GateCheck(
+                                name="feasibility_recheck",
+                                passed=False,
+                                hard_fail=True,
+                                detail=detail,
+                            ), pt, ct, False
+
+                        return GateCheck(
+                            name="feasibility_recheck",
+                            passed=feasible,
+                            hard_fail=False,
+                            detail=f"{'Feasible' if feasible else 'Concerns'}: {'; '.join(concerns) if concerns else 'none'}",
+                        ), pt, ct, False
 
             except Exception as e:
                 last_error = e

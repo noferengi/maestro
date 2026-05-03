@@ -23,7 +23,7 @@ def down(conn):
         DROP TABLE planning_results;
         CREATE TABLE planning_results (
             id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-            task_id               TEXT    NOT NULL REFERENCES tasks(id),
+            task_id               TEXT    NOT NULL,
             file_manifest         TEXT,
             dependency_graph      TEXT,
             interface_contracts   TEXT,

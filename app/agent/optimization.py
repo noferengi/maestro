@@ -34,8 +34,9 @@ from app.agent.config import (
     BIG_O_RANKING,
     OPTIMIZATION_BIG_O_BONUS_PCT,
 )
+from app.agent.json_utils import extract_json_block
 from app.agent.tools import dispatch_tool, build_tool_schemas
-from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError
+from app.agent.llm_client import call_llm, is_shutting_down, sanitize_user_content, ShutdownError
 
 logger = logging.getLogger(__name__)
 AGENT_NAME = "Optimization Pipeline"
@@ -199,7 +200,7 @@ class OptimizationPipeline:
 
         prompt = (
             f"You are a performance profiler running {phase_name} analysis.\n"
-            f"Task: {self.task_description}\n\n"
+            f"Task: {sanitize_user_content(self.task_description)}\n\n"
             "Step 1 - Read the relevant source files to understand the code.\n"
             "Step 2 - Determine the Big O class of the critical path by reading the code "
             "(do not guess; trace the actual algorithm).\n"
@@ -215,16 +216,17 @@ class OptimizationPipeline:
             "Step 7 - Determine if this optimization targets a real measured bottleneck "
             "(is_premature=false) or an assumed one (is_premature=true).\n"
             "Step 8 - Determine if this resolves known tech debt (tech_debt_resolved=true/false).\n\n"
-            "Render your report by calling the `submit_work` tool.\n"
-            "Use signal='REVIEW_COMPLETE' and provide the following in the tool arguments:\n"
-            "test_duration_ms: 0, memory_peak_mb: 0, dep_count: 0, hotspots: [], "
-            "complexity_score: 0, big_o_class: 'O(n)', scale_n: 10000, "
-            "readability_cost: 0.0, is_premature: false, tech_debt_resolved: false, "
-            "notes: ''"
+            "To complete your report, call the submit_work tool with:\n"
+            "- signal: 'ACCEPTED'\n"
+            "- summary: A brief summary of your findings.\n"
+            "- payload: {\"test_duration_ms\": 0, \"memory_peak_mb\": 0, \"dep_count\": 0, \"hotspots\": [], "
+            "\"complexity_score\": 0, \"big_o_class\": \"O(n)\", \"scale_n\": 10000, "
+            "\"readability_cost\": 0.0, \"is_premature\": false, \"tech_debt_resolved\": false, "
+            "\"notes\": \"\"}"
         )
 
         messages: list[dict] = [
-            {"role": "system", "content": "You are a performance profiler. Call submit_work to finish."},
+            {"role": "system", "content": "You are a performance profiler. Use submit_work to output your report when ready."},
             {"role": "user", "content": prompt},
         ]
 
@@ -268,24 +270,24 @@ class OptimizationPipeline:
 
             if tool_calls:
                 for tc in tool_calls:
-                    fn_name = tc["function"]["name"]
-                    fn_args = json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"]
-                    tc_result = dispatch_tool(fn_name, fn_args)
-                    
+                    tc_result = dispatch_tool(
+                        tc["function"]["name"],
+                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                    )
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
-                        "name": fn_name,
+                        "name": tc["function"]["name"],
                         "content": tc_result,
                     })
 
-                    # Detect submit_work
-                    if fn_name == "submit_work":
+                    # Check for terminal signal from submit_work
+                    if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
                         try:
-                            terminal_data = json.loads(tc_result)
-                            if terminal_data.get("__maestro_terminal__") is True:
-                                logger.info(f"[{AGENT_NAME}] submit_work detected - signal=%s", terminal_data.get("signal"))
-                                return terminal_data
+                            data = json.loads(tc_result)
+                            payload = data.get("payload", {})
+                            if isinstance(payload, dict) and ("test_duration_ms" in payload or "complexity_score" in payload or "big_o_class" in payload or "error" in payload):
+                                return payload
                         except (json.JSONDecodeError, ValueError):
                             pass
                 continue
@@ -294,7 +296,7 @@ class OptimizationPipeline:
             if turns_remaining <= 2:
                 messages.append({
                     "role": "user",
-                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Call submit_work to submit your profiling report.",
+                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Call submit_work with your profiling report now.",
                 })
 
         return {"error": "Profiler exhausted turns"}
@@ -310,18 +312,17 @@ class OptimizationPipeline:
         prompt = (
             f"You are an optimization proposer with lens: {lens_name}.\n"
             f"Focus: {focus}\n\n"
-            f"Task: {self.task_description}\n"
-            f"Baseline: {json.dumps(baseline, indent=1)[:2000]}\n\n"
+            f"Task: {sanitize_user_content(self.task_description)}\n"
+            f"Baseline: {sanitize_user_content(json.dumps(baseline, indent=1)[:2000])}\n\n"
             "You may use tools to inspect code files.\n\n"
-            "Propose optimizations by calling the `submit_work` tool.\n"
-            "Use signal='RESEARCH_COMPLETE' and provide the following in the tool arguments:\n"
-            "lens: '...', proposals: [{\"description\": \"...\", "
+            "To submit your proposals, call the submit_work tool with:\n"
+            "payload={\"lens\": \"...\", \"proposals\": [{\"description\": \"...\", "
             "\"estimated_improvement_pct\": 0, \"risk\": \"low|medium|high\", "
-            "\"implementation_steps\": [\"...\"]}]"
+            "\"implementation_steps\": [\"...\"]}]}"
         )
 
         messages: list[dict] = [
-            {"role": "system", "content": "You are an optimization expert. Call submit_work to finish."},
+            {"role": "system", "content": "You are an optimization expert. Use submit_work to output your proposals when ready."},
             {"role": "user", "content": prompt},
         ]
 
@@ -365,24 +366,24 @@ class OptimizationPipeline:
 
             if tool_calls:
                 for tc in tool_calls:
-                    fn_name = tc["function"]["name"]
-                    fn_args = json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"]
-                    tc_result = dispatch_tool(fn_name, fn_args)
-                    
+                    tc_result = dispatch_tool(
+                        tc["function"]["name"],
+                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                    )
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
-                        "name": fn_name,
+                        "name": tc["function"]["name"],
                         "content": tc_result,
                     })
 
-                    # Detect submit_work
-                    if fn_name == "submit_work":
+                    # Check for terminal signal from submit_work
+                    if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
                         try:
-                            terminal_data = json.loads(tc_result)
-                            if terminal_data.get("__maestro_terminal__") is True:
-                                logger.info(f"[{AGENT_NAME}] submit_work detected - signal=%s", terminal_data.get("signal"))
-                                return terminal_data
+                            data = json.loads(tc_result)
+                            payload = data.get("payload", {})
+                            if isinstance(payload, dict) and "lens" in payload:
+                                return payload
                         except (json.JSONDecodeError, ValueError):
                             pass
                 continue
@@ -391,7 +392,7 @@ class OptimizationPipeline:
             if turns_remaining <= 2:
                 messages.append({
                     "role": "user",
-                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Call submit_work to submit your proposals.",
+                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Call submit_work with your proposals now.",
                 })
 
         return None
@@ -426,15 +427,8 @@ class OptimizationPipeline:
 
     async def _run_single_judge(self, judge_prompt: str) -> dict | None:
         """Run a single optimization judge using a mini-loop."""
-        # Update judge prompt instructions
-        judge_prompt += (
-            "\n\nRender your verdict by calling the `submit_work` tool.\n"
-            "Use signal='REVIEW_COMPLETE' and provide the following in the tool arguments:\n"
-            "scores: [{\"index\": 0, \"score\": 0, \"rationale\": \"...\"}], winner_index: 0"
-        )
-
         messages: list[dict] = [
-            {"role": "system", "content": "You are an optimization judge. Call submit_work to finish."},
+            {"role": "system", "content": "You are an optimization judge. Use submit_work to output your verdict when ready."},
             {"role": "user", "content": judge_prompt},
         ]
 
@@ -478,24 +472,24 @@ class OptimizationPipeline:
 
             if tool_calls:
                 for tc in tool_calls:
-                    fn_name = tc["function"]["name"]
-                    fn_args = json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"]
-                    tc_result = dispatch_tool(fn_name, fn_args)
-                    
+                    tc_result = dispatch_tool(
+                        tc["function"]["name"],
+                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                    )
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
-                        "name": fn_name,
+                        "name": tc["function"]["name"],
                         "content": tc_result,
                     })
 
-                    # Detect submit_work
-                    if fn_name == "submit_work":
+                    # Check for terminal signal from submit_work
+                    if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
                         try:
-                            terminal_data = json.loads(tc_result)
-                            if terminal_data.get("__maestro_terminal__") is True:
-                                logger.info(f"[{AGENT_NAME}] submit_work detected - signal=%s", terminal_data.get("signal"))
-                                return terminal_data
+                            data = json.loads(tc_result)
+                            payload = data.get("payload", {})
+                            if isinstance(payload, dict) and "winner_index" in payload:
+                                return payload
                         except (json.JSONDecodeError, ValueError):
                             pass
                 continue
@@ -504,7 +498,7 @@ class OptimizationPipeline:
             if turns_remaining <= 2:
                 messages.append({
                     "role": "user",
-                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Call submit_work to submit your judgment.",
+                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Call submit_work with your judgment now.",
                 })
 
         return None
@@ -531,6 +525,10 @@ class OptimizationPipeline:
                 p += f"\n--- Proposal {i} ---\n{json.dumps(prop, indent=1)[:1500]}\n"
             if extra_context:
                 p += f"\n{extra_context}\n"
+            p += (
+                "\nTo submit your judgment, call the submit_work tool with:\n"
+                "payload={\"scores\": [{\"index\": 0, \"score\": 0, \"rationale\": \"...\"}], \"winner_index\": 0}"
+            )
             return p
 
         async def _run_judges(judge_prompt: str) -> tuple[list[dict], dict[int, int]]:

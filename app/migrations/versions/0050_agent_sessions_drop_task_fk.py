@@ -56,8 +56,7 @@ def down(conn):
             llm_id              INTEGER,
             budget_id           INTEGER,
             prompt_tokens       INTEGER  NOT NULL DEFAULT 0,
-            completion_tokens   INTEGER  NOT NULL DEFAULT 0,
-            FOREIGN KEY (task_id) REFERENCES tasks(id)
+            completion_tokens   INTEGER  NOT NULL DEFAULT 0
         )
     """)
     conn.execute("""

@@ -16,7 +16,7 @@ def down(conn):
             name        TEXT PRIMARY KEY,
             path        TEXT,
             description TEXT,
-            llm_id      INTEGER REFERENCES llms(id),
+            llm_id      INTEGER,
             created_at  TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """)

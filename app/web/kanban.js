@@ -407,17 +407,20 @@ const COLUMN_DISPLAY = {
     'subdividing': 'Ideas',
     'planning': 'Planning',
     'indev': 'In Development',
-    'conceptual_review': 'Concept Review',
-    'optimization': 'Optimization',
-    'security': 'Security',
-    'full_review': 'Full Review',
+    'conceptual_review': 'AI Review',
+    'optimization': 'AI Review',
+    'security': 'AI Review',
+    'full_review': 'Human Review',
     'completed': 'Completed',
 };
+
+// Backend stages that are visually merged into the "AI REVIEW" column.
+const AI_REVIEW_STAGES = ['conceptual_review', 'optimization', 'security'];
 
 // Returns the label for an advance button given a task's current type.
 function _advanceBtnLabel(taskType, hasRejections) {
     if (hasRejections) return 'Retry Pipeline';
-    if (taskType === 'full_review') return 'Merge to Completed';
+    if (taskType === 'full_review') return 'Approve & Merge';
     return 'Run Pipeline';
 }
 
@@ -768,6 +771,14 @@ function updateTaskCounts() {
             countElement.textContent = count;
         }
     });
+
+    // Aggregate count badge for the merged AI REVIEW column header.
+    const aiCount = AI_REVIEW_STAGES.reduce((sum, col) => {
+        const c = document.getElementById(`tasks-${col}`);
+        return sum + (c ? c.querySelectorAll('.task-card').length : 0);
+    }, 0);
+    const aiCountEl = document.getElementById('count-ai-review');
+    if (aiCountEl) aiCountEl.textContent = aiCount;
 }
 
 // ============================================
@@ -1163,7 +1174,7 @@ function closeStageJournal() {
 async function _buildStageJournal(taskId) {
     const body = document.getElementById('sj-body');
     try {
-        const [summaryResp, planResp, compResp, optResp, secResp, frResp, mrResp, diffResp, rjResp] = await Promise.all([
+        const [summaryResp, planResp, compResp, optResp, secResp, frResp, mrResp, diffResp, rjResp, txnResp] = await Promise.all([
             fetch(`/api/tasks/${taskId}/stage-summary`),
             fetch(`/api/tasks/${taskId}/planning-result`),
             fetch(`/api/tasks/${taskId}/component-status`),
@@ -1173,6 +1184,7 @@ async function _buildStageJournal(taskId) {
             fetch(`/api/tasks/${taskId}/merge-status`),
             fetch(`/api/tasks/${taskId}/diff`),
             fetch(`/api/tasks/${taskId}/research-jobs`),
+            fetch(`/api/tasks/${taskId}/transition-status`),
         ]);
 
         const summary  = summaryResp.ok  ? await summaryResp.json()  : null;
@@ -1184,8 +1196,53 @@ async function _buildStageJournal(taskId) {
         const merge    = mrResp.ok       ? await mrResp.json()       : null;
         const diffData = diffResp.ok     ? await diffResp.json()     : null;
         const rjList   = rjResp.ok       ? await rjResp.json()       : [];
+        const txn      = txnResp.ok      ? await txnResp.json()      : null;
 
         let html = '';
+
+        // ---- Transitions section ----
+        const txnHistory = txn && Array.isArray(txn.history) && txn.history.length > 0 ? txn.history : null;
+        if (txnHistory) {
+            const VERDICT_ORDER = ['REJECTED','NOT_SUITABLE','NEEDS_RESEARCH','POSSIBLE','LIKELY'];
+            const latestOutcome = (txnHistory[0].outcome || '').toUpperCase();
+            const outcomeOk = latestOutcome === 'ACCEPTED';
+            html += `<div class="sj-section">
+                <div class="sj-section-title">&#128229; Intake Transitions <span class="sj-badge ${outcomeOk?'ok':'warn'}">${escHtml(latestOutcome)}</span></div>`;
+            for (const run of txnHistory) {
+                const runOutcome = (run.outcome || '').toUpperCase();
+                const runOk = runOutcome === 'ACCEPTED';
+                const runCls = runOutcome === 'ACCEPTED' ? 'accepted' : runOutcome === 'REJECTED' ? 'rejected' : 'passed';
+                const ts = run.created_at ? new Date(run.created_at).toLocaleString() : '';
+                const trigger = run.trigger ? ` · ${escHtml(run.trigger)}` : '';
+                html += `<div class="sj-txn-run sj-txn-run--${runCls}">
+                    <div class="sj-txn-run-header">
+                        <span class="sj-badge ${runOk?'ok':runOutcome==='REJECTED'?'warn':'info'}">${escHtml(runOutcome)}</span>
+                        <span class="sj-txn-meta">${escHtml(ts)}${trigger}</span>
+                    </div>`;
+                if (run.tally_narrative) {
+                    html += `<div class="sj-txn-narrative">${escHtml(run.tally_narrative)}</div>`;
+                } else if (runOutcome === 'REJECTED') {
+                    html += `<div class="sj-txn-narrative" style="color:#6c757d;font-style:italic">No summary recorded — see votes below for individual reviewer reasoning.</div>`;
+                }
+                const votes = run.votes || [];
+                if (votes.length > 0) {
+                    for (const v of votes) {
+                        const vKey = (v.verdict || '').toUpperCase();
+                        const rawConf = v.confidence;
+                        const confPct = rawConf != null ? (rawConf <= 1 ? Math.round(rawConf * 100) : Math.round(rawConf)) : null;
+                        const confStr = confPct != null ? ` · ${confPct}%` : '';
+                        html += `<div class="sj-vote-row">
+                            <span class="sj-vote-badge vote-${vKey}">${escHtml(vKey)}</span>
+                            <div><strong>${escHtml(v.stage||'')}</strong>${escHtml(confStr)}
+                                ${v.justification ? `<div class="sj-check-detail">${escHtml((v.justification||'').slice(0,600))}</div>` : ''}
+                            </div>
+                        </div>`;
+                    }
+                }
+                html += `</div>`;
+            }
+            html += '</div>';
+        }
 
         // ---- Planning section ----
         if (plan) {
@@ -1376,11 +1433,17 @@ async function _buildStageJournal(taskId) {
                 : `<span class="sj-badge info">${escHtml(branch)}</span>`;
             html += `<div class="sj-section" id="sj-diff-section">
                 <div class="sj-section-title">&#9998; Code Diff ${methodLabel}</div>`;
-            if (diffData.stat) {
-                html += `<div class="diff-stat">${escHtml(diffData.stat)}</div>`;
-            }
             if (hasDiff) {
-                html += `<div class="diff-viewer">${_renderDiff(diffData.diff)}</div>`;
+                const diffRendered = _renderDiff(diffData.diff);
+                const isTabbed = diffRendered.includes('sj-diff-tabs');
+                if (diffData.stat) {
+                    html += `<div class="diff-stat">${escHtml(diffData.stat)}</div>`;
+                }
+                if (isTabbed) {
+                    html += diffRendered;
+                } else {
+                    html += `<div class="diff-viewer">${diffRendered}</div>`;
+                }
                 if (diffData.truncated) {
                     html += `<div class="diff-truncated-note">&#8230; diff truncated at 64 KiB — use git diff locally for the full output</div>`;
                 }
@@ -1434,39 +1497,72 @@ async function _buildStageJournal(taskId) {
     }
 }
 
-function _renderDiff(diffText) {
-    // Parse unified diff into colored HTML
+function _parseDiffFiles(diffText) {
+    // Split unified diff into per-file segments: [{name, html}]
     const lines = diffText.split('\n');
-    let html = '';
+    const files = [];
+    let current = null;
     let lineNum = 0;
 
     for (const line of lines) {
-        if (line.startsWith('diff --git') || line.startsWith('index ') ||
-            line.startsWith('--- ') || line.startsWith('+++ ')) {
-            if (line.startsWith('diff --git')) {
-                const fname = line.replace('diff --git ', '').split(' b/').pop() || line;
-                html += `<div class="diff-file-header">&#128196; ${escHtml(fname)}</div>`;
-            }
+        if (line.startsWith('diff --git')) {
+            if (current) files.push(current);
+            const fname = line.replace('diff --git ', '').split(' b/').pop() || line;
+            current = { name: fname, html: '' };
+            lineNum = 0;
             continue;
         }
+        if (!current) continue;
+        if (line.startsWith('index ') || line.startsWith('--- ') || line.startsWith('+++ ')) continue;
         if (line.startsWith('@@')) {
-            // Parse hunk header for starting line number
             const m = line.match(/@@ -\d+(?:,\d+)? \+(\d+)/);
             lineNum = m ? parseInt(m[1], 10) - 1 : lineNum;
-            html += `<div class="diff-hunk-header">${escHtml(line)}</div>`;
-            continue;
-        }
-        if (line.startsWith('+') && !line.startsWith('+++')) {
+            current.html += `<div class="diff-hunk-header">${escHtml(line)}</div>`;
+        } else if (line.startsWith('+') && !line.startsWith('+++')) {
             lineNum++;
-            html += `<div class="diff-line diff-line-add"><span class="diff-gutter">${lineNum}</span><span class="diff-content">${escHtml(line)}</span></div>`;
+            current.html += `<div class="diff-line diff-line-add"><span class="diff-gutter">${lineNum}</span><span class="diff-content">${escHtml(line)}</span></div>`;
         } else if (line.startsWith('-') && !line.startsWith('---')) {
-            html += `<div class="diff-line diff-line-del"><span class="diff-gutter">-</span><span class="diff-content">${escHtml(line)}</span></div>`;
+            current.html += `<div class="diff-line diff-line-del"><span class="diff-gutter">-</span><span class="diff-content">${escHtml(line)}</span></div>`;
         } else if (line.startsWith(' ') || line === '') {
             lineNum++;
-            html += `<div class="diff-line diff-line-ctx"><span class="diff-gutter">${lineNum}</span><span class="diff-content">${escHtml(line)}</span></div>`;
+            current.html += `<div class="diff-line diff-line-ctx"><span class="diff-gutter">${lineNum}</span><span class="diff-content">${escHtml(line)}</span></div>`;
         }
     }
-    return html;
+    if (current) files.push(current);
+    return files;
+}
+
+function _renderDiff(diffText) {
+    const files = _parseDiffFiles(diffText);
+    if (files.length === 0) return '';
+    // Single file — skip tabs
+    if (files.length === 1) return files[0].html;
+    // Multiple files — render as tabs
+    let tabsHtml = '<div class="sj-diff-tabs">';
+    let panelsHtml = '<div class="sj-diff-panels">';
+    files.forEach((f, i) => {
+        const activeClass = i === 0 ? ' active' : '';
+        tabsHtml += `<button class="sj-diff-tab${activeClass}" title="${escHtml(f.name)}" onclick="_sjSelectDiffTab(this,${i})">${escHtml(f.name.split('/').pop())}</button>`;
+        panelsHtml += `<div class="sj-diff-panel${activeClass}"><div class="diff-viewer">${f.html}</div></div>`;
+    });
+    tabsHtml += '</div>';
+    panelsHtml += '</div>';
+    return tabsHtml + panelsHtml;
+}
+
+function _sjSelectDiffTab(tabEl, idx) {
+    const tabsEl = tabEl.closest('.sj-diff-tabs');
+    const panelsEl = tabsEl.nextElementSibling;
+    tabsEl.querySelectorAll('.sj-diff-tab').forEach((t, i) => t.classList.toggle('active', i === idx));
+    panelsEl.querySelectorAll('.sj-diff-panel').forEach((p, i) => p.classList.toggle('active', i === idx));
+}
+
+function _sjToggleFullscreen() {
+    const modal = document.getElementById('sj-modal-inner');
+    const btn = document.getElementById('sj-expand-btn');
+    const full = modal.classList.toggle('sj-fullscreen');
+    btn.title = full ? 'Exit fullscreen' : 'Toggle fullscreen';
+    btn.innerHTML = full ? '&#x2715;&#xFE0E;' : '&#x26F6;';
 }
 
 // ============================================
@@ -2719,6 +2815,12 @@ function createTaskCard(id, title, tags, owner, status) {
         subdivBadge = `<span class="subdivision-badge gen" title="Generation ${generation} sub-idea">Gen ${generation}</span>`;
     }
 
+    // Cached plan badge — shown on planning/idea cards with a valid cached result
+    let cachedPlanBadge = '';
+    if ((status === 'planning' || status === 'idea') && taskObj.has_cached_plan) {
+        cachedPlanBadge = '<span class="cached-plan-badge" title="Cached plan available — will skip re-planning and advance to INDEV instantly">&#9889; Cached</span>';
+    }
+
     // Big Idea badge and styling
     const isBigIdea = taskObj.is_big_idea;
     let bigIdeaBadge = '';
@@ -2756,6 +2858,7 @@ function createTaskCard(id, title, tags, owner, status) {
             ${tagsHtml}
             ${ownerHtml}
             ${intakeRetryBadge}
+            ${cachedPlanBadge}
         </div>
         ${pipRequirementsHtml}
         ${prereqHtml}
@@ -2765,7 +2868,8 @@ function createTaskCard(id, title, tags, owner, status) {
             <span class="toolbar-sep"></span>
             <button class="toolbar-btn" title="Research — run a research agent on this card" onclick="event.stopPropagation();openResearchDialog('${id}')">🔍</button>
             <button class="toolbar-btn" title="Subdivide — run subdivision agent on this card" onclick="event.stopPropagation();toolbarSubdivide('${id}')">✂</button>
-            <button class="toolbar-btn" title="Run Planning pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','planning')">📋</button>
+            <button class="toolbar-btn" title="Run Planning pipeline (uses cache if available)" onclick="event.stopPropagation();toolbarRunPipeline('${id}','planning')">📋</button>
+            <button class="toolbar-btn" title="Force Recompute Plan — bypass cache, recompute with prior failure context" onclick="event.stopPropagation();toolbarForceRecompute('${id}')">&#x1F504;</button>
             <button class="toolbar-btn" title="Run Conceptual Review pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','review')">👁</button>
             <button class="toolbar-btn" title="Run Optimization pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','optimization')">⚡</button>
             <button class="toolbar-btn" title="Run Security pipeline" onclick="event.stopPropagation();toolbarRunPipeline('${id}','security')">🔒</button>
@@ -2850,7 +2954,27 @@ function createTaskCard(id, title, tags, owner, status) {
             childBtn.onclick = (e) => { e.stopPropagation(); viewChildren(id); };
             actionsDiv.appendChild(childBtn);
         }
-    } else if (status === 'planning' || status === 'indev' || status === 'conceptual_review' || status === 'optimization' || status === 'security' || status === 'full_review') {
+    } else if (status === 'full_review') {
+        const actionsDiv = card.querySelector('.task-actions');
+        const mergeBtn = document.createElement('button');
+        mergeBtn.className = 'action-btn action-btn-advance';
+        mergeBtn.textContent = 'Accept & Merge';
+        mergeBtn.onclick = async (e) => {
+            e.stopPropagation();
+            if (!await showConfirm('Accept & Merge',
+                `Run the git merge pipeline for "${task.title}" and mark it COMPLETED?`,
+                'Accept & Merge')) return;
+            const r = await fetch(`${API_BASE}/tasks/${id}/merge`, { method: 'POST' });
+            const d = await r.json().catch(() => ({}));
+            if (r.ok) {
+                showToast('Merge pipeline started.', 'success');
+                await loadTasksFromDatabase();
+            } else {
+                showToast(d.detail || 'Merge failed.', 'error');
+            }
+        };
+        actionsDiv.appendChild(mergeBtn);
+    } else if (status === 'planning' || status === 'indev' || status === 'conceptual_review' || status === 'optimization' || status === 'security') {
         const actionsDiv = card.querySelector('.task-actions');
         const advanceBtn = document.createElement('button');
         advanceBtn.className = 'action-btn action-btn-advance';
@@ -2868,6 +2992,7 @@ function createTaskCard(id, title, tags, owner, status) {
     } else if (status === 'completed') {
         const viewBtn = card.querySelector('.task-actions');
         viewBtn.innerHTML = `<button class="action-btn" onclick="viewTaskHistory('${id}')">View Proof</button>
+                             <button class="action-btn action-btn-warn" onclick="unmergeTask('${id}')">Unmerge</button>
                              <button class="action-btn action-btn-danger" onclick="deleteTask('${id}')">Delete</button>`;
     } else if (status === 'architecture') {
         const editBtn = card.querySelector('.task-actions');
@@ -2893,6 +3018,15 @@ function createTaskCard(id, title, tags, owner, status) {
         benchBtn.textContent = 'Benchmarks';
         benchBtn.onclick = (e) => { e.stopPropagation(); viewBenchmarks(id); };
         card.querySelector('.task-actions').appendChild(benchBtn);
+    }
+
+    // Reports button — always present on pipeline cards; opens Stage Journal
+    if (status !== 'architecture') {
+        const reportsBtn = document.createElement('button');
+        reportsBtn.className = 'action-btn action-btn-reports';
+        reportsBtn.textContent = 'Reports';
+        reportsBtn.onclick = (e) => { e.stopPropagation(); openStageJournal(id); };
+        card.querySelector('.task-actions').appendChild(reportsBtn);
     }
 
     card.addEventListener('dragstart', handleDragStart);
@@ -3731,56 +3865,9 @@ async function moveTask(taskId, newStatus) {
             currentContainer.removeChild(currentCard);
         }
 
-        const actions = currentCard.querySelector('.task-actions');
-        const ready = canTaskAdvance(taskId);
-        if (newStatus === 'planning') {
-            actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
-                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
-                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'indev')">Move to IN DEVELOPMENT</button>` : '');
-        } else if (newStatus === 'indev') {
-            actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
-                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
-                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'conceptual_review')">Move to CONCEPTUAL REVIEW</button>` : '');
-        } else if (newStatus === 'conceptual_review') {
-            actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
-                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
-                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'optimization')">Move to OPTIMIZATION</button>` : '');
-        } else if (newStatus === 'optimization') {
-            actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
-                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
-                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'security')">Move to SECURITY</button>` : '');
-        } else if (newStatus === 'security') {
-            actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
-                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
-                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'full_review')">Move to FINAL REVIEW</button>` : '');
-        } else if (newStatus === 'full_review') {
-            actions.innerHTML = `<button class="action-btn" onclick="editTask('${taskId}')">Edit</button>
-                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`
-                + (ready ? `<button class="action-btn" onclick="moveTask('${taskId}', 'completed')">Move to COMPLETED</button>` : '');
-        } else if (newStatus === 'completed') {
-            actions.innerHTML = `<button class="action-btn" onclick="viewTaskHistory('${taskId}')">View Proof</button>
-                                 <button class="action-btn action-btn-danger" onclick="deleteTask('${taskId}')">Delete</button>`;
-        }
-
-        if (newContainer) {
-            newContainer.appendChild(currentCard);
-        }
-
-        updateTaskCount(currentStatus);
-        updateTaskCount(newStatus);
-
-        console.log(`Task ${taskId} moved from ${currentStatus} to ${newStatus}`);
     }
 
-    // Auto-move from indev to conceptual_review after 15 seconds
-    if (newStatus === 'indev') {
-        setTimeout(async () => {
-            if (taskData[taskId]) {
-                await moveTask(taskId, 'conceptual_review');
-                console.log(`Auto-move: Task ${taskId} moved to conceptual_review after 15 seconds`);
-            }
-        }, 15000);
-    }
+    await loadTasksFromDatabase();
 }
 
 // ============================================
@@ -4970,10 +5057,10 @@ const MAP_COLUMN_LABELS = {
     idea:              'IDEAS MAP',
     planning:          'PLANNING MAP',
     indev:             'IN DEVELOPMENT MAP',
-    conceptual_review: 'CONCEPTUAL REVIEW MAP',
-    optimization:      'OPTIMIZATION MAP',
-    security:          'SECURITY MAP',
-    full_review:       'FINAL REVIEW MAP',
+    conceptual_review: 'AI REVIEW MAP — CONCEPT',
+    optimization:      'AI REVIEW MAP — OPTIMIZATION',
+    security:          'AI REVIEW MAP — SECURITY',
+    full_review:       'HUMAN REVIEW MAP',
     completed:         'COMPLETED MAP',
 };
 
@@ -5829,6 +5916,24 @@ async function toolbarStopAgent(taskId) {
     }
 }
 
+async function unmergeTask(taskId) {
+    const task = taskData[taskId];
+    const label = task ? task.title : taskId;
+    if (!await showConfirm(
+        'Unmerge Task',
+        `This will run "git revert" on the merge commit and move "${label}" back to Human Review. Continue?`,
+        'Unmerge'
+    )) return;
+    const resp = await fetch(`${API_BASE}/tasks/${taskId}/unmerge`, { method: 'POST' });
+    const d = await resp.json().catch(() => ({}));
+    if (resp.ok) {
+        showToast(`Unmerged — moved to Human Review. ${d.git || ''}`, 'success');
+        await loadTasksFromDatabase();
+    } else {
+        showToast(d.detail || 'Unmerge failed.', 'error');
+    }
+}
+
 async function toolbarDemote(taskId) {
     const task = taskData[taskId];
     const label = task ? task.type : taskId;
@@ -5915,6 +6020,34 @@ async function toolbarRunPipeline(taskId, pipeline) {
         showToast(`${label} pipeline started.`, 'success');
     } else {
         showToast(d.detail || `${label} pipeline failed to start.`, 'error');
+    }
+}
+
+async function toolbarForceRecompute(taskId) {
+    // Set cache_mode to force_with_context, then trigger the planning pipeline.
+    // The pipeline will recompute from scratch while injecting context from prior failures.
+    try {
+        const modeResp = await fetch(`${API_BASE}/tasks/${taskId}/cache-mode`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode: 'force_with_context' }),
+        });
+        if (!modeResp.ok) {
+            const d = await modeResp.json().catch(() => ({}));
+            showToast(d.detail || 'Failed to set recompute mode.', 'error');
+            return;
+        }
+        const planResp = await fetch(`${API_BASE}/tasks/${taskId}/run-planning`, { method: 'POST' });
+        const d = await planResp.json().catch(() => ({}));
+        if (planResp.ok) {
+            showToast('Recomputing plan (with prior failure context)...', 'success');
+            setCardProcessing(taskId, true);
+            startTransitionPolling(taskId, new Date().toISOString());
+        } else {
+            showToast(d.detail || 'Failed to start planning pipeline.', 'error');
+        }
+    } catch (err) {
+        showToast('Force recompute failed: ' + err.message, 'error');
     }
 }
 

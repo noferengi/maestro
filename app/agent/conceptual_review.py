@@ -35,11 +35,12 @@ from app.agent.config import (
     CONCEPTUAL_REVIEW_RESEARCH_LIVES,
     CONCEPTUAL_REVIEW_REVIEWER_TOOLS,
     PROJECT_ROOT,
+    check_context_saturation,
 )
-from app.agent.agent_loop import ReviewerLoop
-from app.agent.llm_client import is_shutting_down, ShutdownError
+from app.agent.json_utils import extract_json_block
+from app.agent.llm_client import call_llm, is_shutting_down, sanitize_user_content, ShutdownError
 from app.agent.research import run_research
-from app.agent.tools import build_tool_schemas
+from app.agent.tools import dispatch_tool, build_tool_schemas
 from app.agent.verdicts import Vote, Verdict, tally_votes
 
 logger = logging.getLogger(__name__)
@@ -371,10 +372,10 @@ class ConceptualReviewPipeline:
         plan_summary: str, det_summary: str,
         extra_context: str = "",
     ) -> Vote:
-        """Run a single LLM reviewer using ReviewerLoop."""
-        user_prompt = (
+        """Run a single LLM reviewer using a mini-loop with tool access."""
+        prompt = (
             f"You are reviewing code from the perspective of: {focus}\n\n"
-            f"Task description (authoritative user intent):\n{self.task_description}\n\n"
+            f"Task description (authoritative user intent):\n{sanitize_user_content(self.task_description)}\n\n"
             "IMPORTANT: The task description above is the user's authoritative specification. "
             "If the description explicitly requests a particular algorithm, approach, or trade-off "
             "(e.g. 'naive recursive', 'simple', 'no caching'), treat that as an intentional design "
@@ -382,32 +383,120 @@ class ConceptualReviewPipeline:
             "must not classify it as NOT_SUITABLE or REJECTED solely because it conflicts with "
             "general best practices. Reserve REJECTED/NOT_SUITABLE for genuine defects that "
             "contradict the task description or would cause functional failures.\n\n"
-            f"Planning result:\n{plan_summary}\n\n"
-            f"Deterministic check results:\n{det_summary}\n\n"
-            f"{extra_context}"
+            f"Planning result:\n{sanitize_user_content(plan_summary)}\n\n"
+            f"Deterministic check results:\n{sanitize_user_content(det_summary)}\n\n"
+            f"{sanitize_user_content(extra_context)}"
             "You may use tools to read code files before giving your verdict.\n\n"
-            "When ready, call submit_work(signal='REVIEW_COMPLETE', summary='<one sentence>', "
-            "payload={'verdict': 'LIKELY|POSSIBLE|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED', "
-            "'confidence': <0-100>, 'justification': '...', "
-            "'severity': 'low|medium|high|critical'})"
+            "To complete your review, call the submit_work tool with:\n"
+            "- signal: 'ACCEPTED' if the plan is sound, or 'REJECTED' if there are critical defects.\n"
+            "- summary: Your justification.\n"
+            "- payload: {\"verdict\": \"LIKELY|POSSIBLE|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED\", "
+            "\"confidence\": <0-100>, \"severity\": \"low|medium|high|critical\"}"
         )
-        reviewer = ReviewerLoop(
-            stage_name=name,
-            system_prompt="You are a code reviewer. Call submit_work to finish.",
-            user_prompt=user_prompt,
-            tool_schemas=self._REVIEWER_SCHEMAS,
-            task_id=str(self.task_id),
-            llm_id=self.llm_id,
-            budget_id=self.budget_id,
-            max_turns=CONCEPTUAL_REVIEW_MAX_TURNS,
-            llm_base_url=self.llm_base_url,
-            llm_model=self.llm_model,
-            max_context=self.max_context,
+
+        messages: list[dict] = [
+            {"role": "system", "content": "You are a code reviewer. Use submit_work to output your verdict when ready."},
+            {"role": "user", "content": prompt},
+        ]
+
+        max_turns = CONCEPTUAL_REVIEW_MAX_TURNS
+        _ctx_warned: set[float] = set()
+        _turn_warned: set[int] = set()
+
+        for turn in range(max_turns):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
+
+            # Turn saturation check
+            from app.agent.config import check_turn_saturation
+            if check_turn_saturation(
+                turn, max_turns, _turn_warned, messages
+            ):
+                # Turn nudge was injected
+                pass
+
+            response = await call_llm(
+                messages,
+                base_url=self.llm_base_url,
+                model=self.llm_model,
+                tools=self._REVIEWER_SCHEMAS,
+                tool_choice="auto",
+                task_id=self.task_id,
+                llm_id=self.llm_id,
+                budget_id=self.budget_id,
+                agent_name=AGENT_NAME,
+            )
+
+            usage = response.get("usage", {})
+            prompt_tokens_this_call = usage.get("prompt_tokens", 0)
+            self._total_prompt += prompt_tokens_this_call
+            self._total_completion += usage.get("completion_tokens", 0)
+
+            # Context saturation check
+            if check_context_saturation(
+                prompt_tokens_this_call, self.max_context, _ctx_warned, messages
+            ):
+                logger.warning("[conceptual_review] Reviewer '%s' context saturation (turn %d) - terminating", name, turn + 1)
+                break
+
+            assistant_msg = response.get("choices", [{}])[0].get("message", {})
+            messages.append(assistant_msg)
+            tool_calls = assistant_msg.get("tool_calls") or []
+            content = assistant_msg.get("content") or ""
+
+            if tool_calls:
+                for tc in tool_calls:
+                    tc_result = dispatch_tool(
+                        tc["function"]["name"],
+                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                    )
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "content": tc_result,
+                    })
+
+                    # Check for terminal signal from submit_work
+                    if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
+                        try:
+                            data = json.loads(tc_result)
+                            payload = data.get("payload", {})
+                            verdict_str = payload.get("verdict", "POSSIBLE").upper()
+                            verdict = Verdict(verdict_str)
+                            confidence = int(payload.get("confidence", 80))
+                            lo, hi = verdict.confidence_range
+                            confidence = max(lo, min(hi, confidence))
+                            justification = data.get("summary", "")
+                            severity = payload.get("severity", "medium")
+                            if severity in ("high", "critical"):
+                                justification = f"[{severity.upper()}] {justification}"
+                            return Vote(
+                                stage=name,
+                                verdict=verdict,
+                                confidence=confidence,
+                                justification=justification,
+                                model=self.llm_model or "",
+                            )
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                continue
+
+            turns_remaining = max_turns - turn - 1
+            if turns_remaining <= 2:
+                messages.append({
+                    "role": "user",
+                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Call submit_work with your verdict now.",
+                })
+
+        # Fallback: turns exhausted
+        return Vote(
+            stage=name,
+            verdict=Verdict.NEEDS_RESEARCH,
+            confidence=65,
+            justification="Reviewer exhausted turns",
+            model=self.llm_model or "",
         )
-        vote = await reviewer.run()
-        self._total_prompt += reviewer._total_prompt_tokens
-        self._total_completion += reviewer._total_completion_tokens
-        return vote
 
     # ------------------------------------------------------------------
     # Research agent dispatch (NEEDS_RESEARCH recovery)
@@ -416,7 +505,7 @@ class ConceptualReviewPipeline:
     async def _handle_needs_research(self, all_votes: list[Vote]) -> list[Vote]:
         """Spawn a research agent for NEEDS_RESEARCH votes, then re-vote affected LLM reviewers."""
         research_votes = [v for v in all_votes if v.verdict is Verdict.NEEDS_RESEARCH]
-        questions = [f"[{v.stage}] {v.justification}" for v in research_votes]
+        questions = [f"[{v.stage}] {sanitize_user_content(v.justification)}" for v in research_votes]
         question = (
             f"During conceptual review of task {self.task_id}, reviewers raised these "
             f"questions needing investigation:\n" + "\n".join(questions)

@@ -461,12 +461,20 @@ body {
 .task-card.review { border-left-color: #fd7e14; }
 .task-card.completed { border-left-color: #198754; }
 
-/* New 9-column layout colors */
+/* Column colors */
 .column#column-indev .column-header { border-bottom-color: #0d6efd; }
-.column#column-conceptual_review .column-header { border-bottom-color: #20c997; }
-.column#column-optimization .column-header { border-bottom-color: #6610f2; }
-.column#column-security .column-header { border-bottom-color: #e83e8c; }
+.column#column-ai-review .column-header { border-bottom-color: #e83e8c; }
 .column#column-full_review .column-header { border-bottom-color: #fd7e14; }
+
+/* AI REVIEW grouped column: three tasks-containers scroll as one pool */
+.column.column-group {
+    overflow-y: auto;
+}
+.column.column-group .tasks-container {
+    flex: 0 0 auto;
+    overflow-y: visible;
+    min-height: 8px;
+}
 
 .task-card.indev { border-left: 4px solid #0d6efd; }
 .task-card.conceptual_review { border-left: 4px solid #20c997; }
@@ -654,6 +662,14 @@ body {
     background: #f8d7da;
 }
 
+.action-btn-warn {
+    color: #856404;
+}
+
+.action-btn-warn:hover {
+    background: #fff3cd;
+}
+
 /* Advance button styling */
 .action-btn-advance {
     background: #17a2b8;
@@ -663,6 +679,16 @@ body {
 .action-btn-advance:hover {
     background: #138496;
     color: white;
+}
+
+.action-btn-reports {
+    background: #1a3a5c;
+    color: #7eb8f7;
+    border-color: #2a5a8c;
+}
+.action-btn-reports:hover {
+    background: #234e7a;
+    color: #a8d4ff;
 }
 
 /* Modal Styles */
@@ -1525,6 +1551,19 @@ body {
     margin-left: 0.4rem;
     vertical-align: middle;
     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: #fff;
+    letter-spacing: 0.3px;
+}
+
+.cached-plan-badge {
+    display: inline-block;
+    font-size: 0.6rem;
+    font-weight: 700;
+    padding: 0.1rem 0.45rem;
+    border-radius: 8px;
+    margin-left: 0.3rem;
+    vertical-align: middle;
+    background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
     color: #fff;
     letter-spacing: 0.3px;
 }
@@ -2671,6 +2710,38 @@ body {
 .vote-NOT_SUITABLE   { background: rgba(253,126,20,0.15); color: #dc6a00; }
 .vote-REJECTED    { background: rgba(220,53,69,0.15);  color: #dc3545; }
 
+.sj-txn-run {
+    border: 1px solid #dee2e6;
+    border-left: 4px solid #adb5bd;
+    border-radius: 4px;
+    padding: 0.5rem 0.7rem;
+    margin-bottom: 0.6rem;
+    background: #f8f9fa;
+}
+.sj-txn-run--accepted { border-left-color: #198754; }
+.sj-txn-run--passed   { border-left-color: #0d6efd; }
+.sj-txn-run--rejected { border-left-color: #dc3545; background: rgba(220,53,69,0.04); }
+.sj-txn-run-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.3rem;
+}
+.sj-txn-meta {
+    font-size: 0.78rem;
+    color: #6c757d;
+}
+.sj-txn-narrative {
+    font-size: 0.82rem;
+    color: #212529;
+    margin-bottom: 0.4rem;
+    line-height: 1.5;
+    white-space: pre-wrap;
+}
+.sj-txn-run--rejected .sj-txn-narrative {
+    color: #842029;
+}
+
 .sj-pitfall {
     display: flex;
     align-items: flex-start;
@@ -2759,10 +2830,11 @@ body {
     border-radius: 4px;
     overflow-x: auto;
     overflow-y: auto;
-    max-height: 420px;
+    max-height: 560px;
     padding: 0.5rem 0;
     tab-size: 4;
 }
+.sj-fullscreen .diff-viewer { max-height: calc(97vh - 200px); }
 .diff-file-header {
     background: #161b22;
     color: #79c0ff;
@@ -2822,3 +2894,56 @@ body {
     background: #161b22;
     border-top: 1px solid #30363d;
 }
+
+/* Diff file tabs */
+.sj-diff-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-bottom: none;
+    border-radius: 4px 4px 0 0;
+    padding: 4px 4px 0;
+    overflow-x: auto;
+    scrollbar-width: thin;
+}
+.sj-diff-tab {
+    font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    font-size: 0.70rem;
+    padding: 0.2rem 0.65rem;
+    border-radius: 3px 3px 0 0;
+    background: transparent;
+    color: #8b949e;
+    border: none;
+    cursor: pointer;
+    white-space: nowrap;
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: background 0.1s, color 0.1s;
+}
+.sj-diff-tab:hover { background: #1c2128; color: #c9d1d9; }
+.sj-diff-tab.active { background: #0d1117; color: #79c0ff; font-weight: 600; }
+.sj-diff-panel { display: none; }
+.sj-diff-panel.active { display: block; }
+.sj-diff-panels > .diff-viewer { border-radius: 0 0 4px 4px; max-height: none; }
+
+/* Modal fullscreen toggle */
+.modal.sj-fullscreen {
+    width: 98vw !important;
+    max-width: 98vw !important;
+    max-height: 97vh !important;
+    height: 97vh;
+}
+.sj-expand-btn {
+    background: none;
+    border: none;
+    font-size: 1.1rem;
+    color: #6c757d;
+    cursor: pointer;
+    padding: 0 0.35rem;
+    line-height: 1;
+    margin-right: 0.15rem;
+}
+.sj-expand-btn:hover { color: #212529; }

@@ -18,23 +18,24 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
-from app.agent.agent_loop import AgentLoop
 from app.agent.config import (
     CORRECTION_MAX_TURNS,
-    SIGNAL_CORRECTION_STALLED,
+    check_context_saturation,
 )
-from app.agent.llm_client import is_shutting_down
-from app.agent.tools import build_tool_schemas, CORRECTION_AGENT_TOOLS
+from app.agent.llm_client import call_llm, is_shutting_down, sanitize_user_content, ShutdownError
+from app.agent.tools import async_dispatch_tool, build_tool_schemas, CORRECTION_AGENT_TOOLS
 
 logger = logging.getLogger(__name__)
 AGENT_NAME = "Planning Correction Agent"
 _MAX_CONSECUTIVE_ERRORS = 3
 
-_CORRECTION_TOOL_SCHEMAS: list[dict] = build_tool_schemas(CORRECTION_AGENT_TOOLS)
+# Include submit_work in correction tools
+_CORRECTION_TOOL_SCHEMAS: list[dict] = build_tool_schemas(CORRECTION_AGENT_TOOLS + ["submit_work"])
 
 
-class PlanningCorrectionAgent(AgentLoop):
+class PlanningCorrectionAgent:
     """
     Lightweight agent that patches a failing plan to satisfy gate checks.
 
@@ -42,8 +43,6 @@ class PlanningCorrectionAgent(AgentLoop):
     changes to the plan fields that failed the gate via write_plan_fields.
     Does not write files or use git tools.
     """
-
-    _agent_name = AGENT_NAME
 
     def __init__(
         self,
@@ -60,24 +59,151 @@ class PlanningCorrectionAgent(AgentLoop):
         task_title: str = "",
         task_description: str = "",
     ) -> None:
-        super().__init__(
-            task_id=task_id,
-            llm_id=llm_id,
-            budget_id=budget_id,
-            max_turns=CORRECTION_MAX_TURNS,
-            llm_base_url=llm_base_url,
-            llm_model=llm_model,
-            max_context=max_context,
-        )
+        self.task_id = task_id
         self.planning_result_id = planning_result_id
         self.current_plan = current_plan
         self.gate_failures = gate_failures
         self.project_root = project_root
+        self.llm_id = llm_id
+        self.budget_id = budget_id
+        self.llm_base_url = llm_base_url
+        self.llm_model = llm_model
+        self.max_context = max_context
         self.task_title = task_title
         self.task_description = task_description
 
+        self._messages: list[dict] = []
+        self._turn: int = 0
+        self._consecutive_errors: int = 0
+        self._no_tool_turns: int = 0
+        self._warnings_fired: set[float] = set()
+        self._turn_warnings_fired: set[int] = set()
+
+    async def run(self) -> dict:
+        """
+        Execute the correction agent loop.
+
+        Returns:
+          {"outcome": "corrected"|"stalled"|"max_turns"|"error", "fields_patched": [...]}
+        """
+        from app.agent.llm_client import set_llm_session_context
+        set_llm_session_context(AGENT_NAME)
+        if is_shutting_down():
+            return {"outcome": "error", "fields_patched": []}
+
+        if self.project_root:
+            from app.agent.tools import set_task_git_cwd
+            set_task_git_cwd(self.project_root)
+
+        self._messages = self._build_messages()
+
+        while self._turn < CORRECTION_MAX_TURNS:
+            self._turn += 1
+            logger.debug(
+                "[planning_correction] task '%s' — turn %d/%d",
+                self.task_id, self._turn, CORRECTION_MAX_TURNS,
+            )
+
+            # Turn saturation check
+            from app.agent.config import check_turn_saturation
+            if check_turn_saturation(
+                self._turn, CORRECTION_MAX_TURNS, self._turn_warnings_fired, self._messages
+            ):
+                # Turn nudge was injected
+                pass
+
+            try:
+                response = await self._call_llm(self._messages)
+            except ShutdownError:
+                logger.info("[planning_correction] task '%s' — shutdown.", self.task_id)
+                return {"outcome": "error", "fields_patched": []}
+            except Exception as exc:
+                self._turn -= 1
+                self._consecutive_errors += 1
+                logger.error(
+                    "[planning_correction] task '%s' LLM error: %s", self.task_id, exc
+                )
+                if self._consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                    return {"outcome": "stalled", "fields_patched": []}
+                self._messages.append({
+                    "role": "user",
+                    "content": f"[SYSTEM] LLM call failed: {exc}. Please continue.",
+                })
+                continue
+
+            assistant_message = response.get("choices", [{}])[0].get("message", {})
+            self._messages.append(assistant_message)
+
+            usage = response.get("usage", {})
+            self._maybe_inject_context_warning(usage.get("prompt_tokens", 0))
+
+            tool_calls = assistant_message.get("tool_calls") or []
+            content = assistant_message.get("content") or ""
+
+            if tool_calls:
+                result_messages = await self._handle_tool_calls(tool_calls)
+                self._messages.extend(result_messages)
+
+                # Check for terminal signal from submit_work or successful write_plan_fields
+                for rm in result_messages:
+                    content_str = rm.get("content", "")
+                    if isinstance(content_str, str) and "__maestro_terminal__" in content_str:
+                        try:
+                            data = json.loads(content_str)
+                            if data.get("signal") == "REJECTED":
+                                logger.warning(
+                                    "[planning_correction] task '%s' signalled REJECTED via submit_work.",
+                                    self.task_id,
+                                )
+                                return {"outcome": "stalled", "fields_patched": []}
+                        except Exception:
+                            pass
+
+                patched_fields = self._extract_patched_fields(tool_calls, result_messages)
+                if patched_fields:
+                    logger.info(
+                        "[planning_correction] task '%s' — patched fields: %s.",
+                        self.task_id, patched_fields,
+                    )
+                    return {"outcome": "corrected", "fields_patched": patched_fields}
+
+                all_errors = all(
+                    m.get("content", "").startswith("ERROR")
+                    for m in result_messages
+                )
+                if all_errors:
+                    self._consecutive_errors += 1
+                    if self._consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                        return {"outcome": "stalled", "fields_patched": []}
+                else:
+                    self._consecutive_errors = 0
+                    self._no_tool_turns = 0
+                continue
+
+            self._no_tool_turns += 1
+            if self._no_tool_turns >= 2:
+                logger.info(
+                    "[planning_correction] task '%s' — stopped calling tools after %d turns.",
+                    self.task_id, self._turn,
+                )
+                return {"outcome": "stalled", "fields_patched": []}
+
+            self._messages.append({
+                "role": "user",
+                "content": (
+                    "[SYSTEM] No tool was called. Use write_plan_fields to apply your corrections, "
+                    "or call submit_work with signal='REJECTED' if you cannot determine a fix."
+                ),
+            })
+
+        logger.warning(
+            "[planning_correction] task '%s' — max_turns (%d) exceeded.",
+            self.task_id, CORRECTION_MAX_TURNS,
+        )
+        return {"outcome": "max_turns", "fields_patched": []}
+
     # ------------------------------------------------------------------
-    # AgentLoop interface
+    # Message building
     # ------------------------------------------------------------------
 
     def _build_messages(self) -> list[dict]:
@@ -106,15 +232,15 @@ class PlanningCorrectionAgent(AgentLoop):
             "Your job: make the MINIMAL targeted changes to the plan JSON fields "
             "that satisfy the failing checks. Do NOT redesign the plan. "
             "Do NOT touch fields that are not failing.\n\n"
-            f"TASK: {self.task_title}\n"
-            f"DESCRIPTION: {self.task_description}\n\n"
+            f"TASK: {sanitize_user_content(self.task_title)}\n"
+            f"DESCRIPTION: {sanitize_user_content(self.task_description)}\n\n"
             f"PLANNING RESULT ID: {self.planning_result_id}\n\n"
-            f"GATE FAILURES:\n{failures_text}\n\n"
-            f"CURRENT interface_contracts:\n{contracts_json}\n\n"
-            f"PROJECT SNAPSHOT:\n{snapshot}"
-            f"{arch_block}\n\n"
+            f"GATE FAILURES:\n{sanitize_user_content(failures_text)}\n\n"
+            f"CURRENT interface_contracts:\n{sanitize_user_content(contracts_json)}\n\n"
+            f"PROJECT SNAPSHOT:\n{sanitize_user_content(snapshot)}"
+            f"{sanitize_user_content(arch_block)}\n\n"
             "WORKFLOW:\n"
-            "1. Read relevant source files (read_file, find_in_files) to verify what actually "
+            "1. Read relevant source files (read_file, search_files) to verify what actually "
             "exists in the codebase.\n"
             "2. Determine the minimal JSON change that fixes each failing check.\n"
             "   For interface_completeness failures: entries in `consumes` that have no matching "
@@ -127,97 +253,23 @@ class PlanningCorrectionAgent(AgentLoop):
             "     - Files/classes that already exist in the codebase (imports from other modules) "
             "— read the file first to confirm it exists, then remove it from consumes.\n"
             "   They are not cross-component contracts within this plan.\n"
-            "3. Call write_plan_fields ONCE with ALL corrected fields.\n"
-            "4. If you cannot determine a valid fix, call:\n"
-            "     submit_work(signal='CORRECTION_STALLED', summary='cannot fix plan',\n"
-            "                 payload={'reason': '<root cause>', 'advice': '<what to try instead>'})\n"
-            "Do NOT output raw JSON with a signal key — use the submit_work tool call.\n\n"
+            "   For spec_compliance failures: the gate found a forbidden algorithm or approach "
+            "named in design_rationale. Rewrite design_rationale so it describes only the TARGET "
+            "implementation — what the code WILL do after this task completes. You may include "
+            "one brief sentence such as 'Replaces the existing X with Y.' Do NOT repeat the "
+            "forbidden keyword anywhere else in design_rationale. Field to patch: design_rationale.\n"
+            "3. Call write_plan_fields EXACTLY ONCE with ALL corrected fields in a single call. "
+            "After the tool returns success, stop immediately — do not call any more tools and "
+            "do not output additional explanation.\n"
+            "4. If you cannot determine a valid fix, call submit_work with signal='REJECTED'.\n\n"
             f"After {_MAX_CONSECUTIVE_ERRORS} consecutive tool failures, "
-            "call submit_work(signal='CORRECTION_STALLED', ...) to signal stall."
+            "call submit_work with signal='REJECTED'."
         )
 
         return [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": "Analyze the gate failures above and apply the minimal corrections to the plan."},
         ]
-
-    def _get_tool_schemas(self) -> list[dict]:
-        return _CORRECTION_TOOL_SCHEMAS
-
-    async def _on_terminal(self) -> dict:
-        # submit_work CORRECTION_STALLED → stalled
-        sig = self._terminal_signal.get("signal", SIGNAL_CORRECTION_STALLED)
-        logger.info(
-            "[planning_correction] task '%s': submit_work signal=%s",
-            self.task_id, sig,
-        )
-        return {"outcome": "stalled", "fields_patched": [], "terminal_signal": sig}
-
-    async def _on_max_turns(self) -> dict:
-        logger.warning(
-            "[planning_correction] task '%s' — max_turns (%d) exceeded.",
-            self.task_id, self.max_turns,
-        )
-        return {"outcome": "max_turns", "fields_patched": []}
-
-    async def _on_error(self, reason: str) -> dict:
-        logger.info("[planning_correction] task '%s' — error: %s", self.task_id, reason)
-        if "shutting down" in reason.lower():
-            return {"outcome": "error", "fields_patched": []}
-        return {"outcome": "stalled", "fields_patched": []}
-
-    async def _on_no_tool_call(self):
-        self._no_tool_turns += 1
-        if self._no_tool_turns >= 2:
-            logger.info(
-                "[planning_correction] task '%s' — stopped calling tools after %d turns.",
-                self.task_id, self._turn,
-            )
-            return {"outcome": "stalled", "fields_patched": []}
-        self._messages.append({
-            "role": "user",
-            "content": (
-                "[SYSTEM] No tool was called. Use write_plan_fields to apply your corrections, "
-                "or call submit_work(signal='CORRECTION_STALLED', summary='...') "
-                "if you cannot determine a fix."
-            ),
-        })
-        return None
-
-    async def _post_dispatch_hook(
-        self, tool_calls: list, result_messages: list[dict]
-    ) -> dict | None:
-        """Exit 'corrected' as soon as write_plan_fields succeeds."""
-        patched_fields = self._extract_patched_fields(tool_calls, result_messages)
-        if patched_fields:
-            logger.info(
-                "[planning_correction] task '%s' — patched fields: %s.",
-                self.task_id, patched_fields,
-            )
-            return {"outcome": "corrected", "fields_patched": patched_fields}
-        return None
-
-    # ------------------------------------------------------------------
-    # run() override for setup logic
-    # ------------------------------------------------------------------
-
-    async def run(self) -> dict:
-        from app.agent.llm_client import set_llm_session_context
-        set_llm_session_context(AGENT_NAME)
-
-        if is_shutting_down():
-            return {"outcome": "error", "fields_patched": []}
-
-        if self.project_root:
-            from app.agent.tools import set_task_git_cwd
-            set_task_git_cwd(self.project_root)
-
-        self._messages = self._build_messages()
-        return await self._run_loop()
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     def _format_failures(self) -> str:
         lines = []
@@ -236,6 +288,10 @@ class PlanningCorrectionAgent(AgentLoop):
             return json.dumps(contracts, indent=2)
         except Exception:
             return str(contracts)
+
+    # ------------------------------------------------------------------
+    # Result extraction
+    # ------------------------------------------------------------------
 
     def _extract_patched_fields(
         self, tool_calls: list, result_messages: list[dict]
@@ -257,3 +313,68 @@ class PlanningCorrectionAgent(AgentLoop):
             except Exception:
                 return ["(unknown)"]
         return []
+
+    # ------------------------------------------------------------------
+    # LLM call
+    # ------------------------------------------------------------------
+
+    async def _call_llm(self, messages: list[dict]) -> dict:
+        return await call_llm(
+            messages,
+            base_url=self.llm_base_url,
+            model=self.llm_model,
+            tools=_CORRECTION_TOOL_SCHEMAS,
+            tool_choice="auto",
+            task_id=self.task_id,
+            llm_id=self.llm_id,
+            budget_id=self.budget_id,
+            agent_name=AGENT_NAME,
+        )
+
+    # ------------------------------------------------------------------
+    # Tool dispatch
+    # ------------------------------------------------------------------
+
+    async def _handle_tool_calls(self, tool_calls: list) -> list[dict]:
+        result_messages = []
+        for tc in tool_calls:
+            tool_id = tc.get("id", "unknown")
+            function_block = tc.get("function", {})
+            name = function_block.get("name", "")
+            raw_args = function_block.get("arguments", "{}")
+            try:
+                arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except json.JSONDecodeError:
+                arguments = {}
+            try:
+                result = await async_dispatch_tool(
+                    name,
+                    arguments,
+                    task_id=self.task_id,
+                    llm_id=self.llm_id,
+                    budget_id=self.budget_id,
+                    llm_base_url=self.llm_base_url,
+                    llm_model=self.llm_model,
+                )
+            except Exception as exc:
+                result = f"ERROR: tool '{name}' raised: {exc}"
+            result_messages.append({
+                "role": "tool",
+                "tool_call_id": tool_id,
+                "content": str(result),
+            })
+        return result_messages
+
+    # ------------------------------------------------------------------
+    # Context warning injection
+    # ------------------------------------------------------------------
+
+    def _maybe_inject_context_warning(self, prompt_tokens: int) -> None:
+        if not self.max_context:
+            return
+        check_context_saturation(
+            prompt_tokens,
+            self.max_context,
+            self._warnings_fired,
+            self._messages,
+        )

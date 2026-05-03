@@ -5,7 +5,7 @@ import logging
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("test_read_file_reread")
+logger = logging.getLogger("test_read_file")
 
 import app.agent.tools as tools
 

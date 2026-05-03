@@ -13,15 +13,14 @@ description = "Add numeric integer PK to projects; add project_id FK to tasks"
 
 def _has_column(cur, table: str, column: str) -> bool:
     cur.execute(f"PRAGMA table_info({table})")
-    return any(row[1] == column for row in cur.fetchall())
+    return any(row["name"] == column for row in cur.fetchall())
 
 
 def _is_integer_pk(cur, table: str) -> bool:
     """Return True if the table already has an INTEGER PRIMARY KEY (rowid alias)."""
     cur.execute(f"PRAGMA table_info({table})")
     for row in cur.fetchall():
-        # PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk
-        if row[5] == 1 and "INTEGER" in (row[2] or "").upper():
+        if row["pk"] == 1 and "INTEGER" in (row["type"] or "").upper():
             return True
     return False
 

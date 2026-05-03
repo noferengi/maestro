@@ -35,13 +35,16 @@ async def test_generate_pip_success():
     mock_task.llm_id = 1
     mock_task.budget_id = 1
 
-    mock_response = json.dumps({
+    mock_content = json.dumps({
         "requirements": [
             "Remove all hardcoded API keys from src/controllers.",
             "Implement a secure environment variable loader.",
         ]
     })
-    mock_stats = {"prompt_tokens": 100, "completion_tokens": 50}
+    mock_response = {
+        "choices": [{"message": {"content": mock_content, "tool_calls": None}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 50},
+    }
 
     with patch("app.agent.pip_agent.get_task", return_value=mock_task), \
          patch("app.agent.pip_agent.get_project_path", return_value="/tmp/proj"), \
@@ -50,7 +53,7 @@ async def test_generate_pip_success():
          patch("app.agent.pip_agent.create_pip") as mock_create:
 
         mock_subproc.run.return_value = MagicMock(returncode=0, stdout="abc123\n")
-        mock_call.return_value = (mock_response, mock_stats)
+        mock_call.return_value = mock_response
 
         await generate_pip(task_id, origin_stage, reason)
 
@@ -72,7 +75,10 @@ async def test_generate_pip_captures_commit():
     mock_task.llm_id = 1
     mock_task.budget_id = 1
 
-    mock_response = json.dumps({"requirements": ["req1"]})
+    mock_response = {
+        "choices": [{"message": {"content": json.dumps({"requirements": ["req1"]}), "tool_calls": None}}],
+        "usage": {},
+    }
 
     with patch("app.agent.pip_agent.get_task", return_value=mock_task), \
          patch("app.agent.pip_agent.get_project_path", return_value="/tmp/proj"), \
@@ -81,7 +87,7 @@ async def test_generate_pip_captures_commit():
          patch("app.agent.pip_agent.create_pip") as mock_create:
 
         mock_subproc.run.return_value = MagicMock(returncode=0, stdout="deadbeef\n")
-        mock_call.return_value = (mock_response, {})
+        mock_call.return_value = mock_response
 
         await generate_pip("t-1", "conceptual_review", "reason")
 
@@ -99,7 +105,10 @@ async def test_generate_pip_no_git():
     mock_task.llm_id = 1
     mock_task.budget_id = 1
 
-    mock_response = json.dumps({"requirements": ["req1"]})
+    mock_response = {
+        "choices": [{"message": {"content": json.dumps({"requirements": ["req1"]}), "tool_calls": None}}],
+        "usage": {},
+    }
 
     with patch("app.agent.pip_agent.get_task", return_value=mock_task), \
          patch("app.agent.pip_agent.get_project_path", return_value="/tmp/proj"), \
@@ -108,7 +117,7 @@ async def test_generate_pip_no_git():
          patch("app.agent.pip_agent.create_pip") as mock_create:
 
         mock_subproc.run.side_effect = FileNotFoundError("git not found")
-        mock_call.return_value = (mock_response, {})
+        mock_call.return_value = mock_response
 
         await generate_pip("t-2", "security", "reason")
 
@@ -138,11 +147,15 @@ async def test_preflight_all_passed():
     mock_task = MagicMock()
     mock_task.id = "t-10"
 
-    passed_response = json.dumps({
+    passed_content = json.dumps({
         "outcome": "passed",
         "summary": "All good.",
         "findings": [{"requirement": "Req A", "status": "satisfied", "detail": "done"}],
     })
+    passed_response = {
+        "choices": [{"message": {"content": passed_content, "tool_calls": None}}],
+        "usage": {},
+    }
 
     with patch("app.agent.pip_agent.get_task", return_value=mock_task), \
          patch("app.agent.pip_agent.get_pips_for_task", return_value=[pip1, pip2]), \
@@ -151,7 +164,7 @@ async def test_preflight_all_passed():
          patch("app.agent.pip_agent.call_llm", new_callable=AsyncMock) as mock_call, \
          patch("app.agent.pip_agent.create_pip_verification") as mock_write:
 
-        mock_call.return_value = (passed_response, {})
+        mock_call.return_value = passed_response
 
         result = await run_pip_preflight("t-10", "conceptual_review", 1, 1, "/tmp/proj")
 
@@ -170,16 +183,19 @@ async def test_preflight_one_failed():
     mock_task = MagicMock()
     mock_task.id = "t-11"
 
-    passed = json.dumps({"outcome": "passed", "summary": "OK", "findings": []})
-    failed = json.dumps({"outcome": "failed", "summary": "Missing tests.", "findings": [
+    def _wrap(content_str):
+        return {"choices": [{"message": {"content": content_str, "tool_calls": None}}], "usage": {}}
+
+    passed = _wrap(json.dumps({"outcome": "passed", "summary": "OK", "findings": []}))
+    failed = _wrap(json.dumps({"outcome": "failed", "summary": "Missing tests.", "findings": [
         {"requirement": "Req A", "status": "missing", "detail": "no tests found"}
-    ]})
+    ]}))
 
     call_count = 0
     async def _alternating(*a, **kw):
         nonlocal call_count
         call_count += 1
-        return (passed if call_count % 2 == 1 else failed, {})
+        return passed if call_count % 2 == 1 else failed
 
     with patch("app.agent.pip_agent.get_task", return_value=mock_task), \
          patch("app.agent.pip_agent.get_pips_for_task", return_value=[pip1, pip2]), \
@@ -205,12 +221,13 @@ async def test_preflight_no_commit_context():
     mock_task = MagicMock()
     mock_task.id = "t-12"
 
-    passed = json.dumps({"outcome": "passed", "summary": "OK", "findings": []})
-
     captured_prompts = []
     async def _capture(messages, **kw):
         captured_prompts.append(messages[0]["content"])
-        return (passed, {})
+        return {
+            "choices": [{"message": {"content": json.dumps({"outcome": "passed", "summary": "OK", "findings": []}), "tool_calls": None}}],
+            "usage": {},
+        }
 
     with patch("app.agent.pip_agent.get_task", return_value=mock_task), \
          patch("app.agent.pip_agent.get_pips_for_task", return_value=[pip1]), \

@@ -143,8 +143,8 @@ async def test_resolution_agent_runs_to_completion():
     agent = _make_agent()
 
     with patch("app.agent.pip_resolution.is_shutting_down", return_value=False), \
-         patch("app.agent.agent_loop.call_llm", side_effect=_mock_llm), \
-         patch("app.agent.agent_loop.async_dispatch_tool",
+         patch("app.agent.pip_resolution.call_llm", side_effect=_mock_llm), \
+         patch("app.agent.pip_resolution.async_dispatch_tool",
                new_callable=AsyncMock, return_value="['src/auth.py']"), \
          patch("app.agent.project_snapshot.build_project_snapshot", return_value="(snap)"), \
          patch("app.agent.project_snapshot.build_architecture_context", return_value=""), \
@@ -175,8 +175,8 @@ async def test_resolution_agent_stalls_after_tool_failures():
     agent = _make_agent()
 
     with patch("app.agent.pip_resolution.is_shutting_down", return_value=False), \
-         patch("app.agent.agent_loop.call_llm", side_effect=_always_tool), \
-         patch("app.agent.agent_loop.async_dispatch_tool",
+         patch("app.agent.pip_resolution.call_llm", side_effect=_always_tool), \
+         patch("app.agent.pip_resolution.async_dispatch_tool",
                new_callable=AsyncMock,
                return_value="ERROR: file not found"), \
          patch("app.agent.project_snapshot.build_project_snapshot", return_value="(snap)"), \
@@ -204,7 +204,7 @@ async def test_resolution_agent_stalls_on_signal():
         return _stall_response()
 
     with patch("app.agent.pip_resolution.is_shutting_down", return_value=False), \
-         patch("app.agent.agent_loop.call_llm", side_effect=_emit_stall), \
+         patch("app.agent.pip_resolution.call_llm", side_effect=_emit_stall), \
          patch("app.agent.project_snapshot.build_project_snapshot", return_value="(snap)"), \
          patch("app.agent.project_snapshot.build_architecture_context", return_value=""), \
          patch("app.database.get_task", return_value=None):
@@ -306,8 +306,8 @@ async def test_resolution_agent_respects_max_turns():
     # is already patched when the __init__ reads it for max_turns.
     with patch("app.agent.pip_resolution.PIP_RESOLUTION_MAX_TURNS", 3), \
          patch("app.agent.pip_resolution.is_shutting_down", return_value=False), \
-         patch("app.agent.agent_loop.call_llm", side_effect=_always_tool), \
-         patch("app.agent.agent_loop.async_dispatch_tool",
+         patch("app.agent.pip_resolution.call_llm", side_effect=_always_tool), \
+         patch("app.agent.pip_resolution.async_dispatch_tool",
                new_callable=AsyncMock, return_value="ok"), \
          patch("app.agent.project_snapshot.build_project_snapshot", return_value="(snap)"), \
          patch("app.agent.project_snapshot.build_architecture_context", return_value=""), \

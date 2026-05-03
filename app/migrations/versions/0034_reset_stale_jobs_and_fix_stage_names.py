@@ -42,9 +42,10 @@ def up(conn):
     # 1. Reset stuck file_summary_jobs
     # ------------------------------------------------------------------
     cur = conn.execute(
-        "SELECT COUNT(*) FROM file_summary_jobs WHERE status IN ('running', 'failed')"
+        "SELECT COUNT(*) AS cnt FROM file_summary_jobs WHERE status IN ('running', 'failed')"
     )
-    fsj_count = cur.fetchone()[0]
+    row = cur.fetchone()
+    fsj_count = row["cnt"] if row else 0
 
     conn.execute(
         """
@@ -60,9 +61,10 @@ def up(conn):
     # 2. Reset stuck research_jobs
     # ------------------------------------------------------------------
     cur = conn.execute(
-        "SELECT COUNT(*) FROM research_jobs WHERE status IN ('running', 'failed')"
+        "SELECT COUNT(*) AS cnt FROM research_jobs WHERE status IN ('running', 'failed')"
     )
-    rj_count = cur.fetchone()[0]
+    row = cur.fetchone()
+    rj_count = row["cnt"] if row else 0
 
     conn.execute(
         """

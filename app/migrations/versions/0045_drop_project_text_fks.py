@@ -14,7 +14,7 @@ description = "Drop legacy TEXT project FK from tasks and arch_gen_jobs"
 
 def _has_column(cur, table: str, column: str) -> bool:
     cur.execute(f"PRAGMA table_info({table})")
-    return any(row[1] == column for row in cur.fetchall())
+    return any(row["name"] == column for row in cur.fetchall())
 
 
 def up(conn):

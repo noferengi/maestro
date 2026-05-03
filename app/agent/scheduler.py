@@ -306,9 +306,8 @@ _FAIL_COOLDOWN_SECONDS = 60.0  # Wait 60s before retrying a failed task
 _rejection_cooldowns: dict[str, float] = {}
 _REJECTION_RETRY_COOLDOWN = 300.0   # 5 min between retries
 
-# Planning gate failure limits.  After this many failed gate attempts the task
-# is demoted back to IDEA and a forced-subdivide record is written so the
-# stranded-subdivision detector can break it into smaller pieces.
+# Planning gate failure limit.  After this many failed gate attempts the task is
+# parked in _planning_stopped and requires a manual "Run Planning" trigger to retry.
 _MAX_PLANNING_GATE_FAILURES = 5
 
 # task_id -> human-readable reason: planning exhausted all design retries without
@@ -495,7 +494,7 @@ def get_scheduler_status() -> dict:
         }
         if active_llm_set:
             pinned_llm_id = next(iter(active_llm_set))
-
+    
     with _external_sessions_lock:
         external_sessions_snapshot = dict(_external_sessions)
         for lid in external_sessions_snapshot.values():
@@ -1769,7 +1768,7 @@ def _dispatch_scope_survey_jobs(
 
 def _run_scope_survey_job(job: Any, llm: Any) -> None:
     """Worker thread for a single scope survey job.
-
+    
     Implements recursive 'paging' for large scopes and bottom-up chaining.
     """
     from app.database import (
@@ -1790,7 +1789,7 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
         budget_id=job.budget_id,
         scheduler_reason="scheduler",
     )
-
+    
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -1840,7 +1839,7 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
                     summary=existing.summary, staleness_state="fresh", git_commit="HEAD"
                 )
                 update_scope_survey_job(job.id, status="done")
-
+            
             close_agent_session(_session_id, "completed", f"Staleness check: {verdict}")
             return
 
@@ -1905,7 +1904,7 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
                         "id": rel_path,
                         "text": f.short_summary or f.summary or ""
                     })
-
+        
         elif job.scope_type == "project":
             # Project summarizes Directories AND Modules
             all_scopes = list_scope_summaries(job.project_name)
@@ -2001,7 +2000,7 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
                     update_scope_survey_job(job.id, status="pending", priority=job.priority + 0.1)
                     close_agent_session(_session_id, "completed", "Waiting for Level 1 seeds")
                     return
-
+            
             update_scope_survey_job(job.id, status="done", error_message="No children found to summarize")
             close_agent_session(_session_id, "completed", "No children")
             return
@@ -2010,15 +2009,19 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
         # Use orchestrator to determine how many chars we can afford per child.
         total_limit = orchestrator.get_summary_context_limit(llm.max_context)
         per_child_limit = max(200, int(total_limit / max(1, len(children))))
-
+        
         child_block = "\n".join([f"- {c['id']}: {c['text'][:per_child_limit]}" for c in children])
+        
+        from app.agent.tools import build_tool_schemas, dispatch_tool
+        cluster_tools = build_tool_schemas(["submit_work"])
 
         if job.scope_type == "module_clustering":
             prompt = (
                 f"Given these file summaries for project '{job.project_name}', group them into 3-8 logical modules. "
                 "A module may span multiple directories. For each module, provide a name, a 2-sentence purpose, "
                 "and the list of files it contains.\n"
-                "Output as JSON: [{\"name\": \"...\", \"purpose\": \"...\", \"files\": [\"...\", ...]}, ...]\n\n"
+                "To complete your clustering, call the submit_work tool with:\n"
+                "payload=[{\"name\": \"...\", \"purpose\": \"...\", \"files\": [\"...\", ...]}, ...]\n\n"
                 "Files:\n" + child_block
             )
         else:
@@ -2034,41 +2037,62 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
             messages=[{"role": "user", "content": prompt}],
             base_url=f"http://{llm.address}:{llm.port}/v1",
             model=llm.model,
+            tools=cluster_tools if job.scope_type == "module_clustering" else None,
+            tool_choice="auto" if job.scope_type == "module_clustering" else None,
             llm_id=llm.id,
             budget_id=job.budget_id,
             max_tokens=SURVEY_SUMMARY_MAX_TOKENS,
         ))
 
-        content = resp.get("content", "")
-        if job.scope_type == "module_clustering":
-            try:
-                # Basic JSON extraction
-                if "```json" in content:
-                    content = content.split("```json")[1].split("```")[0].strip()
-                elif "```" in content:
-                    content = content.split("```")[1].split("```")[0].strip()
+        assistant_msg = resp.get("message") or {}
+        content = assistant_msg.get("content", "")
+        tool_calls = assistant_msg.get("tool_calls", [])
 
-                modules = json.loads(content)
-                for m in modules:
-                    upsert_scope_summary(
-                        project_name=job.project_name,
-                        scope_type="module",
-                        scope_key=m["name"],
-                        summary=m["purpose"],
-                        short_summary=m["purpose"],
-                        file_paths=m.get("files", []),
-                        file_count=len(m.get("files", [])),
-                        llm_id=llm.id,
-                        budget_id=job.budget_id
+        if job.scope_type == "module_clustering":
+            modules = None
+            if tool_calls:
+                for tc in tool_calls:
+                    tc_result = dispatch_tool(
+                        tc["function"]["name"],
+                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
                     )
-                    # Enqueue the actual summary job for this newly created module
-                    enqueue_scope_survey_job(
-                        job.project_name, "module", m["name"],
-                        action="generate", priority=job.priority + 0.1,
-                        llm_id=llm.id, budget_id=job.budget_id
-                    )
-            except Exception as e:
-                logger.error(f"Failed to parse module clustering JSON: {e}\nContent: {content[:500]}")
+                    if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
+                        modules = json.loads(tc_result).get("payload")
+                        break
+            
+            if modules is None:
+                # Fallback to basic JSON extraction
+                try:
+                    if "```json" in content:
+                        content = content.split("```json")[1].split("```")[0].strip()
+                    elif "```" in content:
+                        content = content.split("```")[1].split("```")[0].strip()
+                    modules = json.loads(content)
+                except Exception:
+                    modules = []
+
+            if modules:
+                try:
+                    for m in modules:
+                        upsert_scope_summary(
+                            project_name=job.project_name,
+                            scope_type="module",
+                            scope_key=m["name"],
+                            summary=m["purpose"],
+                            short_summary=m["purpose"],
+                            file_paths=m.get("files", []),
+                            file_count=len(m.get("files", [])),
+                            llm_id=llm.id,
+                            budget_id=job.budget_id
+                        )
+                        # Enqueue the actual summary job for this newly created module
+                        enqueue_scope_survey_job(
+                            job.project_name, "module", m["name"],
+                            action="generate", priority=job.priority + 0.1,
+                            llm_id=llm.id, budget_id=job.budget_id
+                        )
+                except Exception as e:
+                    logger.error(f"Failed to process module clustering results: {e}")
         else:
             summary = content
             short = ""
@@ -2078,7 +2102,7 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
                 short = parts[1].strip()
             else:
                 short = content.split(". ")[0] + "." if ". " in content else content[:200]
-
+            
             upsert_scope_summary(
                 project_name=job.project_name,
                 scope_type=job.scope_type,
@@ -2585,14 +2609,13 @@ def _dispatch_stranded_subdivisions(
     node_obj_cache: "dict[int, Any]",
     llm_node_cache: "dict[int, int | None]",
 ) -> None:
-    """Detect Big Idea tasks that voted SUBDIVIDE but have no active children, and re-trigger subdivision.
+    """Detect tasks mid-subdivision (type='subdividing') with no children, and re-trigger.
 
-    Two cases:
-      - type == 'subdividing' with 0 children: subdivision ran but produced nothing (crashed, low confidence).
-      - type == 'idea' with outcome='subdivide' in transition_results and 0 children: intake voted subdivide
-        but subdivision was never started (ghost parent).
+    Only recovers type == 'subdividing' with 0 children — subdivision started but crashed or
+    produced nothing.  Tasks sitting in IDEA with a prior subdivide vote are NOT auto-recovered
+    here; they require a manual trigger so the user stays in control.
     """
-    from app.database import get_all_tasks, get_task, get_llm, get_transition_results
+    from app.database import get_all_tasks, get_task, get_llm
 
     try:
         all_tasks = get_all_tasks()
@@ -2609,20 +2632,12 @@ def _dispatch_stranded_subdivisions(
         tid = task.id
         ttype = (task.type or "").lower()
 
-        if ttype not in ("idea", "subdividing"):
+        if ttype != "subdividing":
             continue
         if child_counts.get(tid, 0) > 0:
             continue  # Has children - not stranded
 
-        stored_result_str: str | None = None
-
-        if ttype == "idea":
-            # Must have a prior subdivide vote to be a stranded subdivision
-            results = get_transition_results(tid, transition="idea_to_planning")
-            if not results or results[0].outcome != "subdivide":
-                continue
-            stored_result_str = results[0].vote_summary
-        # For "subdividing" with 0 children: always stranded regardless
+        # type == 'subdividing' with 0 children: always stranded regardless
 
         # Already running recovery for this task?
         recovery_key = f"subdivision-recovery-{tid}"
@@ -2652,15 +2667,7 @@ def _dispatch_stranded_subdivisions(
         ):
             continue
 
-        # Parse the stored intake result dict (contains "votes" array for context)
-        stored_result: dict = {}
-        if stored_result_str:
-            try:
-                stored_result = json.loads(stored_result_str)
-            except Exception:
-                stored_result = {"outcome": "subdivide", "votes": []}
-        else:
-            stored_result = {"outcome": "subdivide", "votes": []}
+        stored_result: dict = {"outcome": "subdivide", "votes": []}
 
         logger.info(
             f"[{AGENT_NAME}] Dispatching subdivision recovery for stranded task '%s' (type=%s).",
@@ -2751,18 +2758,6 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
         wt = setup_task_worktree(task_id, project_path)
         if wt is not None:
             worktree_path = wt
-        else:
-            # RC4: Strict isolation. If we are a git repo but worktree creation failed,
-            # we MUST NOT fall back to the project_path for any mutation-heavy stage.
-            # Read-only or intake stages (idea) are less risky, but implementation/review
-            # stages perform git operations that pollute the root.
-            mutation_types = {"planning", "indev", "conceptual_review", "optimization", "security", "full_review"}
-            if task_type in mutation_types:
-                from app.agent.worktree import _is_git_repo
-                if _is_git_repo(project_path):
-                    logger.error("[scheduler] Strict isolation violation: could not create worktree for task '%s' type '%s'. Aborting dispatch to protect project root.", task_id, task_type)
-                    _failed_cooldowns[task_id] = time.time()
-                    return # Abort
 
     try:
         llm_base_url = f"http://{llm.address}:{llm.port}/v1"
@@ -2780,7 +2775,7 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
         elif task_type == "conceptual_review":
             _run_conceptual_review_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
         elif task_type == "optimization":
-            _run_optimization_security_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
+            _run_optimization_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
         elif task_type == "security":
             _run_security_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
         elif task_type == "full_review":
@@ -2796,7 +2791,7 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
         with _active_sessions_lock:
             _session_ids.pop(task_id, None)
         clear_killed_session(session_id)
-
+        
         with _llm_counts_lock:
             _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
         if project_path and worktree_path != project_path:
@@ -3070,6 +3065,48 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
     if not task:
         return
 
+    # --- Planning cache gate ---
+    # Compute content hash for this task spec. Used both to check for a reusable
+    # cached result and to mark the result after the gate passes.
+    _content_hash = None
+    try:
+        from hashlib import sha256 as _sha256
+        _content_hash = _sha256(f"{task.title}||{task.description or ''}".encode()).hexdigest()
+    except Exception:
+        pass
+
+    _cache_mode = getattr(task, 'cache_mode', None) or 'normal'
+    if _cache_mode == 'normal' and _content_hash:
+        try:
+            from app.database import get_reusable_planning_result, restore_planning_result
+            from app.database import supersede_planning_results as _spr_cache
+            _cached = get_reusable_planning_result(task_id, _content_hash)
+            if _cached:
+                _spr_cache(task_id)
+                restore_planning_result(_cached.id)
+                update_task(task_id, type='indev')
+                logger.info(
+                    "[planning] Cache HIT task '%s' — reusing plan %d, skipping 40-min pipeline.",
+                    task_id, _cached.id,
+                )
+                return
+        except Exception:
+            logger.exception("[planning] Cache gate check failed for '%s' — running full pipeline.", task_id)
+    elif _cache_mode in ('force_with_context', 'force_fresh'):
+        try:
+            update_task(task_id, cache_mode='normal')
+        except Exception:
+            pass
+
+    # Collect prior failure context to inject into the planning prompts (skip on force_fresh).
+    _prior_failures = []
+    if _cache_mode != 'force_fresh':
+        try:
+            from app.database import get_prior_failure_context
+            _prior_failures = get_prior_failure_context(task_id)
+        except Exception:
+            pass
+
     # RC4: Supersede any stale planning_results rows from prior runs so the new
     # session starts clean.  The API path already does this in main.py; this call
     # covers the scheduler-dispatched path which previously skipped it.
@@ -3109,6 +3146,7 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
                 budget_id=budget_id,
                 max_context=max_context,
                 project_path=project_path,
+                prior_failure_context=_prior_failures,
             )
         )
 
@@ -3131,31 +3169,19 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
             from app.agent.config import PLANNING_MAX_REJECTIONS as _MAX_PLANNING_REJECTIONS
             rejections = _gtr_plan(task_id, transition="planning_to_indev") or []
             fail_count = sum(1 for r in rejections if r.outcome == "rejected")
-
+            
             if fail_count >= _MAX_PLANNING_REJECTIONS:
                 logger.warning(
                     "[planning] Task '%s' rejected by review panel %d time(s) — "
-                    "demoting to IDEA for forced subdivision.",
+                    "parking for manual review (user must re-trigger).",
                     task_id, fail_count,
                 )
-                update_task(task_id, type="idea")
-                create_transition_result(
-                    task_id=task_id,
-                    transition="idea_to_planning",
-                    outcome="subdivide",
-                    vote_summary={
-                        "outcome": "subdivide",
-                        "forced": True,
-                        "reason": f"Forced after {fail_count} design review rejections",
-                        "votes": [],
-                    },
-                    total_prompt_tokens=0,
-                    total_completion_tokens=0,
+                _stop_reason = (
+                    f"Design review exhausted ({fail_count}/{_MAX_PLANNING_REJECTIONS} attempts) — "
+                    "revise the task description and click Run Planning to retry."
                 )
-                _exit_summary = (
-                    f"Design review rejected {fail_count} time(s) — "
-                    "demoted to IDEA for forced subdivision."
-                )
+                _planning_stopped[task_id] = _stop_reason
+                _exit_summary = _stop_reason
             else:
                 # Park the card — requires manual re-trigger via "Run Planning" button.
                 # Do not use _rejection_cooldowns (which would auto-retry after 5 min).
@@ -3180,6 +3206,14 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
                 )
             )
             if gate_result.get("passed"):
+                # Mark the planning result as gate-passed so future runs can reuse it.
+                try:
+                    from app.database import get_planning_result as _gpr_cache, mark_gate_passed
+                    _pr_cache = _gpr_cache(task_id)
+                    if _pr_cache and _content_hash:
+                        mark_gate_passed(_pr_cache.id, _content_hash)
+                except Exception:
+                    pass
                 _exit_summary = "Planning passed and gate checks confirmed. Advanced to INDEV."
                 update_task(task_id, type="indev")
                 logger.info("[planning] Task '%s' advanced to IN DEV.", task_id)
@@ -3204,27 +3238,15 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
                 if gate_fail_count >= _MAX_PLANNING_GATE_FAILURES:
                     logger.warning(
                         "[planning] Task '%s' failed planning gate %d time(s) — "
-                        "demoting to IDEA for forced subdivision.",
+                        "parking for manual review (user must re-trigger).",
                         task_id, gate_fail_count,
                     )
-                    update_task(task_id, type="idea")
-                    create_transition_result(
-                        task_id=task_id,
-                        transition="idea_to_planning",
-                        outcome="subdivide",
-                        vote_summary={
-                            "outcome": "subdivide",
-                            "forced": True,
-                            "reason": f"Forced after {gate_fail_count} planning gate failures",
-                            "votes": [],
-                        },
-                        total_prompt_tokens=0,
-                        total_completion_tokens=0,
+                    _stop_reason = (
+                        f"Planning gate exhausted ({gate_fail_count}/{_MAX_PLANNING_GATE_FAILURES} attempts) — "
+                        "review gate failures and click Run Planning to retry."
                     )
-                    _exit_summary = (
-                        f"Planning gate failed {gate_fail_count} time(s) — "
-                        "demoted to IDEA for forced subdivision."
-                    )
+                    _planning_stopped[task_id] = _stop_reason
+                    _exit_summary = _stop_reason
                 else:
                     # Try correction agent before applying cooldown.
                     hard_failures = [
@@ -3278,6 +3300,14 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
                                     )
                                 )
                                 if gate_result2.get("passed"):
+                                    # Mark corrected plan as gate-passed for future cache reuse.
+                                    try:
+                                        from app.database import get_planning_result as _gpr_c2, mark_gate_passed
+                                        _pr_c2 = _gpr_c2(task_id)
+                                        if _pr_c2 and _content_hash:
+                                            mark_gate_passed(_pr_c2.id, _content_hash)
+                                    except Exception:
+                                        pass
                                     _exit_summary = (
                                         "Correction agent patched plan; gate now passes. "
                                         "Advanced to INDEV."
@@ -3576,30 +3606,20 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
             _exit_summary = f"Dev orchestrator completed. {result.get('batches_completed', 0)}/{result.get('total_batches', 0)} batches done."
             update_task(task_id, type="conceptual_review")
             logger.info("Task '%s' advanced to CONCEPTUAL REVIEW via scheduler.", task_id)
-        else:
+        elif result.get("status") == "REVERT_TO_DESIGN":
+            # Agent explicitly signalled the design is wrong — demote to planning.
             _exit_reason = "rejected"
-            _error_detail = result.get("error_detail") or "Dev orchestrator returned non-ACCEPTED status."
+            _error_detail = result.get("error_detail") or "Agent requested design revision."
             _exit_summary = _error_detail[:300]
-            # Forward the test failure context to planning so the next design session
-            # knows exactly what broke and why — prevents the planner from repeating
-            # the same mistake without any signal about the previous INDEV failure.
-            _files_touched = result.get("files_changed", [])
-            _files_str = (", ".join(_files_touched[:8])) if _files_touched else "(none recorded)"
-            _failure_note = (
-                f"\n\n[PREVIOUS INDEV FAILURE — {_now_utc()}]\n"
-                f"{_error_detail[:1200]}\n"
-                f"Files touched before failure: {_files_str}"
-            )
-            try:
-                from app.database import get_task as _gt_indev, update_task as _ut_indev
-                _t = _gt_indev(task_id)
-                if _t:
-                    _new_desc = (_t.description or "") + _failure_note
-                    _ut_indev(task_id, description=_new_desc)
-            except Exception as _desc_exc:
-                logger.warning("[planning] Could not append failure note to task '%s': %s", task_id, _desc_exc)
             update_task(task_id, type="planning")
-            logger.info("Task '%s' reverted to PLANNING: %s", task_id, _exit_summary)
+            _record_demotion_inline(task_id, "indev", "planning", _exit_summary)
+            logger.warning("Task '%s' reverted to PLANNING (agent REVERT_TO_DESIGN): %s", task_id, _exit_summary)
+        else:
+            # Transient failure (loop, LLM error, context saturation) — stay in INDEV.
+            _exit_reason = "rejected"
+            _error_detail = result.get("error_detail") or "Dev orchestrator transient failure."
+            _exit_summary = _error_detail[:300]
+            logger.warning("Task '%s' dev orchestrator transient failure — staying in INDEV: %s", task_id, _exit_summary)
     except ShutdownError:
         _exit_reason = "shutdown"
         _exit_summary = "Server shutdown during dev orchestrator."
@@ -3608,8 +3628,7 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
         _exit_reason = "error"
         _exit_summary = "Dev orchestrator raised an unexpected exception."
         logger.exception(f"[{AGENT_NAME}] Dev orchestrator for task '%s' failed.", task_id)
-        update_task(task_id, type="planning")
-        _record_demotion_inline(task_id, "indev", "planning", "Exception in dev orchestrator")
+        # Stay in INDEV — an unexpected exception is not a design problem.
     finally:
         close_agent_session(_session_id, _exit_reason, _exit_summary,
                             prompt_tokens=_prompt_tokens, completion_tokens=_completion_tokens)
@@ -3734,20 +3753,16 @@ def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
             pass
 
 
-def _run_optimization_security_task(task_id: str, llm_base_url: str, llm_model: str,
-                                     max_context: int | None = None,
-                                     llm_id: int | None = None,
-                                     budget_id: int | None = None,
-                                     project_path: str | None = None) -> None:
-    """Run optimization then security pipeline for an OPTIMIZATION task."""
+def _run_optimization_task(task_id: str, llm_base_url: str, llm_model: str,
+                            max_context: int | None = None,
+                            llm_id: int | None = None,
+                            budget_id: int | None = None,
+                            project_path: str | None = None) -> None:
+    """Run optimization pipeline for an OPTIMIZATION task; advance to security on pass."""
     from app.agent.optimization import run_optimization_pipeline
-    from app.agent.security_review import run_security_pipeline
     from app.agent.tools import set_task_git_cwd
     from app.database import get_task, update_task
-    from app.database import (
-        create_transition_vote, create_transition_result,
-        create_agent_session, close_agent_session,
-    )
+    from app.database import create_agent_session, close_agent_session
 
     set_task_git_cwd(project_path)
 
@@ -3755,28 +3770,23 @@ def _run_optimization_security_task(task_id: str, llm_base_url: str, llm_model: 
     if not task:
         return
 
-    # Two separate sessions: one for optimization, one for security.
-    _opt_session_id = create_agent_session(
+    _session_id = create_agent_session(
         task_id=task_id, agent_type="optimization",
         llm_id=llm_id, budget_id=budget_id, scheduler_reason="scheduler",
     )
-    _opt_exit_reason = "error"
-    _opt_exit_summary = ""
-    _sec_session_id = None
-    _sec_exit_reason = "error"
-    _sec_exit_summary = ""
-    _opt_prompt = _opt_compl = _sec_prompt = _sec_compl = 0
+    _exit_reason = "error"
+    _exit_summary = ""
+    _prompt = _compl = 0
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         # Pre-flight PIP gate — runs at optimization stage entry
         if not _run_pip_preflight_and_gate(task_id, "optimization", llm_id, budget_id, project_path, loop):
-            _opt_exit_reason = "pip_blocked"
-            _opt_exit_summary = "PIP pre-flight gate blocked optimization entry."
+            _exit_reason = "pip_blocked"
+            _exit_summary = "PIP pre-flight gate blocked optimization entry."
             return  # card stays in optimization; resolution jobs dispatched
 
-        # Run optimization first
         opt_result = loop.run_until_complete(
             run_optimization_pipeline(
                 task_id=task_id,
@@ -3788,90 +3798,27 @@ def _run_optimization_security_task(task_id: str, llm_base_url: str, llm_model: 
                 project_path=project_path,
             )
         )
-        _opt_exit_reason = opt_result.get("outcome", "error")
-        _opt_exit_summary = opt_result.get("improvement_summary", "")
-        _opt_prompt = opt_result.get("total_prompt_tokens", 0)
-        _opt_compl = opt_result.get("total_completion_tokens", 0)
+        _exit_reason = opt_result.get("outcome", "error")
+        _exit_summary = opt_result.get("improvement_summary", "")
+        _prompt = opt_result.get("total_prompt_tokens", 0)
+        _compl = opt_result.get("total_completion_tokens", 0)
         logger.info("[optimization] Task '%s' via scheduler: %s", task_id, opt_result.get("outcome"))
 
-        # Close optimization session before starting security
-        close_agent_session(_opt_session_id, _opt_exit_reason, _opt_exit_summary,
-                            prompt_tokens=_opt_prompt, completion_tokens=_opt_compl)
-        _opt_session_id = None  # prevent double-close in finally
-
-        # Advance to security stage so the card reflects progress and pre-flight
-        # can check requirements at the correct stage.
         update_task(task_id, type="security")
-
-        _sec_session_id = create_agent_session(
-            task_id=task_id, agent_type="security",
-            llm_id=llm_id, budget_id=budget_id, scheduler_reason="scheduler",
-        )
-
-        # Pre-flight PIP gate — blocks security entry if any PIP has unmet requirements
-        if not _run_pip_preflight_and_gate(task_id, "security", llm_id, budget_id, project_path, loop):
-            _sec_exit_reason = "pip_blocked"
-            _sec_exit_summary = "PIP pre-flight gate blocked security entry."
-            return  # card stays in security; resolution jobs dispatched
-
-        # Run security review
-        sec_result = loop.run_until_complete(
-            run_security_pipeline(
-                task_id=task_id,
-                task_description=task.description or "",
-                llm_base_url=llm_base_url,
-                llm_model=llm_model,
-                llm_id=llm_id,
-                budget_id=budget_id,
-                project_path=project_path,
-            )
-        )
-        _sec_exit_reason = sec_result.get("outcome", "error")
-        _sec_exit_summary = sec_result.get("summary", "")
-        _sec_prompt = sec_result.get("total_prompt_tokens", 0)
-        _sec_compl = sec_result.get("total_completion_tokens", 0)
-        create_transition_result(
-            task_id=task_id,
-            transition="security_review",
-            outcome=sec_result.get("outcome", "unknown"),
-            vote_summary=sec_result,
-            total_prompt_tokens=_sec_prompt,
-            total_completion_tokens=_sec_compl,
-        )
-
-        if sec_result.get("outcome") == "passed":
-            update_task(task_id, type="full_review")
-            logger.info("[security] Task '%s' advanced to FULL REVIEW via scheduler.", task_id)
-        else:
-            demotion = sec_result.get("demotion_target", "indev")
-            update_task(task_id, type=demotion)
-            _record_demotion_inline(task_id, "security", demotion, sec_result.get("summary", ""))
-            logger.warning("[security] Task '%s' demoted to %s via scheduler.", task_id, demotion)
+        logger.info("[optimization] Task '%s' advanced to SECURITY via scheduler.", task_id)
     except ShutdownError:
-        _opt_exit_reason = _opt_exit_reason if _opt_session_id else _opt_exit_reason
-        _sec_exit_reason = "shutdown"
-        _sec_exit_summary = "Server shutdown during optimization/security."
-        if _opt_session_id:
-            _opt_exit_reason = "shutdown"
-            _opt_exit_summary = "Server shutdown before optimization completed."
-        logger.info(f"[{AGENT_NAME}] Optimization/Security for task '%s' aborted due to server shutdown.", task_id)
+        _exit_reason = "shutdown"
+        _exit_summary = "Server shutdown during optimization."
+        logger.info(f"[{AGENT_NAME}] Optimization for task '%s' aborted due to server shutdown.", task_id)
     except Exception:
-        if _opt_session_id:
-            _opt_exit_reason = "error"
-            _opt_exit_summary = "Exception during optimization/security pipeline."
-        else:
-            _sec_exit_reason = "error"
-            _sec_exit_summary = "Exception during security pipeline."
-        logger.exception(f"[{AGENT_NAME}] Optimization/Security for task '%s' failed.", task_id)
+        _exit_reason = "error"
+        _exit_summary = "Exception during optimization pipeline."
+        logger.exception(f"[{AGENT_NAME}] Optimization for task '%s' failed.", task_id)
         update_task(task_id, type="indev")
-        _record_demotion_inline(task_id, "optimization", "indev", "Exception in optimization/security")
+        _record_demotion_inline(task_id, "optimization", "indev", "Exception in optimization")
     finally:
-        if _opt_session_id is not None:
-            close_agent_session(_opt_session_id, _opt_exit_reason, _opt_exit_summary,
-                                prompt_tokens=_opt_prompt, completion_tokens=_opt_compl)
-        if _sec_session_id is not None:
-            close_agent_session(_sec_session_id, _sec_exit_reason, _sec_exit_summary,
-                                prompt_tokens=_sec_prompt, completion_tokens=_sec_compl)
+        close_agent_session(_session_id, _exit_reason, _exit_summary,
+                            prompt_tokens=_prompt, completion_tokens=_compl)
         try:
             loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
         except Exception:
@@ -3981,7 +3928,7 @@ def _run_full_review_task(task_id: str, llm_base_url: str, llm_model: str,
                            llm_id: int | None = None,
                            budget_id: int | None = None,
                            project_path: str | None = None) -> None:
-    """Run the full review pipeline for a FULL_REVIEW task."""
+    """Run the full review pipeline for a FULL_REVIEW task; advance to completed on pass."""
     from app.agent.full_review import run_full_review_pipeline
     from app.agent.tools import set_task_git_cwd
     from app.database import get_task, update_task
@@ -4114,23 +4061,6 @@ def _record_demotion_inline(task_id: str, from_stage: str, to_stage: str, reason
             asyncio.run(generate_pip(task_id, from_stage, reason))
 
 
-def _check_completion_rollup_inline(task_id: str) -> None:
-    """Mirror of main._check_completion_rollup - avoids circular import."""
-    import app.database as db
-    task = db.get_task(task_id)
-    if not task or not task.parent_task_id:
-        return
-    parent = db.get_task(task.parent_task_id)
-    if not parent:
-        return
-    children = db.get_active_child_tasks(parent.id)
-    if not children:
-        return
-    all_done = all((c.type or "").lower() in PIPELINE_DONE_STATUSES for c in children)
-    if all_done:
-        db.update_task(parent.id, type="completed")
-        logger.info("[rollup] All children of '%s' completed. Parent marked completed.", parent.id)
-        _check_completion_rollup_inline(parent.id)
 
 
 # ---------------------------------------------------------------------------

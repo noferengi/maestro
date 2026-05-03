@@ -472,7 +472,7 @@ class TestContextAwareToolSelection:
         schemas, names = _build_context_aware_schemas(has_source=False)
         assert "write_arch_doc" in names
         assert "spawn_research_agent" in names
-        assert "read_list_dir" in names
+        assert "list_directory" in names
         assert "find_files" in names
         # Codebase tools should NOT be present
         assert "read_file" not in names

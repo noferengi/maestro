@@ -119,13 +119,13 @@ def _make_llm(address, port, model):
 # ---------------------------------------------------------------------------
 
 class TestAdvanceHandlersMap:
-    """ADVANCE_HANDLERS covers exactly the 7 advanceable column types."""
+    """ADVANCE_HANDLERS covers the 6 AI-driven pipeline stages; full_review is a human gate."""
 
     def test_all_advanceable_types_present(self):
         import main
         expected = {
             "idea", "planning", "indev",
-            "conceptual_review", "optimization", "security", "full_review",
+            "conceptual_review", "optimization", "security",
         }
         assert set(main.ADVANCE_HANDLERS.keys()) == expected
 
@@ -143,7 +143,8 @@ class TestAdvanceHandlersMap:
         assert main.ADVANCE_HANDLERS["conceptual_review"]  == "_advance_to_optimization"
         assert main.ADVANCE_HANDLERS["optimization"]       == "_run_security_pipeline_bg"
         assert main.ADVANCE_HANDLERS["security"]           == "_run_full_review_bg"
-        assert main.ADVANCE_HANDLERS["full_review"]        == "_execute_merge_bg"
+        # full_review is a human gate — no automated advance handler; merge via /merge endpoint
+        assert "full_review" not in main.ADVANCE_HANDLERS
 
     def test_non_advanceable_types_absent(self):
         """architecture, completed, cancelled, subdividing are never in the map."""

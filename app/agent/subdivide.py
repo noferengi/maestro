@@ -35,7 +35,7 @@ from app.agent.config import (
     SUBDIVISION_CONTEXT_AWARE_TOOLS,
     check_context_saturation,
 )
-from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError, ContextTooLargeError
+from app.agent.llm_client import call_llm, is_shutting_down, sanitize_user_content, ShutdownError, ContextTooLargeError
 from app.agent.tools import TOOL_SCHEMAS, async_dispatch_tool, LISTING_EXCLUDED_DIRS, set_task_git_cwd
 
 logger = logging.getLogger(__name__)
@@ -84,6 +84,7 @@ def _build_context_aware_schemas(
 
     # Planning tools are always available
     allowed = set(SUBDIVISION_PLANNING_TOOLS)
+    allowed.add("submit_work")
 
     if has_source and SUBDIVISION_CONTEXT_AWARE_TOOLS:
         # Add all codebase read tools
@@ -174,35 +175,37 @@ Use `spawn_research_agent` when you need domain knowledge about unfamiliar techn
 7. Estimated scope should be "small" or "medium" - if you'd estimate "large",
    the sub-idea itself may need further decomposition.
 
-== TERMINAL ACTION ==
-When you are ready, call the `submit_work` tool:
-```python
+== OUTPUT FORMAT ==
+To submit your decomposition, call the submit_work tool with:
 submit_work(
-    signal="SUBDIVISION_COMPLETE",
-    summary="Decomposition summary and architectural rationale",
-    sub_ideas=[
-      {
+  signal="ACCEPTED",
+  summary="<one-line summary of the decomposition>",
+  payload={{
+    "sub_ideas": [
+      {{
         "title": "Short descriptive title",
         "description": "Full description of what this sub-idea entails",
         "prerequisites": ["sub-0"],
         "estimated_scope": "small" | "medium",
         "rationale": "Why this is a coherent, independent unit of work",
-        "provides": [ { "name": "...", "type": "...", "description": "..." } ],
-        "consumes": [ { "name": "...", "type": "...", "source": "sub-N" } ]
-      }
+        "provides": [ {{ "name": "...", "type": "...", "description": "..." }} ],
+        "consumes": [ {{ "name": "...", "type": "...", "source": "sub-N" }} ]
+      }}
     ],
-    interface_contracts=[
-      {
+    "interface_contracts": [
+      {{
         "component": "sub-0 title",
-        "provides": [ { "name": "...", "type": "..." } ],
-        "consumes": [ { "name": "...", "type": "...", "source": "sub-N" } ]
-      }
+        "provides": [ {{ "name": "...", "type": "..." }} ],
+        "consumes": [ {{ "name": "...", "type": "...", "source": "sub-N" }} ]
+      }}
     ],
-    decomposition_rationale="Why you chose this particular decomposition strategy",
-    coverage_check="How the sub-ideas together cover the entire original task",
-    confidence=85
+    "decomposition_rationale": "Why you chose this particular decomposition strategy",
+    "coverage_check": "How the sub-ideas together cover the entire original task",
+    "confidence": 85
+  }}
 )
-```
+
+No prose after calling submit_work.
 
 == CONTEXT BUDGET ==
 Your total token budget is ~{token_budget} tokens ({budget_pct}% of {max_context}).
@@ -213,12 +216,11 @@ Plan tool calls efficiently.
 - Do NOT attempt to write or modify any files.
 - Focus on evidence from the actual code (if available) and sound architectural reasoning.
 - If you cannot confidently decompose the task, set confidence below 50 and explain why.
-- You MUST use `submit_work` to finish.
 """
 
 _CODEBASE_TOOLS_AVAILABLE = """\
 **Codebase tools** (project has existing source code):
-- `read_file`, `count_lines`, `search_files`
+- `read_file`, `read_file_harder`, `count_lines`, `search_files`
 - `git_status`, `git_diff`, `git_log`, `git_blame`, `git_show`
 Use these to understand the current code structure before deciding how to split the task."""
 
@@ -303,7 +305,6 @@ class SubdivisionAgent:
         self._total_prompt_tokens = 0
         self._total_completion_tokens = 0
         self._budget_exceeded = False
-        self._terminal_signal: dict | None = None
 
     async def run(self) -> SubdivisionResult:
         """Execute the subdivision agent and return decomposed sub-ideas."""
@@ -350,9 +351,9 @@ class SubdivisionAgent:
 
             # Hard budget enforcement
             if self._budget_exceeded:
-                messages.append({
+                 messages.append({
                     "role": "user",
-                    "content": "[SYSTEM] TOKEN BUDGET EXCEEDED. Output your JSON decomposition NOW. No more tool calls.",
+                    "content": "[SYSTEM] TOKEN BUDGET EXCEEDED. Call submit_work with your decomposition NOW. No more tool calls.",
                 })
 
             try:
@@ -421,12 +422,17 @@ class SubdivisionAgent:
                 tool_results = await self._handle_tool_calls(tool_calls)
                 messages.extend(tool_results)
 
-                # Check for terminal signal from submit_work tool call
-                if self._terminal_signal is not None:
-                    # Treat the terminal signal payload as the raw output
-                    result = self._try_parse(json.dumps(self._terminal_signal))
-                    if result:
-                        return result
+                # Check for terminal signal from submit_work
+                for tr in tool_results:
+                    if isinstance(tr.get("content"), str) and "__maestro_terminal__" in tr["content"]:
+                        try:
+                            data = json.loads(tr["content"])
+                            if data.get("payload"):
+                                parsed = self._try_parse_payload(data["payload"])
+                                if parsed:
+                                    return parsed
+                        except Exception:
+                            pass
                 continue
 
             if tool_calls and self._budget_exceeded:
@@ -436,7 +442,7 @@ class SubdivisionAgent:
                         "role": "tool",
                         "tool_call_id": tc.get("id", "unknown"),
                         "name": tc.get("function", {}).get("name", ""),
-                        "content": "ERROR: Token budget exceeded. Output your decomposition NOW.",
+                        "content": "ERROR: Token budget exceeded. Call submit_work with your decomposition NOW.",
                     })
                 continue
 
@@ -445,13 +451,13 @@ class SubdivisionAgent:
             if remaining <= 3:
                 messages.append({
                     "role": "user",
-                    "content": f"[SYSTEM] You have {remaining} turns remaining. Output your JSON decomposition NOW.",
+                    "content": f"[SYSTEM] You have {remaining} turns remaining. Call submit_work with your decomposition NOW.",
                 })
             else:
                 messages.append({
                     "role": "user",
                     "content": "[SYSTEM] You did not call any tool and did not output a decomposition. "
-                               "Either call a tool to investigate, or output your JSON decomposition.",
+                               "Either call a tool to investigate, or call submit_work with your decomposition.",
                 })
 
         # Turn loop exited — either true exhaustion (all max_turns consumed) or an
@@ -518,15 +524,15 @@ class SubdivisionAgent:
                 if _task_rec and _task_rec.project:
                     _arch = build_architecture_context(_task_rec.project, agent_type='subdivision')
                     if _arch:
-                        parts.append(_arch)
+                        parts.append(sanitize_user_content(_arch))
             except Exception:
                 pass
 
         parts.append("## Task to Decompose")
         parts += [
             f"**ID:** {self.parent_task_id}",
-            f"**Title:** {self.parent_title}",
-            f"**Description:**\n{self.parent_description}",
+            f"**Title:** {sanitize_user_content(self.parent_title)}",
+            f"**Description:**\n{sanitize_user_content(self.parent_description)}",
         ]
 
         if self.max_context:
@@ -536,9 +542,9 @@ class SubdivisionAgent:
         if self.scope_vote:
             try:
                 scope_str = json.dumps(self.scope_vote, indent=2, default=str)
-                parts.append(f"\n## Scope Analysis (from intake pipeline)\n```json\n{scope_str}\n```")
+                parts.append(f"\n## Scope Analysis (from intake pipeline)\n```json\n{sanitize_user_content(scope_str)}\n```")
             except (TypeError, ValueError):
-                parts.append(f"\n## Scope Analysis\n{self.scope_vote}")
+                parts.append(f"\n## Scope Analysis\n{sanitize_user_content(str(self.scope_vote))}")
 
         if self.rejection_context:
             rc = self.rejection_context
@@ -553,13 +559,13 @@ class SubdivisionAgent:
                 planning_ctx = "\n## Prior Planning Analysis\n"
                 planning_ctx += f"The planning pipeline attempted to design this task but determined it is too broad:\n\n"
                 if _scope_reason:
-                    planning_ctx += f"**Scope verdict:** {_scope_reason}\n\n"
+                    planning_ctx += f"**Scope verdict:** {sanitize_user_content(_scope_reason)}\n\n"
                 if _rationale:
-                    planning_ctx += f"**Design rationale attempted:** {_rationale[:500]}\n\n"
+                    planning_ctx += f"**Design rationale attempted:** {sanitize_user_content(_rationale[:500])}\n\n"
                 if _manifest_str and _manifest_str != "[]":
-                    planning_ctx += f"**File manifest from attempted design:**\n```json\n{_manifest_str[:2000]}\n```\n\n"
+                    planning_ctx += f"**File manifest from attempted design:**\n```json\n{sanitize_user_content(_manifest_str[:2000])}\n```\n\n"
                 if _survey:
-                    planning_ctx += f"**Codebase survey summary:**\n{_survey[:1500]}\n\n"
+                    planning_ctx += f"**Codebase survey summary:**\n{sanitize_user_content(_survey[:1500])}\n\n"
                 planning_ctx += (
                     "Use this information to decompose the task into smaller, focused sub-ideas "
                     "that each touch fewer files and have a single clear responsibility."
@@ -573,10 +579,10 @@ class SubdivisionAgent:
 
                 retry_text = _SUBDIVISION_RETRY_CONTEXT.format(
                     attempt_number=rc.get("attempt_number", "?"),
-                    previous_decomposition=prev_decomp,
-                    rejected_details=rejected,
-                    passed_details=passed,
-                    guidance=guidance,
+                    previous_decomposition=sanitize_user_content(prev_decomp),
+                    rejected_details=sanitize_user_content(rejected),
+                    passed_details=sanitize_user_content(passed),
+                    guidance=sanitize_user_content(guidance),
                 )
                 parts.append(retry_text)
 
@@ -629,19 +635,6 @@ class SubdivisionAgent:
                     llm_model=self.llm_model,
                 )
 
-            # Detect __maestro_terminal__ marker from submit_work
-            if name == "submit_work":
-                try:
-                    terminal_data = json.loads(str(result_content))
-                    if terminal_data.get("__maestro_terminal__") is True:
-                        logger.info(
-                            "Subdivision Agent: submit_work tool call — signal=%s",
-                            terminal_data.get("signal"),
-                        )
-                        self._terminal_signal = terminal_data
-                except (json.JSONDecodeError, ValueError):
-                    pass
-
             results.append({
                 "role": "tool",
                 "tool_call_id": tool_id,
@@ -664,7 +657,7 @@ class SubdivisionAgent:
         # Try fenced JSON block first
         fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
         if fenced:
-            parsed = self._try_parse(fenced.group(1))
+            parsed = self._try_parse_payload(fenced.group(1))
             if parsed:
                 return parsed
 
@@ -672,20 +665,23 @@ class SubdivisionAgent:
         start = content.find("{")
         end = content.rfind("}")
         if start != -1 and end > start:
-            parsed = self._try_parse(content[start:end + 1])
+            parsed = self._try_parse_payload(content[start:end + 1])
             if parsed:
                 return parsed
 
         return None
 
-    def _try_parse(self, raw: str) -> SubdivisionResult | None:
-        """Attempt to parse a JSON string into a SubdivisionResult."""
+    def _try_parse_payload(self, raw: Any) -> SubdivisionResult | None:
+        """Attempt to parse a JSON string or dict into a SubdivisionResult."""
         try:
-            data = json.loads(raw)
+            if isinstance(raw, str):
+                data = json.loads(raw)
+            else:
+                data = raw
         except (json.JSONDecodeError, ValueError):
             return None
 
-        if "sub_ideas" not in data:
+        if not isinstance(data, dict) or "sub_ideas" not in data:
             return None
 
         sub_ideas = []

@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import threading
 import time
 import uuid
@@ -36,6 +37,22 @@ from app.agent.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Matches bare {identifier} and {dotted.identifier} patterns that llama.cpp's
+# Jinja2 chat-template parser would interpret as template variables.
+_SINGLE_BRACE_RE = re.compile(r"\{([A-Za-z_][\w.]*)\}")
+
+
+def sanitize_user_content(text: str) -> str:
+    """Escape user/DB-sourced content before embedding it in an LLM prompt.
+
+    Converts bare {identifier} patterns to [identifier] so llm_client's
+    sanitizer passes the content silently.  Call this at every injection site
+    where non-developer-written text enters a prompt string.
+    """
+    if not text:
+        return text
+    return _SINGLE_BRACE_RE.sub(r"[\1]", text)
 
 # ---------------------------------------------------------------------------
 # Session identity context vars
@@ -585,8 +602,6 @@ def _sanitize_messages(messages: list[dict]) -> list[dict]:
                 content = content.replace(raw, safe)
                 changed = True
 
-        import re as _re
-        _SINGLE_BRACE_RE = _re.compile(r'\{([A-Za-z_][\w.]*)\}')
         _sbrace_match = _SINGLE_BRACE_RE.search(content)
         if _sbrace_match:
             if log_warn:

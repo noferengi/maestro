@@ -41,14 +41,7 @@
       "mcp__maestro__get_scheduler_state",
       "mcp__maestro__diagnose_task",
       "mcp__maestro__restart_server",
-      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_security_review_unit.py -v --tb=short)",
-      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_planning_unit.py app/tests/test_research_jobs.py -v --tb=short)",
-      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_pip_resolution_unit.py -v --tb=short)",
-      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_e2e_pipeline.py -v --tb=line)",
-      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_intake_pipeline.py -v --tb=short)",
-      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_e2e_pipeline.py -v --tb=short)",
-      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_e2e_pipeline.py -q --tb=no)",
-      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_e2e_pipeline.py::TestIntakePipelineE2E::test_intake_all_pass_through_mock_llm -v --tb=short)"
+      "Bash(sqlite3 *)"
     ]
   },
   "enableAllProjectMcpServers": true

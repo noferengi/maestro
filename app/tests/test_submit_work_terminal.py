@@ -134,8 +134,8 @@ async def test_handle_tool_calls_sets_terminal_signal_on_accepted():
         "function": {"name": "submit_work", "arguments": json.dumps({"signal": "ACCEPTED", "summary": "done"})},
     }]
 
-    with mock.patch("app.agent.agent_loop.async_dispatch_tool", return_value=submit_json):
-        await loop._dispatch_tools(tool_calls)
+    with mock.patch("app.agent.loop.async_dispatch_tool", return_value=submit_json):
+        await loop._handle_tool_calls(tool_calls)
 
     assert loop._terminal_signal is not None
     assert loop._terminal_signal["signal"] == "ACCEPTED"
@@ -163,8 +163,8 @@ async def test_handle_tool_calls_does_not_set_terminal_signal_for_normal_tools()
         "function": {"name": "read_file", "arguments": json.dumps({"path": "README.md"})},
     }]
 
-    with mock.patch("app.agent.agent_loop.async_dispatch_tool", return_value="file contents here"):
-        await loop._dispatch_tools(tool_calls)
+    with mock.patch("app.agent.loop.async_dispatch_tool", return_value="file contents here"):
+        await loop._handle_tool_calls(tool_calls)
 
     assert loop._terminal_signal is None
 
@@ -180,7 +180,7 @@ async def test_maestro_loop_exits_accepted_on_submit_work():
 
     submit_response = _llm_tool_call("submit_work", {"signal": "ACCEPTED", "summary": "done"})
 
-    with mock.patch("app.agent.agent_loop.call_llm", _sequential_llm(submit_response)):
+    with mock.patch("app.agent.loop.call_llm", _sequential_llm(submit_response)):
         loop = MaestroLoop(task_id="t-loop-accepted", max_turns=5)
         result = await loop.run()
 
@@ -197,7 +197,7 @@ async def test_maestro_loop_exits_revert_on_submit_work():
         "submit_work", {"signal": "REVERT_TO_DESIGN", "summary": "impossible"}
     )
 
-    with mock.patch("app.agent.agent_loop.call_llm", _sequential_llm(revert_response)):
+    with mock.patch("app.agent.loop.call_llm", _sequential_llm(revert_response)):
         loop = MaestroLoop(task_id="t-loop-revert", max_turns=5)
         result = await loop.run()
 
@@ -213,7 +213,7 @@ async def test_maestro_loop_summary_propagates_from_submit_work():
         "submit_work", {"signal": "ACCEPTED", "summary": "Refactored cache module"}
     )
 
-    with mock.patch("app.agent.agent_loop.call_llm", _sequential_llm(submit_response)):
+    with mock.patch("app.agent.loop.call_llm", _sequential_llm(submit_response)):
         loop = MaestroLoop(task_id="t-loop-summary", max_turns=5)
         result = await loop.run()
 
@@ -239,7 +239,7 @@ async def test_maestro_loop_no_tool_nudge_mentions_submit_work():
             return text_response
         return submit_response
 
-    with mock.patch("app.agent.agent_loop.call_llm", recording_llm):
+    with mock.patch("app.agent.loop.call_llm", recording_llm):
         loop = MaestroLoop(task_id="t-nudge", max_turns=5)
         await loop.run()
 

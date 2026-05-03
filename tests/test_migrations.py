@@ -310,20 +310,25 @@ class TestTableCreation:
             os.unlink(path)
 
     def test_test_migration_creates_expected_tables_multiple(self, initial_migration):
-        """Test that migration creates multiple expected tables."""
+        """Test that sequential migrations create the expected tables."""
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
 
         try:
-            # Load prerequisites migration which creates additional tables
+            # 0002 ALTERs the tasks table, so 0001 must be applied first
             prereq_migration = load_migration("app/migrations/versions/0002_add_prerequisites.py")
-
-            result = test_migration_creates_expected_tables(
-                path,
-                "app/migrations/versions/0002_add_prerequisites.py",
-                ["tasks", "schema_migrations"]
-            )
-            assert result is True
+            conn = create_fresh_db(path)
+            try:
+                execute_migration(conn, initial_migration, "up")
+                execute_migration(conn, prereq_migration, "up")
+                cursor = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )
+                tables = {row["name"] for row in cursor.fetchall()}
+                assert "tasks" in tables
+                assert "schema_migrations" in tables
+            finally:
+                conn.close()
         finally:
             os.unlink(path)
 
@@ -356,28 +361,29 @@ class TestRollbackSafety:
         os.close(fd)
 
         try:
+            # 0001's down() drops tasks; nothing extra expected after rollback
             result = test_migration_rollback_safe(
                 path,
                 "app/migrations/versions/0001_initial_schema.py",
-                before_tables=[],  # No tables before migration
-                after_tables=["tasks"]  # tasks table after rollback (should be dropped)
+                before_tables=[],
+                after_tables=[]
             )
             assert result is True
         finally:
             os.unlink(path)
 
     def test_test_migration_rollback_safe_with_before_tables(self, initial_migration):
-        """Test rollback with before tables specified."""
+        """Test rollback leaves schema_migrations intact."""
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
 
         try:
-            # The initial migration creates tasks table
+            # 0001 creates tasks; after rollback only schema_migrations (from create_fresh_db) remains
             result = test_migration_rollback_safe(
                 path,
                 "app/migrations/versions/0001_initial_schema.py",
-                before_tables=["tasks"],  # tasks exists before
-                after_tables=["schema_migrations"]  # only schema_migrations after rollback
+                before_tables=[],
+                after_tables=["schema_migrations"]
             )
             assert result is True
         finally:

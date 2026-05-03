@@ -36,8 +36,6 @@ const TOOL_COLORS = {
 
 const TOOL_CATEGORY_MAP = {
     read_file:         'read',
-    read_file_harder:  'read',
-    read_file_lines:   'read',
     count_lines:       'read',
     write_file:        'write',
     append_file:       'write',
