@@ -330,7 +330,6 @@ PLANNING_JUDGE_MAX_TOKENS: int = _getint("planning", "judge_max_tokens", None, 8
 PLANNING_MAX_DESIGN_RETRIES: int = _getint("planning", "max_design_retries", None, 3)
 PLANNING_MAX_REJECTIONS: int = _getint("planning", "max_rejections", None, 5)
 PLANNING_SURVEY_MAX_TURNS: int = _getint("planning", "survey_max_turns", None, 100)
-PLANNING_SESSION_TIMEOUT_MINUTES: int = _getint("planning", "session_timeout_minutes", None, 120)
 
 PLANNING_GATE_FEASIBILITY_RECHECK: bool = _getbool("planning_gate", "feasibility_recheck_enabled", None, True)
 PLANNING_GATE_CONTEXT_SAFETY_MARGIN: float = _getfloat("planning_gate", "context_safety_margin", None, 0.15)

@@ -49,7 +49,7 @@ from app.agent.config import (
     MAX_TOKENS_PER_TURN,
     SURVEY_VERDICT_MAX_TOKENS,
     SURVEY_SUMMARY_MAX_TOKENS,
-    PLANNING_SESSION_TIMEOUT_MINUTES,
+
 )
 from app.agent.llm_client import is_shutting_down, signal_shutdown, signal_force_shutdown, ShutdownError, TaskDeactivatedError
 
@@ -89,8 +89,6 @@ _session_types: dict[str, str] = {}
 # Protected by _active_sessions_lock.
 _session_started_at: dict[str, float] = {}
 
-# Wall-clock limit for a single planning session before the scheduler force-expires it.
-_PLANNING_SESSION_TIMEOUT_SECS = PLANNING_SESSION_TIMEOUT_MINUTES * 60
 
 # Per-LLM active session count: llm_id -> count
 _llm_session_counts: dict[int, int] = defaultdict(int)
@@ -884,10 +882,6 @@ def _tick() -> None:
     # 0. Cleanup finished sessions (also removes from _session_llm_ids)
     _cleanup_finished()
 
-    # 0a'. Expire planning sessions that have exceeded the wall-clock timeout.
-    #      This frees LLM slots so other tasks can be dispatched, and re-queues
-    #      the timed-out task for a fresh run in the next tick.
-    _check_planning_timeouts()
 
     # 0a. Rescue stale background jobs: orphaned 'running' and cooled-down 'failed'
     #     file-summary and research jobs are reset to 'pending' so they flow through
@@ -4225,84 +4219,13 @@ def _cleanup_finished() -> None:
         _llm_session_counts.update(new_counts)
 
 
-def _check_planning_timeouts() -> None:
-    """Force-expire planning sessions that have exceeded the wall-clock limit.
-
-    The associated LLM session is killed via llm_client.kill_session(), which
-    causes in-flight call_llm() calls to abort immediately. The task is then
-    removed from _active_sessions so the scheduler can re-dispatch it.
-    """
-    from app.agent.llm_client import kill_session
-    now = time.time()
-    timed_out_sessions: list[tuple[str, int, str | None]] = []  # (task_id, llm_id, session_id)
-
-    with _active_sessions_lock:
-        for task_id, thread in list(_active_sessions.items()):
-            if not thread.is_alive():
-                continue
-            if _session_types.get(task_id) != "planning":
-                continue
-            started = _session_started_at.get(task_id, now)
-            if now - started >= _PLANNING_SESSION_TIMEOUT_SECS:
-                elapsed_min = int((now - started) / 60)
-                logger.warning(
-                    "[scheduler] Planning session for task '%s' has been running %d min "
-                    "(limit %d min) — killing LLM session and re-queuing.",
-                    task_id, elapsed_min, _PLANNING_SESSION_TIMEOUT_SECS // 60,
-                )
-                llm_id = _session_llm_ids.get(task_id)
-                session_id = _session_ids.get(task_id)
-                timed_out_sessions.append((task_id, llm_id, session_id))
-
-                if session_id:
-                    kill_session(session_id)
-
-                del _active_sessions[task_id]
-                _session_llm_ids.pop(task_id, None)
-                _session_types.pop(task_id, None)
-                _session_started_at.pop(task_id, None)
-                _session_titles.pop(task_id, None)
-                _session_ids.pop(task_id, None)
-
-    if not timed_out_sessions:
-        return
-
-    # Re-sync LLM counts after removing timed-out sessions.
-    with _llm_counts_lock:
-        for _, llm_id, _ in timed_out_sessions:
-            if llm_id is not None:
-                _llm_session_counts[llm_id] = max(0, _llm_session_counts[llm_id] - 1)
-
-    # Write a timeout audit record per expired task.
-    try:
-        from app.database import create_agent_session, close_agent_session
-        for task_id, llm_id, session_id in timed_out_sessions:
-            sid = create_agent_session(
-                task_id=task_id,
-                agent_type="planning",
-                llm_id=llm_id,
-                budget_id=None,
-                scheduler_reason="timeout",
-            )
-            close_agent_session(
-                sid,
-                exit_reason="planning_timeout",
-                exit_summary=(
-                    f"Session exceeded the {_PLANNING_SESSION_TIMEOUT_SECS // 60}-minute "
-                    "wall-clock limit; re-queued for dispatch."
-                ),
-            )
-    except Exception:
-        logger.exception("[scheduler] Failed to write timeout audit record.")
-
-
 def cancel_task_sessions(task_ids: list[str]) -> None:
     """Kill active scheduler sessions for a list of soft-deleted task IDs.
 
-    Mirrors _check_planning_timeouts: kills the LLM session so the in-flight
-    call_llm() raises SessionKilledError (a ShutdownError subclass), removes
-    the task from _active_sessions to free the slot immediately, and calls
-    request_stop() for any running MaestroLoop (indev) tasks.
+    Kills the LLM session so the in-flight call_llm() raises SessionKilledError
+    (a ShutdownError subclass), removes the task from _active_sessions to free
+    the slot immediately, and calls request_stop() for any running MaestroLoop
+    (indev) tasks.
     """
     from app.agent.llm_client import kill_session as _kill_session
     from app.agent.loop import request_stop

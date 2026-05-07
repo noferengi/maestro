@@ -832,8 +832,17 @@ class PlanningPipeline:
             + _greenfield_warning
         )
 
-        tasks = []
+        # Build tool schema: read-only survey tools + submit_work so agents can
+        # read the codebase before committing to a design. Agents run sequentially
+        # (not in parallel) to avoid saturating the single LLM endpoint.
+        _design_tools = build_tool_schemas(["submit_work"] + SURVEY_TOOLS)
+        _DESIGN_AGENT_MAX_TURNS = 12
+
+        designs = []
         for i in range(n):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
+
             persona_label, persona_concern = _DESIGN_PERSONAS[i % len(_DESIGN_PERSONAS)]
             _spec_suffix = (
                 "\n\n*** SPEC COMPLIANCE — BINDING CONSTRAINTS ***\n"
@@ -847,70 +856,101 @@ class PlanningPipeline:
                 + "\n\n"
                 + _format
             )
-            tasks.append(call_llm(
-                [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_msg},
-                ],
-                base_url=self.llm_base_url,
-                model=self.llm_model,
-                tools=_gate_tools,
-                tool_choice="auto",
-                total_timeout_secs=600,
-                task_id=self.task_id,
-                llm_id=self.llm_id,
-                budget_id=self.budget_id,
-                agent_name=f"{AGENT_NAME}[{persona_label}]",
-            ))
+            messages: list[dict] = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
+            ]
 
-        if is_shutting_down():
-            raise ShutdownError("Server is shutting down")
+            design: dict | None = None
+            try:
+                for turn in range(_DESIGN_AGENT_MAX_TURNS):
+                    if is_shutting_down():
+                        raise ShutdownError("Server is shutting down")
 
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
-
-        designs = []
-        for i, resp in enumerate(responses):
-            if isinstance(resp, Exception):
-                if isinstance(resp, ShutdownError):
-                    raise resp
-                logger.warning(f"[{AGENT_NAME}] Design %d failed: %s", i, resp)
-                designs.append({"error": str(resp)})
-                continue
-            self._track_tokens(resp)
-            
-            assistant_msg = resp.get("choices", [{}])[0].get("message", {})
-            tool_calls = assistant_msg.get("tool_calls") or []
-            
-            design = None
-            if tool_calls:
-                for tc in tool_calls:
-                    tc_result = dispatch_tool(
-                        tc["function"]["name"],
-                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                    resp = await call_llm(
+                        messages,
+                        base_url=self.llm_base_url,
+                        model=self.llm_model,
+                        tools=_design_tools,
+                        tool_choice="auto",
+                        task_id=self.task_id,
+                        llm_id=self.llm_id,
+                        budget_id=self.budget_id,
+                        agent_name=f"{AGENT_NAME}[{persona_label}]",
                     )
-                    if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
-                        data = json.loads(tc_result)
-                        design = data.get("payload")
+                    self._track_tokens(resp)
+
+                    assistant_msg = resp.get("choices", [{}])[0].get("message", {})
+                    tool_calls = assistant_msg.get("tool_calls") or []
+
+                    if not tool_calls:
+                        # LLM emitted free-form text — try to parse as JSON design
+                        content = assistant_msg.get("content", "")
+                        try:
+                            design, _ = json.JSONDecoder().raw_decode(content.lstrip())
+                        except (json.JSONDecodeError, ValueError):
+                            design = {"raw": content, "parse_error": True}
                         break
-            
-            if design is None:
-                # Fallback to free-form if they missed the tool (unlikely with system prompt nudge)
-                content = assistant_msg.get("content", "")
-                try:
-                    design, _ = json.JSONDecoder().raw_decode(content.lstrip())
-                except (json.JSONDecodeError, ValueError):
-                    design = {"raw": content, "parse_error": True}
-            
+
+                    # Process all tool calls for this turn
+                    tool_result_msgs: list[dict] = []
+                    terminal = False
+                    for tc in tool_calls:
+                        tc_name = tc["function"]["name"]
+                        tc_args = (
+                            json.loads(tc["function"]["arguments"])
+                            if isinstance(tc["function"]["arguments"], str)
+                            else tc["function"]["arguments"]
+                        )
+                        tc_result = dispatch_tool(tc_name, tc_args)
+
+                        if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
+                            data = json.loads(tc_result)
+                            design = data.get("payload")
+                            terminal = True
+                            break
+
+                        tool_result_msgs.append({
+                            "role": "tool",
+                            "tool_call_id": tc.get("id", f"call_{turn}_{tc_name}"),
+                            "content": str(tc_result)[:8000],
+                        })
+
+                    if terminal:
+                        break
+
+                    # Append assistant turn + tool results and continue
+                    messages.append({
+                        "role": "assistant",
+                        "content": assistant_msg.get("content") or "",
+                        "tool_calls": tool_calls,
+                    })
+                    messages.extend(tool_result_msgs)
+
+                if design is None:
+                    design = {"error": f"Design agent [{persona_label}] did not submit within {_DESIGN_AGENT_MAX_TURNS} turns"}
+
+            except ShutdownError:
+                raise
+            except Exception as exc:
+                logger.warning("[%s] Design agent %d (%s) failed: %s", AGENT_NAME, i, persona_label, exc)
+                design = {"error": str(exc)}
+
             designs.append(design)
 
-        logger.info(f"[{AGENT_NAME}] Generated %d designs", len(designs))
+        logger.info("[%s] Generated %d designs", AGENT_NAME, len(designs))
         return designs
 
     async def _stage_judge_designs(
         self, designs: list[dict], survey: str
     ) -> tuple[int, dict]:
         """Use a judge LLM call to select the best design."""
-        valid = [(i, d) for i, d in enumerate(designs) if "error" not in d and "parse_error" not in d]
+        valid = [
+            (i, d) for i, d in enumerate(designs)
+            if "error" not in d
+            and "parse_error" not in d
+            and bool(d.get("design_rationale") or d.get("file_manifest"))
+        ]
         if not valid:
             logger.warning(f"[{AGENT_NAME}] No valid designs generated.")
             # Create a synthetic design that explicitly signals failure to reviewers
