@@ -828,3 +828,365 @@ def run_inspect_cards(section: str = "", extra_args: str = "") -> str:
         return "ERROR: inspect_cards.py timed out after 30s"
     except Exception as exc:
         return f"ERROR: {exc}"
+
+
+def preview_dispatch(project: str = None) -> dict:
+    """
+    Dry-run the scheduler tick without dispatching anything.
+
+    Returns what *would* be dispatched: task ID, title, target LLM, estimated
+    token cost, and why each other ready task was skipped (capacity, cooldown,
+    PIP gate, budget, etc.).
+
+    No DB writes. Replicates the _tick() dispatch logic in read-only mode
+    using the same DAG resolution, capacity checks, and cooldown filters.
+
+    project: optional project name filter. If None, scans all projects.
+    """
+    import time
+    import sys
+    import os
+    from pathlib import Path
+
+    # Ensure project root is on sys.path
+    _project_root = str(Path(__file__).parent.parent)
+    if _project_root not in sys.path:
+        sys.path.insert(0, _project_root)
+
+    from app.agent.dag import DAGResolver
+    from app.agent.config import SCHEDULER_DISPATCHABLE_TYPES
+    from app.database import get_all_tasks, get_task, get_llm, get_project
+
+    conn = get_conn()
+    try:
+        # --- Gather tasks ---
+        all_tasks_rows = conn.execute(
+            "SELECT t.id, t.title, t.type, t.prerequisites, t.llm_id, t.budget_id, "
+            "       t.position, t.clarification_status, t.intake_exhausted_at, "
+            "       p.name AS project, p.id AS project_id "
+            "FROM tasks t LEFT JOIN projects p ON t.project_id = p.id "
+            "WHERE t.is_active=1",
+        ).fetchall()
+
+        if project:
+            all_tasks_rows = [r for r in all_tasks_rows if r["project"] == project]
+
+        task_dicts = []
+        for r in all_tasks_rows:
+            prereqs = r["prerequisites"]
+            try:
+                prereqs = json.loads(prereqs) if isinstance(prereqs, str) else (prereqs or [])
+            except Exception:
+                prereqs = []
+            task_dicts.append({
+                "id": r["id"],
+                "title": r["title"],
+                "type": r["type"],
+                "prerequisites": prereqs,
+                "position": r["position"] or 0,
+                "_llm_id": r["llm_id"],
+                "_budget_id": r["budget_id"],
+                "_project": r["project"],
+                "_clarification_status": r["clarification_status"] or "none",
+                "_intake_exhausted": bool(r["intake_exhausted_at"]),
+            })
+
+        # --- DAG resolution ---
+        resolver = DAGResolver(task_dicts)
+        ready_tasks = resolver.get_ready_tasks()
+        by_id = {t["id"]: t for t in task_dicts}
+
+        # Compute DAG depth for priority sorting
+        def _dag_depth(tid):
+            task = by_id.get(tid)
+            if not task or not task.get("prerequisites"):
+                return 0
+            return max(
+                (_dag_depth(pid) for pid in task["prerequisites"] if pid in by_id),
+                default=0,
+            ) + 1
+
+        ready_tasks.sort(key=lambda t: _dag_depth(t["id"]))
+
+        # --- Simulate dispatch state ---
+        # Track which LLMs are "active" (we read from the real scheduler state
+        # so the simulation reflects what's actually pinned right now).
+        # We'll use the real _active_sessions from the scheduler module if it's
+        # running, otherwise assume nothing is active.
+        simulated_active_llm_ids = set()
+        try:
+            from app.agent.scheduler import _active_sessions, _session_llm_ids, _active_sessions_lock
+            from app.agent.scheduler import _external_sessions, _external_sessions_lock
+            with _active_sessions_lock:
+                simulated_active_llm_ids = {
+                    lid for key, lid in _session_llm_ids.items()
+                    if key in _active_sessions and _active_sessions[key].is_alive()
+                }
+            with _external_sessions_lock:
+                simulated_active_llm_ids.update(_external_sessions.values())
+        except Exception:
+            pass
+
+        allowed_llm_id = next(iter(simulated_active_llm_ids)) if simulated_active_llm_ids else None
+
+        # Track simulated capacity
+        simulated_llm_sessions: dict[int, int] = {}
+        for lid in simulated_active_llm_ids:
+            simulated_llm_sessions[lid] = simulated_llm_sessions.get(lid, 0)
+            # Count sessions already pinned to this LLM
+        try:
+            from app.agent.scheduler import _llm_session_counts, _llm_counts_lock
+            with _llm_counts_lock:
+                snap = dict(_llm_session_counts)
+            simulated_llm_sessions.update(snap)
+        except Exception:
+            pass
+
+        # Cooldown simulation — read from DB for rejection cooldowns
+        # We can't easily read the in-memory cooldown dicts, so we approximate
+        # using the rejection_cooldowns table or just note the limitation.
+        # For a read-only preview, we'll check if the task was recently rejected.
+        now = time.time()
+
+        dispatched = []
+        skipped = []
+
+        for task in ready_tasks:
+            task_id = task["id"]
+            task_type = task["type"]
+            llm_id = task["_llm_id"]
+            budget_id = task["_budget_id"]
+
+            # Check 1: dispatchable types
+            if task_type not in SCHEDULER_DISPATCHABLE_TYPES:
+                skipped.append({
+                    "task_id": task_id,
+                    "title": task["title"],
+                    "type": task_type,
+                    "reason": f"type '{task_type}' not in SCHEDULER_DISPATCHABLE_TYPES",
+                })
+                continue
+
+            # Check 2: intake exhausted (idea tasks)
+            if task_type == "idea" and task["_intake_exhausted"]:
+                skipped.append({
+                    "task_id": task_id,
+                    "title": task["title"],
+                    "type": task_type,
+                    "reason": "intake exhausted — human reset required",
+                })
+                continue
+
+            # Check 3: clarification approved or skipped (idea tasks)
+            if task_type == "idea" and task["_clarification_status"] not in ("approved", "skipped"):
+                skipped.append({
+                    "task_id": task_id,
+                    "title": task["title"],
+                    "type": task_type,
+                    "reason": f"clarification_status='{task['_clarification_status']}' (not approved)",
+                })
+                continue
+
+            # Check 4: already running — read from real scheduler state
+            is_running = False
+            try:
+                from app.agent.scheduler import _active_sessions, _active_sessions_lock
+                with _active_sessions_lock:
+                    is_running = task_id in _active_sessions and _active_sessions[task_id].is_alive()
+            except Exception:
+                pass
+            if is_running:
+                skipped.append({
+                    "task_id": task_id,
+                    "title": task["title"],
+                    "type": task_type,
+                    "reason": "already running (active session)",
+                })
+                continue
+
+            # Check 5: PIP resolution guard (review stages)
+            pip_guarded = False
+            if task_type in {"conceptual_review", "optimization", "security", "human_review"}:
+                try:
+                    from app.database import get_active_pip_resolution_jobs_for_task
+                    if get_active_pip_resolution_jobs_for_task(task_id):
+                        pip_guarded = True
+                except Exception:
+                    pass
+            if pip_guarded:
+                skipped.append({
+                    "task_id": task_id,
+                    "title": task["title"],
+                    "type": task_type,
+                    "reason": "PIP resolution jobs active — re-dispatch blocked",
+                })
+                continue
+
+            # Check 6: planning-gate rejection cooldown / stopped
+            if task_type == "planning":
+                try:
+                    from app.agent.scheduler import _planning_stopped
+                    if task_id in _planning_stopped:
+                        skipped.append({
+                            "task_id": task_id,
+                            "title": task["title"],
+                            "type": task_type,
+                            "reason": "planning stopped — requires manual re-trigger via /run-planning",
+                        })
+                        continue
+                except Exception:
+                    pass
+                # Check rejection cooldown via DB transition results
+                try:
+                    last_planning_gate = conn.execute(
+                        "SELECT created_at FROM transition_results "
+                        "WHERE task_id=? AND transition='planning_gate' AND outcome='fail' "
+                        "ORDER BY id DESC LIMIT 1",
+                        (task_id,),
+                    ).fetchone()
+                    if last_planning_gate and last_planning_gate["created_at"]:
+                        gate_time = last_planning_gate["created_at"].replace("T", " ").replace("Z", "")
+                        from datetime import datetime as _dt
+                        try:
+                            gate_dt = _dt.strptime(gate_time, "%Y-%m-%d %H:%M:%S")
+                            gate_dt = gate_dt.replace(tzinfo=_dt.now(_dt.timezone.utc).tzinfo)
+                            age_min = (now - gate_dt.timestamp()) / 60
+                            if age_min < 5:
+                                skipped.append({
+                                    "task_id": task_id,
+                                    "title": task["title"],
+                                    "type": task_type,
+                                    "reason": f"planning-gate rejection cooldown ({age_min:.1f} min ago, 5 min cooldown)",
+                                })
+                                continue
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            # Check 7: failure cooldown (60s)
+            failure_cooldown = False
+            try:
+                from app.agent.scheduler import _failed_cooldowns
+                if task_id in _failed_cooldowns:
+                    elapsed = now - _failed_cooldowns[task_id]
+                    if elapsed < 60:
+                        failure_cooldown = True
+                        skipped.append({
+                            "task_id": task_id,
+                            "title": task["title"],
+                            "type": task_type,
+                            "reason": f"failure cooldown ({60 - elapsed:.0f}s remaining)",
+                        })
+                        continue
+            except Exception:
+                pass
+
+            # Check 8: LLM configured
+            if not llm_id:
+                skipped.append({
+                    "task_id": task_id,
+                    "title": task["title"],
+                    "type": task_type,
+                    "reason": "no LLM configured",
+                })
+                continue
+
+            # Check 9: LLM exists
+            db_task = get_task(task_id)
+            if not db_task or not db_task.llm_id:
+                skipped.append({
+                    "task_id": task_id,
+                    "title": task["title"],
+                    "type": task_type,
+                    "reason": "task has no LLM reference",
+                })
+                continue
+
+            llm = get_llm(db_task.llm_id)
+            if not llm:
+                skipped.append({
+                    "task_id": task_id,
+                    "title": task["title"],
+                    "type": task_type,
+                    "reason": f"LLM {db_task.llm_id} not found",
+                })
+                continue
+
+            # Check 10: one-LLM-at-a-time policy
+            if allowed_llm_id is not None and llm.id != allowed_llm_id:
+                skipped.append({
+                    "task_id": task_id,
+                    "title": task["title"],
+                    "type": task_type,
+                    "reason": f"one-LLM policy pinned to LLM {allowed_llm_id} ({llm.model}); this task uses LLM {llm.id} ({llm.model})",
+                })
+                continue
+
+            # Check 11: budget capacity
+            worst = 0
+            if llm_id and budget_id:
+                pp_rate = getattr(llm, 'cost_per_million_prompt_tokens', 0.0) or 0.0
+                tg_rate = getattr(llm, 'cost_per_million_completion_tokens', 0.0) or 0.0
+                if pp_rate > 0 or tg_rate > 0:
+                    from app.agent.config import MAX_TOKENS_PER_TURN
+                    worst = int(llm.max_context * pp_rate * 100) + int(MAX_TOKENS_PER_TURN * tg_rate * 100)
+
+            if worst > 0:
+                try:
+                    from app.database import budget_has_capacity
+                    if not budget_has_capacity(budget_id, worst):
+                        skipped.append({
+                            "task_id": task_id,
+                            "title": task["title"],
+                            "type": task_type,
+                            "reason": f"budget {budget_id} insufficient (worst-case {worst} µ¢ needed)",
+                        })
+                        continue
+                except Exception:
+                    pass
+
+            # Check 12: capacity slot
+            current_count = simulated_llm_sessions.get(llm.id, 0)
+            cap = llm.parallel_sessions
+            if current_count >= cap:
+                skipped.append({
+                    "task_id": task_id,
+                    "title": task["title"],
+                    "type": task_type,
+                    "reason": f"LLM {llm.id} capacity full ({current_count}/{cap} sessions)",
+                })
+                continue
+
+            # All checks passed — would dispatch
+            simulated_llm_sessions[llm.id] = current_count + 1
+            if allowed_llm_id is None:
+                allowed_llm_id = llm.id
+
+            estimated_cost = ""
+            if worst > 0:
+                estimated_cost = f"{worst} µ¢"
+
+            dispatched.append({
+                "task_id": task_id,
+                "title": task["title"],
+                "type": task_type,
+                "project": task["_project"],
+                "llm_id": llm.id,
+                "llm_model": llm.model,
+                "estimated_cost": estimated_cost,
+            })
+
+        return {
+            "dispatched": dispatched,
+            "skipped": skipped,
+            "summary": {
+                "total_ready": len(ready_tasks),
+                "would_dispatch": len(dispatched),
+                "would_skip": len(skipped),
+                "active_llm_ids": list(simulated_active_llm_ids),
+                "pinned_llm_id": allowed_llm_id,
+            },
+        }
+    finally:
+        conn.close()

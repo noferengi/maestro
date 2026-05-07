@@ -51,7 +51,7 @@ from app.agent.config import (
     SURVEY_SUMMARY_MAX_TOKENS,
     PLANNING_SESSION_TIMEOUT_MINUTES,
 )
-from app.agent.llm_client import is_shutting_down, signal_shutdown, signal_force_shutdown, ShutdownError
+from app.agent.llm_client import is_shutting_down, signal_shutdown, signal_force_shutdown, ShutdownError, TaskDeactivatedError
 
 logger = logging.getLogger(__name__)
 AGENT_NAME = "Scheduler"
@@ -623,15 +623,30 @@ def get_scheduler_status() -> dict:
             stopped_list.append(entry)
         elif tid in ready_ids:
             # Ready but not dispatched - determine why
-            if not task.llm_id:
-                reason = "no_llm"
-            elif tid in _failed_cooldowns and (now - _failed_cooldowns[tid]) < _FAIL_COOLDOWN_SECONDS:
-                remaining = int(_FAIL_COOLDOWN_SECONDS - (now - _failed_cooldowns[tid]))
-                reason = f"cooldown ({remaining}s)"
-            elif info and llm_counts.get(task.llm_id, 0) >= info["max"]:
-                reason = "at_capacity"
+            if task_type == 'idea':
+                cs = getattr(task, 'clarification_status', 'none')
+                if cs == 'pending':
+                    reason = "clarifying"
+                elif cs == 'awaiting_user':
+                    reason = "awaiting_approval"
+                elif cs != 'approved':
+                    reason = "needs_clarification"
+                else:
+                    reason = None # Proceed to other checks
             else:
-                reason = "pending"
+                reason = None
+
+            if reason is None:
+                if not task.llm_id:
+                    reason = "no_llm"
+                elif tid in _failed_cooldowns and (now - _failed_cooldowns[tid]) < _FAIL_COOLDOWN_SECONDS:
+                    remaining = int(_FAIL_COOLDOWN_SECONDS - (now - _failed_cooldowns[tid]))
+                    reason = f"cooldown ({remaining}s)"
+                elif info and llm_counts.get(task.llm_id, 0) >= info["max"]:
+                    reason = "at_capacity"
+                else:
+                    reason = "pending"
+            
             entry["reason"] = reason
             queued_list.append(entry)
         else:
@@ -902,6 +917,16 @@ def _tick() -> None:
     for node_id, llm_set in _node_active_llms.items():
         node_active_counts[node_id] = len(llm_set)
 
+    # 0c. Clarification jobs — absolute highest priority.
+    #     Run before the one-LLM policy check so clarification can pin the LLM
+    #     before any pipeline task does. A new IDEA card's spec rewrite should
+    #     never queue behind an already-running optimization or final-review.
+    #     allowed_llm_id is None here (computed below), so clarification always
+    #     gets the first free slot regardless of what else is queued.
+    _dispatch_clarification_jobs(
+        None, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
+    )
+
     # 1. Determine the currently pinned LLM (one-at-a-time policy).
     #    allowed_llm_id = None  → nothing is running; first dispatch pins a new LLM.
     #    allowed_llm_id = N     → only dispatch to LLM N until it drains completely.
@@ -951,6 +976,13 @@ def _tick() -> None:
             if _db_task and _db_task.intake_exhausted_at:
                 continue  # Intake exhausted — human must reset via /reset-intake
 
+            # Human approval gate: only dispatch intake after the clarification draft
+            # has been reviewed and approved. 'awaiting_user' and 'pending' block here.
+            # 'skipped' bypasses the draft UI entirely and is treated as approved.
+            cs = getattr(_db_task, 'clarification_status', 'none') if _db_task else 'none'
+            if cs not in ('approved', 'skipped'):
+                continue
+
             # Rejected / needs_research / etc.: retry after cooldown
             if task_id in _rejection_cooldowns:
                 if time.time() - _rejection_cooldowns[task_id] < _REJECTION_RETRY_COOLDOWN:
@@ -964,7 +996,7 @@ def _tick() -> None:
         # PIP resolution guard: don't re-dispatch a review stage while resolution
         # agents are still working on its PIPs.  The stage will re-enter naturally
         # on the next tick after all jobs reach 'done'.
-        if task_type in {"conceptual_review", "optimization", "security", "full_review"}:
+        if task_type in {"conceptual_review", "optimization", "security", "human_review"}:
             from app.database import get_active_pip_resolution_jobs_for_task
             if get_active_pip_resolution_jobs_for_task(task_id):
                 logger.debug(
@@ -1349,6 +1381,59 @@ def _start_dreamer_thread(
         _session_llm_ids[session_key] = llm_id
         _session_titles[session_key] = f"Dreamer: {project_name}"
     t.start()
+
+
+def _dispatch_clarification_jobs(
+    allowed_llm_id: "int | None",
+    node_active_counts: dict,
+    node_session_counts: dict,
+    node_obj_cache: dict,
+    llm_node_cache: dict,
+) -> "int | None":
+    """Dispatch IDEA cards with clarification_status='pending'.
+
+    Runs FIRST in every tick — before file summaries, arch-gen, and pipeline tasks —
+    so a newly created IDEA card's clarification always gets the next free LLM slot.
+    """
+    from app.database import get_tasks_needing_clarification, get_llm
+    from app.agent.clarify import run_clarification_for_task
+
+    pending_tasks = get_tasks_needing_clarification()
+    for task in pending_tasks:
+        job_key = f"clarify-{task.id}"
+        with _active_sessions_lock:
+            if job_key in _active_sessions and _active_sessions[job_key].is_alive():
+                continue
+
+        llm = get_llm(task.llm_id)
+        if not llm:
+            continue
+
+        if allowed_llm_id is not None and llm.id != allowed_llm_id:
+            continue
+
+        if not _check_and_reserve_slot(
+            llm, node_active_counts, node_session_counts, node_obj_cache, llm_node_cache,
+            label=job_key,
+        ):
+            continue
+
+        thread = threading.Thread(
+            target=run_clarification_for_task,
+            args=(task.id,),
+            daemon=True,
+            name=f"maestro-clarify-{task.id}",
+        )
+        with _active_sessions_lock:
+            _active_sessions[job_key] = thread
+            _session_llm_ids[job_key] = llm.id
+            _session_titles[job_key] = f"Clarification: {(task.title or '')[:60]}"
+            _session_types[job_key] = "clarification"
+        thread.start()
+        logger.info("[Scheduler] Dispatched clarification for task '%s' on LLM %d", task.id, llm.id)
+        allowed_llm_id = llm.id  # pin LLM for subsequent dispatch calls this tick
+
+    return allowed_llm_id
 
 
 def _dispatch_file_summary_jobs(
@@ -1806,13 +1891,18 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
                 return
 
             # Get diff for the files in this scope
-            from app.agent.tools import run_shell
+            import subprocess as _subprocess
             diff_text = ""
             if existing.file_paths:
                 file_list = json.loads(existing.file_paths)
-                # Cap diff size
-                diff_cmd = f"git diff {existing.git_commit or 'HEAD^'}..HEAD -- " + " ".join(file_list[:20])
-                diff_text = loop.run_until_complete(run_shell(diff_cmd, cwd=project_root))
+                diff_args = ["git", "diff", f"{existing.git_commit or 'HEAD^'}..HEAD", "--"] + file_list[:20]
+                try:
+                    _result = _subprocess.run(
+                        diff_args, cwd=project_root, capture_output=True, text=True, timeout=30
+                    )
+                    diff_text = _result.stdout
+                except Exception:
+                    diff_text = ""
 
             prompt = (
                 f"Here is the current summary for the '{job.scope_key}' {job.scope_type} in project '{job.project_name}':\n"
@@ -1851,12 +1941,18 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
                 return
 
             # Get diff for the files in this scope
-            from app.agent.tools import run_shell
+            import subprocess as _subprocess
             diff_text = ""
             if existing.file_paths:
                 file_list = json.loads(existing.file_paths)
-                diff_cmd = f"git diff {existing.git_commit or 'HEAD^'}..HEAD -- " + " ".join(file_list[:20])
-                diff_text = loop.run_until_complete(run_shell(diff_cmd, cwd=project_root))
+                diff_args = ["git", "diff", f"{existing.git_commit or 'HEAD^'}..HEAD", "--"] + file_list[:20]
+                try:
+                    _result = _subprocess.run(
+                        diff_args, cwd=project_root, capture_output=True, text=True, timeout=30
+                    )
+                    diff_text = _result.stdout
+                except Exception:
+                    diff_text = ""
 
             prompt = (
                 f"You are updating the summary for the '{job.scope_key}' {job.scope_type} in project '{job.project_name}'.\n"
@@ -2778,10 +2874,12 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
             _run_optimization_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
         elif task_type == "security":
             _run_security_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
-        elif task_type == "full_review":
-            _run_full_review_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
+        elif task_type == "final_review":
+            _run_final_review_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
         else:
             _run_maestro_loop(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
+    except TaskDeactivatedError as exc:
+        logger.info("Task '%s' session halted: %s", task_id, exc)
     except ShutdownError:
         logger.info("Task '%s' dispatch aborted due to server shutdown.", task_id)
     except Exception:
@@ -3549,7 +3647,7 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
     try:
         from app.database import get_transition_results as _gtr_dev
         _review_transitions = {"conceptual_to_optimization", "optimization_to_security",
-                                "security_to_full_review", "full_review_to_completed"}
+                                "security_to_final_review", "final_review_to_human_review"}
         for _tr in _gtr_dev(task_id):  # ordered desc by created_at
             if _tr.outcome in ("rejected", "failed") and _tr.transition in _review_transitions:
                 _vs = _tr.vote_summary or {}
@@ -3893,8 +3991,8 @@ def _run_security_task(task_id: str, llm_base_url: str, llm_model: str,
         )
 
         if sec_result.get("outcome") == "passed":
-            update_task(task_id, type="full_review")
-            logger.info("[security] Task '%s' advanced to FULL REVIEW via scheduler.", task_id)
+            update_task(task_id, type="final_review")
+            logger.info("[security] Task '%s' advanced to FINAL REVIEW via scheduler.", task_id)
         else:
             demotion = sec_result.get("demotion_target", "indev")
             update_task(task_id, type=demotion)
@@ -3923,15 +4021,16 @@ def _run_security_task(task_id: str, llm_base_url: str, llm_model: str,
             pass
 
 
-def _run_full_review_task(task_id: str, llm_base_url: str, llm_model: str,
-                           max_context: int | None = None,
-                           llm_id: int | None = None,
-                           budget_id: int | None = None,
-                           project_path: str | None = None) -> None:
-    """Run the full review pipeline for a FULL_REVIEW task; advance to completed on pass."""
-    from app.agent.full_review import run_full_review_pipeline
+
+def _run_final_review_task(task_id: str, llm_base_url: str, llm_model: str,
+                            max_context: int | None = None,
+                            llm_id: int | None = None,
+                            budget_id: int | None = None,
+                            project_path: str | None = None) -> None:
+    """Run the final review pipeline for a FINAL_REVIEW task; advance to human_review (manual) on pass."""
+    from app.agent.final_review import run_final_review_pipeline
     from app.agent.tools import set_task_git_cwd
-    from app.database import get_task, update_task
+    from app.database import get_task, update_task, append_task_history
     from app.database import (
         create_transition_vote, create_transition_result,
         create_agent_session, close_agent_session,
@@ -3944,7 +4043,7 @@ def _run_full_review_task(task_id: str, llm_base_url: str, llm_model: str,
         return
 
     _session_id = create_agent_session(
-        task_id=task_id, agent_type="full_review",
+        task_id=task_id, agent_type="final_review",
         llm_id=llm_id, budget_id=budget_id, scheduler_reason="scheduler",
     )
     _exit_reason = "error"
@@ -3954,14 +4053,13 @@ def _run_full_review_task(task_id: str, llm_base_url: str, llm_model: str,
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        # Pre-flight PIP gate — blocks full_review entry if any PIP is unmet
-        if not _run_pip_preflight_and_gate(task_id, "full_review", llm_id, budget_id, project_path, loop):
+        if not _run_pip_preflight_and_gate(task_id, "final_review", llm_id, budget_id, project_path, loop):
             _exit_reason = "pip_blocked"
-            _exit_summary = "PIP pre-flight gate blocked full_review entry."
-            return  # card stays in full_review; resolution jobs dispatched
+            _exit_summary = "PIP pre-flight gate blocked final_review entry."
+            return
 
         result = loop.run_until_complete(
-            run_full_review_pipeline(
+            run_final_review_pipeline(
                 task_id=task_id,
                 task_description=task.description or "",
                 llm_base_url=llm_base_url,
@@ -3977,7 +4075,7 @@ def _run_full_review_task(task_id: str, llm_base_url: str, llm_model: str,
         _completion_tokens = result.get("total_completion_tokens", 0)
         create_transition_result(
             task_id=task_id,
-            transition="full_review",
+            transition="final_review",
             outcome=result.get("outcome", "unknown"),
             vote_summary=result,
             total_prompt_tokens=_prompt_tokens,
@@ -3985,40 +4083,38 @@ def _run_full_review_task(task_id: str, llm_base_url: str, llm_model: str,
         )
 
         if result.get("outcome") == "passed":
-            # Pushed to FINAL REVIEW (full_review column) - do a virtual merge test.
             from app.agent.merge import execute_merge
             from app.database import get_project_path as _get_project_path
             pp = project_path
             if not pp and task.project:
                 pp = _get_project_path(task.project)
 
-            logger.info("[full_review] Task '%s' passed. Running virtual merge test.", task_id)
             merge_test = execute_merge(task_id, project_path=pp, dry_run=True)
-
-            from app.database import append_task_history
             if merge_test.status == "virtual_passed":
-                _exit_summary = "Full review passed. Virtual merge SUCCEEDED."
-                append_task_history(task_id, "ready_for_review", message="Full review passed. Virtual merge/test SUCCEEDED. Ready for final manual review and merge.")
-                logger.info("[full_review] Task '%s' virtual merge SUCCEEDED.", task_id)
+                _exit_summary = "Final AI review passed. Virtual merge SUCCEEDED. Ready for human review."
+                append_task_history(task_id, "ready_for_review", message=_exit_summary)
             else:
-                _exit_summary = f"Full review passed, but virtual merge FAILED: {merge_test.status}."
-                append_task_history(task_id, "merge_test_failed", message=f"Full review passed, but VIRTUAL MERGE FAILED: {merge_test.status}. Detail: {merge_test.error_detail}")
-                logger.warning("[full_review] Task '%s' virtual merge FAILED: %s", task_id, merge_test.status)
+                _exit_summary = f"Final AI review passed, but virtual merge FAILED: {merge_test.status}."
+                append_task_history(task_id, "merge_test_failed", message=f"{_exit_summary} Detail: {merge_test.error_detail}")
+                logger.warning("[final_review] Task '%s' virtual merge FAILED: %s", task_id, merge_test.status)
+
+            update_task(task_id, type="human_review")
+            logger.info("[final_review] Task '%s' passed. Advanced to HUMAN REVIEW.", task_id)
         else:
             demotion = result.get("demotion_target", "indev")
             update_task(task_id, type=demotion)
-            _record_demotion_inline(task_id, "full_review", demotion, result.get("summary", ""))
-            logger.warning("[full_review] Task '%s' demoted to %s via scheduler.", task_id, demotion)
+            _record_demotion_inline(task_id, "final_review", demotion, result.get("summary", ""))
+            logger.warning("[final_review] Task '%s' demoted to %s via scheduler.", task_id, demotion)
     except ShutdownError:
         _exit_reason = "shutdown"
-        _exit_summary = "Server shutdown during full review."
-        logger.info(f"[{AGENT_NAME}] Full review for task '%s' aborted due to server shutdown.", task_id)
+        _exit_summary = "Server shutdown during final review."
+        logger.info(f"[{AGENT_NAME}] Final review for task '%s' aborted due to server shutdown.", task_id)
     except Exception:
         _exit_reason = "error"
-        _exit_summary = "Full review raised an unexpected exception."
-        logger.exception(f"[{AGENT_NAME}] Full review for task '%s' failed.", task_id)
+        _exit_summary = "Final review raised an unexpected exception."
+        logger.exception(f"[{AGENT_NAME}] Final review for task '%s' failed.", task_id)
         update_task(task_id, type="indev")
-        _record_demotion_inline(task_id, "full_review", "indev", "Exception in full review")
+        _record_demotion_inline(task_id, "final_review", "indev", "Exception in final review")
     finally:
         close_agent_session(_session_id, _exit_reason, _exit_summary,
                             prompt_tokens=_prompt_tokens, completion_tokens=_completion_tokens)
@@ -4050,7 +4146,7 @@ def _record_demotion_inline(task_id: str, from_stage: str, to_stage: str, reason
     update_task(task_id, demotion_count=(task.demotion_count or 0) + 1, demotion_history=history)
 
     # Trigger PIP generation if demoted from a review stage
-    review_stages = {"conceptual_review", "optimization", "security", "full_review"}
+    review_stages = {"conceptual_review", "optimization", "security", "human_review"}
     if from_stage in review_stages:
         logger.info("[pip] Triggering PIP generation for task '%s' demoted from '%s'.", task_id, from_stage)
         # We're in a daemon thread, but we can still use the loop if one exists
