@@ -279,14 +279,22 @@ def check_turn_saturation(
         # If we have reached or dropped below the threshold, and haven't warned for it yet
         if remaining <= t and t not in warned_set:
             warned_set.add(t)
-            messages.append({
-                "role": "user", 
-                "content": (
-                    f"[SYSTEM WARNING] You have {remaining} tool-call turns remaining. "
-                    "Focus on completing your current task, validating your changes, "
-                    "and providing your final output before the budget is exhausted."
+            if t <= 5:
+                msg = (
+                    f"[SYSTEM WARNING — CRITICAL] You have {remaining} tool-call turns remaining. "
+                    "You MUST call submit_work NOW. "
+                    "If your implementation is complete and tests pass, call submit_work(signal='ACCEPTED', summary='...'). "
+                    "If you cannot finish in time, call submit_work(signal='REVERT_TO_DESIGN', summary='...reason...') "
+                    "rather than being cut off silently. Do NOT make further exploratory tool calls."
                 )
-            })
+            else:
+                msg = (
+                    f"[SYSTEM WARNING] You have {remaining} tool-call turns remaining. "
+                    "Focus on completing and validating your changes. "
+                    "If you cannot finish within the remaining budget, call "
+                    "submit_work(signal='REVERT_TO_DESIGN', summary='...reason...') rather than being cut off."
+                )
+            messages.append({"role": "user", "content": msg})
             return True
     return False
 
@@ -422,23 +430,22 @@ SECURITY_REVIEWER_TOOLS: list[str] = _getlist("security_review", "reviewer_tools
 )
 
 # ===========================================================================
-# Full review
+# Final review (AI stage before human review)
 # ===========================================================================
 
-FULL_REVIEW_AUTO_UX: bool = _getbool("full_review", "auto_ux_review", None, True)
-FULL_REVIEW_FRONTEND_PATTERNS: list[str] = _getlist("full_review", "frontend_patterns", "app/web/*.html, app/web/*.js, app/web/*.css")
-FULL_REVIEW_RESEARCH_LIVES: int = _getint("full_review", "research_agent_max_lives", None, 2)
-FULL_REVIEW_RESEARCH_LIVES: int = _getint("full_review", "research_agent_max_lives", None, 2)
-FULL_REVIEW_MAX_REVIEWER_TURNS: int = _getint("full_review", "reviewer_max_turns", None, 100)
+FINAL_REVIEW_AUTO_UX: bool = _getbool("final_review", "auto_ux_review", None, True)
+FINAL_REVIEW_FRONTEND_PATTERNS: list[str] = _getlist("final_review", "frontend_patterns", "app/web/*.html, app/web/*.js, app/web/*.css")
+FINAL_REVIEW_RESEARCH_LIVES: int = _getint("final_review", "research_agent_max_lives", None, 2)
+FINAL_REVIEW_MAX_REVIEWER_TURNS: int = _getint("final_review", "reviewer_max_turns", None, 100)
 
-FULL_REVIEW_CODE_QUALITY_TOOLS: list[str] = _getlist("full_review", "code_quality_reviewer_tools",
+FINAL_REVIEW_CODE_QUALITY_TOOLS: list[str] = _getlist("final_review", "code_quality_reviewer_tools",
     "read_file, read_file_metadata, read_last_output, "
     "find_in_files, find_files, list_directory, "
     "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
     "get_task, list_tasks, submit_work, "
     "run_test_pytest, run_check_mypy, run_check_ruff, run_check_black, read_test_summary"
 )
-FULL_REVIEW_FUNCTIONAL_TOOLS: list[str] = _getlist("full_review", "functional_reviewer_tools",
+FINAL_REVIEW_FUNCTIONAL_TOOLS: list[str] = _getlist("final_review", "functional_reviewer_tools",
     "read_file, read_file_metadata, read_last_output, "
     "find_in_files, find_files, list_directory, "
     "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
@@ -463,7 +470,7 @@ MERGE_PUSH_RETRIES: int  = _getint("merge", "push_retries",        None,        
 PIPELINE_COLUMN_ORDER: list[str] = _getlist(
     "pipeline", "column_order",
     "architecture, idea, planning, indev, conceptual_review, "
-    "optimization, security, full_review, completed",
+    "optimization, security, final_review, completed",
 )
 
 PIPELINE_DONE_STATUSES: frozenset[str] = frozenset(
@@ -530,7 +537,7 @@ SCHEDULER_TICK_INTERVAL: float = _getfloat("scheduler", "tick_interval", None, 5
 SCHEDULER_ENABLED: bool = _getbool("scheduler", "enabled", None, True)
 SCHEDULER_DISPATCHABLE_TYPES: list[str] = _getlist(
     "scheduler", "dispatchable_types",
-    "idea, planning, indev, conceptual_review, optimization, security, full_review"
+    "idea, planning, indev, conceptual_review, optimization, security, final_review"
 )
 FILE_SUMMARY_WAIT_TIMEOUT: float = _getfloat("scheduler", "file_summary_wait_timeout", None, 300.0)
 FILE_SUMMARY_STREAM_IDLE_TIMEOUT: float = _getfloat("scheduler", "file_summary_stream_idle_timeout", None, 30.0)

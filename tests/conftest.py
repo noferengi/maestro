@@ -152,3 +152,35 @@ def print_migration_status(conn):
         state = status.get(migration_id, "pending")
         print(f"  {migration_id}: {state} - {desc}")
     print("-" * 60)
+
+
+# ---------------------------------------------------------------------------
+# Intake Pipeline Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def sample_all_tasks():
+    """A sample list of tasks for conflict detection tests."""
+    return [
+        {
+            "id": "task-existing-1",
+            "title": "Database Schema Design",
+            "type": "planning",
+            "description": "Designing the core database schema for the kanban board.",
+            "project": "Maestro"
+        },
+        {
+            "id": "task-existing-2",
+            "title": "React Dashboard UI",
+            "type": "indev",
+            "description": "Implementing the main dashboard view with React components.",
+            "project": "Maestro"
+        },
+        {
+            "id": "task-existing-3",
+            "title": "Authentication API",
+            "type": "completed",
+            "description": "User authentication endpoints and middleware.",
+            "project": "Maestro"
+        }
+    ]

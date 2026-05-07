@@ -50,7 +50,7 @@ if globals().get('_initialized'):
         'app.database.crud_pipeline', 'app.database.crud_jobs',
         'app.database.crud_files', 'app.database.crud_inbox',
         'app.database.crud_sessions', 'app.database.crud_dreamer',
-        'app.database.crud_survey',
+        'app.database.crud_survey', 'app.database.crud_clarification',
         ]:  # NOTE: keep this list in sync with the from-imports below
 
         if _sub in _sys.modules:
@@ -83,7 +83,7 @@ from .models import (
     ComponentResult,
     OptimizationResult,
     SecurityReviewResult,
-    FullReviewResult,
+    FinalReviewResult,
     MergeRecord,
     PerformanceImprovementPlan,
     PipVerification,
@@ -99,6 +99,7 @@ from .models import (
     DreamerRun,
     ScopeSummary,
     ScopeSurveyJob,
+    IntakeDraft,
 )
 
 # Task CRUD + seeding + helpers
@@ -126,6 +127,7 @@ from .crud_tasks import (
     count_total_sub_ideas,
     get_descendant_tree,
     task_to_dict,
+    get_tasks_needing_clarification,
     create_pip,
     get_pips_for_task,
     satisfy_pips,
@@ -212,9 +214,9 @@ from .crud_pipeline import (
     create_security_review_result,
     get_security_review_results,
     update_security_review_result,
-    create_full_review_result,
-    get_full_review_results,
-    update_full_review_result,
+    create_final_review_result,
+    get_final_review_results,
+    update_final_review_result,
     create_merge_record,
     get_merge_record,
     update_merge_record,
@@ -283,6 +285,15 @@ from .crud_dreamer import (
     get_dreamer_run,
 )
 
+# Intake clarification drafts
+from .crud_clarification import (
+    create_intake_draft,
+    get_intake_draft,
+    update_intake_draft,
+    append_conversation_message,
+    intake_draft_to_dict,
+)
+
 # Project survey / summarization
 from .crud_survey import (
     upsert_scope_summary,
@@ -302,7 +313,7 @@ __all__ = [
     "ComputeNode", "LLM", "Budget", "Project", "Task", "BudgetEntry", "Expense",
     "TransitionVote", "TransitionResult", "SubdivisionRecord",
     "PlanningResult", "ComponentResult", "OptimizationResult",
-    "SecurityReviewResult", "FullReviewResult", "MergeRecord", "PerformanceImprovementPlan",
+    "SecurityReviewResult", "FinalReviewResult", "MergeRecord", "PerformanceImprovementPlan",
     "PipVerification",
     "PipResolutionJob",
     "ResearchJob", "FileSummaryJob", "OptimizationBenchmark", "ArchGenJob",
@@ -310,6 +321,7 @@ __all__ = [
     "FileSummary", "SearchCache", "InboxMessage",
     "DreamerRun",
     "ScopeSummary", "ScopeSurveyJob",
+    "IntakeDraft",
     # crud_tasks
     "init_db", "seed_sample_tasks", "seed_task", "seed_sample_tasks_raw",
     "create_task", "get_task", "get_tasks_by_type", "get_tasks_by_project",
@@ -317,6 +329,7 @@ __all__ = [
     "get_task_history", "append_task_history", "reorder_tasks", "batch_reorder_tasks",
     "set_big_idea_flag", "get_child_tasks", "get_active_child_tasks",
     "count_total_sub_ideas", "get_descendant_tree", "task_to_dict",
+    "get_tasks_needing_clarification",
     "create_pip", "get_pips_for_task", "satisfy_pips",
     "create_pip_verification", "get_latest_pip_verification",
     "get_pip_verification_map", "get_pip_verifications_for_pip", "pip_status_at_stage",
@@ -345,7 +358,7 @@ __all__ = [
     "create_component_result", "get_component_results", "get_latest_dev_run_number", "update_component_result",
     "create_optimization_result", "get_optimization_result", "update_optimization_result",
     "create_security_review_result", "get_security_review_results", "update_security_review_result",
-    "create_full_review_result", "get_full_review_results", "update_full_review_result",
+    "create_final_review_result", "get_final_review_results", "update_final_review_result",
     "create_merge_record", "get_merge_record", "update_merge_record",
     # crud_jobs
     "create_research_job", "get_research_job", "get_pending_research_jobs",
@@ -373,6 +386,9 @@ __all__ = [
     "mark_scope_stale", "enqueue_scope_survey_job",
     "get_pending_scope_survey_jobs", "update_scope_survey_job",
     "get_scope_survey_page_jobs",
+    # crud_clarification
+    "create_intake_draft", "get_intake_draft", "update_intake_draft",
+    "append_conversation_message", "intake_draft_to_dict",
 ]
 
 # Sentinel — presence of this flag on a subsequent execution means we're

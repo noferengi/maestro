@@ -41,6 +41,8 @@ class DevOrchestratorResult:
     files_changed: list[str] = field(default_factory=list)
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    test_output: str | None = None
+    test_parsed: dict = field(default_factory=dict)
     error_detail: str | None = None
 
 
@@ -174,7 +176,7 @@ class DevOrchestrator:
                 logger.warning("[dev_orch] Batch commit failed: %s", e)
 
         # Run full test suite
-        test_passed, test_output = await self._run_full_tests()
+        test_passed, test_output, test_parsed = await self._run_full_tests()
 
         if not test_passed:
             # Before demoting to planning, give the agent targeted fix attempts.
@@ -205,7 +207,7 @@ class DevOrchestrator:
                         error_detail=f"Test-fix loop signalled redesign needed: {test_output[:500]}",
                     )
 
-                test_passed, test_output = await self._run_full_tests()
+                test_passed, test_output, test_parsed = await self._run_full_tests()
                 if test_passed:
                     logger.info(
                         "[dev_orch] Test-fix loop %d succeeded for task '%s'.",
@@ -217,6 +219,9 @@ class DevOrchestrator:
                     fix_attempt, self.task_id,
                 )
 
+        # Store test evidence as a special component result row
+        self._store_test_evidence(test_output, test_parsed, self._dev_run_number)
+
         return DevOrchestratorResult(
             task_id=self.task_id,
             status="ACCEPTED" if test_passed else "REVERT_TO_DESIGN",
@@ -226,6 +231,8 @@ class DevOrchestrator:
             files_changed=sorted(all_files),
             prompt_tokens=total_prompt,
             completion_tokens=total_completion,
+            test_output=test_output,
+            test_parsed=test_parsed,
             error_detail=None if test_passed else (
                 f"Test suite failed after {INDEV_TEST_FIX_MAX_RETRIES} fix attempt(s).\n\n"
                 f"Last test output:\n{test_output}"
@@ -358,17 +365,31 @@ class DevOrchestrator:
 
         return result  # Last attempt result
 
-    async def _run_full_tests(self) -> tuple[bool, str]:
-        """Run the full test suite. Returns (passed, output)."""
-        from app.agent.tools import run_shell
+    async def _run_full_tests(self) -> tuple[bool, str, dict]:
+        """Run the full test suite and parse results.
+
+        Returns:
+            (passed, raw_output, parsed) where parsed is a dict from
+            :py:func:`app.agent.test_parser.parse_pytest_output`.
+        """
+        import asyncio as _asyncio
+        from app.agent.test_parser import parse_pytest_output
         try:
-            output = run_shell("python -m pytest -x --tb=short -q 2>&1")
-            passed = "failed" not in output.lower() and "error" not in output.lower()
-            return passed, output[:6000]
+            proc = await _asyncio.create_subprocess_exec(
+                "python", "-m", "pytest", "-x", "--tb=short", "-q",
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.STDOUT,
+                cwd=str(self.project_path),
+            )
+            raw, _ = await _asyncio.wait_for(proc.communicate(), timeout=120)
+            output = raw.decode("utf-8", errors="replace")
+            parsed = parse_pytest_output(output)
+            passed = parsed["all_passed"]
+            return passed, output[:6000], parsed
         except Exception as e:
             msg = f"Test runner error: {e}"
             logger.warning("[dev_orch] %s", msg)
-            return False, msg
+            return False, msg, {}
 
     async def _run_test_fix_loop(
         self, test_output: str, fix_attempt: int
@@ -384,7 +405,7 @@ class DevOrchestrator:
 
         _FIX_TOOLS = {
             "read_file", "count_lines",
-            "search_files", "find_files", "list_directory",
+            "find_in_files", "find_files", "list_directory",
             "write_file", "append_file",
         }
         tool_schemas = build_tool_schemas(list(_FIX_TOOLS) + ["submit_work"])
@@ -500,15 +521,52 @@ class DevOrchestrator:
                 dev_run_number=dev_run_number,
                 status=result.status,
                 files_changed=json.dumps(result.files_changed),
-                tests_passed=result.tests_passed,
+                tests_passed=int(result.tests_passed),
                 turns_used=result.turns,
                 error_detail=result.error_detail,
                 prompt_tokens=result.prompt_tokens,
                 completion_tokens=result.completion_tokens,
+                test_output=result.test_output,
+                coverage_pct=result.coverage_pct,
                 completed_at=datetime.now(timezone.utc) if result.status == "ACCEPTED" else None,
             )
         except Exception as e:
             logger.error("[dev_orch] Failed to store component result: %s", e)
+
+    def _store_test_evidence(
+        self, test_output: str | None, test_parsed: dict, dev_run_number: int,
+    ) -> None:
+        """Store the whole-task test run as a special component result row.
+
+        Uses component_name='__tests__' so the frontend can identify it.
+        """
+        try:
+            from app.database import create_component_result
+            passed = test_parsed.get("passed")
+            total = test_parsed.get("total")
+            if passed is not None and total is not None:
+                tests_passed_val = passed
+            else:
+                tests_passed_val = 1 if (test_output and "passed" in test_output.lower()) else 0
+            create_component_result(
+                task_id=self.task_id,
+                component_name="__tests__",
+                step_order=0,
+                batch_number=0,
+                dev_run_number=dev_run_number,
+                status="ACCEPTED" if test_parsed.get("all_passed") else "FAILED",
+                files_changed="[]",
+                tests_passed=tests_passed_val,
+                turns_used=0,
+                error_detail=None,
+                prompt_tokens=0,
+                completion_tokens=0,
+                test_output=test_output,
+                coverage_pct=test_parsed.get("coverage_pct"),
+                completed_at=datetime.now(timezone.utc),
+            )
+        except Exception as e:
+            logger.error("[dev_orch] Failed to store test evidence: %s", e)
 
 
 # ---------------------------------------------------------------------------

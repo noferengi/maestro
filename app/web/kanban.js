@@ -39,7 +39,8 @@ const WIP_LIMITS = {
     'conceptual_review': 5,
     'optimization': 5,
     'security': 5,
-    'full_review': 5,
+    'final_review': 5,
+    'human_review': 5,
     'completed': 15
 };
 
@@ -273,6 +274,7 @@ function taskFingerprint(task) {
         (task.pips || []).map(p => `${p.id}:${p.status}:${p.last_checked||''}`).join(','),
         task.intake_exhausted ? '1' : '0',
         task.intake_rejection_count || 0,
+        task.clarification_status || 'none',
     ].join('|');
 }
 
@@ -397,8 +399,9 @@ const COLUMN_NEXT = {
     'indev': 'conceptual_review',
     'conceptual_review': 'optimization',
     'optimization': 'security',
-    'security': 'full_review',
-    'full_review': 'completed'
+    'security': 'final_review',
+    'final_review': 'human_review',
+    'human_review': 'completed'
 };
 
 const COLUMN_DISPLAY = {
@@ -410,17 +413,18 @@ const COLUMN_DISPLAY = {
     'conceptual_review': 'AI Review',
     'optimization': 'AI Review',
     'security': 'AI Review',
-    'full_review': 'Human Review',
+    'final_review': 'AI Review',
+    'human_review': 'Human Review',
     'completed': 'Completed',
 };
 
 // Backend stages that are visually merged into the "AI REVIEW" column.
-const AI_REVIEW_STAGES = ['conceptual_review', 'optimization', 'security'];
+const AI_REVIEW_STAGES = ['conceptual_review', 'optimization', 'security', 'final_review'];
 
 // Returns the label for an advance button given a task's current type.
 function _advanceBtnLabel(taskType, hasRejections) {
     if (hasRejections) return 'Retry Pipeline';
-    if (taskType === 'full_review') return 'Approve & Merge';
+    if (taskType === 'human_review') return 'Approve & Merge';
     return 'Run Pipeline';
 }
 
@@ -700,7 +704,7 @@ function renderTasksFromDatabase() {
     Object.keys(fingerprintCache).forEach(id => delete fingerprintCache[id]);
 
     // Clear ALL existing task cards from ALL columns
-    const columns = ['idea', 'planning', 'indev', 'conceptual_review', 'optimization', 'security', 'full_review', 'completed'];
+    const columns = ['idea', 'planning', 'indev', 'conceptual_review', 'optimization', 'security', 'final_review', 'human_review', 'completed'];
 
     columns.forEach(columnType => {
         const container = document.getElementById(`tasks-${columnType}`);
@@ -760,7 +764,7 @@ function renderTasksFromDatabase() {
 }
 
 function updateTaskCounts() {
-    const columns = ['idea', 'planning', 'indev', 'conceptual_review', 'optimization', 'security', 'full_review', 'completed'];
+    const columns = ['idea', 'planning', 'indev', 'conceptual_review', 'optimization', 'security', 'final_review', 'human_review', 'completed'];
 
     columns.forEach(columnType => {
         const container = document.getElementById(`tasks-${columnType}`);
@@ -1046,7 +1050,7 @@ let _stageFooterBatchTimer = null;
 function _scheduleStageFooterBatch() {
     if (_stageFooterBatchTimer) clearTimeout(_stageFooterBatchTimer);
     _stageFooterBatchTimer = setTimeout(() => {
-        const stages = ['planning','indev','conceptual_review','optimization','security','full_review','completed'];
+        const stages = ['planning','indev','conceptual_review','optimization','security','human_review','completed'];
         const ids = Object.values(taskData)
             .filter(t => t && stages.includes(t.type))
             .map(t => t.id);
@@ -1121,9 +1125,10 @@ function _renderStageFooter(el, s) {
             const c = s.security.critical_count;
             if (c > 0) parts.push(`<span class="csf-chip csf-warn">${c} critical</span>`);
         }
-    } else if (stage === 'full_review') {
-        if (s.full_review.has_result) {
-            const v = s.full_review.worst_verdict || '';
+    } else if (stage === 'final_review' || stage === 'human_review') {
+        const fr = s.final_review || {};
+        if (fr.has_result) {
+            const v = fr.worst_verdict || '';
             const cls = (v==='REJECTED'||v==='NOT_SUITABLE') ? 'csf-warn' : (v==='LIKELY'?'csf-ok':'csf-muted');
             parts.push(`<span class="csf-chip ${cls}">&#128065; ${escHtml(v)}</span>`);
         }
@@ -1180,7 +1185,7 @@ async function _buildStageJournal(taskId) {
             fetch(`/api/tasks/${taskId}/component-status`),
             fetch(`/api/tasks/${taskId}/optimization-status`),
             fetch(`/api/tasks/${taskId}/security-status`),
-            fetch(`/api/tasks/${taskId}/full-review-status`),
+            fetch(`/api/tasks/${taskId}/final-review-status`),
             fetch(`/api/tasks/${taskId}/merge-status`),
             fetch(`/api/tasks/${taskId}/diff`),
             fetch(`/api/tasks/${taskId}/research-jobs`),
@@ -1359,6 +1364,17 @@ async function _buildStageJournal(taskId) {
                 </tr>`;
             }
             html += '</tbody></table></div>';
+        }
+
+        // ---- Acceptance Criteria section ----
+        if (task && task.acceptance_criteria && task.acceptance_criteria.length) {
+            html += `<div class="sj-section">
+                <div class="sj-section-title">&#10003; Acceptance Criteria</div>
+                <ol style="margin:0.3rem 0 0 1.2rem;font-size:0.85rem;line-height:1.6">`;
+            task.acceptance_criteria.forEach((c, i) => {
+                html += `<li style="margin-bottom:0.25rem">${escHtml(typeof c === 'string' ? c : JSON.stringify(c))}</li>`;
+            });
+            html += '</ol></div>';
         }
 
         // ---- Optimization section ----
@@ -1889,6 +1905,12 @@ function closeModal() {
     document.getElementById('task-modal').classList.remove('active');
     currentTaskId = null;
     currentTargetStatus = null;
+    // Clean up prerequisites selector listeners
+    if (window._prereqCloseDropdown) {
+        document.removeEventListener('click', window._prereqCloseDropdown);
+        window._prereqCloseDropdown = null;
+    }
+    _prereqSelectedIds = [];
     // Restore modal to editable state if it was opened read-only
     _restoreModalEditable();
 }
@@ -2780,6 +2802,18 @@ function createTaskCard(id, title, tags, owner, status) {
         : '';
     const pipRequirementsHtml = '';  // requirements now live in .pip-card segments below the card
 
+    // Clarification status badge
+    const clarificationStatus = taskObj.clarification_status || 'none';
+    let clarificationBadge = '';
+    if (status === 'idea') {
+        if (clarificationStatus === 'pending') {
+            clarificationBadge = '<span class="intake-clarification-badge intake-clarification-badge--pending" title="Intake agent is researching this card…">Intake running…</span>';
+            card.classList.add('intake-clarifying');
+        } else if (clarificationStatus === 'awaiting_user') {
+            clarificationBadge = '<span class="intake-clarification-badge intake-clarification-badge--ready" title="Intake agent has finished — click Review Intake to see results">Review required</span>';
+        }
+    }
+
     // Intake retry badge — shown on IDEA cards that have been rejected at least once
     let intakeRetryBadge = '';
     if (status === 'idea' || status === 'subdividing') {
@@ -2857,6 +2891,7 @@ function createTaskCard(id, title, tags, owner, status) {
         <div class="task-meta">
             ${tagsHtml}
             ${ownerHtml}
+            ${clarificationBadge}
             ${intakeRetryBadge}
             ${cachedPlanBadge}
         </div>
@@ -2866,6 +2901,7 @@ function createTaskCard(id, title, tags, owner, status) {
         <div class="card-job-indicator" id="ji-${id}"></div>
         <div class="card-toolbar">
             <span class="toolbar-sep"></span>
+            ${status === 'idea' ? `<button class="toolbar-btn" title="Re-run clarification agent — reset and rewrite this card's spec" onclick="event.stopPropagation();retriggerIntakeClarification('${id}')">✎</button>` : ''}
             <button class="toolbar-btn" title="Research — run a research agent on this card" onclick="event.stopPropagation();openResearchDialog('${id}')">🔍</button>
             <button class="toolbar-btn" title="Subdivide — run subdivision agent on this card" onclick="event.stopPropagation();toolbarSubdivide('${id}')">✂</button>
             <button class="toolbar-btn" title="Run Planning pipeline (uses cache if available)" onclick="event.stopPropagation();toolbarRunPipeline('${id}','planning')">📋</button>
@@ -2884,7 +2920,7 @@ function createTaskCard(id, title, tags, owner, status) {
             <button class="toolbar-btn" title="Card Story — agent session timeline" onclick="event.stopPropagation();toolbarOpenStory('${id}')">📜</button>
             <button class="toolbar-btn" title="Stage Journal — artifacts, gate checks, code diff" onclick="event.stopPropagation();openStageJournal('${id}')">📋</button>
             <button class="toolbar-btn" title="Research Jobs — view research agents run for this card" onclick="event.stopPropagation();viewResearchJobs('${id}')">🗂</button>
-            ${['indev','conceptual_review','optimization','security','full_review','completed'].includes(status) ? `<button class="toolbar-btn" title="View code diff" onclick="event.stopPropagation();openStageDiff('${id}')">&#9998;</button>` : ''}
+            ${['indev','conceptual_review','optimization','security','human_review','completed'].includes(status) ? `<button class="toolbar-btn" title="View code diff" onclick="event.stopPropagation();openStageDiff('${id}')">&#9998;</button>` : ''}
             <button class="toolbar-btn" title="Clone as new Idea" onclick="event.stopPropagation();toolbarClone('${id}')">⧉</button>
             <button class="toolbar-btn" title="Pin to top of column" onclick="event.stopPropagation();toolbarPin('${id}')">📌</button>
             <button class="toolbar-btn" title="Open in Column Map (DAG view)" onclick="event.stopPropagation();toolbarOpenMap('${id}')">🔗</button>
@@ -2931,19 +2967,36 @@ function createTaskCard(id, title, tags, owner, status) {
         }
     } else if (status === 'idea') {
         const actionsDiv = card.querySelector('.task-actions');
-        const advanceBtn = document.createElement('button');
-        advanceBtn.className = 'action-btn action-btn-advance';
-        if (transitionPollers[id]) {
-            advanceBtn.textContent = 'Processing...';
-            advanceBtn.disabled = true;
+        const cs = clarificationStatus;
+        const needsReview = cs === 'pending' || cs === 'awaiting_user';
+
+        if (needsReview) {
+            // Hard gate: show "Review Intake →" instead of pipeline button
+            const reviewBtn = document.createElement('button');
+            reviewBtn.className = 'action-btn action-btn-advance';
+            if (cs === 'pending') {
+                reviewBtn.textContent = 'Intake running…';
+                reviewBtn.disabled = true;
+            } else {
+                reviewBtn.textContent = 'Review Intake →';
+                reviewBtn.onclick = (e) => { e.stopPropagation(); openIntakeModal(id); };
+            }
+            actionsDiv.appendChild(reviewBtn);
         } else {
-            advanceBtn.textContent = _advanceBtnLabel(status, rejectionCount > 0);
+            const advanceBtn = document.createElement('button');
+            advanceBtn.className = 'action-btn action-btn-advance';
+            if (transitionPollers[id]) {
+                advanceBtn.textContent = 'Processing...';
+                advanceBtn.disabled = true;
+            } else {
+                advanceBtn.textContent = _advanceBtnLabel(status, rejectionCount > 0);
+            }
+            advanceBtn.onclick = (e) => {
+                e.stopPropagation();
+                advanceTask(id);
+            };
+            actionsDiv.appendChild(advanceBtn);
         }
-        advanceBtn.onclick = (e) => {
-            e.stopPropagation();
-            advanceTask(id);
-        };
-        actionsDiv.appendChild(advanceBtn);
 
         // Show View Children if this card is a Big Idea or has non-cancelled children
         const hasChildren = (childIndex[id] || []).some(cid => taskData[cid] && taskData[cid].type !== 'cancelled');
@@ -2954,7 +3007,7 @@ function createTaskCard(id, title, tags, owner, status) {
             childBtn.onclick = (e) => { e.stopPropagation(); viewChildren(id); };
             actionsDiv.appendChild(childBtn);
         }
-    } else if (status === 'full_review') {
+    } else if (status === 'human_review') {
         const actionsDiv = card.querySelector('.task-actions');
         const mergeBtn = document.createElement('button');
         mergeBtn.className = 'action-btn action-btn-advance';
@@ -3012,7 +3065,7 @@ function createTaskCard(id, title, tags, owner, status) {
     }
 
     // Benchmarks button — visible once optimization stage has run
-    if (status === 'optimization' || status === 'security' || status === 'full_review' || status === 'completed') {
+    if (status === 'optimization' || status === 'security' || status === 'human_review' || status === 'completed') {
         const benchBtn = document.createElement('button');
         benchBtn.className = 'action-btn';
         benchBtn.textContent = 'Benchmarks';
@@ -3043,6 +3096,15 @@ async function advanceTask(taskId) {
     const task = taskData[taskId];
     if (!task) return;
 
+    // Clarification gate: redirect IDEA cards that haven't been reviewed yet
+    if (task.type === 'idea') {
+        const cs = task.clarification_status || 'none';
+        if (cs === 'pending' || cs === 'awaiting_user') {
+            openIntakeModal(taskId);
+            return;
+        }
+    }
+
     const advanceStartedAt = new Date().toISOString();
     
     // Map status to specific API endpoints
@@ -3053,8 +3115,8 @@ async function advanceTask(taskId) {
         'indev': 'run-review', // after indev we want conceptual review
         'conceptual_review': 'run-review',
         'optimization': 'run-security',
-        'security': 'run-full-review',
-        'full_review': 'merge'
+        'security': 'run-final-review',
+        'human_review': 'merge'
     };
 
     const action = endpointMap[task.type] || 'advance';
@@ -3325,6 +3387,390 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
+// ============================================
+// Intake Clarification Modal
+// ============================================
+
+let _intakeCurrentTaskId = null;
+let _intakePendingPoller = null;
+
+function _intakeModalBgClick(event) {
+    if (event.target === document.getElementById('intake-modal')) closeIntakeModal();
+}
+
+async function openIntakeModal(taskId) {
+    _intakeCurrentTaskId = taskId;
+    const task = taskData[taskId];
+    const cs = (task && task.clarification_status) || 'none';
+    document.getElementById('intake-modal-title').textContent = 'Intake Review: ' + (task ? task.title : taskId);
+    document.getElementById('intake-modal').classList.add('active');
+
+    if (cs === 'pending') {
+        // Show loading state; auto-transition when reconcile updates taskData
+        _setIntakeModalLoading(true);
+        _intakePendingPoller = setInterval(() => {
+            const t = taskData[_intakeCurrentTaskId];
+            if (!t || t.clarification_status !== 'pending') {
+                clearInterval(_intakePendingPoller);
+                _intakePendingPoller = null;
+                if (t && t.clarification_status === 'awaiting_user') {
+                    fetch(`${API_BASE}/tasks/${_intakeCurrentTaskId}/clarification`)
+                        .then(r => r.ok ? r.json() : null)
+                        .then(data => {
+                            if (data) {
+                                _setIntakeModalLoading(false);
+                                _renderIntakeModal(data, taskData[_intakeCurrentTaskId]);
+                            }
+                        });
+                }
+            }
+        }, 2000);
+        return;
+    }
+
+    _setIntakeModalLoading(false);
+    try {
+        const r = await fetch(`${API_BASE}/tasks/${taskId}/clarification`);
+        if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            showToast('Failed to load intake draft: ' + (err.detail || 'Not found'), 'error');
+            return;
+        }
+        const data = await r.json();
+        _renderIntakeModal(data, task);
+    } catch (err) {
+        showToast('Error loading intake draft: ' + err.message, 'error');
+    }
+}
+
+function _setIntakeModalLoading(loading) {
+    const bodyContent = document.getElementById('intake-modal-body-content');
+    const approveBtn = document.getElementById('intake-approve-btn');
+    const footer = document.querySelector('#intake-modal .modal-footer');
+    if (loading) {
+        bodyContent.innerHTML =
+            `<div style="text-align:center;padding:3rem 1rem;color:#6c757d">
+                <div class="processing-indicator" style="font-size:1.5rem">◷</div>
+                <div style="margin-top:0.75rem;font-size:0.95rem">Thinking about your idea…</div>
+                <div style="margin-top:0.4rem;font-size:0.82rem">The intake agent is analysing this card.<br>This usually takes 1–3 minutes.</div>
+            </div>`;
+        if (approveBtn) approveBtn.disabled = true;
+        if (footer) footer.querySelectorAll('button').forEach(b => { b.disabled = true; });
+    } else {
+        // Restore the original body structure if it was replaced by the loading state
+        const hasOriginalContent = bodyContent.querySelector('#intake-original-desc');
+        if (!hasOriginalContent) {
+            bodyContent.innerHTML = `
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1rem">
+                    <div>
+                        <div style="font-size:0.8rem;font-weight:600;color:#6c757d;text-transform:uppercase;margin-bottom:0.4rem">Original Description</div>
+                        <div id="intake-original-desc" style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;padding:0.75rem;font-size:0.85rem;white-space:pre-wrap;max-height:260px;overflow-y:auto;color:#495057"></div>
+                    </div>
+                    <div>
+                        <div style="font-size:0.8rem;font-weight:600;color:#0d6efd;text-transform:uppercase;margin-bottom:0.4rem">Suggested Rewrite <span style="font-weight:400;color:#6c757d;text-transform:none">(editable)</span></div>
+                        <textarea id="intake-rewrite-desc" style="width:100%;height:260px;border:1px solid #0d6efd;border-radius:4px;padding:0.75rem;font-size:0.85rem;resize:vertical;font-family:inherit;box-sizing:border-box"></textarea>
+                    </div>
+                </div>
+                <div id="intake-rationale-row" style="margin-bottom:1rem;display:none">
+                    <div style="font-size:0.8rem;font-weight:600;color:#6c757d;text-transform:uppercase;margin-bottom:0.25rem">Why the agent rewrote it</div>
+                    <div id="intake-rationale" style="font-size:0.82rem;color:#495057;background:#fffdf0;border-left:3px solid #ffc107;padding:0.5rem 0.75rem;border-radius:0 4px 4px 0"></div>
+                </div>
+                <div id="intake-prereqs-section" style="margin-bottom:1rem;display:none">
+                    <div style="font-size:0.8rem;font-weight:600;color:#6c757d;text-transform:uppercase;margin-bottom:0.5rem">Suggested Prerequisites</div>
+                    <div id="intake-prereqs-list"></div>
+                </div>
+                <div id="intake-subtasks-section" style="margin-bottom:1rem;display:none">
+                    <div style="font-size:0.8rem;font-weight:600;color:#6c757d;text-transform:uppercase;margin-bottom:0.5rem">Suggested Subtasks</div>
+                    <div id="intake-subtasks-list"></div>
+                </div>
+                <div id="intake-questions-section" style="margin-bottom:1rem;display:none">
+                    <div style="background:#fff3cd;border:1px solid #ffc107;border-radius:4px;padding:0.75rem">
+                        <div style="font-size:0.8rem;font-weight:700;color:#856404;margin-bottom:0.4rem">Open Questions — resolve before planning</div>
+                        <ul id="intake-questions-list" style="margin:0;padding-left:1.25rem;font-size:0.85rem;color:#664d03"></ul>
+                    </div>
+                </div>
+                <div style="border-top:1px solid #dee2e6;padding-top:1rem">
+                    <div style="font-size:0.8rem;font-weight:600;color:#6c757d;text-transform:uppercase;margin-bottom:0.5rem">Ask the agent to refine</div>
+                    <div id="intake-chat-history" style="max-height:180px;overflow-y:auto;margin-bottom:0.5rem;display:flex;flex-direction:column;gap:0.4rem"></div>
+                    <div style="display:flex;gap:0.5rem">
+                        <input type="text" id="intake-chat-input" class="form-control" placeholder="e.g. Add error handling requirements, or make acceptance criteria more specific…" style="flex:1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){sendIntakeMessage();event.preventDefault();}">
+                        <button class="btn btn-secondary" onclick="sendIntakeMessage()" id="intake-chat-send">Send</button>
+                    </div>
+                </div>`;
+        }
+        if (approveBtn) approveBtn.disabled = false;
+        if (footer) footer.querySelectorAll('button').forEach(b => { b.disabled = false; });
+    }
+}
+
+function _renderIntakeModal(data, task) {
+    const draft = data.draft || {};
+    const original = data.description_original || (task && task.description) || '';
+
+    document.getElementById('intake-original-desc').textContent = original;
+    document.getElementById('intake-rewrite-desc').value = draft.rewritten_description || original;
+
+    if (draft.design_rationale) {
+        document.getElementById('intake-rationale').textContent = draft.design_rationale;
+        document.getElementById('intake-rationale-row').style.display = '';
+    }
+
+    // Prerequisites
+    const prereqs = draft.suggested_prerequisites || [];
+    if (prereqs.length) {
+        const list = document.getElementById('intake-prereqs-list');
+        list.innerHTML = prereqs.map((p, i) =>
+            `<label style="display:flex;align-items:flex-start;gap:0.5rem;margin-bottom:0.4rem;font-size:0.85rem">
+                <input type="checkbox" data-prereq-idx="${i}" checked style="margin-top:2px;flex-shrink:0">
+                <span><strong>${escapeHtml(p.title || p.task_id)}</strong> <span style="color:#6c757d">[${p.task_id}]</span>${p.reason ? ' — ' + escapeHtml(p.reason) : ''}</span>
+            </label>`
+        ).join('');
+        document.getElementById('intake-prereqs-section').style.display = '';
+    }
+
+    // Subtasks
+    const subtasks = draft.suggested_subtasks || [];
+    if (subtasks.length) {
+        const list = document.getElementById('intake-subtasks-list');
+        list.innerHTML = subtasks.map((s, i) =>
+            `<label style="display:flex;align-items:flex-start;gap:0.5rem;margin-bottom:0.4rem;font-size:0.85rem">
+                <input type="checkbox" data-subtask-idx="${i}" checked style="margin-top:2px;flex-shrink:0">
+                <span><strong>${escapeHtml(s.title)}</strong>${s.description ? ': ' + escapeHtml(s.description.slice(0, 120)) + (s.description.length > 120 ? '…' : '') : ''}</span>
+            </label>`
+        ).join('');
+        document.getElementById('intake-subtasks-section').style.display = '';
+    }
+
+    // Open questions
+    const questions = draft.open_questions || [];
+    if (questions.length) {
+        document.getElementById('intake-questions-list').innerHTML =
+            questions.map(q => `<li>${escapeHtml(q)}</li>`).join('');
+        document.getElementById('intake-questions-section').style.display = '';
+    }
+
+    // Conversation history
+    const history = draft.conversation_history || [];
+    const chatDiv = document.getElementById('intake-chat-history');
+    chatDiv.innerHTML = history.map(msg => _renderIntakeChatBubble(msg.role, msg.content)).join('');
+    chatDiv.scrollTop = chatDiv.scrollHeight;
+}
+
+let _intakeInvestigationOpen = false;
+
+function toggleIntakeInvestigation() {
+    const body = document.getElementById('intake-investigation-body');
+    const toggle = document.getElementById('intake-investigation-toggle');
+    _intakeInvestigationOpen = !_intakeInvestigationOpen;
+    body.style.display = _intakeInvestigationOpen ? '' : 'none';
+    const span = toggle.querySelector('span');
+    if (span) span.textContent = (_intakeInvestigationOpen ? '▼' : '▶') + span.textContent.slice(1);
+    if (_intakeInvestigationOpen) _loadIntakeInvestigation(_intakeCurrentTaskId);
+}
+
+async function _loadIntakeInvestigation(taskId) {
+    if (!taskId) return;
+    const content = document.getElementById('intake-investigation-content');
+    content.innerHTML = '<div style="color:#6c757d;font-style:italic">Loading…</div>';
+    try {
+        const r = await fetch(`${API_BASE}/tasks/${taskId}/clarification/trace`);
+        if (!r.ok) { content.innerHTML = '<div style="color:#dc3545">Could not load trace.</div>'; return; }
+        const data = await r.json();
+        const count = document.getElementById('intake-investigation-count');
+        if (count) count.textContent = `(${data.total} step${data.total !== 1 ? 's' : ''})`;
+        if (!data.steps || !data.steps.length) {
+            content.innerHTML = '<div style="color:#6c757d;font-style:italic">No investigation trace recorded.</div>';
+            return;
+        }
+        content.innerHTML = data.steps.map(step => _renderInvestigationStep(step)).join('');
+    } catch (err) {
+        content.innerHTML = `<div style="color:#dc3545">Error: ${escapeHtml(err.message)}</div>`;
+    }
+}
+
+function _renderInvestigationStep(step) {
+    const isFinal = step.is_final;
+    const borderColor = isFinal ? '#198754' : '#dee2e6';
+    const bgColor = isFinal ? '#f0fff4' : '#fafafa';
+    const toolsHtml = (step.tools_used || []).map(t =>
+        `<span style="display:inline-flex;align-items:center;gap:0.25rem;background:#e9ecef;border-radius:3px;padding:0.1rem 0.4rem;font-size:0.75rem;color:#495057;margin:0.15rem 0.15rem 0 0">
+            <span style="color:#6c757d;font-family:monospace">${escapeHtml(t.name)}</span>
+            ${t.arg ? `<span style="color:#6c757d">→</span><span style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(t.arg)}">${escapeHtml(t.arg)}</span>` : ''}
+        </span>`
+    ).join('');
+    const reasoningHtml = step.reasoning_preview
+        ? `<div style="margin-top:0.35rem;color:#495057;font-style:italic;line-height:1.4">${escapeHtml(step.reasoning_preview)}</div>`
+        : '';
+    const finalBadge = isFinal
+        ? `<span style="margin-left:0.5rem;background:#198754;color:#fff;font-size:0.7rem;padding:0.1rem 0.4rem;border-radius:3px">Draft produced</span>`
+        : '';
+    const ts = step.created_at ? new Date(step.created_at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '';
+    return `<div style="border-left:3px solid ${borderColor};background:${bgColor};padding:0.5rem 0.65rem;margin-bottom:0.5rem;border-radius:0 4px 4px 0">
+        <div style="display:flex;align-items:center;gap:0.4rem;margin-bottom:0.25rem">
+            <span style="font-weight:600;color:#495057">Step ${step.step}</span>
+            ${finalBadge}
+            <span style="color:#adb5bd;font-size:0.75rem;margin-left:auto">${ts}</span>
+        </div>
+        ${toolsHtml ? `<div style="margin-bottom:0.2rem">${toolsHtml}</div>` : ''}
+        ${reasoningHtml}
+    </div>`;
+}
+
+function _renderIntakeChatBubble(role, content) {
+    const isUser = role === 'user';
+    return `<div style="display:flex;justify-content:${isUser ? 'flex-end' : 'flex-start'}">
+        <div style="max-width:80%;background:${isUser ? '#0d6efd' : '#f0f0f0'};color:${isUser ? '#fff' : '#212529'};border-radius:10px;padding:0.4rem 0.7rem;font-size:0.82rem;white-space:pre-wrap">${escapeHtml(content)}</div>
+    </div>`;
+}
+
+function closeIntakeModal() {
+    if (_intakePendingPoller) { clearInterval(_intakePendingPoller); _intakePendingPoller = null; }
+    document.getElementById('intake-modal').classList.remove('active');
+    _intakeCurrentTaskId = null;
+    // Collapse investigation panel for next open
+    _intakeInvestigationOpen = false;
+    const invBody = document.getElementById('intake-investigation-body');
+    if (invBody) invBody.style.display = 'none';
+    const invToggle = document.getElementById('intake-investigation-toggle');
+    if (invToggle) { const s = invToggle.querySelector('span'); if (s) s.textContent = '▶' + s.textContent.slice(1); }
+}
+
+async function sendIntakeMessage() {
+    const taskId = _intakeCurrentTaskId;
+    if (!taskId) return;
+    const input = document.getElementById('intake-chat-input');
+    const message = input.value.trim();
+    if (!message) return;
+
+    input.value = '';
+    const sendBtn = document.getElementById('intake-chat-send');
+    sendBtn.disabled = true;
+    sendBtn.textContent = '…';
+
+    const chatDiv = document.getElementById('intake-chat-history');
+    chatDiv.insertAdjacentHTML('beforeend', _renderIntakeChatBubble('user', message));
+    chatDiv.scrollTop = chatDiv.scrollHeight;
+
+    try {
+        const r = await fetch(`${API_BASE}/tasks/${taskId}/clarification/message`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            showToast('Chat failed: ' + (data.detail || 'Unknown error'), 'error');
+        } else {
+            if (data.response) {
+                chatDiv.insertAdjacentHTML('beforeend', _renderIntakeChatBubble('assistant', data.response));
+                chatDiv.scrollTop = chatDiv.scrollHeight;
+            }
+            if (data.updated_draft && data.updated_draft.rewritten_description) {
+                document.getElementById('intake-rewrite-desc').value = data.updated_draft.rewritten_description;
+            }
+        }
+    } catch (err) {
+        showToast('Chat error: ' + err.message, 'error');
+    } finally {
+        sendBtn.disabled = false;
+        sendBtn.textContent = 'Send';
+    }
+}
+
+async function approveIntakeClarification() {
+    const taskId = _intakeCurrentTaskId;
+    if (!taskId) return;
+
+    const btn = document.getElementById('intake-approve-btn');
+    btn.disabled = true;
+    btn.textContent = 'Approving…';
+
+    // Collect the (possibly edited) rewritten description
+    const rewrittenDescription = document.getElementById('intake-rewrite-desc').value.trim();
+
+    // Collect checked prerequisites
+    const prereqCheckboxes = document.querySelectorAll('#intake-prereqs-list input[type=checkbox]:checked');
+    const draft = await fetch(`${API_BASE}/tasks/${taskId}/clarification`).then(r => r.json()).catch(() => ({}));
+    const allPrereqs = (draft.draft && draft.draft.suggested_prerequisites) || [];
+    const applyPrerequisites = Array.from(prereqCheckboxes)
+        .map(cb => {
+            const idx = parseInt(cb.dataset.prereqIdx);
+            return allPrereqs[idx] ? allPrereqs[idx].task_id : null;
+        })
+        .filter(Boolean);
+
+    // Collect checked subtasks
+    const subtaskCheckboxes = document.querySelectorAll('#intake-subtasks-list input[type=checkbox]:checked');
+    const allSubtasks = (draft.draft && draft.draft.suggested_subtasks) || [];
+    const applySubtasks = Array.from(subtaskCheckboxes)
+        .map(cb => {
+            const idx = parseInt(cb.dataset.subtaskIdx);
+            return allSubtasks[idx] || null;
+        })
+        .filter(Boolean);
+
+    try {
+        const r = await fetch(`${API_BASE}/tasks/${taskId}/clarification/approve`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                rewritten_description: rewrittenDescription,
+                apply_prerequisites: applyPrerequisites,
+                apply_subtasks: applySubtasks,
+            }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            showToast('Approval failed: ' + (data.detail || 'Unknown error'), 'error');
+            btn.disabled = false;
+            btn.textContent = 'Approve & Run Pipeline';
+            return;
+        }
+        closeIntakeModal();
+        await loadTasksFromDatabase();
+        if (data.created_subtasks && data.created_subtasks.length) {
+            showToast(`Created ${data.created_subtasks.length} subtask(s).`, 'success');
+        }
+        // Now advance the task
+        await advanceTask(taskId);
+    } catch (err) {
+        showToast('Approval error: ' + err.message, 'error');
+        btn.disabled = false;
+        btn.textContent = 'Approve & Run Pipeline';
+    }
+}
+
+async function skipIntakeClarification() {
+    const taskId = _intakeCurrentTaskId;
+    if (!taskId) return;
+    try {
+        const r = await fetch(`${API_BASE}/tasks/${taskId}/clarification/skip`, { method: 'POST' });
+        if (!r.ok) { showToast('Skip failed', 'error'); return; }
+        closeIntakeModal();
+        await loadTasksFromDatabase();
+    } catch (err) {
+        showToast('Skip error: ' + err.message, 'error');
+    }
+}
+
+async function retriggerIntakeClarification(taskId) {
+    const task = taskData[taskId];
+    if (!task) return;
+    if (!confirm(`Re-run the clarification agent for "${task.title}"?\n\nThis will reset the current draft.`)) return;
+    try {
+        const r = await fetch(`${API_BASE}/tasks/${taskId}/clarification/retrigger`, { method: 'POST' });
+        if (!r.ok) {
+            const e = await r.json().catch(() => ({}));
+            showToast('Re-clarify failed: ' + (e.detail || 'Unknown error'), 'error');
+            return;
+        }
+        showToast('Clarification agent started — card will update automatically.', 'success');
+        await loadTasksFromDatabase();
+    } catch (err) {
+        showToast('Re-clarify error: ' + err.message, 'error');
+    }
+}
+
 function closeTransitionModal() {
     document.getElementById('transition-modal').classList.remove('active');
     _viewChildrenState = null;
@@ -3419,7 +3865,7 @@ function _renderSchedulerModal(data) {
         const typeColor = {
             idea:'#6c757d', planning:'#0d6efd', indev:'#198754',
             conceptual_review:'#20c997', optimization:'#fd7e14',
-            full_review:'#dc3545'
+            human_review:'#dc3545'
         }[t.type] || '#6c757d';
 
         let badge = '';
@@ -3889,8 +4335,236 @@ function editTask(taskId) {
     showArchContentFields(task.type);
     populateLlmSelect(task.llm_id);
     populateBudgetSelect(task.budget_id);
+    _initPrereqsSelector(task);
 
     document.getElementById('task-modal').classList.add('active');
+}
+
+// ============================================
+// Prerequisites Selector (searchable multi-select + mini DAG)
+// ============================================
+
+let _prereqSelectedIds = [];   // currently selected prerequisite task IDs
+let _prereqAllTasks = [];      // all tasks in current project (cache)
+let _prereqSearchTimer = null;
+
+function _initPrereqsSelector(task) {
+    const group = document.getElementById('task-prereqs-group');
+    if (!group) return;
+    group.style.display = '';
+
+    _prereqSelectedIds = [...(task.prerequisites || [])];
+    _prereqSelectedIds = _prereqSelectedIds.filter(id => id !== task.id); // exclude self
+
+    // Load all tasks in the current project (excluding self and architecture tasks)
+    _prereqAllTasks = Object.values(taskData)
+        .filter(t => t.id !== task.id && t.is_active && t.type !== 'architecture')
+        .sort((a, b) => (a.title || '').localeCompare(b.title || ''));
+
+    // Clear inputs
+    document.getElementById('task-prereqs-input').value = '';
+    document.getElementById('prereqs-dropdown').style.display = 'none';
+    _renderPrereqSelected();
+    document.getElementById('prereqs-dag-container').style.display = 'none';
+
+    // Wire up search input
+    const input = document.getElementById('task-prereqs-input');
+    input.oninput = () => {
+        clearTimeout(_prereqSearchTimer);
+        _prereqSearchTimer = setTimeout(() => _renderPrereqDropdown(input.value.trim()), 120);
+    };
+    input.onfocus = () => {
+        if (!input.value.trim() && _prereqAllTasks.length) _renderPrereqDropdown('');
+    };
+
+    // Close dropdown on outside click
+    const closeDropdown = (e) => {
+        if (!document.getElementById('prereqs-selector').contains(e.target)) {
+            document.getElementById('prereqs-dropdown').style.display = 'none';
+        }
+    };
+    setTimeout(() => document.addEventListener('click', closeDropdown), 0);
+    window._prereqCloseDropdown = closeDropdown;
+}
+
+function _renderPrereqDropdown(query) {
+    const dropdown = document.getElementById('prereqs-dropdown');
+    const q = (query || '').toLowerCase();
+    const filtered = _prereqAllTasks.filter(t => {
+        const inSelected = _prereqSelectedIds.includes(t.id);
+        if (inSelected) return false;
+        if (!q) return true;
+        return (t.title || '').toLowerCase().includes(q) || (t.id || '').toLowerCase().includes(q);
+    });
+
+    if (!filtered.length) {
+        dropdown.innerHTML = `<div style="padding:0.6rem 0.8rem;color:#6c757d;font-size:0.85rem">${q ? 'No matching tasks.' : 'No other tasks in this project.'}</div>`;
+    } else {
+        dropdown.innerHTML = filtered.slice(0, 30).map(t => {
+            const stageColors = {
+                'idea': '#6c757d', 'planning': '#6f42c1', 'indev': '#0d6efd',
+                'conceptual_review': '#fd7e14', 'optimization': '#20c997',
+                'security': '#dc3545', 'final_review': '#e83e8c',
+                'human_review': '#ffc107', 'completed': '#198754'
+            };
+            const color = stageColors[t.type] || '#6c757d';
+            return `<div class="prereq-option" data-task-id="${t.id}" style="padding:0.45rem 0.8rem;cursor:pointer;display:flex;align-items:center;gap:0.5rem;transition:background 0.1s"
+                onmouseover="this.style.background='#f0f4ff'" onmouseout="this.style.background=''"
+                onclick="event.stopPropagation();_addPrerequisite('${t.id}');document.getElementById('task-prereqs-input').value='';document.getElementById('prereqs-dropdown').style.display='none';document.getElementById('task-prereqs-input').focus()">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${color};flex-shrink:0"></span>
+                <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:0.88rem">${escapeHtml(t.title)}</span>
+                <span style="font-size:0.72rem;color:#adb5bd;flex-shrink:0">${t.type.replace('_', ' ')}</span>
+            </div>`;
+        }).join('');
+        if (filtered.length > 30) {
+            dropdown.innerHTML += `<div style="padding:0.4rem 0.8rem;color:#6c757d;font-size:0.78rem;border-top:1px solid #e9ecef">…and ${filtered.length - 30} more. Refine your search.</div>`;
+        }
+    }
+    dropdown.style.display = '';
+}
+
+function _addPrerequisite(taskId) {
+    if (_prereqSelectedIds.includes(taskId)) return;
+    _prereqSelectedIds.push(taskId);
+    _renderPrereqSelected();
+}
+
+function _removePrerequisite(taskId) {
+    _prereqSelectedIds = _prereqSelectedIds.filter(id => id !== taskId);
+    _renderPrereqSelected();
+}
+
+function _renderPrereqSelected() {
+    const container = document.getElementById('preregs-selected');
+    if (!_prereqSelectedIds.length) {
+        container.innerHTML = '<span style="color:#adb5bd;font-size:0.82rem;font-style:italic">No prerequisites selected</span>';
+        document.getElementById('prereqs-dag-container').style.display = 'none';
+        return;
+    }
+
+    container.innerHTML = _prereqSelectedIds.map(id => {
+        const t = taskData[id];
+        if (!t) return '';
+        const stageColors = {
+            'idea': '#6c757d', 'planning': '#6f42c1', 'indev': '#0d6efd',
+            'conceptual_review': '#fd7e14', 'optimization': '#20c997',
+            'security': '#dc3545', 'final_review': '#e83e8c',
+            'human_review': '#ffc107', 'completed': '#198754'
+        };
+        const color = stageColors[t.type] || '#6c757d';
+        return `<span style="display:inline-flex;align-items:center;gap:0.3rem;padding:0.2rem 0.5rem;background:#e7f1ff;border:1px solid #b8daff;border-radius:4px;font-size:0.82rem">
+            <span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:${color}"></span>
+            <span>${escapeHtml(t.title)}</span>
+            <button type="button" onclick="event.stopPropagation();_removePrerequisite('${id}')" style="background:none;border:none;color:#0d6efd;cursor:pointer;font-size:1rem;line-height:1;padding:0 0.1rem" title="Remove">&times;</button>
+        </span>`;
+    }).join('');
+
+    // Render mini DAG
+    _renderPrereqDag();
+}
+
+function _renderPrereqDag() {
+    const container = document.getElementById('prereqs-dag-container');
+    const svg = document.getElementById('prereqs-dag-svg');
+    if (!_prereqSelectedIds.length) {
+        container.style.display = 'none';
+        return;
+    }
+
+    container.style.display = '';
+    const allPrereqTasks = _prereqSelectedIds.map(id => taskData[id]).filter(Boolean);
+    if (!allPrereqTasks.length) return;
+
+    // Build a flat list: current task → prerequisite tasks
+    // If prerequisites have their own prerequisites, show the chain
+    const visited = new Set();
+    const nodes = [];
+    const edges = [];
+
+    function walk(taskId, depth) {
+        if (visited.has(taskId)) return;
+        visited.add(taskId);
+        const t = taskData[taskId];
+        if (!t) return;
+        nodes.push({ id: taskId, title: (t.title || '').slice(0, 30), depth });
+        (t.prerequisites || []).forEach(pid => {
+            if (!visited.has(pid)) {
+                edges.push({ from: taskId, to: pid });
+                walk(pid, depth + 1);
+            }
+        });
+    }
+
+    // Start from current task (we use currentTaskId)
+    const currentTask = taskData[currentTaskId];
+    if (currentTask) {
+        nodes.push({ id: currentTaskId, title: (currentTask.title || '').slice(0, 25) + '…', depth: 0, isCurrent: true });
+        _prereqSelectedIds.forEach(id => walk(id, 1));
+    }
+
+    const width = Math.max(400, container.clientWidth || 400);
+    const nodeW = 130, nodeH = 28;
+    const colGap = 50, rowGap = 36;
+    const maxCols = Math.max(1, Math.floor((width - nodeW) / (nodeW + colGap)));
+
+    // Layout: BFS by depth, left-to-right within each depth level
+    const byDepth = {};
+    nodes.forEach(n => { (byDepth[n.depth] = byDepth[n.depth] || []).push(n); });
+    const depths = Object.keys(byDepth).map(Number).sort((a, b) => a - b);
+
+    const layout = {};
+    depths.forEach(d => {
+        const cols = byDepth[d];
+        cols.forEach((n, i) => {
+            layout[n.id] = {
+                x: (i % maxCols) * (nodeW + colGap) + 10,
+                y: Math.floor(i / maxCols) * (nodeH + rowGap) + 10,
+            };
+        });
+    });
+
+    const maxX = Math.max(...Object.values(layout).map(l => l.x), 0) + nodeW + 10;
+    const maxY = Math.max(...Object.values(layout).map(l => l.y), 0) + nodeH + 10;
+    svg.setAttribute('viewBox', `0 0 ${maxX + 10} ${maxY + 10}`);
+
+    const stageColors = {
+        'idea': '#6c757d', 'planning': '#6f42c1', 'indev': '#0d6efd',
+        'conceptual_review': '#fd7e14', 'optimization': '#20c997',
+        'security': '#dc3545', 'final_review': '#e83e8c',
+        'human_review': '#ffc107', 'completed': '#198754'
+    };
+
+    let svgContent = '';
+
+    // Edges
+    edges.forEach(e => {
+        const from = layout[e.from];
+        const to = layout[e.to];
+        if (!from || !to) return;
+        const x1 = from.x + nodeW, y1 = from.y + nodeH / 2;
+        const x2 = to.x, y2 = to.y + nodeH / 2;
+        const mx = (x1 + x2) / 2;
+        svgContent += `<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}" fill="none" stroke="#adb5bd" stroke-width="1.5" marker-end="url(#arrowhead)"/>`;
+    });
+
+    // Nodes
+    nodes.forEach(n => {
+        const pos = layout[n.id];
+        if (!pos) return;
+        const t = taskData[n.id];
+        const color = n.isCurrent ? '#0d6efd' : (stageColors[t?.type] || '#6c757d');
+        const fill = n.isCurrent ? '#e7f1ff' : '#fff';
+        const stroke = n.isCurrent ? '#0d6efd' : '#dee2e6';
+        const sw = n.isCurrent ? 2 : 1;
+        const title = (n.title || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        svgContent += `<rect x="${pos.x}" y="${pos.y}" width="${nodeW}" height="${nodeH}" rx="4" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>`;
+        svgContent += `<text x="${pos.x + 6}" y="${pos.y + nodeH / 2 + 4}" font-size="10" fill="${color}" font-family="inherit" font-weight="${n.isCurrent ? '600' : '400'}">${title}</text>`;
+    });
+
+    // Arrowhead marker
+    svgContent = `<defs><marker id="arrowhead" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#adb5bd"/></marker></defs>` + svgContent;
+
+    svg.innerHTML = svgContent;
 }
 
 async function saveEditTask() {
@@ -3917,6 +4591,7 @@ async function saveEditTask() {
         description,
         owner,
         tags,
+        prerequisites: [..._prereqSelectedIds],
         ...(content && { content })
     };
 
@@ -5047,7 +5722,7 @@ const MAP_COLORS = {
     conceptual_review: '#20c997',
     optimization:      '#6610f2',
     security:          '#e83e8c',
-    full_review:       '#fd7e14',
+    human_review:       '#fd7e14',
     completed:         '#198754',
     subdividing:       '#6f42c1',
 };
@@ -5060,7 +5735,7 @@ const MAP_COLUMN_LABELS = {
     conceptual_review: 'AI REVIEW MAP — CONCEPT',
     optimization:      'AI REVIEW MAP — OPTIMIZATION',
     security:          'AI REVIEW MAP — SECURITY',
-    full_review:       'HUMAN REVIEW MAP',
+    human_review:       'HUMAN REVIEW MAP',
     completed:         'COMPLETED MAP',
 };
 
@@ -5384,6 +6059,7 @@ function renderColumnMap(colType) {
             <button class="card-highlight-btn" title="Highlight" onclick="event.stopPropagation();toggleHighlight('${id}')">☆</button>
             <div class="map-node-title" onclick="editTask('${id}')">${task.title || '(untitled)'}${badges ? ' ' + badges : ''}</div>
             <div class="map-node-meta">${tagHtml}${ownerHtml}</div>
+            <div class="map-node-prereq-handle" data-handle-for="${id}" title="Drag to create prerequisite" style="position:absolute;top:4px;right:4px;width:16px;height:16px;border-radius:50%;background:#0d6efd;color:#fff;font-size:10px;display:flex;align-items:center;justify-content:center;cursor:crosshair;z-index:10;opacity:0;transition:opacity 0.15s" onmousedown="event.stopPropagation();_mapStartPrereqDrag(event,'${id}')">+</div>
             <div class="card-toolbar" style="margin-bottom:0.3rem">
                 <button class="toolbar-btn" title="Research" onclick="event.stopPropagation();openResearchDialog('${id}')">🔍</button>
                 <button class="toolbar-btn" title="Subdivide" onclick="event.stopPropagation();toolbarSubdivide('${id}')">✂</button>
@@ -5559,6 +6235,117 @@ function _mapRedrawArrows() {
         path.setAttribute('marker-end', 'url(#map-arrowhead)');
         svg.appendChild(path);
     });
+}
+
+// ============================================
+// Column Map: Drag-to-Connect Prerequisites
+// ============================================
+
+let _mapPrereqDrag = { active: false, sourceId: null, line: null };
+
+function _mapStartPrereqDrag(event, sourceId) {
+    event.preventDefault();
+    event.stopPropagation();
+    _mapPrereqDrag = { active: true, sourceId, line: null };
+
+    // Get source node position
+    const sourcePos = _mapCurrentNodePositions[sourceId];
+    if (!sourcePos) return;
+
+    const svg = document.getElementById('column-map-svg');
+    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    line.setAttribute('stroke', '#0d6efd');
+    line.setAttribute('stroke-width', '2');
+    line.setAttribute('stroke-dasharray', '6,3');
+    line.setAttribute('x1', sourcePos.x + _mapOffsetX + 130);
+    line.setAttribute('y1', sourcePos.y + _mapOffsetY + 20);
+    line.setAttribute('x2', sourcePos.x + _mapOffsetX + 130);
+    line.setAttribute('y2', sourcePos.y + _mapOffsetY + 20);
+    svg.appendChild(line);
+    _mapPrereqDrag.line = line;
+
+    // Highlight all nodes as drop targets
+    document.querySelectorAll('.map-node').forEach(n => {
+        n.style.outline = '2px dashed #0d6efd44';
+        n.style.outlineOffset = '2px';
+    });
+
+    document.addEventListener('mousemove', _mapPrereqDragMove);
+    document.addEventListener('mouseup', _mapPrereqDragEnd);
+}
+
+function _mapPrereqDragMove(event) {
+    if (!_mapPrereqDrag.active) return;
+    const line = _mapPrereqDrag.line;
+    if (!line) return;
+
+    const svg = document.getElementById('column-map-svg');
+    const pt = svg.createSVGPoint();
+    pt.x = event.clientX;
+    pt.y = event.clientY;
+    const svgP = pt.matrixTransform(svg.getScreenCTM().inverse());
+
+    line.setAttribute('x2', svgP.x);
+    line.setAttribute('y2', svgP.y);
+}
+
+function _mapPrereqDragEnd(event) {
+    if (!_mapPrereqDrag.active) return;
+    _mapPrereqDrag.active = false;
+
+    document.removeEventListener('mousemove', _mapPrereqDragMove);
+    document.removeEventListener('mouseup', _mapPrereqDragEnd);
+
+    // Remove the temp line
+    if (_mapPrereqDrag.line) {
+        _mapPrereqDrag.line.remove();
+        _mapPrereqDrag.line = null;
+    }
+
+    // Remove highlight from all nodes
+    document.querySelectorAll('.map-node').forEach(n => {
+        n.style.outline = '';
+        n.style.outlineOffset = '';
+    });
+
+    // Check if we dropped on another node
+    const target = event.target.closest('.map-node');
+    if (!target) { _mapPrereqDrag.sourceId = null; return; }
+
+    const targetId = target.id.replace('map-node-', '');
+    const sourceId = _mapPrereqDrag.sourceId;
+    if (!sourceId || sourceId === targetId) { _mapPrereqDrag.sourceId = null; return; }
+
+    // Add target as prerequisite of source
+    _addMapPrerequisite(sourceId, targetId);
+    _mapPrereqDrag.sourceId = null;
+}
+
+async function _addMapPrerequisite(taskId, prereqId) {
+    const task = taskData[taskId];
+    if (!task) return;
+
+    const existing = task.prerequisites || [];
+    if (existing.includes(prereqId)) return; // already a prereq
+
+    const updated = { ...task, prerequisites: [...existing, prereqId] };
+
+    try {
+        const resp = await fetch(`${API_BASE}/tasks/${taskId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prerequisites: updated.prerequisites })
+        });
+        if (!resp.ok) {
+            showToast('Failed to add prerequisite', 'error');
+            return;
+        }
+        const result = await resp.json();
+        taskData[taskId] = result;
+        showToast(`Added prerequisite: ${taskData[prereqId]?.title?.slice(0, 30) || prereqId}`, 'success');
+    } catch (err) {
+        showToast('Failed to add prerequisite: ' + err.message, 'error');
+    }
 }
 
 function applyMapTransform() {
@@ -5959,7 +6746,7 @@ function _removeStagePicker() {
 const _STAGE_LABELS = {
     architecture: 'Architecture', idea: 'Ideas', planning: 'Planning',
     indev: 'In Dev', conceptual_review: 'Review', optimization: 'Optimization',
-    security: 'Security', full_review: 'Full Review', completed: 'Completed',
+    security: 'Security', human_review: 'Full Review', completed: 'Completed',
 };
 
 function toolbarStagePicker(taskId, btn) {
@@ -5972,7 +6759,7 @@ function toolbarStagePicker(taskId, btn) {
     flyout.id = '_stage-picker-flyout';
     flyout.className = 'stage-picker-flyout';
 
-    const pipeline = ['architecture','idea','planning','indev','conceptual_review','optimization','security','full_review','completed'];
+    const pipeline = ['architecture','idea','planning','indev','conceptual_review','optimization','security','human_review','completed'];
     const current = taskData[taskId]?.type;
     pipeline.forEach(stage => {
         const item = document.createElement('button');
@@ -6012,7 +6799,7 @@ function toolbarStagePicker(taskId, btn) {
 }
 
 async function toolbarRunPipeline(taskId, pipeline) {
-    const labels = { planning: 'Planning', review: 'Conceptual Review', optimization: 'Optimization', security: 'Security', 'full-review': 'Full Review' };
+    const labels = { planning: 'Planning', review: 'Conceptual Review', optimization: 'Optimization', security: 'Security', 'final-review': 'Final Review' };
     const label = labels[pipeline] || pipeline;
     const resp = await fetch(`${API_BASE}/tasks/${taskId}/run-${pipeline}`, { method: 'POST' });
     const d = await resp.json().catch(() => ({}));

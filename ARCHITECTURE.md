@@ -33,7 +33,7 @@ The core design principle is **irreversibility prevention**: every agent action 
 │  │                     Agent System                              │  │
 │  │  MaestroLoop · PlanningPipeline · SubdivisionAgent           │  │
 │  │  IntakeVoter · ConceptualReview · SecurityReview             │  │
-│  │  OptimizationPipeline · FullReviewPipeline · PIPResolution   │  │
+│  │  OptimizationPipeline · FinalReviewPipeline · PIPResolution   │  │
 │  └──────────────────────────┬────────────────────────────────────┘  │
 │                             │  OpenAI-compatible HTTP                │
 └─────────────────────────────┼───────────────────────────────────────┘
@@ -74,7 +74,7 @@ flowchart LR
     INDEV -->|component loop| CR[CONCEPTUAL_REVIEW]
     CR -->|LLM panel| OPT[OPTIMIZATION]
     OPT -->|LLM pass| SEC[SECURITY]
-    SEC -->|bandit+LLM| FR[FULL_REVIEW]
+    SEC -->|bandit+LLM| FR[FINAL_REVIEW]
     FR -->|majority vote| COMPLETED
 
     PLANNING -->|scope too large| IDEA
@@ -97,7 +97,7 @@ flowchart LR
 | **CONCEPTUAL_REVIEW** | ConceptualReviewPipeline | LLM panel majority | INDEV |
 | **OPTIMIZATION** | OptimizationPipeline | LLM pass | INDEV (if regressions) |
 | **SECURITY** | SecurityPipeline | Bandit + pip-audit + semgrep + LLM | INDEV |
-| **FULL_REVIEW** | FullReviewPipeline | LIKELY/POSSIBLE majority | INDEV |
+| **FINAL_REVIEW** | FinalReviewPipeline | LIKELY/POSSIBLE majority | INDEV |
 | **COMPLETED** | — | Human merge to main | — |
 
 ### Demotion & PIPs
@@ -208,7 +208,7 @@ Every 5 seconds:
 `DAGResolver` implements Kahn's topological sort. A task is **ready** when:
 - `type` is in `dispatchable_types` (configurable; default: all pipeline stages)
 - `is_active = True`
-- All task IDs in `prerequisites` have `type` in `{completed, cancelled, full_review}` (via `is_effectively_done()`)
+- All task IDs in `prerequisites` have `type` in `{completed, cancelled, final_review}` (via `is_effectively_done()`)
 - For Big Idea parents: ready only after all child tasks are effectively done
 - Not currently in `_active_sessions`
 - Not in cooldown (`failed` within 60s, `rejected` within 300s, project-level throttle within 300s)
@@ -240,7 +240,7 @@ Each agent is an async Python class that drives a single LLM in a turn-based loo
 | **ConceptualReviewPipeline** | `ConceptualReviewPipeline` | `conceptual_review.py` | Post-INDEV design quality review. |
 | **OptimizationPipeline** | `OptimizationPipeline` | `optimization.py` | Performance improvement pass. |
 | **SecurityPipeline** | `SecurityPipeline` | `security_review.py` | Static analysis + LLM security review. |
-| **FullReviewPipeline** | `FullReviewPipeline` | `full_review.py` | Final multi-reviewer acceptance vote. |
+| **FinalReviewPipeline** | `FinalReviewPipeline` | `final_review.py` | Final multi-reviewer acceptance vote. |
 | **DevOrchestrator** | `DevOrchestrator` | `dev_orchestrator.py` | Coordinates component execution order; manages batches; runs test-fix loop. |
 | **WebSearchAgent** | `WebSearchAgent` | `research.py` | Search + fetch + synthesize research questions. Dispatched async. |
 | **FileSummaryAgent** | `FileSummaryAgent` | `file_summary_agent.py` | Background file summarization for project context cache. |
@@ -458,7 +458,7 @@ Layer 4: Planning Gate (structural review before any code is written)
   • Context budget: each step must fit within max_context × 0.8
 
 Layer 5: Review Chain (multi-stage acceptance before merge)
-  • ConceptualReview → Optimization → Security → FullReview
+  • ConceptualReview → Optimization → Security → FinalReview
   • Each stage: LLM vote panel with justifications recorded in Stage Journal
   • Demotion with PIP on failure: next attempt must address recorded failures
   • Human merge required: COMPLETED ≠ merged; a human clicks the merge button
@@ -609,7 +609,7 @@ terminate_threshold = 0.95            # 0 = disabled
 [scheduler]
 tick_interval = 5.0                   # seconds
 enabled = true
-dispatchable_types = idea,planning,indev,conceptual_review,optimization,security,full_review
+dispatchable_types = idea,planning,indev,conceptual_review,optimization,security,final_review
 
 [verdicts]
 # intake vote thresholds
@@ -663,7 +663,7 @@ D:\workspace\TheMaestro\
 │   │   ├── conceptual_review.py    ← post-INDEV design review
 │   │   ├── optimization.py         ← performance improvement pipeline
 │   │   ├── security_review.py      ← static analysis + LLM security
-│   │   ├── full_review.py          ← final acceptance vote
+│   │   ├── final_review.py         ← final acceptance vote
 │   │   ├── dev_orchestrator.py     ← component batching + test-fix loop
 │   │   ├── scheduler.py            ← 5-second DAG-aware dispatch loop
 │   │   ├── system_prompt.py        ← agent system prompts + context builders

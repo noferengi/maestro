@@ -104,7 +104,7 @@ class TestPipCreation:
         reqs = ["Add logging.", "Write tests."]
         pip = create_pip(
             task_id=task_id,
-            origin_stage="full_review",
+            origin_stage="final_review",
             requirements=json.dumps(reqs),
         )
         pips = get_pips_for_task(task_id)
@@ -316,10 +316,10 @@ class TestResolutionJobLifecycle:
         task_id = _make_task()
         pip = _make_pip(task_id)
 
-        job1 = create_pip_resolution_job(task_id, pip.id, "full_review")
+        job1 = create_pip_resolution_job(task_id, pip.id, "final_review")
         update_pip_resolution_job(job1.id, status="done")
 
-        job2 = create_pip_resolution_job(task_id, pip.id, "full_review")
+        job2 = create_pip_resolution_job(task_id, pip.id, "final_review")
         assert job2 is not None
         assert job2.status == "pending"
 

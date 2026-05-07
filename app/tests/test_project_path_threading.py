@@ -70,7 +70,7 @@ class TestRunShellReview(unittest.TestCase):
 
     def test_uses_explicit_project_path(self):
         """subprocess.run should receive the explicit cwd."""
-        from app.agent.full_review import run_shell_review
+        from app.agent.final_review import run_shell_review
 
         mock_result = MagicMock()
         mock_result.stdout = "pytest ok"
@@ -83,7 +83,7 @@ class TestRunShellReview(unittest.TestCase):
 
     def test_falls_back_to_context_var(self):
         """When project_path is None, cwd comes from the ContextVar."""
-        from app.agent.full_review import run_shell_review
+        from app.agent.final_review import run_shell_review
         from app.agent.tools import set_task_git_cwd
 
         set_task_git_cwd("/contextvar/path")
@@ -116,9 +116,9 @@ class TestPipelineSignatures(unittest.TestCase):
         from app.agent.security_review import run_security_pipeline
         self.assertTrue(self._has_project_path(run_security_pipeline))
 
-    def test_run_full_review_pipeline(self):
-        from app.agent.full_review import run_full_review_pipeline
-        self.assertTrue(self._has_project_path(run_full_review_pipeline))
+    def test_run_final_review_pipeline(self):
+        from app.agent.final_review import run_final_review_pipeline
+        self.assertTrue(self._has_project_path(run_final_review_pipeline))
 
     def test_run_planning_pipeline(self):
         from app.agent.planning import run_planning_pipeline

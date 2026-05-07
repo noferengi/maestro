@@ -1838,7 +1838,7 @@ def write_task_status(task_id: str, new_status: str) -> str:
             "ERROR: 'ACCEPTED' is not valid here. "
             "To signal task completion, call the submit_work tool with signal='ACCEPTED'. "
             "This routes through the full review pipeline (conceptual_review → optimization → "
-            "security → full_review) before the task can reach completed."
+            "security → final_review) before the task can reach completed."
         )
     if new_status not in STATUS_TO_TYPE:
         return (
@@ -2306,8 +2306,7 @@ def _execute_in_project(
             return timeout_msg
         output = stdout or ""
         rc = proc.returncode
-        result_str = output[:8000] if output else ""
-        return result_str if result_str else f"EXIT_CODE: {rc}"
+        return output if output else f"EXIT_CODE: {rc}"
     except Exception as exc:
         return f"ERROR running command: {exc}"
 
@@ -3674,6 +3673,47 @@ TOOL_SCHEMAS: list[dict] = [
                     },
                 },
                 "required": ["result_id", "fields_json"],
+            },
+        },
+    },
+    # ---- Terminal tool ----
+    {
+        "type": "function",
+        "function": {
+            "name": "submit_work",
+            "description": (
+                "[FINISH] Terminate your session and report outcome. "
+                "Call this ONCE at the very end — it immediately stops the agent loop. "
+                "Choose signal: ACCEPTED (work done, tests pass), "
+                "REVERT_TO_DESIGN (blocked by design flaw or exhausted retries), "
+                "SUBDIVIDE (task too large, needs breakdown into sub-tasks), "
+                "PLAN_UPDATED (planning correction complete)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "signal": {
+                        "type": "string",
+                        "enum": ["ACCEPTED", "REVERT_TO_DESIGN", "SUBDIVIDE", "PLAN_UPDATED"],
+                        "description": (
+                            "Terminal signal: ACCEPTED (task complete), REVERT_TO_DESIGN "
+                            "(task impossible/needs re-plan), SUBDIVIDE (needs further breakdown), "
+                            "PLAN_UPDATED (correction complete)."
+                        ),
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "A concise final report of work done or justification for the signal.",
+                    },
+                    "payload": {
+                        "type": ["object", "null"],
+                        "description": (
+                            "Optional dictionary for agent-specific data (e.g., test results, "
+                            "sub-task lists, verdict details). Pass null or omit if no payload needed."
+                        ),
+                    },
+                },
+                "required": ["signal", "summary"],
             },
         },
     },

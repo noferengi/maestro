@@ -19,7 +19,7 @@ _ALLOWED_PLAN_FIELDS = {
 
 _ALLOWED_TASK_TYPES = {
     "idea", "planning", "indev", "conceptual_review",
-    "optimization", "security", "full_review", "completed", "architecture",
+    "optimization", "security", "final_review", "human_review", "completed", "architecture",
 }
 
 
@@ -96,7 +96,7 @@ def set_task_type(task_id: str, type: str) -> str:
     Force a task to any pipeline stage. Equivalent to the /set-stage endpoint.
 
     Allowed types: idea, planning, indev, conceptual_review, optimization,
-    security, full_review, completed, architecture.
+    security, final_review, human_review, completed, architecture.
 
     Use with care — this bypasses gate checks and does not create demotion records.
     """
@@ -219,7 +219,7 @@ def stop_agent(task_id: str) -> str:
     Request a graceful stop of the MaestroLoop running for task_id.
 
     Only works for MaestroLoop agents (indev stage). Pipeline agents
-    (planning, review, security, full_review) cannot be stopped mid-run.
+    (planning, review, security, final_review) cannot be stopped mid-run.
     After calling this, the agent will finish its current turn and halt.
     """
     import urllib.request, urllib.error
@@ -240,7 +240,7 @@ def stop_agent(task_id: str) -> str:
 _RUN_STAGE_ENDPOINTS = {
     "review": "run-review",
     "security": "run-security",
-    "full_review": "run-full-review",
+    "final_review": "run-final-review",
 }
 
 
@@ -248,7 +248,7 @@ def run_pipeline_stage(task_id: str, stage: str) -> str:
     """
     Trigger a pipeline stage run for a task.
 
-    stage must be one of: review, security, full_review.
+    stage must be one of: review, security, final_review.
     For planning use trigger_planning_run instead.
 
     Requires the Maestro server to be running on localhost:8000.

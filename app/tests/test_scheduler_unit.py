@@ -81,6 +81,7 @@ def _fake_db_task(
     task.description = description
     task.title = "Test Task"
     task.parent_task_id = parent_task_id
+    task.clarification_status = "approved"
     task.intake_exhausted_at = None  # not exhausted by default
     return task
 
@@ -443,13 +444,25 @@ class TestTickFiltering:
                 MockDAG.return_value.get_ready_tasks.return_value = ready
                 with patch("app.database.get_task", return_value=fake_task):
                     with patch("app.database.get_llm", return_value=fake_llm):
-                        with patch("app.database.count_pending_research_jobs", return_value=0):
-                            with patch("app.database.get_pending_research_jobs", return_value=[]):
-                                with patch("app.agent.scheduler.threading.Thread") as mock_thread_cls:
-                                    mock_thread_cls.return_value.start = lambda: None
-                                    sched_mod._tick()
-                                    # idea tasks are now in default dispatchable types
-                                    mock_thread_cls.assert_called()
+                        with patch("app.agent.scheduler._dispatch_clarification_jobs", return_value=None), \
+                             patch("app.agent.scheduler._dispatch_file_summary_jobs", return_value=None), \
+                             patch("app.agent.scheduler._dispatch_research_jobs", return_value=None), \
+                             patch("app.agent.scheduler._dispatch_arch_gen_jobs", return_value=None), \
+                             patch("app.agent.scheduler._dispatch_scope_survey_jobs", return_value=None), \
+                             patch("app.agent.scheduler._dispatch_pip_resolution_jobs", return_value=None), \
+                             patch("app.agent.scheduler._dispatch_dreamer", return_value=None), \
+                             patch("app.agent.scheduler._rescue_stale_jobs", return_value=None), \
+                             patch("app.agent.scheduler._run_subdivision_recovery", return_value=None), \
+                             patch("app.agent.scheduler._check_and_reserve_slot", return_value=True), \
+                             patch("app.agent.scheduler._estimate_worst_case_microcents", return_value=0), \
+                             patch("app.database.budget_has_capacity", return_value=True), \
+                             patch("app.database.get_project_path", return_value="/tmp"), \
+                             patch("app.agent.scheduler.is_shutting_down", return_value=False):
+                            with patch("app.agent.scheduler.threading.Thread") as mock_thread_cls:
+                                mock_thread_cls.return_value.start = lambda: None
+                                sched_mod._tick()
+                                # idea tasks are now in default dispatchable types
+                                mock_thread_cls.assert_called()
 
     def test_completed_tasks_not_dispatched(self):
         """Completed tasks must not be auto-dispatched."""
@@ -537,15 +550,15 @@ class TestNewDispatcherRouting:
         mock_fn.assert_called_once()
         mock_loop.assert_not_called()
 
-    def test_full_review_routes_to_new_dispatcher(self):
+    def test_final_review_routes_to_new_dispatcher(self):
         llm = _fake_llm(llm_id=32)
-        db_task = _fake_db_task(task_type="full_review", task_id="t-fr")
+        db_task = _fake_db_task(task_type="final_review", task_id="t-fr")
         with _llm_counts_lock:
             _llm_session_counts[32] = 1
 
-        with patch("app.agent.scheduler._run_full_review_task") as mock_fn, \
+        with patch("app.agent.scheduler._run_final_review_task") as mock_fn, \
              patch("app.agent.scheduler._run_maestro_loop") as mock_loop:
-            _run_task("t-fr", "full_review", llm, db_task, None)
+            _run_task("t-fr", "final_review", llm, db_task, None)
 
         mock_fn.assert_called_once()
         mock_loop.assert_not_called()
@@ -676,7 +689,7 @@ class TestRunSecurityTask:
         "total_completion_tokens": 0,
     }
 
-    def test_advances_to_full_review_on_security_pass(self):
+    def test_advances_to_final_review_on_security_pass(self):
         from app.agent.scheduler import _run_security_task
 
         updated_types = []
@@ -693,7 +706,7 @@ class TestRunSecurityTask:
                    return_value=self._SEC_PASS):
             _run_security_task("sec-1", "http://localhost:8008/v1", "model")
 
-        assert "full_review" in updated_types
+        assert "final_review" in updated_types
 
     def test_demotes_on_security_rejected(self):
         from app.agent.scheduler import _run_security_task
@@ -717,7 +730,7 @@ class TestRunSecurityTask:
             _run_security_task("sec-2", "http://localhost:8008/v1", "model")
 
         assert "indev" in updated_types
-        assert "full_review" not in updated_types
+        assert "final_review" not in updated_types
 
     def test_demotion_target_respected(self):
         from app.agent.scheduler import _run_security_task
@@ -743,7 +756,7 @@ class TestRunSecurityTask:
             _run_security_task("sec-3", "http://localhost:8008/v1", "model")
 
         assert "optimization" in updated_types
-        assert "full_review" not in updated_types
+        assert "final_review" not in updated_types
 
     def test_transition_result_recorded(self):
         from app.agent.scheduler import _run_security_task
@@ -765,10 +778,10 @@ class TestRunSecurityTask:
 
 
 # ===========================================================================
-# _run_full_review_task unit tests
+# _run_final_review_task unit tests
 # ===========================================================================
 
-class TestRunFullReviewTask:
+class TestRunFinalReviewTask:
     _FR_PASS = {
         "outcome": "passed", "demotion_target": None, "summary": "",
         "total_prompt_tokens": 10, "total_completion_tokens": 20, "votes": [],
@@ -778,8 +791,8 @@ class TestRunFullReviewTask:
         "total_prompt_tokens": 10, "total_completion_tokens": 20, "votes": [],
     }
 
-    def test_full_review_failed_demotes(self):
-        from app.agent.scheduler import _run_full_review_task
+    def test_final_review_failed_demotes(self):
+        from app.agent.scheduler import _run_final_review_task
 
         updated_types = []
 
@@ -789,45 +802,45 @@ class TestRunFullReviewTask:
 
         mock_record = MagicMock()
 
-        with patch("app.database.get_task", return_value=_fake_db_task(task_id="fr-1", task_type="full_review")), \
+        with patch("app.database.get_task", return_value=_fake_db_task(task_id="fr-1", task_type="final_review")), \
              patch("app.database.update_task", side_effect=_capture), \
              patch("app.database.create_transition_result", MagicMock()), \
              patch("app.database.get_project_path", return_value=None), \
              patch("app.agent.tools.set_task_git_cwd", MagicMock()), \
-             patch("app.agent.full_review.run_full_review_pipeline",
+             patch("app.agent.final_review.run_final_review_pipeline",
                    return_value=self._FR_FAIL), \
              patch("app.agent.scheduler._record_demotion_inline", mock_record):
-            _run_full_review_task("fr-1", "http://localhost:8008/v1", "model")
+            _run_final_review_task("fr-1", "http://localhost:8008/v1", "model")
 
         assert "indev" in updated_types
         mock_record.assert_called()
 
     def test_virtual_passed_records_ready_for_review(self):
         """Virtual merge success → append_task_history with 'ready_for_review'."""
-        from app.agent.scheduler import _run_full_review_task
+        from app.agent.scheduler import _run_final_review_task
         from app.agent.merge import MergeResult
 
         mock_append = MagicMock()
 
-        with patch("app.database.get_task", return_value=_fake_db_task(task_id="fr-2", task_type="full_review")), \
+        with patch("app.database.get_task", return_value=_fake_db_task(task_id="fr-2", task_type="final_review")), \
              patch("app.database.update_task", MagicMock()), \
              patch("app.database.create_transition_result", MagicMock()), \
              patch("app.database.get_project_path", return_value=None), \
              patch("app.database.append_task_history", mock_append), \
              patch("app.agent.tools.set_task_git_cwd", MagicMock()), \
-             patch("app.agent.full_review.run_full_review_pipeline",
+             patch("app.agent.final_review.run_final_review_pipeline",
                    return_value=self._FR_PASS), \
              patch("app.agent.merge.execute_merge",
                    return_value=MergeResult(task_id="fr-2", status="virtual_passed")), \
              patch("app.agent.scheduler._record_demotion_inline", MagicMock()):
-            _run_full_review_task("fr-2", "http://localhost:8008/v1", "model")
+            _run_final_review_task("fr-2", "http://localhost:8008/v1", "model")
 
         mock_append.assert_called_once()
         assert mock_append.call_args[0][1] == "ready_for_review"
 
     def test_conflict_logs_merge_test_failed(self):
         """Virtual merge conflict → append_task_history with 'merge_test_failed'; no type change."""
-        from app.agent.scheduler import _run_full_review_task
+        from app.agent.scheduler import _run_final_review_task
         from app.agent.merge import MergeResult
 
         mock_append = MagicMock()
@@ -837,18 +850,18 @@ class TestRunFullReviewTask:
             if "type" in kwargs:
                 updated_types.append(kwargs["type"])
 
-        with patch("app.database.get_task", return_value=_fake_db_task(task_id="fr-3", task_type="full_review")), \
+        with patch("app.database.get_task", return_value=_fake_db_task(task_id="fr-3", task_type="final_review")), \
              patch("app.database.update_task", side_effect=_capture), \
              patch("app.database.create_transition_result", MagicMock()), \
              patch("app.database.get_project_path", return_value=None), \
              patch("app.database.append_task_history", mock_append), \
              patch("app.agent.tools.set_task_git_cwd", MagicMock()), \
-             patch("app.agent.full_review.run_full_review_pipeline",
+             patch("app.agent.final_review.run_final_review_pipeline",
                    return_value=self._FR_PASS), \
              patch("app.agent.merge.execute_merge",
                    return_value=MergeResult(task_id="fr-3", status="conflict")), \
              patch("app.agent.scheduler._record_demotion_inline", MagicMock()):
-            _run_full_review_task("fr-3", "http://localhost:8008/v1", "model")
+            _run_final_review_task("fr-3", "http://localhost:8008/v1", "model")
 
         mock_append.assert_called_once()
         assert mock_append.call_args[0][1] == "merge_test_failed"
@@ -856,7 +869,7 @@ class TestRunFullReviewTask:
 
     def test_test_failure_logs_merge_test_failed(self):
         """Virtual merge test_failure → append_task_history with 'merge_test_failed'; no type change."""
-        from app.agent.scheduler import _run_full_review_task
+        from app.agent.scheduler import _run_final_review_task
         from app.agent.merge import MergeResult
 
         mock_append = MagicMock()
@@ -866,18 +879,18 @@ class TestRunFullReviewTask:
             if "type" in kwargs:
                 updated_types.append(kwargs["type"])
 
-        with patch("app.database.get_task", return_value=_fake_db_task(task_id="fr-4", task_type="full_review")), \
+        with patch("app.database.get_task", return_value=_fake_db_task(task_id="fr-4", task_type="final_review")), \
              patch("app.database.update_task", side_effect=_capture), \
              patch("app.database.create_transition_result", MagicMock()), \
              patch("app.database.get_project_path", return_value=None), \
              patch("app.database.append_task_history", mock_append), \
              patch("app.agent.tools.set_task_git_cwd", MagicMock()), \
-             patch("app.agent.full_review.run_full_review_pipeline",
+             patch("app.agent.final_review.run_final_review_pipeline",
                    return_value=self._FR_PASS), \
              patch("app.agent.merge.execute_merge",
                    return_value=MergeResult(task_id="fr-4", status="test_failure")), \
              patch("app.agent.scheduler._record_demotion_inline", MagicMock()):
-            _run_full_review_task("fr-4", "http://localhost:8008/v1", "model")
+            _run_final_review_task("fr-4", "http://localhost:8008/v1", "model")
 
         mock_append.assert_called_once()
         assert mock_append.call_args[0][1] == "merge_test_failed"
@@ -885,7 +898,7 @@ class TestRunFullReviewTask:
 
     def test_push_failure_logs_merge_test_failed(self):
         """Virtual merge push_failure → append_task_history with 'merge_test_failed'; no type change."""
-        from app.agent.scheduler import _run_full_review_task
+        from app.agent.scheduler import _run_final_review_task
         from app.agent.merge import MergeResult
 
         mock_append = MagicMock()
@@ -895,18 +908,18 @@ class TestRunFullReviewTask:
             if "type" in kwargs:
                 updated_types.append(kwargs["type"])
 
-        with patch("app.database.get_task", return_value=_fake_db_task(task_id="fr-5", task_type="full_review")), \
+        with patch("app.database.get_task", return_value=_fake_db_task(task_id="fr-5", task_type="final_review")), \
              patch("app.database.update_task", side_effect=_capture), \
              patch("app.database.create_transition_result", MagicMock()), \
              patch("app.database.get_project_path", return_value=None), \
              patch("app.database.append_task_history", mock_append), \
              patch("app.agent.tools.set_task_git_cwd", MagicMock()), \
-             patch("app.agent.full_review.run_full_review_pipeline",
+             patch("app.agent.final_review.run_final_review_pipeline",
                    return_value=self._FR_PASS), \
              patch("app.agent.merge.execute_merge",
                    return_value=MergeResult(task_id="fr-5", status="push_failure")), \
              patch("app.agent.scheduler._record_demotion_inline", MagicMock()):
-            _run_full_review_task("fr-5", "http://localhost:8008/v1", "model")
+            _run_final_review_task("fr-5", "http://localhost:8008/v1", "model")
 
         mock_append.assert_called_once()
         assert mock_append.call_args[0][1] == "merge_test_failed"

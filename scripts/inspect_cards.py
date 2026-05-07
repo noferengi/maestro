@@ -31,12 +31,12 @@ from datetime import datetime, timedelta, timezone
 
 # -- Config -------------------------------------------------------------------
 DB_PATH = "data/kanban.db"
-DISPATCHABLE = {"idea", "planning", "indev", "conceptual_review", "optimization", "full_review"}
+DISPATCHABLE = {"idea", "planning", "indev", "conceptual_review", "optimization", "security", "final_review"}
 DONE_STATUSES = {"completed", "accepted"}
-NEVER_DISPATCH = {"security", "completed", "accepted", "cancelled", "subdividing"}
+NEVER_DISPATCH = {"completed", "accepted", "cancelled", "subdividing"}
 PIPELINE_STAGES = [
     "idea", "planning", "indev", "conceptual_review",
-    "optimization", "security", "full_review", "completed",
+    "optimization", "security", "final_review", "human_review", "completed",
 ]
 _REJECTION_RETRY_COOLDOWN = 300  # seconds, matches scheduler.py
 
@@ -445,6 +445,13 @@ def cmd_scheduler(cur, project=None):
         created = hist[0].get("timestamp", "?") if hist else "?"
         print("  {} | {}".format(t["id"], t["title"][:50]))
         print("    children={}  created={}  ({})".format(n_children, fmt_ts(created), since(created)))
+
+    if buckets["non_dispatchable"]:
+        print("\n[!] NON-DISPATCHABLE TYPE ({}) -- not in SCHEDULER_DISPATCHABLE_TYPES".format(
+            len(buckets["non_dispatchable"])
+        ))
+        for t in buckets["non_dispatchable"]:
+            print("  [{}] {}".format(t["type"], t["title"][:55]))
 
     if buckets["no_llm"]:
         print("\n[!] NO LLM ASSIGNED ({})".format(len(buckets["no_llm"])))

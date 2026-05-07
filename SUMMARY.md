@@ -37,4 +37,4 @@ Following the server restart, the scheduler successfully identified the "strande
 1.  **Reduced Deadlocks:** With the `SubdivisionAgent` stabilized, "Big Ideas" will now reliably decompose into smaller tasks. The scheduler will no longer leave tasks in a `subdividing` limbo.
 2.  **Resource Efficiency:** The Circuit Breaker will significantly reduce "token burn" on tasks with vague descriptions. Instead of looping 100+ times, they will surface in the `idea` column for human intervention after 5 failures.
 3.  **Higher Planning Quality:** By injecting specific security requirements, we've set a pattern for how to break planning loops. In the future, the Planning Correction Agent could be extended to suggest these description updates automatically.
-4.  **Scaling:** The pipeline is now more resilient to LLM "hallucinations" or design rejections, which is critical as the project moves into the more complex `INDEV` and `FULL_REVIEW` stages.
+4.  **Scaling:** The pipeline is now more resilient to LLM "hallucinations" or design rejections, which is critical as the project moves into the more complex `INDEV` and `FINAL_REVIEW` stages.

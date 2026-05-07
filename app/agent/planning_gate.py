@@ -704,6 +704,20 @@ class PlanningGate:
             f"TASK DESCRIPTION:\n{self.task_description[:1500]}\n\n"
             if self.task_description else ""
         )
+        # Acceptance criteria (from clarification draft)
+        acceptance_criteria = getattr(self, "acceptance_criteria", None)
+        ac_block = ""
+        if acceptance_criteria:
+            if isinstance(acceptance_criteria, list):
+                ac_block = f"ACCEPTANCE CRITERIA (must all be satisfied):\n{json.dumps(acceptance_criteria, indent=1)}\n\n"
+            elif isinstance(acceptance_criteria, str):
+                try:
+                    ac_list = json.loads(acceptance_criteria)
+                    if isinstance(ac_list, list):
+                        ac_block = f"ACCEPTANCE CRITERIA (must all be satisfied):\n{json.dumps(ac_list, indent=1)}\n\n"
+                except (json.JSONDecodeError, ValueError):
+                    ac_block = f"ACCEPTANCE CRITERIA:\n{acceptance_criteria}\n\n"
+
         # Strip pitfalls/advisory fields — they describe risks NOT being implemented and
         # confuse the spec checker into treating "we won't use X" as "we implement X".
         spec_plan = {
@@ -718,12 +732,15 @@ class PlanningGate:
             ],
         }
         prompt = (
-            f"{task_desc_block}"
+            f"{task_desc_block}{ac_block}"
             f"PLAN (implementation fields only):\n{json.dumps(spec_plan, indent=1)[:3000]}\n\n"
-            "Review the plan above on two dimensions:\n\n"
+            "Review the plan above on three dimensions:\n\n"
             "1. FEASIBILITY — is the plan technically sound and achievable?\n\n"
             "2. SPEC COMPLIANCE — does the plan's actual implementation use an approach "
-            "the task explicitly forbids?\n"
+            "the task explicitly forbids?\n\n"
+            "3. ACCEPTANCE CRITERIA COVERAGE — does the plan's implementation_steps "
+            "address every item in the ACCEPTANCE CRITERIA section above?\n"
+            "   List any criteria that are NOT addressed by the plan.\n\n"
             "   CRITICAL RULES:\n"
             "   - Read ONLY the file_manifest actions and implementation_steps descriptions "
             "to judge what the code will DO. Ignore any mentions of approaches being "
@@ -741,6 +758,7 @@ class PlanningGate:
             '    "feasible": true/false,\n'
             '    "spec_violation": true/false,\n'
             '    "spec_violation_detail": "which constraint is violated and how" or "",\n'
+            '    "acceptance_criteria_coverage": "which criteria are met, which are missing" or "",\n'
             '    "concerns": ["concern 1", ...]\n'
             '  }\n'
             "}"

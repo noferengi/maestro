@@ -27,7 +27,7 @@ def _delete_task(task_id):
     from app.database import (
         SessionLocal, Task, TransitionVote, TransitionResult, BudgetEntry,
         SubdivisionRecord, PlanningResult, ComponentResult,
-        OptimizationResult, SecurityReviewResult, FullReviewResult,
+        OptimizationResult, SecurityReviewResult, FinalReviewResult,
         MergeRecord,
     )
     db = SessionLocal()
@@ -38,7 +38,7 @@ def _delete_task(task_id):
         for model in (
             TransitionVote, TransitionResult, BudgetEntry,
             PlanningResult, ComponentResult, OptimizationResult,
-            SecurityReviewResult, FullReviewResult, MergeRecord,
+            SecurityReviewResult, FinalReviewResult, MergeRecord,
         ):
             db.query(model).filter(model.task_id == task_id).delete(synchronize_session=False)
         # SubdivisionRecord uses parent_task_id, not task_id.
@@ -73,13 +73,17 @@ def _cleanup_budget(budget_id):
         db.close()
 
 
-def _make_task(task_id, task_type, description="desc", llm_id=None, budget_id=None):
+def _make_task(task_id, task_type, description="desc", llm_id=None, budget_id=None,
+               clarification_status=None):
     from app.database import SessionLocal, Task
     db = SessionLocal()
     try:
-        t = Task(id=task_id, title="T", type=task_type, position=0,
+        kwargs = dict(id=task_id, title="T", type=task_type, position=0,
                  project="TestPipelineRouting", description=description,
                  llm_id=llm_id, budget_id=budget_id)
+        if clarification_status is not None:
+            kwargs["clarification_status"] = clarification_status
+        t = Task(**kwargs)
         db.add(t)
         db.commit()
     finally:
@@ -119,13 +123,14 @@ def _make_llm(address, port, model):
 # ---------------------------------------------------------------------------
 
 class TestAdvanceHandlersMap:
-    """ADVANCE_HANDLERS covers the 6 AI-driven pipeline stages; full_review is a human gate."""
+    """ADVANCE_HANDLERS covers the 7 AI-driven pipeline stages; human_review is a manual gate."""
 
     def test_all_advanceable_types_present(self):
         import main
         expected = {
             "idea", "planning", "indev",
             "conceptual_review", "optimization", "security",
+            "final_review",
         }
         assert set(main.ADVANCE_HANDLERS.keys()) == expected
 
@@ -140,11 +145,11 @@ class TestAdvanceHandlersMap:
         assert main.ADVANCE_HANDLERS["idea"]               == "_run_intake_pipeline"
         assert main.ADVANCE_HANDLERS["planning"]           == "_run_planning_pipeline_bg"
         assert main.ADVANCE_HANDLERS["indev"]              == "_run_dev_orchestrator_bg"
-        assert main.ADVANCE_HANDLERS["conceptual_review"]  == "_advance_to_optimization"
+        assert main.ADVANCE_HANDLERS["conceptual_review"]  == "_run_optimization_pipeline_bg"
         assert main.ADVANCE_HANDLERS["optimization"]       == "_run_security_pipeline_bg"
-        assert main.ADVANCE_HANDLERS["security"]           == "_run_full_review_bg"
-        # full_review is a human gate — no automated advance handler; merge via /merge endpoint
-        assert "full_review" not in main.ADVANCE_HANDLERS
+        assert main.ADVANCE_HANDLERS["security"]           == "_run_security_pipeline_bg"
+        assert main.ADVANCE_HANDLERS["final_review"]       == "_run_final_review_pipeline_bg"
+        # human_review is a manual gate — no automated advance handler; merge via /merge endpoint
 
     def test_non_advanceable_types_absent(self):
         """architecture, completed, cancelled, subdividing are never in the map."""
@@ -229,7 +234,8 @@ class TestAdvanceEndpointValidation:
         llm_id = _make_llm("test-ok-host", 19998, "test-ok")
         budget_id = _make_budget("test-budget-advance-ok")
         _make_task(task_id, "idea", description="Implement login",
-                   llm_id=llm_id, budget_id=budget_id)
+                   llm_id=llm_id, budget_id=budget_id,
+                   clarification_status="approved")
         try:
             with patch("main._run_intake_pipeline"):
                 r = self.client.post(f"/api/tasks/{task_id}/advance")
@@ -266,8 +272,8 @@ class TestAdvanceEndpointValidation:
 
 class TestSchedulerDispatch:
     """Scheduler auto-dispatches all pipeline stages (planning, indev,
-    conceptual_review, optimization, full_review) plus idea tasks.
-    Architecture, security, and completed are the only types never dispatched."""
+    conceptual_review, optimization, security, final_review) plus idea tasks.
+    Architecture, human_review, and completed are the only types never dispatched."""
 
     # Patch targets: _tick() uses lazy imports, so we patch at the source module
     _DB_GET_ALL   = "app.database.get_all_tasks"
@@ -350,7 +356,7 @@ class TestSchedulerDispatch:
         """All mid-pipeline stages must be in SCHEDULER_DISPATCHABLE_TYPES for
         orphan recovery after server restart."""
         from app.agent.scheduler import SCHEDULER_DISPATCHABLE_TYPES
-        for col_type in ("indev", "conceptual_review", "optimization", "security", "full_review"):
+        for col_type in ("indev", "conceptual_review", "optimization", "security", "final_review"):
             assert col_type in SCHEDULER_DISPATCHABLE_TYPES, \
                 f"'{col_type}' must be auto-dispatchable (restart recovery)"
 
@@ -394,9 +400,9 @@ class TestSchedulerDispatch:
         mock_thread = self._isolated_tick([task], db_task=db_task, llm=llm)
         mock_thread.assert_called_once()
 
-    def test_full_review_task_spawns_thread(self):
-        """An orphaned full_review task is re-dispatched (restart recovery)."""
-        task = self._ready_task_dict("sched-fr-1", "full_review")
+    def test_final_review_task_spawns_thread(self):
+        """An orphaned final_review task is re-dispatched (restart recovery)."""
+        task = self._ready_task_dict("sched-fr-1", "final_review")
         db_task = MagicMock(llm_id=79, budget_id=1)
         llm = MagicMock(id=79, parallel_sessions=3, address="localhost",
                         port=8008, model="test")

@@ -25,6 +25,7 @@ def _fake_db_task(task_id="t1", task_type="idea", llm_id=1, budget_id=1, project
     task.title = "Test Task"
     task.parent_task_id = None
     task.intake_exhausted_at = None
+    task.clarification_status = "approved"
     return task
 
 def _fake_llm(llm_id=1):
@@ -75,6 +76,8 @@ class TestSchedulerDemotionBug:
 
             # We need to mock a lot of other things that _tick calls
             with patch("app.agent.scheduler._dispatch_file_summary_jobs", return_value=None), \
+                 patch("app.agent.scheduler._dispatch_clarification_jobs", return_value=None), \
+                 patch("app.agent.scheduler._dispatch_research_jobs", return_value=None), \
                  patch("app.agent.scheduler._dispatch_arch_gen_jobs", return_value=None), \
                  patch("app.agent.scheduler._dispatch_scope_survey_jobs", return_value=None), \
                  patch("app.agent.scheduler._dispatch_pip_resolution_jobs", return_value=None), \
@@ -109,6 +112,8 @@ class TestSchedulerDemotionBug:
             mock_thread_cls.return_value.start = lambda: None
 
             with patch("app.agent.scheduler._dispatch_file_summary_jobs", return_value=None), \
+                 patch("app.agent.scheduler._dispatch_clarification_jobs", return_value=None), \
+                 patch("app.agent.scheduler._dispatch_research_jobs", return_value=None), \
                  patch("app.agent.scheduler._dispatch_arch_gen_jobs", return_value=None), \
                  patch("app.agent.scheduler._dispatch_scope_survey_jobs", return_value=None), \
                  patch("app.agent.scheduler._dispatch_pip_resolution_jobs", return_value=None), \

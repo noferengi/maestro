@@ -188,7 +188,7 @@ POST /api/tasks/{id}/run-pip-resolution/{pip_id}
 ### Where it fires
 
 Each stage worker thread (in `scheduler.py`) wraps its pipeline call with a pre-flight check.
-Affected stages: `conceptual_review`, `optimization`, `security`, `full_review`.
+Affected stages: `conceptual_review`, `optimization`, `security`, `final_review`.
 
 The check does **not** add voters to the existing pipeline — it runs before the pipeline starts.
 If it blocks, the pipeline function is never called.
@@ -434,7 +434,7 @@ Logic:
 Each resolution agent counts against per-LLM and per-compute-node caps as a normal session.
 Key in `_active_sessions`: `f"pip_resolution_{pip_id}"` (not `task_id`).
 
-### `_dispatch_conceptual_review_jobs()` (and optimization / security / full_review equivalents)
+### `_dispatch_conceptual_review_jobs()` (and optimization / security / final_review equivalents)
 
 Add pre-flight wrapper at the top of each dispatch thread worker. Pattern is identical across
 all four stages — extract a shared `_run_pip_preflight_and_gate(task_id, stage, ...)` helper

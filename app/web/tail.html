@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Session Tail — TheMaestro</title>
+    <link rel="stylesheet" href="/static/style.css?v=24">
+    <link rel="stylesheet" href="/static/diagnostics.css?v=19">
+    <style>
+        /* ── Layout ─────────────────────────────────────────────────── */
+        .tail-body { background: #0d1117; color: #c9d1d9; }
+
+        .tail-workspace {
+            display: flex;
+            flex-direction: column;
+            height: calc(100vh - 52px);
+            overflow: hidden;
+        }
+
+        /* ── Toolbar ────────────────────────────────────────────────── */
+        .tail-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: 0.5rem 1.25rem;
+            background: #161b22;
+            border-bottom: 1px solid #30363d;
+            flex-shrink: 0;
+            flex-wrap: wrap;
+        }
+        .tail-status {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            font-size: 0.82rem;
+            font-weight: 600;
+        }
+        .tail-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #484f58;
+        }
+        .tail-dot.connected { background: #3fb950; box-shadow: 0 0 6px #3fb95088; }
+        .tail-dot.connecting { background: #d29922; animation: tail-pulse 1s ease-in-out infinite; }
+        .tail-dot.error { background: #f85149; }
+        @keyframes tail-pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+        .tail-count {
+            font-size: 0.78rem;
+            color: #8b949e;
+        }
+        .tail-count span { color: #c9d1d9; font-weight: 600; }
+        .tail-fps {
+            margin-left: auto;
+            font-size: 0.74rem;
+            color: #484f58;
+        }
+        .tail-fps span { color: #8b949e; }
+
+        .tail-btn {
+            background: #21262d;
+            border: 1px solid #30363d;
+            color: #c9d1d9;
+            border-radius: 6px;
+            padding: 0.3rem 0.7rem;
+            font-size: 0.78rem;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        .tail-btn:hover { background: #30363d; }
+        .tail-btn.active { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+
+        /* ── Log area ───────────────────────────────────────────────── */
+        .tail-log {
+            flex: 1;
+            overflow-y: auto;
+            padding: 0.5rem 0;
+            scroll-behavior: smooth;
+        }
+
+        .tail-entry {
+            display: flex;
+            gap: 0.75rem;
+            padding: 0.45rem 1.25rem;
+            border-bottom: 1px solid #21262d;
+            font-size: 0.8rem;
+            line-height: 1.5;
+            transition: background 0.2s;
+        }
+        .tail-entry:hover { background: #161b2244; }
+        .tail-entry.new { background: #1f6feb11; }
+
+        .tail-ts {
+            font-family: "Cascadia Code", "Fira Code", "Consolas", monospace;
+            font-size: 0.72rem;
+            color: #484f58;
+            white-space: nowrap;
+            min-width: 140px;
+            flex-shrink: 0;
+            padding-top: 1px;
+        }
+
+        .tail-meta {
+            display: flex;
+            flex-direction: column;
+            gap: 0.15rem;
+            min-width: 160px;
+            max-width: 220px;
+            flex-shrink: 0;
+        }
+        .tail-agent {
+            font-weight: 700;
+            font-size: 0.76rem;
+            color: #58a6ff;
+        }
+        .tail-agent.none { color: #484f58; font-weight: 400; }
+        .tail-task-ref {
+            font-size: 0.72rem;
+            color: #8b949e;
+        }
+        .tail-task-ref a {
+            color: #58a6ff;
+            text-decoration: none;
+        }
+        .tail-task-ref a:hover { text-decoration: underline; }
+
+        .tail-body-text {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+        }
+
+        .tail-task-title {
+            font-weight: 600;
+            color: #c9d1d9;
+            margin-bottom: 0.2rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .tail-preview {
+            font-family: "Cascadia Code", "Fira Code", "Consolas", monospace;
+            font-size: 0.72rem;
+            color: #8b949e;
+            background: #0d1117;
+            border: 1px solid #21262d;
+            border-radius: 4px;
+            padding: 0.35rem 0.6rem;
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 120px;
+            overflow-y: auto;
+            line-height: 1.4;
+        }
+
+        .tail-tokens {
+            display: flex;
+            gap: 0.6rem;
+            margin-top: 0.25rem;
+            flex-wrap: wrap;
+        }
+        .tail-token-pill {
+            font-size: 0.68rem;
+            color: #484f58;
+            background: #161b22;
+            border: 1px solid #21262d;
+            border-radius: 3px;
+            padding: 0.05rem 0.4rem;
+        }
+        .tail-token-pill span { color: #8b949e; font-weight: 600; }
+
+        .tail-finish {
+            font-size: 0.68rem;
+            font-weight: 700;
+            border-radius: 3px;
+            padding: 0.05rem 0.4rem;
+            text-transform: uppercase;
+        }
+        .tail-finish.length   { background: #da363333; color: #f85149; border: 1px solid #f8514955; }
+        .tail-finish.stop    { background: #1f6feb33; color: #58a6ff; border: 1px solid #58a6ff55; }
+        .tail-finish.error   { background: #da363333; color: #f85149; border: 1px solid #da363355; }
+        .tail-finish.null_   { background: #21262d; color: #484f58; border: 1px solid #30363d; }
+
+        .tail-empty {
+            color: #484f58;
+            text-align: center;
+            padding: 3rem 0;
+            font-size: 0.9rem;
+        }
+
+        /* ── Scrollbar ──────────────────────────────────────────────── */
+        .tail-log::-webkit-scrollbar { width: 6px; }
+        .tail-log::-webkit-scrollbar-track { background: transparent; }
+        .tail-log::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+        .tail-log::-webkit-scrollbar-thumb:hover { background: #484f58; }
+    </style>
+</head>
+<body class="diag-body tail-body">
+
+    <!-- Header -->
+    <div class="diag-header">
+        <div class="diag-header-left">
+            <a href="/scheduler" class="diag-back-btn">&larr; Scheduler</a>
+            <h1 class="diag-title">Session Tail</h1>
+        </div>
+        <div class="diag-header-right">
+            <a href="/diagnostics" class="diag-back-btn">LLM Diagnostics</a>
+        </div>
+    </div>
+
+    <div class="tail-workspace">
+        <!-- Toolbar -->
+        <div class="tail-toolbar">
+            <div class="tail-status">
+                <div id="tail-dot" class="tail-dot connecting"></div>
+                <span id="tail-status-text">Connecting…</span>
+            </div>
+            <div class="tail-count">Entries: <span id="tail-entry-count">0</span></div>
+            <button class="tail-btn" id="tail-autoscroll-btn" onclick="toggleAutoscroll()">Autoscroll ✓</button>
+            <button class="tail-btn" id="tail-clear-btn" onclick="clearLog()">Clear</button>
+            <div class="tail-fps">fps: <span id="tail-fps">0</span></div>
+        </div>
+
+        <!-- Log -->
+        <div class="tail-log" id="tail-log">
+            <p class="tail-empty">Waiting for active sessions…</p>
+        </div>
+    </div>
+
+    <script>
+    // ── State ──────────────────────────────────────────────────────────────
+    let entryCount = 0;
+    let autoScroll = true;
+    let eventSource = null;
+    let fpsSamples = [];
+    let lastEntryTime = 0;
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+    function esc(str) {
+        if (!str) return '';
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    function formatTime(iso) {
+        if (!iso) return '';
+        const d = new Date(iso);
+        const hh = String(d.getHours()).padStart(2, '0');
+        const mm = String(d.getMinutes()).padStart(2, '0');
+        const ss = String(d.getSeconds()).padStart(2, '0');
+        const ms = String(d.getMilliseconds()).padStart(3, '0');
+        return `${hh}:${mm}:${ss}.${ms}`;
+    }
+
+    function formatNumber(n) {
+        if (n == null) return '—';
+        return n.toLocaleString();
+    }
+
+    function finishClass(reason) {
+        if (!reason) return 'null_';
+        if (reason === 'length') return 'length';
+        if (reason === 'stop') return 'stop';
+        if (reason === 'error') return 'error';
+        return 'null_';
+    }
+
+    function finishLabel(reason) {
+        if (!reason) return '';
+        return reason;
+    }
+
+    // ── Entry rendering ───────────────────────────────────────────────────
+    function renderEntry(data) {
+        const log = document.getElementById('tail-log');
+
+        // Remove empty-state message if present
+        const emptyMsg = log.querySelector('.tail-empty');
+        if (emptyMsg) emptyMsg.remove();
+
+        // Check if we already have a row for this session — replace it
+        const sid = data.session_id || data.id;
+        const existing = log.querySelector(`.tail-entry[data-session="${esc(sid)}"]`);
+        const div = existing || document.createElement('div');
+        const isNew = !existing;
+        if (isNew) {
+            div.className = 'tail-entry new';
+            div.setAttribute('data-session', esc(sid));
+        }
+
+        // Build preview text: extract content from response_data if available
+        let previewText = '';
+        if (data.content_preview) {
+            previewText = data.content_preview;
+        } else if (data.response_data) {
+            try {
+                const resp = JSON.parse(data.response_data);
+                const content = resp.choices?.[0]?.message?.content;
+                if (content) {
+                    previewText = content.substring(0, 500);
+                }
+            } catch (_) { /* fall through */ }
+        }
+
+        const hasContent = previewText.length > 0;
+
+        div.innerHTML = `
+            <div class="tail-ts">${formatTime(data.created_at)}</div>
+            <div class="tail-meta">
+                <div class="tail-agent ${data.agent_name ? '' : 'none'}">${data.agent_name || '—'}</div>
+                <div class="tail-task-ref">
+                    <a href="/diagnostics?task=${esc(data.task_id)}" target="_blank" title="Open in diagnostics">
+                        ${esc(data.task_id)}
+                    </a>
+                </div>
+                ${data.session_id ? `<div class="tail-task-ref" style="color:#484f58">${esc(data.session_id.substring(0, 12))}…</div>` : ''}
+            </div>
+            <div class="tail-body-text">
+                <div class="tail-task-title" title="${esc(data.task_title)}">${esc(data.task_title)}</div>
+                ${hasContent ? `<div class="tail-preview">${esc(previewText)}</div>` : ''}
+                <div class="tail-tokens">
+                    <div class="tail-token-pill">prompt: <span>${formatNumber(data.prompt_tokens)}</span></div>
+                    <div class="tail-token-pill">gen: <span>${formatNumber(data.completion_tokens)}</span></div>
+                    <div class="tail-token-pill">turns: <span>${formatNumber(data.tool_calls)}</span></div>
+                    ${data.finish_reason ? `<div class="tail-finish ${finishClass(data.finish_reason)}">${esc(finishLabel(data.finish_reason))}</div>` : ''}
+                </div>
+            </div>
+        `;
+
+        if (isNew) {
+            log.appendChild(div);
+            entryCount++;
+            document.getElementById('tail-entry-count').textContent = entryCount;
+        }
+
+        // Remove "new" highlight after a moment
+        setTimeout(() => div.classList.remove('new'), 1500);
+
+        // Autoscroll
+        if (autoScroll) {
+            requestAnimationFrame(() => {
+                log.scrollTop = log.scrollHeight;
+            });
+        }
+    }
+
+    // ── Connection management ────────────────────────────────────────────
+    function connect() {
+        const dot = document.getElementById('tail-dot');
+        const statusText = document.getElementById('tail-status-text');
+
+        if (eventSource) {
+            eventSource.close();
+        }
+
+        dot.className = 'tail-dot connecting';
+        statusText.textContent = 'Connecting…';
+
+        eventSource = new EventSource('/api/scheduler/tail');
+
+        eventSource.addEventListener('entry', (e) => {
+            const data = JSON.parse(e.data);
+            renderEntry(data);
+
+            // FPS tracking
+            const now = Date.now();
+            if (lastEntryTime > 0) {
+                fpsSamples.push(now - lastEntryTime);
+                if (fpsSamples.length > 60) fpsSamples.shift();
+            }
+            lastEntryTime = now;
+            updateFPS();
+        });
+
+        eventSource.addEventListener('heartbeat', (e) => {
+            dot.className = 'tail-dot connected';
+            statusText.textContent = 'Live';
+        });
+
+        eventSource.addEventListener('error', (e) => {
+            if (e.data) {
+                dot.className = 'tail-dot error';
+                statusText.textContent = 'Error';
+                console.error('Tail error:', e.data);
+            }
+        });
+
+        eventSource.onerror = () => {
+            dot.className = 'tail-dot error';
+            statusText.textContent = 'Disconnected — reconnecting…';
+            // EventSource auto-reconnects, but update status after a delay
+            setTimeout(() => {
+                if (eventSource?.readyState === EventSource.CONNECTING) {
+                    dot.className = 'tail-dot connecting';
+                    statusText.textContent = 'Reconnecting…';
+                }
+            }, 2000);
+        };
+    }
+
+    // ── FPS display ──────────────────────────────────────────────────────
+    function updateFPS() {
+        if (fpsSamples.length < 2) {
+            document.getElementById('tail-fps').textContent = '—';
+            return;
+        }
+        const avg = fpsSamples.reduce((a, b) => a + b, 0) / fpsSamples.length;
+        document.getElementById('tail-fps').textContent = (1000 / avg).toFixed(1);
+    }
+
+    // ── Controls ─────────────────────────────────────────────────────────
+    function toggleAutoscroll() {
+        autoScroll = !autoScroll;
+        const btn = document.getElementById('tail-autoscroll-btn');
+        btn.classList.toggle('active', autoScroll);
+        btn.textContent = autoScroll ? 'Autoscroll ✓' : 'Autoscroll';
+    }
+
+    function clearLog() {
+        const log = document.getElementById('tail-log');
+        log.innerHTML = '<p class="tail-empty">Cleared. Waiting for new entries…</p>';
+        entryCount = 0;
+        document.getElementById('tail-entry-count').textContent = '0';
+    }
+
+    // ── Start ────────────────────────────────────────────────────────────
+    connect();
+    toggleAutoscroll(); // set initial active state
+    </script>
+</body>
+</html>

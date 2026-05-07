@@ -610,6 +610,41 @@ def get_all_tasks():
         db.close()
 
 
+def get_tasks_needing_clarification():
+    """Return active IDEA tasks with clarification_status='pending' that have an LLM assigned.
+    Also auto-advances 'none' tasks with LLM/Budget assigned to 'pending'.
+    """
+    db = SessionLocal()
+    try:
+        # 1. Detect and correct 'none' tasks that should be 'pending'
+        stuck_tasks = db.query(Task).filter(
+            Task.is_active == True,
+            Task.type == 'idea',
+            Task.clarification_status == 'none',
+            Task.llm_id.isnot(None),
+            Task.budget_id.isnot(None),
+        ).all()
+        
+        if stuck_tasks:
+            for task in stuck_tasks:
+                task.clarification_status = 'pending'
+                if not task.description_original:
+                    task.description_original = task.description or ''
+            db.commit()
+            logger.info("Auto-advanced %d stuck IDEA tasks to 'pending' clarification.", len(stuck_tasks))
+
+        # 2. Return all pending tasks
+        return db.query(Task).filter(
+            Task.is_active == True,
+            Task.type == 'idea',
+            Task.clarification_status == 'pending',
+            Task.llm_id.isnot(None),
+            Task.budget_id.isnot(None),
+        ).all()
+    finally:
+        db.close()
+
+
 def update_task(task_id, **kwargs):
     """Update a task with provided fields."""
     db = SessionLocal()
@@ -999,6 +1034,8 @@ def task_to_dict(task):
         "map_x": getattr(task, "map_x", None),
         "map_y": getattr(task, "map_y", None),
         "is_active": bool(getattr(task, "is_active", True)),
+        "clarification_status": getattr(task, "clarification_status", "none") or "none",
+        "description_original": getattr(task, "description_original", None),
         "created_at": task.created_at.isoformat() if task.created_at else None,
         "updated_at": task.updated_at.isoformat() if task.updated_at else None,
         "pips": [

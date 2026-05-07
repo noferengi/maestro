@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kanban Board - TheMaestro</title>
-    <link rel="stylesheet" href="/static/style.css?v=36">
-    <script src="/static/kanban.js?v=59"></script>
+    <link rel="stylesheet" href="/static/style.css?v=37">
+    <script src="/static/kanban.js?v=61"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -143,15 +143,17 @@
                 </div>
                 <div class="tasks-container" id="tasks-security" onclick="handleTasksContainerClick(event,'security')">
                 </div>
+                <div class="tasks-container" id="tasks-final_review" onclick="handleTasksContainerClick(event,'final_review')">
+                </div>
             </div>
 
             <!-- HUMAN REVIEW Column -->
-            <div class="column" id="column-full_review">
-                <div class="column-header" onclick="openColumnMap('full_review')" title="Click to open Human Review Map">
+            <div class="column" id="column-human_review">
+                <div class="column-header" onclick="openColumnMap('human_review')" title="Click to open Human Review Map">
                     <span class="column-title">HUMAN REVIEW</span>
-                    <span class="task-count" id="count-full_review">0</span>
+                    <span class="task-count" id="count-human_review">0</span>
                 </div>
-                <div class="tasks-container" id="tasks-full_review" onclick="handleTasksContainerClick(event,'full_review')">
+                <div class="tasks-container" id="tasks-human_review" onclick="handleTasksContainerClick(event,'human_review')">
                 </div>
             </div>
 
@@ -247,6 +249,18 @@
                 <div class="form-group" id="task-budget-group">
                     <label class="form-label" for="task-budget-select">Budget</label>
                     <select class="form-input" id="task-budget-select"></select>
+                </div>
+                <div class="form-group" id="task-prereqs-group" style="display:none">
+                    <label class="form-label" for="task-prereqs-input">Prerequisites</label>
+                    <div id="prereqs-selector" style="position:relative">
+                        <input type="text" class="form-input" id="task-prereqs-input" placeholder="Search tasks to add as prerequisites…" autocomplete="off">
+                        <div id="prereqs-dropdown" style="display:none;position:absolute;top:100%;left:0;right:0;max-height:240px;overflow-y:auto;background:#fff;border:1px solid #dee2e6;border-radius:0 0 6px 6px;z-index:1000;box-shadow:0 4px 12px rgba(0,0,0,0.12)"></div>
+                    </div>
+                    <div id="preregs-selected" style="display:flex;flex-wrap:wrap;gap:0.35rem;margin-top:0.4rem;min-height:1.5rem"></div>
+                    <div id="prereqs-dag-container" style="margin-top:0.6rem;border:1px solid #e9ecef;border-radius:6px;background:#fafbfc;overflow:hidden;display:none">
+                        <svg id="prereqs-dag-svg" width="100%" height="80" style="display:block"></svg>
+                    </div>
+                    <div style="font-size:0.78rem;color:#6c757d;margin-top:0.25rem">Tasks that must complete before this one can start. Edges are enforced by the DAG scheduler.</div>
                 </div>
             </div>
             <div class="modal-footer">
@@ -585,6 +599,86 @@
             </div>
             <div class="modal-footer">
                 <button class="btn btn-secondary" onclick="closeInboxDetailModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Intake Clarification Modal -->
+    <div class="modal-overlay" id="intake-modal" onclick="_intakeModalBgClick(event)">
+        <div class="modal" style="width:900px;max-width:98vw;max-height:92vh;display:flex;flex-direction:column" id="intake-modal-inner">
+            <div class="modal-header" style="flex-shrink:0">
+                <h2 class="modal-title" id="intake-modal-title">Intake Review</h2>
+                <button class="close-btn" onclick="closeIntakeModal()">&times;</button>
+            </div>
+            <div class="modal-body" style="flex:1;overflow-y:auto;padding:1rem 1.25rem" id="intake-modal-body-content">
+                <!-- Two-column description pane -->
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1rem">
+                    <div>
+                        <div style="font-size:0.8rem;font-weight:600;color:#6c757d;text-transform:uppercase;margin-bottom:0.4rem">Original Description</div>
+                        <div id="intake-original-desc" style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;padding:0.75rem;font-size:0.85rem;white-space:pre-wrap;max-height:260px;overflow-y:auto;color:#495057"></div>
+                    </div>
+                    <div>
+                        <div style="font-size:0.8rem;font-weight:600;color:#0d6efd;text-transform:uppercase;margin-bottom:0.4rem">Suggested Rewrite <span style="font-weight:400;color:#6c757d;text-transform:none">(editable)</span></div>
+                        <textarea id="intake-rewrite-desc" style="width:100%;height:260px;border:1px solid #0d6efd;border-radius:4px;padding:0.75rem;font-size:0.85rem;resize:vertical;font-family:inherit;box-sizing:border-box"></textarea>
+                    </div>
+                </div>
+
+                <!-- Design rationale -->
+                <div id="intake-rationale-row" style="margin-bottom:1rem;display:none">
+                    <div style="font-size:0.8rem;font-weight:600;color:#6c757d;text-transform:uppercase;margin-bottom:0.25rem">Why the agent rewrote it</div>
+                    <div id="intake-rationale" style="font-size:0.82rem;color:#495057;background:#fffdf0;border-left:3px solid #ffc107;padding:0.5rem 0.75rem;border-radius:0 4px 4px 0"></div>
+                </div>
+
+                <!-- Suggested prerequisites -->
+                <div id="intake-prereqs-section" style="margin-bottom:1rem;display:none">
+                    <div style="font-size:0.8rem;font-weight:600;color:#6c757d;text-transform:uppercase;margin-bottom:0.5rem">Suggested Prerequisites</div>
+                    <div id="intake-prereqs-list"></div>
+                </div>
+
+                <!-- Suggested subtasks -->
+                <div id="intake-subtasks-section" style="margin-bottom:1rem;display:none">
+                    <div style="font-size:0.8rem;font-weight:600;color:#6c757d;text-transform:uppercase;margin-bottom:0.5rem">Suggested Subtasks</div>
+                    <div id="intake-subtasks-list"></div>
+                </div>
+
+                <!-- Open questions -->
+                <div id="intake-questions-section" style="margin-bottom:1rem;display:none">
+                    <div style="background:#fff3cd;border:1px solid #ffc107;border-radius:4px;padding:0.75rem">
+                        <div style="font-size:0.8rem;font-weight:700;color:#856404;margin-bottom:0.4rem">Open Questions — resolve before planning</div>
+                        <ul id="intake-questions-list" style="margin:0;padding-left:1.25rem;font-size:0.85rem;color:#664d03"></ul>
+                    </div>
+                </div>
+
+                <!-- Agent Investigation (collapsible) -->
+                <div id="intake-investigation-section" style="margin-bottom:1rem;border:1px solid #dee2e6;border-radius:4px;overflow:hidden">
+                    <button onclick="toggleIntakeInvestigation()" id="intake-investigation-toggle"
+                        style="width:100%;text-align:left;background:#f8f9fa;border:none;padding:0.5rem 0.75rem;font-size:0.8rem;font-weight:600;color:#495057;cursor:pointer;display:flex;justify-content:space-between;align-items:center">
+                        <span>▶ Agent Investigation <span id="intake-investigation-count" style="font-weight:400;color:#6c757d"></span></span>
+                        <span style="font-size:0.75rem;color:#6c757d;font-weight:400">How the agent produced this rewrite</span>
+                    </button>
+                    <div id="intake-investigation-body" style="display:none;padding:0.75rem;max-height:320px;overflow-y:auto;background:#fff">
+                        <div id="intake-investigation-content" style="font-size:0.82rem">
+                            <div style="color:#6c757d;font-style:italic">Loading investigation…</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Chat section -->
+                <div style="border-top:1px solid #dee2e6;padding-top:1rem">
+                    <div style="font-size:0.8rem;font-weight:600;color:#6c757d;text-transform:uppercase;margin-bottom:0.5rem">Ask the agent to refine</div>
+                    <div id="intake-chat-history" style="max-height:180px;overflow-y:auto;margin-bottom:0.5rem;display:flex;flex-direction:column;gap:0.4rem"></div>
+                    <div style="display:flex;gap:0.5rem">
+                        <input type="text" id="intake-chat-input" class="form-control" placeholder="e.g. Add error handling requirements, or make acceptance criteria more specific…" style="flex:1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){sendIntakeMessage();event.preventDefault();}">
+                        <button class="btn btn-secondary" onclick="sendIntakeMessage()" id="intake-chat-send">Send</button>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer" style="flex-shrink:0">
+                <div style="flex:1">
+                    <button class="btn btn-secondary" onclick="skipIntakeClarification()" style="font-size:0.82rem">Skip Clarification</button>
+                </div>
+                <button class="btn btn-secondary" onclick="closeIntakeModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="approveIntakeClarification()" id="intake-approve-btn">Approve &amp; Run Pipeline</button>
             </div>
         </div>
     </div>

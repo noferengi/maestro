@@ -276,6 +276,18 @@ class SessionKilledError(ShutdownError):
     pass
 
 
+class TaskDeactivatedError(BaseException):
+    """Raised when an LLM call is made for a task that has been hidden/soft-deleted.
+
+    Inherits from BaseException (not Exception) so it bypasses every
+    ``except Exception`` handler inside agent turn loops and propagates
+    immediately to the pipeline runner, where it is caught and logged cleanly.
+    """
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        super().__init__(f"Task '{task_id}' was deactivated (hidden/deleted); halting session")
+
+
 def signal_shutdown() -> None:
     """Phase-1 shutdown: signal in-flight calls to abort at their next check."""
     _shutdown_event.set()
@@ -916,6 +928,14 @@ async def call_llm(
     # Bail out before sleeping if shutdown was already signalled
     if _shutdown_event.is_set():
         raise ShutdownError("Server is shutting down")
+
+    # Per-turn deactivation check: halt if the task was hidden/soft-deleted since dispatch.
+    # Checked once per LLM call (= once per turn) across all agents.
+    if task_id:
+        from app.database import get_task as _db_get_task
+        _t = _db_get_task(task_id)
+        if _t is not None and not getattr(_t, 'is_active', True):
+            raise TaskDeactivatedError(task_id)
 
     _stagger_sleep = _reserved_at - _now
     if _stagger_sleep > 0:

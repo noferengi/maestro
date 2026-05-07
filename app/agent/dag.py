@@ -82,7 +82,7 @@ class DAGResolver:
             # Permanently terminal states - never dispatch
             if task_type in ("completed", "cancelled", "subdividing"):
                 continue
-            # indev / conceptual_review / optimization / full_review are
+            # indev / conceptual_review / optimization / final_review are
             # mid-pipeline stages.  They are NOT excluded here: if there is no
             # live thread for them (fresh startup, crash recovery) the
             # _active_sessions guard in scheduler._tick() re-dispatches them.

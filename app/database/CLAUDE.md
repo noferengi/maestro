@@ -59,7 +59,7 @@ __init__.py        (imports from all of the above)
   The resolved path is always `<repo_root>/data/kanban.db`.
 
 - **`update_planning_result`, `update_optimization_result`,
-  `update_security_review_result`, `update_full_review_result`,
+  `update_security_review_result`, `update_final_review_result`,
   `update_merge_record`** accept an explicit `db` session as their first
   argument.  These are called from within long-running pipeline transactions
   where the session is already open.  All other CRUD functions manage their
@@ -99,7 +99,7 @@ __init__.py        (imports from all of the above)
 - `ComponentResult` — per-component dev agent result
 - `OptimizationResult` — optimization pipeline output
 - `SecurityReviewResult` — security review findings
-- `FullReviewResult` — final review findings
+- `FinalReviewResult` — final review findings
 - `MergeRecord` — merge-to-main operations
 
 **Background jobs**

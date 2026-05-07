@@ -59,7 +59,7 @@ Each agent prompt file has instructions telling agents to "output ONLY JSON" or 
 - **`app/agent/research.py`** — Has "output ONLY this JSON" instructions. Replace with submit_work tool call instructions.
 - **`app/agent/subdivide.py`** — Has "output ONLY this JSON object" instructions. Replace with submit_work tool call instructions.
 - **`app/agent/dreamer.py`** — Has "Output JSON only" instructions. Replace with submit_work tool call instructions.
-- **`app/agent/full_review.py`** — Has "Output JSON" instructions. Replace with submit_work tool call instructions.
+- **`app/agent/final_review.py`** — Has "Output JSON" instructions. Replace with submit_work tool call instructions.
 - **`app/agent/conceptual_review.py`** — Has "Output JSON" instructions. Replace with submit_work tool call instructions.
 - **`app/agent/security_review.py`** — Has "Output JSON" instructions. Replace with submit_work tool call instructions.
 
@@ -119,4 +119,4 @@ submit_work(signal="ACCEPTED", summary="Done")
 - **NOT YET MODIFIED**: `app/agent/component_loop.py`
 - **NOT YET MODIFIED**: `app/agent/system_prompt.py`
 - **NOT YET MODIFIED**: `app/agent/intake.py`, `planning.py`, `research.py`, `subdivide.py`, `dreamer.py`
-- **NOT YET MODIFIED**: `app/agent/full_review.py`, `conceptual_review.py`, `security_review.py`
+- **NOT YET MODIFIED**: `app/agent/final_review.py`, `conceptual_review.py`, `security_review.py`

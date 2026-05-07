@@ -333,7 +333,7 @@
 .agent-conceptual_review { background: #fd7e14; }
 .agent-optimization    { background: #f59f00; }
 .agent-security        { background: #dc3545; }
-.agent-full_review     { background: #0ca678; }
+.agent-final_review     { background: #0ca678; }
 .agent-pip_preflight   { background: #e83e8c; }
 .agent-pip_research    { background: #ffc107; color: #212529 !important; }
 .agent-pip_resolution  { background: #e03131; }
@@ -512,6 +512,29 @@
     letter-spacing: 0.05em;
     color: #842029;
     margin-bottom: 0.35rem;
+}
+
+/* ── Test evidence within dev_orchestrator session card ──── */
+.story-test-summary {
+    font-size: 0.78rem;
+    color: #495057;
+    margin-bottom: 0.25rem;
+}
+
+.story-test-output {
+    margin: 0.4rem 0 0;
+    padding: 0.6rem 0.75rem;
+    background: #f8f9fa;
+    border: 1px solid #dee2e6;
+    border-radius: 4px;
+    font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    font-size: 0.72rem;
+    line-height: 1.5;
+    max-height: 320px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: #212529;
 }
 
 /* ── Demotion card ───────────────────────────────────────── */

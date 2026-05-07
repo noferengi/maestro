@@ -1,7 +1,7 @@
 """
-app/agent/full_review.py
+app/agent/final_review.py
 -------------------------
-Full/Final Review Pipeline - 4-agent final judgment.
+Final Review Pipeline - 4-agent final judgment.
 
 4 Parallel Reviewer Agents (3 if no frontend changes):
   - Functional: requirements traceability, missing features, scope creep
@@ -24,11 +24,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.agent.config import (
-    FULL_REVIEW_AUTO_UX,
-    FULL_REVIEW_FRONTEND_PATTERNS,
-    FULL_REVIEW_MAX_REVIEWER_TURNS,
-    FULL_REVIEW_CODE_QUALITY_TOOLS,
-    FULL_REVIEW_FUNCTIONAL_TOOLS,
+    FINAL_REVIEW_AUTO_UX,
+    FINAL_REVIEW_FRONTEND_PATTERNS,
+    FINAL_REVIEW_MAX_REVIEWER_TURNS,
+    FINAL_REVIEW_CODE_QUALITY_TOOLS,
+    FINAL_REVIEW_FUNCTIONAL_TOOLS,
     PROJECT_ROOT,
     SHELL_TIMEOUT_SECONDS,
     check_context_saturation,
@@ -39,7 +39,7 @@ from app.agent.llm_client import call_llm, is_shutting_down, sanitize_user_conte
 from app.agent.verdicts import Vote, Verdict, tally_votes
 
 logger = logging.getLogger(__name__)
-AGENT_NAME = "Full Review Pipeline"
+AGENT_NAME = "Final Review Pipeline"
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +98,7 @@ def run_shell_review(command: str, *, project_path: str | None = None, timeout: 
 # ---------------------------------------------------------------------------
 
 @dataclass(slots=True)
-class FullReviewPipelineResult:
+class FinalReviewPipelineResult:
     task_id: str
     outcome: str  # "passed" | "rejected"
     votes: list[Vote] = field(default_factory=list)
@@ -112,14 +112,14 @@ class FullReviewPipelineResult:
 # Pipeline
 # ---------------------------------------------------------------------------
 
-class FullReviewPipeline:
+class FinalReviewPipeline:
     """4-agent final review pipeline."""
 
     def _get_reviewer_schemas(self, reviewer_type: str) -> list[dict]:
         """Return tool schemas appropriate for the reviewer type."""
         if reviewer_type in ("code_quality", "integration"):
-            return build_tool_schemas(FULL_REVIEW_CODE_QUALITY_TOOLS)
-        return build_tool_schemas(FULL_REVIEW_FUNCTIONAL_TOOLS)
+            return build_tool_schemas(FINAL_REVIEW_CODE_QUALITY_TOOLS)
+        return build_tool_schemas(FINAL_REVIEW_FUNCTIONAL_TOOLS)
 
     def __init__(
         self,
@@ -133,6 +133,7 @@ class FullReviewPipeline:
         budget_id: int | None = None,
         project_path: str | None = None,
         max_context: int = 0,
+        acceptance_criteria: list[str] | None = None,
     ):
         self.task_id = task_id
         self.task_description = task_description
@@ -143,10 +144,11 @@ class FullReviewPipeline:
         self.budget_id = budget_id
         self.project_path = project_path
         self.max_context = max_context
+        self.acceptance_criteria = acceptance_criteria or []
         self._total_prompt = 0
         self._total_completion = 0
 
-    async def run(self) -> FullReviewPipelineResult:
+    async def run(self) -> FinalReviewPipelineResult:
         """Run all review agents in parallel."""
         from app.agent.llm_client import set_llm_session_context
         set_llm_session_context(AGENT_NAME)
@@ -234,7 +236,7 @@ class FullReviewPipeline:
 
         logger.info(f"[{AGENT_NAME}] Task '%s': %s", self.task_id, outcome)
 
-        return FullReviewPipelineResult(
+        return FinalReviewPipelineResult(
             task_id=self.task_id,
             outcome=outcome,
             votes=votes,
@@ -246,11 +248,15 @@ class FullReviewPipeline:
 
     async def _run_reviewer(self, reviewer: dict) -> Vote:
         """Run a single reviewer agent using a mini-loop with tool access."""
+        ac_block = ""
+        if self.acceptance_criteria:
+            ac_block = f"\nACCEPTANCE CRITERIA (verify each is satisfied):\n{json.dumps(self.acceptance_criteria, indent=1)}\n\n"
         prompt = (
             f"You are a final reviewer ({reviewer['type']}).\n"
             f"Focus: {reviewer['focus']}\n\n"
             f"Task: {sanitize_user_content(self.task_description)}\n"
             f"Files changed: {json.dumps(self.files_changed[:20])}\n\n"
+            f"{ac_block}"
             "You may use tools to read code files before giving your verdict.\n\n"
             "To complete your review, call the submit_work tool with:\n"
             "- signal: 'ACCEPTED' if the implementation is correct, or 'REJECTED' if there are defects.\n"
@@ -265,7 +271,7 @@ class FullReviewPipeline:
         ]
 
         schemas = self._get_reviewer_schemas(reviewer["type"])
-        max_turns = FULL_REVIEW_MAX_REVIEWER_TURNS
+        max_turns = FINAL_REVIEW_MAX_REVIEWER_TURNS
         _ctx_warned: set[float] = set()
         _turn_warned: set[int] = set()
 
@@ -366,19 +372,19 @@ class FullReviewPipeline:
 
     def _has_frontend_changes(self) -> bool:
         """Check if any changed files match frontend patterns."""
-        if not FULL_REVIEW_AUTO_UX:
+        if not FINAL_REVIEW_AUTO_UX:
             return False
         import fnmatch
         for fpath in self.files_changed:
-            for pattern in FULL_REVIEW_FRONTEND_PATTERNS:
+            for pattern in FINAL_REVIEW_FRONTEND_PATTERNS:
                 if fnmatch.fnmatch(fpath, pattern):
                     return True
         return False
 
     def _store_reviewer_result(self, vote: Vote, reviewer_type: str) -> None:
         try:
-            from app.database import create_full_review_result
-            create_full_review_result(
+            from app.database import create_final_review_result
+            create_final_review_result(
                 task_id=self.task_id,
                 reviewer_type=reviewer_type,
                 verdict=vote.verdict.value,
@@ -398,7 +404,7 @@ class FullReviewPipeline:
 # Public entry point
 # ---------------------------------------------------------------------------
 
-async def run_full_review_pipeline(
+async def run_final_review_pipeline(
     task_id: str,
     task_description: str,
     files_changed: list[str] | None = None,
@@ -408,6 +414,7 @@ async def run_full_review_pipeline(
     llm_id: int | None = None,
     budget_id: int | None = None,
     project_path: str | None = None,
+    acceptance_criteria: list[str] | None = None,
 ) -> dict:
     if project_path is not None:
         from app.agent.tools import set_task_git_cwd
@@ -420,7 +427,7 @@ async def run_full_review_pipeline(
         if _llm_record is not None:
             _max_context = _llm_record.max_context or 0
 
-    pipeline = FullReviewPipeline(
+    pipeline = FinalReviewPipeline(
         task_id=task_id,
         task_description=task_description,
         files_changed=files_changed,
@@ -430,6 +437,7 @@ async def run_full_review_pipeline(
         budget_id=budget_id,
         project_path=project_path,
         max_context=_max_context,
+        acceptance_criteria=acceptance_criteria,
     )
     result = await pipeline.run()
     return {

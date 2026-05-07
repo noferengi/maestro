@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Project Maestro — a Kanban board with an agentic LLM orchestration backend. The board is the UI face of a "Wiggum Loop": a Do-While that drives a local LLM through Design → Implement → Test → Verify cycles until all DAG task nodes reach ACCEPTED. Tasks transition IDEA → PLANNING → INDEV → CONCEPTUAL_REVIEW → OPTIMIZATION → SECURITY → FULL_REVIEW → COMPLETED, gated by a multi-stage intake pipeline with LLM voting.
+Project Maestro — a Kanban board with an agentic LLM orchestration backend. The board is the UI face of a "Wiggum Loop": a Do-While that drives a local LLM through Design → Implement → Test → Verify cycles until all DAG task nodes reach ACCEPTED. Tasks transition IDEA → PLANNING → INDEV → CONCEPTUAL_REVIEW → OPTIMIZATION → SECURITY → FINAL_REVIEW → HUMAN_REVIEW → COMPLETED, gated by a multi-stage intake pipeline with LLM voting.
 
 **See `ARCHITECTURE.md`** for the full system reference: pipeline stages, compute resource model (LLM Endpoints + Compute Nodes), scheduler tick lifecycle, all agent types, planning pipeline deep-dive, git worktree isolation, safety layers, and data schema overview. **See `PRD.md`** for the product roadmap and feature specs.
 
@@ -60,10 +60,31 @@ five pattern flags: `rapid_cycling`, `token_limited`, `zombie_sessions`, `stage_
 | Force a task to a pipeline stage (no demotion record) | `set_task_type(task_id, "planning")` |
 | Move task backward with demotion record | `demote_task(task_id, target_stage?)` |
 | Trigger planning pipeline manually | `trigger_planning_run(task_id)` |
-| Trigger review / security / full_review | `run_pipeline_stage(task_id, stage)` |
+| Trigger review / security / final_review | `run_pipeline_stage(task_id, stage)` |
 | Stop a running MaestroLoop | `stop_agent(task_id)` |
 | Restart the Maestro server | `restart_server()` — drains sessions, waits ~60 s |
 | Anything not covered above | `run_inspect_cards(section, extra_args)` |
+
+### When MCP tool calls hang or return no result
+
+MCP tools in this project are **synchronous** and make direct SQLite calls with no timeout
+configured (`mcp_tools/helpers.py:15-26`). SQLite's default lock-wait timeout is 5 seconds;
+if the scheduler is holding a write lock (e.g., committing a task update, running an intake
+vote, persisting budget entries), MCP reads queue behind it and can appear to hang.
+
+**Root causes (structural — can happen any time):**
+- `mcp_tools/helpers.py` — `get_conn()` / `get_rw_conn()` have no `timeout=` argument
+- `app/database/session.py` — no `PRAGMA journal_mode=WAL`, so writes exclusively lock the DB;
+  also no `connect_args={"timeout": N}` on the SQLAlchemy engine
+- High-query tools (`get_scheduler_state`, `diagnose_task`, `find_stuck_tasks`) issue 4–8+
+  SELECT statements per call, each of which must wait for any in-progress write lock
+
+**What to do when a tool call silently stalls:**
+1. Check the server log for active LLM calls — if several are in-flight the DB is under write
+   pressure; wait a few seconds and retry the tool call
+2. If retrying fails, use `restart_server()` to drain sessions and clear lock contention
+3. Fall back to `venv/Scripts/python.exe scripts/inspect_cards.py <section>` for the same
+   diagnostic information without going through the MCP layer
 
 ### Key signal from `diagnose_task`
 
@@ -76,7 +97,7 @@ five pattern flags: `rapid_cycling`, `token_limited`, `zombie_sessions`, `stage_
 
 ## Shell / path conventions (Windows)
 
-The shell is bash. Use **forward slashes** — backslashes are treated as escape characters and
+If you are **Claude**, the shell is virtual bash environment. Use **forward slashes** — backslashes are treated as escape characters and
 silently dropped, mushing the path together:
 
 ```
@@ -86,6 +107,18 @@ venv\Scripts\python.exe -m pytest app/tests/ -q
 
 # Correct
 venv/Scripts/python.exe -m pytest app/tests/ -q
+```
+
+If you are **Qwen**, the shell is actually Windows Powershell. Use **backward slashes** — forward slashes are instead
+silently dropped, mushing the path together:
+
+```
+# Wrong
+venv/Scripts/python.exe -m pytest app/tests/ -q
+→ line 1: venvScriptspython.exe: command not found
+
+# Correct
+venv\Scripts\python.exe -m pytest app\tests\ -q
 ```
 
 ## Running the server
@@ -165,7 +198,7 @@ For stuck planning tasks use `diagnose_task(task_id)` — covers budget traces, 
 ## Architecture
 
 ### Backend (`app/`)
-- `main.py` — FastAPI app. All routes. Mounts static files from `app/web/`. On startup calls `init_db()` + `seed_sample_tasks()` (skips seeding if data exists). Quick-action endpoints: `/demote`, `/set-stage`, `/clone`, `/pin`, `/run-planning`, `/run-review`, `/run-security`, `/run-full-review`. Task serialization (`_task_to_dict`) always includes a `"pips"` array. `sync_update_llm_with_cache` / `sync_delete_llm_with_cache` call `invalidate_llm_cache` after LLM record mutations so stale context/capacity state is flushed immediately.
+- `main.py` — FastAPI app. All routes. Mounts static files from `app/web/`. On startup calls `init_db()` + `seed_sample_tasks()` (skips seeding if data exists). Quick-action endpoints: `/demote`, `/set-stage`, `/clone`, `/pin`, `/run-planning`, `/run-review`, `/run-security`, `/run-final-review`. Task serialization (`_task_to_dict`) always includes a `"pips"` array. `sync_update_llm_with_cache` / `sync_delete_llm_with_cache` call `invalidate_llm_cache` after LLM record mutations so stale context/capacity state is flushed immediately.
 - `database/` — DB package. `models.py` has SQLAlchemy ORM definitions. `__init__.py` re-exports the main CRUD surface. Specialized modules: `crud_pipeline.py` (planning/review/component results), `crud_tasks.py` (task + PIP CRUD), `crud_sessions.py` (agent sessions), `crud_infra.py` (LLMs, budgets, compute nodes), `crud_jobs.py` (research + file-summary jobs), `crud_costs.py` (budget entries + expenses), `crud_projects.py`, `crud_files.py`, `crud_dreamer.py`, `crud_survey.py`, `crud_inbox.py`, `session.py` (SQLAlchemy session factory). `delete_task()` is a **soft-delete**: sets `is_active=False` on the target and all descendants via BFS. All read queries filter `is_active=True`. `upsert_project()` uses `...` (Ellipsis) sentinel for `llm_id`/`budget_id` — pass Ellipsis to leave unchanged, None to clear. `pip_status_at_stage(pip, stage)` derives status at read time — no stored status column.
 - `migrations/runner.py` — standalone sqlite3 migration engine, no SQLAlchemy dependency.
 
@@ -210,7 +243,7 @@ POST   /api/tasks/{task_id}/pin           — set position=0 (top of column)
 POST   /api/tasks/{task_id}/run-planning  — trigger PlanningPipeline + gate in background
 POST   /api/tasks/{task_id}/run-review    — trigger ConceptualReviewPipeline in background
 POST   /api/tasks/{task_id}/run-security  — trigger OptimizationPipeline + SecurityPipeline in background
-POST   /api/tasks/{task_id}/run-full-review — trigger FullReviewPipeline in background
+POST   /api/tasks/{task_id}/run-final-review — trigger FinalReviewPipeline in background
 POST   /api/agent/run/{task_id}           — start MaestroLoop (background)
 GET    /api/agent/status/{task_id}        — loop status
 POST   /api/agent/stop/{task_id}          — request graceful stop (MaestroLoop only; pipeline agents are not stoppable)
@@ -232,7 +265,7 @@ GET    /api/tasks/{id}/planning-result    — full planning_result row (file_man
 GET    /api/tasks/{id}/component-status   — list of component_results rows for this task
 GET    /api/tasks/{id}/optimization-status — latest optimization pipeline outcome
 GET    /api/tasks/{id}/security-status    — list of security reviewer verdicts
-GET    /api/tasks/{id}/full-review-status — list of full-review verdicts
+GET    /api/tasks/{id}/final-review-status — list of final-review verdicts
 GET    /api/tasks/{id}/merge-status       — branch name + merge_commit_sha if merged
 GET    /api/tasks/{id}/diff               — git diff for the task branch (method, branch, stat, diff text, truncated flag)
 GET    /api/tasks/{id}/research-jobs      — research jobs associated with this task

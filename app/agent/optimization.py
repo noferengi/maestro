@@ -204,11 +204,12 @@ class OptimizationPipeline:
             "Step 1 - Read the relevant source files to understand the code.\n"
             "Step 2 - Determine the Big O class of the critical path by reading the code "
             "(do not guess; trace the actual algorithm).\n"
-            "Step 3 - Run a synthetic benchmark using run_shell with a Python one-liner. "
+            "Step 3 - Estimate performance statically: trace the critical path in code and "
+            "determine the Big O class from the algorithm structure (use read_file and "
+            "find_in_files to inspect the implementation — do not attempt to run a benchmark). "
             "Choose scale_n based on operation type: N=10_000 for I/O-bound, "
-            "N=100_000 for CPU-bound, N=1_000_000 for trivial ops. Example:\n"
-            "  python -c \"import time; start=time.perf_counter(); [your_op() for _ in range(N)]; "
-            "print((time.perf_counter()-start)*1000)\"\n"
+            "N=100_000 for CPU-bound, N=1_000_000 for trivial ops. "
+            "Report the Big O estimate and the specific file:line that determines complexity.\n"
             "Step 4 - Estimate peak memory usage (RSS) during the benchmark if measurable.\n"
             "Step 5 - Identify hotspots (function/line references).\n"
             "Step 6 - Rate readability_cost from 0.0 (simple, clear) to 1.0 (requires deep "
@@ -649,10 +650,9 @@ class OptimizationPipeline:
             "**Compute time is the most precious resource in this project.** "
             "Improvements to CPU/wall time are weighted highest in the decision framework.",
             "",
-            "**Before making any code changes**, run a timed benchmark using `run_shell`:",
-            "```bash",
-            "python -c \"import time; start=time.perf_counter(); [YOUR_OP for _ in range(N)]; print((time.perf_counter()-start)*1000)\"",
-            "```",
+            "**Before making any code changes**, estimate performance from static analysis: "
+            "read the implementation with read_file and find_in_files, trace the algorithm, "
+            "and determine the Big O class from the code structure. "
             "Choose `scale_n`: N=10_000 for I/O-bound, N=100_000 for CPU-bound, N=1_000_000 for trivial ops.",
             "",
             f"Then call `record_benchmark` with `benchmark_type='before'`, `parent_task_id='{self.task_id}'`, and all required metrics:",

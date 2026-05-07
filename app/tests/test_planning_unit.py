@@ -572,13 +572,13 @@ class TestComplexityClassifier:
         with _patch("app.agent.planning.call_llm", mock_call_llm):
             result = _run_async(pipeline._stage_design_review(_MINIMAL_DESIGN, "survey"))
 
-        full_reviewer_names = {r["name"] for r in [
+        final_reviewer_names = {r["name"] for r in [
             {"name": "coupling_reviewer"}, {"name": "interface_reviewer"},
             {"name": "testability_reviewer"}, {"name": "security_design_reviewer"},
             {"name": "performance_reviewer"},
         ]}
         voted_verdicts = {v.stage for v in result}
-        skipped = full_reviewer_names - voted_verdicts
+        skipped = final_reviewer_names - voted_verdicts
         assert skipped, "Some reviewers should be skipped for simple tasks"
         assert voted_verdicts.issubset(_SIMPLE_TASK_REVIEWER_SUBSET), (
             f"Simple task should only use {_SIMPLE_TASK_REVIEWER_SUBSET}, got {voted_verdicts}"

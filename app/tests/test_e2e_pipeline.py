@@ -93,7 +93,7 @@ def _sec_response_content(verdict: str, pt: int = 50, ct: int = 100) -> str:
 
 
 def _submit_work_response(verdict: str, pt: int = 50, ct: int = 5):
-    """Build a submit_work tool-call response for security/conceptual/full-review pipelines."""
+    """Build a submit_work tool-call response for security/conceptual/final-review pipelines."""
     from app.agent.mock_llm import MockLLM
     signal = "REVERT_TO_DESIGN" if verdict == "REJECTED" else "ACCEPTED"
     return MockLLM._tool_call_response(
@@ -418,8 +418,8 @@ def _make_conceptual_mock_llm(*verdicts, pt=50, ct=100):
     return ml
 
 
-def _make_full_review_mock_llm(*verdicts, pt=50, ct=100):
-    """Queue of full-review LLM responses (one per verdict string)."""
+def _make_final_review_mock_llm(*verdicts, pt=50, ct=100):
+    """Queue of final-review LLM responses (one per verdict string)."""
     from app.agent.mock_llm import MockLLM
 
     ml = MockLLM(scenario="pass")
@@ -501,16 +501,16 @@ class TestConceptualReviewPipelineE2E:
 
 
 # ---------------------------------------------------------------------------
-# 11. FullReviewPipeline E2E via MockLLM
+# 11. FinalReviewPipeline E2E via MockLLM
 # ---------------------------------------------------------------------------
 
 
-class TestFullReviewPipelineE2E:
-    def _run_full_review(self, mock_llm, *, task_id="e2e-fr"):
-        from app.agent.full_review import run_full_review_pipeline
+class TestFinalReviewPipelineE2E:
+    def _run_final_review(self, mock_llm, *, task_id="e2e-fr"):
+        from app.agent.final_review import run_final_review_pipeline
 
         async def _go():
-            return await run_full_review_pipeline(
+            return await run_final_review_pipeline(
                 task_id=task_id,
                 task_description="Add authentication endpoint",
                 files_changed=[],  # no frontend -> 3 reviewers only
@@ -520,29 +520,29 @@ class TestFullReviewPipelineE2E:
 
         with patch("httpx.AsyncClient", _mock_client_cls(mock_llm)):
             with patch("app.database.create_budget_entry", MagicMock()):
-                with patch("app.database.create_full_review_result", MagicMock()):
+                with patch("app.database.create_final_review_result", MagicMock()):
                     return _run(_go())
 
-    def test_full_review_all_pass(self):
-        mock_llm = _make_full_review_mock_llm("LIKELY", "LIKELY", "LIKELY")
-        result = self._run_full_review(mock_llm)
+    def test_final_review_all_pass(self):
+        mock_llm = _make_final_review_mock_llm("LIKELY", "LIKELY", "LIKELY")
+        result = self._run_final_review(mock_llm)
         assert result["outcome"] == "passed"
 
-    def test_full_review_rejected(self):
+    def test_final_review_rejected(self):
         # 3rd reviewer (integration) rejects -> demotion_target="indev"
-        mock_llm = _make_full_review_mock_llm("LIKELY", "LIKELY", "REJECTED")
-        result = self._run_full_review(mock_llm)
+        mock_llm = _make_final_review_mock_llm("LIKELY", "LIKELY", "REJECTED")
+        result = self._run_final_review(mock_llm)
         assert result["outcome"] == "rejected"
         assert result["demotion_target"] is not None
 
-    def test_full_review_budget_entries_recorded(self):
-        from app.agent.full_review import run_full_review_pipeline
+    def test_final_review_budget_entries_recorded(self):
+        from app.agent.final_review import run_final_review_pipeline
 
-        mock_llm = _make_full_review_mock_llm("LIKELY", "LIKELY", "LIKELY")
+        mock_llm = _make_final_review_mock_llm("LIKELY", "LIKELY", "LIKELY")
         mock_create = MagicMock()
 
         async def _go():
-            return await run_full_review_pipeline(
+            return await run_final_review_pipeline(
                 task_id="e2e-fr-budget",
                 task_description="Add auth",
                 files_changed=[],
@@ -552,14 +552,14 @@ class TestFullReviewPipelineE2E:
 
         with patch("httpx.AsyncClient", _mock_client_cls(mock_llm)):
             with patch("app.database.create_budget_entry", mock_create):
-                with patch("app.database.create_full_review_result", MagicMock()):
+                with patch("app.database.create_final_review_result", MagicMock()):
                     _run(_go())
 
         assert mock_create.call_count >= 3
 
-    def test_full_review_token_accumulation(self):
-        mock_llm = _make_full_review_mock_llm("LIKELY", "LIKELY", "LIKELY", pt=50, ct=100)
-        result = self._run_full_review(mock_llm, task_id="e2e-fr-tokens")
+    def test_final_review_token_accumulation(self):
+        mock_llm = _make_final_review_mock_llm("LIKELY", "LIKELY", "LIKELY", pt=50, ct=100)
+        result = self._run_final_review(mock_llm, task_id="e2e-fr-tokens")
         assert result["total_prompt_tokens"] == 150
         assert result["total_completion_tokens"] == 300
 
@@ -570,7 +570,7 @@ class TestFullReviewPipelineE2E:
 
 
 class TestSchedulerFullChainE2E:
-    def test_full_chain_conceptual_to_full_review(self):
+    def test_full_chain_conceptual_to_final_review(self):
         from app.agent.scheduler import (
             _run_conceptual_review_task,
             _run_optimization_task,
@@ -612,15 +612,15 @@ class TestSchedulerFullChainE2E:
 
         assert "optimization" in updated_types
         assert "security" in updated_types
-        assert "full_review" in updated_types
+        assert "final_review" in updated_types
 
     def test_full_chain_merge_virtual_passed_records_ready_for_review(self):
-        """After full_review passes and virtual merge succeeds, task history is updated."""
-        from app.agent.scheduler import _run_full_review_task
+        """After final_review passes and virtual merge succeeds, task history is updated."""
+        from app.agent.scheduler import _run_final_review_task
         from app.agent.merge import MergeResult
 
         mock_append = MagicMock()
-        fake_task = _fake_db_task_e2e(task_id="merge-t", task_type="full_review")
+        fake_task = _fake_db_task_e2e(task_id="merge-t", task_type="final_review")
 
         with patch("app.database.get_task", return_value=fake_task), \
              patch("app.database.update_task", MagicMock()), \
@@ -628,13 +628,13 @@ class TestSchedulerFullChainE2E:
              patch("app.database.get_project_path", return_value=None), \
              patch("app.database.append_task_history", mock_append), \
              patch("app.agent.tools.set_task_git_cwd", MagicMock()), \
-             patch("app.agent.full_review.run_full_review_pipeline",
+             patch("app.agent.final_review.run_final_review_pipeline",
                    return_value={"outcome": "passed", "demotion_target": None, "summary": "",
                                  "total_prompt_tokens": 0, "total_completion_tokens": 0, "votes": []}), \
              patch("app.agent.merge.execute_merge",
                    return_value=MergeResult(task_id="merge-t", status="virtual_passed")), \
              patch("app.agent.scheduler._record_demotion_inline", MagicMock()):
-            _run_full_review_task("merge-t", "http://localhost:8008/v1", "model")
+            _run_final_review_task("merge-t", "http://localhost:8008/v1", "model")
 
         mock_append.assert_called_once()
         assert mock_append.call_args[0][0] == "merge-t"
@@ -664,7 +664,7 @@ class TestSchedulerFullChainE2E:
 
         assert "indev" in updated_types
         mock_record.assert_called_once()
-        assert "full_review" not in updated_types
+        assert "final_review" not in updated_types
 
 
 def _fake_db_task_e2e(task_id="t", task_type="planning"):

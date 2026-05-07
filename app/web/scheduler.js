@@ -16,7 +16,7 @@ function esc(str) {
 }
 
 function typeBadgeClass(type) {
-    const known = ['idea','planning','indev','conceptual_review','optimization','full_review','file_summary'];
+    const known = ['idea','planning','indev','conceptual_review','optimization','human_review','file_summary'];
     return known.includes(type) ? `type-${type}` : 'type-other';
 }
 

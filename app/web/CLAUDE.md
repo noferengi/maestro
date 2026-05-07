@@ -9,7 +9,7 @@ All files in this directory are served as static files by FastAPI from the `/sta
 
 ### Board (`index.html` + `kanban.js` + `style.css`)
 
-The main Kanban board. Layout: a **`#arch-bar`** horizontal band spanning full width at the top, followed by eight pipeline columns: IDEAS → PLANNING → INDEV → CONCEPTUAL_REVIEW → OPTIMIZATION → SECURITY → FULL_REVIEW → COMPLETED. Tasks are draggable within a column to reorder. Column transitions are gated by the backend intake pipeline. Clicking a column header opens the **Column Map View**.
+The main Kanban board. Layout: a **`#arch-bar`** horizontal band spanning full width at the top, followed by eight pipeline columns: IDEAS → PLANNING → INDEV → CONCEPTUAL_REVIEW → OPTIMIZATION → SECURITY → FINAL_REVIEW → COMPLETED. Tasks are draggable within a column to reorder. Column transitions are gated by the backend intake pipeline. Clicking a column header opens the **Column Map View**.
 
 **`index.html`** — Board shell. Project tabs, the `#arch-bar` architecture bar, eight pipeline column containers, the Column Map overlay (`#column-map-container`), nine modals (task create/edit, new project, edit project, transition, LLM endpoints, budgets, tools, compute nodes). Both New Project and Edit Project modals have **Default LLM** and **Budget** dropdowns. The task create/edit modal has shared `#arch-category` and `#arch-priority` selects for architecture cards (shown/hidden by `showArchContentFields()`).
 

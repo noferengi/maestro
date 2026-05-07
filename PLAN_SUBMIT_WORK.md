@@ -79,7 +79,7 @@ Replace JSON text-signal emission with `submit_work` tool calls throughout the c
 - Says "Output JSON only. No prose before or after."
 - Non-terminal pipeline stage — may not need submit_work.
 
-### 15. Update review prompts (`full_review.py`, `conceptual_review.py`, `security_review.py`)
+### 15. Update review prompts (`final_review.py`, `conceptual_review.py`, `security_review.py`)
 - Say "Output your verdict as JSON"
 - Non-terminal pipeline stages — may not need submit_work.
 
@@ -115,7 +115,7 @@ Replace JSON text-signal emission with `submit_work` tool calls throughout the c
 | `app/agent/research.py` | MAYBE: non-terminal, assess if changes needed |
 | `app/agent/subdivide.py` | MAYBE: non-terminal, assess if changes needed |
 | `app/agent/dreamer.py` | MAYBE: non-terminal, assess if changes needed |
-| `app/agent/full_review.py` | MAYBE: non-terminal, assess if changes needed |
+| `app/agent/final_review.py` | MAYBE: non-terminal, assess if changes needed |
 | `app/agent/conceptual_review.py` | MAYBE: non-terminal, assess if changes needed |
 | `app/agent/security_review.py` | MAYBE: non-terminal, assess if changes needed |
 | `app/tests/test_submit_work_terminal.py` | TODO: run tests to verify |

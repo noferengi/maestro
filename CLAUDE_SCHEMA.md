@@ -35,7 +35,7 @@ Primary task/card table. `type` is the pipeline stage.
 | map_y | REAL | yes | — |
 | is_active | INTEGER | no | `1` |
 
-Valid `type` values (pipeline stages): `idea`, `planning`, `indev`, `conceptual_review`, `optimization`, `security`, `full_review`, `completed`, `cancelled`, `subdividing`, `accepted`, `architecture`
+Valid `type` values (pipeline stages): `idea`, `planning`, `indev`, `conceptual_review`, `optimization`, `security`, `final_review`, `human_review`, `completed`, `cancelled`, `subdividing`, `accepted`, `architecture`
 
 ---
 
@@ -285,7 +285,7 @@ Per-step results from the dev orchestrator (MaestroLoop implementation batches).
 
 ---
 
-## full_review_results
+## final_review_results
 
 | Column | Type | Nullable | Default |
 |---|---|---|---|
@@ -321,7 +321,7 @@ Per-step results from the dev orchestrator (MaestroLoop implementation batches).
 | test_output | TEXT | yes | — |
 | error_detail | TEXT | yes | — |
 | security_review_ids | TEXT | yes | — |
-| full_review_ids | TEXT | yes | — |
+| final_review_ids | TEXT | yes | — |
 | total_pipeline_tokens | INTEGER | yes | — |
 | llm_id | INTEGER | yes | — |
 | budget_id | INTEGER | yes | — |
@@ -484,7 +484,7 @@ agent is running; closed with exit details on completion or error.
 | completion_tokens | INTEGER | no | `0` |
 
 **`agent_type` values:** `intake`, `planning`, `maestro_loop`, `dev_orchestrator`,
-`conceptual_review`, `optimization`, `security`, `full_review`, `pip_preflight`,
+`conceptual_review`, `optimization`, `security`, `final_review`, `pip_preflight`,
 `pip_research`, `pip_resolution`, `subdivision`, `arch_gen`
 
 **`exit_reason` values:** `completed`, `max_turns`, `stalled`, `error`, `shutdown`,

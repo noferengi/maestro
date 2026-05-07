@@ -8,20 +8,20 @@ DB_PATH = Path(__file__).parent.parent / "data" / "kanban.db"
 
 DISPATCHABLE_TYPES = {
     "planning", "indev", "conceptual_review", "optimization",
-    "security", "full_review", "subdividing", "pip_resolution",
+    "security", "human_review", "subdividing", "pip_resolution",
 }
 
 
 def get_conn() -> sqlite3.Connection:
     """Read-only SQLite connection to kanban.db."""
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def get_rw_conn() -> sqlite3.Connection:
     """Read-write SQLite connection — use only in action tools."""
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 

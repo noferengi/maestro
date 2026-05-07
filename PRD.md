@@ -1,6 +1,6 @@
 # TheMaestro — Product Requirements Document
 
-> **Living document.** Edit in-place. Update status badges as work ships. Add new sections at the bottom of each theme; never reorder shipped items. Last substantive revision: 2026-05-03.
+> **Living document.** Edit in-place. Update status badges as work ships. Add new sections at the bottom of each theme; never reorder shipped items. Last substantive revision: 2026-05-04.
 
 ---
 
@@ -10,7 +10,7 @@
 
 ### B.1 Operational Runbook — `RUNBOOK.md`
 
-`PLANNED` · Priority: **P1**
+`SHIPPED` · Priority: **P1**
 
 A lookup table of the ten most common stuck-card patterns: symptom → likely cause → fix command. The MCP `diagnose_task` surfaces the data; knowing what to do with it requires experience that currently lives only in the operator's head. Format: a short markdown table plus one paragraph per pattern. Target: any new session should be able to resolve any common failure in under 2 minutes without prior context.
 
@@ -30,13 +30,13 @@ Patterns to cover at minimum:
 
 ### B.2 `preview_dispatch()` MCP Tool
 
-`PLANNED` · Priority: **P2**
+`SHIPPED` · Priority: **P2**
 
 Dry-run the scheduler tick without dispatching anything. Returns what *would* be dispatched: task ID, title, target LLM, estimated token cost, and why each other ready task was skipped (capacity, cooldown, PIP gate, etc.).
 
 Useful for reasoning about ordering and capacity before flipping the scheduler on, and for debugging "why didn't my card dispatch?" without staring at logs.
 
-Implementation: replicate the `_tick()` logic in read-only mode — same DAG resolution, same capacity checks, same cooldown filters — but instead of calling `_run_task()`, collect the decisions into a report. No DB writes. Lives in `mcp_tools/diagnostics.py`.
+Implementation: replicated the `_tick()` logic in read-only mode — same DAG resolution, same capacity checks, same cooldown filters — but instead of calling `_run_task()`, collect the decisions into a report. No DB writes. Lives in `mcp_tools/diagnostics.py`.
 
 ---
 
@@ -75,7 +75,7 @@ Everything listed here has working code in the repository.
 | CONCEPTUAL_REVIEW | LLM panel reviews implementation quality | `SHIPPED` |
 | OPTIMIZATION | LLM suggests and applies performance improvements | `SHIPPED` |
 | SECURITY | Bandit + pip-audit + semgrep + LLM security reviewer | `SHIPPED` |
-| FULL_REVIEW | Final LLM panel; gates on LIKELY/POSSIBLE majority | `SHIPPED` |
+| FINAL_REVIEW | Final LLM panel; gates on LIKELY/POSSIBLE majority | `SHIPPED` |
 | COMPLETED | Task accepted; branch ready to merge | `SHIPPED` |
 
 ### Scheduler
@@ -117,9 +117,11 @@ Everything listed here has working code in the repository.
 
 ### 1.1 Intent Clarification — LLM-Assisted Description Rewrite
 
-`PLANNED` · Priority: **P0** · Spec: [§FS-1.1](#fs-11-intent-clarification)
+`SHIPPED` · Priority: **P0**
 
 When a user saves a new IDEA card (or edits an existing one), the system triggers a one-shot LLM rewrite of the description. The user sees the original and the suggested version side-by-side and chooses to accept, edit, or discard the suggestion. Only after this approval step does the card become available for pipeline dispatch.
+
+Implementation: `app/agent/clarify.py` (Clarification Agent, 488 lines) produces `rewritten_description`, `acceptance_criteria`, `out_of_scope`, `open_questions`, `suggested_prerequisites`, `suggested_subtasks`. API endpoints at `/api/tasks/{id}/clarification`, `/clarification/approve`, `/clarification/skip`, `/clarification/retrigger`. Intake modal in `index.html:606-680` with side-by-side comparison and chat bubbles. Gate in `main.py:1788-1797` blocks dispatch until clarification approved. DB table `clarification_drafts` (migration 0055), `clarification_status` on tasks.
 
 **Why this matters:** The planning pipeline's 5-stage design process, the gate checks, and the implementation agent all depend on the description as their source of truth. A vague description produces a vague plan. A plan that doesn't match the user's intent demotes and retries, burning tokens and time. Front-loading clarity is the highest-leverage improvement in the entire system.
 
@@ -129,26 +131,27 @@ When a user saves a new IDEA card (or edits an existing one), the system trigger
 
 ### 1.2 Prerequisites UI — Visual DAG Wiring
 
-`PLANNED` · Priority: **P1** · Spec: [§FS-1.2](#fs-12-prerequisites-ui)
+`SHIPPED` · Priority: **P1**
 
-No UI currently exists for setting `prerequisites`. The DAG is wired either by the subdivision agent (automatically) or not at all (human-created IDEA cards). This means human-authored work is dispatched without dependency ordering unless the user manually edits the DB.
+A **prerequisite selector** in the task edit modal: searchable multi-select (`kanban.js:4344-4460`, `_initPrereqsSelector`) showing all tasks in the current project. Below the selector, a prerequisite chain visualization renders the dependency chain in the edit modal (`kanban.js:4462-4540`). Suggested prerequisites shown in intake modal and edit modal.
 
-Add a **prerequisite selector** to the task edit modal: a searchable multi-select showing all tasks in the current project. Below the selector, a mini DAG visualization (SVG, lightweight) shows the dependency chain so the user can see the effect of their selections before saving.
+Drag-to-connect on Column Map view: hovering over a node reveals a `+` handle (`kanban.js:6241-6347`, `_mapStartPrereqDrag`); dragging from one node to another creates a prerequisite edge via `_addMapPrerequisite`.
 
-Also add drag-to-connect to the Column Map view: hovering over a node reveals connection handles; dragging from one node to another creates a prerequisite edge.
+Backend: `prerequisites` JSON column on tasks, resolved at sub-idea creation time (`main.py:421-445`).
 
 ---
 
 ### 1.3 Acceptance Criteria Extraction
 
-`PLANNED` · Priority: **P1** · Spec: [§FS-1.3](#fs-13-acceptance-criteria-extraction)
+`SHIPPED` · Priority: **P1**
 
-The Intent Clarification step (1.1) produces a rewritten description. This step goes further: it extracts a **structured acceptance criteria list** from the description and stores it as a separate field on the task record.
+The Clarification Agent (`clarify.py:102,210`) extracts a structured `acceptance_criteria: list[str]` from the description. Stored in `tasks.acceptance_criteria` TEXT column (migration `0057_add_acceptance_criteria_to_tasks.py`) as a JSON array.
 
-These criteria become:
-- The seed for PIPs (Performance Improvement Plans) if the card is demoted
-- The pass/fail checklist for the FULL_REVIEW stage
-- Pre-hoc test stubs injected into the component loop agent's initial context
+These criteria are injected into:
+- **Planning gate** (`planning_gate.py:708-719`) — injected into gate prompt, coverage checked in vote schema
+- **Final review** (`final_review.py:136-147,252-253`) — injected into reviewer prompt for verification
+- **UI** — displayed in intake modal (`kanban.js:1370-1378`) and task serialization (`main.py:1625,1943,3336`)
+- **Clarification CRUD** — persistence and retrieval via `crud_clarification.py`
 
 This closes the loop between what the user wanted and what the machine verifies.
 
@@ -189,7 +192,7 @@ Templates are stored as JSON in the project (or globally). The "New Card" modal 
 
 **The gap:** Agent A is modifying `src/auth.py`. Agent B starts and also plans to modify `src/auth.py`. Neither knows about the other. Both will succeed. The conflict surfaces at merge time, not at run time.
 
-**The fix:** At dispatch time, for each task being launched, query the DB for all tasks whose status is `completed` or `full_review` and which have a non-null `merge_commit_sha = NULL` (accepted but not yet merged). For each such task that has a file manifest overlapping with the current task's file manifest, inject a read-only summary into the agent's initial context:
+**The fix:** At dispatch time, for each task being launched, query the DB for all tasks whose status is `completed` or `final_review` and which have a non-null `merge_commit_sha = NULL` (accepted but not yet merged). For each such task that has a file manifest overlapping with the current task's file manifest, inject a read-only summary into the agent's initial context:
 
 ```
 ⚠ PENDING UNMERGED CHANGES:
@@ -542,9 +545,16 @@ Checkboxes on cards to select multiple; bulk operations: move to stage, assign L
 
 ### FS-1.1 Intent Clarification
 
-**Status:** `PLANNED`
+**Status:** `SHIPPED`
 
-**Trigger:** User clicks "Save" on a new IDEA card, or clicks "Clarify" on an existing one.
+**Implementation note:** Shipped version exceeds the spec — multi-turn research agent (not a
+single LLM call), suggested prerequisites and subtasks with checkboxes, interactive chat
+refinement loop, design rationale section, and an agent investigation viewer showing each
+tool-call step. The `kept_original` status value from the spec is implemented as `skipped`.
+Re-trigger button (✎) on the card toolbar allows re-running clarification on any IDEA card.
+Scheduler dispatches clarification at highest priority (before all pipeline tasks).
+
+**Trigger:** User clicks "Save" on a new IDEA card, or clicks ✎ (Re-clarify) on an existing one.
 
 **Flow:**
 
@@ -653,7 +663,7 @@ def _get_pending_sibling_changes(task_id: str, project_id: int, file_manifest: l
     Returns accepted-but-unmerged sibling tasks whose file manifests overlap
     with the current task's file manifest.
     """
-    # Query: tasks in same project, type in (completed, full_review),
+    # Query: tasks in same project, type in (completed, final_review),
     #        merge_commit_sha IS NULL, id != task_id
     # For each: check if file_manifest overlap with current task's manifest
     # Return: [{task_id, title, branch, overlapping_files}]

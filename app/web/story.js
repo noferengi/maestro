@@ -14,7 +14,7 @@ const AGENT_TYPE_COLORS = {
     conceptual_review: '#fd7e14',
     optimization:      '#f59f00',
     security:          '#dc3545',
-    full_review:       '#0ca678',
+    human_review:       '#0ca678',
     pip_preflight:     '#e83e8c',
     pip_research:      '#ffc107',
     pip_resolution:    '#e03131',
@@ -30,7 +30,7 @@ const AGENT_TYPE_LABELS = {
     conceptual_review: 'Conceptual Review',
     optimization:      'Optimization',
     security:          'Security',
-    full_review:       'Full Review',
+    human_review:       'Full Review',
     pip_preflight:     'PIP Pre-flight',
     pip_research:      'PIP Research',
     pip_resolution:    'PIP Resolution',
@@ -45,7 +45,7 @@ const STAGE_LABELS = {
     conceptual_review:  'REVIEW',
     optimization:       'OPTIM',
     security:           'SECURITY',
-    full_review:        'FULL REVIEW',
+    human_review:        'FULL REVIEW',
     completed:          'COMPLETED',
     architecture:       'ARCH',
 };
@@ -397,7 +397,10 @@ function buildSessionCard(s, matchedGate = null, matchedComponents = null) {
 
     // ── Inline component failure details (dev_orchestrator, rejected) ──
     if (matchedComponents && matchedComponents.length > 0) {
-        const failedComps = matchedComponents.filter(c => c.status !== 'ACCEPTED');
+        // Filter out the synthetic __tests__ row from component display
+        const failedComps = matchedComponents.filter(
+            c => c.status !== 'ACCEPTED' && c.component_name !== '__tests__',
+        );
         if (failedComps.length > 0) {
             const compBlock = document.createElement('div');
             compBlock.className = 'story-inline-detail';
@@ -438,6 +441,66 @@ function buildSessionCard(s, matchedGate = null, matchedComponents = null) {
             }
             compBlock.appendChild(compGrid);
             inner.appendChild(compBlock);
+        }
+    }
+
+   // ── Test evidence (dev_orchestrator only) ────────────────
+    if (agentKey === 'dev_orchestrator' && matchedComponents) {
+        const testRow = matchedComponents.find(
+            c => c.component_name === '__tests__',
+        );
+        if (testRow) {
+            const testBlock = document.createElement('div');
+            testBlock.className = 'story-inline-detail';
+            const testPassed = testRow.status === 'ACCEPTED';
+            if (testPassed) {
+                testBlock.style.borderColor = '#badbcc';
+            }
+
+            // Title: summary line
+            const testTitle = document.createElement('div');
+            testTitle.className = 'story-inline-detail-title';
+            if (testPassed) {
+                testTitle.style.color = '#19693d';
+            }
+            const statusIcon = testPassed ? '✓' : '✗';
+            const coverageText = testRow.coverage_pct != null
+                ? ` · ${testRow.coverage_pct.toFixed(1)}% coverage`
+                : '';
+            testTitle.textContent = `${statusIcon} Tests${coverageText}`;
+            testBlock.appendChild(testTitle);
+
+            // Summary line: N passed / total
+            if (testRow.tests_passed != null) {
+                const summaryLine = document.createElement('div');
+                summaryLine.className = 'story-test-summary';
+                summaryLine.textContent = `${testRow.tests_passed} test(s) passed`;
+                testBlock.appendChild(summaryLine);
+            }
+
+            // Collapsible raw output
+            if (testRow.test_output) {
+                const outputToggle = document.createElement('button');
+                outputToggle.className = 'story-expand-btn';
+                outputToggle.textContent = 'Show test output';
+                outputToggle.style.marginTop = '8px';
+
+                const outputPre = document.createElement('pre');
+                outputPre.className = 'story-test-output';
+                outputPre.style.display = 'none';
+                outputPre.textContent = testRow.test_output;
+
+                outputToggle.onclick = () => {
+                    const visible = outputPre.style.display !== 'none';
+                    outputPre.style.display = visible ? 'none' : 'block';
+                    outputToggle.textContent = visible ? 'Show test output' : 'Hide test output';
+                };
+
+                testBlock.appendChild(outputToggle);
+                testBlock.appendChild(outputPre);
+            }
+
+            inner.appendChild(testBlock);
         }
     }
 

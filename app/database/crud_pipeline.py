@@ -11,11 +11,11 @@ Tables covered:
   ComponentResult                    — per-component dev agent result
   OptimizationResult                 — optimization pipeline output
   SecurityReviewResult               — security review findings (has veto power)
-  FullReviewResult                   — final review findings
+  FinalReviewResult                  — final AI review findings
   MergeRecord                        — merge-to-main operations
 
 Note: update_*() functions for PlanningResult, OptimizationResult,
-SecurityReviewResult, FullReviewResult, and MergeRecord accept an explicit
+SecurityReviewResult, FinalReviewResult, and MergeRecord accept an explicit
 `db` session as their first argument (called from within an existing
 transaction in the pipeline orchestrators).  All other functions open and
 close their own sessions.
@@ -29,7 +29,7 @@ from .session import SessionLocal
 from .models import (
     TransitionVote, TransitionResult, SubdivisionRecord,
     PlanningResult, ComponentResult, OptimizationResult,
-    SecurityReviewResult, FullReviewResult, MergeRecord,
+    SecurityReviewResult, FinalReviewResult, MergeRecord,
 )
 
 logger = logging.getLogger(__name__)
@@ -558,13 +558,13 @@ def update_security_review_result(db, result_id, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# FullReviewResult
+# FinalReviewResult
 # ---------------------------------------------------------------------------
 
-def create_full_review_result(task_id, reviewer_type, verdict, confidence, **kwargs):
+def create_final_review_result(task_id, reviewer_type, verdict, confidence, **kwargs):
     db = SessionLocal()
     try:
-        result = FullReviewResult(
+        result = FinalReviewResult(
             task_id=task_id, reviewer_type=reviewer_type,
             verdict=verdict, confidence=confidence, **kwargs
         )
@@ -574,27 +574,27 @@ def create_full_review_result(task_id, reviewer_type, verdict, confidence, **kwa
         return result
     except Exception as e:
         db.rollback()
-        logger.error("Error creating full review result: %s", e)
+        logger.error("Error creating final review result: %s", e)
         return None
     finally:
         db.close()
 
 
-def get_full_review_results(task_id):
+def get_final_review_results(task_id):
     db = SessionLocal()
     try:
-        return (db.query(FullReviewResult)
-                .filter(FullReviewResult.task_id == task_id)
-                .order_by(FullReviewResult.created_at.desc())
+        return (db.query(FinalReviewResult)
+                .filter(FinalReviewResult.task_id == task_id)
+                .order_by(FinalReviewResult.created_at.desc())
                 .all())
     finally:
         db.close()
 
 
-def update_full_review_result(db, result_id, **kwargs):
-    """Update a full review result by ID (caller-supplied session)."""
+def update_final_review_result(db, result_id, **kwargs):
+    """Update a final review result by ID (caller-supplied session)."""
     try:
-        result = db.query(FullReviewResult).filter(FullReviewResult.id == result_id).first()
+        result = db.query(FinalReviewResult).filter(FinalReviewResult.id == result_id).first()
         if not result:
             return None
         for key, value in kwargs.items():
@@ -605,7 +605,7 @@ def update_full_review_result(db, result_id, **kwargs):
         return result
     except Exception as e:
         db.rollback()
-        logger.error("Error updating full review result: %s", e)
+        logger.error("Error updating final review result: %s", e)
         return None
 
 

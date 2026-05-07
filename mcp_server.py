@@ -19,6 +19,7 @@ Tools:
     maestro__get_capacity_status    — per-node/LLM slot utilisation (free/used/total)
     maestro__list_pending_merges    — completed tasks not yet merged to main
     maestro__get_project_health     — cold-start briefing: stages, sessions, spend, demotions
+    maestro__preview_dispatch       — dry-run scheduler tick: what would dispatch + skip reasons
 
   Action (write):
     maestro__append_task_description  — add context to task description
@@ -29,7 +30,7 @@ Tools:
     maestro__trigger_planning_run     — POST /api/tasks/{id}/run-planning
     maestro__demote_task              — move task backward with demotion record
     maestro__stop_agent               — graceful stop of a running MaestroLoop
-    maestro__run_pipeline_stage       — trigger review / security / full_review
+    maestro__run_pipeline_stage       — trigger review / security / final_review
     maestro__get_budget_entry_full    — full prompt+response for one budget entry
 
   Monitor:
@@ -59,6 +60,7 @@ from mcp_tools.diagnostics import (
     get_capacity_status,
     list_pending_merges,
     get_project_health,
+    preview_dispatch,
 )
 from mcp_tools.actions import (
     append_task_description,
@@ -91,6 +93,7 @@ mcp.tool()(run_inspect_cards)
 mcp.tool()(get_capacity_status)
 mcp.tool()(list_pending_merges)
 mcp.tool()(get_project_health)
+mcp.tool()(preview_dispatch)
 
 # --- Live API tool ---
 mcp.tool()(get_scheduler_api_status)

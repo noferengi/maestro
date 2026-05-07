@@ -89,7 +89,7 @@ ARCH_CATEGORIES = [
 #                    Accessibility/Compliance/General matter most.
 #   security       - focused audit: Security/Compliance/API/Data/Platform/General.
 #   optimization   - focused audit: Performance/Platform/Data/Observability/Tooling/General.
-#   research/loop/intake/full_review → None (all categories, full context needed).
+#   research/loop/intake/final_review → None (all categories, full context needed).
 ARCH_CATEGORY_RELEVANCE: dict[str, set[str] | None] = {
     'file_summary':      {'Platform', 'Tooling', 'Data', 'General'},
     'subdivision':       {'Platform', 'Design', 'Testing', 'Performance',
@@ -100,7 +100,7 @@ ARCH_CATEGORY_RELEVANCE: dict[str, set[str] | None] = {
     'optimization':      {'Performance', 'Platform', 'Data', 'Observability',
                           'Tooling', 'General'},
     'planning':         None,  # all categories — needs full platform/design context
-    # research, loop, intake, full_review → all categories (key absent = None)
+    # research, loop, intake, final_review → all categories (key absent = None)
 }
 
 # Priority sort order for injection (critical first)

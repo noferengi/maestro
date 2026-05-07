@@ -282,7 +282,7 @@ the `/api/tasks/{id}/set-stage` endpoint but callable from Claude's tool loop
 without needing `curl`.
 
 Allowed types: `idea`, `planning`, `indev`, `conceptual_review`, `optimization`,
-`security`, `full_review`, `completed`.
+`security`, `final_review`, `completed`.
 
 Returns: `"OK: task '{task_id}' set to type '{type}'"`
 
@@ -547,7 +547,7 @@ def patch_planning_fields(result_id: int, fields: dict) -> str:
 def set_task_type(task_id: str, type: str) -> str:
     """Force a task to any pipeline stage."""
     ALLOWED_TYPES = {"idea","planning","indev","conceptual_review","optimization",
-                     "security","full_review","completed","architecture"}
+                     "security","final_review","completed","architecture"}
     if type not in ALLOWED_TYPES:
         return f"ERROR: Invalid type '{type}'. Allowed: {sorted(ALLOWED_TYPES)}"
     import sys, os

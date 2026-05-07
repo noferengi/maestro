@@ -139,6 +139,10 @@ class Task(Base):
     is_active = Column(Boolean, nullable=False, default=True)  # False = soft-deleted (hidden everywhere)
     intake_exhausted_at = Column(String, nullable=True)  # Set when scheduler gives up retrying intake
     cache_mode = Column(String, nullable=False, default='normal')  # normal | force_with_context | force_fresh
+    # Intake clarification fields (migration 0055)
+    clarification_status = Column(String, nullable=False, default='none')  # none | pending | awaiting_user | approved | skipped
+    description_original = Column(Text, nullable=True)  # Raw user input before clarification rewrite
+    acceptance_criteria = Column(Text, nullable=True)  # JSON array of strings, extracted from approved clarification draft
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -316,6 +320,8 @@ class ComponentResult(Base):
     error_detail = Column(Text, nullable=True)
     prompt_tokens = Column(Integer, default=0)
     completion_tokens = Column(Integer, default=0)
+    test_output = Column(Text, nullable=True)
+    coverage_pct = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
 
@@ -375,9 +381,9 @@ class SecurityReviewResult(Base):
         return f"<SecurityReviewResult(id={self.id}, task={self.task_id}, type={self.reviewer_type})>"
 
 
-class FullReviewResult(Base):
-    """Full/final review findings."""
-    __tablename__ = "full_review_results"
+class FinalReviewResult(Base):
+    """Final AI review findings."""
+    __tablename__ = "final_review_results"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     task_id = Column(String, ForeignKey('tasks.id'), nullable=False)
@@ -398,7 +404,7 @@ class FullReviewResult(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     def __repr__(self):
-        return f"<FullReviewResult(id={self.id}, task={self.task_id}, type={self.reviewer_type})>"
+        return f"<FinalReviewResult(id={self.id}, task={self.task_id}, type={self.reviewer_type})>"
 
 
 class MergeRecord(Base):
@@ -413,7 +419,7 @@ class MergeRecord(Base):
     test_output = Column(Text, nullable=True)
     error_detail = Column(Text, nullable=True)
     security_review_ids = Column(Text, nullable=True)
-    full_review_ids = Column(Text, nullable=True)
+    final_review_ids = Column(Text, nullable=True)
     total_pipeline_tokens = Column(Integer, default=0)
     llm_id = Column(Integer, nullable=True)
     budget_id = Column(Integer, nullable=True)
@@ -463,6 +469,33 @@ class PipVerification(Base):
             f"<PipVerification(id={self.id}, pip={self.pip_id}, "
             f"stage={self.checked_at_stage!r}, outcome={self.outcome!r})>"
         )
+
+
+class IntakeDraft(Base):
+    """Working draft produced by the clarification agent for an IDEA card.
+
+    One row per task (UNIQUE on task_id).  Holds the LLM-rewritten description,
+    suggested prerequisites, suggested subtasks, and the running conversation
+    history between the user and the refinement LLM.
+    """
+    __tablename__ = "intake_drafts"
+
+    id                      = Column(Integer, primary_key=True, autoincrement=True)
+    task_id                 = Column(String, ForeignKey('tasks.id'), nullable=False, unique=True)
+    rewritten_description   = Column(Text, nullable=True)
+    design_rationale        = Column(Text, nullable=True)
+    acceptance_criteria     = Column(Text, nullable=True)   # JSON array of strings
+    out_of_scope            = Column(Text, nullable=True)
+    open_questions          = Column(Text, nullable=True)   # JSON array of strings
+    suggested_prerequisites = Column(Text, nullable=True)   # JSON: [{task_id, title, reason}]
+    suggested_subtasks      = Column(Text, nullable=True)   # JSON: [{title, description, order}]
+    conversation_history    = Column(Text, nullable=True)   # JSON: [{role, content, timestamp}]
+    agent_token_cost        = Column(Integer, nullable=True)
+    created_at              = Column(String, nullable=False)
+    updated_at              = Column(String, nullable=False)
+
+    def __repr__(self):
+        return f"<IntakeDraft(id={self.id}, task={self.task_id})>"
 
 
 # ---------------------------------------------------------------------------
@@ -606,7 +639,7 @@ class AgentSession(Base):
 
     agent_type values:
         intake, planning, maestro_loop, dev_orchestrator, conceptual_review,
-        optimization, security, full_review, pip_preflight, pip_research,
+        optimization, security, final_review, pip_preflight, pip_research,
         pip_resolution, subdivision, arch_gen
 
     exit_reason values:

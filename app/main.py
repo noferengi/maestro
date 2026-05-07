@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Body
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from typing import List, Optional
@@ -52,12 +52,12 @@ from database import (
 )
 from database import (
     PlanningResult, ComponentResult, OptimizationResult,
-    SecurityReviewResult, FullReviewResult, MergeRecord,
+    SecurityReviewResult, FinalReviewResult, MergeRecord,
     create_planning_result, get_planning_result,
     create_component_result, get_component_results,
     create_optimization_result, get_optimization_result,
     create_security_review_result, get_security_review_results,
-    create_full_review_result, get_full_review_results,
+    create_final_review_result, get_final_review_results,
     create_merge_record, get_merge_record,
     get_research_jobs_for_task, get_research_job,
     create_research_job, update_research_job,
@@ -67,9 +67,13 @@ from database import (
     create_inbox_message, get_inbox_messages, get_inbox_message,
     mark_inbox_read, mark_all_inbox_read, delete_inbox_message, count_unread_inbox,
 )
+from database import (
+    get_intake_draft, create_intake_draft, update_intake_draft,
+    append_conversation_message, intake_draft_to_dict,
+)
 
 from app.agent.config import PIPELINE_COLUMN_ORDER, PIPELINE_DONE_STATUSES
-from app.agent.llm_client import ShutdownError, PipelineAbortedError, invalidate_llm_cache
+from app.agent.llm_client import ShutdownError, PipelineAbortedError, TaskDeactivatedError, invalidate_llm_cache
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -173,6 +177,12 @@ def create_new_task(task_data: dict):
     if not task:
         raise HTTPException(status_code=500, detail="Failed to create task")
 
+    # Queue clarification for new IDEA cards — scheduler picks it up on the next tick
+    # at highest priority (before file summaries and all pipeline tasks).
+    if requested_type == 'idea' and task.llm_id and task.budget_id:
+        update_task(task.id, clarification_status='pending', description_original=task.description or '')
+        task = get_task(task.id)  # reload to get updated clarification_status
+
     return task_to_dict(task)
 
 
@@ -219,6 +229,13 @@ def update_existing_task(task_id: str, task_data: dict):
 
     if not updated_task:
         raise HTTPException(status_code=500, detail="Failed to update task")
+
+    # Queue clarification for IDEA cards that just got an LLM/Budget assigned
+    if (updated_task.type == 'idea' and 
+        updated_task.clarification_status == 'none' and 
+        updated_task.llm_id and 
+        updated_task.budget_id):
+        updated_task = update_task(task_id, clarification_status='pending', description_original=updated_task.description or '')
 
     # Check for completion rollup if task moved to completed
     if new_type and new_type.lower() in PIPELINE_DONE_STATUSES:
@@ -723,9 +740,9 @@ def _pipeline_session(func):
         "_run_regenerate_subdivision": "subdivision",
         "_run_planning_pipeline_bg": "planning",
         "_run_review_pipeline_bg": "conceptual_review",
-        "_run_security_only_bg": "security",
-        "_run_security_pipeline_bg": "optimization",
-        "_run_full_review_bg": "security",
+        "_run_optimization_pipeline_bg": "optimization",
+        "_run_security_pipeline_bg": "security",
+        "_run_final_review_pipeline_bg": "final_review",
         "_run_loop_bg": "maestro_loop",
         "_run_intake_bg": "intake",
     }
@@ -758,6 +775,9 @@ def _pipeline_session(func):
             _exit_reason = "completed"
             try:
                 return func(task_id, *args, **kwargs)
+            except TaskDeactivatedError as exc:
+                _exit_reason = "deactivated"
+                logger.info("[pipeline] %s", exc)
             except Exception:
                 _exit_reason = "error"
                 raise
@@ -1401,8 +1421,8 @@ def _run_security_only_bg(task_id: str) -> None:
 
 
 @_pipeline_session
-def _run_security_pipeline_bg(task_id: str) -> None:
-    """Advance handler for OPTIMIZATION cards: run optimization, advance to security on pass."""
+def _run_optimization_pipeline_bg(task_id: str) -> None:
+    """Advance handler for CONCEPTUAL_REVIEW cards: run optimization, advance to security on pass."""
     project_path = None
     worktree_path = None
     try:
@@ -1454,8 +1474,8 @@ def _run_security_pipeline_bg(task_id: str) -> None:
 
 
 @_pipeline_session
-def _run_full_review_bg(task_id: str) -> None:
-    """Advance handler for SECURITY cards: run security, advance to full_review on pass."""
+def _run_security_pipeline_bg(task_id: str) -> None:
+    """Advance handler for SECURITY cards: run security, advance to final_review on pass."""
     project_path = None
     worktree_path = None
     try:
@@ -1489,8 +1509,8 @@ def _run_full_review_bg(task_id: str) -> None:
             _store_pipeline_result_generic(task_id, sec_result, task.budget_id, "security_review")
 
             if sec_result.get("outcome") == "passed":
-                update_task(task_id, type="full_review")
-                logger.info("[security] Task '%s' advanced to FULL REVIEW.", task_id)
+                update_task(task_id, type="final_review")
+                logger.info("[security] Task '%s' passed. Advanced to FINAL REVIEW.", task_id)
             else:
                 demotion = sec_result.get("demotion_target", "indev")
                 update_task(task_id, type=demotion)
@@ -1512,13 +1532,13 @@ def _run_full_review_bg(task_id: str) -> None:
 
 
 @_pipeline_session
-def _run_full_review_only_bg(task_id: str) -> None:
-    """On-demand: run only the full review pipeline (no security, no stage advancement)."""
+def _run_final_review_only_bg(task_id: str) -> None:
+    """On-demand: run only the final review pipeline (no security, no stage advancement)."""
     project_path = None
     worktree_path = None
     try:
         import asyncio
-        from app.agent.full_review import run_full_review_pipeline
+        from app.agent.final_review import run_final_review_pipeline
         from app.agent.merge import execute_merge
 
         task = get_task(task_id)
@@ -1535,7 +1555,7 @@ def _run_full_review_only_bg(task_id: str) -> None:
         asyncio.set_event_loop(loop)
         try:
             fr_result = loop.run_until_complete(
-                run_full_review_pipeline(
+                run_final_review_pipeline(
                     task_id=task_id,
                     task_description=task.description or "",
                     llm_base_url=llm_base_url,
@@ -1545,34 +1565,100 @@ def _run_full_review_only_bg(task_id: str) -> None:
                     project_path=worktree_path,
                 )
             )
-            _store_pipeline_result_generic(task_id, fr_result, task.budget_id, "full_review")
+            _store_pipeline_result_generic(task_id, fr_result, task.budget_id, "final_review")
 
             if fr_result.get("outcome") == "passed":
-                logger.info("[full_review] Task '%s' passed. Running virtual merge test.", task_id)
+                logger.info("[final_review] Task '%s' passed. Running virtual merge test.", task_id)
                 # execute_merge operates on the main repo branch, not the worktree
                 merge_test = execute_merge(task_id, project_path=project_path, dry_run=True)
                 if merge_test.status == "virtual_passed":
-                    append_task_history(task_id, "ready_for_review", message="Full review passed. Virtual merge/test SUCCEEDED. Ready for final manual review and merge.")
-                    logger.info("[full_review] Task '%s' virtual merge SUCCEEDED.", task_id)
+                    append_task_history(task_id, "ready_for_review", message="Final review passed. Virtual merge/test SUCCEEDED. Ready for final manual review and merge.")
+                    logger.info("[final_review] Task '%s' virtual merge SUCCEEDED.", task_id)
                 else:
-                    append_task_history(task_id, "merge_test_failed", message=f"Full review passed, but VIRTUAL MERGE FAILED: {merge_test.status}. Detail: {merge_test.error_detail}")
-                    logger.warning("[full_review] Task '%s' virtual merge FAILED: %s", task_id, merge_test.status)
+                    append_task_history(task_id, "merge_test_failed", message=f"Final review passed, but VIRTUAL MERGE FAILED: {merge_test.status}. Detail: {merge_test.error_detail}")
+                    logger.warning("[final_review] Task '%s' virtual merge FAILED: %s", task_id, merge_test.status)
             else:
                 demotion = fr_result.get("demotion_target", "indev")
                 update_task(task_id, type=demotion)
-                _record_demotion(task_id, "full_review", demotion, fr_result.get("summary", ""))
-                logger.warning("[full_review] Task '%s' demoted to %s.", task_id, demotion)
+                _record_demotion(task_id, "final_review", demotion, fr_result.get("summary", ""))
+                logger.warning("[final_review] Task '%s' demoted to %s.", task_id, demotion)
         except ShutdownError:
-            logger.info("[full_review] Pipeline for '%s' aborted due to server shutdown.", task_id)
+            logger.info("[final_review] Pipeline for '%s' aborted due to server shutdown.", task_id)
         except PipelineAbortedError as exc:
-            logger.warning("[full_review] Task '%s' aborted at stage '%s': %s — will retry.",
+            logger.warning("[final_review] Task '%s' aborted at stage '%s': %s — will retry.",
                            task_id, exc.stage, exc.cause)
         except Exception:
-            logger.exception("[full_review] Pipeline for '%s' failed.", task_id)
+            logger.exception("[final_review] Pipeline for '%s' failed.", task_id)
         finally:
             loop.close()
     except Exception as exc:
-        logger.exception("[full_review] Pipeline for '%s' failed.", task_id)
+        logger.exception("[final_review] Pipeline for '%s' failed.", task_id)
+    finally:
+        _teardown_worktree(task_id, project_path, worktree_path)
+
+
+@_pipeline_session
+def _run_final_review_pipeline_bg(task_id: str) -> None:
+    """Advance handler for FINAL_REVIEW cards: run final review pipeline, advance to human_review on pass."""
+    project_path = None
+    worktree_path = None
+    try:
+        import asyncio
+        from app.agent.final_review import run_final_review_pipeline
+        from app.agent.merge import execute_merge
+
+        task = get_task(task_id)
+        if not task:
+            return
+        project_path = _setup_thread_context(task)
+        worktree_path, _aborted = _setup_worktree(task_id, project_path)
+        if _aborted:
+            return
+
+        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            fr_result = loop.run_until_complete(
+                run_final_review_pipeline(
+                    task_id=task_id,
+                    task_description=task.description or "",
+                    llm_base_url=llm_base_url,
+                    llm_model=llm_model,
+                    llm_id=task.llm_id,
+                    budget_id=task.budget_id,
+                    project_path=worktree_path,
+                    acceptance_criteria=json.loads(task.acceptance_criteria) if getattr(task, "acceptance_criteria", None) else None,
+                )
+            )
+            _store_pipeline_result_generic(task_id, fr_result, task.budget_id, "final_review")
+
+            if fr_result.get("outcome") == "passed":
+                merge_test = execute_merge(task_id, project_path=project_path, dry_run=True)
+                if merge_test.status == "virtual_passed":
+                    append_task_history(task_id, "ready_for_review", message="Final AI review passed. Virtual merge SUCCEEDED. Ready for human review.")
+                else:
+                    append_task_history(task_id, "merge_test_failed", message=f"Final AI review passed, but VIRTUAL MERGE FAILED: {merge_test.status}. Detail: {merge_test.error_detail}")
+                    logger.warning("[final_review] Task '%s' virtual merge FAILED: %s", task_id, merge_test.status)
+                update_task(task_id, type="human_review")
+                logger.info("[final_review] Task '%s' advanced to HUMAN REVIEW.", task_id)
+            else:
+                demotion = fr_result.get("demotion_target", "indev")
+                update_task(task_id, type=demotion)
+                _record_demotion(task_id, "final_review", demotion, fr_result.get("summary", ""))
+                logger.warning("[final_review] Task '%s' demoted to %s.", task_id, demotion)
+        except ShutdownError:
+            logger.info("[final_review] Pipeline for '%s' aborted due to server shutdown.", task_id)
+        except PipelineAbortedError as exc:
+            logger.warning("[final_review] Task '%s' aborted at stage '%s': %s — will retry.",
+                           task_id, exc.stage, exc.cause)
+        except Exception:
+            logger.exception("[final_review] Pipeline for '%s' failed.", task_id)
+        finally:
+            loop.close()
+    except Exception as exc:
+        logger.exception("[final_review] Pipeline for '%s' failed.", task_id)
     finally:
         _teardown_worktree(task_id, project_path, worktree_path)
 
@@ -1602,10 +1688,10 @@ def _execute_merge_bg(task_id: str) -> None:
             _record_demotion(task_id, "merge", "indev", result.error_detail or "Tests failed")
             logger.warning("[merge] Task '%s' tests failed after merge. Demoted to IN DEV.", task_id)
         elif result.status == "push_failure":
-            update_task(task_id, type="full_review")
-            _record_demotion(task_id, "merge", "full_review",
+            update_task(task_id, type="human_review")
+            _record_demotion(task_id, "merge", "human_review",
                              result.error_detail or "Push to remote failed")
-            logger.error("[merge] Task '%s' push failed permanently. Demoted to full_review. %s",
+            logger.error("[merge] Task '%s' push failed permanently. Demoted to human_review. %s",
                          task_id, result.error_detail)
         else:
             logger.error("[merge] Task '%s' merge error: %s", task_id, result.error_detail)
@@ -1656,7 +1742,8 @@ def _record_demotion(task_id: str, from_stage: str, to_stage: str, reason: str) 
     update_task(task_id, demotion_count=(task.demotion_count or 0) + 1, demotion_history=history)
 
     # Trigger PIP generation if demoted from a review stage
-    review_stages = {"conceptual_review", "optimization", "security", "full_review"}
+    review_stages = {"conceptual_review", "optimization", "security", "final_review", "human_review"}
+
     if from_stage in review_stages:
         logger.info("[pip] Triggering PIP generation for task '%s' demoted from '%s'.", task_id, from_stage)
         # Create a task in the running loop
@@ -1672,10 +1759,11 @@ ADVANCE_HANDLERS = {
     "idea": "_run_intake_pipeline",
     "planning": "_run_planning_pipeline_bg",
     "indev": "_run_dev_orchestrator_bg",
-    "conceptual_review": "_advance_to_optimization",
+    "conceptual_review": "_run_optimization_pipeline_bg",
     "optimization": "_run_security_pipeline_bg",
-    "security": "_run_full_review_bg",
-    # "full_review": "_execute_merge_bg",  # DISABLED: Requires manual review/merge
+    "security": "_run_security_pipeline_bg",
+    "final_review": "_run_final_review_pipeline_bg",
+    # "human_review": "_execute_merge_bg",  # DISABLED: Requires manual review/merge
 }
 
 
@@ -1704,6 +1792,20 @@ def advance_task(task_id: str):
     if not task.budget_id:
         raise HTTPException(status_code=422, detail="Task must have a budget assigned before advancing.")
 
+    # Clarification gate: IDEA cards must be reviewed before entering the pipeline.
+    # 'none' is no longer accepted — all IDEA cards go through clarification first.
+    if current_type == 'idea':
+        cs = getattr(task, 'clarification_status', 'none')
+        if cs not in ('approved', 'skipped'):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "clarification_required",
+                    "clarification_status": cs,
+                    "message": "Review and approve this card's intake draft before running the pipeline.",
+                }
+            )
+
     handler_name = ADVANCE_HANDLERS[current_type]
 
     # Dispatch to appropriate handler
@@ -1713,12 +1815,12 @@ def advance_task(task_id: str):
         _start_bg(_run_planning_pipeline_bg, task_id)
     elif handler_name == "_run_dev_orchestrator_bg":
         _start_bg(_run_dev_orchestrator_bg, task_id)
-    elif handler_name == "_advance_to_optimization":
-        _start_bg(_advance_to_optimization, task_id)
+    elif handler_name == "_run_optimization_pipeline_bg":
+        _start_bg(_run_optimization_pipeline_bg, task_id)
     elif handler_name == "_run_security_pipeline_bg":
         _start_bg(_run_security_pipeline_bg, task_id)
-    elif handler_name == "_run_full_review_bg":
-        _start_bg(_run_full_review_bg, task_id)
+    elif handler_name == "_run_final_review_pipeline_bg":
+        _start_bg(_run_final_review_pipeline_bg, task_id)
     elif handler_name == "_execute_merge_bg":
         _start_bg(_execute_merge_bg, task_id)
 
@@ -1727,6 +1829,302 @@ def advance_task(task_id: str):
         "status": "PIPELINE_STARTED",
         "message": f"Pipeline started for task '{task_id}' (from {current_type}). Poll /api/tasks/{task_id}/transition-status for updates."
     }
+
+
+# ============================================
+# Intake Clarification Endpoints
+# ============================================
+
+@app.get("/api/tasks/{task_id}/clarification", response_model=dict)
+def get_clarification(task_id: str):
+    """Get the current intake draft for an IDEA card."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found.")
+    draft = get_intake_draft(task_id)
+    if not draft:
+        raise HTTPException(status_code=404, detail="No intake draft found for this task.")
+    return {
+        "clarification_status": getattr(task, 'clarification_status', 'none'),
+        "description_original": getattr(task, 'description_original', None),
+        "draft": intake_draft_to_dict(draft),
+    }
+
+
+@app.get("/api/tasks/{task_id}/clarification/trace", response_model=dict)
+def get_clarification_trace(task_id: str):
+    """Return the clarification agent's LLM call trace for the intake modal investigation viewer."""
+    import json as _json
+
+    def _extract_fields(response_data_raw):
+        try:
+            data = _json.loads(response_data_raw or "{}")
+            choice = (data.get("choices") or [{}])[0]
+            msg = choice.get("message", {})
+            content = (msg.get("content") or "").strip()
+            reasoning = (msg.get("reasoning_content") or "").strip()
+            tool_calls = msg.get("tool_calls") or []
+            tools_used = []
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                name = fn.get("name", "")
+                try:
+                    args = _json.loads(fn.get("arguments", "{}"))
+                    # Extract the most meaningful arg (path, query, etc.)
+                    label = (args.get("path") or args.get("query") or args.get("pattern")
+                             or args.get("command") or next(iter(args.values()), ""))
+                    if isinstance(label, str) and len(label) > 60:
+                        label = label[:60] + "…"
+                except Exception:
+                    label = ""
+                tools_used.append({"name": name, "arg": label})
+            return {
+                "finish_reason": choice.get("finish_reason", ""),
+                "content_preview": content[:500] if content else "",
+                "reasoning_preview": reasoning[:300] if reasoning else "",
+                "tools_used": tools_used,
+            }
+        except Exception:
+            return {"finish_reason": "", "content_preview": "", "reasoning_preview": "", "tools_used": []}
+
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found.")
+
+    from app.database import get_budget_entries
+    all_entries = get_budget_entries(task_id=task_id, limit=200)
+    # Filter to Clarification Agent, reverse to chronological order
+    entries = [e for e in reversed(all_entries) if e.agent_name == "Clarification Agent"]
+
+    result = []
+    for i, entry in enumerate(entries):
+        fields = _extract_fields(entry.response_data)
+        result.append({
+            "step": i + 1,
+            "id": entry.id,
+            "created_at": entry.created_at.isoformat() if entry.created_at else None,
+            "prompt_tokens": entry.prompt_cost,
+            "completion_tokens": entry.generation_cost,
+            "finish_reason": fields["finish_reason"],
+            "reasoning_preview": fields["reasoning_preview"],
+            "content_preview": fields["content_preview"],
+            "tools_used": fields["tools_used"],
+            "is_final": fields["finish_reason"] == "stop",
+        })
+
+    return {"task_id": task_id, "steps": result, "total": len(result)}
+
+
+@app.post("/api/tasks/{task_id}/clarification/message", response_model=dict)
+def clarification_message(task_id: str, body: dict = Body(...)):
+    """Send a refinement message and get an updated draft in return."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found.")
+    draft = get_intake_draft(task_id)
+    if not draft:
+        raise HTTPException(status_code=404, detail="No intake draft for this task.")
+
+    user_message = body.get("message", "").strip()
+    if not user_message:
+        raise HTTPException(status_code=400, detail="message is required.")
+
+    # Build a one-shot LLM conversation to refine the draft
+    import asyncio as _asyncio
+    from app.agent.llm_client import call_llm as _call_llm
+    from database import get_project_path
+    import json as _json
+
+    draft_dict = intake_draft_to_dict(draft)
+    history = draft_dict.get("conversation_history") or []
+
+    # Build system + conversation + user message
+    system = (
+        "You are helping a developer refine an IDEA card specification. "
+        "You have access to the current draft. When the user asks for changes, "
+        "update the relevant fields and return the FULL updated draft as JSON "
+        "inside a ```json block, followed by a brief conversational response explaining what you changed."
+    )
+    current_draft_summary = _json.dumps({
+        "rewritten_description": draft_dict.get("rewritten_description"),
+        "acceptance_criteria": draft_dict.get("acceptance_criteria"),
+        "out_of_scope": draft_dict.get("out_of_scope"),
+        "open_questions": draft_dict.get("open_questions"),
+        "suggested_prerequisites": draft_dict.get("suggested_prerequisites"),
+        "suggested_subtasks": draft_dict.get("suggested_subtasks"),
+    }, indent=2)
+
+    messages = [{"role": "system", "content": system}]
+    messages.append({"role": "user", "content": f"Current draft:\n```json\n{current_draft_summary}\n```"})
+    for msg in history[-6:]:  # last 3 exchanges
+        messages.append({"role": msg["role"] if msg["role"] in ("user", "assistant") else "user", "content": msg["content"]})
+    messages.append({"role": "user", "content": user_message})
+
+    llm = None
+    if task.llm_id:
+        from database import get_llm as _get_llm
+        llm = _get_llm(task.llm_id)
+
+    try:
+        response = _asyncio.run(_call_llm(
+            messages,
+            base_url=f"http://{llm.address}:{llm.port}/v1" if llm else None,
+            model=llm.model if llm else None,
+            tools=None,
+            task_id=task_id,
+            llm_id=task.llm_id,
+            budget_id=task.budget_id,
+            agent_name="Clarification Chat",
+        ))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"LLM call failed: {exc}")
+
+    assistant_content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+    # Try to extract updated draft JSON from response
+    from app.agent.json_utils import extract_json_block as _extract_json
+    import json as _json2
+    updated_draft_fields: dict = {}
+    raw_json = _extract_json(assistant_content)
+    if raw_json:
+        try:
+            parsed = _json2.loads(raw_json)
+            if isinstance(parsed, dict) and "rewritten_description" in parsed:
+                updated_draft_fields = parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Extract conversational response (text after the JSON block)
+    chat_response = assistant_content
+    if "```" in assistant_content:
+        parts = assistant_content.split("```")
+        # Text after the last code block
+        after_blocks = [p for i, p in enumerate(parts) if i % 2 == 0]
+        chat_response = "\n".join(p.strip() for p in after_blocks if p.strip()) or assistant_content
+
+    # Persist conversation turn
+    append_conversation_message(task_id, "user", user_message)
+    append_conversation_message(task_id, "assistant", chat_response)
+
+    # Apply updated fields if present
+    update_kwargs = {}
+    for field in ("rewritten_description", "acceptance_criteria", "out_of_scope",
+                  "open_questions", "suggested_prerequisites", "suggested_subtasks"):
+        if field in updated_draft_fields:
+            update_kwargs[field] = updated_draft_fields[field]
+    if update_kwargs:
+        update_intake_draft(task_id, **update_kwargs)
+
+    updated_draft = get_intake_draft(task_id)
+    return {
+        "response": chat_response,
+        "updated_draft": intake_draft_to_dict(updated_draft) if updated_draft else None,
+    }
+
+
+@app.post("/api/tasks/{task_id}/clarification/approve", response_model=dict)
+def approve_clarification(task_id: str, body: dict = Body(default={})):
+    """Approve the intake draft: update task description, set prerequisites, create subtasks."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found.")
+    draft = get_intake_draft(task_id)
+    if not draft:
+        raise HTTPException(status_code=404, detail="No intake draft for this task.")
+
+    draft_dict = intake_draft_to_dict(draft)
+
+    # Use the user-edited rewritten description (may differ from agent's if they edited the textarea)
+    approved_description = body.get("rewritten_description") or draft_dict.get("rewritten_description") or task.description
+
+    # Prerequisites: user may have checked a subset of the suggestions
+    apply_prerequisites = body.get("apply_prerequisites")  # list of task IDs or None (use all suggested)
+    if apply_prerequisites is None:
+        suggested = draft_dict.get("suggested_prerequisites") or []
+        apply_prerequisites = [s["task_id"] for s in suggested if isinstance(s, dict) and "task_id" in s]
+
+    # Subtasks: user may have checked a subset
+    apply_subtasks = body.get("apply_subtasks")  # list of {title, description} dicts or None
+    if apply_subtasks is None:
+        apply_subtasks = draft_dict.get("suggested_subtasks") or []
+
+    # Apply changes to the task
+    update_kwargs = {
+        "description": approved_description,
+        "clarification_status": "approved",
+    }
+    if apply_prerequisites:
+        update_kwargs["prerequisites"] = apply_prerequisites
+    # Copy acceptance criteria from the approved draft to the task
+    acceptance_criteria = draft_dict.get("acceptance_criteria")
+    if acceptance_criteria:
+        update_kwargs["acceptance_criteria"] = json.dumps(acceptance_criteria) if isinstance(acceptance_criteria, list) else acceptance_criteria
+    update_task(task_id, **update_kwargs)
+
+    # Create sub-tasks for approved subtasks
+    created_subtasks = []
+    for sub in apply_subtasks:
+        if not isinstance(sub, dict) or not sub.get("title"):
+            continue
+        sub_task = create_task(
+            title=sub["title"],
+            task_type="idea",
+            description=sub.get("description", ""),
+            owner=task.owner or "user",
+            llm_id=task.llm_id,
+            budget_id=task.budget_id,
+            prerequisites=[task_id],
+            project=task.project or "TheMaestro",
+        )
+        if sub_task:
+            # Mark sub-tasks as skipped clarification so they can advance immediately
+            update_task(sub_task.id, clarification_status="skipped")
+            created_subtasks.append({"id": sub_task.id, "title": sub_task.title})
+
+    return {
+        "status": "approved",
+        "task_id": task_id,
+        "created_subtasks": created_subtasks,
+    }
+
+
+@app.post("/api/tasks/{task_id}/clarification/skip", response_model=dict)
+def skip_clarification(task_id: str):
+    """Skip the intake clarification for this card (keep original description)."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found.")
+    update_task(task_id, clarification_status="skipped")
+    return {"status": "skipped", "task_id": task_id}
+
+
+@app.post("/api/tasks/{task_id}/clarification/retrigger", response_model=dict)
+def retrigger_clarification(task_id: str):
+    """Re-run the clarification agent on a card that has already been approved/skipped."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found.")
+    if task.type != 'idea':
+        raise HTTPException(status_code=400, detail="Only IDEA cards can be re-clarified.")
+    update_task(task_id,
+                clarification_status='pending',
+                description_original=task.description or '')
+    existing = get_intake_draft(task_id)
+    if existing:
+        update_intake_draft(task_id,
+                            rewritten_description=None,
+                            design_rationale=None,
+                            acceptance_criteria=[],
+                            out_of_scope=None,
+                            open_questions=[],
+                            suggested_prerequisites=[],
+                            suggested_subtasks=[],
+                            conversation_history=[],
+                            agent_token_cost=0)
+    else:
+        create_intake_draft(task_id)
+    # Scheduler picks up the pending status on the next tick at highest priority
+    return {"status": "retriggered", "task_id": task_id}
 
 
 @app.get("/api/tasks/{task_id}/transition-status", response_model=dict)
@@ -1837,7 +2235,8 @@ def get_task_stage_summary(task_id: str):
         "components": {"total": 0, "done": 0, "pending": 0, "failed": 0, "failing": [], "files_changed": 0},
         "optimization": {"has_result": False, "outcome": None, "improvement_summary": None},
         "security": {"has_result": False, "worst_verdict": None, "critical_count": 0, "high_count": 0},
-        "full_review": {"has_result": False, "worst_verdict": None},
+        "final_review": {"has_result": False, "worst_verdict": None},
+        "human_review": {"has_result": False, "worst_verdict": None},
         "merge": {"status": None, "branch_name": None},
         "blocking_issue": None,
     }
@@ -1900,12 +2299,12 @@ def get_task_stage_summary(task_id: str):
             "high_count": sum(s.high_count or 0 for s in sec),
         }
 
-    # Full review
-    fr = get_full_review_results(task_id)
+    # Final review
+    fr = get_final_review_results(task_id)
     if fr:
         verdicts = [r.verdict for r in fr]
         worst = next((v for v in _verdict_order if v in verdicts), None)
-        summary["full_review"] = {"has_result": True, "worst_verdict": worst}
+        summary["final_review"] = {"has_result": True, "worst_verdict": worst}
 
     # Merge record
     mr = get_merge_record(task_id)
@@ -1925,9 +2324,9 @@ def get_task_stage_summary(task_id: str):
         if summary["security"]["worst_verdict"] in ("REJECTED", "NOT_SUITABLE"):
             c = summary["security"]["critical_count"]
             summary["blocking_issue"] = f"security {summary['security']['worst_verdict']}" + (f" · {c} critical" if c else "")
-    elif stage == "full_review" and summary["full_review"]["has_result"]:
-        if summary["full_review"]["worst_verdict"] in ("REJECTED", "NOT_SUITABLE"):
-            summary["blocking_issue"] = f"review {summary['full_review']['worst_verdict']}"
+    elif stage in ("final_review", "human_review") and summary["final_review"]["has_result"]:
+        if summary["final_review"]["worst_verdict"] in ("REJECTED", "NOT_SUITABLE"):
+            summary["blocking_issue"] = f"review {summary['final_review']['worst_verdict']}"
 
     return summary
 
@@ -1936,7 +2335,7 @@ def get_task_stage_summary(task_id: str):
 def get_task_diff(task_id: str, max_bytes: int = 65536):
     """Return the git diff for all changes made on the task's branch.
 
-    For in-progress tasks (INDEV → FULL_REVIEW): diffs the task branch
+    For in-progress tasks (INDEV → FINAL_REVIEW): diffs the task branch
     against the project's main/master.
     For completed/merged tasks: diffs the merge commit against its parent.
 
@@ -2076,10 +2475,10 @@ def get_task_security_status(task_id: str):
     ]
 
 
-@app.get("/api/tasks/{task_id}/full-review-status", response_model=list)
-def get_task_full_review_status(task_id: str):
-    """Get full review findings for a task."""
-    results = get_full_review_results(task_id)
+@app.get("/api/tasks/{task_id}/final-review-status", response_model=list)
+def get_task_final_review_status(task_id: str):
+    """Get final review findings for a task."""
+    results = get_final_review_results(task_id)
     return [
         {
             "reviewer_type": r.reviewer_type, "verdict": r.verdict,
@@ -2123,7 +2522,7 @@ def get_task_audit_trail(task_id: str):
         "components": [],
         "optimization": None,
         "security_reviews": [],
-        "full_reviews": [],
+        "final_reviews": [],
         "merge": None,
     }
 
@@ -2164,10 +2563,10 @@ def get_task_audit_trail(task_id: str):
             "created_at": s.created_at.isoformat() if s.created_at else None,
         })
 
-    # Full reviews
-    fr_reviews = get_full_review_results(task_id)
+    # Final reviews
+    fr_reviews = get_final_review_results(task_id)
     for f in fr_reviews:
-        trail["full_reviews"].append({
+        trail["final_reviews"].append({
             "reviewer_type": f.reviewer_type,
             "verdict": f.verdict,
             "created_at": f.created_at.isoformat() if f.created_at else None,
@@ -2941,6 +3340,8 @@ def task_to_dict(task):
         ),
         "cache_mode": getattr(task, "cache_mode", "normal") or "normal",
         "has_cached_plan": _check_has_cached_plan(task),
+        "acceptance_criteria": json.loads(task.acceptance_criteria) if getattr(task, "acceptance_criteria", None) else None,
+        "clarification_status": getattr(task, "clarification_status", "none") or "none",
     }
 
 
@@ -3977,6 +4378,12 @@ def read_scheduler():
     return FileResponse("app/web/scheduler.html")
 
 
+@app.get("/tail.html")
+def read_tail():
+    """Session tail page — live log of active agent LLM calls."""
+    return FileResponse("app/web/tail.html")
+
+
 # ============================================
 # Legacy Routes (Still Serving HTML Files)
 # ============================================
@@ -4059,7 +4466,7 @@ AGENT_TOOL_ACCESS: dict = {
         "description": "3 parallel security reviewer agents with veto power. Uses allowlisted security scanner shell.",
         "tools": ["run_shell_security", "read_file", "search_files", "find_files", "list_directory"],
     },
-    "FullReviewPipeline": {
+    "FinalReviewPipeline": {
         "description": "4-agent final review (functional, code quality, integration, UX). Uses allowlisted review runner shell.",
         "tools": ["run_shell_review", "read_file", "search_files", "find_files", "list_directory"],
     },
@@ -4562,16 +4969,16 @@ def run_security_on_demand(task_id: str):
     return {"task_id": task_id, "status": "STARTED", "pipeline": "security"}
 
 
-@app.post("/api/tasks/{task_id}/run-full-review", response_model=dict)
-def run_full_review_on_demand(task_id: str):
-    """Manually trigger the full review pipeline for a task."""
+@app.post("/api/tasks/{task_id}/run-final-review", response_model=dict)
+def run_final_review_on_demand(task_id: str):
+    """Manually trigger the final review pipeline for a task."""
     task = get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     if not task.llm_id or not task.budget_id:
         raise HTTPException(status_code=400, detail="Task needs an LLM endpoint and budget assigned.")
-    _start_bg(_run_full_review_bg, task_id)
-    return {"task_id": task_id, "status": "STARTED", "pipeline": "full_review"}
+    _start_bg(_run_final_review_pipeline_bg, task_id)
+    return {"task_id": task_id, "status": "STARTED", "pipeline": "final_review"}
 
 
 # ===========================================================================
@@ -4712,7 +5119,7 @@ def run_merge_manually(task_id: str):
 
 @app.post("/api/tasks/{task_id}/unmerge", response_model=dict)
 def unmerge_task(task_id: str):
-    """Revert a completed merged task: git revert the merge commit and move back to full_review."""
+    """Revert a completed merged task: git revert the merge commit and move back to human_review."""
     import subprocess as _subprocess
     task = get_task(task_id)
     if not task:
@@ -4723,8 +5130,8 @@ def unmerge_task(task_id: str):
     mr = get_merge_record(task_id)
     if not mr or not mr.merge_commit_sha:
         # No merge record — just move the card back without touching git
-        _record_demotion(task_id, from_stage="completed", to_stage="full_review", reason="manual unmerge (no merge record)")
-        updated = update_task(task_id, type="full_review")
+        _record_demotion(task_id, from_stage="completed", to_stage="human_review", reason="manual unmerge (no merge record)")
+        updated = update_task(task_id, type="human_review")
         return {**task_to_dict(updated), "git": "skipped — no merge record found"}
 
     sha = mr.merge_commit_sha
@@ -4751,8 +5158,8 @@ def unmerge_task(task_id: str):
     if rc != 0:
         raise HTTPException(status_code=500, detail=f"git revert failed: {out[:500]}")
 
-    _record_demotion(task_id, from_stage="completed", to_stage="full_review", reason=f"manual unmerge — reverted {sha[:8]}")
-    updated = update_task(task_id, type="full_review")
+    _record_demotion(task_id, from_stage="completed", to_stage="human_review", reason=f"manual unmerge — reverted {sha[:8]}")
+    updated = update_task(task_id, type="human_review")
     append_task_history(task_id, "unmerged", message=f"Merge commit {sha[:8]} reverted. Moved back to Human Review.")
     return {**task_to_dict(updated), "git": f"reverted {sha[:8]}"}
 
@@ -4775,6 +5182,132 @@ def scheduler_status():
     """Return the current state of the push-first eager scheduler."""
     from app.agent.scheduler import get_scheduler_status  # noqa: PLC0415
     return get_scheduler_status()
+
+
+@app.get("/api/scheduler/tail")
+async def scheduler_tail():
+    """SSE endpoint that streams budget entries for all active scheduler sessions.
+
+    Shows one entry per active agent session (the latest LLM call for each).
+    When a session's latest call updates, the entry is re-emitted so the client
+    can replace its existing row for that session.
+
+    Events:
+      - entry: JSON blob for the latest entry of an active session
+      - heartbeat: keepalive every 15s
+      - error: JSON error message on failure
+    """
+    from app.database import SessionLocal, BudgetEntry  # noqa: PLC0415
+    from app.agent.scheduler import _active_sessions, _active_sessions_lock  # noqa: PLC0415
+    import time
+
+    def event_stream():
+        db = SessionLocal()
+        # session_id -> max entry id emitted for that session
+        last_emitted: dict[str, int] = {}
+        heartbeat_counter = 0
+
+        try:
+            while True:
+                # 1. Discover active session IDs from the scheduler
+                active_task_ids: set[str] = set()
+                with _active_sessions_lock:
+                    active_task_ids = {
+                        tid for tid, t in _active_sessions.items() if t.is_alive()
+                    }
+
+                if not active_task_ids:
+                    time.sleep(1)
+                    heartbeat_counter += 1
+                    yield f"event: heartbeat\ndata: {{\"time\": {time.time()}}}\n\n"
+                    continue
+
+                # 2. Fetch all budget entries for active tasks since last poll
+                min_id = max(last_emitted.values()) if last_emitted else 0
+                entries = (
+                    db.query(BudgetEntry)
+                    .filter(
+                        BudgetEntry.task_id.in_(list(active_task_ids)),
+                        BudgetEntry.id > min_id,
+                    )
+                    .order_by(BudgetEntry.id.asc())
+                    .all()
+                )
+
+                if entries:
+                    # Group by session_id, keep only the latest entry per session
+                    latest_by_session: dict[str, BudgetEntry] = {}
+                    for entry in entries:
+                        sid = entry.session_id or ""
+                        if sid not in latest_by_session or entry.id > latest_by_session[sid].id:
+                            latest_by_session[sid] = entry
+
+                    for sid, entry in latest_by_session.items():
+                        emitted_id = last_emitted.get(sid, 0)
+                        if entry.id > emitted_id:
+                            last_emitted[sid] = entry.id
+
+                            # Extract finish_reason and content_preview from response_data
+                            finish_reason = None
+                            content_preview = ""
+                            if entry.response_data:
+                                try:
+                                    resp = json.loads(entry.response_data)
+                                    choices = resp.get("choices", [])
+                                    if choices:
+                                        msg = choices[0].get("message", {})
+                                        content = msg.get("content", "")
+                                        if content:
+                                            content_preview = content[:500]
+                                        finish_reason = choices[0].get("finish_reason")
+                                except (json.JSONDecodeError, KeyError, IndexError):
+                                    pass
+
+                            task_title = ""
+                            if entry.task_id:
+                                try:
+                                    task = db.query(Task).filter(Task.id == entry.task_id).first()
+                                    if task:
+                                        task_title = (task.title or entry.task_id)[:120]
+                                except Exception:
+                                    task_title = entry.task_id
+
+                            payload = {
+                                "id": entry.id,
+                                "created_at": entry.created_at.isoformat() if entry.created_at else "",
+                                "task_id": entry.task_id or "",
+                                "task_title": task_title,
+                                "agent_name": entry.agent_name or "",
+                                "session_id": sid,
+                                "prompt_tokens": entry.prompt_cost,
+                                "completion_tokens": entry.generation_cost,
+                                "tool_calls": entry.tool_calls,
+                                "finish_reason": finish_reason,
+                                "content_preview": content_preview,
+                                "response_data": entry.response_data if entry.response_data else "",
+                            }
+                            yield f"event: entry\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+                time.sleep(1)
+                heartbeat_counter += 1
+                if heartbeat_counter >= 15:
+                    yield f"event: heartbeat\ndata: {{\"time\": {time.time()}}}\n\n"
+                    heartbeat_counter = 0
+
+        except GeneratorExit:
+            pass
+        finally:
+            db.close()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

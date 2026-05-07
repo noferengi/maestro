@@ -116,13 +116,8 @@ def _get_test_command_hint() -> str:
 
 def _is_test_command(fn_name: str, fn_args: dict) -> bool:
     """Return True if this tool call is running tests."""
-    if fn_name in ("run_test_pytest", "run_test_unittest", "run_test_cargo",
-                   "run_test_go", "run_test_npm"):
-        return True
-    if fn_name in ("run_shell_indev", "run_shell_review"):
-        cmd = fn_args.get("command", "").lower()
-        return any(kw in cmd for kw in ("pytest", "unittest", "cargo test", "go test", "npm test", "mvn test", "ctest", "gradlew test"))
-    return False
+    return fn_name in ("run_test_pytest", "run_test_unittest", "run_test_cargo",
+                       "run_test_go", "run_test_npm")
 
 
 def _detect_test_outcome(output: str) -> str | None:
@@ -188,6 +183,8 @@ class ComponentLoopResult:
     error_detail: str | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    test_output: str | None = None
+    coverage_pct: float | None = None
 
 
 # ---------------------------------------------------------------------------
