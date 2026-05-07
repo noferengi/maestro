@@ -56,6 +56,10 @@ from app.agent.llm_client import is_shutting_down, signal_shutdown, signal_force
 logger = logging.getLogger(__name__)
 AGENT_NAME = "Scheduler"
 
+
+class WorktreeIsolationError(Exception):
+    """Raised when a task's git worktree cannot be created. Task will not run."""
+
 # ---------------------------------------------------------------------------
 # Scheduler state
 # ---------------------------------------------------------------------------
@@ -2852,8 +2856,13 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
     if project_path:
         from app.agent.worktree import setup_task_worktree
         wt = setup_task_worktree(task_id, project_path)
-        if wt is not None:
-            worktree_path = wt
+        if wt is None:
+            raise WorktreeIsolationError(
+                f"Task '{task_id}': cannot create git worktree at '{project_path}'. "
+                f"Project must be a git repository with at least one commit. "
+                f"Initialize with: git init && git commit --allow-empty -m 'init'"
+            )
+        worktree_path = wt
 
     try:
         llm_base_url = f"http://{llm.address}:{llm.port}/v1"
@@ -2880,6 +2889,13 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
             _run_maestro_loop(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
     except TaskDeactivatedError as exc:
         logger.info("Task '%s' session halted: %s", task_id, exc)
+    except WorktreeIsolationError as exc:
+        logger.error("[scheduler] Task '%s' aborted — worktree isolation failed: %s", task_id, exc)
+        try:
+            from app.database import append_task_history
+            append_task_history(task_id, "worktree_isolation_error", message=str(exc))
+        except Exception:
+            pass
     except ShutdownError:
         logger.info("Task '%s' dispatch aborted due to server shutdown.", task_id)
     except Exception:
@@ -4085,21 +4101,37 @@ def _run_final_review_task(task_id: str, llm_base_url: str, llm_model: str,
         if result.get("outcome") == "passed":
             from app.agent.merge import execute_merge
             from app.database import get_project_path as _get_project_path
-            pp = project_path
-            if not pp and task.project:
-                pp = _get_project_path(task.project)
+            # Always use real project root for merge — project_path here is the
+            # worktree path; git checkout base_branch inside a worktree fails.
+            real_pp = (_get_project_path(task.project) if task.project else None) or project_path
 
-            merge_test = execute_merge(task_id, project_path=pp, dry_run=True)
+            merge_test = execute_merge(
+                task_id, project_path=real_pp, dry_run=True,
+                llm_id=llm_id, budget_id=budget_id,
+            )
             if merge_test.status == "virtual_passed":
                 _exit_summary = "Final AI review passed. Virtual merge SUCCEEDED. Ready for human review."
                 append_task_history(task_id, "ready_for_review", message=_exit_summary)
+                update_task(task_id, type="human_review")
+                logger.info("[final_review] Task '%s' passed. Advanced to HUMAN REVIEW.", task_id)
+            elif merge_test.status in ("conflict", "test_failure"):
+                _exit_summary = f"Final AI review passed, but virtual merge {merge_test.status.upper()}. Demoting to indev."
+                append_task_history(
+                    task_id, "merge_test_failed",
+                    message=f"{_exit_summary}\n\n{merge_test.error_detail or ''}",
+                )
+                update_task(task_id, type="indev")
+                _record_demotion_inline(task_id, "final_review", "indev", _exit_summary)
+                logger.warning("[final_review] Task '%s' virtual merge %s. Demoted to indev.", task_id, merge_test.status)
             else:
+                # "error" = infrastructure failure; code review passed, advance anyway
                 _exit_summary = f"Final AI review passed, but virtual merge FAILED: {merge_test.status}."
-                append_task_history(task_id, "merge_test_failed", message=f"{_exit_summary} Detail: {merge_test.error_detail}")
-                logger.warning("[final_review] Task '%s' virtual merge FAILED: %s", task_id, merge_test.status)
-
-            update_task(task_id, type="human_review")
-            logger.info("[final_review] Task '%s' passed. Advanced to HUMAN REVIEW.", task_id)
+                append_task_history(
+                    task_id, "merge_test_failed",
+                    message=f"{_exit_summary} Detail: {merge_test.error_detail}",
+                )
+                update_task(task_id, type="human_review")
+                logger.warning("[final_review] Task '%s' virtual merge infrastructure error (%s). Advanced to HUMAN REVIEW with warning.", task_id, merge_test.status)
         else:
             demotion = result.get("demotion_target", "indev")
             update_task(task_id, type=demotion)

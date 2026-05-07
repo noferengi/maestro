@@ -1190,3 +1190,158 @@ def preview_dispatch(project: str = None) -> dict:
         }
     finally:
         conn.close()
+
+
+def get_task_events(task_id: str, event_type: str | None = None) -> list[dict]:
+    """
+    Task event log from the tasks.history JSON column.
+
+    Returns the array written by append_task_history().
+    Each entry: {status, timestamp, message}.
+
+    event_type: optional filter, e.g. 'merge_test_failed', 'ready_for_review',
+                'correction_attempts'. Pass None to return all events.
+
+    Useful for diagnosing merge failures, correction cycles, and other
+    lifecycle events that aren't captured in agent_sessions or transitions.
+    """
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT history FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        if not row:
+            return []
+        events = parse_json_field(row["history"]) or []
+        if not isinstance(events, list):
+            return []
+        if event_type:
+            events = [e for e in events if isinstance(e, dict) and e.get("status") == event_type]
+        return events
+    finally:
+        conn.close()
+
+
+def get_merge_records(task_id: str) -> list[dict]:
+    """
+    All merge and virtual-merge attempts for a task from the merge_records table.
+
+    Each record includes: id, branch_name, merge_commit_sha, status,
+    error_detail, test_output (first 500 chars), created_at.
+
+    Status values: merged | conflict | test_failure | error | virtual_passed | push_failure
+
+    Useful for understanding why virtual merge kept failing before a task
+    could advance from final_review to human_review.
+    """
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, task_id, branch_name, merge_commit_sha, status, "
+            "       error_detail, test_output, created_at "
+            "FROM merge_records WHERE task_id=? ORDER BY id DESC",
+            (task_id,),
+        ).fetchall()
+        result = []
+        for r in rows:
+            result.append({
+                "id": r["id"],
+                "task_id": r["task_id"],
+                "branch_name": r["branch_name"],
+                "merge_commit_sha": r["merge_commit_sha"],
+                "status": r["status"],
+                "error_detail": r["error_detail"],
+                "test_output": (r["test_output"] or "")[:500] if r["test_output"] else None,
+                "created_at": r["created_at"],
+            })
+        return result
+    finally:
+        conn.close()
+
+
+def get_git_branch_state(project_name: str) -> dict:
+    """
+    Git state for a project: HEAD branch, all maestro/task-* branches,
+    and active worktrees.
+
+    Runs read-only git commands against the project's real filesystem path
+    (looked up from the projects table). Useful for diagnosing merge failures:
+    - Reveals main vs master branch name mismatches
+    - Shows which task branches exist locally
+    - Identifies stale or orphaned worktrees
+
+    Returns: project_name, project_path, main_branch, current_commit,
+             task_branches (list), active_worktrees (list).
+    """
+    import subprocess
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT path FROM projects WHERE name=?", (project_name,)
+        ).fetchone()
+        if not row:
+            return {"error": f"Project '{project_name}' not found."}
+        project_path = row["path"]
+    finally:
+        conn.close()
+
+    def _git(args: list[str]) -> tuple[int, str]:
+        try:
+            r = subprocess.run(
+                ["git"] + args, capture_output=True, text=True,
+                timeout=15, cwd=project_path,
+            )
+            return r.returncode, (r.stdout + r.stderr).strip()
+        except Exception as e:
+            return 1, str(e)
+
+    # Current HEAD
+    rc, head_branch = _git(["symbolic-ref", "--short", "HEAD"])
+    if rc != 0:
+        rc, head_branch = _git(["rev-parse", "--abbrev-ref", "HEAD"])
+    head_branch = head_branch if rc == 0 else "unknown"
+
+    rc, current_commit = _git(["rev-parse", "--short", "HEAD"])
+    current_commit = current_commit if rc == 0 else "unknown"
+
+    # Detect main branch (main or master)
+    main_branch = None
+    for candidate in ("main", "master"):
+        rc2, out2 = _git(["branch", "--list", candidate])
+        if out2.strip():
+            main_branch = candidate
+            break
+
+    # All maestro/task-* branches
+    rc, branches_out = _git(["branch", "--list", "maestro/task-*"])
+    task_branches = [b.strip().lstrip("* ") for b in branches_out.splitlines() if b.strip()] if rc == 0 else []
+
+    # Active worktrees
+    rc, worktree_out = _git(["worktree", "list", "--porcelain"])
+    worktrees = []
+    if rc == 0:
+        current_wt: dict = {}
+        for line in worktree_out.splitlines():
+            if line.startswith("worktree "):
+                if current_wt:
+                    worktrees.append(current_wt)
+                current_wt = {"path": line[len("worktree "):]}
+            elif line.startswith("HEAD "):
+                current_wt["commit"] = line[5:]
+            elif line.startswith("branch "):
+                current_wt["branch"] = line[len("branch "):]
+            elif line == "detached":
+                current_wt["branch"] = "(detached)"
+        if current_wt:
+            worktrees.append(current_wt)
+
+    return {
+        "project_name": project_name,
+        "project_path": project_path,
+        "head_branch": head_branch,
+        "main_branch": main_branch,
+        "current_commit": current_commit,
+        "task_branches": task_branches,
+        "task_branch_count": len(task_branches),
+        "active_worktrees": worktrees,
+    }

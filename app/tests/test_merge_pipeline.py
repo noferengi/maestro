@@ -42,9 +42,11 @@ class TestMergeSuccess:
         with patch("subprocess.run") as mock_run, \
              patch("app.database.update_task") as mock_update, \
              patch("app.database.create_merge_record"):
-            # Sequence: branch_list, checkout main, pull, merge, rev-parse, pytest, push, tag
+            # Sequence: branch_list, _get_base_branch(main), checkout main, pull,
+            #           merge, rev-parse, pytest, push, tag
             mock_run.side_effect = [
-                _make_run_result(0, _BRANCH),     # branch --list
+                _make_run_result(0, _BRANCH),     # branch --list (task branch exists)
+                _make_run_result(0, "  main"),    # branch --list main (_get_base_branch)
                 _make_run_result(0),               # checkout main
                 _make_run_result(0),               # pull
                 _make_run_result(0),               # merge --no-ff
@@ -64,6 +66,7 @@ class TestMergeSuccess:
              patch("app.database.create_merge_record"):
             mock_run.side_effect = [
                 _make_run_result(0, _BRANCH),
+                _make_run_result(0, "  main"),    # _get_base_branch
                 _make_run_result(0),
                 _make_run_result(0),
                 _make_run_result(0),
@@ -87,6 +90,7 @@ class TestMergeSuccess:
                  patch("app.database.create_merge_record"):
                 mock_run.side_effect = [
                     _make_run_result(0, _BRANCH),
+                    _make_run_result(0, "  main"),  # _get_base_branch
                     _make_run_result(0),
                     _make_run_result(0),
                     _make_run_result(0),
@@ -104,13 +108,16 @@ class TestMergeConflict:
     def test_conflict_status_returned(self):
         from app.agent.merge import execute_merge
 
-        with patch("subprocess.run") as mock_run:
+        with patch("subprocess.run") as mock_run, \
+             patch("app.database.create_merge_record"):
             mock_run.side_effect = [
-                _make_run_result(0, _BRANCH),   # branch --list
-                _make_run_result(0),             # checkout main
-                _make_run_result(0),             # pull
-                _make_run_result(1, "", "conflict"),  # merge fails
-                _make_run_result(0),             # merge --abort
+                _make_run_result(0, _BRANCH),          # branch --list (task branch)
+                _make_run_result(0, "  main"),          # _get_base_branch
+                _make_run_result(0),                    # checkout main
+                _make_run_result(0),                    # pull
+                _make_run_result(1, "", "conflict"),    # merge fails
+                _make_run_result(0, ""),                # diff --name-only (no files listed)
+                _make_run_result(0),                    # merge --abort
             ]
             result = execute_merge(_TASK_ID)
         assert result.status == "conflict"
@@ -119,12 +126,15 @@ class TestMergeConflict:
         from app.agent.merge import execute_merge
 
         with patch("subprocess.run") as mock_run, \
-             patch("app.database.update_task") as mock_update:
+             patch("app.database.update_task") as mock_update, \
+             patch("app.database.create_merge_record"):
             mock_run.side_effect = [
                 _make_run_result(0, _BRANCH),
+                _make_run_result(0, "  main"),          # _get_base_branch
                 _make_run_result(0),
                 _make_run_result(0),
                 _make_run_result(1, "", "conflict"),
+                _make_run_result(0, ""),                # diff --name-only
                 _make_run_result(0),
             ]
             execute_merge(_TASK_ID)
@@ -137,10 +147,13 @@ class TestTestFailure:
     def test_test_failure_status_returned(self):
         from app.agent.merge import execute_merge
 
-        with patch("subprocess.run") as mock_run:
-            # Order: branch, checkout, pull, merge, rev-parse, pytest(fails), reset
+        with patch("subprocess.run") as mock_run, \
+             patch("app.database.create_merge_record"):
+            # Order: branch, _get_base_branch, checkout, pull, merge, rev-parse,
+            #        pytest(fails), reset
             mock_run.side_effect = [
                 _make_run_result(0, _BRANCH),
+                _make_run_result(0, "  main"),    # _get_base_branch
                 _make_run_result(0),
                 _make_run_result(0),
                 _make_run_result(0),              # merge succeeds
@@ -155,9 +168,11 @@ class TestTestFailure:
         from app.agent.merge import execute_merge
 
         with patch("subprocess.run") as mock_run, \
-             patch("app.database.update_task") as mock_update:
+             patch("app.database.update_task") as mock_update, \
+             patch("app.database.create_merge_record"):
             mock_run.side_effect = [
                 _make_run_result(0, _BRANCH),
+                _make_run_result(0, "  main"),    # _get_base_branch
                 _make_run_result(0),
                 _make_run_result(0),
                 _make_run_result(0),
@@ -172,9 +187,10 @@ class TestTestFailure:
 
 class TestPushFailure:
     def _merge_then_push_fail(self, mock_run, push_rc=1, push_attempts=3):
-        """Build side_effect for: branch exists, checkout, pull, merge, rev-parse, pytest(passes), [push failures]."""
+        """Build side_effect for: branch exists, _get_base_branch, checkout, pull, merge, rev-parse, pytest(passes), [push failures]."""
         responses = [
-            _make_run_result(0, _BRANCH),   # branch --list
+            _make_run_result(0, _BRANCH),   # branch --list (task branch)
+            _make_run_result(0, "  main"),  # _get_base_branch
             _make_run_result(0),             # checkout main
             _make_run_result(0),             # pull
             _make_run_result(0),             # merge --no-ff

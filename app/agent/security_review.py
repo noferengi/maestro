@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import re
+import sys
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -44,52 +45,41 @@ AGENT_NAME = "Security Pipeline"
 # Allowlisted security scanner shell
 # ---------------------------------------------------------------------------
 
-SECURITY_SCANNER_ALLOWLIST = [
-    r"^python\s+-m\s+bandit\b",
-    r"^python\s+-m\s+safety\b",
-    r"^python\s+-m\s+pip\s+audit\b",
-    r"^python\s+-m\s+detect_secrets\b",
-    r"^semgrep\b",
-    r"^trivy\b",
-    r"^npm\s+audit\b",
-]
-
-_SECURITY_ALLOWLIST_RE = [re.compile(p) for p in SECURITY_SCANNER_ALLOWLIST]
+_SECURITY_TOOL_BUILDERS: dict = {
+    "bandit":         lambda path: [sys.executable, "-m", "bandit", "-r", path],
+    "safety":         lambda path: [sys.executable, "-m", "safety", "check"],
+    "pip-audit":      lambda path: [sys.executable, "-m", "pip_audit"],
+    "detect-secrets": lambda path: [sys.executable, "-m", "detect_secrets", "scan"],
+    "semgrep":        lambda path: ["semgrep", "--config", "auto", path],
+    "trivy":          lambda path: ["trivy", "fs", path],
+    "npm-audit":      lambda path: ["npm", "audit", "--json"],
+}
 
 
-def run_shell_security(command: str, *, project_path: str | None = None) -> str:
-    """Execute a shell command from the security scanner allowlist only.
+def run_shell_security(tool: str, path: str = ".", *, project_path: str | None = None) -> str:
+    """Run a whitelisted security scanner with shell=False.
 
-    Unlike run_shell (blocklist), this uses a strict allowlist.
-    Only commands matching SECURITY_SCANNER_ALLOWLIST patterns are permitted.
+    tool: one of bandit | safety | pip-audit | detect-secrets | semgrep | trivy | npm-audit
+    path: relative path within the project to scan (validated).
     """
-    import subprocess
     from app.agent.config import SHELL_TIMEOUT_SECONDS
+    from app.agent.tools import _validate_tool_path, _run_tool_subprocess
 
-    command = command.strip()
-    allowed = any(pat.match(command) for pat in _SECURITY_ALLOWLIST_RE)
-    if not allowed:
-        return (
-            f"ERROR: Command not in security scanner allowlist. "
-            f"Allowed: {', '.join(SECURITY_SCANNER_ALLOWLIST)}"
-        )
+    cwd = project_path or _task_git_cwd.get() or PROJECT_ROOT
 
-    try:
-        cwd = project_path or _task_git_cwd.get() or PROJECT_ROOT
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=SHELL_TIMEOUT_SECONDS,
-            cwd=cwd,
-        )
-        output = result.stdout + result.stderr
-        return output[:8000] if output else "(no output)"
-    except subprocess.TimeoutExpired:
-        return f"ERROR: Command timed out after {SHELL_TIMEOUT_SECONDS}s"
-    except Exception as e:
-        return f"ERROR: {e}"
+    builder = _SECURITY_TOOL_BUILDERS.get(tool.lower().strip())
+    if builder is None:
+        known = ", ".join(_SECURITY_TOOL_BUILDERS)
+        logger.warning("[security] run_shell_security rejected tool=%r (known: %s)", tool, known)
+        return f"[security] Unknown security tool {tool!r}. Known tools: {known}"
+
+    safe_path = _validate_tool_path(path, f"run_shell_security:{tool}")
+    if safe_path is None:
+        return f"[security] path {path!r} rejected"
+
+    args = builder(safe_path)
+    rc, out = _run_tool_subprocess(args, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: {tool} timed out after {SHELL_TIMEOUT_SECONDS}s")
+    return out[:8000] if out else "(no output)"
 
 
 # ---------------------------------------------------------------------------

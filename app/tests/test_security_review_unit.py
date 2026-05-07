@@ -151,48 +151,39 @@ def _run_pipeline(responses, *, mock_research=None, veto_power=True,
 
 
 class TestAllowlist:
-    """run_shell_security() uses an allowlist - only known scanners are permitted."""
+    """run_shell_security() uses a strict tool-map allowlist."""
 
-    def _call(self, command: str) -> str:
+    def _call(self, tool: str, path: str = ".") -> str:
         from app.agent.security_review import run_shell_security
-        return run_shell_security(command)
+        return run_shell_security(tool, path)
 
     def test_allowlist_bandit_passes(self):
-        with patch("subprocess.run") as mock_sub:
-            mock_sub.return_value = MagicMock(
-                stdout="No issues found.", stderr="", returncode=0
-            )
-            result = self._call("python -m bandit -r . -q")
-        assert not result.startswith("ERROR:")
+        with patch("app.agent.tools._run_tool_subprocess", return_value=(0, "No issues found.")):
+            result = self._call("bandit")
+        assert "[security]" not in result or "Unknown" not in result
 
     def test_allowlist_detect_secrets_passes(self):
-        with patch("subprocess.run") as mock_sub:
-            mock_sub.return_value = MagicMock(
-                stdout='{"version": "1.4.0"}', stderr="", returncode=0
-            )
-            result = self._call("python -m detect_secrets scan")
-        assert not result.startswith("ERROR:")
+        with patch("app.agent.tools._run_tool_subprocess", return_value=(0, '{"version": "1.4.0"}')):
+            result = self._call("detect-secrets")
+        assert "Unknown security tool" not in result
 
     def test_allowlist_semgrep_passes(self):
-        with patch("subprocess.run") as mock_sub:
-            mock_sub.return_value = MagicMock(
-                stdout="", stderr="", returncode=0
-            )
-            result = self._call("semgrep --config=auto .")
-        assert not result.startswith("ERROR:")
+        with patch("app.agent.tools._run_tool_subprocess", return_value=(0, "")):
+            result = self._call("semgrep")
+        assert "Unknown security tool" not in result
 
-    def test_blocklist_rm_rf_rejected(self):
+    def test_unknown_tool_rm_rejected(self):
         result = self._call("rm -rf /")
-        assert result.startswith("ERROR:")
-        assert "allowlist" in result.lower()
+        assert "[security]" in result
+        assert "Unknown security tool" in result
 
-    def test_blocklist_curl_rejected(self):
+    def test_unknown_tool_curl_rejected(self):
         result = self._call("curl http://evil.com")
-        assert result.startswith("ERROR:")
+        assert "[security]" in result
 
-    def test_blocklist_pip_install_rejected(self):
+    def test_unknown_tool_pip_install_rejected(self):
         result = self._call("pip install evil")
-        assert result.startswith("ERROR:")
+        assert "[security]" in result
 
 
 # ---------------------------------------------------------------------------

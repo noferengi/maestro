@@ -20,6 +20,7 @@ import hashlib
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -2009,6 +2010,219 @@ def _make_py_cmd(base: str, cwd: str) -> str:
     return base
 
 
+def _venv_python(project_cwd: str) -> str:
+    """Return the venv python executable for the project, falling back to 'python'."""
+    for candidate in (
+        os.path.join(project_cwd, "venv", "Scripts", "python.exe"),
+        os.path.join(project_cwd, "venv", "bin", "python"),
+        os.path.join(project_cwd, ".venv", "Scripts", "python.exe"),
+        os.path.join(project_cwd, ".venv", "bin", "python"),
+    ):
+        if os.path.isfile(candidate):
+            return candidate
+    return "python"
+
+
+# --- Tool flag allowlists ---
+# Tokens the LLM passes that are NOT in these sets are logged and silently dropped.
+
+_SHELL_METACHAR_RE = re.compile(r'[;|&><`$\n\r\x00()\{\}\\]')
+
+_PYTEST_FLAGS = frozenset({
+    "-x", "--exitfirst",
+    "-v", "--verbose", "-q", "--quiet", "--no-header", "--no-summary",
+    "-s", "--capture=no", "--capture=fd", "--capture=sys", "--capture=tee-sys",
+    "--tb=short", "--tb=long", "--tb=no", "--tb=line", "--tb=native", "--tb=auto",
+    "--co", "--collect-only",
+    "--last-failed", "--lf", "--failed-first", "--ff", "--new-first", "--nf",
+    "--cache-clear", "--cache-show",
+    "-p no:warnings", "-p no:cacheprovider",
+    "--pdb",
+    "--assert=plain", "--assert=rewrite",
+    "--strict-markers", "--strict-config",
+    "--no-cov", "--cov-report=term", "--cov-report=term-missing",
+    "--durations=0", "--durations=10", "--durations=20",
+    "--log-cli-level=DEBUG", "--log-cli-level=INFO", "--log-cli-level=WARNING",
+    "--import-mode=importlib", "--import-mode=prepend", "--import-mode=append",
+})
+_PYTEST_VALUE_FLAGS = frozenset({
+    "-k", "-m", "--ignore", "-n", "--timeout", "--cov",
+    "--rootdir", "--junit-xml", "--log-file",
+})
+
+_MYPY_FLAGS = frozenset({
+    "--strict", "--ignore-missing-imports",
+    "--no-error-summary", "--pretty", "--show-error-codes", "--show-error-context",
+    "--warn-return-any", "--warn-unused-ignores", "--warn-unused-configs",
+    "--warn-redundant-casts",
+    "--disallow-untyped-defs", "--disallow-incomplete-defs",
+    "--disallow-untyped-calls", "--disallow-any-generics",
+    "--check-untyped-defs", "--no-check-untyped-defs",
+    "--follow-imports=silent", "--follow-imports=skip", "--follow-imports=normal",
+    "--no-site-packages", "--no-namespace-packages",
+    "-q", "--quiet", "--no-color-output",
+    "--show-column-numbers", "--show-absolute-path",
+})
+_MYPY_VALUE_FLAGS = frozenset({
+    "--exclude", "--python-version", "--platform",
+    "--config-file", "--package", "--module",
+})
+
+_RUFF_FLAGS = frozenset({
+    "--fix", "--no-fix", "--unsafe-fixes",
+    "-q", "--quiet", "--no-cache", "--statistics",
+    "--output-format=text", "--output-format=json", "--output-format=grouped",
+    "--show-fixes", "--show-source",
+    "--exit-zero", "--exit-non-zero-on-fix",
+    "--respect-gitignore", "--no-respect-gitignore",
+    "--isolated",
+})
+_RUFF_VALUE_FLAGS = frozenset({
+    "--select", "--ignore", "--extend-select",
+    "--extend-ignore", "--per-file-ignores",
+    "--config", "--line-length", "--target-version",
+})
+
+_CARGO_TEST_FLAGS = frozenset({
+    "--verbose", "-v", "-q", "--quiet",
+    "--release", "--all-features", "--no-default-features",
+    "--lib", "--bins", "--examples", "--tests", "--benches", "--all-targets",
+    "--nocapture", "--no-fail-fast",
+    "--color=auto", "--color=always", "--color=never",
+})
+_CARGO_TEST_VALUE_FLAGS = frozenset({
+    "--features", "--package", "-p",
+    "--manifest-path", "--target", "--jobs", "-j",
+})
+
+_GO_TEST_FLAGS = frozenset({
+    "-v", "-race", "-count=1", "-count=10",
+    "-short", "-failfast",
+    "-cover", "-covermode=set", "-covermode=count", "-covermode=atomic",
+    "-json",
+})
+_GO_TEST_VALUE_FLAGS = frozenset({
+    "-run", "-bench", "-benchtime", "-timeout",
+    "-cpu", "-parallel", "-count", "-coverprofile",
+})
+
+_CARGO_BUILD_FLAGS = frozenset({
+    "--verbose", "-v", "-q", "--quiet",
+    "--release", "--all-features", "--no-default-features",
+    "--lib", "--bins", "--examples",
+    "--color=auto", "--color=always", "--color=never",
+    "--frozen", "--locked",
+})
+_CARGO_BUILD_VALUE_FLAGS = frozenset({
+    "--features", "--package", "-p",
+    "--manifest-path", "--target", "--jobs", "-j",
+})
+
+_TSC_FLAGS = frozenset({
+    "--noEmit", "--strict", "--declaration",
+    "--sourceMap", "--watch",
+    "--incremental", "--composite",
+    "--pretty", "--noEmitOnError",
+    "--listFiles", "--diagnostics",
+})
+_TSC_VALUE_FLAGS = frozenset({
+    "--target", "--module", "--moduleResolution",
+    "--lib", "--outDir", "--rootDir", "--project", "-p",
+})
+
+_MAKE_TARGET_RE = re.compile(r'^[a-zA-Z0-9_.\-/]+$')
+_NPM_SCRIPT_RE = re.compile(r'^[a-zA-Z0-9_\-:.]+$')
+_MVN_GOAL_RE = re.compile(r'^[a-zA-Z0-9_:.\-]+$')
+
+# --- End allowlists ---
+
+
+def _validate_flags(
+    flags: str,
+    tool_name: str,
+    allowlist: frozenset,
+    value_flags: frozenset = frozenset(),
+    task_id: str | None = None,
+) -> list:
+    """
+    Split flags string and return only allowlisted tokens.
+    Rejected tokens are logged and dropped — never executed.
+    """
+    if not flags or not flags.strip():
+        return []
+    try:
+        tokens = shlex.split(flags)
+    except ValueError as exc:
+        logger.warning(
+            "[security] Tool '%s' (task=%s): shlex.split failed on flags=%r — rejected entirely. Error: %s",
+            tool_name, task_id, flags[:200], exc,
+        )
+        return []
+
+    result: list = []
+    rejected: list = []
+    skip_next = False
+
+    for i, token in enumerate(tokens):
+        if skip_next:
+            if _SHELL_METACHAR_RE.search(token):
+                rejected.append(f"{token!r} (value for {tokens[i-1]!r} contains metachar)")
+                result.pop()
+            elif len(token) > 256:
+                rejected.append(f"{token!r} (value too long: {len(token)} chars)")
+                result.pop()
+            else:
+                result.append(token)
+            skip_next = False
+            continue
+
+        flag_key = token.split("=")[0] if "=" in token else token
+
+        if token in allowlist or flag_key in allowlist:
+            result.append(token)
+        elif flag_key in value_flags:
+            result.append(token)
+            skip_next = True
+        else:
+            rejected.append(repr(token))
+
+    if rejected:
+        logger.warning(
+            "[security] Tool '%s' (task=%s) rejected %d flag token(s): %s",
+            tool_name, task_id, len(rejected), ", ".join(rejected),
+        )
+    return result
+
+
+def _validate_tool_path(path: str, tool_name: str, task_id: str | None = None) -> str | None:
+    """
+    Validate a path argument from a run_* tool.
+    Returns the path if safe, or None if rejected (with a log warning).
+    """
+    if not path or not path.strip():
+        return "."
+    if _SHELL_METACHAR_RE.search(path):
+        logger.warning(
+            "[security] Tool '%s' (task=%s) rejected path=%r: contains shell metacharacters",
+            tool_name, task_id, path[:200],
+        )
+        return None
+    norm = os.path.normpath(path)
+    if os.path.isabs(path) or os.path.isabs(norm) or norm.startswith(".."):
+        logger.warning(
+            "[security] Tool '%s' (task=%s) rejected path=%r: absolute or traversal path",
+            tool_name, task_id, path[:200],
+        )
+        return None
+    if len(path) > 512:
+        logger.warning(
+            "[security] Tool '%s' (task=%s) rejected path: too long (%d chars)",
+            tool_name, task_id, len(path),
+        )
+        return None
+    return path
+
+
 # --- Testing / linting ---
 
 def run_test_pytest(
@@ -2022,11 +2236,12 @@ def run_test_pytest(
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    cmd = f"python -m pytest {path}"
-    if flags:
-        cmd += f" {flags}"
+    safe_path = _validate_tool_path(path, "run_test_pytest") or "."
+    safe_flags = _validate_flags(flags, "run_test_pytest", _PYTEST_FLAGS, _PYTEST_VALUE_FLAGS)
+    args = [_venv_python(cwd), "-m", "pytest", safe_path] + safe_flags
     # Inject per-test timeout unless the project config already sets one.
-    if "--timeout" not in cmd:
+    has_timeout = any("--timeout" in f for f in safe_flags)
+    if not has_timeout:
         _has_timeout_config = False
         for _cfg in ("pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"):
             _cfg_path = os.path.join(cwd, _cfg)
@@ -2040,12 +2255,12 @@ def run_test_pytest(
                     pass
         if not _has_timeout_config:
             injected = max(60, SHELL_TIMEOUT_SECONDS // 2) if SHELL_TIMEOUT_SECONDS > 60 else SHELL_TIMEOUT_SECONDS
-            cmd = cmd.rstrip() + f" --timeout={injected}"
+            args.append(f"--timeout={injected}")
     timeout_msg = (
         f"ERROR: Command timed out after {SHELL_TIMEOUT_SECONDS}s. "
         "This may indicate a hang, infinite loop, or high computational complexity."
     )
-    result = _execute_in_project(cmd, cwd, SHELL_TIMEOUT_SECONDS, timeout_msg, replace_python=True)
+    rc, result = _run_tool_subprocess(args, cwd, SHELL_TIMEOUT_SECONDS, timeout_msg)
     _last_test_output.set(result)
     return _slice_output(result, head=head, tail=tail, grep=grep)
 
@@ -2055,10 +2270,11 @@ def run_check_mypy(path: str, flags: str = "") -> str:
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    cmd = f"python -m mypy {path}"
-    if flags:
-        cmd += f" {flags}"
-    return _execute_in_project(cmd, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: mypy timed out after {SHELL_TIMEOUT_SECONDS}s.", replace_python=True)
+    safe_path = _validate_tool_path(path, "run_check_mypy") or "."
+    safe_flags = _validate_flags(flags, "run_check_mypy", _MYPY_FLAGS, _MYPY_VALUE_FLAGS)
+    args = [_venv_python(cwd), "-m", "mypy", safe_path] + safe_flags
+    rc, out = _run_tool_subprocess(args, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: mypy timed out after {SHELL_TIMEOUT_SECONDS}s.")
+    return out
 
 
 def run_check_ruff(path: str = ".", flags: str = "") -> str:
@@ -2066,10 +2282,11 @@ def run_check_ruff(path: str = ".", flags: str = "") -> str:
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    cmd = f"python -m ruff check {path}"
-    if flags:
-        cmd += f" {flags}"
-    return _execute_in_project(cmd, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: ruff timed out after {SHELL_TIMEOUT_SECONDS}s.", replace_python=True)
+    safe_path = _validate_tool_path(path, "run_check_ruff") or "."
+    safe_flags = _validate_flags(flags, "run_check_ruff", _RUFF_FLAGS, _RUFF_VALUE_FLAGS)
+    args = [_venv_python(cwd), "-m", "ruff", "check", safe_path] + safe_flags
+    rc, out = _run_tool_subprocess(args, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: ruff timed out after {SHELL_TIMEOUT_SECONDS}s.")
+    return out
 
 
 def run_check_black(path: str = ".") -> str:
@@ -2077,29 +2294,42 @@ def run_check_black(path: str = ".") -> str:
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    return _execute_in_project(f"python -m black --check {path}", cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: black timed out after {SHELL_TIMEOUT_SECONDS}s.", replace_python=True)
+    safe_path = _validate_tool_path(path, "run_check_black") or "."
+    args = [_venv_python(cwd), "-m", "black", "--check", safe_path]
+    rc, out = _run_tool_subprocess(args, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: black timed out after {SHELL_TIMEOUT_SECONDS}s.")
+    return out
 
 
-def run_test_unittest(args: str = "") -> str:
-    """[RUN — sandbox] Run Python unittest discovery or a specific test module/class/method. No project-file mutation."""
+def run_test_unittest(module: str = "", pattern: str = "") -> str:
+    """[RUN — sandbox] Run Python unittest. module: dotted module name (e.g. 'tests.test_foo'). pattern: file pattern for discover (e.g. 'test_*.py'). No project-file mutation."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    cmd = "python -m unittest"
-    if args:
-        cmd += f" {args}"
-    return _execute_in_project(cmd, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: unittest timed out after {SHELL_TIMEOUT_SECONDS}s.", replace_python=True)
+    args = [_venv_python(cwd), "-m", "unittest"]
+    if module:
+        if re.match(r'^[\w.]+$', module):
+            args.append(module)
+        else:
+            logger.warning("[security] run_test_unittest rejected module=%r", module)
+            return f"[security] unittest module {module!r} rejected: must be a dotted identifier"
+    elif pattern:
+        if _SHELL_METACHAR_RE.search(pattern) or len(pattern) > 128:
+            logger.warning("[security] run_test_unittest rejected pattern=%r", pattern)
+            return f"[security] unittest pattern {pattern!r} rejected"
+        args += ["discover", "-p", pattern]
+    else:
+        args.append("discover")
+    rc, out = _run_tool_subprocess(args, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: unittest timed out after {SHELL_TIMEOUT_SECONDS}s.")
+    return out
 
 
-def run_test_npm(args: str = "") -> str:
-    """[RUN — sandbox] Run npm test. args: additional arguments for the test runner. No project-file mutation."""
+def run_test_npm() -> str:
+    """[RUN — sandbox] Run npm test in the task's project directory. No project-file mutation."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    cmd = "npm test"
-    if args:
-        cmd += f" {args}"
-    return _execute_in_project(cmd, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: npm test timed out after {SHELL_TIMEOUT_SECONDS}s.")
+    rc, out = _run_tool_subprocess(["npm", "test"], cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: npm test timed out after {SHELL_TIMEOUT_SECONDS}s.")
+    return out
 
 
 def run_test_cargo(args: str = "") -> str:
@@ -2107,10 +2337,9 @@ def run_test_cargo(args: str = "") -> str:
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    cmd = "cargo test"
-    if args:
-        cmd += f" {args}"
-    return _execute_in_project(cmd, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: cargo test timed out after {SHELL_TIMEOUT_SECONDS}s.")
+    safe_flags = _validate_flags(args, "run_test_cargo", _CARGO_TEST_FLAGS, _CARGO_TEST_VALUE_FLAGS)
+    rc, out = _run_tool_subprocess(["cargo", "test"] + safe_flags, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: cargo test timed out after {SHELL_TIMEOUT_SECONDS}s.")
+    return out
 
 
 def run_test_go(path: str = "./...", flags: str = "") -> str:
@@ -2118,23 +2347,25 @@ def run_test_go(path: str = "./...", flags: str = "") -> str:
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    cmd = f"go test {path}"
-    if flags:
-        cmd += f" {flags}"
-    return _execute_in_project(cmd, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: go test timed out after {SHELL_TIMEOUT_SECONDS}s.")
+    safe_path = _validate_tool_path(path, "run_test_go") or "./..."
+    safe_flags = _validate_flags(flags, "run_test_go", _GO_TEST_FLAGS, _GO_TEST_VALUE_FLAGS)
+    args = ["go", "test"] + safe_flags + [safe_path]
+    rc, out = _run_tool_subprocess(args, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: go test timed out after {SHELL_TIMEOUT_SECONDS}s.")
+    return out
 
 
 # --- Build ---
 
-def run_build_make(target: str, args: str = "") -> str:
+def run_build_make(target: str) -> str:
     """[RUN — build] Run a Makefile target. target: e.g. 'build', 'test', 'all'. Creates build artifacts inside the project."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    cmd = f"make {target}"
-    if args:
-        cmd += f" {args}"
-    return _execute_in_project(cmd, cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: make timed out after {_BUILD_TIMEOUT_SECONDS}s.")
+    if not _MAKE_TARGET_RE.match(target):
+        logger.warning("[security] run_build_make rejected target=%r", target)
+        return f"[security] make target {target!r} rejected: must match ^[a-zA-Z0-9_.\\-/]+$"
+    rc, out = _run_tool_subprocess(["make", target], cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: make timed out after {_BUILD_TIMEOUT_SECONDS}s.")
+    return out
 
 
 def run_build_cargo(args: str = "") -> str:
@@ -2142,21 +2373,18 @@ def run_build_cargo(args: str = "") -> str:
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    cmd = "cargo build"
-    if args:
-        cmd += f" {args}"
-    return _execute_in_project(cmd, cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: cargo build timed out after {_BUILD_TIMEOUT_SECONDS}s.")
+    safe_flags = _validate_flags(args, "run_build_cargo", _CARGO_BUILD_FLAGS, _CARGO_BUILD_VALUE_FLAGS)
+    rc, out = _run_tool_subprocess(["cargo", "build"] + safe_flags, cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: cargo build timed out after {_BUILD_TIMEOUT_SECONDS}s.")
+    return out
 
 
-def run_build_go(args: str = "") -> str:
-    """[RUN — build] Build a Go project (go build). Creates build artifacts inside the project."""
+def run_build_go() -> str:
+    """[RUN — build] Build a Go project (go build ./...). Creates build artifacts inside the project."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    cmd = "go build"
-    if args:
-        cmd += f" {args}"
-    return _execute_in_project(cmd, cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: go build timed out after {_BUILD_TIMEOUT_SECONDS}s.")
+    rc, out = _run_tool_subprocess(["go", "build", "./..."], cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: go build timed out after {_BUILD_TIMEOUT_SECONDS}s.")
+    return out
 
 
 def run_build_npm(script: str = "build") -> str:
@@ -2164,7 +2392,11 @@ def run_build_npm(script: str = "build") -> str:
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    return _execute_in_project(f"npm run {script}", cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: npm build timed out after {_BUILD_TIMEOUT_SECONDS}s.")
+    if not _NPM_SCRIPT_RE.match(script):
+        logger.warning("[security] run_build_npm rejected script=%r", script)
+        return f"[security] npm script {script!r} rejected: must match ^[a-zA-Z0-9_\\-:.]+$"
+    rc, out = _run_tool_subprocess(["npm", "run", script], cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: npm build timed out after {_BUILD_TIMEOUT_SECONDS}s.")
+    return out
 
 
 def run_build_tsc(args: str = "") -> str:
@@ -2172,53 +2404,87 @@ def run_build_tsc(args: str = "") -> str:
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    cmd = "tsc"
-    if args:
-        cmd += f" {args}"
-    return _execute_in_project(cmd, cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: tsc timed out after {_BUILD_TIMEOUT_SECONDS}s.")
+    safe_flags = _validate_flags(args, "run_build_tsc", _TSC_FLAGS, _TSC_VALUE_FLAGS)
+    rc, out = _run_tool_subprocess(["tsc"] + safe_flags, cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: tsc timed out after {_BUILD_TIMEOUT_SECONDS}s.")
+    return out
 
 
-def run_build_gradle(target: str, args: str = "") -> str:
+def run_build_gradle(target: str) -> str:
     """[RUN — build] Run a Gradle task. target: e.g. 'build', 'assemble'. Creates build artifacts inside the project."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    cmd = f"gradle {target}"
-    if args:
-        cmd += f" {args}"
-    return _execute_in_project(cmd, cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: gradle timed out after {_BUILD_TIMEOUT_SECONDS}s.")
+    if not _MAKE_TARGET_RE.match(target):
+        logger.warning("[security] run_build_gradle rejected target=%r", target)
+        return f"[security] gradle target {target!r} rejected"
+    gradle_exe = "./gradlew" if os.path.isfile(os.path.join(cwd, "gradlew")) else "gradle"
+    rc, out = _run_tool_subprocess([gradle_exe, target], cwd, _BUILD_TIMEOUT_SECONDS * 2, f"ERROR: gradle timed out after {_BUILD_TIMEOUT_SECONDS * 2}s.")
+    return out
 
 
-def run_build_mvn(goal: str, args: str = "") -> str:
+def run_build_mvn(goal: str) -> str:
     """[RUN — build] Run a Maven goal. goal: e.g. 'package', 'compile'. Creates build artifacts inside the project."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    cmd = f"mvn {goal}"
-    if args:
-        cmd += f" {args}"
-    return _execute_in_project(cmd, cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: mvn timed out after {_BUILD_TIMEOUT_SECONDS}s.")
+    if not _MVN_GOAL_RE.match(goal):
+        logger.warning("[security] run_build_mvn rejected goal=%r", goal)
+        return f"[security] mvn goal {goal!r} rejected"
+    rc, out = _run_tool_subprocess(["mvn", goal, "--batch-mode", "--no-transfer-progress"], cwd, _BUILD_TIMEOUT_SECONDS * 2, f"ERROR: mvn timed out after {_BUILD_TIMEOUT_SECONDS * 2}s.")
+    return out
 
 
 # --- Dependencies ---
 
 def run_deps_pip(args: str) -> str:
-    """[RUN — deps] Install Python packages with pip. MUTATES environment. args: e.g. '-r requirements.txt', 'requests>=2.28', '-e .'."""
+    """[RUN — deps] Install Python packages with pip. MUTATES environment. args: e.g. '-r requirements.txt', 'requests>=2.28'."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    return _execute_in_project(f"python -m pip install {args}", cwd, _DEPS_TIMEOUT_SECONDS, f"ERROR: pip install timed out after {_DEPS_TIMEOUT_SECONDS}s.", replace_python=True)
+    stripped = args.strip() if args else ""
+    if not stripped:
+        return "[error] run_deps_pip: no arguments provided"
+    if _SHELL_METACHAR_RE.search(stripped):
+        logger.warning("[security] run_deps_pip rejected args=%r: metacharacters", stripped[:200])
+        return "[security] pip args rejected: contains shell metacharacters"
+    try:
+        tokens = shlex.split(stripped)
+    except ValueError as e:
+        return f"[security] pip args rejected: {e}"
+    allowed_pip_tokens = {"--upgrade", "-U", "--no-deps", "--quiet", "-q",
+                          "--no-index", "--pre"}
+    req_file_next = False
+    clean_tokens: list = []
+    for tok in tokens:
+        if req_file_next:
+            if re.match(r'^[\w./\-]+\.txt$', tok) and not tok.startswith(".."):
+                clean_tokens.append(tok)
+            else:
+                logger.warning("[security] run_deps_pip rejected requirements file: %r", tok)
+                return f"[security] pip requirements file {tok!r} rejected"
+            req_file_next = False
+        elif tok in ("-r", "--requirement"):
+            clean_tokens.append(tok)
+            req_file_next = True
+        elif tok in allowed_pip_tokens:
+            clean_tokens.append(tok)
+        elif re.match(r'^[a-zA-Z0-9_\-.\[\]]+([><=!]+[\w.]+)?$', tok):
+            clean_tokens.append(tok)
+        else:
+            logger.warning("[security] run_deps_pip rejected token: %r", tok)
+            return f"[security] pip argument {tok!r} rejected"
+    args_list = [_venv_python(cwd), "-m", "pip", "install"] + clean_tokens
+    rc, out = _run_tool_subprocess(args_list, cwd, _DEPS_TIMEOUT_SECONDS, f"ERROR: pip install timed out after {_DEPS_TIMEOUT_SECONDS}s.")
+    return out
 
 
-def run_deps_npm(args: str = "") -> str:
+def run_deps_npm() -> str:
     """[RUN — deps] Install Node.js dependencies (npm install). MUTATES environment. Call after modifying package.json."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    cmd = "npm install"
-    if args:
-        cmd += f" {args}"
-    return _execute_in_project(cmd, cwd, _DEPS_TIMEOUT_SECONDS, f"ERROR: npm install timed out after {_DEPS_TIMEOUT_SECONDS}s.")
+    rc, out = _run_tool_subprocess(["npm", "install"], cwd, _DEPS_TIMEOUT_SECONDS, f"ERROR: npm install timed out after {_DEPS_TIMEOUT_SECONDS}s.")
+    return out
 
 
 def run_deps_cargo() -> str:
@@ -2226,36 +2492,36 @@ def run_deps_cargo() -> str:
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    return _execute_in_project("cargo fetch", cwd, _DEPS_TIMEOUT_SECONDS, f"ERROR: cargo fetch timed out after {_DEPS_TIMEOUT_SECONDS}s.")
+    rc, out = _run_tool_subprocess(["cargo", "fetch"], cwd, _DEPS_TIMEOUT_SECONDS, f"ERROR: cargo fetch timed out after {_DEPS_TIMEOUT_SECONDS}s.")
+    return out
 
 
 # --- Security scanners ---
 
-def run_audit_bandit(path: str = ".", args: str = "") -> str:
+def run_audit_bandit(path: str = ".") -> str:
     """[RUN — audit] Run bandit Python security linter. No project-file mutation. path: dir or file (default '.')."""
-    cmd = f"python -m bandit -r {path}"
-    if args:
-        cmd += f" {args}"
     from app.agent.security_review import run_shell_security
-    return run_shell_security(cmd)
+    return run_shell_security("bandit", path)
 
 
 def run_audit_pip() -> str:
     """[RUN — audit] Audit installed Python packages for known vulnerabilities (pip-audit). No project-file mutation."""
     from app.agent.security_review import run_shell_security
-    return run_shell_security("python -m pip audit")
+    return run_shell_security("pip-audit")
 
 
 def run_audit_semgrep(path: str = ".", config: str = "auto") -> str:
-    """[RUN — audit] Run semgrep static analysis. No project-file mutation. config: ruleset (default 'auto')."""
+    """[RUN — audit] Run semgrep static analysis. No project-file mutation. config: ruleset (default 'auto', always used)."""
+    if config != "auto":
+        logger.warning("[security] run_audit_semgrep: config=%r ignored, using 'auto'", config)
     from app.agent.security_review import run_shell_security
-    return run_shell_security(f"semgrep --config {config} {path}")
+    return run_shell_security("semgrep", path)
 
 
 def run_audit_npm() -> str:
     """[RUN — audit] Run npm audit to check Node.js dependencies for vulnerabilities. No project-file mutation."""
     from app.agent.security_review import run_shell_security
-    return run_shell_security("npm audit")
+    return run_shell_security("npm-audit")
 
 
 # ---------------------------------------------------------------------------
@@ -2266,27 +2532,24 @@ _BUILD_TIMEOUT_SECONDS = 300
 _DEPS_TIMEOUT_SECONDS = 600
 
 
-def _execute_in_project(
-    command: str,
+def _run_tool_subprocess(
+    args: list,
     cwd: str,
     timeout: int,
     timeout_msg: str,
-    *,
-    replace_python: bool = False,
-) -> str:
-    """Run command in the project cwd. Sets up venv; optionally swaps bare python for project venv."""
-    from app.agent.worktree import setup_test_environment, venv_python as _venv_python
+) -> tuple:
+    """
+    Execute a fixed command+args list with shell=False.
+    Never accepts a string command. Never interprets shell metacharacters.
+    Returns (returncode, combined_output).
+    """
+    from app.agent.worktree import setup_test_environment
     setup_test_environment(cwd)
-
-    if replace_python:
-        _py = _venv_python(cwd)
-        if _py != "python":
-            command = re.sub(r"^python\b", _py.replace("\\", "/"), command)
 
     try:
         proc = subprocess.Popen(
-            command,
-            shell=True,
+            args,
+            shell=False,  # immutable — never change this
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -2303,12 +2566,14 @@ def _execute_in_project(
             else:
                 proc.kill()
             proc.communicate()
-            return timeout_msg
+            return 1, timeout_msg
         output = stdout or ""
         rc = proc.returncode
-        return output if output else f"EXIT_CODE: {rc}"
+        return rc, output if output else f"EXIT_CODE: {rc}"
+    except FileNotFoundError as exc:
+        return 1, f"Command not found: {exc}"
     except Exception as exc:
-        return f"ERROR running command: {exc}"
+        return 1, f"Subprocess error: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -3288,11 +3553,12 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_test_unittest",
-            "description": "[RUN — sandbox] Run Python unittest discovery or a specific test module/class/method. Does not modify project files.",
+            "description": "[RUN — sandbox] Run Python unittest discovery or a specific test module. Does not modify project files.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "args": {"type": "string", "description": "Module, class, or method (e.g. 'tests.test_foo'). Leave empty for full discovery."},
+                    "module": {"type": "string", "description": "Dotted module name to run (e.g. 'tests.test_foo'). Leave empty for full discovery."},
+                    "pattern": {"type": "string", "description": "File pattern for discover (e.g. 'test_*.py'). Ignored if module is set."},
                 },
                 "required": [],
             },
@@ -3305,9 +3571,7 @@ TOOL_SCHEMAS: list[dict] = [
             "description": "[RUN — sandbox] Run npm test in the task's project directory. Does not modify project files.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "args": {"type": "string", "description": "Additional arguments to pass to the test runner."},
-                },
+                "properties": {},
                 "required": [],
             },
         },
@@ -3350,8 +3614,7 @@ TOOL_SCHEMAS: list[dict] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "target": {"type": "string", "description": "Makefile target (e.g. 'build', 'test', 'lint', 'all')."},
-                    "args": {"type": "string", "description": "Additional make arguments."},
+                    "target": {"type": "string", "description": "Makefile target (e.g. 'build', 'test', 'lint', 'all'). Must be alphanumeric/underscore/dash/dot/slash only."},
                 },
                 "required": ["target"],
             },
@@ -3375,12 +3638,10 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_build_go",
-            "description": "[RUN — build] Build a Go project (go build). Writes binary output inside the project.",
+            "description": "[RUN — build] Build a Go project (go build ./...). Writes binary output inside the project.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "args": {"type": "string", "description": "Additional go build flags (e.g. '-o bin/app', './cmd/...')."},
-                },
+                "properties": {},
                 "required": [],
             },
         },
@@ -3421,8 +3682,7 @@ TOOL_SCHEMAS: list[dict] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "target": {"type": "string", "description": "Gradle task name (e.g. 'build', 'test', 'assemble')."},
-                    "args": {"type": "string", "description": "Additional Gradle flags."},
+                    "target": {"type": "string", "description": "Gradle task name (e.g. 'build', 'test', 'assemble'). Must be alphanumeric/underscore/dash/dot/slash only."},
                 },
                 "required": ["target"],
             },
@@ -3437,7 +3697,6 @@ TOOL_SCHEMAS: list[dict] = [
                 "type": "object",
                 "properties": {
                     "goal": {"type": "string", "description": "Maven lifecycle phase or plugin goal (e.g. 'package', 'test', 'compile')."},
-                    "args": {"type": "string", "description": "Additional Maven flags (e.g. '-DskipTests')."},
                 },
                 "required": ["goal"],
             },
@@ -3469,9 +3728,7 @@ TOOL_SCHEMAS: list[dict] = [
             "description": "[RUN — deps] Install Node.js dependencies (npm install). Mutates node_modules. Call after modifying package.json.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "args": {"type": "string", "description": "Additional npm install flags (e.g. '--save-dev')."},
-                },
+                "properties": {},
                 "required": [],
             },
         },
@@ -3498,7 +3755,6 @@ TOOL_SCHEMAS: list[dict] = [
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Directory or file to scan (default: '.')."},
-                    "args": {"type": "string", "description": "Additional bandit flags (e.g. '-ll', '--skip B101')."},
                 },
                 "required": [],
             },

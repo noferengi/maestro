@@ -21,18 +21,14 @@ from unittest.mock import MagicMock, patch
 class TestRunShellSecurity(unittest.TestCase):
 
     def test_uses_explicit_project_path(self):
-        """subprocess.run should receive the explicit cwd, not the ContextVar value."""
+        """_run_tool_subprocess should receive the explicit cwd, not the ContextVar value."""
         from app.agent.security_review import run_shell_security
 
-        mock_result = MagicMock()
-        mock_result.stdout = "bandit ok"
-        mock_result.stderr = ""
-
-        with patch("subprocess.run", return_value=mock_result) as mock_run:
-            run_shell_security("python -m bandit -r . -q --no-show-progress",
-                               project_path="/explicit/path")
-            _, kwargs = mock_run.call_args
-            self.assertEqual(kwargs["cwd"], "/explicit/path")
+        with patch("app.agent.tools._run_tool_subprocess", return_value=(0, "bandit ok")) as mock_run:
+            run_shell_security("bandit", ".", project_path="/explicit/path")
+            args, kwargs = mock_run.call_args
+            # Second positional arg is cwd
+            self.assertEqual(args[1], "/explicit/path")
 
     def test_falls_back_to_context_var(self):
         """When project_path is None, cwd comes from the ContextVar."""
@@ -41,25 +37,21 @@ class TestRunShellSecurity(unittest.TestCase):
 
         set_task_git_cwd("/contextvar/path")
 
-        mock_result = MagicMock()
-        mock_result.stdout = "bandit ok"
-        mock_result.stderr = ""
-
         try:
-            with patch("subprocess.run", return_value=mock_result) as mock_run:
-                run_shell_security("python -m bandit -r . -q --no-show-progress")
-                _, kwargs = mock_run.call_args
-                self.assertEqual(kwargs["cwd"], "/contextvar/path")
+            with patch("app.agent.tools._run_tool_subprocess", return_value=(0, "bandit ok")) as mock_run:
+                run_shell_security("bandit", ".")
+                args, kwargs = mock_run.call_args
+                self.assertEqual(args[1], "/contextvar/path")
         finally:
             set_task_git_cwd(None)
 
-    def test_blocklist_still_enforced(self):
-        """Non-allowlisted commands are rejected regardless of project_path."""
+    def test_unknown_tool_is_rejected(self):
+        """Unknown tool names are rejected with a [security] message."""
         from app.agent.security_review import run_shell_security
 
         result = run_shell_security("rm -rf /", project_path="/some/path")
-        self.assertIn("ERROR", result)
-        self.assertIn("allowlist", result)
+        self.assertIn("[security]", result)
+        self.assertIn("Unknown security tool", result)
 
 
 # ---------------------------------------------------------------------------
@@ -69,17 +61,13 @@ class TestRunShellSecurity(unittest.TestCase):
 class TestRunShellReview(unittest.TestCase):
 
     def test_uses_explicit_project_path(self):
-        """subprocess.run should receive the explicit cwd."""
+        """_run_tool_subprocess should receive the explicit cwd."""
         from app.agent.final_review import run_shell_review
 
-        mock_result = MagicMock()
-        mock_result.stdout = "pytest ok"
-        mock_result.stderr = ""
-
-        with patch("subprocess.run", return_value=mock_result) as mock_run:
-            run_shell_review("python -m pytest", project_path="/explicit/path")
-            _, kwargs = mock_run.call_args
-            self.assertEqual(kwargs["cwd"], "/explicit/path")
+        with patch("app.agent.tools._run_tool_subprocess", return_value=(0, "pytest ok")) as mock_run:
+            run_shell_review("pytest", ".", project_path="/explicit/path")
+            args, kwargs = mock_run.call_args
+            self.assertEqual(args[1], "/explicit/path")
 
     def test_falls_back_to_context_var(self):
         """When project_path is None, cwd comes from the ContextVar."""
@@ -88,15 +76,11 @@ class TestRunShellReview(unittest.TestCase):
 
         set_task_git_cwd("/contextvar/path")
 
-        mock_result = MagicMock()
-        mock_result.stdout = "pytest ok"
-        mock_result.stderr = ""
-
         try:
-            with patch("subprocess.run", return_value=mock_result) as mock_run:
-                run_shell_review("python -m pytest")
-                _, kwargs = mock_run.call_args
-                self.assertEqual(kwargs["cwd"], "/contextvar/path")
+            with patch("app.agent.tools._run_tool_subprocess", return_value=(0, "pytest ok")) as mock_run:
+                run_shell_review("pytest", ".")
+                args, kwargs = mock_run.call_args
+                self.assertEqual(args[1], "/contextvar/path")
         finally:
             set_task_git_cwd(None)
 

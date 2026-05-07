@@ -66,7 +66,10 @@
       "Bash(venv/Scripts/python.exe -m py_compile app/database/crud_clarification.py)",
       "mcp__maestro__list_tasks",
       "mcp__maestro__get_budget_trace",
-      "Bash(xargs grep *)"
+      "Bash(xargs grep *)",
+      "mcp__maestro__get_project_health",
+      "mcp__maestro__find_stuck_tasks",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/ -x --tb=short -q)"
     ]
   },
   "enableAllProjectMcpServers": true

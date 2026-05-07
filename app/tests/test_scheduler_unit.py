@@ -839,7 +839,7 @@ class TestRunFinalReviewTask:
         assert mock_append.call_args[0][1] == "ready_for_review"
 
     def test_conflict_logs_merge_test_failed(self):
-        """Virtual merge conflict → append_task_history with 'merge_test_failed'; no type change."""
+        """Virtual merge conflict → append_task_history with 'merge_test_failed'; task demoted to indev."""
         from app.agent.scheduler import _run_final_review_task
         from app.agent.merge import MergeResult
 
@@ -865,10 +865,12 @@ class TestRunFinalReviewTask:
 
         mock_append.assert_called_once()
         assert mock_append.call_args[0][1] == "merge_test_failed"
-        assert "indev" not in updated_types
+        # Conflict → demote to indev so dev agent can fix the conflicting code
+        assert "indev" in updated_types
+        assert "human_review" not in updated_types
 
     def test_test_failure_logs_merge_test_failed(self):
-        """Virtual merge test_failure → append_task_history with 'merge_test_failed'; no type change."""
+        """Virtual merge test_failure → append_task_history with 'merge_test_failed'; task demoted to indev."""
         from app.agent.scheduler import _run_final_review_task
         from app.agent.merge import MergeResult
 
@@ -894,7 +896,9 @@ class TestRunFinalReviewTask:
 
         mock_append.assert_called_once()
         assert mock_append.call_args[0][1] == "merge_test_failed"
-        assert "indev" not in updated_types
+        # Test failure → demote to indev so dev agent can fix the broken code
+        assert "indev" in updated_types
+        assert "human_review" not in updated_types
 
     def test_push_failure_logs_merge_test_failed(self):
         """Virtual merge push_failure → append_task_history with 'merge_test_failed'; no type change."""

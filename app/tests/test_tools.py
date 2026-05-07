@@ -388,10 +388,10 @@ class TestRunTestPytestSlicing:
 
         fake_output = "\n".join(f"line_{i}" for i in range(20))
 
-        def fake_execute(cmd, cwd, timeout, timeout_msg, *, replace_python=False):
-            return fake_output
+        def fake_run(args, cwd, timeout, timeout_msg):
+            return 0, fake_output
 
-        monkeypatch.setattr(tools_mod, "_execute_in_project", fake_execute)
+        monkeypatch.setattr(tools_mod, "_run_tool_subprocess", fake_run)
         token = _task_git_cwd.set(str(tmp_path))
         try:
             result = tools_mod.run_test_pytest(head=5)
@@ -406,10 +406,10 @@ class TestRunTestPytestSlicing:
 
         fake_output = "PASSED test_foo\nFAILED test_bar\nPASSED test_baz"
 
-        def fake_execute(cmd, cwd, timeout, timeout_msg, *, replace_python=False):
-            return fake_output
+        def fake_run(args, cwd, timeout, timeout_msg):
+            return 0, fake_output
 
-        monkeypatch.setattr(tools_mod, "_execute_in_project", fake_execute)
+        monkeypatch.setattr(tools_mod, "_run_tool_subprocess", fake_run)
         token = _task_git_cwd.set(str(tmp_path))
         try:
             result = tools_mod.run_test_pytest(grep="FAILED")

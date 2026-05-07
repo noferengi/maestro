@@ -1569,11 +1569,22 @@ def _run_final_review_only_bg(task_id: str) -> None:
 
             if fr_result.get("outcome") == "passed":
                 logger.info("[final_review] Task '%s' passed. Running virtual merge test.", task_id)
-                # execute_merge operates on the main repo branch, not the worktree
-                merge_test = execute_merge(task_id, project_path=project_path, dry_run=True)
+                # Use real project root, not worktree path — git checkout fails inside a worktree.
+                from app.database import get_project_path as _get_project_path
+                real_pp = (_get_project_path(task.project) if task.project else None) or project_path
+                merge_test = execute_merge(
+                    task_id, project_path=real_pp, dry_run=True,
+                    llm_id=task.llm_id, budget_id=task.budget_id,
+                )
                 if merge_test.status == "virtual_passed":
                     append_task_history(task_id, "ready_for_review", message="Final review passed. Virtual merge/test SUCCEEDED. Ready for final manual review and merge.")
                     logger.info("[final_review] Task '%s' virtual merge SUCCEEDED.", task_id)
+                elif merge_test.status in ("conflict", "test_failure"):
+                    msg = f"Final review passed, but virtual merge {merge_test.status.upper()}. Demoting to indev.\n\n{merge_test.error_detail or ''}"
+                    append_task_history(task_id, "merge_test_failed", message=msg)
+                    update_task(task_id, type="indev")
+                    _record_demotion(task_id, "final_review", "indev", msg[:200])
+                    logger.warning("[final_review] Task '%s' virtual merge %s. Demoted to indev.", task_id, merge_test.status)
                 else:
                     append_task_history(task_id, "merge_test_failed", message=f"Final review passed, but VIRTUAL MERGE FAILED: {merge_test.status}. Detail: {merge_test.error_detail}")
                     logger.warning("[final_review] Task '%s' virtual merge FAILED: %s", task_id, merge_test.status)
@@ -1635,14 +1646,27 @@ def _run_final_review_pipeline_bg(task_id: str) -> None:
             _store_pipeline_result_generic(task_id, fr_result, task.budget_id, "final_review")
 
             if fr_result.get("outcome") == "passed":
-                merge_test = execute_merge(task_id, project_path=project_path, dry_run=True)
+                # Use real project root, not worktree path — git checkout fails inside a worktree.
+                from app.database import get_project_path as _get_project_path
+                real_pp = (_get_project_path(task.project) if task.project else None) or project_path
+                merge_test = execute_merge(
+                    task_id, project_path=real_pp, dry_run=True,
+                    llm_id=task.llm_id, budget_id=task.budget_id,
+                )
                 if merge_test.status == "virtual_passed":
                     append_task_history(task_id, "ready_for_review", message="Final AI review passed. Virtual merge SUCCEEDED. Ready for human review.")
+                    update_task(task_id, type="human_review")
+                    logger.info("[final_review] Task '%s' advanced to HUMAN REVIEW.", task_id)
+                elif merge_test.status in ("conflict", "test_failure"):
+                    msg = f"Final AI review passed, but virtual merge {merge_test.status.upper()}. Demoting to indev.\n\n{merge_test.error_detail or ''}"
+                    append_task_history(task_id, "merge_test_failed", message=msg)
+                    update_task(task_id, type="indev")
+                    _record_demotion(task_id, "final_review", "indev", msg[:200])
+                    logger.warning("[final_review] Task '%s' virtual merge %s. Demoted to indev.", task_id, merge_test.status)
                 else:
                     append_task_history(task_id, "merge_test_failed", message=f"Final AI review passed, but VIRTUAL MERGE FAILED: {merge_test.status}. Detail: {merge_test.error_detail}")
-                    logger.warning("[final_review] Task '%s' virtual merge FAILED: %s", task_id, merge_test.status)
-                update_task(task_id, type="human_review")
-                logger.info("[final_review] Task '%s' advanced to HUMAN REVIEW.", task_id)
+                    update_task(task_id, type="human_review")
+                    logger.warning("[final_review] Task '%s' virtual merge infrastructure error (%s). Advanced to HUMAN REVIEW with warning.", task_id, merge_test.status)
             else:
                 demotion = fr_result.get("demotion_target", "indev")
                 update_task(task_id, type=demotion)

@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -46,51 +47,40 @@ AGENT_NAME = "Final Review Pipeline"
 # Allowlisted test runner shell
 # ---------------------------------------------------------------------------
 
-REVIEW_SHELL_ALLOWLIST = [
-    r"^python\s+-m\s+pytest\b",
-    r"^python\s+-m\s+ruff\b",
-    r"^python\s+-m\s+mypy\b",
-    r"^python\s+-m\s+black\s+--check\b",
-    r"^npm\s+test\b",
-    r"^npm\s+run\s+lint\b",
-]
-
-_REVIEW_ALLOWLIST_RE = [re.compile(p) for p in REVIEW_SHELL_ALLOWLIST]
+_REVIEW_TOOL_BUILDERS: dict = {
+    "pytest":      lambda path: [sys.executable, "-m", "pytest", path],
+    "ruff":        lambda path: [sys.executable, "-m", "ruff", "check", path],
+    "mypy":        lambda path: [sys.executable, "-m", "mypy", path],
+    "black-check": lambda path: [sys.executable, "-m", "black", "--check", path],
+    "npm-test":    lambda path: ["npm", "test"],
+    "npm-lint":    lambda path: ["npm", "run", "lint"],
+}
 
 
-def run_shell_review(command: str, *, project_path: str | None = None, timeout: int | None = None) -> str:
-    """Execute a shell command from the review runner allowlist only."""
-    import subprocess
+def run_shell_review(tool: str, path: str = ".", *, project_path: str | None = None, timeout: int | None = None) -> str:
+    """Execute a whitelisted review tool with shell=False.
 
-    command = command.strip()
-    allowed = any(pat.match(command) for pat in _REVIEW_ALLOWLIST_RE)
-    if not allowed:
-        return (
-            f"ERROR: Command not in review runner allowlist. "
-            f"Allowed patterns: {', '.join(REVIEW_SHELL_ALLOWLIST)}"
-        )
+    tool: one of pytest | ruff | mypy | black-check | npm-test | npm-lint
+    path: relative path to scan (validated).
+    """
+    from app.agent.tools import _validate_tool_path, _run_tool_subprocess
+
+    cwd = project_path or _task_git_cwd.get() or PROJECT_ROOT
+
+    builder = _REVIEW_TOOL_BUILDERS.get(tool.lower().strip())
+    if builder is None:
+        known = ", ".join(_REVIEW_TOOL_BUILDERS)
+        logger.warning("[security] run_shell_review rejected tool=%r (known: %s)", tool, known)
+        return f"[security] Unknown review tool {tool!r}. Known tools: {known}"
+
+    safe_path = _validate_tool_path(path, f"run_shell_review:{tool}")
+    if safe_path is None:
+        return f"[security] path {path!r} rejected"
 
     effective_timeout = timeout if timeout is not None else SHELL_TIMEOUT_SECONDS
-
-    try:
-        cwd = project_path or _task_git_cwd.get() or PROJECT_ROOT
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=effective_timeout,
-            cwd=cwd,
-        )
-        output = result.stdout + result.stderr
-        return output[:8000] if output else "(no output)"
-    except subprocess.TimeoutExpired:
-        return (
-            f"ERROR: Command timed out after {effective_timeout}s. "
-            "This may indicate a hang or high computational complexity."
-        )
-    except Exception as e:
-        return f"ERROR: {e}"
+    args = builder(safe_path)
+    rc, out = _run_tool_subprocess(args, cwd, effective_timeout, f"ERROR: {tool} timed out after {effective_timeout}s")
+    return out[:8000] if out else "(no output)"
 
 
 # ---------------------------------------------------------------------------

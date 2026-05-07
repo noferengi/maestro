@@ -20,6 +20,9 @@ Tools:
     maestro__list_pending_merges    — completed tasks not yet merged to main
     maestro__get_project_health     — cold-start briefing: stages, sessions, spend, demotions
     maestro__preview_dispatch       — dry-run scheduler tick: what would dispatch + skip reasons
+    maestro__get_task_events        — task lifecycle event log (merge_test_failed, ready_for_review, etc.)
+    maestro__get_merge_records      — all merge/virtual-merge attempts for a task with error details
+    maestro__get_git_branch_state   — git HEAD, task branches, and worktrees for a project
 
   Action (write):
     maestro__append_task_description  — add context to task description
@@ -61,6 +64,9 @@ from mcp_tools.diagnostics import (
     list_pending_merges,
     get_project_health,
     preview_dispatch,
+    get_task_events,
+    get_merge_records,
+    get_git_branch_state,
 )
 from mcp_tools.actions import (
     append_task_description,
@@ -94,6 +100,9 @@ mcp.tool()(get_capacity_status)
 mcp.tool()(list_pending_merges)
 mcp.tool()(get_project_health)
 mcp.tool()(preview_dispatch)
+mcp.tool()(get_task_events)
+mcp.tool()(get_merge_records)
+mcp.tool()(get_git_branch_state)
 
 # --- Live API tool ---
 mcp.tool()(get_scheduler_api_status)
