@@ -16,8 +16,10 @@ import logging
 
 from sqlalchemy import func
 
+from datetime import datetime
+
 from .session import SessionLocal
-from .models import BudgetEntry, Expense
+from .models import BudgetEntry, Expense, Task
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,10 @@ def create_budget_entry(llm_id=None, budget_id=None, task_id=None,
             session_id=session_id, agent_name=agent_name,
         )
         db.add(entry)
+        if task_id:
+            db.query(Task).filter(Task.id == task_id).update(
+                {"last_progress_at": datetime.utcnow()}, synchronize_session=False
+            )
         db.commit()
         db.refresh(entry)
         return entry

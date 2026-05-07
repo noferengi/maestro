@@ -13,7 +13,7 @@ import logging
 from datetime import datetime, timezone
 
 from .session import SessionLocal
-from .models import AgentSession
+from .models import AgentSession, Task
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,10 @@ def create_agent_session(
             max_turns=max_turns,
         )
         db.add(session)
+        db.query(Task).filter(Task.id == task_id).update(
+            {"last_progress_at": datetime.now(timezone.utc).replace(tzinfo=None)},
+            synchronize_session=False,
+        )
         db.commit()
         db.refresh(session)
         return session.id
@@ -84,6 +88,11 @@ def close_agent_session(
             row.turn_count = turn_count
         row.prompt_tokens = prompt_tokens or 0
         row.completion_tokens = completion_tokens or 0
+        if row.task_id:
+            db.query(Task).filter(Task.id == row.task_id).update(
+                {"last_progress_at": datetime.now(timezone.utc).replace(tzinfo=None)},
+                synchronize_session=False,
+            )
         db.commit()
     except Exception as exc:
         db.rollback()

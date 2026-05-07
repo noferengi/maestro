@@ -765,17 +765,32 @@ def _compute_dag_depth(task_id: str, by_id: dict) -> int:
 
 
 def _compute_priority(task_dict: dict, by_id: dict) -> float:
-    """Lower score = higher priority. Shallower DAG depth first."""
-    depth = _compute_dag_depth(task_dict["id"], by_id)
-    try:
-        col_idx = PIPELINE_COLUMN_ORDER.index(task_dict.get("type", ""))
-    except ValueError:
-        col_idx = len(PIPELINE_COLUMN_ORDER)
-    return (
-        depth * RESEARCH_JOB_PRIORITY_DEPTH_PENALTY
-        + col_idx * 100
-        + (task_dict.get("position") or 0)
-    )
+    """Lower score = higher priority.
+
+    Tier 0 (score ≤ 0):              type='idea'   — new human work, always first
+    Tier 1 (0 < score < 10_000_000): is_starred    — starred tasks jump the general queue
+    Tier 2 (score ≥ 10_000_000):     everyone else — pure staleness round-robin
+
+    Within each tier the most stale task (largest staleness_seconds) wins because
+    subtracting a larger number yields a lower score.  Tier gaps are 10 M seconds
+    (~115 days) so tiers never overlap regardless of staleness.
+    """
+    import datetime as _dt
+    now = _dt.datetime.utcnow()
+    raw = task_dict.get("last_progress_at")
+    if isinstance(raw, str):
+        try:
+            raw = _dt.datetime.fromisoformat(raw)
+        except ValueError:
+            raw = None
+    last_progress: _dt.datetime = raw if raw is not None else now
+    staleness = (now - last_progress).total_seconds()
+
+    if task_dict.get("type") == "idea":
+        return -staleness                   # Tier 0: most stale idea dispatched first
+    if task_dict.get("is_starred"):
+        return 10_000_000.0 - staleness    # Tier 1: most stale starred task first
+    return 20_000_000.0 - staleness        # Tier 2: most stale task first
 
 
 def _check_and_reserve_slot(
@@ -4428,4 +4443,6 @@ def _task_to_mini_dict(task: Any) -> dict:
         "position": task.position,
         "prerequisites": task.prerequisites or [],
         "parent_task_id": getattr(task, "parent_task_id", None),
+        "last_progress_at": getattr(task, "last_progress_at", None),
+        "is_starred": bool(getattr(task, "is_starred", False)),
     }

@@ -29,7 +29,7 @@ from .session import SessionLocal
 from .models import (
     TransitionVote, TransitionResult, SubdivisionRecord,
     PlanningResult, ComponentResult, OptimizationResult,
-    SecurityReviewResult, FinalReviewResult, MergeRecord,
+    SecurityReviewResult, FinalReviewResult, MergeRecord, Task,
 )
 
 logger = logging.getLogger(__name__)
@@ -80,6 +80,9 @@ def create_transition_result(task_id, transition, outcome, vote_summary=None, to
             total_completion_tokens=total_completion_tokens
         )
         db.add(result)
+        db.query(Task).filter(Task.id == task_id).update(
+            {"last_progress_at": datetime.utcnow()}, synchronize_session=False
+        )
         db.commit()
         db.refresh(result)
         return result

@@ -773,6 +773,22 @@ def get_task_history(task_id):
         db.close()
 
 
+def touch_progress(task_id: str) -> None:
+    """Update last_progress_at to now. Called by every path that does real work on a task."""
+    if not task_id:
+        return
+    db = SessionLocal()
+    try:
+        db.query(Task).filter(Task.id == task_id).update(
+            {"last_progress_at": datetime.utcnow()}, synchronize_session=False
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
 def append_task_history(task_id, status, message=None):
     """Append a single history entry to a task without changing any other fields."""
     db = SessionLocal()

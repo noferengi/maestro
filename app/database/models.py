@@ -143,6 +143,8 @@ class Task(Base):
     clarification_status = Column(String, nullable=False, default='none')  # none | pending | awaiting_user | approved | skipped
     description_original = Column(Text, nullable=True)  # Raw user input before clarification rewrite
     acceptance_criteria = Column(Text, nullable=True)  # JSON array of strings, extracted from approved clarification draft
+    last_progress_at = Column(DateTime, nullable=True, default=datetime.utcnow)
+    is_starred = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

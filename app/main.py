@@ -3366,6 +3366,8 @@ def task_to_dict(task):
         "has_cached_plan": _check_has_cached_plan(task),
         "acceptance_criteria": json.loads(task.acceptance_criteria) if getattr(task, "acceptance_criteria", None) else None,
         "clarification_status": getattr(task, "clarification_status", "none") or "none",
+        "is_starred": bool(getattr(task, "is_starred", False)),
+        "last_progress_at": task.last_progress_at.isoformat() if getattr(task, "last_progress_at", None) else None,
     }
 
 
@@ -4903,6 +4905,18 @@ def pin_task(task_id: str):
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     updated = update_task(task_id, position=0)
+    return task_to_dict(updated)
+
+
+@app.post("/api/tasks/{task_id}/star", response_model=dict)
+def star_task(task_id: str):
+    """Toggle is_starred flag — starred tasks are dispatched ahead of the general queue."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    from datetime import datetime as _dt
+    updated = update_task(task_id, is_starred=not bool(task.is_starred),
+                          last_progress_at=_dt.utcnow())
     return task_to_dict(updated)
 
 

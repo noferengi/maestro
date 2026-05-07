@@ -277,15 +277,32 @@ def test_compute_dag_depth_chain():
     assert _compute_dag_depth("a", by_id) == 0
 
 
-def test_compute_priority_shallow_first():
+def test_compute_priority_tiers():
+    """Priority tiers: idea < starred < regular, stalest within tier wins."""
+    import datetime as _dt
     from app.agent.scheduler import _compute_priority
+
+    old_ts = (_dt.datetime.utcnow() - _dt.timedelta(days=10)).isoformat()
+    new_ts = _dt.datetime.utcnow().isoformat()
+
     by_id = {
-        "root": {"id": "root", "prerequisites": [], "type": "planning", "position": 0},
-        "child": {"id": "child", "prerequisites": ["root"], "type": "planning", "position": 0},
+        "idea":    {"id": "idea",    "prerequisites": [], "type": "idea",     "position": 0,
+                    "last_progress_at": new_ts, "is_starred": False},
+        "starred": {"id": "starred", "prerequisites": [], "type": "planning", "position": 0,
+                    "last_progress_at": new_ts, "is_starred": True},
+        "regular": {"id": "regular", "prerequisites": [], "type": "planning", "position": 0,
+                    "last_progress_at": new_ts, "is_starred": False},
+        "stale":   {"id": "stale",   "prerequisites": [], "type": "planning", "position": 0,
+                    "last_progress_at": old_ts, "is_starred": False},
     }
-    p_root = _compute_priority(by_id["root"], by_id)
-    p_child = _compute_priority(by_id["child"], by_id)
-    assert p_root < p_child, "Shallower tasks must have lower (higher) priority score"
+    p_idea    = _compute_priority(by_id["idea"],    by_id)
+    p_starred = _compute_priority(by_id["starred"], by_id)
+    p_regular = _compute_priority(by_id["regular"], by_id)
+    p_stale   = _compute_priority(by_id["stale"],   by_id)
+
+    assert p_idea < p_starred,  "idea must beat starred"
+    assert p_starred < p_regular, "starred must beat regular"
+    assert p_stale < p_regular,   "stalest regular task dispatched before fresher one"
 
 
 # ---------------------------------------------------------------------------

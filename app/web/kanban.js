@@ -168,26 +168,22 @@ async function submitResearchDialog() {
 }
 
 // Highlighted cards (localStorage-backed)
-let _highlightedCards = new Set(JSON.parse(localStorage.getItem('maestro_highlights') || '[]'));
-
-function _saveHighlights() {
-    try { localStorage.setItem('maestro_highlights', JSON.stringify([..._highlightedCards])); } catch (_) {}
-}
-
 function _applyHighlightState(el, taskId) {
-    el.classList.toggle('highlighted', _highlightedCards.has(taskId));
+    const task = taskData[taskId] || (allTasks || []).find(t => t.id === taskId);
+    const starred = task ? Boolean(task.is_starred) : false;
+    el.classList.toggle('highlighted', starred);
     const btn = el.querySelector('.card-highlight-btn');
-    if (btn) btn.textContent = _highlightedCards.has(taskId) ? '★' : '☆';
+    if (btn) btn.textContent = starred ? '★' : '☆';
 }
 
-function toggleHighlight(taskId) {
-    if (_highlightedCards.has(taskId)) { _highlightedCards.delete(taskId); }
-    else { _highlightedCards.add(taskId); }
-    _saveHighlights();
-    const card = cardCache[taskId];
-    if (card) _applyHighlightState(card, taskId);
-    const mapNode = document.getElementById(`map-node-${taskId}`);
-    if (mapNode) _applyHighlightState(mapNode, taskId);
+async function toggleHighlight(taskId) {
+    const resp = await fetch(`${API_BASE}/tasks/${taskId}/star`, { method: 'POST' });
+    if (resp.ok) {
+        await loadTasksFromDatabase();
+    } else {
+        const d = await resp.json().catch(() => ({}));
+        showToast(d.detail || 'Star failed.', 'error');
+    }
 }
 
 // Grouped drag state
@@ -275,6 +271,7 @@ function taskFingerprint(task) {
         task.intake_exhausted ? '1' : '0',
         task.intake_rejection_count || 0,
         task.clarification_status || 'none',
+        task.is_starred ? '1' : '0',
     ].join('|');
 }
 
@@ -2884,8 +2881,9 @@ function createTaskCard(id, title, tags, owner, status) {
         ? `<div class="card-stage-footer csf-loading" id="csf-${id}" onclick="event.stopPropagation();openStageJournal('${id}')">…</div>`
         : '';
 
+    const _isStarred = Boolean((taskData[id] || {}).is_starred);
     card.innerHTML = `
-        <button class="card-highlight-btn" title="Highlight card" onclick="event.stopPropagation();toggleHighlight('${id}')">☆</button>
+        <button class="card-highlight-btn" title="${_isStarred ? 'Unstar (remove priority boost)' : 'Star (boost scheduler priority)'}" onclick="event.stopPropagation();toggleHighlight('${id}')">${_isStarred ? '★' : '☆'}</button>
         ${parentLink}
         <div class="task-title"${isBigIdea ? ` onclick="zoomIntoBigIdea('${id}')" style="cursor:pointer"` : ''}>${title}${rejBadge}${processingSpinner}${subdivBadge}${bigIdeaBadge}${contractIndicator}${pipBadge}</div>
         <div class="task-meta">
@@ -6056,7 +6054,7 @@ function renderColumnMap(colType) {
             actionHtml += ` <button class="map-btn map-btn-warning" onclick="moveTask('${id}','indev')">&#8594; Dev</button>`;
 
         node.innerHTML = `
-            <button class="card-highlight-btn" title="Highlight" onclick="event.stopPropagation();toggleHighlight('${id}')">☆</button>
+            <button class="card-highlight-btn" title="${task.is_starred ? 'Unstar (remove priority boost)' : 'Star (boost scheduler priority)'}" onclick="event.stopPropagation();toggleHighlight('${id}')">${task.is_starred ? '★' : '☆'}</button>
             <div class="map-node-title" onclick="editTask('${id}')">${task.title || '(untitled)'}${badges ? ' ' + badges : ''}</div>
             <div class="map-node-meta">${tagHtml}${ownerHtml}</div>
             <div class="map-node-prereq-handle" data-handle-for="${id}" title="Drag to create prerequisite" style="position:absolute;top:4px;right:4px;width:16px;height:16px;border-radius:50%;background:#0d6efd;color:#fff;font-size:10px;display:flex;align-items:center;justify-content:center;cursor:crosshair;z-index:10;opacity:0;transition:opacity 0.15s" onmousedown="event.stopPropagation();_mapStartPrereqDrag(event,'${id}')">+</div>
