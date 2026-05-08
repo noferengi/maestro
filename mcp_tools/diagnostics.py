@@ -1358,6 +1358,7 @@ def get_git_branch_state(project_name: str) -> dict:
 def get_tool_bug_reports(
     task_id: str = None,
     tool_name: str = None,
+    unread_only: bool = True,
     limit: int = 50,
 ) -> list:
     """
@@ -1368,8 +1369,9 @@ def get_tool_bug_reports(
     captures the session_id, tool name, what the agent was trying to do,
     what it expected, and what actually happened.
 
-    Filter by task_id or tool_name to drill into a specific session or
-    tool. Returns newest-first up to `limit` rows.
+    unread_only: when True (default) only returns reports not yet viewed.
+    Filter by task_id or tool_name to drill into a specific session or tool.
+    Returns newest-first up to `limit` rows.
     """
     conn = get_conn()
     params: list = []
@@ -1380,10 +1382,12 @@ def get_tool_bug_reports(
     if tool_name:
         where_clauses.append("tool_name = ?")
         params.append(tool_name)
+    if unread_only:
+        where_clauses.append("viewed_at IS NULL")
     where = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
     params.append(limit)
     rows = conn.execute(
-        f"SELECT id, task_id, session_id, tool_name, trying_to, expected, actual, created_at "
+        f"SELECT id, task_id, session_id, tool_name, trying_to, expected, actual, created_at, viewed_at "
         f"FROM tool_bug_reports {where} ORDER BY created_at DESC LIMIT ?",
         params,
     ).fetchall()
@@ -1397,6 +1401,33 @@ def get_tool_bug_reports(
             "expected": r[5],
             "actual": r[6],
             "created_at": r[7],
+            "viewed_at": r[8],
         }
         for r in rows
     ]
+
+
+def mark_tool_bug_reports_viewed(report_ids: list = None) -> dict:
+    """
+    Mark tool bug reports as viewed so they no longer appear in the unread feed.
+
+    Pass report_ids=[1, 2, 3] to mark specific reports, or omit (None) to mark
+    all unread reports viewed at once.
+
+    Returns {"marked": N} count of rows updated.
+    """
+    conn = get_rw_conn()
+    now = __import__("datetime").datetime.utcnow().isoformat()
+    if report_ids:
+        placeholders = ",".join("?" for _ in report_ids)
+        result = conn.execute(
+            f"UPDATE tool_bug_reports SET viewed_at=? WHERE viewed_at IS NULL AND id IN ({placeholders})",
+            [now, *report_ids],
+        )
+    else:
+        result = conn.execute(
+            "UPDATE tool_bug_reports SET viewed_at=? WHERE viewed_at IS NULL",
+            [now],
+        )
+    conn.commit()
+    return {"marked": result.rowcount}

@@ -844,6 +844,7 @@ class ToolBugReport(Base):
     expected    = Column(Text, nullable=False)
     actual      = Column(Text, nullable=False)
     created_at  = Column(DateTime, default=datetime.utcnow)
+    viewed_at   = Column(DateTime, nullable=True)
 
     def __repr__(self):
         return f"<ToolBugReport(id={self.id}, task={self.task_id!r}, tool={self.tool_name!r})>"

@@ -378,7 +378,7 @@ CONCEPTUAL_REVIEW_REVIEWER_TOOLS: list[str] = _getlist("conceptual_review", "rev
     "read_file, read_file_metadata, read_last_output, "
     "find_in_files, find_files, list_directory, "
     "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
-    "get_task, list_tasks, submit_work"
+    "get_task, list_tasks, report_tool_bug, submit_work"
     )
 
 
@@ -397,7 +397,7 @@ OPTIMIZATION_REVIEWER_TOOLS: list[str] = _getlist("optimization", "reviewer_tool
     "read_file, read_file_metadata, read_last_output, "
     "find_in_files, find_files, list_directory, "
     "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
-    "get_task, list_tasks, submit_work"
+    "get_task, list_tasks, report_tool_bug, submit_work"
     )
 
 
@@ -426,7 +426,7 @@ SECURITY_REVIEWER_TOOLS: list[str] = _getlist("security_review", "reviewer_tools
     "read_file, read_file_metadata, read_last_output, "
     "find_in_files, find_files, list_directory, "
     "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
-    "get_task, list_tasks, submit_work, "
+    "get_task, list_tasks, report_tool_bug, submit_work, "
     "run_audit_bandit, run_audit_pip, run_audit_semgrep, run_audit_npm"
 )
 
@@ -443,14 +443,14 @@ FINAL_REVIEW_CODE_QUALITY_TOOLS: list[str] = _getlist("final_review", "code_qual
     "read_file, read_file_metadata, read_last_output, "
     "find_in_files, find_files, list_directory, "
     "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
-    "get_task, list_tasks, submit_work, "
+    "get_task, list_tasks, report_tool_bug, submit_work, "
     "run_test_pytest, run_check_mypy, run_check_ruff, run_check_black, read_test_summary"
 )
 FINAL_REVIEW_FUNCTIONAL_TOOLS: list[str] = _getlist("final_review", "functional_reviewer_tools",
     "read_file, read_file_metadata, read_last_output, "
     "find_in_files, find_files, list_directory, "
     "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
-    "get_task, list_tasks, submit_work"
+    "get_task, list_tasks, report_tool_bug, submit_work"
     )
 
 

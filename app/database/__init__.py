@@ -279,6 +279,7 @@ from .crud_sessions import (
     get_agent_sessions_for_task,
     create_tool_bug_report,
     get_tool_bug_reports,
+    mark_tool_bug_reports_viewed,
 )
 
 # Dreamer run tracking
@@ -383,7 +384,7 @@ __all__ = [
     "mark_inbox_read", "mark_all_inbox_read", "delete_inbox_message", "count_unread_inbox",
     # crud_sessions
     "create_agent_session", "close_agent_session", "get_agent_sessions_for_task",
-    "create_tool_bug_report", "get_tool_bug_reports",
+    "create_tool_bug_report", "get_tool_bug_reports", "mark_tool_bug_reports_viewed",
     # crud_dreamer
     "create_dreamer_run", "update_dreamer_run", "get_dreamer_runs", "get_dreamer_run",
     # crud_survey

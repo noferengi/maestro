@@ -219,9 +219,10 @@ def create_tool_bug_report(
 def get_tool_bug_reports(
     task_id: str | None = None,
     tool_name: str | None = None,
+    unread_only: bool = False,
     limit: int = 50,
 ) -> list[ToolBugReport]:
-    """Fetch tool bug reports, optionally filtered by task or tool name, newest first."""
+    """Fetch tool bug reports, optionally filtered by task, tool name, or unread status."""
     db = SessionLocal()
     try:
         q = db.query(ToolBugReport)
@@ -229,9 +230,34 @@ def get_tool_bug_reports(
             q = q.filter(ToolBugReport.task_id == task_id)
         if tool_name:
             q = q.filter(ToolBugReport.tool_name == tool_name)
+        if unread_only:
+            q = q.filter(ToolBugReport.viewed_at.is_(None))
         return q.order_by(ToolBugReport.created_at.desc()).limit(limit).all()
     except Exception as exc:
         logger.error("Error fetching tool_bug_reports: %s", exc)
         return []
+    finally:
+        db.close()
+
+
+def mark_tool_bug_reports_viewed(report_ids: list[int] | None = None) -> int:
+    """Mark bug reports as viewed. Pass None to mark all unread reports viewed.
+
+    Returns count of rows updated.
+    """
+    db = SessionLocal()
+    try:
+        import sqlalchemy as _sa
+        now = datetime.now(timezone.utc).isoformat()
+        q = db.query(ToolBugReport).filter(ToolBugReport.viewed_at.is_(None))
+        if report_ids is not None:
+            q = q.filter(ToolBugReport.id.in_(report_ids))
+        count = q.update({"viewed_at": now}, synchronize_session=False)
+        db.commit()
+        return count
+    except Exception as exc:
+        db.rollback()
+        logger.error("Error marking tool_bug_reports viewed: %s", exc)
+        return 0
     finally:
         db.close()
