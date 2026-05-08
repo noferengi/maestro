@@ -3069,7 +3069,8 @@ TOOL_REGISTRY: dict[str, Any] = {
     "run_audit_pip": run_audit_pip,
     "run_audit_semgrep": run_audit_semgrep,
     "run_audit_npm": run_audit_npm,
-    # Terminal tool
+    # Diagnostic / terminal tools
+    "report_tool_bug": report_tool_bug,
     "submit_work": submit_work,
     # Survey/project summary tools
     "get_project_summary": get_project_summary,
@@ -4157,6 +4158,42 @@ TOOL_SCHEMAS: list[dict] = [
                     },
                 },
                 "required": ["result_id", "fields_json"],
+            },
+        },
+    },
+    # ---- Diagnostic tool ----
+    {
+        "type": "function",
+        "function": {
+            "name": "report_tool_bug",
+            "description": (
+                "[WRITE — diagnostics] Report a tool malfunction to the Maestro bug tracker. "
+                "Use this when a tool behaves in a way that prevents you from making progress — "
+                "wrong output, stale content, unexpected error, missing capability, silent failure, etc. "
+                "After filing the report, try an alternative approach or call submit_work. "
+                "Do NOT use this for expected errors like 'file not found' — only for tool misbehaviour."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "type": "string",
+                        "description": "Name of the misbehaving tool, e.g. 'patch_file', 'run_test_pytest'.",
+                    },
+                    "trying_to": {
+                        "type": "string",
+                        "description": "What you were attempting when the tool failed, e.g. 'replace the retry logic in llm_client.py lines 40-55'.",
+                    },
+                    "expected": {
+                        "type": "string",
+                        "description": "What the tool should have done or returned.",
+                    },
+                    "actual": {
+                        "type": "string",
+                        "description": "What it actually did or returned. Include the exact error message or describe the wrong output.",
+                    },
+                },
+                "required": ["tool_name", "trying_to", "expected", "actual"],
             },
         },
     },

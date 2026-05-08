@@ -3805,7 +3805,7 @@ def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
     from datetime import datetime
     import json as _json
 
-    set_task_git_cwd(project_path)
+    set_task_git_cwd(project_path, task_id=task_id)
 
     task = get_task(task_id)
     if not task:
@@ -3925,7 +3925,7 @@ def _run_optimization_task(task_id: str, llm_base_url: str, llm_model: str,
     from app.database import get_task, update_task
     from app.database import create_agent_session, close_agent_session
 
-    set_task_git_cwd(project_path)
+    set_task_git_cwd(project_path, task_id=task_id)
 
     task = get_task(task_id)
     if not task:
@@ -4006,7 +4006,7 @@ def _run_security_task(task_id: str, llm_base_url: str, llm_model: str,
     from app.database import get_task, update_task
     from app.database import create_transition_result, create_agent_session, close_agent_session
 
-    set_task_git_cwd(project_path)
+    set_task_git_cwd(project_path, task_id=task_id)
 
     task = get_task(task_id)
     if not task:
@@ -4099,7 +4099,7 @@ def _run_final_review_task(task_id: str, llm_base_url: str, llm_model: str,
         create_agent_session, close_agent_session,
     )
 
-    set_task_git_cwd(project_path)
+    set_task_git_cwd(project_path, task_id=task_id)
 
     task = get_task(task_id)
     if not task:
