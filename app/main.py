@@ -202,7 +202,7 @@ def update_existing_task(task_id: str, task_data: dict):
         raise HTTPException(status_code=404, detail="Task not found")
 
     # Only allow updating specific fields
-    allowed_fields = ['title', 'description', 'owner', 'tags', 'content', 'llm_id', 'budget_id', 'type', 'prerequisites', 'map_x', 'map_y']
+    allowed_fields = ['title', 'description', 'owner', 'tags', 'content', 'llm_id', 'budget_id', 'type', 'prerequisites', 'map_x', 'map_y', 'review_notes']
     update_data = {key: value for key, value in task_data.items() if key in allowed_fields}
 
     # Gate: advancing a task requires description, llm_id, and budget_id

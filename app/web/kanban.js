@@ -1151,6 +1151,8 @@ function escHtml(s) {
 // ---- Stage Journal Modal ----
 
 window._sjTaskId = null;
+window._sjDiffData = null;
+let _sjDiffMode = 'unified'; // 'unified' | 'split'
 
 function openStageJournal(taskId, section) {
     window._sjTaskId = taskId;
@@ -1171,6 +1173,8 @@ function openStageDiff(taskId) {
 function closeStageJournal() {
     document.getElementById('stage-journal-modal').style.display = 'none';
     window._sjTaskId = null;
+    window._sjDiffData = null;
+    _sjDiffMode = 'unified';
 }
 
 async function _buildStageJournal(taskId) {
@@ -1438,6 +1442,7 @@ async function _buildStageJournal(taskId) {
 
         // ---- Code Diff section ----
         if (diffData && diffData.method) {
+            window._sjDiffData = diffData;
             const branch = diffData.branch || '';
             const method = diffData.method;
             const hasDiff = diffData.diff && diffData.diff.trim().length > 0;
@@ -1445,10 +1450,8 @@ async function _buildStageJournal(taskId) {
                 ? `<span class="sj-badge muted">merge commit ${escHtml((diffData.head_ref||'').slice(0,8))}</span>`
                 : `<span class="sj-badge info">${escHtml(branch)}</span>`;
             html += `<div class="sj-section" id="sj-diff-section">
-                <div class="sj-section-title">&#9998; Code Diff ${methodLabel}</div>`;
+                <div class="sj-section-title">&#9998; Code Diff ${methodLabel}${hasDiff ? `<button class="sj-diff-mode-toggle" id="sj-split-toggle" onclick="_sjToggleDiffSplit()">&#9889; Split</button>` : ''}</div>`;
             if (hasDiff) {
-                const diffRendered = _renderDiff(diffData.diff);
-                const isTabbed = diffRendered.includes('sj-diff-tabs');
                 if (diffData.stat) {
                     // Parse "3 files changed, 142 insertions(+), 38 deletions(-)" into a styled banner
                     const _statRaw = diffData.stat.trim().split('\n').pop() || diffData.stat.trim();
@@ -1465,11 +1468,7 @@ async function _buildStageJournal(taskId) {
                         html += `<div class="diff-stat">${escHtml(_statRaw)}</div>`;
                     }
                 }
-                if (isTabbed) {
-                    html += diffRendered;
-                } else {
-                    html += `<div class="diff-viewer">${diffRendered}</div>`;
-                }
+                html += `<div id="sj-diff-content">${_renderDiff(diffData.diff)}</div>`;
                 if (diffData.truncated) {
                     html += `<div class="diff-truncated-note">&#8230; diff truncated at 64 KiB — use git diff locally for the full output</div>`;
                 }
@@ -1508,6 +1507,8 @@ async function _buildStageJournal(taskId) {
         }
 
         body.innerHTML = html;
+        _sjApplySyntaxHighlighting(body);
+        _sjSetupHunkComments(taskId, body);
 
         // Scroll to requested section
         if (window._sjScrollTo === 'diff') {
@@ -1524,52 +1525,159 @@ async function _buildStageJournal(taskId) {
 }
 
 function _parseDiffFiles(diffText) {
-    // Split unified diff into per-file segments: [{name, html}]
-    const lines = diffText.split('\n');
+    // Returns [{name, lines}] where each line is {type, content, oldNum, newNum}
+    const rawLines = diffText.split('\n');
     const files = [];
     let current = null;
-    let lineNum = 0;
+    let oldNum = 0, newNum = 0;
 
-    for (const line of lines) {
+    for (const line of rawLines) {
         if (line.startsWith('diff --git')) {
             if (current) files.push(current);
             const fname = line.replace('diff --git ', '').split(' b/').pop() || line;
-            current = { name: fname, html: '' };
-            lineNum = 0;
+            current = { name: fname, lines: [] };
+            oldNum = 0; newNum = 0;
             continue;
         }
         if (!current) continue;
         if (line.startsWith('index ') || line.startsWith('--- ') || line.startsWith('+++ ')) continue;
         if (line.startsWith('@@')) {
-            const m = line.match(/@@ -\d+(?:,\d+)? \+(\d+)/);
-            lineNum = m ? parseInt(m[1], 10) - 1 : lineNum;
-            current.html += `<div class="diff-hunk-header">${escHtml(line)}</div>`;
+            const mOld = line.match(/@@ -(\d+)/);
+            const mNew = line.match(/\+(\d+)/);
+            oldNum = mOld ? parseInt(mOld[1], 10) - 1 : oldNum;
+            newNum = mNew ? parseInt(mNew[1], 10) - 1 : newNum;
+            current.lines.push({ type: 'hunk', content: line, oldNum: null, newNum: null });
         } else if (line.startsWith('+') && !line.startsWith('+++')) {
-            lineNum++;
-            current.html += `<div class="diff-line diff-line-add"><span class="diff-gutter">${lineNum}</span><span class="diff-content">${escHtml(line)}</span></div>`;
+            newNum++;
+            current.lines.push({ type: 'add', content: line.slice(1), oldNum: null, newNum });
         } else if (line.startsWith('-') && !line.startsWith('---')) {
-            current.html += `<div class="diff-line diff-line-del"><span class="diff-gutter">-</span><span class="diff-content">${escHtml(line)}</span></div>`;
+            oldNum++;
+            current.lines.push({ type: 'del', content: line.slice(1), oldNum, newNum: null });
         } else if (line.startsWith(' ') || line === '') {
-            lineNum++;
-            current.html += `<div class="diff-line diff-line-ctx"><span class="diff-gutter">${lineNum}</span><span class="diff-content">${escHtml(line)}</span></div>`;
+            oldNum++; newNum++;
+            current.lines.push({ type: 'ctx', content: line.slice(1), oldNum, newNum });
         }
     }
     if (current) files.push(current);
     return files;
 }
 
+function _renderUnifiedFile(file, fileIdx) {
+    let html = '';
+    let hunkIdx = -1;
+    for (const line of file.lines) {
+        if (line.type === 'hunk') {
+            hunkIdx++;
+            const hk = `${fileIdx}:${hunkIdx}`;
+            html += `<div class="diff-hunk-header" data-hunk="${escHtml(hk)}">` +
+                `<span class="diff-hunk-text">${escHtml(line.content)}</span>` +
+                `<button class="diff-comment-btn" title="Add review note" onclick="_sjToggleHunkComment(this)">&#128172;</button>` +
+                `</div>` +
+                `<div class="diff-hunk-comment" data-hunk="${escHtml(hk)}" style="display:none">` +
+                `<textarea class="diff-hunk-textarea" rows="2" placeholder="Review note for this hunk…"></textarea>` +
+                `<div class="diff-hunk-comment-actions">` +
+                `<button class="diff-comment-save" onclick="_sjSaveHunkComment(this)">Save</button>` +
+                `<button class="diff-comment-cancel" onclick="_sjCancelHunkComment(this)">Cancel</button>` +
+                `</div></div>`;
+        } else if (line.type === 'add') {
+            html += `<div class="diff-line diff-line-add">` +
+                `<span class="diff-gutter">${line.newNum}</span>` +
+                `<span class="diff-sigil">+</span>` +
+                `<span class="diff-content">${escHtml(line.content)}</span>` +
+                `</div>`;
+        } else if (line.type === 'del') {
+            html += `<div class="diff-line diff-line-del">` +
+                `<span class="diff-gutter">${line.oldNum}</span>` +
+                `<span class="diff-sigil">-</span>` +
+                `<span class="diff-content">${escHtml(line.content)}</span>` +
+                `</div>`;
+        } else if (line.type === 'ctx') {
+            html += `<div class="diff-line diff-line-ctx">` +
+                `<span class="diff-gutter">${line.newNum}</span>` +
+                `<span class="diff-sigil"> </span>` +
+                `<span class="diff-content">${escHtml(line.content)}</span>` +
+                `</div>`;
+        }
+    }
+    return html;
+}
+
+function _renderSplitFile(file, fileIdx) {
+    let html = '<table class="diff-split-table"><tbody>';
+    let hunkIdx = -1;
+    let i = 0;
+    const lines = file.lines;
+
+    while (i < lines.length) {
+        const line = lines[i];
+        if (line.type === 'hunk') {
+            hunkIdx++;
+            const hk = `${fileIdx}:${hunkIdx}`;
+            html += `<tr class="diff-split-hunk-row">` +
+                `<td colspan="2" class="diff-hunk-header" data-hunk="${escHtml(hk)}">` +
+                `<span class="diff-hunk-text">${escHtml(line.content)}</span>` +
+                `<button class="diff-comment-btn" title="Add review note" onclick="_sjToggleHunkComment(this)">&#128172;</button>` +
+                `</td></tr>`;
+            html += `<tr class="diff-hunk-comment-row" data-hunk="${escHtml(hk)}" style="display:none">` +
+                `<td colspan="2" class="diff-hunk-comment">` +
+                `<textarea class="diff-hunk-textarea" rows="2" placeholder="Review note for this hunk…"></textarea>` +
+                `<div class="diff-hunk-comment-actions">` +
+                `<button class="diff-comment-save" onclick="_sjSaveHunkComment(this)">Save</button>` +
+                `<button class="diff-comment-cancel" onclick="_sjCancelHunkComment(this)">Cancel</button>` +
+                `</div></td></tr>`;
+            i++;
+        } else if (line.type === 'ctx') {
+            html += `<tr><td class="diff-split-cell diff-split-old diff-line-ctx">` +
+                `<span class="diff-gutter">${line.oldNum}</span>` +
+                `<span class="diff-content">${escHtml(line.content)}</span>` +
+                `</td><td class="diff-split-cell diff-split-new diff-line-ctx">` +
+                `<span class="diff-gutter">${line.newNum}</span>` +
+                `<span class="diff-content">${escHtml(line.content)}</span>` +
+                `</td></tr>`;
+            i++;
+        } else {
+            // Collect consecutive del/add block and pair them side-by-side
+            const dels = [], adds = [];
+            while (i < lines.length && (lines[i].type === 'del' || lines[i].type === 'add')) {
+                if (lines[i].type === 'del') dels.push(lines[i]);
+                else adds.push(lines[i]);
+                i++;
+            }
+            const count = Math.max(dels.length, adds.length);
+            for (let p = 0; p < count; p++) {
+                const d = dels[p], a = adds[p];
+                html += `<tr>` +
+                    `<td class="diff-split-cell diff-split-old${d ? ' diff-line-del' : ' diff-split-empty'}">` +
+                    (d ? `<span class="diff-gutter">${d.oldNum}</span><span class="diff-content">${escHtml(d.content)}</span>` : '') +
+                    `</td>` +
+                    `<td class="diff-split-cell diff-split-new${a ? ' diff-line-add' : ' diff-split-empty'}">` +
+                    (a ? `<span class="diff-gutter">${a.newNum}</span><span class="diff-content">${escHtml(a.content)}</span>` : '') +
+                    `</td></tr>`;
+            }
+        }
+    }
+    html += '</tbody></table>';
+    return html;
+}
+
 function _renderDiff(diffText) {
     const files = _parseDiffFiles(diffText);
     if (files.length === 0) return '';
-    // Single file — skip tabs
-    if (files.length === 1) return files[0].html;
+    const renderFile = _sjDiffMode === 'split' ? _renderSplitFile : _renderUnifiedFile;
+
+    if (files.length === 1) {
+        const ext = files[0].name.split('.').pop().toLowerCase();
+        return `<div class="diff-viewer" data-lang="${escHtml(ext)}">${renderFile(files[0], 0)}</div>`;
+    }
     // Multiple files — render as tabs
     let tabsHtml = '<div class="sj-diff-tabs">';
     let panelsHtml = '<div class="sj-diff-panels">';
     files.forEach((f, i) => {
+        const ext = f.name.split('.').pop().toLowerCase();
         const activeClass = i === 0 ? ' active' : '';
         tabsHtml += `<button class="sj-diff-tab${activeClass}" title="${escHtml(f.name)}" onclick="_sjSelectDiffTab(this,${i})">${escHtml(f.name.split('/').pop())}</button>`;
-        panelsHtml += `<div class="sj-diff-panel${activeClass}"><div class="diff-viewer">${f.html}</div></div>`;
+        panelsHtml += `<div class="sj-diff-panel${activeClass}">` +
+            `<div class="diff-viewer" data-lang="${escHtml(ext)}">${renderFile(f, i)}</div></div>`;
     });
     tabsHtml += '</div>';
     panelsHtml += '</div>';
@@ -1581,6 +1689,135 @@ function _sjSelectDiffTab(tabEl, idx) {
     const panelsEl = tabsEl.nextElementSibling;
     tabsEl.querySelectorAll('.sj-diff-tab').forEach((t, i) => t.classList.toggle('active', i === idx));
     panelsEl.querySelectorAll('.sj-diff-panel').forEach((p, i) => p.classList.toggle('active', i === idx));
+}
+
+function _sjToggleDiffSplit() {
+    _sjDiffMode = _sjDiffMode === 'unified' ? 'split' : 'unified';
+    const btn = document.getElementById('sj-split-toggle');
+    if (btn) {
+        btn.innerHTML = _sjDiffMode === 'split' ? '&#9889; Unified' : '&#9889; Split';
+        btn.classList.toggle('active', _sjDiffMode === 'split');
+    }
+    const content = document.getElementById('sj-diff-content');
+    if (!content || !window._sjDiffData) return;
+    content.innerHTML = _renderDiff(window._sjDiffData.diff);
+    _sjApplySyntaxHighlighting(content);
+    _sjSetupHunkComments(window._sjTaskId, content);
+}
+
+function _sjApplySyntaxHighlighting(containerEl) {
+    if (typeof Prism === 'undefined') return;
+    const langMap = {
+        py: 'python', js: 'javascript', ts: 'typescript', jsx: 'javascript', tsx: 'typescript',
+        css: 'css', html: 'markup', xml: 'markup', json: 'json',
+        sh: 'bash', bash: 'bash', zsh: 'bash',
+        go: 'go', rs: 'rust', sql: 'sql', yaml: 'yaml', yml: 'yaml',
+        md: 'markdown', java: 'java', cpp: 'cpp', c: 'c', h: 'c',
+        rb: 'ruby', php: 'php', kt: 'kotlin', swift: 'swift',
+    };
+    containerEl.querySelectorAll('[data-lang]').forEach(el => {
+        const ext = el.getAttribute('data-lang');
+        const lang = langMap[ext];
+        if (!lang || !Prism.languages[lang]) return;
+        el.querySelectorAll('.diff-content').forEach(span => {
+            try {
+                span.innerHTML = Prism.highlight(span.textContent, Prism.languages[lang], lang);
+            } catch {}
+        });
+    });
+}
+
+function _sjSetupHunkComments(taskId, containerEl) {
+    const task = taskData[taskId];
+    let comments = {};
+    if (task && task.review_notes) {
+        try {
+            const p = JSON.parse(task.review_notes);
+            if (p && p.v === 1) comments = p.hunks || {};
+        } catch {}
+    }
+    Object.entries(comments).forEach(([hunkKey, text]) => {
+        if (!text) return;
+        const commentEl = [...containerEl.querySelectorAll('.diff-hunk-comment, .diff-hunk-comment-row')]
+            .find(el => el.getAttribute('data-hunk') === hunkKey);
+        if (commentEl) {
+            const ta = commentEl.querySelector('.diff-hunk-textarea');
+            if (ta) ta.value = text;
+        }
+        const hunkHeaderEl = [...containerEl.querySelectorAll('[data-hunk]')]
+            .find(el => el.getAttribute('data-hunk') === hunkKey &&
+                  !el.classList.contains('diff-hunk-comment') &&
+                  !el.classList.contains('diff-hunk-comment-row'));
+        if (hunkHeaderEl) {
+            const commentBtn = hunkHeaderEl.querySelector('.diff-comment-btn');
+            if (commentBtn) commentBtn.classList.add('diff-comment-has-note');
+        }
+    });
+}
+
+function _sjToggleHunkComment(btn) {
+    const hunkEl = btn.closest('[data-hunk]');
+    if (!hunkEl) return;
+    const hunkKey = hunkEl.getAttribute('data-hunk');
+    const commentEl = [...document.querySelectorAll('.diff-hunk-comment, .diff-hunk-comment-row')]
+        .find(el => el.getAttribute('data-hunk') === hunkKey);
+    if (!commentEl) return;
+    const isHidden = commentEl.style.display === 'none';
+    commentEl.style.display = isHidden ? '' : 'none';
+    if (isHidden) commentEl.querySelector('.diff-hunk-textarea')?.focus();
+}
+
+function _sjCancelHunkComment(btn) {
+    const commentEl = btn.closest('.diff-hunk-comment') || btn.closest('.diff-hunk-comment-row');
+    if (commentEl) commentEl.style.display = 'none';
+}
+
+async function _sjSaveHunkComment(btn) {
+    const taskId = window._sjTaskId;
+    if (!taskId) return;
+    const commentEl = btn.closest('.diff-hunk-comment') || btn.closest('.diff-hunk-comment-row');
+    if (!commentEl) return;
+    const hunkKey = commentEl.getAttribute('data-hunk');
+    if (!hunkKey) return;
+    const ta = commentEl.querySelector('.diff-hunk-textarea');
+    const text = ta ? ta.value.trim() : '';
+
+    const task = taskData[taskId];
+    let notesData = { v: 1, hunks: {} };
+    if (task && task.review_notes) {
+        try {
+            const p = JSON.parse(task.review_notes);
+            if (p && p.v === 1) notesData = p;
+        } catch {}
+    }
+    if (text) notesData.hunks[hunkKey] = text;
+    else delete notesData.hunks[hunkKey];
+
+    btn.disabled = true;
+    try {
+        const r = await fetch(`/api/tasks/${taskId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ review_notes: JSON.stringify(notesData) }),
+        });
+        if (r.ok) {
+            if (taskData[taskId]) taskData[taskId].review_notes = JSON.stringify(notesData);
+            commentEl.style.display = 'none';
+            const hunkHeaderEl = [...document.querySelectorAll('[data-hunk]')]
+                .find(el => el.getAttribute('data-hunk') === hunkKey &&
+                      !el.classList.contains('diff-hunk-comment') &&
+                      !el.classList.contains('diff-hunk-comment-row'));
+            const commentBtn = hunkHeaderEl?.querySelector('.diff-comment-btn');
+            if (commentBtn) commentBtn.classList.toggle('diff-comment-has-note', !!text);
+            _sjShowToast('Note saved.', 'success');
+        } else {
+            _sjShowToast('Failed to save note.', 'error');
+        }
+    } catch (e) {
+        _sjShowToast('Error: ' + e.message, 'error');
+    } finally {
+        btn.disabled = false;
+    }
 }
 
 function _sjToggleFullscreen() {
