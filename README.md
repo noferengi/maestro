@@ -9,6 +9,50 @@
 
 ---
 
+## Showcase
+
+### Kanban Board
+The main interface. An architecture constraint bar spans the top; task cards flow through nine automated pipeline stages below. Projects switch instantly via the sidebar.
+
+![Kanban Board](screenshots/main_page.png)
+
+---
+
+### Live Task Tracking
+The scheduler status view shows every active, queued, and blocked task in real time — with LLM endpoint assignment, token budgets, and session state at a glance.
+
+![Live Task Tracking](screenshots/live_task_tracking.png)
+
+---
+
+### LLM Diagnostics Viewer
+Full conversation replay for every LLM call — turn-by-turn context bars, tool call trees, token deltas, and cost breakdowns across all agent sessions.
+
+![LLM Diagnostics](screenshots/detailed_audits.png)
+
+---
+
+### Agent & Tool Catalogue
+Every agent type and its permitted tool set is visible in the UI — from SubdivisionAgent and PlanningPipeline through to SecurityPipeline and MergeWorker.
+
+![Agents and Tools](screenshots/agents_and_tools_visible.png)
+
+---
+
+### Split Diff with Syntax Highlighting
+The Stage Journal's code diff viewer supports unified and split modes with full syntax highlighting across all changed files on the task branch.
+
+![Diff Viewer](screenshots/diffs_with_syntax_highlighting.png)
+
+---
+
+### Rich Stage Journal
+Per-task audit trail covering planning gate checks, component results, security verdicts, Performance Improvement Plans, and final review votes — all in one scrollable view.
+
+![Stage Journal](screenshots/rich_stage_journal.png)
+
+---
+
 ## What It Is
 
 TheMaestro takes human intent — expressed as **IDEA cards on a Kanban board** — and drives a fleet of locally-hosted LLMs through a closed-loop pipeline:

@@ -1178,6 +1178,7 @@ function closeStageJournal() {
 }
 
 async function _buildStageJournal(taskId) {
+    const task = taskData[taskId];
     const body = document.getElementById('sj-body');
     try {
         const [summaryResp, planResp, compResp, optResp, secResp, frResp, mrResp, diffResp, rjResp, txnResp] = await Promise.all([

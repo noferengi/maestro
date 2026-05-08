@@ -52,8 +52,9 @@ Thumbs.db
 # Rotating log files — never commit live logs
 logs/
 
-# Screenshots / image assets
+# Screenshots / image assets (app-generated pngs ignored; showcase screenshots/ dir is tracked)
 *.png
+!screenshots/*.png
 
 /.maestro-worktrees/
 maestro.db
