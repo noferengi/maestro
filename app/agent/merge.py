@@ -99,18 +99,32 @@ def _ensure_mergetest_gitignore(project_path: str) -> None:
         logger.warning("[merge] Could not update .gitignore for mergetest entry: %s", e)
 
 
+def _discover_test_path(test_cwd: str) -> list[str]:
+    """Return the pytest path argument for this project, or [] for autodiscovery."""
+    for candidate in ("app/tests", "tests", "test"):
+        if os.path.isdir(os.path.join(test_cwd, candidate)):
+            return [candidate]
+    return []
+
+
 def _run_tests(project_path: str, test_cwd: str) -> tuple[bool, str]:
     """Run the project test suite in test_cwd. Returns (passed, output)."""
+    from app.agent.worktree import venv_python
+    python = venv_python(project_path)
+    test_arg = _discover_test_path(test_cwd)
+    cmd = [python, "-m", "pytest"] + test_arg + ["-x", "--tb=short", "-q"]
     try:
         test_result = subprocess.run(
-            ["python", "-m", "pytest", "app/tests/", "-x", "--tb=short", "-q"],
+            cmd,
             capture_output=True,
             text=True,
             timeout=MERGE_TEST_TIMEOUT,
             cwd=test_cwd,
         )
         output = (test_result.stdout + test_result.stderr)[:4000]
-        return test_result.returncode == 0, output
+        # Exit code 5 = no tests collected — project has no tests, treat as pass
+        passed = test_result.returncode in (0, 5)
+        return passed, output
     except subprocess.TimeoutExpired:
         return False, f"Test suite timed out after {MERGE_TEST_TIMEOUT}s"
     except Exception as e:

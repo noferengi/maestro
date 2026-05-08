@@ -5,7 +5,7 @@ Each dispatched task gets its own checkout at:
 """
 from __future__ import annotations
 import glob as _glob
-import logging, os, subprocess, sys, threading
+import logging, os, subprocess, sys, threading, time
 from typing import Iterable
 from app.agent.config import GIT_SAFETY_BRANCH_PREFIX, GIT_ALLOWED_BASE_BRANCHES, GIT_TIMEOUT_SECONDS
 
@@ -18,6 +18,8 @@ _bootstrap_lock = threading.Lock()
 _bootstrapped_projects: set[str] = set()
 _env_setup_lock = threading.Lock()
 _env_setup_done: set[str] = set()
+_ghost_removal_failures: dict[str, float] = {}  # path -> timestamp of last failed removal
+_GHOST_REMOVAL_COOLDOWN = 300.0  # retry ghost removal at most once per 5 minutes
 
 
 def _run(args, cwd, timeout=GIT_TIMEOUT_SECONDS):
@@ -209,6 +211,11 @@ def setup_task_worktree(task_id: str, project_path: str) -> str | None:
                 return worktree_dir
 
         # If exists but not registered, or registration check failed, try to clean it up
+        # Suppress repeat attempts within the cooldown window to avoid log spam on locked dirs
+        now = time.time()
+        last_failure = _ghost_removal_failures.get(worktree_dir, 0)
+        if now - last_failure < _GHOST_REMOVAL_COOLDOWN:
+            return None
         logger.warning("[worktree] directory '%s' exists but is not registered; attempting removal", worktree_dir)
         import shutil
         try:
@@ -218,8 +225,10 @@ def setup_task_worktree(task_id: str, project_path: str) -> str | None:
                 shutil.rmtree(worktree_dir)
             else:
                 os.remove(worktree_dir)
+            _ghost_removal_failures.pop(worktree_dir, None)
         except Exception as exc:
             logger.error("[worktree] failed to remove ghost directory '%s': %s", worktree_dir, exc)
+            _ghost_removal_failures[worktree_dir] = now
             return None
 
     if _branch_exists(project_path, branch_name):
