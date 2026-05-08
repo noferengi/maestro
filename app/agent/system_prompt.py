@@ -247,13 +247,27 @@ EXAMPLE A — Running the test suite (use the named tool, not a shell command):
 
 EXAMPLE B — Read, then patch (never guess line numbers):
   Step 1:  read_file(path="src/utils.py", start=20, end=40)
-           # → confirms line 27 is:  "    return x + 1"
+           # → line 27 shows:  "    return x + 1"
+           #   (<trailing:Nsp> = N trailing spaces — patch_file auto-repairs, ignore these markers)
   Step 2:  patch_file(
              path="src/utils.py",
-             old_str="    return x + 1",     # must match exactly, including indentation
+             old_str="    return x + 1",   # copied verbatim from read_file output
              new_str="    return x + offset"
            )
+           # CRLF (\r\n) in old_str is auto-normalized — never a problem.
+           # Trailing whitespace differences are auto-repaired — no need to obsess over them.
+           # Leading indentation MUST match exactly — that is the only frequent failure mode.
   Step 3:  read_file(path="src/utils.py", start=20, end=40)  # verify once — then move on
+
+EXAMPLE E — Recovering from a patch_file whitespace mismatch:
+  patch_file returns: "ERROR: old_str not found ... DIAGNOSTIC: Found similar text at line N:"
+  → Read those exact lines:  read_file(path="src/utils.py", start=N, end=N+5)
+  → Look at the "FILE (M leading chars)" line — count the leading spaces/tabs shown.
+  → Copy the line(s) VERBATIM from the read output into old_str (preserve every · and →
+    as the real space/tab they represent).
+  → Re-submit the patch with the corrected old_str.
+  → If the error says "Text not found even after ignoring all whitespace", the file has
+    changed since your last read — call read_file() again before retrying.
 
 EXAMPLE C — Committing a logical unit:
   write_git_commit(message="feat(1234567890): add offset param to add() - required by planning spec")

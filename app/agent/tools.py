@@ -181,9 +181,31 @@ def _serve_file_lines(safe_path: str, start: int, end: int) -> str:
     start = max(1, min(start, total))
     end   = max(start, min(end, total))
     _record_served_range(norm, start, end)
-    result = [f"== FILE: {safe_path} (lines {start}-{end} of {total}) =="]
+    rows: list[str] = []
+    has_trailing = False
     for i in range(start, end + 1):
-        result.append(f"{i}: {all_lines[i - 1].rstrip()}")
+        raw = all_lines[i - 1].rstrip('\r\n')  # strip line endings; keep trailing spaces/tabs
+        stripped = raw.rstrip(' \t')
+        tail = raw[len(stripped):]
+        if tail:
+            has_trailing = True
+            n_sp = tail.count(' ')
+            n_tab = tail.count('\t')
+            parts = []
+            if n_sp:
+                parts.append(f"{n_sp}sp")
+            if n_tab:
+                parts.append(f"{n_tab}tab")
+            rows.append(f"{i}: {stripped}  <trailing:{'+'.join(parts)}>")
+        else:
+            rows.append(f"{i}: {raw}")
+    header = f"== FILE: {safe_path} (lines {start}-{end} of {total}) =="
+    if has_trailing:
+        header += (
+            "\n(note: <trailing:Nsp> = N trailing spaces, <trailing:Ntab> = N trailing tabs"
+            " - patch_file auto-repairs these; you do NOT need to include them in old_str)"
+        )
+    result = [header] + rows
     return "\n".join(result)
 
 
@@ -656,6 +678,35 @@ def append_file(path: str, content: str) -> str:
         return f"ERROR appending to '{path}': {exc}"
 
 
+def _find_old_str_lax(text: str, old_str: str) -> "tuple[int, int] | None":
+    """Line-by-line match ignoring trailing whitespace.
+
+    Returns (char_start, char_end) of the matched block in *text*, or None if
+    the block is not found exactly once (0 or 2+ matches → None).
+    """
+    text_lines = text.splitlines(keepends=True)
+    old_lines = old_str.splitlines(keepends=True) or [old_str]
+    n = len(old_lines)
+    old_stripped = [l.rstrip() for l in old_lines]
+    matches: list[int] = []
+    for i in range(max(1, len(text_lines) - n + 1 + 1)):  # iterate all valid start positions
+        if i + n > len(text_lines):
+            break
+        if [l.rstrip() for l in text_lines[i : i + n]] == old_stripped:
+            matches.append(i)
+    if len(matches) != 1:
+        return None
+    i = matches[0]
+    char_start = sum(len(text_lines[j]) for j in range(i))
+    char_end = char_start + sum(len(text_lines[i + j]) for j in range(n))
+    return char_start, char_end
+
+
+def _vis_ws(s: str) -> str:
+    """Render non-obvious whitespace visibly (ASCII-safe) for diagnostics."""
+    return s.replace('\r', '[CR]').replace('\t', '[TAB]')
+
+
 def patch_file(path: str, old_str: str, new_str: str) -> str:
     """[WRITE — files] Replace an exact string in a file. old_str must appear exactly once.
     Auto-stages for git. Path must be inside project root.
@@ -674,37 +725,91 @@ def patch_file(path: str, old_str: str, new_str: str) -> str:
             original = fh.read()
     except OSError as exc:
         return f"ERROR reading '{path}': {exc}"
+
+    # Normalize CRLF in old_str — Python text-mode reads already strip \r from the
+    # file, so a mismatch is guaranteed if the LLM emitted \r\n in its JSON output.
+    old_str = old_str.replace('\r\n', '\n').replace('\r', '\n')
+
     count = original.count(old_str)
     if count == 0:
-        # Detailed diagnostics for common whitespace/line-ending mismatches
         msg = [f"ERROR: old_str not found in '{path}'."]
-        
-        # 1. Check for basic presence of the text ignoring whitespace
+
+        # Auto-repair path: trailing whitespace on lines doesn't match but text does.
+        lax = _find_old_str_lax(original, old_str)
+        if lax is not None:
+            char_start, char_end = lax
+            start_line = original[:char_start].count("\n") + 1
+            end_line = start_line + old_str.count("\n")
+            norm = os.path.normpath(os.path.realpath(safe_path))
+            unserved = _next_unserved_range(norm, start_line, end_line)
+            if unserved is not None:
+                return (
+                    f"ERROR: lines {start_line}-{end_line} of '{path}' have not been read yet. "
+                    f"Call read_file('{path}', start={start_line}, end={end_line}) first."
+                )
+            effective_root = _task_git_cwd.get() or PROJECT_ROOT
+            rel_path = os.path.relpath(os.path.realpath(safe_path), os.path.realpath(effective_root))
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+            archive_dest = os.path.join(_effective_archive_dir(), timestamp, rel_path)
+            try:
+                os.makedirs(os.path.dirname(archive_dest), exist_ok=True)
+                shutil.copy2(safe_path, archive_dest)
+            except OSError as exc:
+                return f"ERROR: could not archive pre-patch copy of '{path}': {exc}"
+            patched = original[:char_start] + new_str + original[char_end:]
+            try:
+                with open(safe_path, "w", encoding="utf-8") as fh:
+                    fh.write(patched)
+            except OSError as exc:
+                return f"ERROR writing '{path}': {exc}"
+            _invalidate_prepped_cache(safe_path)
+            _git_run(["git", "add", safe_path])
+            lines_changed = new_str.count("\n") - old_str.count("\n")
+            return (
+                f"OK: patched '{path}' (lines {start_line}-{end_line}, net {lines_changed:+d} lines). "
+                f"[auto-repaired: trailing whitespace ignored during match] "
+                f"Staged for git. Pre-patch copy archived to '{archive_dest}'."
+            )
+
+        # Diagnostic path: show visible whitespace so the model can spot the mismatch.
         import re
-        def _canonical(s): return re.sub(r"\s+", "", s)
+        def _canonical(s: str) -> str: return re.sub(r"\s+", "", s)
         if _canonical(old_str) in _canonical(original):
             msg.append("HINT: The text exists but whitespace/indentation does not match exactly.")
-            if "\t" in old_str or "\t" in original:
-                old_has_tabs = "\t" in old_str
-                file_has_tabs = "\t" in original
-                if old_has_tabs != file_has_tabs:
-                    msg.append(f"DIAGNOSTIC: Your string {'has' if old_has_tabs else 'lacks'} TABS, but the file {'has' if file_has_tabs else 'lacks'} them.")
-            
-            # Find the closest match to show the user what they missed
+            old_has_tabs = "\t" in old_str
+            file_has_tabs = "\t" in original
+            if old_has_tabs != file_has_tabs:
+                msg.append(
+                    f"DIAGNOSTIC: Your old_str {'has' if old_has_tabs else 'lacks'} tabs, "
+                    f"but the file {'has' if file_has_tabs else 'lacks'} them."
+                )
             lines = original.splitlines()
             old_lines = old_str.splitlines()
             if old_lines:
                 first_line_clean = old_lines[0].strip()
-                for i, line in enumerate(lines, 1):
-                    if first_line_clean in line:
-                        msg.append(f"DIAGNOSTIC: Found similar text on line {i}:")
-                        msg.append(f"  FILE: '{line.replace('\t', '\\t')}'")
-                        msg.append(f"  YOUR: '{old_lines[0].replace('\t', '\\t')}'")
+                for lineno, line in enumerate(lines, 1):
+                    if first_line_clean and first_line_clean in line:
+                        file_lead = len(line) - len(line.lstrip())
+                        old_lead = len(old_lines[0]) - len(old_lines[0].lstrip())
+                        msg.append(f"DIAGNOSTIC: Found similar text at line {lineno}:")
+                        msg.append(f"  FILE ({file_lead} leading chars): '{_vis_ws(line)}'")
+                        msg.append(f"  YOUR ({old_lead} leading chars): '{_vis_ws(old_lines[0])}'")
+                        msg.append("(legend: ·=space →=tab ↵=carriage-return)")
+                        if file_lead != old_lead:
+                            msg.append(
+                                f"  FIX: adjust leading whitespace in old_str "
+                                f"from {old_lead} to {file_lead} characters."
+                            )
                         break
         else:
-            msg.append("HINT: The text was not found even after ignoring whitespace. Please call read_file() again to verify the content.")
-        
-        msg.append("Check whitespace, indentation, and line endings (\\n vs \\r\\n).")
+            msg.append(
+                "HINT: Text not found even after ignoring all whitespace. "
+                "Call read_file() again to get the exact current content."
+            )
+        msg.append(
+            "ACTION: re-read the affected lines with read_file(start=N, end=M), "
+            "then copy the lines verbatim into old_str."
+        )
         return "\n".join(msg)
     if count > 1:
         return (
@@ -2966,6 +3071,10 @@ TOOL_SCHEMAS: list[dict] = [
                 "REQUIRES the specific lines being edited to have been served by read_file() — enforced. "
                 "old_str must match exactly once — extend it with more surrounding lines if ambiguous. "
                 "Fails with a clear error if old_str appears 0 or 2+ times. "
+                "CRLF (\\r\\n) in old_str is auto-normalized — you never need to worry about \\r. "
+                "Trailing whitespace differences per line are auto-repaired when the text otherwise matches. "
+                "read_file marks trailing whitespace as <trailing:Nsp> or <trailing:Ntab>; "
+                "you do NOT need to include these markers in old_str — they are informational only. "
                 "Prefer this over write_file for any targeted edit: avoids full-file rewrites and the "
                 "silent regressions they cause. Auto-stages for git. Path must be inside project root."
             ),
@@ -2976,9 +3085,11 @@ TOOL_SCHEMAS: list[dict] = [
                     "old_str": {
                         "type": "string",
                         "description": (
-                            "Exact text to find and replace. Must appear exactly once in the file. "
-                            "Include enough surrounding context (blank lines, function signatures) "
-                            "to be unambiguous. Whitespace and indentation must match precisely."
+                            "Text to find and replace — copied verbatim from a recent read_file() call. "
+                            "Must appear exactly once. Include 2-3 lines of surrounding context "
+                            "(blank lines, function signatures) to ensure uniqueness. "
+                            "Leading indentation must match exactly. "
+                            "CRLF is auto-normalized. Trailing whitespace differences are auto-repaired."
                         ),
                     },
                     "new_str": {
