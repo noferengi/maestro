@@ -61,6 +61,7 @@ class DevOrchestrator:
         budget_id: int | None = None,
         max_context: int = 0,
         review_feedback: str | None = None,
+        project_path: str | None = None,
     ):
         self.task_id = task_id
         self.plan = planning_result
@@ -71,6 +72,7 @@ class DevOrchestrator:
         self.budget_id = budget_id
         self.max_context = max_context
         self.review_feedback = review_feedback
+        self.project_path = project_path
 
     async def run(self) -> DevOrchestratorResult:
         """Execute all batches of components."""
@@ -80,8 +82,8 @@ class DevOrchestrator:
         if not steps:
             return DevOrchestratorResult(
                 task_id=self.task_id,
-                status="ERROR",
-                error_detail="No implementation steps in planning result.",
+                status="REVERT_TO_DESIGN",
+                error_detail="Planning result has no implementation_steps — demoting to planning for re-run.",
             )
 
         # Bump run counter so this dispatch's results are isolated from prior runs.
@@ -607,6 +609,7 @@ async def run_dev_orchestrator(
         budget_id=budget_id,
         max_context=_max_context,
         review_feedback=review_feedback,
+        project_path=project_path,
     )
     result = await orch.run()
     return {

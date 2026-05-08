@@ -277,40 +277,86 @@ class TestCleanupFinished:
             _active_sessions.pop("alive-m", None)
 
 
-class TestCheckPlanningTimeouts:
-    def test_check_planning_timeouts_kills_session(self):
+class TestRecoverHungSessions:
+    def test_hung_session_kills_and_frees_slot(self):
+        """_recover_hung_sessions() kills a planning session idle beyond the threshold."""
         from app.agent.scheduler import (
-            _check_planning_timeouts, _active_sessions, _session_types,
-            _session_started_at, _session_ids, _PLANNING_SESSION_TIMEOUT_SECS,
-            _session_llm_ids, _llm_session_counts
+            _recover_hung_sessions,
+            _active_sessions, _active_sessions_lock,
+            _session_types, _session_started_at, _session_ids,
+            _HUNG_SESSION_MIN_AGE_SECONDS, _HUNG_SESSION_IDLE_SECONDS,
+            _session_llm_ids,
         )
         import time
 
         mock_thread = MagicMock(spec=threading.Thread)
         mock_thread.is_alive.return_value = True
-        task_id = "timeout-task"
-        session_id = "llm-session-123"
+        task_id = "timeout-task-hung"
+        session_id = "llm-session-hung-123"
 
-        # Patch the function in llm_client since it's imported locally in _check_planning_timeouts
-        with patch("app.agent.llm_client.kill_session") as mock_kill:
+        # DB mock: no budget entries → idle_secs = time since session start.
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.order_by.return_value.first.return_value = None
+
+        # Session started long enough ago to exceed both MIN_AGE and IDLE thresholds.
+        old_start = time.time() - max(_HUNG_SESSION_MIN_AGE_SECONDS, _HUNG_SESSION_IDLE_SECONDS) - 60
+
+        with patch("app.agent.llm_client.kill_session") as mock_kill, \
+             patch("app.database.session.SessionLocal", return_value=mock_db):
             with _active_sessions_lock:
                 _active_sessions[task_id] = mock_thread
                 _session_types[task_id] = "planning"
-                _session_started_at[task_id] = time.time() - (_PLANNING_SESSION_TIMEOUT_SECS + 10)
+                _session_started_at[task_id] = old_start
                 _session_ids[task_id] = session_id
                 _session_llm_ids[task_id] = 46
 
-            with _llm_counts_lock:
-                _llm_session_counts[46] = 1
-
-            _check_planning_timeouts()
+            _recover_hung_sessions()
 
             mock_kill.assert_called_once_with(session_id)
             with _active_sessions_lock:
                 assert task_id not in _active_sessions
                 assert task_id not in _session_ids
-            with _llm_counts_lock:
-                assert _llm_session_counts[46] == 0
+
+    def test_young_session_is_not_killed(self):
+        """Sessions below MIN_AGE threshold are left alone even if LLM-idle."""
+        from app.agent.scheduler import (
+            _recover_hung_sessions,
+            _active_sessions, _active_sessions_lock,
+            _session_types, _session_started_at, _session_ids,
+            _HUNG_SESSION_MIN_AGE_SECONDS,
+            _session_llm_ids,
+        )
+        import time
+
+        mock_thread = MagicMock(spec=threading.Thread)
+        mock_thread.is_alive.return_value = True
+        task_id = "timeout-task-young"
+        session_id = "llm-session-young-456"
+
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.order_by.return_value.first.return_value = None
+
+        # Session is only 30 seconds old — below MIN_AGE.
+        with patch("app.agent.llm_client.kill_session") as mock_kill, \
+             patch("app.database.session.SessionLocal", return_value=mock_db):
+            with _active_sessions_lock:
+                _active_sessions[task_id] = mock_thread
+                _session_types[task_id] = "planning"
+                _session_started_at[task_id] = time.time() - 30
+                _session_ids[task_id] = session_id
+                _session_llm_ids[task_id] = 46
+
+            _recover_hung_sessions()
+
+            mock_kill.assert_not_called()
+            with _active_sessions_lock:
+                assert task_id in _active_sessions  # untouched
+                # Clean up test state
+                _active_sessions.pop(task_id, None)
+                _session_types.pop(task_id, None)
+                _session_started_at.pop(task_id, None)
+                _session_ids.pop(task_id, None)
+                _session_llm_ids.pop(task_id, None)
 
 
 # ===========================================================================

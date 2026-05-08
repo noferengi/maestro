@@ -2143,13 +2143,16 @@ def _validate_flags(
     allowlist: frozenset,
     value_flags: frozenset = frozenset(),
     task_id: str | None = None,
-) -> list:
+) -> tuple[list, list]:
     """
-    Split flags string and return only allowlisted tokens.
-    Rejected tokens are logged and dropped — never executed.
+    Split flags string and return (safe_flags, rejected_flags).
+
+    safe_flags: only allowlisted tokens, safe to pass to subprocess.
+    rejected_flags: tokens that were dropped (logged + returned so callers
+    can surface the reason to the LLM agent).
     """
     if not flags or not flags.strip():
-        return []
+        return [], []
     try:
         tokens = shlex.split(flags)
     except ValueError as exc:
@@ -2157,7 +2160,7 @@ def _validate_flags(
             "[security] Tool '%s' (task=%s): shlex.split failed on flags=%r — rejected entirely. Error: %s",
             tool_name, task_id, flags[:200], exc,
         )
-        return []
+        return [], [repr(flags[:200])]
 
     result: list = []
     rejected: list = []
@@ -2191,7 +2194,7 @@ def _validate_flags(
             "[security] Tool '%s' (task=%s) rejected %d flag token(s): %s",
             tool_name, task_id, len(rejected), ", ".join(rejected),
         )
-    return result
+    return result, rejected
 
 
 def _validate_tool_path(path: str, tool_name: str, task_id: str | None = None) -> str | None:
@@ -2237,7 +2240,16 @@ def run_test_pytest(
     if cwd is None:
         return "ERROR: No task git working directory configured."
     safe_path = _validate_tool_path(path, "run_test_pytest") or "."
-    safe_flags = _validate_flags(flags, "run_test_pytest", _PYTEST_FLAGS, _PYTEST_VALUE_FLAGS)
+    safe_flags, _rejected = _validate_flags(flags, "run_test_pytest", _PYTEST_FLAGS, _PYTEST_VALUE_FLAGS)
+    _rejection_prefix = ""
+    if _rejected:
+        _rejection_prefix = (
+            f"[SECURITY] {len(_rejected)} flag(s) blocked by security policy and removed: "
+            f"{', '.join(_rejected)}.\n"
+            "NOTE: A per-test timeout is automatically injected — do not pass "
+            "-p no:timeout, -o timeout=0, --override-ini=addopts=, or similar "
+            "timeout-disabling flags. Use --timeout=N if a longer timeout is needed.\n\n"
+        )
     args = [_venv_python(cwd), "-m", "pytest", safe_path] + safe_flags
     # Inject per-test timeout unless the project config already sets one.
     has_timeout = any("--timeout" in f for f in safe_flags)
@@ -2262,7 +2274,7 @@ def run_test_pytest(
     )
     rc, result = _run_tool_subprocess(args, cwd, SHELL_TIMEOUT_SECONDS, timeout_msg)
     _last_test_output.set(result)
-    return _slice_output(result, head=head, tail=tail, grep=grep)
+    return _rejection_prefix + _slice_output(result, head=head, tail=tail, grep=grep)
 
 
 def run_check_mypy(path: str, flags: str = "") -> str:
@@ -2271,7 +2283,7 @@ def run_check_mypy(path: str, flags: str = "") -> str:
     if cwd is None:
         return "ERROR: No task git working directory configured."
     safe_path = _validate_tool_path(path, "run_check_mypy") or "."
-    safe_flags = _validate_flags(flags, "run_check_mypy", _MYPY_FLAGS, _MYPY_VALUE_FLAGS)
+    safe_flags, _ = _validate_flags(flags, "run_check_mypy", _MYPY_FLAGS, _MYPY_VALUE_FLAGS)
     args = [_venv_python(cwd), "-m", "mypy", safe_path] + safe_flags
     rc, out = _run_tool_subprocess(args, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: mypy timed out after {SHELL_TIMEOUT_SECONDS}s.")
     return out
@@ -2283,7 +2295,7 @@ def run_check_ruff(path: str = ".", flags: str = "") -> str:
     if cwd is None:
         return "ERROR: No task git working directory configured."
     safe_path = _validate_tool_path(path, "run_check_ruff") or "."
-    safe_flags = _validate_flags(flags, "run_check_ruff", _RUFF_FLAGS, _RUFF_VALUE_FLAGS)
+    safe_flags, _ = _validate_flags(flags, "run_check_ruff", _RUFF_FLAGS, _RUFF_VALUE_FLAGS)
     args = [_venv_python(cwd), "-m", "ruff", "check", safe_path] + safe_flags
     rc, out = _run_tool_subprocess(args, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: ruff timed out after {SHELL_TIMEOUT_SECONDS}s.")
     return out
@@ -2337,7 +2349,7 @@ def run_test_cargo(args: str = "") -> str:
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    safe_flags = _validate_flags(args, "run_test_cargo", _CARGO_TEST_FLAGS, _CARGO_TEST_VALUE_FLAGS)
+    safe_flags, _ = _validate_flags(args, "run_test_cargo", _CARGO_TEST_FLAGS, _CARGO_TEST_VALUE_FLAGS)
     rc, out = _run_tool_subprocess(["cargo", "test"] + safe_flags, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: cargo test timed out after {SHELL_TIMEOUT_SECONDS}s.")
     return out
 
@@ -2348,7 +2360,7 @@ def run_test_go(path: str = "./...", flags: str = "") -> str:
     if cwd is None:
         return "ERROR: No task git working directory configured."
     safe_path = _validate_tool_path(path, "run_test_go") or "./..."
-    safe_flags = _validate_flags(flags, "run_test_go", _GO_TEST_FLAGS, _GO_TEST_VALUE_FLAGS)
+    safe_flags, _ = _validate_flags(flags, "run_test_go", _GO_TEST_FLAGS, _GO_TEST_VALUE_FLAGS)
     args = ["go", "test"] + safe_flags + [safe_path]
     rc, out = _run_tool_subprocess(args, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: go test timed out after {SHELL_TIMEOUT_SECONDS}s.")
     return out
@@ -2373,7 +2385,7 @@ def run_build_cargo(args: str = "") -> str:
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    safe_flags = _validate_flags(args, "run_build_cargo", _CARGO_BUILD_FLAGS, _CARGO_BUILD_VALUE_FLAGS)
+    safe_flags, _ = _validate_flags(args, "run_build_cargo", _CARGO_BUILD_FLAGS, _CARGO_BUILD_VALUE_FLAGS)
     rc, out = _run_tool_subprocess(["cargo", "build"] + safe_flags, cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: cargo build timed out after {_BUILD_TIMEOUT_SECONDS}s.")
     return out
 
@@ -2404,7 +2416,7 @@ def run_build_tsc(args: str = "") -> str:
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    safe_flags = _validate_flags(args, "run_build_tsc", _TSC_FLAGS, _TSC_VALUE_FLAGS)
+    safe_flags, _ = _validate_flags(args, "run_build_tsc", _TSC_FLAGS, _TSC_VALUE_FLAGS)
     rc, out = _run_tool_subprocess(["tsc"] + safe_flags, cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: tsc timed out after {_BUILD_TIMEOUT_SECONDS}s.")
     return out
 

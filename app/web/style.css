@@ -2991,3 +2991,75 @@ body {
     margin-right: 0.15rem;
 }
 .sj-expand-btn:hover { color: #212529; }
+
+/* Fullscreen review toolbar */
+.sj-fullscreen-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.55rem 1rem;
+    background: #161b22;
+    border-bottom: 1px solid #30363d;
+    border-radius: 6px 6px 0 0;
+    flex-shrink: 0;
+}
+.sj-toolbar-title {
+    font-size: 0.85rem;
+    color: #8b949e;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 55%;
+}
+.sj-toolbar-actions { display: flex; gap: 0.5rem; align-items: center; }
+.sj-toolbar-stage-note { font-size: 0.78rem; color: #6c757d; }
+.sj-toolbar-btn {
+    padding: 0.35rem 0.85rem;
+    border-radius: 4px;
+    border: none;
+    cursor: pointer;
+    font-size: 0.82rem;
+    font-weight: 600;
+    transition: opacity 0.15s;
+}
+.sj-toolbar-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.sj-btn-approve { background: #1a7f37; color: #fff; }
+.sj-btn-approve:hover:not(:disabled) { background: #238636; }
+.sj-btn-reject  { background: #3d1f1f; color: #f85149; border: 1px solid #6e1c1c; }
+.sj-btn-reject:hover:not(:disabled) { background: #57201f; }
+
+/* Diff stat banner */
+.sj-diff-stat-banner {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.3rem 0.5rem;
+    font-size: 0.78rem;
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    margin-bottom: 0.4rem;
+}
+.sj-diff-stat-banner .stat-files { color: #8b949e; }
+.sj-diff-stat-banner .stat-add   { color: #3fb950; font-weight: 600; }
+.sj-diff-stat-banner .stat-del   { color: #f85149; font-weight: 600; }
+
+/* Toast notification */
+.sj-toast {
+    position: fixed;
+    bottom: 1.5rem;
+    right: 1.5rem;
+    padding: 0.65rem 1.1rem;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    font-weight: 500;
+    z-index: 9999;
+    opacity: 0;
+    transform: translateY(8px);
+    transition: opacity 0.25s, transform 0.25s;
+    pointer-events: none;
+}
+.sj-toast-visible { opacity: 1; transform: translateY(0); }
+.sj-toast-success { background: #1a7f37; color: #fff; }
+.sj-toast-error   { background: #8d1919; color: #fff; }

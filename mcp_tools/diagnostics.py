@@ -575,7 +575,11 @@ def get_capacity_status() -> dict:
                     "sessions_used": used,
                     "sessions_free": free,
                     "sessions_total": cap,
-                    "status": "FULL" if free == 0 else f"{free} free",
+                    "status": (
+                        f"OVERCOUNTED ({used}/{cap}) — zombie session likely; restart server to clear"
+                        if used > cap else
+                        "FULL" if free == 0 else f"{free} free"
+                    ),
                 })
 
             result_nodes.append({
@@ -606,7 +610,11 @@ def get_capacity_status() -> dict:
                     "sessions_used": used,
                     "sessions_free": free,
                     "sessions_total": cap,
-                    "status": "FULL" if free == 0 else f"{free} free",
+                    "status": (
+                        f"OVERCOUNTED ({used}/{cap}) — zombie session likely; restart server to clear"
+                        if used > cap else
+                        "FULL" if free == 0 else f"{free} free"
+                    ),
                 })
             result_nodes.append({
                 "node_id": None,

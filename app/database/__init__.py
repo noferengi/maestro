@@ -275,6 +275,7 @@ from .crud_sessions import (
     create_agent_session,
     close_agent_session,
     close_zombie_sessions,
+    close_zombie_sessions_for_tasks,
     get_agent_sessions_for_task,
 )
 

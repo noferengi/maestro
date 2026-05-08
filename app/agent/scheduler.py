@@ -299,6 +299,11 @@ def unpark_session(session_key: str, llm_id: int) -> None:
     )
 
 
+# Hung session recovery: kill sessions that are alive but have made no LLM call recently.
+# Min age prevents false positives on brand-new sessions still in their survey/setup phase.
+_HUNG_SESSION_MIN_AGE_SECONDS = 600   # 10 min
+_HUNG_SESSION_IDLE_SECONDS    = 1800  # 30 min — kill if no LLM call in this window
+
 # task_id -> timestamp of last failed dispatch (cooldown to avoid retry storms)
 _failed_cooldowns: dict[str, float] = {}
 _FAIL_COOLDOWN_SECONDS = 60.0  # Wait 60s before retrying a failed task
@@ -897,6 +902,8 @@ def _tick() -> None:
     # 0. Cleanup finished sessions (also removes from _session_llm_ids)
     _cleanup_finished()
 
+    # 0a-pre. Kill sessions alive but LLM-idle for too long (hung tool calls, stalled HTTP).
+    _recover_hung_sessions()
 
     # 0a. Rescue stale background jobs: orphaned 'running' and cooled-down 'failed'
     #     file-summary and research jobs are reset to 'pending' so they flow through
@@ -4204,6 +4211,92 @@ def _record_demotion_inline(task_id: str, from_stage: str, to_stage: str, reason
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _recover_hung_sessions() -> None:
+    """Kill sessions that have been alive but LLM-idle for _HUNG_SESSION_IDLE_SECONDS.
+
+    The scheduler thread cannot directly interrupt a blocking tool call, but
+    calling kill_session() poisons the session UUID so the next call_llm()
+    raises SessionKilledError.  Removing the task from _active_sessions
+    immediately frees the LLM slot for re-dispatch on the same tick.
+    The old thread closes the DB agent_sessions row when it finally exits.
+    """
+    import datetime as _dt_mod
+    from app.database.session import SessionLocal as _SL
+    from app.database.models import BudgetEntry as _BE
+    from app.agent.llm_client import kill_session as _kill_session
+
+    now_mono = time.time()
+    now_utc = _dt_mod.datetime.now(_dt_mod.timezone.utc)
+
+    with _active_sessions_lock:
+        snapshot = [
+            (tid, _session_started_at.get(tid, now_mono),
+             _session_llm_ids.get(tid), _session_ids.get(tid),
+             _session_types.get(tid))
+            for tid, thread in _active_sessions.items()
+            if thread.is_alive()
+            and now_mono - _session_started_at.get(tid, now_mono) >= _HUNG_SESSION_MIN_AGE_SECONDS
+        ]
+
+    if not snapshot:
+        return
+
+    try:
+        db = _SL()
+        try:
+            for tid, start, llm_id, sess_uuid, stype in snapshot:
+                latest = (
+                    db.query(_BE)
+                    .filter(_BE.task_id == tid)
+                    .order_by(_BE.created_at.desc())
+                    .first()
+                )
+                if latest is None:
+                    idle_secs = now_mono - start
+                else:
+                    last_at = latest.created_at
+                    if isinstance(last_at, str):
+                        last_at = _dt_mod.datetime.fromisoformat(
+                            last_at.replace("Z", "+00:00")
+                        )
+                    if last_at.tzinfo is None:
+                        last_at = last_at.replace(tzinfo=_dt_mod.timezone.utc)
+                    idle_secs = (now_utc - last_at).total_seconds()
+
+                if idle_secs < _HUNG_SESSION_IDLE_SECONDS:
+                    continue
+
+                logger.warning(
+                    "[scheduler] Hung session for task '%s' (idle %.0f min, type=%s) — "
+                    "killing and freeing slot for re-dispatch.",
+                    tid, idle_secs / 60, stype,
+                )
+
+                if sess_uuid:
+                    try:
+                        _kill_session(sess_uuid)
+                    except Exception:
+                        pass
+
+                with _active_sessions_lock:
+                    _active_sessions.pop(tid, None)
+                    _session_llm_ids.pop(tid, None)
+                    _session_types.pop(tid, None)
+                    _session_started_at.pop(tid, None)
+                    _session_titles.pop(tid, None)
+                    _session_ids.pop(tid, None)
+
+                if llm_id is not None:
+                    with _llm_counts_lock:
+                        _llm_session_counts[llm_id] = max(
+                            0, _llm_session_counts[llm_id] - 1
+                        )
+        finally:
+            db.close()
+    except Exception:
+        logger.exception("[scheduler] _recover_hung_sessions error")
+
+
 def _cleanup_finished() -> None:
     """Remove sessions whose threads have completed and re-sync capacity counts."""
     with _active_sessions_lock:
@@ -4232,6 +4325,21 @@ def _cleanup_finished() -> None:
     with _llm_counts_lock:
         _llm_session_counts.clear()
         _llm_session_counts.update(new_counts)
+
+    # When threads actually died, reconcile DB state: close any open agent_sessions
+    # whose task_id is no longer in the alive set (crash-recovery for zombie rows).
+    if finished:
+        with _active_sessions_lock:
+            _alive_ids = set(_active_sessions.keys())
+        with _external_sessions_lock:
+            _alive_ids.update(_external_sessions.keys())
+        try:
+            from app.database import close_zombie_sessions_for_tasks
+            closed = close_zombie_sessions_for_tasks(exclude_task_ids=_alive_ids)
+            if closed:
+                logger.info("[scheduler] Closed %d zombie DB session(s) for dead threads.", closed)
+        except Exception:
+            logger.exception("[scheduler] Failed to reconcile zombie DB sessions.")
 
 
 def cancel_task_sessions(task_ids: list[str]) -> None:

@@ -1450,7 +1450,20 @@ async function _buildStageJournal(taskId) {
                 const diffRendered = _renderDiff(diffData.diff);
                 const isTabbed = diffRendered.includes('sj-diff-tabs');
                 if (diffData.stat) {
-                    html += `<div class="diff-stat">${escHtml(diffData.stat)}</div>`;
+                    // Parse "3 files changed, 142 insertions(+), 38 deletions(-)" into a styled banner
+                    const _statRaw = diffData.stat.trim().split('\n').pop() || diffData.stat.trim();
+                    const _mFiles = _statRaw.match(/(\d+) files? changed/);
+                    const _mAdd   = _statRaw.match(/(\d+) insertion/);
+                    const _mDel   = _statRaw.match(/(\d+) deletion/);
+                    if (_mFiles || _mAdd || _mDel) {
+                        html += `<div class="sj-diff-stat-banner">` +
+                            (_mFiles ? `<span class="stat-files">${_mFiles[1]} file${+_mFiles[1]===1?'':'s'} changed</span>` : '') +
+                            (_mAdd   ? `<span class="stat-add">+${_mAdd[1]}</span>` : '') +
+                            (_mDel   ? `<span class="stat-del">&#x2212;${_mDel[1]}</span>` : '') +
+                            `</div>`;
+                    } else {
+                        html += `<div class="diff-stat">${escHtml(_statRaw)}</div>`;
+                    }
                 }
                 if (isTabbed) {
                     html += diffRendered;
@@ -1576,6 +1589,83 @@ function _sjToggleFullscreen() {
     const full = modal.classList.toggle('sj-fullscreen');
     btn.title = full ? 'Exit fullscreen' : 'Toggle fullscreen';
     btn.innerHTML = full ? '&#x2715;&#xFE0E;' : '&#x26F6;';
+
+    let toolbar = document.getElementById('sj-fullscreen-toolbar');
+    if (full) {
+        if (!toolbar) {
+            toolbar = document.createElement('div');
+            toolbar.id = 'sj-fullscreen-toolbar';
+            toolbar.className = 'sj-fullscreen-toolbar';
+        }
+        const taskId = window._sjTaskId;
+        const task = taskId && taskData[taskId];
+        const stage = task ? task.type : '';
+        const isHumanReview = stage === 'human_review';
+        toolbar.innerHTML = `
+            <span class="sj-toolbar-title">${task ? escHtml(task.title) : ''}</span>
+            <div class="sj-toolbar-actions">
+                ${isHumanReview ? `
+                <button class="sj-toolbar-btn sj-btn-approve" onclick="_sjApproveMerge('${escHtml(taskId)}')">
+                    &#10003; Approve &amp; Merge
+                </button>
+                <button class="sj-toolbar-btn sj-btn-reject" onclick="_sjRequestChanges('${escHtml(taskId)}')">
+                    &#10007; Request Changes
+                </button>` : `<span class="sj-toolbar-stage-note">Stage: <b>${escHtml(stage)}</b> — approve/merge available in Human Review</span>`}
+            </div>`;
+        modal.insertBefore(toolbar, modal.firstChild);
+    } else if (toolbar) {
+        toolbar.remove();
+    }
+}
+
+async function _sjApproveMerge(taskId) {
+    if (!confirm('Approve and merge this task to main? This will run the final merge pipeline.')) return;
+    const btn = document.querySelector('.sj-btn-approve');
+    if (btn) { btn.disabled = true; btn.textContent = 'Merging…'; }
+    try {
+        const res = await fetch(`/api/tasks/${taskId}/merge`, {method: 'POST'});
+        const data = await res.json();
+        if (res.ok) {
+            _sjShowToast('Merge started — task will move to Completed when done.', 'success');
+        } else {
+            _sjShowToast(`Merge failed: ${data.detail || JSON.stringify(data)}`, 'error');
+        }
+    } catch (e) {
+        _sjShowToast(`Merge error: ${e.message}`, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '✓ Approve & Merge'; }
+    }
+}
+
+async function _sjRequestChanges(taskId) {
+    const reason = prompt('Reason for requesting changes (will be appended to task history):');
+    if (!reason) return;
+    try {
+        await fetch(`/api/tasks/${taskId}/demote`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({target: 'indev', reason}),
+        });
+        _sjShowToast('Task demoted to INDEV with your feedback.', 'success');
+        closeStageJournal();
+        loadTasksFromDatabase();
+    } catch (e) {
+        _sjShowToast(`Error: ${e.message}`, 'error');
+    }
+}
+
+function _sjShowToast(msg, type) {
+    let toast = document.getElementById('sj-toast');
+    if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'sj-toast';
+        toast.className = 'sj-toast';
+        document.body.appendChild(toast);
+    }
+    toast.textContent = msg;
+    toast.className = `sj-toast sj-toast-${type} sj-toast-visible`;
+    clearTimeout(toast._timer);
+    toast._timer = setTimeout(() => toast.classList.remove('sj-toast-visible'), 4000);
 }
 
 // ============================================

@@ -217,38 +217,40 @@ from app.agent.tools import (
 
 class TestValidateFlags:
     def test_clean_flags_pass_through(self):
-        result = _validate_flags("-x --tb=short", "run_test_pytest", _PYTEST_FLAGS, _PYTEST_VALUE_FLAGS)
-        assert "-x" in result
-        assert "--tb=short" in result
+        safe, _ = _validate_flags("-x --tb=short", "run_test_pytest", _PYTEST_FLAGS, _PYTEST_VALUE_FLAGS)
+        assert "-x" in safe
+        assert "--tb=short" in safe
 
     def test_injection_attempt_is_dropped(self):
         """Shell injection via flags must be entirely dropped."""
-        result = _validate_flags("; rm -rf .", "run_test_pytest", _PYTEST_FLAGS, _PYTEST_VALUE_FLAGS)
-        assert not any("rm" in tok for tok in result)
-        assert not any(";" in tok for tok in result)
+        safe, _ = _validate_flags("; rm -rf .", "run_test_pytest", _PYTEST_FLAGS, _PYTEST_VALUE_FLAGS)
+        assert not any("rm" in tok for tok in safe)
+        assert not any(";" in tok for tok in safe)
 
     def test_unknown_flag_is_dropped(self):
-        result = _validate_flags("--evil-flag -x", "run_test_pytest", _PYTEST_FLAGS, _PYTEST_VALUE_FLAGS)
-        assert "--evil-flag" not in result
-        assert "-x" in result
+        safe, rejected = _validate_flags("--evil-flag -x", "run_test_pytest", _PYTEST_FLAGS, _PYTEST_VALUE_FLAGS)
+        assert "--evil-flag" not in safe
+        assert "-x" in safe
+        assert any("evil-flag" in r for r in rejected)
 
     def test_value_flag_accepted_with_clean_value(self):
-        result = _validate_flags("-k test_foo", "run_test_pytest", _PYTEST_FLAGS, _PYTEST_VALUE_FLAGS)
-        assert "-k" in result
-        assert "test_foo" in result
+        safe, _ = _validate_flags("-k test_foo", "run_test_pytest", _PYTEST_FLAGS, _PYTEST_VALUE_FLAGS)
+        assert "-k" in safe
+        assert "test_foo" in safe
 
     def test_value_flag_rejected_with_metachar_value(self):
         """Value containing shell metachar should cause both flag and value to be dropped."""
-        result = _validate_flags("-k 'test; rm'", "run_test_pytest", _PYTEST_FLAGS, _PYTEST_VALUE_FLAGS)
-        assert "-k" not in result
+        safe, _ = _validate_flags("-k 'test; rm'", "run_test_pytest", _PYTEST_FLAGS, _PYTEST_VALUE_FLAGS)
+        assert "-k" not in safe
 
     def test_empty_flags_returns_empty_list(self):
-        assert _validate_flags("", "run_test_pytest", _PYTEST_FLAGS) == []
-        assert _validate_flags("   ", "run_test_pytest", _PYTEST_FLAGS) == []
+        assert _validate_flags("", "run_test_pytest", _PYTEST_FLAGS) == ([], [])
+        assert _validate_flags("   ", "run_test_pytest", _PYTEST_FLAGS) == ([], [])
 
     def test_malformed_quotes_rejected(self):
-        result = _validate_flags("'unclosed", "run_test_pytest", _PYTEST_FLAGS)
-        assert result == []
+        safe, rejected = _validate_flags("'unclosed", "run_test_pytest", _PYTEST_FLAGS)
+        assert safe == []
+        assert rejected  # shlex error should be recorded
 
 
 class TestValidateToolPath:

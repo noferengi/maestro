@@ -6,166 +6,260 @@ re-deriving context from scratch. Update it after each significant intervention.
 
 ---
 
-## What was wrong (session ending ~2026-05-07)
+## Most recent session summary (2026-05-07, ~08:00 UTC)
 
-### Root causes found and fixed
+Two things happened this session:
 
-| # | Location | Symptom | Fix applied |
-|---|----------|---------|-------------|
-| 1 | DB `tasks.type` (5 EasyProject tasks) | Tasks stuck in `full_review` for 11 days — completely invisible to scheduler because `SCHEDULER_DISPATCHABLE_TYPES` only lists `final_review` | `set_task_type` → `final_review` on all 5; migration 0059 added to backfill any remaining stragglers |
-| 2 | `app/migrations/versions/0056_rename_full_review_to_final_review.py` | Migration renamed the results TABLE but never ran `UPDATE tasks SET type = 'final_review' WHERE type = 'full_review'` — so tasks that passed security before the code change were permanently stranded | Added the `UPDATE` to 0056's `up()`/`down()`; created migration 0059 to apply the fix to current DB |
-| 3 | `scripts/inspect_cards.py` lines 34–36 | Script's hardcoded `DISPATCHABLE` set was missing `security` and `final_review`; `security` was wrongly in `NEVER_DISPATCH`; `non_dispatchable` bucket was silently dropped with no print | Updated `DISPATCHABLE` to match real scheduler; removed `security` from `NEVER_DISPATCH`; added `[!] NON-DISPATCHABLE TYPE` print block so stranded tasks surface |
+1. **Shell injection hardening** — all `shell=True` subprocess calls in the agent
+   tool layer were eliminated. See "Security hardening" section below for details.
+   Commit: `b322085`.
 
-### What was NOT a bug (healthy / self-resolving)
-
-- **Survey task** (`task-1777972562.612366`, "Survey the Architecture System", INDEV): zombie-killed by repeated server restarts. Marked READY by DAG — will auto-dispatch once LLM 1 has capacity. 3 tasks unblock when it completes.
-- **6 StoryOrchestrator planning tasks**: all READY, waiting on LLM 1 slots held by 3 active intake agents.
-- **$0 budget spend in health report**: tasks not linked to budget IDs — spend tracking is blank, but LLM calls are recording correctly in `budget_entries`.
+2. **Snapshot taken** immediately after server restart to leave a clean handoff.
+   See "Current system state" below.
 
 ---
 
-## The recurring pattern to watch: stage-rename stranding
+## CRITICAL THINGS TO CHECK FIRST (in order)
 
-When a pipeline stage is renamed in code (e.g. `full_review` → `final_review`), tasks
-already in the DB retain the old type string. The scheduler silently skips them because
-the old string isn't in `SCHEDULER_DISPATCHABLE_TYPES`. They show no error — they just
-never get dispatched. This can go undetected for weeks.
+### 1. Did the 5 EasyProject `final_review` tasks start running?
 
-**How to spot it:**
+These 5 tasks were rescued from `full_review` stranding (last session). At restart
+they had **no active sessions** — they should dispatch once LLM capacity frees up
+from the 4 running StoryOrchestrator planning sessions.
+
 ```
-# Check for any task types that aren't in the dispatchable list
+mcp__maestro__get_scheduler_state()
+# Look for final_review entries — do they have has_active_session: true?
+# If still all false after the planning sessions finish, something is wrong.
+```
+
+If they are STILL idle after 30+ minutes:
+- Run `venv/Scripts/python.exe scripts/inspect_cards.py scheduler`
+- Check the `[!] NON-DISPATCHABLE TYPE` section
+- If they appear there, the type string is wrong again — use `set_task_type`
+- If they don't appear there either, check capacity: `mcp__maestro__get_capacity_status()`
+
+### 2. Did the 4 StoryOrchestrator planning sessions complete or time out again?
+
+At restart, these 4 planning tasks were re-dispatched as zombies:
+- `task-1778024927.08974`  — "Fix progress streaming JSON syntax error"
+- `task-1778024927.10267`  — "Add integration tests for DAG pipeline"
+- `task-1778024927.100124` — "Add unit tests for core services"
+- `task-1778024927.097565` — "Implement multi-story dependency scheduling"
+
+**Warning**: multiple recent sessions show `exit_reason: "planning_timeout"` on these
+tasks (60-minute wall-clock limit hit). If they time out again on this run, the
+planning agent is struggling with these tasks. Next action would be to:
+```
+mcp__maestro__diagnose_task(task_id="task-1778024927.097565")  # worst offender
+# Check budget_trace — is it looping? hitting max_tokens? stalling on tools?
+```
+
+### 3. "Fibonacci Dynamic Programming" — 31 demotions, still in final_review
+
+`task-1777182040.748628` ("Fibonacci Dynamic Programming", EasyProject) has been
+demoted 31 times. It is in `final_review` with no active session. This task is a
+persistent problem child. Once the EasyProject final_review sessions start running:
+
+```
+mcp__maestro__diagnose_task(task_id="task-1777182040.748628")
+mcp__maestro__get_gate_history(task_id="task-1777182040.748628")
+```
+
+If it fails final_review again, look at what the reviewers are objecting to.
+It may need a manual `demote_task` → fix → re-run rather than auto-cycling.
+
+### 4. StoryOrchestrator "no Python files" intake rejection — is it recurring?
+
+At 06:53 UTC, `task-1778024927.083731` ("Fix string interpolation bugs") was
+**rejected** at intake because "the project directory has no .py files". It was
+re-tried and passed at 07:45. But if you see more intake rejections from
+StoryOrchestrator tasks citing missing source files, the project path is likely
+pointing at an empty or wrong directory.
+
+```
+# Check what path StoryOrchestrator is configured with:
+mcp__maestro__list_tasks(project="StoryOrchestrator")
+# Then verify the path actually has Python files on disk.
+```
+
+### 5. Survey task — still idle zombie
+
+`task-1777972562.612366` ("Survey the Architecture System", TheMaestro, INDEV) has
+been a zombie for multiple sessions. It has no active session. The scheduler should
+auto-dispatch it when LLM capacity frees up. It has been in this state since at
+least the previous session — if it is STILL not running 2+ hours from now, it may
+have a cooldown or DAG block:
+
+```
+mcp__maestro__diagnose_task(task_id="task-1777972562.612366")
+```
+
+---
+
+## Current system state (snapshot at 2026-05-07 ~08:00 UTC, after restart)
+
+### Stage distribution
+| Stage | Count | Notes |
+|-------|-------|-------|
+| `idea` | 10 | Queued, waiting for capacity |
+| `planning` | 6 | 4 active sessions, 2 waiting (no session) |
+| `indev` | 5 | 4 StoryOrchestrator + 1 TheMaestro Survey — none active |
+| `final_review` | 5 | All EasyProject — NONE have active sessions |
+| `completed` | 5 | |
+| `architecture` | 6 | |
+
+### Active sessions at snapshot time
+All 4 running sessions are StoryOrchestrator planning agents, started at 07:48:43 UTC
+(immediately after server restart from zombie cleanup).
+
+### Pending merges: 5
+| Task | Project | Accepted |
+|------|---------|---------|
+| PRD Master Card for StoryOrchestrator | StoryOrchestrator | 2026-05-06 |
+| Implement drag-and-drop | TheMaestro | 2026-04-28 |
+| Create database schema | TheMaestro | 2026-04-28 |
+| Fibonacci Greenfield | EasyProject | 2026-04-26 |
+| Initialize Git repository | TheMaestro | 2026-03-14 |
+
+The TheMaestro and EasyProject merges are very old (weeks). These may be intentional
+or forgotten — ask the user if they want them merged or archived.
+
+### LLM topology
+- LLM 1: `Qwen3p6-35B-A3B-Q4` on `localhost:8008` — all active sessions on this
+- LLM 45: `Qwen3CoderNextBatch` — idle
+- LLM 46: `Qwen3p5-Omnicoder-9B-BATCH` — idle
+- All tasks pinned to LLM 1; LLMs 45/46 are unused (known issue, no fix attempted)
+
+---
+
+## What happened just before this handoff
+
+### Shell injection hardening (commit b322085, 2026-05-07)
+
+All `shell=True` subprocess calls in the agent tool layer were replaced with
+`shell=False` list-based invocation. This is a **breaking signature change** for
+some tools — if agents appear to be getting "rejected" or "unknown tool" errors on
+tools they used to call, check whether the schema changed:
+
+| Tool | Old signature | New signature |
+|------|--------------|---------------|
+| `run_test_unittest` | `args: str` | `module: str, pattern: str` |
+| `run_test_npm` | `args: str` | *(no args)* |
+| `run_build_make` | `target, args: str` | `target` only |
+| `run_build_go` | `args: str` | *(no args)* |
+| `run_build_gradle` | `target, args: str` | `target` only |
+| `run_build_mvn` | `goal, args: str` | `goal` only |
+| `run_deps_npm` | `args: str` | *(no args)* |
+| `run_audit_bandit` | `path, args: str` | `path` only |
+| `run_shell_security` | `command: str` | `tool: str, path: str` |
+| `run_shell_review` | `command: str` | `tool: str, path: str` |
+
+**Security tool names** for `run_shell_security` (security_review.py):
+`bandit`, `safety`, `pip-audit`, `detect-secrets`, `semgrep`, `trivy`, `npm-audit`
+
+**Review tool names** for `run_shell_review` (final_review.py):
+`pytest`, `ruff`, `mypy`, `black-check`, `npm-test`, `npm-lint`
+
+If a running agent fails with `[security] Unknown security tool` or similar, it is
+calling the old string-command API. The session will fail — demote the task and let
+it re-run under the new schema.
+
+---
+
+## Recurring patterns to know about
+
+### Planning timeout loop (StoryOrchestrator)
+
+Multiple planning tasks are hitting the 60-minute wall-clock limit and being
+re-queued. Recent `planning_timeout` exits:
+- `task-1778024927.097565` — timed out at 07:39 UTC, re-queued, now running again
+- `task-1778024927.086807` — timed out at 07:27 UTC, now in indev (no session)
+- `task-1778024927.094912` — timed out at 07:15 UTC, went through correction agent,
+  got `corrected` outcome, now in indev (no session)
+
+If a task times out 3+ times in a row, diagnose it:
+```
+mcp__maestro__get_budget_trace(task_id="<id>", n=20)
+# Look for: looping tool calls? length finish_reason? wall-clock drift?
+```
+
+### Stage-rename stranding (historical, watch for recurrence)
+
+When a pipeline stage is renamed in code, tasks already in DB retain the old type
+and are silently skipped by the scheduler forever. Fixed for `full_review` → `final_review`
+last session. If you see tasks that logically should be dispatching but aren't:
+
+```
 venv/Scripts/python.exe scripts/inspect_cards.py scheduler
-# Look for [!] NON-DISPATCHABLE TYPE section at the bottom
+# Look for [!] NON-DISPATCHABLE TYPE at the bottom
 ```
 
-**How to fix it:**
-1. `mcp__maestro__set_task_type(task_id, "correct_type")` for each affected task
-2. Write a migration that does `UPDATE tasks SET type = 'new_name' WHERE type = 'old_name'`
-3. Make sure future stage-rename migrations always include the tasks UPDATE — not just table/column renames
+Fix: `mcp__maestro__set_task_type(task_id, "correct_type")`
+
+### Research Agent submit-loop (FIXED 2026-05-07)
+
+Was caused by `maestro.ini` `research_agent_tools` omitting `submit_work`. Fixed.
+If you see an intake agent looping with `finish_reason: "tool_calls"` while saying
+it's trying to submit, check that `submit_work` is still in `[intake] research_agent_tools`.
 
 ---
 
-## Current system state (as of this session)
-
-### Active LLM topology
-- LLM 1: `Qwen3p6-35B-A3B-Q4` on `localhost:8008`, 3 parallel sessions — **primary workhorse**
-- LLM 45: `Qwen3CoderNextBatch`, 4 sessions free
-- LLM 46: `Qwen3p5-Omnicoder-9B-BATCH`, 5 sessions free
-- All tasks currently assigned to LLM 1 — LLMs 45/46 are idle
-
-### Pipeline stage counts (at session end)
-- `idea`: 14 (many READY, queued behind LLM 1 capacity)
-- `planning`: 6 (all READY, StoryOrchestrator)
-- `indev`: 1 (Survey task, READY, idle zombie)
-- `final_review`: 5 (EasyProject — now visible to scheduler after fix)
-- `completed`: 5
-- `architecture`: 6
-
-### Pending merges: 5 (completed tasks awaiting human "Accept & Merge")
-
----
-
-## How to diagnose if tasks are stuck
-
-### Quick triage (run in order)
+## How to diagnose stuck tasks (quick reference)
 
 ```
-# 1. Overall health
+# Cold start: overall health
 mcp__maestro__get_project_health()
 
-# 2. Scheduler view — shows READY / BLOCKED / NON-DISPATCHABLE
+# Scheduler view — READY / BLOCKED / NON-DISPATCHABLE
 venv/Scripts/python.exe scripts/inspect_cards.py scheduler
 
-# 3. Find sessions with no LLM activity in 15+ minutes
+# Capacity check — are LLM slots full?
+mcp__maestro__get_capacity_status()
+
+# Find sessions idle for 15+ min
 mcp__maestro__find_stuck_tasks(idle_minutes=15)
 
-# 4. Full picture for a specific task
+# Full picture for one task
 mcp__maestro__diagnose_task(task_id="<id>")
+
+# Raw LLM call history
+mcp__maestro__get_budget_trace(task_id="<id>", n=20)
+
+# Planning gate failure history
+mcp__maestro__get_gate_history(task_id="<id>")
 ```
 
-### Key signals in `diagnose_task` output
+### Key signals
 
-| Signal | What it means | Action |
-|--------|--------------|--------|
-| `activity_status: "idle"` | Zombie session — server restarted mid-run | Scheduler auto-recovers; wait one tick or check capacity |
-| `budget_trace[0].finish_reason == "length"` | `max_tokens` too low | Increase max_tokens on the LLM endpoint |
-| Task missing from `inspect_cards scheduler` output | Type not in `DISPATCHABLE` | Check `[!] NON-DISPATCHABLE TYPE` section; use `set_task_type` to fix |
-| Planning gate failing repeatedly | `implementation_steps_present` hard-fail | Check `get_gate_history`; use `patch_planning_fields` to fix the plan |
-| `correction_attempts > 0` | PlanningCorrectionAgent ran; check `exit_reason` | May need manual plan fix via `patch_planning_fields` |
-| `exit_reason: "error"` on dev_orchestrator | Unexpected exception; task stays INDEV | Scheduler auto-retries; check budget trace for tool errors |
-
-### What a stage-rename migration must include
-
-Every time a `tasks.type` string is renamed:
-```sql
--- In up():
-UPDATE tasks SET type = 'new_name' WHERE type = 'old_name';
-
--- In down():
-UPDATE tasks SET type = 'old_name' WHERE type = 'new_name';
-```
-
-If this is forgotten, run:
-```
-venv/Scripts/python.exe scripts/create_migration.py "backfill X task types to Y"
-# Edit the scaffolded file, then:
-venv/Scripts/python.exe app/migrations/runner.py migrate
-```
+| Signal | Meaning | Action |
+|--------|---------|--------|
+| `activity_status: "idle"` | Zombie — server restarted mid-run | Wait one tick; scheduler auto-recovers |
+| `finish_reason: "length"` | max_tokens too low for model | Increase max_tokens on LLM endpoint |
+| `[!] NON-DISPATCHABLE TYPE` in inspect_cards | Old stage name in DB | `set_task_type` to correct name |
+| `exit_reason: "planning_timeout"` repeatedly | Planning agent can't finish in 60 min | Diagnose budget trace; may need manual intervention |
+| `[security] Unknown security tool` in logs | Agent using old run_shell_security API | Demote task; will re-run with new schema |
+| `demotion_count > 10` | Task stuck in failure loop | Diagnose gate history; may need manual plan patch |
 
 ---
 
-## Remaining known issues (not fixed in this session)
+## Known standing issues (not fixed)
 
-- **SQLite lock contention**: `mcp_tools/helpers.py` and `app/database/session.py` have no
-  WAL mode or lock timeout configured. MCP tool calls can silently hang when the scheduler
-  holds a write lock. Retry after a few seconds, or use `restart_server()` to drain.
+- **Broken test: `TestCheckPlanningTimeouts`** (`app/tests/test_scheduler_unit.py:280`).
+  Imports `_check_planning_timeouts` from `app.agent.scheduler` which does not exist —
+  the function was removed or renamed at some point. The test also references `_session_ids`
+  which may similarly be absent. Pre-existing failure, not introduced by recent changes.
+  Fix: either restore the function or rewrite the test for the current timeout mechanism.
 
-- **Merge test race**: two concurrent task completions modifying the same file → second
-  "Accept & Merge" hits a conflict and demotes back to `human_review`. Handled correctly
-  but requires manual re-review.
+- **WAL mode and MCP timeout already fixed**: `session.py` sets `PRAGMA journal_mode=WAL`
+  via an `event.listen` hook; `mcp_tools/helpers.py` passes `timeout=30` to `sqlite3.connect`.
+  The WATCH_FOR note below is outdated — both are resolved.
 
-- **LLMs 45/46 underutilised**: all tasks are pinned to LLM 1. With 9 free slots on 45/46,
-  there's latent capacity. No fix attempted — task LLM assignment is a UI/config concern.
+- **LLMs 45/46 underutilised**: all tasks pinned to LLM 1. 9 idle slots on 45/46.
+  No fix attempted — task LLM assignment is a UI/config concern.
 
-- **SQLite lock contention**: `mcp_tools/helpers.py` and `app/database/session.py` have no
-  WAL mode or lock timeout configured. MCP tool calls can silently hang when the scheduler
-  holds a write lock. Retry after a few seconds, or use `restart_server()` to drain.
+- **Merge test race**: concurrent completions on same file → second merge hits conflict
+  → demotes to `human_review`. Handled correctly, requires manual re-review.
 
-- **Merge test race**: two concurrent task completions modifying the same file → second
-  "Accept & Merge" hits a conflict and demotes back to `human_review`. Handled correctly
-  but requires manual re-review.
-
-- **LLMs 45/46 underutilised**: all tasks are pinned to LLM 1. With 9 free slots on 45/46,
-  there's latent capacity. No fix attempted — task LLM assignment is a UI/config concern.
-
----
-
-## Files changed in this session
-
-```
-maestro.ini                          — added submit_work to research_agent_tools (CRITICAL BUG FIX)
-app/agent/config.py                  — turn warning at ≤5 now says CRITICAL + explicit REVERT_TO_DESIGN guidance
-app/migrations/versions/0056_rename_full_review_to_final_review.py  — added UPDATE tasks to up()/down()
-app/migrations/versions/0059_backfill_full_review_task_types_to_final_review.py  — new migration, applied
-scripts/inspect_cards.py             — DISPATCHABLE/NEVER_DISPATCH corrected; non_dispatchable bucket now printed
-```
-
----
-
-## Research Agent submit-loop (FIXED — 2026-05-07)
-
-**Root cause**: `maestro.ini` `research_agent_tools` override listed read/search/web tools but
-omitted `submit_work`. The config.py default includes it, but the ini override wins and strips
-it. The Research Agent's system prompt tells it to "call submit_work to finish", but that tool
-was never in the schema the LLM sees — so it looped forever calling other tools instead.
-
-**Signal in budget trace**: many consecutive entries with finish_reason="tool_calls" and
-reasoning that says "I've exhausted my search budget, submitting now" but never stops.
-
-**Fix**: added `submit_work` to `research_agent_tools` in `maestro.ini` line 164.
-
-**Takes effect**: on next server restart — running intake sessions keep the old schema.
-
-**If you see this recur**: check `maestro.ini [intake] research_agent_tools` and confirm
-`submit_work` is in the list. Also check `[subdivision] subdivision_agent_tools` for the
-same omission.
+- **Old pending merges**: TheMaestro and EasyProject merges have been sitting unmerged
+  for weeks. Ask user whether to action them.

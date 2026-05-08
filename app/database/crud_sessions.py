@@ -126,6 +126,44 @@ def close_zombie_sessions() -> int:
         db.close()
 
 
+def close_zombie_sessions_for_tasks(exclude_task_ids: set[str]) -> int:
+    """Close open sessions for tasks whose threads are no longer alive.
+
+    Called periodically by _cleanup_finished() in scheduler.py to reconcile
+    DB state with in-memory thread state after threads die unexpectedly.
+    exclude_task_ids: task IDs that are known-alive; all others are closed.
+    """
+    db = SessionLocal()
+    try:
+        import sqlalchemy as _sa
+        open_rows = db.execute(
+            _sa.text(
+                "SELECT DISTINCT task_id FROM agent_sessions "
+                "WHERE ended_at IS NULL AND task_id IS NOT NULL"
+            )
+        ).fetchall()
+        zombie_ids = [r[0] for r in open_rows if r[0] not in exclude_task_ids]
+        if not zombie_ids:
+            return 0
+        placeholders = ",".join(f"'{t}'" for t in zombie_ids)
+        result = db.execute(
+            _sa.text(
+                f"UPDATE agent_sessions SET ended_at=:now, exit_reason='shutdown', "
+                f"exit_summary='Closed by scheduler cleanup: thread no longer alive' "
+                f"WHERE ended_at IS NULL AND task_id IN ({placeholders})"
+            ),
+            {"now": _now_iso()},
+        )
+        db.commit()
+        return result.rowcount
+    except Exception as exc:
+        db.rollback()
+        logger.error("Error in close_zombie_sessions_for_tasks: %s", exc)
+        return 0
+    finally:
+        db.close()
+
+
 def get_agent_sessions_for_task(task_id: str) -> list[AgentSession]:
     """Return all sessions for a task, oldest first."""
     db = SessionLocal()

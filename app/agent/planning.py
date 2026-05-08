@@ -463,9 +463,15 @@ class PlanningPipeline:
             # the plan might be weaker than expected.
             valid_count = sum(1 for d in designs if "error" not in d and "parse_error" not in d)
             if 0 < valid_count < self._effective_best_of_n:
+                failed_labels = [
+                    _DESIGN_PERSONAS[i % len(_DESIGN_PERSONAS)][0]
+                    for i, d in enumerate(designs)
+                    if "error" in d or "parse_error" in d
+                ]
                 _partial_warn = (
                     f"[PARTIAL GENERATION on attempt {attempt + 1}]: "
                     f"Only {valid_count}/{self._effective_best_of_n} design proposals succeeded. "
+                    f"Failed personas: {', '.join(failed_labels)}. "
                     "Selected design may not represent the best available option."
                 )
                 logger.warning("[%s] %s", AGENT_NAME, _partial_warn)

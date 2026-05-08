@@ -560,6 +560,17 @@ def _sanitize_messages(messages: list[dict]) -> list[dict]:
     (whether thinking or non-thinking).
     """
     _JINJA2_PAIRS = [("{{", "{ {"), ("}}", "} }"), ("{%", "{ %"), ("{#", "{ #")]
+    # Qwen native XML tool-call format: if these appear in message content they
+    # break the Qwen Jinja2 chat template with "Failed to parse input at pos N".
+    _XML_TOOL_PAIRS = [
+        ("<tool_call>",  "[tool_call]"),
+        ("</tool_call>", "[/tool_call]"),
+        ("<function=",   "[function="),
+        ("</function>",  "[/function]"),
+        ("<parameter=",  "[parameter="),
+        ("</parameter>", "[/parameter]"),
+        ("</parameter",  "[/parameter"),
+    ]
     _UNICODE_REPLACEMENTS = [
         ("\u2014", " -- "), ("\u2013", " - "), ("\u2192", " -> "), ("\u2190", " <- "),
         ("\u2018", "'"), ("\u2019", "'"), ("\u201c", '"'), ("\u201d", '"'),
@@ -595,6 +606,11 @@ def _sanitize_messages(messages: list[dict]) -> list[dict]:
                 logger.warning("msg[%d] (%s): Stripping null bytes", i, role)
             content = content.replace("\x00", "")
             changed = True
+
+        for raw, safe in _XML_TOOL_PAIRS:
+            if raw in content:
+                content = content.replace(raw, safe)
+                changed = True
 
         for raw, safe in _JINJA2_PAIRS:
             if raw in content:
