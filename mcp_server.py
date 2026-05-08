@@ -67,6 +67,7 @@ from mcp_tools.diagnostics import (
     get_task_events,
     get_merge_records,
     get_git_branch_state,
+    get_tool_bug_reports,
 )
 from mcp_tools.actions import (
     append_task_description,
@@ -103,6 +104,7 @@ mcp.tool()(preview_dispatch)
 mcp.tool()(get_task_events)
 mcp.tool()(get_merge_records)
 mcp.tool()(get_git_branch_state)
+mcp.tool()(get_tool_bug_reports)
 
 # --- Live API tool ---
 mcp.tool()(get_scheduler_api_status)

@@ -1353,3 +1353,50 @@ def get_git_branch_state(project_name: str) -> dict:
         "task_branch_count": len(task_branches),
         "active_worktrees": worktrees,
     }
+
+
+def get_tool_bug_reports(
+    task_id: str = None,
+    tool_name: str = None,
+    limit: int = 50,
+) -> list:
+    """
+    Fetch agent-filed tool bug reports.
+
+    Agents call report_tool_bug() when a tool misbehaves — wrong output,
+    stale content, unexpected error, missing capability, etc. Each report
+    captures the session_id, tool name, what the agent was trying to do,
+    what it expected, and what actually happened.
+
+    Filter by task_id or tool_name to drill into a specific session or
+    tool. Returns newest-first up to `limit` rows.
+    """
+    conn = get_conn()
+    params: list = []
+    where_clauses: list[str] = []
+    if task_id:
+        where_clauses.append("task_id = ?")
+        params.append(task_id)
+    if tool_name:
+        where_clauses.append("tool_name = ?")
+        params.append(tool_name)
+    where = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    params.append(limit)
+    rows = conn.execute(
+        f"SELECT id, task_id, session_id, tool_name, trying_to, expected, actual, created_at "
+        f"FROM tool_bug_reports {where} ORDER BY created_at DESC LIMIT ?",
+        params,
+    ).fetchall()
+    return [
+        {
+            "id": r[0],
+            "task_id": r[1],
+            "session_id": r[2],
+            "tool_name": r[3],
+            "trying_to": r[4],
+            "expected": r[5],
+            "actual": r[6],
+            "created_at": r[7],
+        }
+        for r in rows
+    ]

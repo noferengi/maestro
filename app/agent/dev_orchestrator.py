@@ -376,12 +376,17 @@ class DevOrchestrator:
         """
         import asyncio as _asyncio
         from app.agent.test_parser import parse_pytest_output
+        from app.agent.tools import _venv_python
+        if not self.project_path:
+            return False, "Test runner error: no project_path configured", {}
+        cwd = str(self.project_path)
+        python_exe = _venv_python(cwd)
         try:
             proc = await _asyncio.create_subprocess_exec(
-                "python", "-m", "pytest", "-x", "--tb=short", "-q",
+                python_exe, "-m", "pytest", "-x", "--tb=short", "-q",
                 stdout=_asyncio.subprocess.PIPE,
                 stderr=_asyncio.subprocess.STDOUT,
-                cwd=str(self.project_path),
+                cwd=cwd,
             )
             raw, _ = await _asyncio.wait_for(proc.communicate(), timeout=120)
             output = raw.decode("utf-8", errors="replace")

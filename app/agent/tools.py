@@ -70,6 +70,15 @@ _task_project_name: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "_task_project_name", default=None
 )
 
+# Current task_id and session_id — set by the scheduler alongside set_task_git_cwd
+# so report_tool_bug can stamp reports without requiring the agent to know its own ID.
+_task_id_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_task_id_ctx", default=None
+)
+_session_id_ctx: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "_session_id_ctx", default=None
+)
+
 # ---------------------------------------------------------------------------
 # Per-call output buffer — enables read_last_output slicing
 # ---------------------------------------------------------------------------
@@ -120,12 +129,17 @@ def _is_file_prepped(path: str) -> bool:
 
 
 def _invalidate_prepped_cache(path: str) -> None:
-    """Drop any served-range record for path so the next read_file returns fresh content."""
+    """Reset served-range record for path so the next read_file returns fresh content.
+
+    Sets the entry to an empty list (not removed) so _is_file_prepped still returns
+    True — this causes read_file to skip the structural-summary phase and serve the
+    new content immediately, which is what agents need after a write.
+    """
     try:
         norm = os.path.normpath(os.path.realpath(path))
     except OSError:
         return
-    _get_prepped_files().pop(norm, None)
+    _get_prepped_files()[norm] = []
 
 
 def _record_served_range(norm_path: str, start: int, end: int) -> None:
@@ -249,7 +263,11 @@ def ensure_git_repo(path: str) -> None:
         logger.warning("[git] git init error at %s: %s", path, exc)
 
 
-def set_task_git_cwd(path: str | None) -> None:
+def set_task_git_cwd(
+    path: str | None,
+    task_id: str | None = None,
+    session_id: int | None = None,
+) -> None:
     """
     Set the git working directory for all git tool calls in the current context.
 
@@ -257,15 +275,24 @@ def set_task_git_cwd(path: str | None) -> None:
     path of the project the task belongs to. Pass None to clear the override
     (git tools will error rather than fall back to TheMaestro's own repo).
 
-    Returns the contextvars.Token so the caller can restore the previous value
-    if needed (e.g. in tests).
+    Optionally pass task_id and session_id to stamp report_tool_bug reports.
     """
     _task_git_cwd.set(path)
+    if task_id is not None:
+        _task_id_ctx.set(task_id)
+    if session_id is not None:
+        _session_id_ctx.set(session_id)
 
 
 def get_task_git_cwd() -> str | None:
     """Return the currently active task git working directory, or None."""
     return _task_git_cwd.get()
+
+
+def set_task_context(task_id: str, session_id: int | None = None) -> None:
+    """Set task_id and session_id for the current context (used by report_tool_bug)."""
+    _task_id_ctx.set(task_id)
+    _session_id_ctx.set(session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -662,8 +689,12 @@ def write_file(path: str, content: str) -> str:
                 status += "\n"
             status += "== END =="
         else:
-            preview = '\n'.join(f"{i+1}: {l}" for i, l in enumerate(content.split('\n')[:10]))
-            status += f"\n(first 10 of {line_count} lines)\n{preview}\n..."
+            # Show first and last 20 lines so the agent can verify both ends.
+            lines = content.split('\n')
+            head = '\n'.join(f"{i+1}: {l}" for i, l in enumerate(lines[:20]))
+            tail_start = max(20, line_count - 20)
+            tail = '\n'.join(f"{i+1}: {l}" for i, l in enumerate(lines[tail_start:], start=tail_start + 1))
+            status += f"\n(file has {line_count} lines — showing first 20 and last 20)\n{head}\n...\n{tail}"
         return status
     except OSError as exc:
         return f"ERROR writing '{path}': {exc}"
@@ -1492,6 +1523,37 @@ def write_git_restore(path: str) -> str:
     return f"OK: restored '{path}' to HEAD state."
 
 
+
+
+def report_tool_bug(tool_name: str, trying_to: str, expected: str, actual: str) -> str:
+    """[DIAGNOSTIC] Report a tool malfunction to the Maestro bug tracker.
+
+    Use this when a tool behaves in a way that prevents you from making progress —
+    wrong output, stale content, unexpected error, missing capability, etc.
+    After filing the report, try an alternative approach or call submit_work.
+
+    tool_name:  name of the misbehaving tool (e.g. 'patch_file', 'read_file')
+    trying_to:  what you were attempting (e.g. 'replace the retry logic in llm_client.py')
+    expected:   what the tool should have done
+    actual:     what it actually did or returned (paste the error or describe the bad output)
+    """
+    from app.database import create_tool_bug_report
+    task_id = _task_id_ctx.get() or "unknown"
+    session_id = _session_id_ctx.get()
+    report_id = create_tool_bug_report(
+        task_id=task_id,
+        tool_name=tool_name,
+        trying_to=trying_to,
+        expected=expected,
+        actual=actual,
+        session_id=session_id,
+    )
+    if report_id is None:
+        return "WARNING: bug report could not be saved (DB error), but noted internally."
+    return (
+        f"Bug report #{report_id} filed for tool '{tool_name}'. "
+        "A human operator will review it. Please try an alternative approach or submit_work."
+    )
 
 
 def submit_work(signal: str, summary: str, payload: dict | None = None) -> str:

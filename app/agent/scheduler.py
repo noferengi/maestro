@@ -3673,7 +3673,7 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
     from app.database import create_agent_session, close_agent_session
     import json
 
-    set_task_git_cwd(project_path)
+    set_task_git_cwd(project_path, task_id=task_id)
 
     planning_result_obj = get_planning_result(task_id)
     if not planning_result_obj:
@@ -3743,6 +3743,7 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
                 llm_id=llm_id,
                 budget_id=budget_id,
                 review_feedback=review_feedback,
+                project_path=project_path,
             )
         )
         _prompt_tokens = result.get("prompt_tokens", 0)

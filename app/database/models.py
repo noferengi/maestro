@@ -830,3 +830,20 @@ class ScopeSurveyJob(Base):
 
     def __repr__(self):
         return f"<ScopeSurveyJob(id={self.id}, project={self.project_name!r}, type={self.scope_type!r}, key={self.scope_key!r}, status={self.status!r})>"
+
+
+class ToolBugReport(Base):
+    """Agent-filed report of a tool misbehavior during an active session."""
+    __tablename__ = "tool_bug_reports"
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    task_id     = Column(String, nullable=False)
+    session_id  = Column(Integer, ForeignKey("agent_sessions.id"), nullable=True)
+    tool_name   = Column(String, nullable=False)
+    trying_to   = Column(Text, nullable=False)
+    expected    = Column(Text, nullable=False)
+    actual      = Column(Text, nullable=False)
+    created_at  = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<ToolBugReport(id={self.id}, task={self.task_id!r}, tool={self.tool_name!r})>"

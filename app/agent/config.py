@@ -363,7 +363,7 @@ INDEV_AGENT_TOOLS: list[str] = _getlist("indev", "agent_tools",
     "run_build_make, run_build_cargo, run_build_go, run_build_npm, run_build_tsc, "
     "run_build_gradle, run_build_mvn, "
     "run_deps_pip, run_deps_npm, run_deps_cargo, "
-    "submit_work"
+    "report_tool_bug, submit_work"
 )
 
 # ===========================================================================

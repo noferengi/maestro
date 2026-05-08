@@ -13,7 +13,7 @@ import logging
 from datetime import datetime, timezone
 
 from .session import SessionLocal
-from .models import AgentSession, Task
+from .models import AgentSession, Task, ToolBugReport
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +176,62 @@ def get_agent_sessions_for_task(task_id: str) -> list[AgentSession]:
         )
     except Exception as exc:
         logger.error("Error fetching agent_sessions for task %s: %s", task_id, exc)
+        return []
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Tool bug reports
+# ---------------------------------------------------------------------------
+
+def create_tool_bug_report(
+    task_id: str,
+    tool_name: str,
+    trying_to: str,
+    expected: str,
+    actual: str,
+    session_id: int | None = None,
+) -> int | None:
+    """Insert an agent-filed tool bug report. Returns the new row id or None on error."""
+    db = SessionLocal()
+    try:
+        row = ToolBugReport(
+            task_id=task_id,
+            session_id=session_id,
+            tool_name=tool_name,
+            trying_to=trying_to[:4000],
+            expected=expected[:2000],
+            actual=actual[:2000],
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row.id
+    except Exception as exc:
+        db.rollback()
+        logger.error("Error creating tool_bug_report (task=%s tool=%s): %s", task_id, tool_name, exc)
+        return None
+    finally:
+        db.close()
+
+
+def get_tool_bug_reports(
+    task_id: str | None = None,
+    tool_name: str | None = None,
+    limit: int = 50,
+) -> list[ToolBugReport]:
+    """Fetch tool bug reports, optionally filtered by task or tool name, newest first."""
+    db = SessionLocal()
+    try:
+        q = db.query(ToolBugReport)
+        if task_id:
+            q = q.filter(ToolBugReport.task_id == task_id)
+        if tool_name:
+            q = q.filter(ToolBugReport.tool_name == tool_name)
+        return q.order_by(ToolBugReport.created_at.desc()).limit(limit).all()
+    except Exception as exc:
+        logger.error("Error fetching tool_bug_reports: %s", exc)
         return []
     finally:
         db.close()
