@@ -249,14 +249,21 @@ class FinalReviewPipeline:
             f"{ac_block}"
             "You may use tools to read code files before giving your verdict.\n\n"
             "To complete your review, call the submit_work tool with:\n"
-            "- signal: 'ACCEPTED' if the implementation is correct, or 'REJECTED' if there are defects.\n"
+            "- signal: 'ACCEPTED' if the implementation passes your review, "
+            "or 'REVERT_TO_DESIGN' if there are defects requiring rework.\n"
             "- summary: Your justification.\n"
             "- payload: {\"verdict\": \"LIKELY|POSSIBLE|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED\", "
-            "\"confidence\": <0-100>}"
+            "\"confidence\": <0-100>}\n\n"
+            "Once you have gathered enough evidence to decide, call submit_work immediately. "
+            "Do not re-run tools or re-verify findings you have already confirmed."
         )
 
         messages: list[dict] = [
-            {"role": "system", "content": "You are a code reviewer. Use submit_work to output your verdict when ready."},
+            {"role": "system", "content": (
+                "You are a code reviewer. Your session ends when you call submit_work. "
+                "Read what you need, reach a verdict, then call submit_work — "
+                "do not loop back to re-check things you have already seen."
+            )},
             {"role": "user", "content": prompt},
         ]
 
@@ -277,12 +284,20 @@ class FinalReviewPipeline:
                 # Turn nudge was injected
                 pass
 
+            # Force submit_work on the last turn so the agent cannot loop past budget
+            is_final_turn = (turn >= max_turns - 1)
+            tool_choice_param = (
+                {"type": "function", "function": {"name": "submit_work"}}
+                if is_final_turn
+                else "auto"
+            )
+
             response = await call_llm(
                 messages,
                 base_url=self.llm_base_url,
                 model=self.llm_model,
                 tools=schemas,
-                tool_choice="auto",
+                tool_choice=tool_choice_param,
                 task_id=self.task_id,
                 llm_id=self.llm_id,
                 budget_id=self.budget_id,
@@ -340,16 +355,19 @@ class FinalReviewPipeline:
                                 justification=justification,
                                 model=self.llm_model or "",
                             )
-                        except (json.JSONDecodeError, ValueError):
-                            pass
+                        except (json.JSONDecodeError, ValueError) as e:
+                            logger.warning(
+                                "[%s] submit_work payload parse error for reviewer '%s': %s — returning fallback",
+                                AGENT_NAME, reviewer["type"], e,
+                            )
+                            return Vote(
+                                stage=f"review_{reviewer['type']}",
+                                verdict=Verdict.NEEDS_RESEARCH,
+                                confidence=65,
+                                justification=f"submit_work parse error: {e}",
+                                model=self.llm_model or "",
+                            )
                 continue
-
-            turns_remaining = max_turns - turn - 1
-            if turns_remaining <= 2:
-                messages.append({
-                    "role": "user",
-                    "content": f"[SYSTEM] {turns_remaining} turns remaining. Call submit_work with your verdict now.",
-                })
 
         # Fallback: turns exhausted
         return Vote(
