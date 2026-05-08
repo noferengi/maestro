@@ -314,6 +314,82 @@ body {
     transition: color 0.15s, background 0.15s;
 }
 .inbox-delete-btn:hover { color: #dc3545; background: #f8d7da; }
+.inbox-outcome-needs_human { background: #fff3cd; color: #7d4a00; }
+
+/* Card scroll-to highlight flash */
+@keyframes highlight-flash-kf {
+    0%   { box-shadow: 0 0 0 4px #f59e0b; }
+    70%  { box-shadow: 0 0 0 8px rgba(245,158,11,0.3); }
+    100% { box-shadow: none; }
+}
+.highlight-flash { animation: highlight-flash-kf 1.5s ease forwards; }
+
+/* Escalation Dialog (NEEDS_HUMAN) */
+.escalation-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.6);
+    z-index: 3000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: escalation-fade-in 0.2s ease;
+}
+@keyframes escalation-fade-in {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+}
+.escalation-dialog {
+    background: #fff;
+    border-radius: 10px;
+    border: 3px solid #f59e0b;
+    box-shadow: 0 8px 40px rgba(245,158,11,0.35), 0 2px 8px rgba(0,0,0,0.2);
+    width: 560px;
+    max-width: 95vw;
+    overflow: hidden;
+    animation: escalation-slide-in 0.25s cubic-bezier(0.34,1.56,0.64,1);
+}
+@keyframes escalation-slide-in {
+    from { transform: scale(0.88) translateY(-24px); opacity: 0; }
+    to   { transform: scale(1)    translateY(0);     opacity: 1; }
+}
+.escalation-header {
+    background: linear-gradient(135deg, #f59e0b, #d97706);
+    color: #fff;
+    padding: 1rem 1.25rem;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    font-weight: 700;
+    font-size: 1rem;
+}
+.escalation-icon { font-size: 1.4rem; line-height: 1; }
+.escalation-task {
+    padding: 0.75rem 1.25rem 0;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: #6c757d;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+.escalation-body {
+    padding: 0.75rem 1.25rem 1rem;
+    font-size: 0.95rem;
+    color: #212529;
+    line-height: 1.55;
+    max-height: 220px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.escalation-footer {
+    padding: 0.75rem 1.25rem;
+    background: #fafafa;
+    border-top: 1px solid #f0f0f0;
+    display: flex;
+    gap: 0.5rem;
+    justify-content: flex-end;
+}
 
 /* Kanban Columns */
 .kanban-board {

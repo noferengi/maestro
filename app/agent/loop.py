@@ -25,7 +25,9 @@ from app.agent.config import (
     MAX_CONSECUTIVE_ERRORS,
     PROJECT_ROOT,
     SIGNAL_ACCEPTED,
+    SIGNAL_REJECTED,
     SIGNAL_REVERT,
+    SIGNAL_NEEDS_HUMAN,
     GIT_SAFETY_BRANCH_PREFIX,
     INDEV_AGENT_TOOLS,
     check_context_saturation,
@@ -49,7 +51,7 @@ class LoopResult:
     """Outcome of a single MaestroLoop run."""
 
     task_id: str
-    status: Literal["ACCEPTED", "REVERT_TO_DESIGN", "MAX_TURNS", "ERROR"]
+    status: Literal["ACCEPTED", "REJECTED", "REVERT_TO_DESIGN", "NEEDS_HUMAN", "MAX_TURNS", "ERROR"]
     turns: int
     final_message: str
     git_branch: str | None = None
@@ -524,12 +526,30 @@ class MaestroLoop:
                 git_branch=signal_dict.get("git_branch") or self._git_branch,
                 files_changed=signal_dict.get("files_changed") or self._files_changed,
             )
-        else:  # REVERT_TO_DESIGN
+        elif sig == SIGNAL_NEEDS_HUMAN:
+            result = LoopResult(
+                task_id=self.task_id,
+                status="NEEDS_HUMAN",
+                turns=self._turn,
+                final_message=signal_dict.get("summary", "Agent escalated for human review."),
+                git_branch=self._git_branch,
+            )
+        elif sig == SIGNAL_REJECTED:
+            # Dev agent self-reporting rejection — treat like a design revert
+            result = LoopResult(
+                task_id=self.task_id,
+                status="REJECTED",
+                turns=self._turn,
+                final_message=signal_dict.get("summary", "Implementation rejected."),
+                git_branch=self._git_branch,
+                error_detail=signal_dict.get("advice"),
+            )
+        else:  # REVERT_TO_DESIGN and any unknown signal
             result = LoopResult(
                 task_id=self.task_id,
                 status="REVERT_TO_DESIGN",
                 turns=self._turn,
-                final_message=signal_dict.get("reason", "Reverting to design."),
+                final_message=signal_dict.get("reason", signal_dict.get("summary", "Reverting to design.")),
                 git_branch=self._git_branch,
                 error_detail=signal_dict.get("advice"),
             )

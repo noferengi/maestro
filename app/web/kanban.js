@@ -1935,9 +1935,10 @@ document.addEventListener('DOMContentLoaded', async function() {
     // Start auto-refresh every 5 seconds
     startAutoRefresh();
 
-    // Load inbox and start badge polling
+    // Load inbox, start badge polling, and start escalation poll
     await loadInbox();
     _inboxPollInterval = setInterval(refreshInboxBadge, 60_000);
+    _startEscalationPoll();
 });
 
 // Start automatic polling for database changes
@@ -4526,6 +4527,102 @@ async function _inboxSaveTransitionResult(taskId, taskTitle, data) {
     } catch (e) {
         console.error('[inbox] save failed:', e);
     }
+}
+
+// ============================================
+// Escalation Dialog (NEEDS_HUMAN)
+// ============================================
+
+let _escalationCurrentMsg = null;
+let _escalationSeenIds = new Set();
+let _escalationPollTimer = null;
+
+async function _escalationPoll() {
+    try {
+        const resp = await fetch(`${API_BASE}/inbox/escalations`);
+        if (!resp.ok) return;
+        const msgs = await resp.json();
+        const unseen = msgs.filter(m => !_escalationSeenIds.has(m.id));
+        if (unseen.length > 0) {
+            _showEscalationDialog(unseen[0]);
+        }
+    } catch (e) { /* silent */ }
+}
+
+function _showEscalationDialog(msg) {
+    _escalationCurrentMsg = msg;
+    _escalationSeenIds.add(msg.id);
+
+    const titleEl = document.getElementById('escalation-task-title');
+    const bodyEl = document.getElementById('escalation-body');
+    if (titleEl) titleEl.textContent = msg.task_title || msg.task_id || '';
+
+    let summary = msg.subject || '';
+    try {
+        if (msg.data_json) {
+            const d = JSON.parse(msg.data_json);
+            if (d.summary) summary = d.summary;
+        }
+    } catch (e) { /* use subject */ }
+    if (bodyEl) bodyEl.textContent = summary;
+
+    const overlay = document.getElementById('escalation-overlay');
+    if (overlay) overlay.style.display = 'flex';
+}
+
+function closeEscalationDialog() {
+    const overlay = document.getElementById('escalation-overlay');
+    if (overlay) overlay.style.display = 'none';
+    _escalationCurrentMsg = null;
+}
+
+async function escalationAcknowledge() {
+    if (_escalationCurrentMsg) {
+        try {
+            await fetch(`${API_BASE}/inbox/${_escalationCurrentMsg.id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ read: true }),
+            });
+            _inboxUnreadCount = Math.max(0, _inboxUnreadCount - 1);
+            _updateInboxBadge();
+        } catch (e) { /* silent */ }
+    }
+    closeEscalationDialog();
+}
+
+async function escalationGoToCard() {
+    const msg = _escalationCurrentMsg;
+    await escalationAcknowledge();
+    if (!msg || !msg.task_id) return;
+
+    // Find the task and switch to its project if needed
+    let task = allTasks.find(t => t.id === msg.task_id);
+    if (!task && msg.task_id) {
+        // Task may be in a different project — look it up
+        try {
+            const resp = await fetch(`${API_BASE}/tasks/${msg.task_id}`);
+            if (resp.ok) task = await resp.json();
+        } catch (e) { /* ignore */ }
+    }
+    if (task && task.project && task.project !== currentProject) {
+        await switchProject(task.project);
+    }
+    // Scroll card into view
+    setTimeout(() => {
+        const card = document.querySelector(`[data-task-id="${msg.task_id}"]`);
+        if (card) {
+            card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            card.classList.add('highlight-flash');
+            setTimeout(() => card.classList.remove('highlight-flash'), 1500);
+        }
+    }, 400);
+}
+
+function _startEscalationPoll() {
+    if (_escalationPollTimer) return;
+    _escalationPoll();  // immediate check on startup
+    _escalationPollTimer = setInterval(_escalationPoll, 15_000);
 }
 
 // ============================================

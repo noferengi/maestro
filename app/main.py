@@ -5420,6 +5420,12 @@ def inbox_unread_count():
     return {"count": count_unread_inbox()}
 
 
+@app.get("/api/inbox/escalations", response_model=List[dict])
+def inbox_escalations():
+    """Return unread needs_human escalation messages, newest first."""
+    return get_inbox_messages(unread_only=True, source_type="needs_human")
+
+
 @app.post("/api/inbox", response_model=dict)
 def create_inbox(payload: dict):
     """Create an inbox message. Body: {subject, source_type?, task_id?, task_title?, outcome?, data_json?}"""

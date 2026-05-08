@@ -203,6 +203,20 @@ class FinalReviewPipeline:
                 votes.append(result)
                 self._store_reviewer_result(result, reviewer_type)
 
+        # Check if any reviewer escalated to human
+        for v in votes:
+            if isinstance(v, Vote) and v.justification.startswith("[NEEDS_HUMAN]"):
+                escalation_msg = v.justification[len("[NEEDS_HUMAN]"):].strip()
+                logger.info(f"[{AGENT_NAME}] Task '%s' escalated to human review.", self.task_id)
+                return FinalReviewPipelineResult(
+                    task_id=self.task_id,
+                    outcome="needs_human",
+                    votes=votes,
+                    summary=escalation_msg,
+                    prompt_tokens=self._total_prompt,
+                    completion_tokens=self._total_completion,
+                )
+
         # Standard tally
         tally = tally_votes(votes)
 
@@ -249,8 +263,8 @@ class FinalReviewPipeline:
             f"{ac_block}"
             "You may use tools to read code files before giving your verdict.\n\n"
             "To complete your review, call the submit_work tool with:\n"
-            "- signal: 'ACCEPTED' if the implementation passes your review, "
-            "or 'REVERT_TO_DESIGN' if there are defects requiring rework.\n"
+            "- signal: 'ACCEPTED' if the implementation passes, 'REJECTED' if it has defects, "
+            "or 'NEEDS_HUMAN' if the decision genuinely requires human judgment.\n"
             "- summary: Your justification.\n"
             "- payload: {\"verdict\": \"LIKELY|POSSIBLE|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED\", "
             "\"confidence\": <0-100>}\n\n"
@@ -341,6 +355,14 @@ class FinalReviewPipeline:
                     if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
                         try:
                             data = json.loads(tc_result)
+                            if data.get("signal") == "NEEDS_HUMAN":
+                                return Vote(
+                                    stage=f"review_{reviewer['type']}",
+                                    verdict=Verdict.NEEDS_RESEARCH,
+                                    confidence=65,
+                                    justification=f"[NEEDS_HUMAN] {data.get('summary', 'Reviewer escalated.')}",
+                                    model=self.llm_model or "",
+                                )
                             payload = data.get("payload", {})
                             verdict_str = payload.get("verdict", "POSSIBLE").upper()
                             verdict = Verdict(verdict_str)

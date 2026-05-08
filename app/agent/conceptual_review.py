@@ -104,6 +104,20 @@ class ConceptualReviewPipeline:
 
         all_votes = det_votes + llm_votes
 
+        # Check for NEEDS_HUMAN escalation before any further processing
+        for v in all_votes:
+            if isinstance(v, Vote) and v.justification.startswith("[NEEDS_HUMAN]"):
+                escalation_msg = v.justification[len("[NEEDS_HUMAN]"):].strip()
+                logger.info("[conceptual_review] Task '%s' escalated to human review.", self.task_id)
+                return ConceptualReviewResult(
+                    task_id=self.task_id,
+                    outcome="needs_human",
+                    votes=all_votes,
+                    summary=escalation_msg,
+                    prompt_tokens=self._total_prompt,
+                    completion_tokens=self._total_completion,
+                )
+
         # Handle NEEDS_RESEARCH: spawn research agent and re-vote affected LLM reviewers
         tally = tally_votes(all_votes)
         if tally.outcome == "needs_research":
@@ -388,7 +402,8 @@ class ConceptualReviewPipeline:
             f"{sanitize_user_content(extra_context)}"
             "You may use tools to read code files before giving your verdict.\n\n"
             "To complete your review, call the submit_work tool with:\n"
-            "- signal: 'ACCEPTED' if the plan is sound, or 'REVERT_TO_DESIGN' if there are critical defects.\n"
+            "- signal: 'ACCEPTED' if the plan is sound, 'REJECTED' if there are critical defects, "
+            "or 'NEEDS_HUMAN' if the decision genuinely requires human judgment.\n"
             "- summary: Your justification.\n"
             "- payload: {\"verdict\": \"LIKELY|POSSIBLE|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED\", "
             "\"confidence\": <0-100>, \"severity\": \"low|medium|high|critical\"}\n\n"
@@ -467,6 +482,14 @@ class ConceptualReviewPipeline:
                     if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
                         try:
                             data = json.loads(tc_result)
+                            if data.get("signal") == "NEEDS_HUMAN":
+                                return Vote(
+                                    stage=name,
+                                    verdict=Verdict.NEEDS_RESEARCH,
+                                    confidence=65,
+                                    justification=f"[NEEDS_HUMAN] {data.get('summary', 'Reviewer escalated.')}",
+                                    model=self.llm_model or "",
+                                )
                             payload = data.get("payload", {})
                             verdict_str = payload.get("verdict", "POSSIBLE").upper()
                             verdict = Verdict(verdict_str)

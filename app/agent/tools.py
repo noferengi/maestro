@@ -3952,21 +3952,27 @@ TOOL_SCHEMAS: list[dict] = [
             "description": (
                 "[FINISH] Terminate your session and report outcome. "
                 "Call this ONCE at the very end — it immediately stops the agent loop. "
-                "Choose signal: ACCEPTED (work done, tests pass), "
-                "REVERT_TO_DESIGN (blocked by design flaw or exhausted retries), "
-                "SUBDIVIDE (task too large, needs breakdown into sub-tasks), "
-                "PLAN_UPDATED (planning correction complete)."
+                "Implementors: ACCEPTED (work done, tests pass), "
+                "REVERT_TO_DESIGN (design is broken, cannot proceed), "
+                "SUBDIVIDE (task too large for one agent), "
+                "PLAN_UPDATED (planning correction complete). "
+                "Reviewers: ACCEPTED (implementation passes), "
+                "REJECTED (implementation fails review criteria). "
+                "Any agent: NEEDS_HUMAN (decision requires human judgment — escalates to human review)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "signal": {
                         "type": "string",
-                        "enum": ["ACCEPTED", "REVERT_TO_DESIGN", "SUBDIVIDE", "PLAN_UPDATED"],
+                        "enum": ["ACCEPTED", "REJECTED", "REVERT_TO_DESIGN", "SUBDIVIDE", "PLAN_UPDATED", "NEEDS_HUMAN"],
                         "description": (
-                            "Terminal signal: ACCEPTED (task complete), REVERT_TO_DESIGN "
-                            "(task impossible/needs re-plan), SUBDIVIDE (needs further breakdown), "
-                            "PLAN_UPDATED (correction complete)."
+                            "ACCEPTED: work complete or review passes. "
+                            "REJECTED: reviewer finds the implementation fails criteria. "
+                            "REVERT_TO_DESIGN: implementor cannot proceed — design is broken. "
+                            "SUBDIVIDE: task too large, needs breakdown. "
+                            "PLAN_UPDATED: planning correction applied. "
+                            "NEEDS_HUMAN: decision exceeds agent confidence — escalates to human review."
                         ),
                     },
                     "summary": {

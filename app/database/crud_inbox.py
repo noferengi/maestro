@@ -54,12 +54,14 @@ def create_inbox_message(
         return _row_to_dict(msg)
 
 
-def get_inbox_messages(unread_only: bool = False) -> list[dict]:
-    """Return all inbox messages, newest first. Optionally filter to unread."""
+def get_inbox_messages(unread_only: bool = False, source_type: str | None = None) -> list[dict]:
+    """Return all inbox messages, newest first. Optionally filter to unread or by source_type."""
     with SessionLocal() as db:
         q = db.query(InboxMessage)
         if unread_only:
             q = q.filter(InboxMessage.read == False)  # noqa: E712
+        if source_type is not None:
+            q = q.filter(InboxMessage.source_type == source_type)
         msgs = q.order_by(InboxMessage.created_at.desc()).all()
         return [_row_to_dict(m) for m in msgs]
 

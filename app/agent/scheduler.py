@@ -3577,7 +3577,23 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
             else:
                 logger.info("Task '%s' reached ACCEPTED but current type '%s' has no auto-transition.", task_id, current_type)
 
-        elif result.status == "REVERT_TO_DESIGN":
+        elif result.status == "NEEDS_HUMAN":
+            _exit_reason = "needs_human"
+            _exit_summary = result.final_message or "Agent escalated for human review."
+            update_task(task_id, type="human_review")
+            from app.database import create_inbox_message as _create_inbox
+            task_obj = get_task(task_id)
+            _create_inbox(
+                subject=f"Human review needed: {(task_obj.title if task_obj else task_id)[:60]}",
+                source_type="needs_human",
+                task_id=task_id,
+                task_title=task_obj.title if task_obj else None,
+                outcome="needs_human",
+                data_json=__import__("json").dumps({"summary": _exit_summary}),
+            )
+            logger.info("Task '%s' escalated to HUMAN REVIEW by agent: %s", task_id, _exit_summary)
+
+        elif result.status in ("REVERT_TO_DESIGN", "REJECTED"):
             _exit_reason = "rejected"
             update_task(task_id, type="planning")
             _record_demotion_inline(task_id, "indev", "planning", result.final_message or "Agent requested revert")
@@ -3853,7 +3869,21 @@ def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
             total_prompt_tokens=_prompt_tokens,
             total_completion_tokens=_completion_tokens,
         )
-        if result.get("outcome") == "passed":
+        if result.get("outcome") == "needs_human":
+            _exit_reason = "needs_human"
+            _exit_summary = result.get("summary", "Reviewer escalated for human judgment.")
+            update_task(task_id, type="human_review")
+            from app.database import create_inbox_message as _create_inbox_cr
+            _create_inbox_cr(
+                subject=f"Human review needed: {(task.title or task_id)[:60]}",
+                source_type="needs_human",
+                task_id=task_id,
+                task_title=task.title,
+                outcome="needs_human",
+                data_json=__import__("json").dumps({"summary": _exit_summary}),
+            )
+            logger.info("Task '%s' escalated to HUMAN REVIEW by conceptual reviewer.", task_id)
+        elif result.get("outcome") == "passed":
             update_task(task_id, type="optimization")
             logger.info("Task '%s' advanced to OPTIMIZATION via scheduler.", task_id)
         else:
@@ -4114,7 +4144,22 @@ def _run_final_review_task(task_id: str, llm_base_url: str, llm_model: str,
             total_completion_tokens=_completion_tokens,
         )
 
-        if result.get("outcome") == "passed":
+        if result.get("outcome") == "needs_human":
+            _exit_reason = "needs_human"
+            _exit_summary = result.get("summary", "Reviewer escalated for human judgment.")
+            update_task(task_id, type="human_review")
+            from app.database import create_inbox_message as _create_inbox_fr
+            _create_inbox_fr(
+                subject=f"Human review needed: {(task.title or task_id)[:60]}",
+                source_type="needs_human",
+                task_id=task_id,
+                task_title=task.title,
+                outcome="needs_human",
+                data_json=__import__("json").dumps({"summary": _exit_summary}),
+            )
+            logger.info("[final_review] Task '%s' escalated to HUMAN REVIEW by reviewer.", task_id)
+
+        elif result.get("outcome") == "passed":
             from app.agent.merge import execute_merge
             from app.database import get_project_path as _get_project_path
             # Always use real project root for merge — project_path here is the
