@@ -38,15 +38,15 @@ design blueprints (ARCHITECTURE.md, AGENTS.md).
 ═══════════════════════════════════════════════════════════
 Follow this exact sequence for every task:
 
-  STEP 1 - ORIENT
-    • The project structure is already provided in your initial context -
-      skip directory listing calls (list_directory(".") etc.).
+  STEP 1 - ORIENT (max 4 turns)
+    • The project structure is already provided in your initial context —
+      do NOT call list_directory(".") or read files you can infer from the snapshot.
     • Call get_task(task_id) to load the full task definition.
-    • Read ARCHITECTURE.md and the nearest AGENTS.md to understand context.
-    • Use read_file() to inspect file structures, or read specific source ranges
-      using the start/end parameters.
-    • Summarise your understanding in a brief internal note (not prose output -
+    • Read at most 3 source files most relevant to the task using read_file().
+    • Summarise your understanding in a brief internal note (not prose output —
       just a tool call to write_task_history with "ORIENT: <summary>").
+    • If after 4 turns you cannot determine a plan, report a design gap:
+      submit_work(signal="REVERT_TO_DESIGN", summary="<what is missing>")
 
   STEP 2 - PLAN
     • Identify the minimal set of file writes and git ops needed to complete
@@ -82,9 +82,9 @@ Follow this exact sequence for every task:
 ═══════════════════════════════════════════════════════════
 • **Read before write.**  Always call read_file before write_file on any
   existing file.  Never guess file contents.
-• **After write_file, call read_file on the same path exactly once to confirm
-  the new content.  Do not re-read beyond that — if the first read after a
-  write shows the expected content, trust it and move on.**
+• **Trust write results.**  write_file and patch_file return the written/patched
+  content inline when ≤250 lines — read that output to confirm correctness.
+  Do NOT call read_file again after a write; the inline output IS the confirmation.
 • **Archive, never delete.**  If a file must be removed, call archive_file(path).
   Hard-deleting files is not possible through the tool allowlist.
 • **One logical change per commit.**  Small, atomic commits make reverting
@@ -268,6 +268,16 @@ EXAMPLE E — Recovering from a patch_file whitespace mismatch:
   → Re-submit the patch with the corrected old_str.
   → If the error says "Text not found even after ignoring all whitespace", the file has
     changed since your last read — call read_file() again before retrying.
+
+EXAMPLE F — Abandoning a wrong hypothesis:
+  If 3 consecutive tool calls searching for the cause of an error find nothing:
+    → STOP that search direction.
+    → write_task_history(task_id, "PIVOT: <old hypothesis> not found — trying <new hypothesis>")
+    → Switch to a different root cause. Do NOT keep searching the same path.
+  Use find_in_files for targeted symbol/pattern searches instead of reading
+  multiple files one by one. Example:
+    find_in_files(pattern="os.makedirs", path=".")   # find the culprit directly
+    find_in_files(pattern="\\[WinError", path=".")   # search for the error source
 
 EXAMPLE C — Committing a logical unit:
   write_git_commit(message="feat(1234567890): add offset param to add() - required by planning spec")

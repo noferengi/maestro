@@ -654,7 +654,17 @@ def write_file(path: str, content: str) -> str:
             fh.write(content)
         _invalidate_prepped_cache(safe_path)
         _git_run(["git", "add", safe_path])
-        return f"OK: wrote {len(content)} chars to '{path}' and staged for git.{archived_msg}"
+        line_count = content.count('\n') + (1 if content and not content.endswith('\n') else 0)
+        status = f"OK: wrote {line_count} lines to '{path}' and staged for git.{archived_msg}"
+        if line_count <= 250:
+            status += f"\n\n== NEW CONTENT: {path} ==\n{content}"
+            if content and not content.endswith('\n'):
+                status += "\n"
+            status += "== END =="
+        else:
+            preview = '\n'.join(f"{i+1}: {l}" for i, l in enumerate(content.split('\n')[:10]))
+            status += f"\n(first 10 of {line_count} lines)\n{preview}\n..."
+        return status
     except OSError as exc:
         return f"ERROR writing '{path}': {exc}"
 
@@ -673,7 +683,17 @@ def append_file(path: str, content: str) -> str:
             fh.write(content)
         _invalidate_prepped_cache(safe_path)
         _git_run(["git", "add", safe_path])
-        return f"OK: appended {len(content)} chars to '{path}'."
+        line_count = content.count('\n') + (1 if content and not content.endswith('\n') else 0)
+        status = f"OK: appended {line_count} lines to '{path}'."
+        if line_count <= 250:
+            status += f"\n\n== APPENDED CONTENT ==\n{content}"
+            if content and not content.endswith('\n'):
+                status += "\n"
+            status += "== END =="
+        else:
+            preview = '\n'.join(f"{i+1}: {l}" for i, l in enumerate(content.split('\n')[:10]))
+            status += f"\n(first 10 of {line_count} lines)\n{preview}\n..."
+        return status
     except OSError as exc:
         return f"ERROR appending to '{path}': {exc}"
 
@@ -765,11 +785,22 @@ def patch_file(path: str, old_str: str, new_str: str) -> str:
             _invalidate_prepped_cache(safe_path)
             _git_run(["git", "add", safe_path])
             lines_changed = new_str.count("\n") - old_str.count("\n")
-            return (
-                f"OK: patched '{path}' (lines {start_line}-{end_line}, net {lines_changed:+d} lines). "
-                f"[auto-repaired: trailing whitespace ignored during match] "
-                f"Staged for git. Pre-patch copy archived to '{archive_dest}'."
+            new_end_line = start_line + new_str.count("\n")
+            lax_msg = (
+                f"OK: patched '{path}' (lines {start_line}-{end_line} -> {start_line}-{new_end_line}, "
+                f"net {lines_changed:+d} lines) [auto-repaired trailing whitespace]. Staged for git."
             )
+            patched_lines = patched.splitlines()
+            ctx_start = max(0, start_line - 2)
+            ctx_end = min(len(patched_lines), new_end_line + 2)
+            if ctx_end - ctx_start <= 250:
+                section = '\n'.join(
+                    f"{ctx_start + i + 1}: {patched_lines[ctx_start + i]}" for i in range(ctx_end - ctx_start)
+                )
+                lax_msg += f"\n\n== PATCHED SECTION (lines {ctx_start+1}-{ctx_end}) ==\n{section}\n== END =="
+            else:
+                lax_msg += f"\n(section spans {ctx_end - ctx_start} lines — too large to show inline)"
+            return lax_msg
 
         # Diagnostic path: show visible whitespace so the model can spot the mismatch.
         import re
@@ -848,10 +879,22 @@ def patch_file(path: str, old_str: str, new_str: str) -> str:
     _invalidate_prepped_cache(safe_path)
     _git_run(["git", "add", safe_path])
     lines_changed = new_str.count("\n") - old_str.count("\n")
-    return (
-        f"OK: patched '{path}' (lines {start_line}-{end_line}, net {lines_changed:+d} lines). "
-        f"Staged for git. Pre-patch copy archived to '{archive_dest}'."
+    new_end_line = start_line + new_str.count("\n")
+    msg = (
+        f"OK: patched '{path}' (lines {start_line}-{end_line} -> {start_line}-{new_end_line}, "
+        f"net {lines_changed:+d} lines). Staged for git."
     )
+    patched_lines = patched.splitlines()
+    ctx_start = max(0, start_line - 2)
+    ctx_end = min(len(patched_lines), new_end_line + 2)
+    if ctx_end - ctx_start <= 250:
+        section = '\n'.join(
+            f"{ctx_start + i + 1}: {patched_lines[ctx_start + i]}" for i in range(ctx_end - ctx_start)
+        )
+        msg += f"\n\n== PATCHED SECTION (lines {ctx_start+1}-{ctx_end}) ==\n{section}\n== END =="
+    else:
+        msg += f"\n(section spans {ctx_end - ctx_start} lines — too large to show inline)"
+    return msg
 
 
 def _get_cached_summary_for_listing(abs_path: str) -> "str | None":

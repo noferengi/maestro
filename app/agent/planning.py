@@ -428,16 +428,29 @@ class PlanningPipeline:
         if self.prior_failure_context:
             try:
                 _fail_block = "\n\n[PRIOR PLANNING ATTEMPT FAILURES — do not repeat these approaches]\n"
+                _steps_failed = False
                 for i, _f in enumerate(self.prior_failure_context, 1):
                     _fail_block += f"\n  Attempt {i} ({_f.get('created_at', '?')}):\n"
                     failing = _f.get('gate_checks') or []
                     if failing:
-                        _fail_block += f"    Gate failures: {', '.join(c.get('name', '?') for c in failing)}\n"
+                        for _c in failing:
+                            _cname = _c.get('name', '?')
+                            _cdetail = _c.get('detail', '')
+                            _fail_block += f"    Gate failure [{_cname}]: {_cdetail}\n"
+                            if _cname == 'implementation_steps_present':
+                                _steps_failed = True
                     if _f.get('error_message'):
                         _fail_block += f"    Error: {_f['error_message'][:200]}\n"
                     pitfalls = _f.get('pitfalls_identified') or []
                     if pitfalls:
                         _fail_block += f"    Pitfalls: {str(pitfalls)[:300]}\n"
+                if _steps_failed:
+                    _fail_block += (
+                        "\n  CRITICAL: implementation_steps was empty in prior attempt(s). "
+                        "You MUST include at least one step in implementation_steps — "
+                        "an empty array is a hard gate failure. Do not call submit_work with "
+                        "implementation_steps: [] or implementation_steps missing.\n"
+                    )
                 survey_summary += _fail_block
             except Exception:
                 pass
@@ -787,12 +800,12 @@ class PlanningPipeline:
             "- signal: 'ACCEPTED'\n"
             "- summary: A brief summary of your design rationale.\n"
             "- payload: {\n"
+            "    \"implementation_steps\": [REQUIRED — non-empty list, see rule 7 below],\n"
             "    \"design_rationale\": \"string explaining the approach\",\n"
             "    \"file_manifest\": \"list of {path, action, purpose, estimated_lines, depends_on}\",\n"
             "    \"dependency_graph\": \"dict mapping component -> [dependencies]\",\n"
             "    \"interface_contracts\": \"list of {component, provides, consumes, invariants}\",\n"
-            "    \"test_strategy\": \"list of {component, test_file, test_cases, fixtures}\",\n"
-            "    \"implementation_steps\": \"list of {order, component, files, description, depends_on, estimated_context_tokens}\"\n"
+            "    \"test_strategy\": \"list of {component, test_file, test_cases, fixtures}\"\n"
             "}\n\n"
             "CRITICAL rules:\n"
             "1. ONLY list NEW or MODIFIED interfaces being introduced by this task.\n"
@@ -806,7 +819,11 @@ class PlanningPipeline:
             "5. If this task requires an artifact from another task, make that other task a "
             "prerequisite, not a consumes entry.\n"
             "6. Name test subjects by component/class name (e.g. 'UserService'), not by filename.\n"
-            "7. implementation_steps must be incremental. Each step must name a component.\n"
+            "7. implementation_steps is MANDATORY and MUST be a non-empty list — an empty array "
+            "is a HARD GATE FAILURE that will reject your entire plan. Fill this BEFORE file_manifest. "
+            "Each step: {\"order\": 1, \"component\": \"MyClass\", \"files\": [\"src/my_class.py\"], "
+            "\"description\": \"Create MyClass with X and Y methods\", "
+            "\"depends_on\": [], \"estimated_context_tokens\": 2000}\n"
             "8. DO NOT output free-form prose after calling submit_work."
             + (f"\n\n{_arch}" if _arch else "")
         )
@@ -911,6 +928,29 @@ class PlanningPipeline:
                         tc_result = dispatch_tool(tc_name, tc_args)
 
                         if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
+                            _reject_steps = False
+                            try:
+                                _data = json.loads(tc_result)
+                                _payload = _data.get("payload") or {}
+                                if not _payload.get("implementation_steps"):
+                                    _reject_steps = True
+                            except Exception:
+                                pass
+                            if _reject_steps:
+                                tool_result_msgs.append({
+                                    "role": "tool",
+                                    "tool_call_id": tc.get("id", f"call_{turn}_{tc_name}"),
+                                    "content": (
+                                        "REJECTED: implementation_steps is empty or missing. "
+                                        "This is a HARD GATE FAILURE — the planning gate will reject any "
+                                        "plan without implementation steps. You MUST include at least one "
+                                        "step: {\"order\": 1, \"component\": \"...\", \"files\": [...], "
+                                        "\"description\": \"...\", \"depends_on\": [], "
+                                        "\"estimated_context_tokens\": 1000}. "
+                                        "Re-call submit_work with a non-empty implementation_steps array."
+                                    ),
+                                })
+                                break  # break tc loop with terminal=False; turn loop continues
                             data = json.loads(tc_result)
                             design = data.get("payload")
                             terminal = True
