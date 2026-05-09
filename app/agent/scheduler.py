@@ -2862,25 +2862,27 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
     with _active_sessions_lock:
         _session_ids[task_id] = session_id
 
-    # Bootstrap: ensure git repo + venv exist before first worktree creation.
-    if project_path:
-        from app.agent.worktree import ensure_project_ready
-        ensure_project_ready(project_path)
-
-    # Worktree isolation: give each task its own git checkout.
+    # worktree_path is set before the try so the finally block can always clean up.
     worktree_path = project_path
-    if project_path:
-        from app.agent.worktree import setup_task_worktree
-        wt = setup_task_worktree(task_id, project_path)
-        if wt is None:
-            raise WorktreeIsolationError(
-                f"Task '{task_id}': cannot create git worktree at '{project_path}'. "
-                f"Project must be a git repository with at least one commit. "
-                f"Initialize with: git init && git commit --allow-empty -m 'init'"
-            )
-        worktree_path = wt
 
     try:
+        # Bootstrap: ensure git repo + venv exist before first worktree creation.
+        if project_path:
+            from app.agent.worktree import ensure_project_ready
+            ensure_project_ready(project_path)
+
+        # Worktree isolation: give each task its own git checkout.
+        if project_path:
+            from app.agent.worktree import setup_task_worktree
+            wt = setup_task_worktree(task_id, project_path)
+            if wt is None:
+                raise WorktreeIsolationError(
+                    f"Task '{task_id}': cannot create git worktree at '{project_path}'. "
+                    f"Common causes: (1) not a git repo — fix with: git init && git commit --allow-empty -m 'init'; "
+                    f"(2) ghost worktree directory exists with locked files — check server log for '[worktree]' entries."
+                )
+            worktree_path = wt
+
         llm_base_url = f"http://{llm.address}:{llm.port}/v1"
         llm_model = llm.model
         max_context = llm.max_context
@@ -2906,6 +2908,7 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
     except TaskDeactivatedError as exc:
         logger.info("Task '%s' session halted: %s", task_id, exc)
     except WorktreeIsolationError as exc:
+        _failed_cooldowns[task_id] = time.time()
         logger.error("[scheduler] Task '%s' aborted — worktree isolation failed: %s", task_id, exc)
         try:
             from app.database import append_task_history
@@ -3682,13 +3685,19 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
         _record_demotion_inline(task_id, "indev", "planning", "Missing planning results")
         return
 
-    planning_result = {
-        "implementation_steps": json.loads(planning_result_obj.implementation_steps or "[]"),
-        "file_manifest": json.loads(planning_result_obj.file_manifest or "[]"),
-        "dependency_graph": json.loads(planning_result_obj.dependency_graph or "{}"),
-        "interface_contracts": json.loads(planning_result_obj.interface_contracts or "[]"),
-        "test_strategy": json.loads(planning_result_obj.test_strategy or "[]"),
-    }
+    try:
+        planning_result = {
+            "implementation_steps": json.loads(planning_result_obj.implementation_steps or "[]"),
+            "file_manifest": json.loads(planning_result_obj.file_manifest or "[]"),
+            "dependency_graph": json.loads(planning_result_obj.dependency_graph or "{}"),
+            "interface_contracts": json.loads(planning_result_obj.interface_contracts or "[]"),
+            "test_strategy": json.loads(planning_result_obj.test_strategy or "[]"),
+        }
+    except json.JSONDecodeError as exc:
+        logger.warning("Corrupt planning result JSON for task '%s' (%s), demoting to planning.", task_id, exc)
+        update_task(task_id, type="planning")
+        _record_demotion_inline(task_id, "indev", "planning", f"Corrupt planning result JSON: {exc}")
+        return
 
     # Fetch the most recent review rejection so the dev agent knows what to fix.
     review_feedback: str | None = None
@@ -4297,6 +4306,11 @@ def _recover_hung_sessions() -> None:
                     .order_by(_BE.created_at.desc())
                     .first()
                 )
+                # Convert session start (monotonic) to a wall-clock UTC datetime so
+                # we can clamp idle baseline to max(last_budget_entry, session_start).
+                # Without this, a fresh session with an old budget entry from a prior
+                # session would appear falsely idle for the full gap since that entry.
+                session_started_utc = now_utc - _dt_mod.timedelta(seconds=(now_mono - start))
                 if latest is None:
                     idle_secs = now_mono - start
                 else:
@@ -4307,7 +4321,8 @@ def _recover_hung_sessions() -> None:
                         )
                     if last_at.tzinfo is None:
                         last_at = last_at.replace(tzinfo=_dt_mod.timezone.utc)
-                    idle_secs = (now_utc - last_at).total_seconds()
+                    effective_baseline = max(last_at, session_started_utc)
+                    idle_secs = (now_utc - effective_baseline).total_seconds()
 
                 if idle_secs < _HUNG_SESSION_IDLE_SECONDS:
                     continue

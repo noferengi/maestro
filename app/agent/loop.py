@@ -360,6 +360,17 @@ class MaestroLoop:
                         pip_block += f"\nPIP {i+1} (from {pip.origin_stage}, status: {pip.status}):\n"
                         for req in reqs:
                             pip_block += f"- {sanitize_user_content(req)}\n"
+
+                # Inject demotion history so re-entering dev sessions know why they were sent back
+                if _task_rec and _task_rec.demotion_history:
+                    recent = _task_rec.demotion_history[-3:]
+                    lines = ["\n\n### DEMOTION HISTORY (most recent first — read before implementing)"]
+                    for entry in reversed(recent):
+                        ts = entry.get("timestamp", "")[:10]
+                        lines.append(
+                            f"- [{ts}] {entry['from']} → {entry['to']}: {sanitize_user_content(entry.get('reason', ''))}"
+                        )
+                    pip_block += "\n".join(lines) + "\n"
         except Exception:
             pass
 

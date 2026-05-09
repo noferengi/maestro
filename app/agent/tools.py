@@ -2273,6 +2273,8 @@ _PYTEST_FLAGS = frozenset({
     "--durations=0", "--durations=10", "--durations=20",
     "--log-cli-level=DEBUG", "--log-cli-level=INFO", "--log-cli-level=WARNING",
     "--import-mode=importlib", "--import-mode=prepend", "--import-mode=append",
+    "--runxfail",
+    "--override-ini=xfail_strict=true", "--override-ini=xfail_strict=false",
 })
 _PYTEST_VALUE_FLAGS = frozenset({
     "-k", "-m", "--ignore", "-n", "--timeout", "--cov",
@@ -2469,7 +2471,7 @@ def run_test_pytest(
     if cwd is None:
         return "ERROR: No task git working directory configured."
     safe_path = _validate_tool_path(path, "run_test_pytest") or "."
-    safe_flags, _rejected = _validate_flags(flags, "run_test_pytest", _PYTEST_FLAGS, _PYTEST_VALUE_FLAGS)
+    safe_flags, _rejected = _validate_flags(flags, "run_test_pytest", _PYTEST_FLAGS, _PYTEST_VALUE_FLAGS, _task_id_ctx.get())
     _rejection_prefix = ""
     if _rejected:
         _rejection_prefix = (
@@ -2495,7 +2497,7 @@ def run_test_pytest(
                 except OSError:
                     pass
         if not _has_timeout_config:
-            injected = max(60, SHELL_TIMEOUT_SECONDS // 2) if SHELL_TIMEOUT_SECONDS > 60 else SHELL_TIMEOUT_SECONDS
+            injected = max(60, SHELL_TIMEOUT_SECONDS)
             args.append(f"--timeout={injected}")
     timeout_msg = (
         f"ERROR: Command timed out after {SHELL_TIMEOUT_SECONDS}s. "

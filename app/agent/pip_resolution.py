@@ -274,7 +274,10 @@ class PIPResolutionAgent:
             "Stop when you are confident every requirement above is satisfied.\n"
             "Do NOT expand scope beyond these requirements.\n"
             f"After {_MAX_CONSECUTIVE_ERRORS} consecutive tool failures, call "
-            'submit_work(signal="RESOLUTION_STALLED", summary="<root cause>") to signal you cannot proceed.'
+            'submit_work(signal="RESOLUTION_STALLED", summary="<root cause>") to signal you cannot proceed.\n'
+            "If a tool fails in a way that seems like a harness bug rather than your mistake, "
+            "call report_tool_bug(tool_name, trying_to, expected, actual) before stalling — "
+            "a human operator will read the report and fix the underlying issue."
         )
 
         return [{"role": "system", "content": system_prompt}]

@@ -220,24 +220,24 @@ class SecurityPipeline:
         """Run allowlisted security scanners and return output as context string."""
         import functools
 
+        # Each entry: (tool_key passed to run_shell_security, display_name in output)
         commands = [
-            "python -m bandit -r . -q --no-show-progress",
-            "python -m detect_secrets scan",
+            ("bandit", "bandit"),
+            ("detect-secrets", "detect_secrets"),
         ]
         loop = asyncio.get_event_loop()
         shell_fn = functools.partial(run_shell_security, project_path=self.project_path)
         scan_outputs = []
 
-        for cmd in commands:
+        for tool_key, scanner_name in commands:
             try:
-                result = await loop.run_in_executor(None, shell_fn, cmd)
+                result = await loop.run_in_executor(None, shell_fn, tool_key)
                 if result and not result.startswith("ERROR:"):
-                    scanner_name = cmd.split()[2]
                     scan_outputs.append(f"[{scanner_name}]\n{result[:2000]}")
                 else:
-                    logger.debug(f"[{AGENT_NAME}] Pre-scan '%s': %s", cmd, result[:200])
+                    logger.debug(f"[{AGENT_NAME}] Pre-scan '%s': %s", tool_key, result[:200])
             except Exception as e:
-                logger.warning(f"[{AGENT_NAME}] Pre-scan '%s' failed: %s", cmd, e)
+                logger.warning(f"[{AGENT_NAME}] Pre-scan '%s' failed: %s", tool_key, e)
 
         if not scan_outputs:
             return ""

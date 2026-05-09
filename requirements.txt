@@ -33,3 +33,4 @@ uvicorn==0.41.0
 duckduckgo-search==7.3.2
 beautifulsoup4==4.13.3
 tavily-python==0.7.23
+psutil>=6.0.0

@@ -618,7 +618,7 @@ def _sanitize_messages(messages: list[dict]) -> list[dict]:
                     count = content.count(raw)
                     idx = content.find(raw)
                     snip = content[max(0, idx - 40):idx + len(raw) + 40].replace("\n", "↵")
-                    logger.warning(
+                    logger.debug(
                         "msg[%d] (%s): Escaping Jinja2 delimiter %r ×%d — near: %r",
                         i, role, raw, count, snip,
                     )
@@ -634,7 +634,7 @@ def _sanitize_messages(messages: list[dict]) -> list[dict]:
         if _sbrace_match:
             if log_warn:
                 snip = content[max(0, _sbrace_match.start() - 40):_sbrace_match.end() + 40].replace("\n", "↵")
-                logger.warning(
+                logger.debug(
                     "msg[%d] (%s): Escaping single-brace identifiers ×%d — near: %r",
                     i, role, len(_SINGLE_BRACE_RE.findall(content)), snip,
                 )

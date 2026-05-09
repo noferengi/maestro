@@ -77,10 +77,20 @@ def patch_planning_fields(result_id: int, fields: dict) -> str:
     from app.database import update_planning_result
     from app.database.session import SessionLocal
 
-    serialized = {
-        k: (v if isinstance(v, str) else json.dumps(v))
-        for k, v in fields.items()
-    }
+    serialized = {}
+    for k, v in fields.items():
+        if isinstance(v, str):
+            try:
+                json.loads(v)
+            except json.JSONDecodeError as exc:
+                return (
+                    f"ERROR: field '{k}' must be a JSON array or object, "
+                    f"not plain text (got: {repr(v[:80])}). "
+                    f"Pass a list/dict and the tool will encode it. Parse error: {exc}"
+                )
+            serialized[k] = v
+        else:
+            serialized[k] = json.dumps(v)
     db = SessionLocal()
     try:
         result = update_planning_result(db, result_id, **serialized)
@@ -316,3 +326,101 @@ def get_scheduler_api_status() -> dict:
         return {"error": f"Maestro server not reachable: {e}"}
     except Exception as exc:
         return {"error": str(exc)}
+
+
+def cleanup_ghost_worktrees(project_path: str | None = None) -> dict:
+    """
+    Scan all projects (or one specific project_path) for ghost worktrees:
+
+      - On-disk directories under .maestro-worktrees/ not registered with git
+      - Git-registered worktrees whose directories still exist after a crash
+
+    For each ghost found:
+      1. Identifies any processes whose exe lives inside the ghost's venv/ directory
+      2. Kills those processes (so Windows DLL locks are released)
+      3. Removes the directory with chmod-retry for read-only git objects
+      4. Runs `git worktree prune` to clean git's internal references
+
+    Returns a report dict with keys:
+      projects_scanned, ghosts_found, ghosts_removed, processes_killed, errors
+    """
+    from app.database import get_all_projects
+    from app.agent.worktree import (
+        _WORKTREE_SUBDIR,
+        _find_processes_in_worktree,
+        _kill_worktree_processes,
+        _force_rmtree,
+        _is_git_repo,
+        _run,
+    )
+
+    if project_path:
+        projects = [project_path]
+    else:
+        try:
+            projects = [p.path for p in get_all_projects() if p.path]
+        except Exception as exc:
+            return {"error": f"Could not load projects: {exc}"}
+
+    report: dict = {
+        "projects_scanned": 0,
+        "ghosts_found": 0,
+        "ghosts_removed": 0,
+        "processes_killed": [],
+        "errors": [],
+    }
+
+    for proj in projects:
+        if not proj or not os.path.isdir(proj):
+            continue
+        if not _is_git_repo(proj):
+            continue
+
+        report["projects_scanned"] += 1
+        worktree_base = os.path.normpath(os.path.join(proj, _WORKTREE_SUBDIR))
+        if not os.path.isdir(worktree_base):
+            continue
+
+        # Collect git-registered worktrees for this project
+        rc, out, _ = _run(["git", "worktree", "list", "--porcelain"], proj)
+        registered: set[str] = set()
+        if rc == 0:
+            for line in out.splitlines():
+                if line.startswith("worktree "):
+                    registered.add(os.path.normpath(line[len("worktree "):].strip()))
+
+        # Scan on-disk entries
+        try:
+            entries = [e for e in os.scandir(worktree_base) if e.is_dir(follow_symlinks=False)]
+        except OSError as exc:
+            report["errors"].append(f"{worktree_base}: {exc}")
+            continue
+
+        for entry in entries:
+            norm_entry = os.path.normpath(entry.path)
+            if norm_entry in registered:
+                continue  # still legitimately registered
+
+            report["ghosts_found"] += 1
+            task_label = entry.name
+
+            # Find and kill locking processes, recording what we killed
+            locking = _find_processes_in_worktree(entry.path)
+            if locking:
+                _kill_worktree_processes(entry.path, task_label)
+                for pid, exe in locking:
+                    report["processes_killed"].append({
+                        "pid": pid,
+                        "exe": os.path.basename(exe),
+                        "worktree": entry.path,
+                    })
+
+            # Remove the directory
+            if _force_rmtree(entry.path, task_label):
+                report["ghosts_removed"] += 1
+            else:
+                report["errors"].append(f"Could not remove {entry.path} — file locks remain")
+
+        _run(["git", "worktree", "prune"], proj)
+
+    return report

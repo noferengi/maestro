@@ -35,6 +35,7 @@ Tools:
     maestro__stop_agent               — graceful stop of a running MaestroLoop
     maestro__run_pipeline_stage       — trigger review / security / final_review
     maestro__get_budget_entry_full    — full prompt+response for one budget entry
+    maestro__cleanup_ghost_worktrees  — kill locking procs, remove ghost worktree dirs across all projects
 
   Monitor:
     maestro__monitor                  — block N seconds, return activity diff + pattern flags
@@ -83,6 +84,7 @@ from mcp_tools.actions import (
     stop_agent,
     run_pipeline_stage,
     get_budget_entry_full,
+    cleanup_ghost_worktrees,
 )
 from mcp_tools.monitor import monitor
 
@@ -123,6 +125,7 @@ mcp.tool()(demote_task)
 mcp.tool()(stop_agent)
 mcp.tool()(run_pipeline_stage)
 mcp.tool()(get_budget_entry_full)
+mcp.tool()(cleanup_ghost_worktrees)
 
 # --- Monitor tool ---
 mcp.tool()(monitor)

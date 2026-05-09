@@ -69,7 +69,8 @@
       "Bash(xargs grep *)",
       "mcp__maestro__get_project_health",
       "mcp__maestro__find_stuck_tasks",
-      "Bash(venv/Scripts/python.exe -m pytest app/tests/ -x --tb=short -q)"
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/ -x --tb=short -q)",
+      "PowerShell(Get-Content \"D:/workspace/TheMaestro/logs/maestro.log\" -Tail 300 | Where-Object { $_ -match '\\\\b\\(ERROR|WARNING|WARN|CRITICAL\\)\\\\b' } | Select-Object -Last 80)"
     ]
   },
   "enableAllProjectMcpServers": true

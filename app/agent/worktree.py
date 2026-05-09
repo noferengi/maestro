@@ -5,7 +5,7 @@ Each dispatched task gets its own checkout at:
 """
 from __future__ import annotations
 import glob as _glob
-import logging, os, subprocess, sys, threading, time
+import logging, os, shutil, stat as _stat, subprocess, sys, threading, time
 from typing import Iterable
 from app.agent.config import GIT_SAFETY_BRANCH_PREFIX, GIT_ALLOWED_BASE_BRANCHES, GIT_TIMEOUT_SECONDS
 
@@ -20,6 +20,116 @@ _env_setup_lock = threading.Lock()
 _env_setup_done: set[str] = set()
 _ghost_removal_failures: dict[str, float] = {}  # path -> timestamp of last failed removal
 _GHOST_REMOVAL_COOLDOWN = 300.0  # retry ghost removal at most once per 5 minutes
+
+
+# ---------------------------------------------------------------------------
+# Process-locking helpers
+# ---------------------------------------------------------------------------
+
+def _find_processes_in_worktree(worktree_path: str) -> list[tuple[int, str]]:
+    """Return [(pid, exe)] for all processes whose exe lives inside worktree_path."""
+    norm_wt = os.path.normcase(os.path.normpath(worktree_path)) + os.sep
+    try:
+        import psutil
+        hits = []
+        for proc in psutil.process_iter(["pid", "exe"]):
+            try:
+                exe = proc.info.get("exe") or ""
+                if exe and os.path.normcase(exe).startswith(norm_wt):
+                    hits.append((proc.pid, exe))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return hits
+    except ImportError:
+        pass
+
+    # Fallback on Windows: wmic
+    if os.name == "nt":
+        try:
+            r = subprocess.run(
+                ["wmic", "process", "get", "ProcessId,ExecutablePath", "/format:csv"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            hits = []
+            for line in r.stdout.splitlines():
+                parts = line.strip().split(",")
+                if len(parts) >= 3:
+                    exe_path, pid_str = parts[1].strip(), parts[2].strip()
+                    if exe_path and pid_str.isdigit():
+                        if os.path.normcase(exe_path).startswith(norm_wt):
+                            hits.append((int(pid_str), exe_path))
+            return hits
+        except Exception:
+            pass
+    return []
+
+
+def _kill_worktree_processes(worktree_path: str, task_id: str) -> list[int]:
+    """Kill all processes running from inside worktree_path. Returns list of killed PIDs."""
+    procs = _find_processes_in_worktree(worktree_path)
+    if not procs:
+        return []
+    killed: list[int] = []
+    for pid, exe in procs:
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                               capture_output=True, timeout=5, check=False)
+            else:
+                import signal
+                os.kill(pid, signal.SIGKILL)
+            killed.append(pid)
+            logger.warning(
+                "[worktree] killed PID %d (%s) locking worktree for task '%s'",
+                pid, os.path.basename(exe), task_id,
+            )
+        except Exception as exc:
+            logger.warning("[worktree] could not kill PID %d: %s", pid, exc)
+    return killed
+
+
+def _force_rmtree(worktree_dir: str, task_id: str) -> bool:
+    """
+    Remove worktree_dir, handling two Windows failure modes:
+      1. Read-only files → chmod then retry (git objects are often read-only)
+      2. DLL/pyd files locked by a subprocess from the worktree's venv → kill the
+         process then retry
+
+    Returns True if the directory is gone afterward.
+    """
+    def _onerror(func, path, exc_info):
+        try:
+            os.chmod(path, _stat.S_IWRITE)
+            func(path)
+        except Exception:
+            pass
+
+    def _try_remove() -> bool:
+        if not os.path.exists(worktree_dir):
+            return True
+        try:
+            if os.path.islink(worktree_dir):
+                os.unlink(worktree_dir)
+            else:
+                try:
+                    shutil.rmtree(worktree_dir, onexc=_onerror)
+                except TypeError:
+                    shutil.rmtree(worktree_dir, onerror=_onerror)
+            return not os.path.exists(worktree_dir)
+        except Exception:
+            return False
+
+    if _try_remove():
+        return True
+
+    # Second attempt: kill processes running from inside the worktree, then retry
+    killed = _kill_worktree_processes(worktree_dir, task_id)
+    if killed:
+        time.sleep(0.5)  # let handles close
+        if _try_remove():
+            return True
+
+    return False
 
 
 def _run(args, cwd, timeout=GIT_TIMEOUT_SECONDS):
@@ -217,19 +327,11 @@ def setup_task_worktree(task_id: str, project_path: str) -> str | None:
         if now - last_failure < _GHOST_REMOVAL_COOLDOWN:
             return None
         logger.warning("[worktree] directory '%s' exists but is not registered; attempting removal", worktree_dir)
-        import shutil
-        try:
-            if os.path.islink(worktree_dir):
-                os.unlink(worktree_dir)
-            elif os.path.isdir(worktree_dir):
-                shutil.rmtree(worktree_dir)
-            else:
-                os.remove(worktree_dir)
-            _ghost_removal_failures.pop(worktree_dir, None)
-        except Exception as exc:
-            logger.error("[worktree] failed to remove ghost directory '%s': %s", worktree_dir, exc)
+        if not _force_rmtree(worktree_dir, task_id):
+            logger.error("[worktree] failed to remove ghost directory '%s' (file locks remain)", worktree_dir)
             _ghost_removal_failures[worktree_dir] = now
             return None
+        _ghost_removal_failures.pop(worktree_dir, None)
 
     if _branch_exists(project_path, branch_name):
         rc, _, err = _run(["git", "worktree", "add", worktree_dir, branch_name], project_path)
@@ -277,6 +379,9 @@ def teardown_task_worktree(task_id: str, project_path: str) -> None:
         worktree_path = _active_worktrees.pop(task_id, None)
     if worktree_path is None:
         return
+    # Kill any subprocesses still running from inside this worktree's venv before
+    # git tries to remove the directory — Windows DLL locks otherwise block removal.
+    _kill_worktree_processes(worktree_path, task_id)
     _run(["git", "worktree", "remove", "--force", worktree_path], project_path)
     _run(["git", "worktree", "prune"], project_path)
     logger.info("[worktree] removed '%s' for task '%s'", worktree_path, task_id)
@@ -284,8 +389,15 @@ def teardown_task_worktree(task_id: str, project_path: str) -> None:
 
 def prune_orphaned_worktrees(project_paths: Iterable[str]) -> None:
     """
-    Called once at scheduler startup. Removes any .maestro-worktrees/ entries
-    left over from a previous crashed server process.
+    Called once at scheduler startup. Removes worktrees left over from a previous
+    crashed server process.  Two passes per project:
+
+    Pass 1 — git-registered orphans: worktrees that git still knows about but
+    whose agent thread is gone (the normal crash-recovery case).
+
+    Pass 2 — on-disk ghosts: directories under .maestro-worktrees/ that are NOT
+    registered with git at all (happen when git worktree prune ran but the directory
+    couldn't be deleted — e.g. a venv Python process still held the DLLs open).
     """
     for project_path in project_paths:
         if not project_path or not os.path.isdir(project_path):
@@ -295,14 +407,36 @@ def prune_orphaned_worktrees(project_paths: Iterable[str]) -> None:
         worktree_base = os.path.normpath(os.path.join(project_path, _WORKTREE_SUBDIR))
         if not os.path.isdir(worktree_base):
             continue
+
         rc, out, _ = _run(["git", "worktree", "list", "--porcelain"], project_path)
         if rc != 0:
             continue
+
+        # Collect paths git knows about
+        registered: set[str] = set()
         for line in out.splitlines():
             if not line.startswith("worktree "):
                 continue
             wt = os.path.normpath(line[len("worktree "):].strip())
+            registered.add(wt)
             if wt.startswith(worktree_base + os.sep) or wt == worktree_base:
                 logger.info("[worktree] pruning orphan '%s'", wt)
                 _run(["git", "worktree", "remove", "--force", wt], project_path)
+
         _run(["git", "worktree", "prune"], project_path)
+
+        # Pass 2: remove on-disk directories that git no longer knows about
+        try:
+            for entry in os.scandir(worktree_base):
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                norm_entry = os.path.normpath(entry.path)
+                if norm_entry not in registered:
+                    logger.info("[worktree] removing on-disk ghost worktree '%s'", entry.path)
+                    if not _force_rmtree(entry.path, entry.name):
+                        logger.warning(
+                            "[worktree] could not remove ghost '%s' — will retry on next dispatch",
+                            entry.path,
+                        )
+        except OSError as exc:
+            logger.warning("[worktree] error scanning '%s' for ghosts: %s", worktree_base, exc)
