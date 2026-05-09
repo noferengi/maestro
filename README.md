@@ -9,6 +9,18 @@
 
 ---
 
+> [!WARNING]
+> ## This project is not complete
+>
+> **TheMaestro is an idea in progress — it is not fit for use.**
+>
+> - The system is unfinished. Large parts are missing, broken, or untested.
+> - Do not use this in production or as a dependency.
+> - If this concept interests you, **contributors are very welcome.**
+>   Open an issue, fork the repo, or reach out — the more hands the better.
+
+---
+
 ## Showcase
 
 ### Kanban Board
