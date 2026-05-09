@@ -2105,10 +2105,25 @@ def write_plan_fields(result_id: int, fields_json: str) -> str:
             )
         if not fields:
             return "ERROR: fields_json is empty — nothing to update."
-        serialized = {
-            k: (v if isinstance(v, str) else _json.dumps(v))
-            for k, v in fields.items()
+        _JSON_REQUIRED = {
+            "implementation_steps", "file_manifest", "dependency_graph",
+            "interface_contracts", "test_strategy",
         }
+        serialized = {}
+        for k, v in fields.items():
+            if isinstance(v, str):
+                if k in _JSON_REQUIRED:
+                    try:
+                        _json.loads(v)
+                    except _json.JSONDecodeError as exc:
+                        return (
+                            f"ERROR: field '{k}' must be a JSON array or object, "
+                            f"not plain text (got: {repr(v[:80])}). "
+                            f"Pass a list/dict and the tool will encode it. Parse error: {exc}"
+                        )
+                serialized[k] = v
+            else:
+                serialized[k] = _json.dumps(v)
         from app.database import update_planning_result
         from app.database.session import SessionLocal as _SL
         db = _SL()
@@ -2237,6 +2252,10 @@ def _venv_python(project_cwd: str) -> str:
 # Tokens the LLM passes that are NOT in these sets are logged and silently dropped.
 
 _SHELL_METACHAR_RE = re.compile(r'[;|&><`$\n\r\x00()\{\}\\]')
+
+# Pip version specifiers legitimately use < and > (e.g. "requests>=2.28,<3").
+# Since run_deps_pip always calls pip with shell=False, these chars are safe.
+_PIP_ARGS_METACHAR_RE = re.compile(r'[;|&`$\n\r\x00()\{\}\\]')
 
 _PYTEST_FLAGS = frozenset({
     "-x", "--exitfirst",
@@ -2666,7 +2685,7 @@ def run_deps_pip(args: str) -> str:
     stripped = args.strip() if args else ""
     if not stripped:
         return "[error] run_deps_pip: no arguments provided"
-    if _SHELL_METACHAR_RE.search(stripped):
+    if _PIP_ARGS_METACHAR_RE.search(stripped):
         logger.warning("[security] run_deps_pip rejected args=%r: metacharacters", stripped[:200])
         return "[security] pip args rejected: contains shell metacharacters"
     try:
@@ -2901,8 +2920,10 @@ def find_symbol(name: str, kind: str = "any") -> str:
                 if cls.name == name or name.lower() in cls.name.lower():
                     results.append(f"{path}:{getattr(cls, 'line', '?')} class {cls.name}")
                 for method in getattr(cls, 'methods', []):
-                    if method.name == name or name.lower() in method.name.lower():
-                        results.append(f"{path}:{getattr(method, 'line', '?')} method {cls.name}.{method.name}")
+                    method_name = method if isinstance(method, str) else method.name
+                    method_line = getattr(method, 'line_start', getattr(cls, 'line_start', '?'))
+                    if method_name == name or name.lower() in method_name.lower():
+                        results.append(f"{path}:{method_line} method {cls.name}.{method_name}")
     return "\n".join(results) if results else f"No symbol '{name}' found (kind={kind})."
 
 

@@ -172,8 +172,8 @@ class DevOrchestrator:
 
             # Commit batch
             try:
-                from app.agent.tools import git_commit
-                git_commit(f"[Maestro] Batch {batch_idx + 1}/{len(batches)} for task {self.task_id}")
+                from app.agent.tools import write_git_commit
+                write_git_commit(f"[Maestro] Batch {batch_idx + 1}/{len(batches)} for task {self.task_id}")
             except Exception as e:
                 logger.warning("[dev_orch] Batch commit failed: %s", e)
 
