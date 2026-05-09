@@ -151,12 +151,12 @@ def _build_restricted_schemas(has_source: bool = True) -> list[dict]:
     """Filter TOOL_SCHEMAS to only include tools in RESEARCH_AGENT_TOOLS.
 
     If has_source is False (greenfield), excludes codebase read tools (read_file, search_files, etc).
-    Always includes list_directory, find_files, git_status, git_log.
+    Always includes list_directory, find_files, read_git_status, read_git_log.
     """
     allowed = set(RESEARCH_AGENT_TOOLS)
     if not has_source:
         # Exclude deep-read tools for greenfield
-        allowed.difference_update({"read_file", "search_files", "git_diff", "git_blame", "git_show"})
+        allowed.difference_update({"read_file", "find_in_files", "read_git_diff", "read_git_blame", "read_git_show"})
 
     return [
         schema for schema in TOOL_SCHEMAS
@@ -201,13 +201,13 @@ conflicts. You have read-only access to the codebase via tools. You cannot modif
 
 == TOOLS AVAILABLE ==
 - read_file(path): Read a file's contents
-- search_files(pattern, directory): Regex search across file contents
+- find_in_files(pattern, path?): Regex search across file contents
 - find_files(glob_pattern, directory): Find files by name pattern
 - list_directory(path): List directory contents
-- git_status(): Show current git status
-- git_diff(path?): Show git diff (optionally scoped to a file)
-- git_log(path?, max_count?): Show recent git history (optionally scoped to a file)
-- git_blame(path): Show git blame for a file
+- read_git_status(): Show current git status
+- read_git_diff(path?): Show git diff (optionally scoped to a file)
+- read_git_log(path?, max_count?): Show recent git history (optionally scoped to a file)
+- read_git_blame(path): Show git blame for a file
 - submit_work(signal, summary, payload): Submit your final verdict (TERMINAL — call this to finish)
 
 == YOUR WORKFLOW ==
@@ -257,13 +257,13 @@ You will receive:
 
 == TOOLS AVAILABLE ==
 - read_file(path): Read a file's contents
-- search_files(pattern, directory): Regex search across file contents
+- find_in_files(pattern, path?): Regex search across file contents
 - find_files(glob_pattern, directory): Find files by name pattern
 - list_directory(path): List directory contents
-- git_status(): Show current git status
-- git_diff(path?): Show git diff (optionally scoped to a file)
-- git_log(path?, max_count?): Show recent git history (optionally scoped to a file)
-- git_blame(path): Show git blame for a file
+- read_git_status(): Show current git status
+- read_git_diff(path?): Show git diff (optionally scoped to a file)
+- read_git_log(path?, max_count?): Show recent git history (optionally scoped to a file)
+- read_git_blame(path): Show git blame for a file
 
 == YOUR WORKFLOW ==
 1. Read each voter's justification carefully. Identify where they disagree.
@@ -930,13 +930,13 @@ Research Agent, you are NOT asked for a feasibility verdict — just comprehensi
 
 == TOOLS AVAILABLE ==
 - read_file(path): Read a file's contents
-- search_files(pattern, directory): Regex search across file contents
+- find_in_files(pattern, path?): Regex search across file contents
 - find_files(glob_pattern, directory): Find files by name pattern
 - list_directory(path): List directory contents
-- git_status(): Show current git status
-- git_diff(path?): Show git diff (optionally scoped to a file)
-- git_log(path?, max_count?): Show recent git history (optionally scoped to a file)
-- git_blame(path): Show git blame for a file
+- read_git_status(): Show current git status
+- read_git_diff(path?): Show git diff (optionally scoped to a file)
+- read_git_log(path?, max_count?): Show recent git history (optionally scoped to a file)
+- read_git_blame(path): Show git blame for a file
 - submit_work(signal, summary, payload): Submit your final report
 
 == YOUR WORKFLOW ==

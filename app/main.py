@@ -4445,9 +4445,9 @@ AGENT_TOOL_ACCESS: dict = {
     "ResearchAgent": {
         "description": "Lightweight read-only investigator spawned by the intake pipeline when votes need clarification. Limited lives, restricted tools.",
         "tools": [
-            "read_file", "count_lines",
-            "search_files", "find_files", "list_directory",
-            "git_status", "git_diff", "git_log", "git_blame", "git_show",
+            "read_file", "read_file_metadata",
+            "find_in_files", "find_files", "list_directory",
+            "read_git_status", "read_git_diff", "read_git_log", "read_git_blame", "read_git_show",
             "get_task", "list_tasks",
         ],
     },
@@ -4462,9 +4462,9 @@ AGENT_TOOL_ACCESS: dict = {
     "SubdivisionAgent": {
         "description": "Decomposes oversized ideas into smaller sub-ideas when intake votes SUBDIVIDE_IDEA. Read-only tools, structured decomposition output.",
         "tools": [
-            "read_file", "count_lines",
-            "search_files", "find_files", "list_directory",
-            "git_status", "git_diff", "git_log", "git_blame", "git_show",
+            "read_file", "read_file_metadata",
+            "find_in_files", "find_files", "list_directory",
+            "read_git_status", "read_git_diff", "read_git_log", "read_git_blame", "read_git_show",
             "get_task", "list_tasks",
         ],
     },
