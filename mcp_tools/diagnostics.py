@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timezone
 from .helpers import (
     get_conn, extract_response_fields, parse_gate_checks,
-    parse_json_field, DISPATCHABLE_TYPES,
+    parse_json_field, DISPATCHABLE_TYPES, _date_ago,
 )
 
 
@@ -732,7 +732,7 @@ def get_project_health(project: str = None) -> dict:
             "SELECT t.id, t.title, t.type, p.name AS project, t.demotion_count, t.updated_at "
             "FROM tasks t LEFT JOIN projects p ON t.project_id = p.id "
             f"WHERE t.is_active = 1 AND t.demotion_count > 0{proj_filter} "
-            "AND t.updated_at >= datetime('now', '-1 day') "
+            f"AND t.updated_at >= {_date_ago(1, 'day')} "
             "ORDER BY t.updated_at DESC",
             params,
         ).fetchall()
@@ -754,7 +754,7 @@ def get_project_health(project: str = None) -> dict:
             "FROM expenses e "
             "JOIN tasks t ON e.task_id = t.id "
             "LEFT JOIN projects p ON t.project_id = p.id "
-            f"WHERE e.created_at >= datetime('now', '-7 days'){proj_filter}",
+            f"WHERE e.created_at >= {_date_ago(7, 'days')}{proj_filter}",
             params,
         ).fetchone()
         spend_microcents = spend_row["total"] if spend_row else 0
@@ -1456,37 +1456,40 @@ def get_tool_bug_reports(
     Returns newest-first up to `limit` rows.
     """
     conn = get_conn()
-    params: list = []
-    where_clauses: list[str] = []
-    if task_id:
-        where_clauses.append("task_id = ?")
-        params.append(task_id)
-    if tool_name:
-        where_clauses.append("tool_name = ?")
-        params.append(tool_name)
-    if unread_only:
-        where_clauses.append("viewed_at IS NULL")
-    where = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
-    params.append(limit)
-    rows = conn.execute(
-        f"SELECT id, task_id, session_id, tool_name, trying_to, expected, actual, created_at, viewed_at "
-        f"FROM tool_bug_reports {where} ORDER BY created_at DESC LIMIT ?",
-        params,
-    ).fetchall()
-    return [
-        {
-            "id": r[0],
-            "task_id": r[1],
-            "session_id": r[2],
-            "tool_name": r[3],
-            "trying_to": r[4],
-            "expected": r[5],
-            "actual": r[6],
-            "created_at": r[7],
-            "viewed_at": r[8],
-        }
-        for r in rows
-    ]
+    try:
+        params: list = []
+        where_clauses: list[str] = []
+        if task_id:
+            where_clauses.append("task_id = ?")
+            params.append(task_id)
+        if tool_name:
+            where_clauses.append("tool_name = ?")
+            params.append(tool_name)
+        if unread_only:
+            where_clauses.append("viewed_at IS NULL")
+        where = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+        params.append(limit)
+        rows = conn.execute(
+            f"SELECT id, task_id, session_id, tool_name, trying_to, expected, actual, created_at, viewed_at "
+            f"FROM tool_bug_reports {where} ORDER BY created_at DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "task_id": r[1],
+                "session_id": r[2],
+                "tool_name": r[3],
+                "trying_to": r[4],
+                "expected": r[5],
+                "actual": r[6],
+                "created_at": r[7],
+                "viewed_at": r[8],
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
 
 
 def mark_tool_bug_reports_viewed(report_ids: list = None) -> dict:
@@ -1498,18 +1501,22 @@ def mark_tool_bug_reports_viewed(report_ids: list = None) -> dict:
 
     Returns {"marked": N} count of rows updated.
     """
+    from .helpers import get_rw_conn
     conn = get_rw_conn()
-    now = __import__("datetime").datetime.utcnow().isoformat()
-    if report_ids:
-        placeholders = ",".join("?" for _ in report_ids)
-        result = conn.execute(
-            f"UPDATE tool_bug_reports SET viewed_at=? WHERE viewed_at IS NULL AND id IN ({placeholders})",
-            [now, *report_ids],
-        )
-    else:
-        result = conn.execute(
-            "UPDATE tool_bug_reports SET viewed_at=? WHERE viewed_at IS NULL",
-            [now],
-        )
-    conn.commit()
-    return {"marked": result.rowcount}
+    try:
+        now = __import__("datetime").datetime.utcnow().isoformat()
+        if report_ids:
+            placeholders = ",".join("?" for _ in report_ids)
+            result = conn.execute(
+                f"UPDATE tool_bug_reports SET viewed_at=? WHERE viewed_at IS NULL AND id IN ({placeholders})",
+                [now, *report_ids],
+            )
+        else:
+            result = conn.execute(
+                "UPDATE tool_bug_reports SET viewed_at=? WHERE viewed_at IS NULL",
+                [now],
+            )
+        conn.commit()
+        return {"marked": result.rowcount}
+    finally:
+        conn.close()

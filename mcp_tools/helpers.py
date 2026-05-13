@@ -1,10 +1,12 @@
 """Shared utilities for MCP tool implementations."""
 
 import json
-import sqlite3
-from pathlib import Path
+from sqlalchemy import text
 
-DB_PATH = Path(__file__).parent.parent / "data" / "kanban.db"
+# Re-use the application's engine — shares the connection pool and dialect
+# (SQLite with WAL mode, or PostgreSQL with MVCC) rather than opening an
+# independent raw sqlite3 connection that causes exclusive-lock contention.
+from app.database.session import engine
 
 DISPATCHABLE_TYPES = {
     "planning", "indev", "conceptual_review", "optimization",
@@ -12,26 +14,114 @@ DISPATCHABLE_TYPES = {
 }
 
 
-def get_conn() -> sqlite3.Connection:
-    """Read-only SQLite connection to kanban.db."""
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=30)
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-    except sqlite3.Error:
-        # mode=ro might prevent setting WAL if the file is truly read-only
-        # at the OS level, but usually it works if the WAL file exists.
-        pass
-    return conn
+# ---------------------------------------------------------------------------
+# Compatibility shims — keep callers unchanged
+# ---------------------------------------------------------------------------
+
+class _Row(dict):
+    """
+    Dict subclass that also supports integer-index access, matching the
+    sqlite3.Row API used throughout the MCP diagnostic code.
+    """
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return super().__getitem__(key)
 
 
-def get_rw_conn() -> sqlite3.Connection:
-    """Read-write SQLite connection — use only in action tools."""
-    conn = sqlite3.connect(str(DB_PATH), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+class _Result:
+    """Wraps a SQLAlchemy CursorResult with a sqlite3-compatible interface."""
 
+    def __init__(self, cursor_result):
+        self._cr = cursor_result
+        # Capture rowcount immediately — the cursor may be consumed after fetchall/fetchone.
+        self.rowcount = cursor_result.rowcount
+
+    def fetchone(self):
+        row = self._cr.mappings().fetchone()
+        return _Row(row) if row is not None else None
+
+    def fetchall(self):
+        return [_Row(r) for r in self._cr.mappings().fetchall()]
+
+    def __iter__(self):
+        for r in self._cr.mappings():
+            yield _Row(r)
+
+
+class _Conn:
+    """
+    Wraps an SQLAlchemy Connection to present the API used throughout the MCP
+    tool code: ?-style positional params, dict-like row access, close/commit.
+
+    Both get_conn() and get_rw_conn() return one of these.  For read paths,
+    close() rolls back the implicit (empty) transaction — safe and fast.
+    For write paths, call commit() before close() to persist the changes.
+    """
+
+    def __init__(self, sa_conn):
+        self._conn = sa_conn
+
+    def execute(self, sql: str, params=None) -> _Result:
+        """Execute *sql* with optional positional params (?-style)."""
+        if params:
+            # Convert ?-style positional params to :p0 :p1 ... named params
+            # required by SQLAlchemy text().  Works for lists and tuples.
+            parts = sql.split("?")
+            named: dict = {}
+            new_sql = parts[0]
+            for i, part in enumerate(parts[1:]):
+                named[f"p{i}"] = params[i]
+                new_sql += f":p{i}" + part
+            sql, params = new_sql, named
+        return _Result(self._conn.execute(text(sql), params or {}))
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        self._conn.close()
+
+
+def get_conn() -> _Conn:
+    """
+    Read connection to the application database.
+
+    Uses the shared SQLAlchemy engine (SQLite+WAL or PostgreSQL) so reads
+    from MCP tools are never serialised behind the scheduler's write lock.
+    On PostgreSQL each connection gets its own MVCC snapshot — reads and
+    writes are fully parallel with no lock contention.
+    """
+    return _Conn(engine.connect())
+
+
+def get_rw_conn() -> _Conn:
+    """
+    Read-write connection — use only in tools that must write to the DB.
+
+    Call commit() to persist changes, then close() to release the connection
+    back to the pool.
+    """
+    return _Conn(engine.connect())
+
+
+def _date_ago(n: int, unit: str) -> str:
+    """
+    Return a SQL literal for 'N units ago', compatible with both SQLite and
+    PostgreSQL.  Embed directly into a query string (not a bind param) since
+    both dialects express this as a function call, not a value.
+
+      _date_ago(1, 'day')   → "datetime('now', '-1 day')"  (SQLite)
+                            → "NOW() - INTERVAL '1 day'"   (PostgreSQL)
+    """
+    if engine.dialect.name == "postgresql":
+        return f"NOW() - INTERVAL '{n} {unit}'"
+    return f"datetime('now', '-{n} {unit}')"
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers (unchanged)
+# ---------------------------------------------------------------------------
 
 def extract_response_fields(response_data: str) -> dict:
     """
