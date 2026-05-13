@@ -53,6 +53,7 @@ class PlanningCorrectionAgent:
         project_root: str | None,
         llm_id: int,
         budget_id: int,
+        all_tasks: list[dict] | None = None,
         llm_base_url: str | None = None,
         llm_model: str | None = None,
         max_context: int | None = None,
@@ -66,6 +67,7 @@ class PlanningCorrectionAgent:
         self.project_root = project_root
         self.llm_id = llm_id
         self.budget_id = budget_id
+        self.all_tasks = all_tasks
         self.llm_base_url = llm_base_url
         self.llm_model = llm_model
         self.max_context = max_context
@@ -87,6 +89,9 @@ class PlanningCorrectionAgent:
           {"outcome": "corrected"|"stalled"|"max_turns"|"error", "fields_patched": [...]}
         """
         from app.agent.llm_client import set_llm_session_context
+        from app.agent.planning_gate import run_planning_gate
+        from app.database import get_tasks as _get_tasks, get_planning_result as _get_planning_result
+        
         set_llm_session_context(AGENT_NAME)
         if is_shutting_down():
             return {"outcome": "error", "fields_patched": []}
@@ -94,6 +99,13 @@ class PlanningCorrectionAgent:
         if self.project_root:
             from app.agent.tools import set_task_git_cwd
             set_task_git_cwd(self.project_root)
+
+        if self.all_tasks is None:
+            # Fallback for manual or legacy calls
+            self.all_tasks = [
+                {"id": t.id, "type": t.type, "prerequisites": t.prerequisites or []}
+                for t in _get_tasks()
+            ]
 
         self._messages = self._build_messages()
 
@@ -162,10 +174,56 @@ class PlanningCorrectionAgent:
                 patched_fields = self._extract_patched_fields(tool_calls, result_messages)
                 if patched_fields:
                     logger.info(
-                        "[planning_correction] task '%s' — patched fields: %s.",
+                        "[planning_correction] task '%s' — patched fields: %s. Validating...",
                         self.task_id, patched_fields,
                     )
-                    return {"outcome": "corrected", "fields_patched": patched_fields}
+                    
+                    # VALIDATION STEP: Re-run the planning gate locally on the patched plan
+                    # Refresh plan from DB to get the actual patched content
+                    latest_result = _get_planning_result(self.task_id)
+                    if not latest_result:
+                        logger.error("[planning_correction] could not find planning result after patch")
+                        return {"outcome": "error", "fields_patched": patched_fields}
+                    
+                    plan_data = {
+                        "design_rationale": latest_result.design_rationale,
+                        "file_manifest": json.loads(latest_result.file_manifest or "[]"),
+                        "implementation_steps": json.loads(latest_result.implementation_steps or "[]"),
+                        "interface_contracts": json.loads(latest_result.interface_contracts or "[]"),
+                        "test_strategy": json.loads(latest_result.test_strategy or "[]"),
+                        "dependency_graph": json.loads(latest_result.dependency_graph or "{}"),
+                    }
+                    
+                    gate_result = await run_planning_gate(
+                        task_id=self.task_id,
+                        planning_result=plan_data,
+                        all_tasks=self.all_tasks,
+                        max_context=self.max_context,
+                        llm_base_url=self.llm_base_url,
+                        llm_model=self.llm_model,
+                        llm_id=self.llm_id,
+                        budget_id=self.budget_id,
+                        project_path=self.project_root,
+                        task_description=self.task_description,
+                    )
+                    
+                    if gate_result.get("passed"):
+                        logger.info("[planning_correction] task '%s' — patch PASSED validation.", self.task_id)
+                        return {"outcome": "corrected", "fields_patched": patched_fields}
+                    else:
+                        # Gate still fails - provide feedback and continue the loop
+                        new_failures = [c for c in gate_result.get("checks", []) if not c.get("passed")]
+                        failures_text = "\n".join([f"  [{c['name']}]: {c['detail']}" for c in new_failures])
+                        logger.warning("[planning_correction] task '%s' — patch FAILED validation. Feedback injected.", self.task_id)
+                        self._messages.append({
+                            "role": "user",
+                            "content": (
+                                f"[SYSTEM] The planning gate STILL FAILS after your correction:\n\n{failures_text}\n\n"
+                                "Please analyze the remaining failures and apply another targeted correction. "
+                                "Make sure you address ALL failing checks."
+                            ),
+                        })
+                        continue
 
                 all_errors = all(
                     m.get("content", "").startswith("ERROR")

@@ -45,12 +45,12 @@ class TestToolRestrictions:
     """Verify research agents are limited to the correct tool set."""
 
     def test_research_agent_tools_list(self):
-        """RESEARCH_AGENT_TOOLS contains only read-only tools."""
+        """RESEARCH_AGENT_TOOLS contains only read-only tools (plus submit_work)."""
         expected = {
-            "web_search", "read_file", "read_file_metadata",
+            "web_search", "web_fetch", "read_file", "read_file_metadata",
             "read_last_output", "find_in_files", "find_files", "list_directory",
             "read_git_status", "read_git_diff", "read_git_log", "read_git_blame", "read_git_show",
-            "get_task", "list_tasks",
+            "get_task", "list_tasks", "submit_work",
         }
         assert set(RESEARCH_AGENT_TOOLS) == expected
 

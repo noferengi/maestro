@@ -452,7 +452,7 @@ class ResearchAgent:
                 kwargs: dict = dict(
                     base_url=self.llm_base_url,
                     model=self.llm_model,
-                    max_tokens=8192,
+                    max_tokens=32768,
                     task_id=self.task_id,
                     llm_id=self.llm_id,
                     budget_id=self.budget_id,
@@ -760,7 +760,7 @@ class ResearchAgent:
                 post_mortem_messages,
                 base_url=self.llm_base_url,
                 model=self.llm_model,
-                max_tokens=8192,
+                max_tokens=32768,
                 task_id=self.task_id,
                 llm_id=self.llm_id,
                 agent_name=AGENT_NAME,

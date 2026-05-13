@@ -11,6 +11,7 @@ import json
 import os
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -71,9 +72,50 @@ def _mock_client_cls(mock_llm):
 
     When the patched AsyncClient is instantiated and used as an async context
     manager, ``client.post(url, ...)`` is routed to ``mock_llm.handle_post``.
+    It also supports ``client.stream(...)`` for SSE-compatible testing.
     """
     mock_instance = AsyncMock()
-    mock_instance.post = mock_llm.handle_post  # handle_post is async def
+    mock_instance.post = mock_llm.handle_post
+
+    @asynccontextmanager
+    async def mock_stream(method, url, **kwargs):
+        # We need to simulate the SSE stream.
+        # Call the non-streaming mock first to get the response.
+        resp_obj = await mock_llm.handle_post(url, **kwargs)
+        full_json = resp_obj.json()
+
+        # Convert to OpenAI streaming format
+        choice = full_json["choices"][0]
+        msg = choice["message"]
+        delta = {}
+        if msg.get("content"):
+            delta["content"] = msg["content"]
+        if msg.get("tool_calls"):
+            delta["tool_calls"] = msg["tool_calls"]
+
+        chunk = {
+            "id": full_json["id"],
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": choice["finish_reason"]
+            }],
+            "usage": full_json["usage"]
+        }
+
+        mock_resp = MagicMock()
+        mock_resp.is_success = True
+        mock_resp.status_code = 200
+
+        async def aiter_lines():
+            yield f"data: {json.dumps(chunk)}"
+            yield "data: [DONE]"
+
+        mock_resp.aiter_lines = aiter_lines
+        yield mock_resp
+
+    mock_instance.stream = mock_stream
+
     mock_cls = MagicMock()
     mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_instance)
     mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)

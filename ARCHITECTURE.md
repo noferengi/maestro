@@ -245,7 +245,7 @@ Each agent is an async Python class that drives a single LLM in a turn-based loo
 | **WebSearchAgent** | `WebSearchAgent` | `research.py` | Search + fetch + synthesize research questions. Dispatched async. |
 | **FileSummaryAgent** | `FileSummaryAgent` | `file_summary_agent.py` | Background file summarization for project context cache. |
 | **PIPResolutionAgent** | `PIPResolutionAgent` | `pip_resolution.py` | Resolves Performance Improvement Plans post-demotion. |
-| **DreamerAgent** | `DreamerAgent` | `dreamer.py` | Survey + orientation agent for project understanding. |
+| **MaestroAgent** | `MaestroAgent` | `maestro.py` | Survey + orientation agent for project understanding. |
 
 ### MaestroLoop Lifecycle
 
@@ -653,7 +653,7 @@ D:\workspace\TheMaestro\
 │   │   ├── CLAUDE.md               ← per-file agent system reference
 │   │   ├── config.py               ← constants, stage tool allowlists
 │   │   ├── dag.py                  ← DAGResolver, topological sort, cycle detection
-│   │   ├── dreamer.py              ← survey/orientation agent
+│   │   ├── maestro.py              ← survey/orientation agent
 │   │   ├── loop.py                 ← MaestroLoop (primary implementation agent)
 │   │   ├── planning.py             ← 5-stage planning pipeline
 │   │   ├── planning_gate.py        ← 7-check structural + LLM gate

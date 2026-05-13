@@ -28,7 +28,7 @@ import asyncio
 import logging
 import os
 import time
-from datetime import datetime, timezone as _tz
+from datetime import datetime, timedelta, timezone as _tz
 
 
 def _now_utc() -> str:
@@ -94,18 +94,40 @@ _session_started_at: dict[str, float] = {}
 _llm_session_counts: dict[int, int] = defaultdict(int)
 _llm_counts_lock = threading.Lock()
 
+_last_global_heartbeat = 0.0
+_HEARTBEAT_INTERVAL_SECONDS = 300.0  # 5 minutes
+
+# Rate-limiting for Maestro logs to prevent log flooding
+_project_last_maestro_log = {}  # project_name -> {log_type: timestamp}
+_MAESTRO_LOG_INTERVAL = 300.0   # 5 minutes
+
+def _log_project_maestro(project_name: str, log_type: str, message: str, level: int = logging.INFO) -> None:
+    """Log a Maestro-related message for a project, with rate-limiting."""
+    now = time.time()
+    if project_name not in _project_last_maestro_log:
+        _project_last_maestro_log[project_name] = {}
+    
+    last_log_time = _project_last_maestro_log[project_name].get(log_type, 0.0)
+    if (now - last_log_time) >= _MAESTRO_LOG_INTERVAL:
+        logger.log(level, message)
+        _project_last_maestro_log[project_name][log_type] = now
+    else:
+        # Always log at DEBUG level even if rate-limited for INFO
+        logger.debug(message)
+
 # ---------------------------------------------------------------------------
-# Dreamer state
+# Session management
 # ---------------------------------------------------------------------------
+
 # project_name -> timestamp (float) of the most recent pipeline activity we
 # observed for that project.  Initialised to now() when the project is first
-# seen so new projects get a grace period before Dreamer fires.
+# seen so new projects get a grace period before Maestro fires.
 _project_last_activity: dict[str, float] = {}
 _project_last_activity_lock = threading.Lock()
 
-# Projects that currently have a Dreamer thread running.
-_active_dreamer_projects: set[str] = set()
-_active_dreamer_lock = threading.Lock()
+# Projects that currently have a Maestro thread running.
+_active_maestro_projects: set[str] = set()
+_active_maestro_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # External pipeline session registry
@@ -1044,6 +1066,17 @@ def _tick() -> None:
         if not db_task or not db_task.llm_id:
             continue
 
+        # CONSULTATION GUARD: Skip tasks that are paused for consultation
+        # but don't have a steering hint yet.
+        if db_task.consultation_payload:
+            try:
+                cp = __import__("json").loads(db_task.consultation_payload)
+                if cp.get("question") and not cp.get("hint"):
+                    logger.debug("Skipping task '%s' - awaiting consultation hint.", task_id)
+                    continue
+            except:
+                pass
+
         llm = get_llm(db_task.llm_id)
         if not llm:
             continue
@@ -1146,14 +1179,147 @@ def _tick() -> None:
         allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
     )
 
-    # 7. Dreamer: resurrect stalled projects (fires when no pipeline progress for N ticks)
-    _dispatch_dreamer(
+    # 7. Maestro: resurrect stalled projects (fires when no pipeline progress for N ticks)
+    _dispatch_maestro(
+        allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
+    )
+
+    # 8. Heartbeat: periodic system health survey (fires every 5 minutes)
+    _dispatch_heartbeat_maestro(
         allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
     )
 
 
-def _project_has_dreamer_signal(project) -> bool:
-    """Return True if the project has enough signal for the Dreamer to operate on.
+def _dispatch_heartbeat_maestro(
+    allowed_llm_id: "int | None",
+    node_active_counts: "dict[int, int]",
+    node_session_counts: "dict[int, int]",
+    node_obj_cache: "dict[int, Any]",
+    llm_node_cache: "dict[int, int | None]",
+) -> None:
+    """Fire a MaestroAgent in heartbeat mode to survey system health every 5 minutes."""
+    global _last_global_heartbeat
+    from app.agent.config import MAESTRO_ENABLED
+    from app.database import get_system_setting, get_llm, get_all_projects
+
+    # Check if Maestro is enabled (dynamically or via config)
+    maestro_enabled = get_system_setting("maestro_enabled", MAESTRO_ENABLED)
+    if not maestro_enabled:
+        return
+    if is_shutting_down():
+        return
+
+    now = time.time()
+    if (now - _last_global_heartbeat) < _HEARTBEAT_INTERVAL_SECONDS:
+        return
+
+    # Check if a heartbeat is already running
+    session_key = "maestro-heartbeat"
+    with _active_sessions_lock:
+        if session_key in _active_sessions:
+            return
+
+    # 1. Try to get global Maestro config from system settings
+    llm_id = get_system_setting("maestro_llm_id")
+    budget_id = get_system_setting("maestro_budget_id")
+    
+    steward_name = "GlobalHeartbeat"
+    steward_path = None
+    
+    # 2. Fallback to a steward project if not configured
+    if not llm_id or not budget_id:
+        projects = get_all_projects()
+        for p in projects:
+            if p.llm_id and p.budget_id:
+                llm_id = llm_id or p.llm_id
+                budget_id = budget_id or p.budget_id
+                steward_name = p.name
+                steward_path = p.path
+                break
+    
+    if not llm_id or not budget_id:
+        # Still no LLM/Budget? We can't run.
+        return
+
+    llm = get_llm(llm_id)
+    if not llm:
+        return
+
+    # Respect one-LLM policy
+    if allowed_llm_id is not None and llm.id != allowed_llm_id:
+        return
+
+    # Reserve slot
+    if not _check_and_reserve_slot(
+        llm, node_active_counts, node_session_counts, node_obj_cache, llm_node_cache,
+        label="maestro-heartbeat",
+    ):
+        return
+
+    logger.info("[Heartbeat] Triggering system health survey via MaestroAgent (LLM %d).", llm.id)
+    _last_global_heartbeat = now
+
+    _start_maestro_heartbeat_thread(
+        project_name=steward_name,
+        project_path=steward_path,
+        llm_id=llm_id,
+        budget_id=budget_id,
+        llm_base_url=f"http://{llm.address}:{llm.port}/v1",
+        llm_model=llm.model,
+    )
+
+
+def _start_maestro_heartbeat_thread(
+    project_name: str,
+    project_path: "str | None",
+    llm_id: int,
+    budget_id: int,
+    llm_base_url: str,
+    llm_model: str,
+) -> None:
+    """Spawn a thread for Maestro heartbeat monitor."""
+    import asyncio as _asyncio
+    from app.agent.maestro import MaestroAgent
+
+    session_key = "maestro-heartbeat"
+
+    def _run():
+        loop = _asyncio.new_event_loop()
+        _asyncio.set_event_loop(loop)
+        try:
+            agent = MaestroAgent(
+                project_name=project_name,
+                project_path=project_path,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                is_heartbeat=True,
+            )
+            loop.run_until_complete(agent.run())
+        except Exception as exc:
+            logger.exception("[Heartbeat] Thread raised: %s", exc)
+        finally:
+            loop.close()
+            with _llm_counts_lock:
+                _llm_session_counts[llm_id] = max(0, _llm_session_counts[llm_id] - 1)
+            with _active_sessions_lock:
+                _active_sessions.pop(session_key, None)
+                _session_llm_ids.pop(session_key, None)
+                _session_titles.pop(session_key, None)
+            logger.debug("[Heartbeat] Monitor thread exited.")
+
+    t = threading.Thread(target=_run, daemon=True, name="maestro-heartbeat")
+    with _active_sessions_lock:
+        _active_sessions[session_key] = t
+        _session_llm_ids[session_key] = llm_id
+        _session_titles[session_key] = "System Heartbeat Monitor"
+    t.start()
+
+
+
+def _project_has_maestro_signal(project) -> bool:
+    """Return True if the project has enough signal for the Maestro to operate on.
 
     A project has signal when at least one of the following is true:
       - Its filesystem path contains source files (substantive codebase exists).
@@ -1161,7 +1327,7 @@ def _project_has_dreamer_signal(project) -> bool:
 
     Soft-deleted tasks are deliberately excluded — they represent cleaned-up
     history, not current intent.  A project the user has emptied and whose
-    filesystem path is empty or absent is a placeholder shell; the Dreamer
+    filesystem path is empty or absent is a placeholder shell; the Maestro
     has nothing to latch onto.
     """
     import os
@@ -1179,13 +1345,15 @@ def _project_has_dreamer_signal(project) -> bool:
         )
         if any_task:
             return True
-    except Exception:
+    except Exception as e:
+        logger.warning("[Maestro] Signal query failed: %s", e)
         pass
     finally:
         db.close()
 
     # Check if the project path contains any source files
     if project.path and os.path.isdir(project.path):
+        logger.info("[Maestro] Signal: scanning path %s", project.path)
         from app.agent.path_filter import walk_safe
         for _root, dirs, files in walk_safe(project.path):
             if files:
@@ -1193,37 +1361,40 @@ def _project_has_dreamer_signal(project) -> bool:
 
     return False
 
-
-def _dispatch_dreamer(
+def _dispatch_maestro(
     allowed_llm_id: "int | None",
     node_active_counts: "dict[int, int]",
     node_session_counts: "dict[int, int]",
     node_obj_cache: "dict[int, Any]",
     llm_node_cache: "dict[int, int | None]",
 ) -> None:
-    """Fire a DreamerAgent for any project that has been stalled long enough.
+    """Fire a MaestroAgent for any project that has been stalled long enough.
 
     "Stalled" = no TransitionResult created for the project's tasks in the last
-    DREAMER_STALL_TICKS * SCHEDULER_TICK_INTERVAL seconds.
+    MAESTRO_STALL_TICKS * SCHEDULER_TICK_INTERVAL seconds.
 
-    One Dreamer per project at a time.  Dreamers MUST respect LLM/node capacity —
-    each Dreamer holds one session slot for its entire run so it doesn't pile on
-    top of a full pipeline load.  The session key is 'dreamer-{project_name}'.
+    One Maestro per project at a time.  Maestros MUST respect LLM/node capacity —
+    each Maestro holds one session slot for its entire run so it doesn't pile on
+    top of a full pipeline load.  The session key is 'maestro-{project_name}'.
     """
     from app.agent.config import (
-        DREAMER_ENABLED, DREAMER_STALL_TICKS, SCHEDULER_TICK_INTERVAL,
+        MAESTRO_ENABLED, MAESTRO_STALL_TICKS, SCHEDULER_TICK_INTERVAL,
     )
-    if not DREAMER_ENABLED:
+    from app.database import get_system_setting
+
+    # Check if Maestro is enabled (dynamically or via config)
+    maestro_enabled = get_system_setting("maestro_enabled", MAESTRO_ENABLED)
+    if not maestro_enabled:
         return
-    if is_shutting_down():
-        return
+
+    if is_shutting_down():        return
 
     from app.database import get_all_projects, get_tasks_by_project, get_llm
     from app.database import get_transition_results
     from app.database.session import SessionLocal
     from app.database.models import TransitionResult, Task
 
-    stall_threshold_secs = DREAMER_STALL_TICKS * SCHEDULER_TICK_INTERVAL
+    stall_threshold_secs = MAESTRO_STALL_TICKS * SCHEDULER_TICK_INTERVAL
     now = time.time()
 
     projects = get_all_projects()
@@ -1234,9 +1405,9 @@ def _dispatch_dreamer(
         if not project.llm_id or not project.budget_id:
             continue
 
-        # Skip if a Dreamer is already running for this project
-        with _active_dreamer_lock:
-            if project_name in _active_dreamer_projects:
+        # Skip if a Maestro is already running for this project
+        with _active_maestro_lock:
+            if project_name in _active_maestro_projects:
                 continue
 
         # Determine last pipeline activity time for this project via DB
@@ -1265,7 +1436,7 @@ def _dispatch_dreamer(
                     except Exception:
                         last_tr_time = None
         except Exception as exc:
-            logger.debug("[Dreamer] Activity query failed for '%s': %s", project_name, exc)
+            logger.debug("[Maestro] Activity query failed for '%s': %s", project_name, exc)
             continue
 
         # Initialise the grace-period clock on first sight
@@ -1277,59 +1448,126 @@ def _dispatch_dreamer(
                 _project_last_activity[project_name] = last_tr_time
             last_activity = _project_last_activity[project_name]
 
-        if (now - last_activity) < stall_threshold_secs:
-            continue  # project is active — skip
+        # Determine if any task is thrashing (high demotion count) or stagnant (>24h)
+        is_thrashing = False
+        is_stagnant = False
+        stagnant_task_id = None
+        
+        try:
+            db = SessionLocal()
+            try:
+                # 1. Thrashing Check (bouncing between stages)
+                thrashing_task = (
+                    db.query(Task.id)
+                      .filter(Task.project_id == project.id, Task.is_active == True, Task.demotion_count >= 5)
+                      .first()
+                )
+                if thrashing_task:
+                    is_thrashing = True
+                    _log_project_maestro(
+                        project_name, "thrashing",
+                        f"[Maestro] Project '{project_name}' detected thrashing task: {thrashing_task[0]}"
+                    )
+                
+                # 2. Stagnation Check (no progress for >24h)
+                # We check transition_results for the latest timestamp per task
+                from sqlalchemy import func
+                subq = (
+                    db.query(TransitionResult.task_id, func.max(TransitionResult.created_at).label("max_ca"))
+                      .join(Task, Task.id == TransitionResult.task_id)
+                      .filter(Task.project_id == project.id, Task.is_active == True)
+                      .group_by(TransitionResult.task_id)
+                      .subquery()
+                )
+                
+                stagnant_threshold = datetime.utcnow() - timedelta(hours=24)
+                stagnant_task = db.query(subq.c.task_id).filter(subq.c.max_ca < stagnant_threshold).first()
+                
+                if stagnant_task:
+                    is_stagnant = True
+                    stagnant_task_id = stagnant_task[0]
+                    _log_project_maestro(
+                        project_name, "stagnant",
+                        f"[Maestro] Project '{project_name}' detected stagnant task: {stagnant_task_id} (>24h no progress)"
+                    )
+
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning("[Maestro] Fault detection query failed for '%s': %s", project_name, e)
+            pass
+
+        if (now - last_activity) < stall_threshold_secs and not is_thrashing and not is_stagnant:
+            # logger.debug("[Maestro] Skipping '%s' — active and healthy.", project_name)
+            continue  # project is active and healthy — skip
+
+        _log_project_maestro(
+            project_name, "eligible",
+            f"[Maestro] Project '{project_name}' eligible (stalled, thrashing, or stagnant). Checking signal..."
+        )
 
         # Guard: only fire when the project has substantive signal to work with.
-        # An empty project (no files, no tasks, no arch cards) has no intent for
-        # the Dreamer to latch onto.  The Dreamer's own survey mode handles the
-        # distinction between "has files but no active tasks" vs "truly empty".
-        if not _project_has_dreamer_signal(project):
-            logger.debug(
-                "[Dreamer] Skipping '%s' — no signal (empty project: no files, "
-                "no tasks, no arch cards).",
-                project_name,
+        if not _project_has_maestro_signal(project):
+            _log_project_maestro(
+                project_name, "no_signal",
+                f"[Maestro] Skipping '{project_name}' — no signal."
             )
             continue
 
-        # Fire Dreamer
+        # Fire Maestro
         llm = get_llm(project.llm_id)
         if not llm:
+            _log_project_maestro(
+                project_name, "no_llm",
+                f"[Maestro] Skipping '{project_name}' — no LLM assigned."
+            )
             continue
 
         # One-LLM-at-a-time: respect the pinned LLM for this tick
         if allowed_llm_id is not None and llm.id != allowed_llm_id:
-            logger.debug(
-                "[Dreamer] Skipping '%s' — LLM %d not pinned (pinned=%s).",
-                project_name, llm.id, allowed_llm_id,
+            _log_project_maestro(
+                project_name, "llm_not_pinned",
+                f"[Maestro] Skipping '{project_name}' — LLM {llm.id} not pinned (pinned={allowed_llm_id})."
             )
             continue
 
-        # Check and reserve a capacity slot — Dreamers must not bypass limits
+        # Check and reserve a capacity slot — Maestros must not bypass limits
         if not _check_and_reserve_slot(
             llm, node_active_counts, node_session_counts, node_obj_cache, llm_node_cache,
-            label=f"dreamer '{project_name}'",
+            label=f"maestro-steward '{project_name}'",
         ):
-            logger.debug(
-                "[Dreamer] Skipping '%s' — LLM %d at capacity.", project_name, llm.id,
+            _log_project_maestro(
+                project_name, "at_capacity",
+                f"[Maestro] Skipping '{project_name}' — LLM {llm.id} at capacity."
             )
             continue
 
         llm_base_url = f"http://{llm.address}:{llm.port}/v1"
         llm_model    = llm.model
 
-        logger.info(
-            "[Dreamer] Project '%s' stalled for %.0fs — starting DreamerAgent (LLM %d).",
-            project_name, now - last_activity, llm.id,
-        )
+        if is_thrashing:
+            logger.info(
+                "[Maestro] Project '%s' has thrashing tasks — starting MaestroAgent (LLM %d).",
+                project_name, llm.id,
+            )
+        elif is_stagnant:
+            logger.info(
+                "[Maestro] Project '%s' has stagnant tasks — starting MaestroAgent (LLM %d).",
+                project_name, llm.id,
+            )
+        else:
+            logger.info(
+                "[Maestro] Project '%s' stalled for %.0fs — starting MaestroAgent (LLM %d).",
+                project_name, now - last_activity, llm.id,
+            )
 
-        with _active_dreamer_lock:
-            _active_dreamer_projects.add(project_name)
+        with _active_maestro_lock:
+            _active_maestro_projects.add(project_name)
         # Reset the activity clock so we don't fire again immediately after completion
         with _project_last_activity_lock:
             _project_last_activity[project_name] = now
 
-        _start_dreamer_thread(
+        _start_maestro_thread(
             project_name=project_name,
             project_path=project.path,
             llm_id=project.llm_id,
@@ -1339,7 +1577,7 @@ def _dispatch_dreamer(
         )
 
 
-def _start_dreamer_thread(
+def _start_maestro_thread(
     project_name: str,
     project_path: "str | None",
     llm_id: int,
@@ -1347,24 +1585,24 @@ def _start_dreamer_thread(
     llm_base_url: str,
     llm_model: str,
 ) -> None:
-    """Spawn a daemon thread that runs DreamerAgent.run() for one project.
+    """Spawn a daemon thread that runs MaestroAgent.run() for one project.
 
-    The slot was already reserved by _check_and_reserve_slot in _dispatch_dreamer.
+    The slot was already reserved by _check_and_reserve_slot in _dispatch_maestro.
     Here we register the thread in _active_sessions / _session_llm_ids so that:
       - _cleanup_finished() can spot when it dies and decrement _llm_session_counts
-      - the one-LLM-at-a-time policy pins the Dreamer's LLM for the duration
-      - scheduler status endpoints show the Dreamer as an active session
+      - the one-LLM-at-a-time policy pins the Maestro's LLM for the duration
+      - scheduler status endpoints show the Maestro as an active session
     """
     import asyncio as _asyncio
-    from app.agent.dreamer import DreamerAgent
+    from app.agent.maestro import MaestroAgent
 
-    session_key = f"dreamer-{project_name}"
+    session_key = f"maestro-{project_name}"
 
     def _run():
         loop = _asyncio.new_event_loop()
         _asyncio.set_event_loop(loop)
         try:
-            agent = DreamerAgent(
+            agent = MaestroAgent(
                 project_name=project_name,
                 project_path=project_path,
                 llm_id=llm_id,
@@ -1374,11 +1612,11 @@ def _start_dreamer_thread(
             )
             loop.run_until_complete(agent.run())
         except Exception as exc:
-            logger.exception("[Dreamer] Thread for '%s' raised: %s", project_name, exc)
+            logger.exception("[Maestro] Thread for '%s' raised: %s", project_name, exc)
         finally:
             loop.close()
             # Release the capacity slot — mirrors what _cleanup_finished does for
-            # normal sessions, but the dreamer does it explicitly so the count
+            # normal sessions, but the Maestro does it explicitly so the count
             # drops immediately when the thread exits rather than waiting for the
             # next cleanup pass.
             with _llm_counts_lock:
@@ -1387,19 +1625,19 @@ def _start_dreamer_thread(
                 _active_sessions.pop(session_key, None)
                 _session_llm_ids.pop(session_key, None)
                 _session_titles.pop(session_key, None)
-            with _active_dreamer_lock:
-                _active_dreamer_projects.discard(project_name)
+            with _active_maestro_lock:
+                _active_maestro_projects.discard(project_name)
             logger.debug(
-                "[Dreamer] Thread for '%s' exited (LLM %d slot released).",
+                "[Maestro] Thread for '%s' exited (LLM %d slot released).",
                 project_name, llm_id,
             )
 
-    t = threading.Thread(target=_run, daemon=True, name=f"dreamer-{project_name[:24]}")
+    t = threading.Thread(target=_run, daemon=True, name=f"maestro-steward-{project_name[:16]}")
     # Register in the session tracking so the scheduler sees this as an active slot
     with _active_sessions_lock:
         _active_sessions[session_key] = t
         _session_llm_ids[session_key] = llm_id
-        _session_titles[session_key] = f"Dreamer: {project_name}"
+        _session_titles[session_key] = f"Maestro: {project_name}"
     t.start()
 
 
@@ -3397,6 +3635,7 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
                             current_plan=result,
                             planning_result_id=_pr_for_correction.id,
                             hard_failures=hard_failures,
+                            all_tasks=all_tasks,
                             llm_base_url=llm_base_url,
                             llm_model=llm_model,
                             max_context=max_context,
@@ -3596,6 +3835,33 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
             )
             logger.info("Task '%s' escalated to HUMAN REVIEW by agent: %s", task_id, _exit_summary)
 
+        elif result.status == "CONSULTING":
+            _exit_reason = "consulting"
+            _exit_summary = result.final_message
+            
+            # Store the question in consultation_payload
+            from app.database import update_task as _update_task, create_inbox_message as _create_inbox
+            _update_task(task_id, consultation_payload=__import__("json").dumps({
+                "question": result.consultation_question,
+                "hint": None,
+                "source": None
+            }))
+            
+            # Notify the human (and Maestro) via Inbox
+            task_obj = get_task(task_id)
+            _create_inbox(
+                subject=f"Consultation needed: {(task_obj.title if task_obj else task_id)[:60]}",
+                source_type="consultation",
+                task_id=task_id,
+                task_title=task_obj.title if task_obj else None,
+                outcome="consultation",
+                data_json=__import__("json").dumps({
+                    "question": result.consultation_question,
+                    "summary": _exit_summary
+                }),
+            )
+            logger.info("Task '%s' paused for CONSULTATION: %s", task_id, result.consultation_question)
+
         elif result.status in ("REVERT_TO_DESIGN", "REJECTED"):
             _exit_reason = "rejected"
             update_task(task_id, type="planning")
@@ -3609,12 +3875,13 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
                 return
 
             current_type = (task.type or "").lower()
-            if current_type == "planning":
-                update_task(task_id, type="indev")
-                logger.warning("Task '%s' advanced from PLANNING to INDEV (max_turns).", task_id)
-            elif current_type == "indev":
-                update_task(task_id, type="conceptual_review")
-                logger.warning("Task '%s' advanced from INDEV to CONCEPTUAL REVIEW (max_turns).", task_id)
+            if current_type in ("planning", "indev"):
+                # Hit the turn limit without submitting.  Demote to planning
+                # so the system re-evaluates the strategy rather than pushing
+                # a likely-incomplete implementation forward.
+                logger.warning("Task '%s' demoted to PLANNING (max_turns).", task_id)
+                _record_demotion_inline(task_id, current_type, "planning", f"Max turns ({_MAX_TURNS}) exceeded without completion.")
+                update_task(task_id, type="planning")
             else:
                 logger.warning("Task '%s' reached terminal state (MAX_TURNS) but current type '%s' has no auto-transition.", task_id, current_type)
 
@@ -3625,12 +3892,11 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
                 return
 
             current_type = (task.type or "").lower()
-            if current_type == "planning":
-                update_task(task_id, type="indev")
-                logger.warning("Task '%s' advanced from PLANNING to INDEV (error).", task_id)
-            elif current_type == "indev":
-                update_task(task_id, type="conceptual_review")
-                logger.warning("Task '%s' advanced from INDEV to CONCEPTUAL REVIEW (error).", task_id)
+            if current_type in ("planning", "indev"):
+                # Execution error.  Demote to planning for retry/re-think.
+                logger.warning("Task '%s' demoted to PLANNING (error).", task_id)
+                _record_demotion_inline(task_id, current_type, "planning", f"Execution error in {current_type} stage.")
+                update_task(task_id, type="planning")
             else:
                 logger.warning("Task '%s' reached terminal state (ERROR) but current type '%s' has no auto-transition.", task_id, current_type)
 
@@ -4277,8 +4543,9 @@ def _recover_hung_sessions() -> None:
     """
     import datetime as _dt_mod
     from app.database.session import SessionLocal as _SL
-    from app.database.models import BudgetEntry as _BE
+    from app.database.models import BudgetEntry as _BE, Task as _T
     from app.agent.llm_client import kill_session as _kill_session
+    from app.agent.worktree import teardown_task_worktree as _teardown_worktree
 
     now_mono = time.time()
     now_utc = _dt_mod.datetime.now(_dt_mod.timezone.utc)
@@ -4308,21 +4575,28 @@ def _recover_hung_sessions() -> None:
                 )
                 # Convert session start (monotonic) to a wall-clock UTC datetime so
                 # we can clamp idle baseline to max(last_budget_entry, session_start).
-                # Without this, a fresh session with an old budget entry from a prior
-                # session would appear falsely idle for the full gap since that entry.
                 session_started_utc = now_utc - _dt_mod.timedelta(seconds=(now_mono - start))
+                
                 if latest is None:
                     idle_secs = now_mono - start
                 else:
                     last_at = latest.created_at
                     if isinstance(last_at, str):
-                        last_at = _dt_mod.datetime.fromisoformat(
-                            last_at.replace("Z", "+00:00")
-                        )
+                        try:
+                            # Handle both " " and "T" separators, and ensure UTC
+                            ts_str = last_at.replace(" ", "T").replace("Z", "+00:00")
+                            last_at = _dt_mod.datetime.fromisoformat(ts_str)
+                            if last_at.tzinfo is None:
+                                last_at = last_at.replace(tzinfo=_dt_mod.timezone.utc)
+                        except ValueError:
+                            last_at = session_started_utc
+                    
                     if last_at.tzinfo is None:
                         last_at = last_at.replace(tzinfo=_dt_mod.timezone.utc)
-                    effective_baseline = max(last_at, session_started_utc)
-                    idle_secs = (now_utc - effective_baseline).total_seconds()
+                    
+                    # Baseline is the most recent of (session start, last LLM call)
+                    baseline = max(last_at, session_started_utc)
+                    idle_secs = (now_utc - baseline).total_seconds()
 
                 if idle_secs < _HUNG_SESSION_IDLE_SECONDS:
                     continue
@@ -4338,6 +4612,15 @@ def _recover_hung_sessions() -> None:
                         _kill_session(sess_uuid)
                     except Exception:
                         pass
+
+                # Force worktree removal for hung tasks to clear potential file/git locks
+                # that cause re-dispatch loops in Windows environments.
+                try:
+                    task = db.query(_T).get(tid)
+                    if task and task.project_ref and task.project_ref.path:
+                        _teardown_worktree(tid, task.project_ref.path)
+                except Exception as exc:
+                    logger.error("[scheduler] Failed to teardown worktree for hung task '%s': %s", tid, exc)
 
                 with _active_sessions_lock:
                     _active_sessions.pop(tid, None)

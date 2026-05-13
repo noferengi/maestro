@@ -173,9 +173,14 @@ class DevOrchestrator:
             # Commit batch
             try:
                 from app.agent.tools import write_git_commit
-                write_git_commit(f"[Maestro] Batch {batch_idx + 1}/{len(batches)} for task {self.task_id}")
+                _commit_result = write_git_commit(f"[Maestro] Batch {batch_idx + 1}/{len(batches)} for task {self.task_id}")
+                if _commit_result.startswith("ERROR"):
+                    logger.warning("[dev_orch] Batch %d/%d commit returned error for task '%s': %s",
+                                   batch_idx + 1, len(batches), self.task_id, _commit_result)
+                else:
+                    logger.debug("[dev_orch] Batch %d/%d commit: %s", batch_idx + 1, len(batches), _commit_result)
             except Exception as e:
-                logger.warning("[dev_orch] Batch commit failed: %s", e)
+                logger.warning("[dev_orch] Batch commit raised exception: %s", e)
 
         # Run full test suite
         test_passed, test_output, test_parsed = await self._run_full_tests()
@@ -478,7 +483,19 @@ class DevOrchestrator:
                     for tc in tool_calls:
                         fn_name = tc["function"]["name"]
                         fn_args_raw = tc["function"]["arguments"]
-                        fn_args = fn_args_raw if isinstance(fn_args_raw, dict) else json.loads(fn_args_raw)
+                        try:
+                            fn_args = fn_args_raw if isinstance(fn_args_raw, dict) else json.loads(fn_args_raw)
+                        except json.JSONDecodeError as e:
+                            logger.warning(
+                                "[dev_orchestrator] Malformed tool call args for %s: %s — skipping call",
+                                fn_name, e,
+                            )
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": f"Error: malformed arguments JSON — {e}",
+                            })
+                            continue
                         try:
                             result_str = str(dispatch_tool(fn_name, fn_args))
                             if "__maestro_terminal__" in result_str:
@@ -488,7 +505,7 @@ class DevOrchestrator:
                                     redesign_needed = True
                         except Exception as exc:
                             result_str = f"Error: {exc}"
-                        
+
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tc["id"],

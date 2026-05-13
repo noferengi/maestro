@@ -396,7 +396,7 @@ def _extract_clarification_output(content: str) -> dict | None:
 _JUDGE_SYSTEM_PROMPT = """You are a **Specification Judge** inside the Maestro Orchestrator.
 
 An automated Enrichment Agent has rewritten an auto-generated task card (created by a
-subdivision or dreamer agent).  Your job is to decide whether the rewrite is a net
+subdivision or maestro agent).  Your job is to decide whether the rewrite is a net
 improvement over the original.
 
 Approve if the rewrite adds at least ONE of:
@@ -473,7 +473,7 @@ async def _judge_enrichment(
 
 # Tasks created by automated agents that bypass the human approval gate.
 # The enrichment judge auto-approves or auto-skips instead.
-_AUTO_OWNERS = frozenset({"system", "dreamer"})
+_AUTO_OWNERS = frozenset({"system", "maestro"})
 
 
 async def run_clarification(

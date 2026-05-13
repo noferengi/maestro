@@ -46,13 +46,32 @@ _SINGLE_BRACE_RE = re.compile(r"\{([A-Za-z_][\w.]*)\}")
 def sanitize_user_content(text: str) -> str:
     """Escape user/DB-sourced content before embedding it in an LLM prompt.
 
-    Converts bare {identifier} patterns to [identifier] so llm_client's
-    sanitizer passes the content silently.  Call this at every injection site
-    where non-developer-written text enters a prompt string.
+    Converts bare {identifier} patterns to [identifier] and normalizes
+    non-ASCII Unicode to ASCII-safe equivalents so _sanitize_messages()
+    never has to strip residual chars from user/system messages.
     """
     if not text:
         return text
-    return _SINGLE_BRACE_RE.sub(r"[\1]", text)
+    # Known replacements first (keeps readable punctuation like em-dash → --)
+    _REPLACEMENTS = [
+        ("—", " -- "), ("–", " - "), ("→", " -> "), ("←", " <- "),
+        ("‘", "'"), ("’", "'"), ("“", '"'), ("”", '"'),
+        ("…", "..."), ("·", "."), ("•", "-"), ("★", "*"),
+    ]
+    for raw, safe in _REPLACEMENTS:
+        if raw in text:
+            text = text.replace(raw, safe)
+    # Escape Jinja2-style delimiters that break llama.cpp's chat template
+    for raw, safe in [("{{", "{ {"), ("}}", "} }"), ("{%", "{ %"), ("{#", "{ #")]:
+        if raw in text:
+            text = text.replace(raw, safe)
+    # Escape bare {identifier} patterns
+    text = _SINGLE_BRACE_RE.sub(r"[\1]", text)
+    # Strip any remaining non-ASCII via NFKD decomposition
+    if any(ord(c) > 127 for c in text):
+        import unicodedata as _ud
+        text = _ud.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    return text
 
 # ---------------------------------------------------------------------------
 # Session identity context vars
@@ -149,7 +168,7 @@ _BACKOFF_FREE_TRIES: int = 10        # attempts logged at WARNING with no delay
 _BACKOFF_BASE_DELAY: float = 3.0     # first backoff duration (seconds)
 _BACKOFF_MAX_DELAY: float = 900.0    # cap for connection errors: 15 minutes
 _BACKOFF_RESPONSE_MAX_DELAY: float = 60.0  # cap for response/timeout errors: 1 minute
-_MIN_DISPATCH_GAP: float = 0.15      # seconds between consecutive dispatches to same endpoint
+_MIN_DISPATCH_GAP: float = 0.50      # seconds between consecutive dispatches to same endpoint
 _MODEL_LOAD_DELAY: float = 10.0      # seconds to gate subsequent requests after a model switch
 
 
@@ -342,6 +361,23 @@ class PipelineAbortedError(Exception):
         super().__init__(f"Stage '{stage}' aborted due to infra error: {cause}")
 
 
+class TruncatedToolCallError(Exception):
+    """Raised when the model's tool call arguments were cut off mid-generation.
+
+    This happens when max_tokens is exhausted while the model is still writing
+    the JSON arguments for a tool call (e.g. a large write_file payload).
+    llama.cpp rejects the incomplete JSON with HTTP 500.
+
+    Unlike a genuine JSON syntax error (unescaped quotes), truncation is
+    recoverable: callers should inject a correction message telling the model
+    to split large writes into smaller append_file calls, then continue the
+    turn loop.
+    """
+    def __init__(self, server_error: str):
+        self.server_error = server_error
+        super().__init__(f"Tool call arguments truncated mid-generation: {server_error[:200]}")
+
+
 def signal_shutdown() -> None:
     """Phase-1 shutdown: signal in-flight calls to abort at their next check."""
     _shutdown_event.set()
@@ -389,10 +425,14 @@ async def _stream_llm_response(
     http_timeout = httpx.Timeout(connect=3.0, read=None, write=30.0, pool=5.0)
 
     accumulated_content: list[str] = []
+            # tool_calls_acc: index -> {id, type, function: {name, arguments}}
+    # Built incrementally from delta.tool_calls chunks (OpenAI streaming format).
+    tool_calls_acc: dict[int, dict] = {}
     finish_reason: str | None = None
     response_id: str | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    last_chunks: list[str] = []  # Diagnostic buffer for premature endings
 
     import json as _json
     async with httpx.AsyncClient(timeout=http_timeout) as client:
@@ -408,36 +448,51 @@ async def _stream_llm_response(
 
             lines_aiter = response.aiter_lines()
             try:
+                # We wrap the iterator's __anext__ in a task so we can poll its progress
+                # without cancelling it (which httpx doesn't handle gracefully).
+                next_line_task: asyncio.Task[str] | None = None
+
                 while True:
-                    if _shutdown_event.is_set() or _force_shutdown_event.is_set():
-                        raise ShutdownError("Server is shutting down")
-                    if is_session_killed(session_id):
-                        raise SessionKilledError(f"Session '{session_id}' was killed")
+                    if next_line_task is None:
+                        next_line_task = asyncio.create_task(lines_aiter.__anext__())
 
                     # Slice the idle-timeout wait into _SHUTDOWN_POLL_SLICE-second
                     # windows so the shutdown flag is checked even during first-token
-                    # latency (prompt-processing window).  The else-branch of the
-                    # inner while fires when elapsed >= idle_timeout (no break).
+                    # latency (prompt-processing window).
                     elapsed = 0.0
                     got_stop = False
                     line = ""
                     while elapsed < idle_timeout:
                         if _shutdown_event.is_set() or _force_shutdown_event.is_set():
+                            next_line_task.cancel()
                             raise ShutdownError("Server is shutting down")
                         if is_session_killed(session_id):
+                            next_line_task.cancel()
                             raise SessionKilledError(f"Session '{session_id}' was killed")
-                        try:
-                            line = await asyncio.wait_for(
-                                lines_aiter.__anext__(),
-                                timeout=min(_SHUTDOWN_POLL_SLICE, idle_timeout - elapsed),
-                            )
-                            break  # got a chunk
-                        except StopAsyncIteration:
-                            got_stop = True
-                            break
-                        except asyncio.TimeoutError:
+
+                        # Wait for the task OR the poll slice
+                        done, _ = await asyncio.wait(
+                            [next_line_task],
+                            timeout=min(_SHUTDOWN_POLL_SLICE, idle_timeout - elapsed),
+                        )
+
+                        if next_line_task in done:
+                            try:
+                                line = next_line_task.result()
+                                next_line_task = None  # Ready for next chunk
+                                break
+                            except StopAsyncIteration:
+                                got_stop = True
+                                break
+                            except Exception as exc:
+                                logger.debug("[%s] SSE stream connection error: %r", session_id, exc)
+                                raise
+                        else:
+                            # Still waiting for the next chunk
                             elapsed += _SHUTDOWN_POLL_SLICE
                     else:
+                        if next_line_task:
+                            next_line_task.cancel()
                         raise httpx.ReadTimeout(
                             f"No token from {url} for {idle_timeout:.0f}s - LLM may be stuck"
                         )
@@ -451,22 +506,62 @@ async def _stream_llm_response(
                     if data_str == "[DONE]":
                         break
 
+                    if len(last_chunks) >= 10:
+                        last_chunks.pop(0)
+                    last_chunks.append(data_str)
+
                     try:
                         chunk = json.loads(data_str)
                     except json.JSONDecodeError:
                         continue
+
+                    # Server-sent error mid-stream?
+                    if "error" in chunk:
+                        err_obj = chunk["error"]
+                        err_msg = err_obj.get("message") or str(err_obj)
+                        logger.warning("[%s] SSE stream error: %s", session_id, err_msg)
+                        # Re-wrap as an HTTPStatusError so call_llm's retry/backoff
+                        # logic handles it identical to a 500.
+                        raise httpx.HTTPStatusError(
+                            f"SSE stream error: {err_msg}",
+                            request=httpx.Request("POST", url),
+                            response=httpx.Response(500, content=data_str.encode("utf-8")),
+                        )
 
                     if response_id is None:
                         response_id = chunk.get("id")
 
                     for choice in chunk.get("choices", []):
                         delta = choice.get("delta", {})
+
                         content = delta.get("content")
                         if content:
                             accumulated_content.append(content)
+
                         fr = choice.get("finish_reason")
                         if fr:
                             finish_reason = fr
+
+                        # Reconstruct tool_calls from incremental delta chunks.
+                        # Each chunk carries a partial update keyed by index.
+                        for tc_delta in delta.get("tool_calls") or []:
+                            idx = tc_delta.get("index", 0)
+                            if idx not in tool_calls_acc:
+                                tool_calls_acc[idx] = {
+                                    "id": "",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                }
+                            tc = tool_calls_acc[idx]
+                            if tc_delta.get("id"):
+                                tc["id"] = tc_delta["id"]
+                            if tc_delta.get("type"):
+                                tc["type"] = tc_delta["type"]
+                            fn = tc_delta.get("function") or {}
+                            if fn.get("name"):
+                                tc["function"]["name"] += fn["name"]
+                            if fn.get("arguments"):
+                                tc["function"]["arguments"] += fn["arguments"]
 
                     # Some servers emit usage in the final chunk
                     usage = chunk.get("usage") or {}
@@ -477,15 +572,33 @@ async def _stream_llm_response(
             finally:
                 await lines_aiter.aclose()
 
+    # If the stream ended by connection close (got_stop) but without a
+    # finish_reason, it's a premature termination (silent crash, timeout,
+    # or dropped connection). Raise a 500 so call_llm retries.
+    if got_stop and not finish_reason:
+        last_chunks_str = "\n".join(f"  > {c}" for c in last_chunks)
+        logger.warning(
+            "[%s] SSE stream ended prematurely (connection closed without finish_reason).\n"
+            "Last 10 chunks captured:\n%s",
+            session_id or "unknown", last_chunks_str
+        )
+        raise httpx.HTTPStatusError(
+            "SSE stream ended prematurely",
+            request=httpx.Request("POST", url),
+            response=httpx.Response(500, content=b'{"error": "Premature end of stream"}'),
+        )
+
+    tool_calls_list = [tool_calls_acc[k] for k in sorted(tool_calls_acc)] if tool_calls_acc else None
+    msg: dict = {"role": "assistant", "content": "".join(accumulated_content)}
+    if tool_calls_list:
+        msg["tool_calls"] = tool_calls_list
+
     return {
         "id": response_id,
         "object": "chat.completion",
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": "".join(accumulated_content),
-            },
+            "message": msg,
             "finish_reason": finish_reason,
         }],
         "usage": {
@@ -493,6 +606,7 @@ async def _stream_llm_response(
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
         },
+        "model": payload.get("model"),
     }
 
 
@@ -572,9 +686,9 @@ def _sanitize_messages(messages: list[dict]) -> list[dict]:
         ("</parameter",  "[/parameter"),
     ]
     _UNICODE_REPLACEMENTS = [
-        ("\u2014", " -- "), ("\u2013", " - "), ("\u2192", " -> "), ("\u2190", " <- "),
-        ("\u2018", "'"), ("\u2019", "'"), ("\u201c", '"'), ("\u201d", '"'),
-        ("\u2026", "..."), ("\u00b7", "."), ("\u2022", "-"), ("\u2605", "*"),
+        ("—", " -- "), ("–", " - "), ("→", " -> "), ("←", " <- "),
+        ("‘", "'"), ("’", "'"), ("“", '"'), ("”", '"'),
+        ("…", "..."), ("·", "."), ("•", "-"), ("★", "*"),
     ]
 
     result = []
@@ -586,7 +700,7 @@ def _sanitize_messages(messages: list[dict]) -> list[dict]:
 
         role = msg.get("role", "?")
         changed = False
-        log_warn = role in ("system", "user")
+        log_debug = role in ("system", "user")
 
         # Strip model-internal reasoning blocks from assistant history.
         # Thinking models re-derive their reasoning each turn; prior thinking
@@ -602,8 +716,8 @@ def _sanitize_messages(messages: list[dict]) -> list[dict]:
                 changed = True
 
         if "\x00" in content:
-            if log_warn:
-                logger.warning("msg[%d] (%s): Stripping null bytes", i, role)
+            if log_debug:
+                logger.debug("msg[%d] (%s): Stripping null bytes", i, role)
             content = content.replace("\x00", "")
             changed = True
 
@@ -614,7 +728,7 @@ def _sanitize_messages(messages: list[dict]) -> list[dict]:
 
         for raw, safe in _JINJA2_PAIRS:
             if raw in content:
-                if log_warn:
+                if log_debug:
                     count = content.count(raw)
                     idx = content.find(raw)
                     snip = content[max(0, idx - 40):idx + len(raw) + 40].replace("\n", "↵")
@@ -632,20 +746,20 @@ def _sanitize_messages(messages: list[dict]) -> list[dict]:
 
         _sbrace_match = _SINGLE_BRACE_RE.search(content)
         if _sbrace_match:
-            if log_warn:
+            if log_debug:
                 snip = content[max(0, _sbrace_match.start() - 40):_sbrace_match.end() + 40].replace("\n", "↵")
                 logger.debug(
                     "msg[%d] (%s): Escaping single-brace identifiers ×%d — near: %r",
                     i, role, len(_SINGLE_BRACE_RE.findall(content)), snip,
                 )
-            content = _SINGLE_BRACE_RE.sub(r'[\1]', content)
+            content = _SINGLE_BRACE_RE.sub(r"[\1]", content)
             changed = True
 
         _non_ascii = sum(1 for c in content if ord(c) > 127)
         if _non_ascii:
             import unicodedata as _ud
-            if log_warn:
-                logger.warning("msg[%d] (%s): Stripping %d residual non-ASCII chars", i, role, _non_ascii)
+            if log_debug:
+                logger.debug("msg[%d] (%s): Stripping %d residual non-ASCII chars", i, role, _non_ascii)
             content = _ud.normalize("NFKD", content).encode("ascii", "ignore").decode("ascii")
             changed = True
 
@@ -749,7 +863,7 @@ async def call_llm(
     tool_choice: str | None = None,
     response_format: dict | None = None,
     grammar: str | None = None,      # GBNF grammar string for llama.cpp constrained generation
-    stream: bool = False,            # Use SSE streaming with per-chunk idle timeout
+    stream: bool = True,             # Use SSE streaming with per-chunk idle timeout (preferred: avoids non-streaming 120s read-timeout dropping llama.cpp slots)
     stream_idle_timeout: float | None = None,  # Seconds of silence -> stuck LLM abort
     max_retries: int | None = None,  # Max consecutive connect failures before raising; None = unlimited
     total_timeout_secs: float | None = None,  # Wall-clock deadline for the entire call (incl. backoff sleeps)
@@ -832,23 +946,32 @@ async def call_llm(
     # chat-template engine to fail with "Failed to parse input at pos N".
     messages = _sanitize_messages(messages)
 
-    # Drop trailing empty assistant messages before sending.
+    # Drop trailing assistant messages with no tool calls before sending.
     # llama.cpp with enable_thinking treats any trailing assistant turn as a
     # "prefill" request (continue-from-here), which conflicts with thinking mode
     # and returns HTTP 400: "Assistant response prefill is incompatible with
-    # enable_thinking."  An assistant message at the tail with empty/null content
-    # and no tool_calls is never meaningful — it's safe to strip.
+    # enable_thinking."  A trailing assistant message with no tool_calls is
+    # never the right thing to send — agent loops must always inject a user
+    # nudge when the model produces text-only output so this guard only fires
+    # as a safety net for paths that forget to do so.
     if (
         messages
         and messages[-1].get("role") == "assistant"
         and not messages[-1].get("tool_calls")
-        and not (messages[-1].get("content") or "").strip()
     ):
         _agent_label_pre = f"[{agent_name}]" if agent_name else "[Agent]"
-        logger.debug(
-            "%s Stripping trailing empty assistant message to avoid enable_thinking prefill rejection",
-            _agent_label_pre,
-        )
+        _trailing_content = (messages[-1].get("content") or "").strip()
+        if not _trailing_content:
+            logger.debug(
+                "%s Stripping trailing empty assistant message to avoid enable_thinking prefill rejection",
+                _agent_label_pre,
+            )
+        else:
+            logger.warning(
+                "%s Stripping trailing non-empty assistant message (%d chars, no tool calls) "
+                "to avoid enable_thinking prefill rejection — agent loop should inject a user nudge",
+                _agent_label_pre, len(_trailing_content),
+            )
         messages = messages[:-1]
 
     # ── Pre-flight context size check ────────────────────────────────────────
@@ -858,19 +981,53 @@ async def call_llm(
     # Raise *before* any HTTP call so callers can handle it as a clean abort
     # rather than burning a retry budget on a guaranteed-to-fail request.
     _resolved_max_context = _get_llm_max_context(llm_id) if llm_id else None
-    if _resolved_max_context:
-        _total_chars = sum(
-            len(m["content"]) if isinstance(m.get("content"), str) else 0
-            for m in messages
-        )
 
+    # ── Dynamic max_tokens ───────────────────────────────────────────────────
+    # For thinking models (Qwen3, QwQ, DeepSeek-R1), the think block consumes
+    # an unpredictable number of tokens before the first response token.  A
+    # fixed max_tokens cap can be entirely consumed by reasoning, leaving the
+    # model with only a handful of tokens for the actual response — producing
+    # tool call arguments like `{` (column-2 truncation).
+    #
+    # When the caller does NOT supply an explicit max_tokens and we know the
+    # LLM's context window, we compute the budget dynamically:
+    #   effective_max_tokens = context_window − estimated_prompt_tokens − 512
+    # This gives the model everything that's left after the prompt, regardless
+    # of how verbose its reasoning chain turns out to be.
+    #
+    # Callers that pass an explicit max_tokens (planning judge, maestro, etc.)
+    # keep their value — it is never overridden.
+    # Estimate total serialised prompt size.  Must include every field that
+    # the chat template will render — content strings AND tool_calls objects.
+    # Omitting tool_calls (multi-KB JSON blobs in assistant turns) caused
+    # severe underestimation and left the model with far fewer generation
+    # tokens than calculated, producing column-2 truncation errors.
+    _total_chars: int = 0
+    if _resolved_max_context:
+        import json as _json
+        for _m in messages:
+            _content = _m.get("content")
+            if isinstance(_content, str):
+                _total_chars += len(_content)
+            _tcs = _m.get("tool_calls")
+            if _tcs:
+                _total_chars += len(_json.dumps(_tcs))
         if tools:
-            import json as _json
             _total_chars += sum(len(_json.dumps(t)) for t in tools)
 
-        _max_output = (max_tokens or MAX_TOKENS_PER_TURN)
-        _available = _resolved_max_context - _max_output
-        # using 3 chars per token to more accurately reflect code
+    if max_tokens is not None:
+        _effective_max_tokens: int = max_tokens
+    elif _resolved_max_context and _total_chars > 0:
+        _estimated_prompt = _total_chars // 3
+        _effective_max_tokens = max(4096, _resolved_max_context - _estimated_prompt - 512)
+    else:
+        _effective_max_tokens = MAX_TOKENS_PER_TURN
+
+    # ── Pre-flight context size check ────────────────────────────────────────
+    # Raise *before* any HTTP call so callers can handle it as a clean abort
+    # rather than burning a retry budget on a guaranteed-to-fail request.
+    if _resolved_max_context and _total_chars > 0:
+        _available = _resolved_max_context - _effective_max_tokens
         _estimated = _total_chars // 3
         if _estimated > _available:
             _agent_label = f"[{agent_name}]" if agent_name else "[Agent]"
@@ -878,7 +1035,7 @@ async def call_llm(
                 "%s Pre-flight context check failed: estimated %d tokens > available %d "
                 "(max_context=%d minus max_tokens=%d). Refusing to send %d chars to LLM.",
                 _agent_label, _estimated, _available,
-                _resolved_max_context, _max_output, _total_chars,
+                _resolved_max_context, _effective_max_tokens, _total_chars,
             )
             raise ContextTooLargeError(_estimated, _resolved_max_context)
     # ────────────────────────────────────────────────────────────────────────
@@ -886,7 +1043,7 @@ async def call_llm(
     payload: dict[str, Any] = {
         "model": resolved_model,
         "messages": messages,
-        "max_tokens": max_tokens or MAX_TOKENS_PER_TURN,
+        "max_tokens": _effective_max_tokens,
     }
 
     if tools is not None:
@@ -1087,16 +1244,39 @@ async def call_llm(
                 payload_desc = _describe_payload(payload)
 
                 # llama.cpp returns 500 when the model generates a tool call whose
-                # `arguments` field contains invalid JSON (e.g. unescaped quotes from
-                # triple-quoted Python strings in write_file content).  Retrying the
-                # same message history will produce the same broken output — fail fast
-                # so the caller (component_loop, MaestroLoop) can count the failure and
-                # inject a correction turn or trigger REVERT_TO_DESIGN.
+                # `arguments` field contains invalid JSON.  There are two sub-cases:
+                #
+                # 1. Truncation ("unexpected end of input" / "unexpected end of string"):
+                #    max_tokens was exhausted while the model was still writing the
+                #    arguments (common with large write_file payloads).  Retrying with
+                #    the same messages will reproduce the same output, but callers can
+                #    recover by injecting a correction turn that tells the model to
+                #    split the write into smaller append_file calls.  Raise
+                #    TruncatedToolCallError so callers can handle this specifically.
+                #
+                # 2. Syntax error (unescaped quotes, stray characters): the model
+                #    generated syntactically wrong JSON.  Retrying is pointless — fail
+                #    fast so the caller can count the failure and trigger
+                #    REVERT_TO_DESIGN.
                 if "Failed to parse tool call arguments" in body_text:
+                    _is_truncation = (
+                        "unexpected end of input" in body_text
+                        or "unexpected end of string" in body_text
+                        or "missing closing quote" in body_text
+                    )
+                    if _is_truncation:
+                        logger.warning(
+                            "%s LLM endpoint %s returned %d (tool call arguments truncated"
+                            " — max_tokens hit mid-generation; raising TruncatedToolCallError"
+                            " for caller correction).\nError: %s\nPayload:\n%s",
+                            _agent_label, url, exc.response.status_code,
+                            body_text[:300], payload_desc,
+                        )
+                        raise TruncatedToolCallError(body_text) from exc
                     logger.warning(
                         "%s LLM endpoint %s returned %d (non-retryable: model generated"
-                        " invalid tool call arguments JSON — likely unescaped quotes in"
-                        " write_file content).\nError: %s\nPayload:\n%s",
+                        " invalid tool call arguments JSON — syntax error, likely unescaped"
+                        " quotes in write_file content).\nError: %s\nPayload:\n%s",
                         _agent_label, url, exc.response.status_code,
                         body_text[:300], payload_desc,
                     )
@@ -1329,8 +1509,8 @@ async def call_llm(
                     )
                     raise
 
-        except httpx.ReadTimeout as exc:
-            # Server alive but too slow to respond within the timeout window.
+        except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.WriteError) as exc:
+            # Server alive but too slow to respond, or connection was dropped/reset.
             # Treat identically to a 5xx: back off and retry rather than
             # propagating immediately to the job scheduler.
             payload_desc = _describe_payload(payload)
@@ -1340,17 +1520,17 @@ async def call_llm(
                 if st.fail_count_response <= _BACKOFF_FREE_TRIES:
                     wait = _BACKOFF_BASE_DELAY
                     logger.warning(
-                        "%s LLM endpoint %s timed out (attempt %d/%d), retrying in %.0fs.\n"
+                        "%s LLM endpoint %s read/write error (attempt %d/%d), retrying in %.0fs: %r.\n"
                         "Payload:\n%s",
-                        _agent_label, resolved_url, st.fail_count_response, _BACKOFF_FREE_TRIES, wait,
+                        _agent_label, resolved_url, st.fail_count_response, _BACKOFF_FREE_TRIES, wait, exc,
                         payload_desc
                     )
                 else:
                     wait = st.delay
                     logger.warning(
-                        "%s LLM endpoint %s timed out (attempt %d), backing off %.0fs.\n"
+                        "%s LLM endpoint %s read/write error (attempt %d), backing off %.0fs: %r.\n"
                         "Payload:\n%s",
-                        _agent_label, resolved_url, st.fail_count_response, wait,
+                        _agent_label, resolved_url, st.fail_count_response, wait, exc,
                         payload_desc
                     )
                     st.next_allowed = time.monotonic() + wait
@@ -1359,7 +1539,7 @@ async def call_llm(
             _total_retry_count += 1
             if max_retries is not None and _total_retry_count >= max_retries:
                 raise RuntimeError(
-                    f"LLM endpoint {resolved_url} timed out after {_total_retry_count} attempt(s)."
+                    f"LLM endpoint {resolved_url} timed out or reset after {_total_retry_count} attempt(s)."
                 ) from exc
             _retry_wait = wait + random.uniform(0, wait * 0.5)
 

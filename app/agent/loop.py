@@ -28,6 +28,7 @@ from app.agent.config import (
     SIGNAL_REJECTED,
     SIGNAL_REVERT,
     SIGNAL_NEEDS_HUMAN,
+    SIGNAL_CONSULT,
     GIT_SAFETY_BRANCH_PREFIX,
     INDEV_AGENT_TOOLS,
     check_context_saturation,
@@ -51,12 +52,13 @@ class LoopResult:
     """Outcome of a single MaestroLoop run."""
 
     task_id: str
-    status: Literal["ACCEPTED", "REJECTED", "REVERT_TO_DESIGN", "NEEDS_HUMAN", "MAX_TURNS", "ERROR"]
+    status: Literal["ACCEPTED", "REJECTED", "REVERT_TO_DESIGN", "NEEDS_HUMAN", "CONSULTING", "MAX_TURNS", "ERROR"]
     turns: int
     final_message: str
     git_branch: str | None = None
     files_changed: list[str] = field(default_factory=list)
     error_detail: str | None = None
+    consultation_question: str | None = None  # Added for CONSULTING state
 
 
 # ---------------------------------------------------------------------------
@@ -321,9 +323,39 @@ class MaestroLoop:
 
     def _build_messages(self) -> list[dict]:
         """
-        Assemble the initial message list:
-          [system_prompt, user_task_brief]
+        Assemble the message list.
+        If a saved session state exists (from a CONSULTING pause), load it.
+        Otherwise, build the initial system prompt and task brief.
         """
+        from app.database import get_task_session_state, delete_task_session_state, get_task as _get_task
+        
+        # Check for saved state (resume logic)
+        saved = get_task_session_state(self.task_id)
+        if saved:
+            _session_id, turn_count, messages = saved
+            self._turn = turn_count
+            
+            # Look up the task to see if a hint was provided
+            task_rec = _get_task(self.task_id)
+            if task_rec and task_rec.consultation_payload:
+                try:
+                    payload = json.loads(task_rec.consultation_payload)
+                    hint = payload.get("hint")
+                    if hint:
+                        messages.append({
+                            "role": "user",
+                            "content": f"[MAESTRO STEERING HINT] {hint}\n\nPlease proceed with implementation based on this guidance."
+                        })
+                except:
+                    pass
+
+            # Clean up the state record now that we've loaded it
+            delete_task_session_state(self.task_id)
+            
+            logger.info("Task '%s': Resuming from saved state (turn %d).", self.task_id, self._turn)
+            return messages
+
+        # --- Standard initial build ---
         _project_path = getattr(self, 'project_path', None) or None
         snapshot_block = ""
         if _project_path:
@@ -360,6 +392,17 @@ class MaestroLoop:
                         pip_block += f"\nPIP {i+1} (from {pip.origin_stage}, status: {pip.status}):\n"
                         for req in reqs:
                             pip_block += f"- {sanitize_user_content(req)}\n"
+
+                # Fetch global architectural decisions
+                from app.database import get_project_decisions
+                decisions = get_project_decisions(_task_rec.project)
+                if decisions:
+                    pip_block += "\n\n### BINDING ARCHITECTURAL DECISIONS\n"
+                    pip_block += "These are global project-level decisions you MUST follow:\n"
+                    for d in decisions:
+                        pip_block += f"\n- [{d.topic}]: {sanitize_user_content(d.decision)}\n"
+                        if d.rationale:
+                            pip_block += f"  Rationale: {sanitize_user_content(d.rationale)}\n"
 
                 # Inject demotion history so re-entering dev sessions know why they were sent back
                 if _task_rec and _task_rec.demotion_history:
@@ -554,6 +597,37 @@ class MaestroLoop:
                 final_message=signal_dict.get("summary", "Implementation rejected."),
                 git_branch=self._git_branch,
                 error_detail=signal_dict.get("advice"),
+            )
+        elif sig == SIGNAL_CONSULT:
+            # Save message history so we can resume later
+            from app.database import save_task_session_state, get_agent_session_id_for_task
+            
+            # We need the current session ID to link the state
+            # This assumes the loop has already been registered (it has, in run())
+            session_id = None
+            try:
+                from app.agent.llm_client import get_active_session_id
+                session_id = get_active_session_id()
+            except:
+                pass
+
+            question = signal_dict.get("payload", {}).get("question", "No question provided.")
+            
+            # Save the state!
+            save_task_session_state(
+                task_id=self.task_id,
+                session_id=session_id or 0,
+                turn_count=self._turn,
+                messages=self._messages
+            )
+
+            result = LoopResult(
+                task_id=self.task_id,
+                status="CONSULTING",
+                turns=self._turn,
+                final_message=f"Agent paused for consultation: {question}",
+                git_branch=self._git_branch,
+                consultation_question=question
             )
         else:  # REVERT_TO_DESIGN and any unknown signal
             result = LoopResult(

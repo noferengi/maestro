@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
-Usage: python scripts/create_migration.py <migration_name>
+Maestro Migration Creator
+-------------------------
+Creates a new numbered migration file template in app/migrations/versions/.
 
-Creates the next numbered migration file in app/migrations/versions/.
-Prints the path of the created file.
+Usage:
+    python scripts/create_migration.py "<migration_description>"
 
-Examples:
-  python scripts/create_migration.py add_clarification_status
-  python scripts/create_migration.py "add acceptance criteria column"
+Next Steps:
+    1. Open the created file (path printed below).
+    2. Edit the 'up(conn)' function with your SQL changes.
+    3. Edit the 'down(conn)' function with the rollback SQL.
+    4. Run '.\migrate.bat status' to verify the new file is detected as 'pending'.
+    5. Run '.\migrate.bat migrate' to apply the changes.
+
+Example:
+    python scripts/create_migration.py "add clarification status to tasks"
 """
 
 import re

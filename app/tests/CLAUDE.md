@@ -20,20 +20,17 @@ The session-scoped autouse fixture `_test_schema()` then:
 
 `test.db` is left on disk after the run for failure inspection. It is gitignored.
 
-**Consequence:** Tests within a session share state. If `test_foo` inserts a task and
-`test_bar` queries all tasks, `test_bar` will see it unless `test_foo` cleans up or the test
-relies on specific IDs. Write tests that either:
-- Create unique enough data (UUIDs, random titles) to not collide, or
-- Explicitly delete their rows after the test.
+The function-scoped autouse fixture `_db_rollback()` wraps **every individual test** in a
+transaction that is rolled back on teardown. Each test sees a clean database and leaves no
+state behind. Tests do not share state — you do not need to clean up rows or use unique
+IDs to avoid collisions.
 
 ### When to use a per-test isolated database instead
 
 Use `tmp_path` + `monkeypatch.setenv` + `importlib.reload` when:
-- You are testing **database initialization or reload behavior** (e.g., testing that
-  `Base.metadata.create_all` produces the right schema)
-- Your test creates data that is genuinely impossible to clean up (e.g., testing a CRUD
-  function whose output will interfere with the ordering assertions of another test)
-- The test is self-contained and cheaper to isolate than to coordinate
+- You are testing **database module reload behavior** (e.g., testing that the engine
+  correctly re-points after an env var change)
+- Your test needs a completely separate schema from `test.db` for structural reasons
 
 Pattern (from `test_research_jobs.py`):
 ```python
@@ -44,11 +41,23 @@ def test_something(tmp_path, monkeypatch):
     import importlib
     import app.database as db_mod
     importlib.reload(db_mod)
-    db_mod.Base.metadata.create_all(bind=db_mod.engine)
+    from migrations.runner import migrate as run_migrate, ConnectionWrapper
+    with db_mod.engine.begin() as _conn:
+        run_migrate(ConnectionWrapper(_conn, is_postgres=False))
 
     # Now use db_mod functions directly — fully isolated SQLite
     job = db_mod.create_research_job(...)
 ```
+
+**Why migration runner, not `Base.metadata.create_all`:** `create_all` builds the schema
+from current ORM model definitions only — it bypasses the 65-migration history. A migration
+that back-fills data or has a specific column default would not be reflected. Always use
+the migration runner for schema setup so the test database matches production exactly.
+
+**Why `db_mod.engine` not `get_connection()`:** `runner.get_connection()` reads
+`ADMIN_DATABASE_URL` from config, which may resolve to the production Postgres URL if
+`use_postgres = true`. `db_mod.engine` is the engine created by the reloaded `session.py`
+from `MAESTRO_TEST_DB`, so it always points at the isolated `tmp_path` file.
 
 **Important:** `importlib.reload` is necessary here because `app.database` builds its
 `engine` and `SessionLocal` at import time from `MAESTRO_TEST_DB`. Without the reload, the

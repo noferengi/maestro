@@ -10,31 +10,52 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import declarative_base, sessionmaker
 import logging
 import os
+from app.agent.config import DATABASE_URL as CFG_DATABASE_URL, PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 
-# Database path — keep it in the project's data/ directory.
-# MAESTRO_TEST_DB env var lets conftest.py redirect to a temp file per session.
-# NOTE: __file__ is app/database/session.py so we need two levels up to reach
-# the repo root, then down into data/.
+# DATABASE_PATH — canonical SQLite file location (used by migration scripts and
+# the SQLite init check in crud_tasks.py; also serves as the migration source
+# for scripts/migrate_to_postgres.py).
 DATABASE_PATH = (
     os.environ.get("MAESTRO_TEST_DB")
-    or os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'kanban.db')
+    or os.path.join(PROJECT_ROOT, "data", "kanban.db")
 )
+os.makedirs(os.path.dirname(os.path.abspath(DATABASE_PATH)), exist_ok=True)
 
-# Ensure data directory exists
-os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
+# MAESTRO_TEST_DB contains a raw file path (e.g. "data/test.db").
+# When set, always use SQLite regardless of the use_postgres config flag so
+# that the test suite never accidentally connects to the production database.
+_test_db_path = os.environ.get("MAESTRO_TEST_DB")
+if _test_db_path:
+    DATABASE_URL = f"sqlite:///{_test_db_path}"
+else:
+    DATABASE_URL = CFG_DATABASE_URL
 
 # Create database engine
-engine = create_engine(f"sqlite:///{DATABASE_PATH}", echo=False)
-
-
-@event.listens_for(engine, "connect")
-def set_sqlite_pragma(dbapi_connection, connection_record):
-    cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.execute("PRAGMA journal_mode=WAL")
-    cursor.close()
+if DATABASE_URL.startswith("sqlite"):
+    # SQLite configuration with 30s busy timeout
+    engine = create_engine(
+        DATABASE_URL,
+        echo=False,
+        connect_args={"timeout": 30}
+    )
+    
+    @event.listens_for(engine, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+else:
+    # PostgreSQL configuration (uses default connection pooling)
+    engine = create_engine(
+        DATABASE_URL,
+        echo=False,
+        pool_size=10,
+        max_overflow=20,
+        pool_pre_ping=True
+    )
 
 
 # Create session factory
@@ -60,4 +81,4 @@ def init_db_tables():
     # hasn't been imported yet by the caller.
     from . import models  # noqa: F401
     Base.metadata.create_all(bind=engine)
-    logger.info("Database tables initialized at: %s", DATABASE_PATH)
+    logger.info("Database tables initialized: %s", DATABASE_URL)

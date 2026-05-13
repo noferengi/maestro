@@ -11,6 +11,7 @@ import json
 import os
 import sys
 from unittest.mock import AsyncMock, MagicMock, call, patch
+from contextlib import asynccontextmanager
 
 import httpx
 import pytest
@@ -41,7 +42,9 @@ def _mock_http_response(body: dict, status: int = 200) -> MagicMock:
     """Build a mock httpx response."""
     m = MagicMock()
     m.status_code = status
+    m.is_success = (status < 400)
     m.json.return_value = body
+    m.aread = AsyncMock()  # Must be awaitable
     if status >= 400:
         m.raise_for_status.side_effect = httpx.HTTPStatusError(
             "err", request=MagicMock(), response=m
@@ -52,9 +55,70 @@ def _mock_http_response(body: dict, status: int = 200) -> MagicMock:
 
 
 def _make_mock_client(post_return):
-    """Return a mock httpx.AsyncClient class whose POST returns post_return."""
+    """Return a mock httpx.AsyncClient class whose POST and stream return post_return (or SSE wrap)."""
     mock_instance = AsyncMock()
     mock_instance.post = AsyncMock(return_value=post_return)
+
+    @asynccontextmanager
+    async def mock_stream(method, url, **kwargs):
+        # Record the call in post() so existing tests that check call_args still pass.
+        # Handle cases where post_return is a side_effect (exception).
+        try:
+            resp = await mock_instance.post(url, **kwargs)
+        except Exception:
+            # If post raises, stream must also raise the same exception.
+            # We don't yield here; the exception propagates up.
+            resp = await mock_instance.post(url, **kwargs)
+            yield resp # should not be reached
+            return
+
+        if not resp.is_success:
+            # Handle cases where post_return.json() fails (e.g. status 500)
+            yield resp
+            return
+
+        try:
+            full_json = resp.json()
+        except Exception:
+            yield resp
+            return
+
+        choice = full_json["choices"][0]
+        msg = choice["message"]
+        delta = {}
+        if msg.get("content"):
+            delta["content"] = msg["content"]
+        if msg.get("tool_calls"):
+            delta["tool_calls"] = [
+                {**tc, "index": i} for i, tc in enumerate(msg["tool_calls"])
+            ]
+
+        chunk = {
+            "id": full_json.get("id", "mock-id"),
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": choice.get("finish_reason", "stop")
+            }],
+            "usage": full_json.get("usage", {"prompt_tokens": 0, "completion_tokens": 0})
+        }
+
+        mock_resp = MagicMock()
+        mock_resp.is_success = resp.is_success
+        mock_resp.status_code = resp.status_code
+        mock_resp.aread = AsyncMock()  # Must be awaitable
+        if not mock_resp.is_success:
+            mock_resp.raise_for_status.side_effect = resp.raise_for_status.side_effect
+
+        async def aiter_lines():
+            yield f"data: {json.dumps(chunk)}"
+            yield "data: [DONE]"
+
+        mock_resp.aiter_lines = aiter_lines
+        yield mock_resp
+
+    mock_instance.stream = mock_stream
+
     mock_cls = MagicMock()
     mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_instance)
     mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
@@ -63,9 +127,15 @@ def _make_mock_client(post_return):
 
 def _ok_body(prompt_tokens: int = 77, completion_tokens: int = 33) -> dict:
     return {
-        "choices": [{"message": {"content": "hello", "tool_calls": None}}],
-        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
-        "model": "mock-model",
+        "id": "mock-id",
+        "object": "chat.completion",
+        "choices": [{"index": 0, "message": {"content": "hello", "role": "assistant"}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens
+        },
+        "model": "omnicoder-9b",
     }
 
 
@@ -278,13 +348,8 @@ class TestHttpErrors:
         """call_llm retries on ReadTimeout; after max_retries it raises RuntimeError."""
         from app.agent.llm_client import call_llm
 
-        mock_instance = AsyncMock()
-        mock_instance.post = AsyncMock(
-            side_effect=httpx.ReadTimeout("timeout", request=MagicMock())
-        )
-        mock_cls = MagicMock()
-        mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_instance)
-        mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_cls, mock_instance = _make_mock_client(None)
+        mock_instance.post.side_effect = httpx.ReadTimeout("timeout", request=MagicMock())
 
         # max_retries=1 caps the loop; asyncio.sleep is mocked to skip real waits
         with patch("httpx.AsyncClient", mock_cls):
@@ -355,14 +420,14 @@ class TestSanitizeSingleBraces:
         # The final form is fully safe for llama.cpp's Jinja2 renderer.
         assert "{ [var] }" in content
 
-    def test_warning_logged_on_substitution(self):
-        """A WARNING is emitted when single-brace identifiers are escaped."""
+    def test_debug_logged_on_substitution(self):
+        """A DEBUG message is emitted when single-brace identifiers are escaped."""
         import logging
         msgs = [{"role": "user", "content": "See /api/tasks/{task_id}/status."}]
         with patch("app.agent.llm_client.logger") as mock_logger:
             self._sanitize(msgs)
-            assert mock_logger.warning.called
-            call_args = mock_logger.warning.call_args[0]
+            assert mock_logger.debug.called
+            call_args = mock_logger.debug.call_args[0]
             assert "single-brace identifier" in call_args[0].lower() or "single-brace" in call_args[0]
 
     def test_no_substitution_when_no_single_braces(self):

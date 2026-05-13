@@ -24,7 +24,9 @@ def test_create_and_get_research_job(tmp_path, monkeypatch):
     importlib.reload(db_mod)
 
     # Need at least the tables - create them
-    db_mod.Base.metadata.create_all(bind=db_mod.engine)
+    from migrations.runner import migrate as run_migrate, ConnectionWrapper
+    with db_mod.engine.begin() as _conn:
+        run_migrate(ConnectionWrapper(_conn, is_postgres=False))
 
     # Create a minimal task row first (FK)
     from datetime import datetime
@@ -66,7 +68,9 @@ def test_get_pending_research_jobs_ordering(tmp_path, monkeypatch):
     import importlib
     import app.database as db_mod
     importlib.reload(db_mod)
-    db_mod.Base.metadata.create_all(bind=db_mod.engine)
+    from migrations.runner import migrate as run_migrate, ConnectionWrapper
+    with db_mod.engine.begin() as _conn:
+        run_migrate(ConnectionWrapper(_conn, is_postgres=False))
 
     session = db_mod.SessionLocal()
     task = db_mod.Task(id="task-ord", title="T", type="idea", project="P", history=[])
@@ -91,7 +95,9 @@ def test_update_research_job(tmp_path, monkeypatch):
     import importlib
     import app.database as db_mod
     importlib.reload(db_mod)
-    db_mod.Base.metadata.create_all(bind=db_mod.engine)
+    from migrations.runner import migrate as run_migrate, ConnectionWrapper
+    with db_mod.engine.begin() as _conn:
+        run_migrate(ConnectionWrapper(_conn, is_postgres=False))
 
     session = db_mod.SessionLocal()
     task = db_mod.Task(id="task-upd", title="T", type="idea", project="P", history=[])
@@ -119,7 +125,9 @@ def test_count_pending_research_jobs(tmp_path, monkeypatch):
     import importlib
     import app.database as db_mod
     importlib.reload(db_mod)
-    db_mod.Base.metadata.create_all(bind=db_mod.engine)
+    from migrations.runner import migrate as run_migrate, ConnectionWrapper
+    with db_mod.engine.begin() as _conn:
+        run_migrate(ConnectionWrapper(_conn, is_postgres=False))
 
     session = db_mod.SessionLocal()
     task = db_mod.Task(id="task-cnt", title="T", type="idea", project="P", history=[])

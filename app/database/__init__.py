@@ -27,7 +27,7 @@ codebase continue to work without modification:
 
 Internal submodule structure:
     session.py      — engine, Base, SessionLocal, get_db, init_db_tables
-    models.py       — all 20 SQLAlchemy model classes
+    models.py       — SQLAlchemy model classes
     crud_tasks.py   — Task CRUD + history + reorder + seed + subdivision helpers
     crud_projects.py— Project CRUD + get_project_path
     crud_infra.py   — LLM + Budget CRUD
@@ -49,8 +49,10 @@ if globals().get('_initialized'):
         'app.database.crud_infra', 'app.database.crud_costs',
         'app.database.crud_pipeline', 'app.database.crud_jobs',
         'app.database.crud_files', 'app.database.crud_inbox',
-        'app.database.crud_sessions', 'app.database.crud_dreamer',
+        'app.database.crud_sessions',
+        'app.database.crud_maestro',
         'app.database.crud_survey', 'app.database.crud_clarification',
+        'app.database.crud_settings',
         ]:  # NOTE: keep this list in sync with the from-imports below
 
         if _sub in _sys.modules:
@@ -96,10 +98,13 @@ from .models import (
     FileSummary,
     SearchCache,
     InboxMessage,
-    DreamerRun,
+    MaestroRun,
+    ProjectDecision,
+    TaskSessionState,
     ScopeSummary,
     ScopeSurveyJob,
     IntakeDraft,
+    ToolBugReport,
 )
 
 # Task CRUD + seeding + helpers
@@ -282,12 +287,17 @@ from .crud_sessions import (
     mark_tool_bug_reports_viewed,
 )
 
-# Dreamer run tracking
-from .crud_dreamer import (
-    create_dreamer_run,
-    update_dreamer_run,
-    get_dreamer_runs,
-    get_dreamer_run,
+# Maestro run tracking + decisions + session state
+from .crud_maestro import (
+    create_maestro_run,
+    update_maestro_run,
+    get_maestro_runs,
+    get_maestro_run,
+    get_project_decisions,
+    upsert_project_decision,
+    save_task_session_state,
+    get_task_session_state,
+    delete_task_session_state,
 )
 
 # Intake clarification drafts
@@ -311,6 +321,13 @@ from .crud_survey import (
     get_scope_survey_page_jobs,
 )
 
+# Global system settings
+from .crud_settings import (
+    get_system_setting,
+    set_system_setting,
+    get_all_system_settings,
+)
+
 __all__ = [
     # session
     "DATABASE_PATH", "engine", "SessionLocal", "Base", "get_db", "init_db_tables",
@@ -319,14 +336,11 @@ __all__ = [
     "TransitionVote", "TransitionResult", "SubdivisionRecord",
     "PlanningResult", "ComponentResult", "OptimizationResult",
     "SecurityReviewResult", "FinalReviewResult", "MergeRecord", "PerformanceImprovementPlan",
-    "PipVerification",
-    "PipResolutionJob",
+    "PipVerification", "PipResolutionJob",
     "ResearchJob", "FileSummaryJob", "OptimizationBenchmark", "ArchGenJob",
-    "AgentSession",
-    "FileSummary", "SearchCache", "InboxMessage",
-    "DreamerRun",
-    "ScopeSummary", "ScopeSurveyJob",
-    "IntakeDraft",
+    "AgentSession", "FileSummary", "SearchCache", "InboxMessage",
+    "MaestroRun", "ProjectDecision", "TaskSessionState",
+    "ScopeSummary", "ScopeSurveyJob", "IntakeDraft", "ToolBugReport",
     # crud_tasks
     "init_db", "seed_sample_tasks", "seed_task", "seed_sample_tasks_raw",
     "create_task", "get_task", "get_tasks_by_type", "get_tasks_by_project",
@@ -341,7 +355,7 @@ __all__ = [
     "create_pip_resolution_job", "get_pending_pip_resolution_jobs",
     "get_active_pip_resolution_jobs_for_task", "update_pip_resolution_job",
     # crud_projects
-    "get_all_projects", "get_project", "get_project_path", "upsert_project", "delete_project",
+    "get_all_projects", "get_project", "get_project_path", "upsert_project", "rename_project", "delete_project",
     # crud_infra
     "get_all_llms", "get_llm", "create_llm", "update_llm", "delete_llm",
     "get_all_budgets", "get_budget", "create_budget", "update_budget", "delete_budget",
@@ -383,10 +397,13 @@ __all__ = [
     "create_inbox_message", "get_inbox_messages", "get_inbox_message",
     "mark_inbox_read", "mark_all_inbox_read", "delete_inbox_message", "count_unread_inbox",
     # crud_sessions
-    "create_agent_session", "close_agent_session", "get_agent_sessions_for_task",
+    "create_agent_session", "close_agent_session", "close_zombie_sessions", "close_zombie_sessions_for_tasks",
+    "get_agent_sessions_for_task",
     "create_tool_bug_report", "get_tool_bug_reports", "mark_tool_bug_reports_viewed",
-    # crud_dreamer
-    "create_dreamer_run", "update_dreamer_run", "get_dreamer_runs", "get_dreamer_run",
+    # crud_maestro
+    "create_maestro_run", "update_maestro_run", "get_maestro_runs", "get_maestro_run",
+    "get_project_decisions", "upsert_project_decision",
+    "save_task_session_state", "get_task_session_state", "delete_task_session_state",
     # crud_survey
     "upsert_scope_summary", "get_scope_summary", "list_scope_summaries",
     "mark_scope_stale", "enqueue_scope_survey_job",

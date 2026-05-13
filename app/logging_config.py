@@ -11,6 +11,18 @@ import logging
 import logging.handlers
 import os
 
+# Endpoints polled at high frequency by the frontend — suppress from access log
+_NOISY_PATHS = (
+    "/api/scheduler/status",
+    "/api/projects/",   # catches /api/projects/{name}/tasks auto-refresh
+)
+
+
+class _AccessLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(p in msg for p in _NOISY_PATHS)
+
 
 def configure_logging(
     level: str = "INFO",
@@ -51,3 +63,6 @@ def configure_logging(
         )
         fh.setFormatter(fmt)
         root.addHandler(fh)
+
+    # Suppress high-frequency frontend poll requests from the uvicorn access log
+    logging.getLogger("uvicorn.access").addFilter(_AccessLogFilter())

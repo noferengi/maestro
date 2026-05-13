@@ -496,7 +496,7 @@ class TestTickFiltering:
                              patch("app.agent.scheduler._dispatch_arch_gen_jobs", return_value=None), \
                              patch("app.agent.scheduler._dispatch_scope_survey_jobs", return_value=None), \
                              patch("app.agent.scheduler._dispatch_pip_resolution_jobs", return_value=None), \
-                             patch("app.agent.scheduler._dispatch_dreamer", return_value=None), \
+                             patch("app.agent.scheduler._dispatch_maestro", return_value=None), \
                              patch("app.agent.scheduler._rescue_stale_jobs", return_value=None), \
                              patch("app.agent.scheduler._run_subdivision_recovery", return_value=None), \
                              patch("app.agent.scheduler._check_and_reserve_slot", return_value=True), \

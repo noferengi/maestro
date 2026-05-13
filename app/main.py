@@ -38,9 +38,11 @@ from database import (
     Task, LLM, Budget, BudgetEntry, SubdivisionRecord, SessionLocal,
     get_all_llms, get_llm, create_llm, update_llm, delete_llm,
     get_all_budgets, get_budget, create_budget, update_budget, delete_budget,
-    ComputeNode, get_all_compute_nodes, get_compute_node,
+    get_all_compute_nodes, get_compute_node,
     create_compute_node, update_compute_node, delete_compute_node,
+    get_system_setting, set_system_setting, get_all_system_settings,
     TransitionVote, TransitionResult,
+
     create_transition_vote, get_transition_votes,
     create_transition_result, get_transition_results,
     get_budget_entries, get_budget_summary,
@@ -330,7 +332,7 @@ def _setup_worktree(task_id: str, project_path: str | None) -> tuple[str | None,
     immediately (git repo but worktree creation failed — strict isolation violation).
     Non-git projects and None project_path return (project_path, False) with no worktree.
     """
-    from app.agent.worktree import setup_task_worktree, _is_git_repo
+    from app.agent.worktree import setup_task_worktree, is_git_repo
     from app.agent.tools import set_task_git_cwd
     if not project_path:
         return project_path, False
@@ -338,7 +340,7 @@ def _setup_worktree(task_id: str, project_path: str | None) -> tuple[str | None,
     if wt:
         set_task_git_cwd(wt)
         return wt, False
-    if _is_git_repo(project_path):
+    if is_git_repo(project_path):
         logger.error("[worktree] Strict isolation violation: could not create worktree for task '%s'. Aborting.", task_id)
         return project_path, True
     set_task_git_cwd(project_path)
@@ -3348,6 +3350,7 @@ def task_to_dict(task):
         "demotion_history": getattr(task, "demotion_history", None),
         "map_x": getattr(task, "map_x", None),
         "map_y": getattr(task, "map_y", None),
+        "consultation_payload": getattr(task, "consultation_payload", None),
         "is_active": bool(getattr(task, "is_active", True)),
         "created_at": task.created_at.isoformat() if task.created_at else None,
         "updated_at": task.updated_at.isoformat() if task.updated_at else None,
@@ -3794,10 +3797,10 @@ async def get_summary_browser():
 
 
 # ============================================
-# Dreamer API Endpoints
+# Maestro API Endpoints
 # ============================================
 
-def _dreamer_run_to_dict(run) -> dict:
+def _maestro_run_to_dict(run) -> dict:
     import json as _json
     actions = []
     new_ids = []
@@ -3825,31 +3828,31 @@ def _dreamer_run_to_dict(run) -> dict:
     }
 
 
-@app.get("/api/projects/{project_name}/dreamer-runs", response_model=List[dict])
-def list_dreamer_runs(project_name: str, limit: int = 20):
-    """Return recent Dreamer run history for a project (newest first)."""
-    from app.database import get_dreamer_runs as _get_runs
+@app.get("/api/projects/{project_name}/maestro-runs", response_model=List[dict])
+def list_maestro_runs(project_name: str, limit: int = 20):
+    """Return recent Maestro run history for a project (newest first)."""
+    from app.database import get_maestro_runs as _get_runs
     project = get_project(project_name)
     if not project:
         raise HTTPException(status_code=404, detail=f"Project '{project_name}' not found")
     runs = _get_runs(project_name, limit=max(1, min(limit, 100)))
-    return [_dreamer_run_to_dict(r) for r in runs]
+    return [_maestro_run_to_dict(r) for r in runs]
 
 
-@app.get("/api/dreamer-runs/{run_id}", response_model=dict)
-def get_single_dreamer_run(run_id: int):
-    """Return a single Dreamer run by ID."""
-    from app.database import get_dreamer_run as _get_run
+@app.get("/api/maestro-runs/{run_id}", response_model=dict)
+def get_single_maestro_run(run_id: int):
+    """Return a single Maestro run by ID."""
+    from app.database import get_maestro_run as _get_run
     run = _get_run(run_id)
     if not run:
-        raise HTTPException(status_code=404, detail="Dreamer run not found")
-    return _dreamer_run_to_dict(run)
+        raise HTTPException(status_code=404, detail="Maestro run not found")
+    return _maestro_run_to_dict(run)
 
 
-@app.post("/api/projects/{project_name}/dreamer/trigger", response_model=dict)
-def trigger_dreamer(project_name: str):
-    """Manually trigger a Dreamer run for a project (bypasses stall check)."""
-    from app.agent.scheduler import _active_dreamer_projects, _active_dreamer_lock, _start_dreamer_thread
+@app.post("/api/projects/{project_name}/maestro/trigger", response_model=dict)
+def trigger_maestro(project_name: str):
+    """Manually trigger a Maestro run for a project (bypasses stall check)."""
+    from app.agent.scheduler import _active_maestro_projects, _active_maestro_lock, _start_maestro_thread
     from app.database import get_llm as _get_llm
 
     project = get_project(project_name)
@@ -3858,11 +3861,11 @@ def trigger_dreamer(project_name: str):
     if not project.llm_id or not project.budget_id:
         raise HTTPException(
             status_code=422,
-            detail="Project must have a default LLM and Budget configured to run Dreamer.",
+            detail="Project must have a default LLM and Budget configured to run Maestro.",
         )
 
-    with _active_dreamer_lock:
-        if project_name in _active_dreamer_projects:
+    with _active_maestro_lock:
+        if project_name in _active_maestro_projects:
             return {"status": "already_running", "project": project_name}
 
     llm = _get_llm(project.llm_id)
@@ -3870,7 +3873,7 @@ def trigger_dreamer(project_name: str):
         raise HTTPException(status_code=422, detail="Project LLM record not found.")
 
     llm_base_url = f"http://{llm.address}:{llm.port}/v1"
-    _start_dreamer_thread(
+    _start_maestro_thread(
         project_name=project_name,
         project_path=project.path,
         llm_id=project.llm_id,
@@ -5462,3 +5465,150 @@ def delete_inbox(msg_id: str):
     if not ok:
         raise HTTPException(status_code=404, detail=f"Inbox message '{msg_id}' not found.")
     return {"deleted": True}
+
+
+# ===========================================================================
+# Maestro Flight Control API
+# ===========================================================================
+
+@app.get("/api/maestro/{project_name}/decisions", response_model=List[dict])
+def list_project_decisions(project_name: str, only_binding: bool = False):
+    """List all architectural decisions for a project."""
+    from app.database import get_project_decisions as _get_decisions
+    decisions = _get_decisions(project_name, only_binding=only_binding)
+    return [
+        {
+            "id": d.id,
+            "topic": d.topic,
+            "decision": d.decision,
+            "rationale": d.rationale,
+            "is_binding": bool(d.is_binding),
+            "created_at": d.created_at.isoformat() if hasattr(d.created_at, "isoformat") else str(d.created_at),
+        }
+        for d in decisions
+    ]
+
+
+class DecisionCreate(BaseModel):
+    topic: str
+    decision: str
+    rationale: Optional[str] = None
+    is_binding: bool = True
+
+
+@app.post("/api/maestro/{project_name}/decisions", response_model=bool)
+def create_decision(project_name: str, data: DecisionCreate):
+    """Create or update a project decision."""
+    from app.database import upsert_project_decision as _upsert
+    return _upsert(
+        project_name=project_name,
+        topic=data.topic,
+        decision=data.decision,
+        rationale=data.rationale,
+        is_binding=data.is_binding
+    )
+
+
+@app.delete("/api/maestro/decisions/{decision_id}")
+def delete_decision(decision_id: int):
+    """Delete a project decision."""
+    from app.database.session import SessionLocal
+    from app.database.models import ProjectDecision
+    db = SessionLocal()
+    try:
+        db.query(ProjectDecision).filter(ProjectDecision.id == decision_id).delete()
+        db.commit()
+        return {"deleted": True}
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        db.close()
+
+
+class ResumeRequest(BaseModel):
+    hint: str
+
+
+@app.post("/api/tasks/{task_id}/resume", response_model=dict)
+def resume_task(task_id: str, body: ResumeRequest):
+    """Provide a steering hint to a CONSULTING task and trigger resumption."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # Update consultation_payload with the hint
+    current_payload = {}
+    if task.consultation_payload:
+        try:
+            current_payload = json.loads(task.consultation_payload)
+        except:
+            pass
+
+    current_payload["hint"] = body.hint
+    current_payload["source"] = "user"
+
+    update_task(task_id, consultation_payload=json.dumps(current_payload))
+
+    # The scheduler will pick this up on the next tick because
+    # the CONSULTATION GUARD now checks for the 'hint' field.
+
+    return {"status": "RESUME_QUEUED", "task_id": task_id, "hint": body.hint}
+
+
+# ===========================================================================
+# Global System Settings API
+# ===========================================================================
+
+@app.get("/api/system-settings", response_model=dict)
+def list_system_settings():
+    """List all global system settings."""
+    return get_all_system_settings()
+
+
+@app.get("/api/system-settings/{key}", response_model=dict)
+def read_system_setting(key: str):
+    """Read a specific system setting."""
+    value = get_system_setting(key)
+    return {"key": key, "value": value}
+
+
+@app.put("/api/system-settings/{key}", response_model=dict)
+def update_system_setting(key: str, data: dict = Body(...)):
+    """Update a specific system setting."""
+    if "value" not in data:
+        raise HTTPException(status_code=400, detail="value field is required")
+    set_system_setting(key, data["value"], data.get("description"))
+    return {"key": key, "value": data["value"], "status": "updated"}
+
+
+@app.get("/api/maestro/config", response_model=dict)
+def get_maestro_config():
+    """Get global Maestro configuration (LLM, Budget, and Autonomous modes)."""
+    from app.agent.config import MAESTRO_ENABLED
+    return {
+        "enabled": get_system_setting("maestro_enabled", MAESTRO_ENABLED),
+        "llm_id": get_system_setting("maestro_llm_id"),
+        "budget_id": get_system_setting("maestro_budget_id"),
+        "auto_steer": get_system_setting("maestro_auto_steer", False),
+        "auto_janitor": get_system_setting("maestro_auto_janitor", False),
+        "auto_merge": get_system_setting("maestro_auto_merge", False),
+    }
+
+
+@app.put("/api/maestro/config", response_model=dict)
+def update_maestro_config(data: dict = Body(...)):
+    """Update global Maestro configuration."""
+    if "enabled" in data:
+        set_system_setting("maestro_enabled", bool(data["enabled"]), "Global master switch for Maestro Orchestrator")
+    if "llm_id" in data:
+        set_system_setting("maestro_llm_id", data["llm_id"], "Global LLM ID for Maestro heartbeat and maintenance")
+    if "budget_id" in data:
+        set_system_setting("maestro_budget_id", data["budget_id"], "Global Budget ID for Maestro heartbeat and maintenance")
+    if "auto_steer" in data:
+        set_system_setting("maestro_auto_steer", bool(data["auto_steer"]), "Enable autonomous steering for CONSULTING tasks")
+    if "auto_janitor" in data:
+        set_system_setting("maestro_auto_janitor", bool(data["auto_janitor"]), "Enable autonomous tech debt identification")
+    if "auto_merge" in data:
+        set_system_setting("maestro_auto_merge", bool(data["auto_merge"]), "Enable autonomous acceptance and merging")
+    return {"status": "updated", "config": data}

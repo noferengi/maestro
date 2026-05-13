@@ -207,7 +207,7 @@ Every demotion writes a **Performance Improvement Plan** (PIP) — hard requirem
 | `[conceptual_review]` | 10-voter panel settings |
 | `[security_review]` | 3-agent veto gate |
 | `[final_review]` | 4-agent final judgment |
-| `[dreamer]` | Autonomous resurrection agent |
+| `[maestro]` | Autonomous resurrection agent |
 | `[pip]` | PIP resolution settings |
 
 All sections have sensible defaults. The system runs out-of-the-box with a local Ollama or llama.cpp instance.

@@ -12,7 +12,7 @@ Uses a context-aware "paging" strategy to handle large projects:
 
 Freshness model: before enqueuing any job, check whether a fresh
 scope_summary already exists with a matching content_hash.  If so, skip.
-This prevents the Dreamer from spinning up duplicate work on every tick.
+This prevents the Maestro from spinning up duplicate work on every tick.
 
 Content hash: SHA1 of sorted "mtime:size" tuples for each file in the scope.
 Fast (stat-only, no file reads) and sufficient for change detection.
@@ -51,7 +51,7 @@ class SurveyOrchestrator:
     All deterministic work (file counting, content hashing, strategy selection,
     job creation) happens synchronously.  LLM calls happen asynchronously in the
     scheduler's job workers.  The orchestrator can be called from:
-      - DreamerAgent (survey mode)
+      - MaestroAgent (survey mode)
       - Project prewarm endpoint
       - Future "Re-survey" button in the SummaryBrowser UI
     """
@@ -128,7 +128,7 @@ class SurveyOrchestrator:
         return result
 
     # -----------------------------------------------------------------------
-    # Read accessors (used by Dreamer tools and SummaryBrowser)
+    # Read accessors (used by Maestro tools and SummaryBrowser)
     # -----------------------------------------------------------------------
 
     def get_project_summary(self, project_name: str) -> str | None:

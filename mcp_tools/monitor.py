@@ -2,12 +2,15 @@
 
 import configparser
 import time
+import json
+import os
 from datetime import datetime, timezone
 from collections import defaultdict
 from pathlib import Path
 from .helpers import get_conn, extract_response_fields, parse_gate_checks
 
 _INI_PATH = Path(__file__).parent.parent / "maestro.ini"
+_LOG_PATH = Path(__file__).parent.parent / "logs" / "maestro.log"
 
 
 def _load_monitor_config() -> dict:
@@ -29,7 +32,7 @@ def _load_monitor_config() -> dict:
         "rapid_cycling_min_entries": _int("rapid_cycling_min_entries", 3),
         "rapid_cycling_max_prompt_cost": _int("rapid_cycling_max_prompt_cost", 700),
         "zombie_idle_minutes": _int("zombie_idle_minutes", 10),
-        "tool_call_storm_rate": _float("tool_call_storm_rate", 2.0),
+        "tool_call_storm_rate": _float("tool_call_storm_rate", 5.0),
         "tool_call_storm_min_entries": _int("tool_call_storm_min_entries", 3),
     }
 
@@ -41,13 +44,9 @@ def monitor(
     watch_task_ids: list = None,
 ) -> dict:
     """
-    Block for duration_seconds, polling the DB every poll_interval_seconds.
+    Block for duration_seconds, polling the DB and Log every poll_interval_seconds.
     Returns a diff-style report of everything that happened: new LLM calls,
-    session starts/completions, stage changes, and detected bad patterns.
-
-    Defaults are read from the [monitor] section of maestro.ini; explicit
-    parameters override them. Designed for /loop use: call once per iteration,
-    review the report, take corrective actions, then call again.
+    session starts/completions, stage changes, log errors, and detected bad patterns.
 
     pattern detection:
       rapid_cycling    — task with >= rapid_cycling_min_entries cheap calls in a sliding window
@@ -55,6 +54,8 @@ def monitor(
       zombie_session   — open session at window-end with no budget entry in last zombie_idle_minutes
       stage_thrash     — task whose type changed >=2 times in the window
       tool_call_storm  — task averaging >tool_call_storm_rate tool-call entries per minute
+      repetitive_tools — task calling the same tool with identical args multiple times
+      gate_looping     — task with multiple gate rejections in the window
     """
     cfg = _load_monitor_config()
     if duration_seconds is None:
@@ -65,6 +66,11 @@ def monitor(
     start_mono = time.monotonic()
     deadline = start_mono + duration_seconds
     start_wall = datetime.now(timezone.utc).isoformat()
+
+    # --- log watermark ---
+    log_offset = 0
+    if _LOG_PATH.exists():
+        log_offset = _LOG_PATH.stat().st_size
 
     # --- initial watermark snapshot ---
     conn = get_conn()
@@ -108,6 +114,8 @@ def monitor(
     session_starts: list[dict] = []
     session_completions: list[dict] = []
     type_changes: list[dict] = []
+    log_events: list[dict] = []
+    gate_rejections: list[dict] = []
     poll_count = 0
 
     # --- poll loop ---
@@ -120,6 +128,17 @@ def monitor(
 
         conn = get_conn()
         try:
+            # log tailing
+            if _LOG_PATH.exists():
+                with open(_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+                    f.seek(log_offset)
+                    new_lines = f.readlines()
+                    log_offset = f.tell()
+                    for line in new_lines:
+                        # Catch capacity limits, thrashing, and errors
+                        if "at capacity" in line or "thrashing" in line or "ERROR" in line or "HTTP 500" in line:
+                            log_events.append({"line": line.strip(), "time": datetime.now(timezone.utc).isoformat()})
+
             # new budget entries
             rows = conn.execute(
                 "SELECT be.id, be.task_id, be.agent_name, be.prompt_cost, "
@@ -130,9 +149,6 @@ def monitor(
                 (max_budget_id,),
             ).fetchall()
             for r in rows:
-                if project:
-                    # filter: only entries belonging to the requested project's tasks
-                    pass  # project filter applied via task_types membership check below
                 fields = extract_response_fields(r["response_data"])
                 entry = {
                     "id": r["id"],
@@ -151,7 +167,7 @@ def monitor(
             if rows:
                 max_budget_id = rows[-1]["id"]
 
-            # session completions: sessions that were open and closed DURING this window
+            # session completions
             closed_ids = list(open_sessions.keys())
             if closed_ids:
                 placeholders = ",".join("?" * len(closed_ids))
@@ -215,15 +231,58 @@ def monitor(
                     })
                 task_types[tid] = (r["title"], new_type)
 
+            # gate rejections
+            for r in conn.execute(
+                "SELECT task_id, transition, outcome, created_at FROM transition_results "
+                "WHERE created_at >= ? AND outcome='rejected'",
+                (start_wall,),
+            ).fetchall():
+                if project and r["task_id"] not in task_types:
+                    continue
+                gate_rejections.append(dict(r))
+
         finally:
             conn.close()
 
     end_wall = datetime.now(timezone.utc).isoformat()
 
-    # --- end-state stuck detection ---
-    stuck_candidates: list[dict] = []
+    # --- background job check ---
+    stuck_jobs: list[dict] = []
     conn = get_conn()
     try:
+        # Check research, file_summary, and arch_gen jobs
+        for table in ["research_jobs", "file_summary_jobs", "arch_gen_jobs"]:
+            try:
+                for r in conn.execute(
+                    f"SELECT id, status, created_at FROM {table} WHERE status = 'running'"
+                ).fetchall():
+                    created_at = r["created_at"]
+                    # If older than zombie threshold
+                    try:
+                        last_dt = datetime.fromisoformat(created_at.replace(" ", "T"))
+                        if last_dt.tzinfo is None:
+                            last_dt = last_dt.replace(tzinfo=timezone.utc)
+                        idle_min = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
+                        if idle_min > cfg["zombie_idle_minutes"]:
+                            stuck_jobs.append({
+                                "table": table,
+                                "id": r["id"],
+                                "idle_minutes": round(idle_min, 1),
+                                "created_at": created_at
+                            })
+                    except Exception:
+                        pass
+            except Exception:
+                pass # Table might not exist or schema differs
+    finally:
+        conn.close()
+
+    # --- end-state stuck detection ---
+    stuck_candidates: list[dict] = []
+    stagnant_tasks: list[dict] = []
+    conn = get_conn()
+    try:
+        # 1. Zombie Sessions (no activity in open session)
         for tid, info in open_sessions.items():
             row = conn.execute(
                 "SELECT created_at FROM budget_entries WHERE task_id=? ORDER BY id DESC LIMIT 1",
@@ -246,18 +305,55 @@ def monitor(
                         })
                 except Exception:
                     pass
+
+        # 2. Stagnant Tasks (in same stage for > 24h)
+        for tid, (title, ttype) in task_types.items():
+            if ttype in ("completed", "accepted", "cancelled"):
+                continue
+            # Check last transition_result or history entry for this task
+            row = conn.execute(
+                "SELECT created_at FROM transition_results WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                (tid,)
+            ).fetchone()
+            if row:
+                try:
+                    ts = datetime.fromisoformat(row["created_at"].replace(" ", "T"))
+                    if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
+                    age_h = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+                    if age_h > 24:
+                        stagnant_tasks.append({
+                            "task_id": tid, "title": title, "type": ttype,
+                            "age_hours": round(age_h, 1), "note": "stagnant stage"
+                        })
+                except Exception: pass
+
+        # 3. Merge & Subdivision Failures
+        merge_fails = conn.execute(
+            "SELECT task_id, status, error_detail, created_at FROM merge_records "
+            "WHERE created_at >= ? AND status NOT IN ('merged', 'virtual_passed')",
+            (start_wall,)
+        ).fetchall()
+        
+        subdiv_fails = conn.execute(
+            "SELECT parent_task_id, status, created_at FROM subdivision_records "
+            "WHERE created_at >= ? AND status = 'failed'",
+            (start_wall,)
+        ).fetchall()
+
     finally:
         conn.close()
 
     # --- pattern analysis ---
-    patterns = _analyze_patterns(new_budget_entries, open_sessions, type_changes, cfg)
+    patterns = _analyze_patterns(new_budget_entries, open_sessions, type_changes, gate_rejections, cfg)
 
     # --- inline diagnostics for all flagged tasks ---
     flagged_ids: set[str] = set()
     for flag_list in patterns.values():
         for item in flag_list:
-            if "task_id" in item:
+            if isinstance(item, dict) and "task_id" in item:
                 flagged_ids.add(item["task_id"])
+    for f in merge_fails: flagged_ids.add(f["task_id"])
+    for f in subdiv_fails: flagged_ids.add(f["parent_task_id"])
 
     inline_diagnostics: dict[str, dict] = {}
     if flagged_ids:
@@ -275,9 +371,19 @@ def monitor(
     if session_starts:
         parts.append(f"{len(session_starts)} session start(s)")
     if stuck_candidates:
-        parts.append(f"{len(stuck_candidates)} stuck")
+        parts.append(f"{len(stuck_candidates)} stuck tasks")
+    if stagnant_tasks:
+        parts.append(f"{len(stagnant_tasks)} stagnant tasks")
+    if stuck_jobs:
+        parts.append(f"{len(stuck_jobs)} stuck background jobs")
+    if merge_fails:
+        parts.append(f"{len(merge_fails)} merge fail(s)")
+    if subdiv_fails:
+        parts.append(f"{len(subdiv_fails)} subdivision fail(s)")
     if type_changes:
         parts.append(f"{len(type_changes)} stage change(s)")
+    if log_events:
+        parts.append(f"{len(log_events)} log alert(s)")
     flagged = sum(len(v) for v in patterns.values())
     if flagged:
         parts.append(f"{flagged} pattern flag(s)")
@@ -294,11 +400,16 @@ def monitor(
         "session_starts": session_starts,
         "session_completions": session_completions,
         "type_changes": type_changes,
+        "log_alerts": log_events,
+        "stuck_jobs": stuck_jobs,
+        "merge_failures": [dict(f) for f in merge_fails],
+        "subdivision_failures": [dict(f) for f in subdiv_fails],
         "end_state": {
             "open_sessions": [
                 {"task_id": tid, **info} for tid, info in open_sessions.items()
             ],
             "stuck_candidates": stuck_candidates,
+            "stagnant_tasks": stagnant_tasks,
         },
         "patterns": patterns,
         "inline_diagnostics": inline_diagnostics,
@@ -348,6 +459,7 @@ def _analyze_patterns(
     entries: list[dict],
     open_sessions: dict,
     type_changes: list[dict],
+    gate_rejections: list[dict],
     cfg: dict,
 ) -> dict:
     by_task: dict[str, list[dict]] = defaultdict(list)
@@ -358,6 +470,8 @@ def _analyze_patterns(
     rapid_cycling: list[dict] = []
     token_limited: list[dict] = []
     tool_call_storms: list[dict] = []
+    repetitive_tools: list[dict] = []
+    gate_looping: list[dict] = []
 
     rc_window = cfg["rapid_cycling_window_seconds"]
     rc_min = cfg["rapid_cycling_min_entries"]
@@ -378,21 +492,50 @@ def _analyze_patterns(
                     "created_at": e["created_at"],
                 })
 
+        # repetitive_tools: calling same tool + same args multiple times
+        tool_counts: dict[str, int] = defaultdict(int)
+        for e in task_entries:
+            tc_str = e.get("tool_calls")
+            if tc_str:
+                tool_counts[tc_str] += 1
+        
+        for tc_str, count in tool_counts.items():
+            if count >= 3:
+                try:
+                    # Try to get a friendly label for the tool
+                    calls = json.loads(tc_str)
+                    if calls and isinstance(calls, list):
+                        call = calls[0]
+                        tool_name = call.get("function", {}).get("name", "unknown")
+                        repetitive_tools.append({
+                            "task_id": tid, "title": title,
+                            "tool": tool_name, "count": count,
+                            "args_preview": str(call.get("function", {}).get("arguments", ""))[:100]
+                        })
+                except Exception:
+                    pass
+
         # rapid_cycling: >= rc_min cheap entries in any rc_window seconds
         cheap = [e for e in task_entries if (e.get("prompt_cost") or 0) < rc_max_cost]
         if len(cheap) >= rc_min:
             try:
                 cheap_sorted = sorted(
                     cheap,
-                    key=lambda e: datetime.fromisoformat(e["created_at"].replace(" ", "T")),
+                    key=lambda e: datetime.fromisoformat(e["created_at"].replace("T", " ")) # Fixed ISO format
                 )
+                # Helper to parse created_at consistently
+                def parse_ts(ts_str):
+                    try:
+                        dt = datetime.fromisoformat(ts_str.replace(" ", "T"))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        return dt
+                    except:
+                        return datetime.now(timezone.utc)
+
                 for i in range(len(cheap_sorted) - (rc_min - 1)):
-                    t0 = datetime.fromisoformat(cheap_sorted[i]["created_at"].replace(" ", "T"))
-                    tn = datetime.fromisoformat(cheap_sorted[i + rc_min - 1]["created_at"].replace(" ", "T"))
-                    if t0.tzinfo is None:
-                        t0 = t0.replace(tzinfo=timezone.utc)
-                    if tn.tzinfo is None:
-                        tn = tn.replace(tzinfo=timezone.utc)
+                    t0 = parse_ts(cheap_sorted[i]["created_at"])
+                    tn = parse_ts(cheap_sorted[i + rc_min - 1]["created_at"])
                     span = (tn - t0).total_seconds()
                     if span <= rc_window:
                         rapid_cycling.append({
@@ -408,10 +551,16 @@ def _analyze_patterns(
         tc_entries = [e for e in task_entries if e.get("has_tool_calls")]
         if len(tc_entries) >= storm_min:
             try:
-                times = sorted(
-                    datetime.fromisoformat(e["created_at"].replace(" ", "T"))
-                    for e in tc_entries
-                )
+                def parse_ts(ts_str):
+                    try:
+                        dt = datetime.fromisoformat(ts_str.replace(" ", "T"))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        return dt
+                    except:
+                        return datetime.now(timezone.utc)
+
+                times = sorted(parse_ts(e["created_at"]) for e in tc_entries)
                 span_min = max((times[-1] - times[0]).total_seconds() / 60, 0.5)
                 rate = len(tc_entries) / span_min
                 if rate > storm_rate:
@@ -422,6 +571,14 @@ def _analyze_patterns(
                     })
             except Exception:
                 pass
+
+    # gate_looping: multiple rejections in this window
+    rejection_counts = defaultdict(int)
+    for gr in gate_rejections:
+        rejection_counts[gr["task_id"]] += 1
+    for tid, count in rejection_counts.items():
+        if count >= 2:
+            gate_looping.append({"task_id": tid, "rejections": count})
 
     # stage_thrash: type changed >=2 times
     thrash_counts: dict[str, list] = defaultdict(list)
@@ -446,4 +603,6 @@ def _analyze_patterns(
         "zombie_sessions": zombie_sessions,
         "stage_thrash": stage_thrash,
         "tool_call_storms": tool_call_storms,
+        "repetitive_tools": repetitive_tools,
+        "gate_looping": gate_looping,
     }

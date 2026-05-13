@@ -15,6 +15,7 @@ import logging
 
 from .session import SessionLocal
 from .models import Project
+from app.utils import normalize_path
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,8 @@ def upsert_project(
     """
     db = SessionLocal()
     try:
+        if path is not None and path is not ...:
+            path = normalize_path(path)
         existing = db.query(Project).filter(Project.name == name).first()
         if existing:
             if path is not None:
@@ -108,7 +111,7 @@ def upsert_project(
 def rename_project(old_name: str, new_name: str) -> "Project | None":
     """
     Rename a project and cascade the name change to all tables that store it
-    as a plain string (DreamerRun, ScopeSummary, ScopeSurveyJob).
+    as a plain string (MaestroRun, ScopeSummary, ScopeSurveyJob).
     Tasks are unaffected — they reference projects via project_id FK.
     Returns the updated Project, or None on failure.
     """
@@ -121,8 +124,8 @@ def rename_project(old_name: str, new_name: str) -> "Project | None":
             raise ValueError(f"A project named '{new_name}' already exists.")
         project.name = new_name
         # Cascade to string-keyed tables
-        from .models import DreamerRun, ScopeSummary, ScopeSurveyJob
-        db.query(DreamerRun).filter(DreamerRun.project_name == old_name).update(
+        from .models import MaestroRun, ScopeSummary, ScopeSurveyJob
+        db.query(MaestroRun).filter(MaestroRun.project_name == old_name).update(
             {"project_name": new_name}, synchronize_session=False
         )
         db.query(ScopeSummary).filter(ScopeSummary.project_name == old_name).update(

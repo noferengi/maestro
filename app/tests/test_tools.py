@@ -215,7 +215,7 @@ class TestAllowlistSanity:
             SUBDIVISION_PLANNING_TOOLS,
             CONCEPTUAL_REVIEW_REVIEWER_TOOLS,
             OPTIMIZATION_REVIEWER_TOOLS,
-            DREAMER_SURVEY_TOOLS,
+            MAESTRO_SURVEY_TOOLS,
         )
         all_lists = {
             "RESEARCH_AGENT_TOOLS": RESEARCH_AGENT_TOOLS,
@@ -227,7 +227,7 @@ class TestAllowlistSanity:
             "SUBDIVISION_PLANNING_TOOLS": SUBDIVISION_PLANNING_TOOLS,
             "CONCEPTUAL_REVIEW_REVIEWER_TOOLS": CONCEPTUAL_REVIEW_REVIEWER_TOOLS,
             "OPTIMIZATION_REVIEWER_TOOLS": OPTIMIZATION_REVIEWER_TOOLS,
-            "DREAMER_SURVEY_TOOLS": DREAMER_SURVEY_TOOLS,
+            "MAESTRO_SURVEY_TOOLS": MAESTRO_SURVEY_TOOLS,
         }
         missing: dict[str, list[str]] = {}
         for list_name, tools in all_lists.items():

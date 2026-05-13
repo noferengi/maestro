@@ -45,6 +45,7 @@ from app.agent.llm_client import call_llm, is_shutting_down, ShutdownError, Pipe
 from app.database import get_project_path
 from app.agent.verdicts import Verdict
 from app.agent.tools import build_tool_schemas, dispatch_tool
+from app.utils import normalize_path
 
 logger = logging.getLogger(__name__)
 AGENT_NAME = "Intake Pipeline"
@@ -632,7 +633,7 @@ class IntakePipeline:
             from app.agent.static_analysis import analyze_project, generate_vote
 
             # Get the project root for this task - MUST be configured
-            project_root = get_project_path(self.project)
+            project_root = normalize_path(get_project_path(self.project))
             if not project_root:
                 raise ValueError(
                     f"Project '{self.project}' has no configured path. "
@@ -650,15 +651,50 @@ class IntakePipeline:
                 "completion_tokens": 0,
                 "model": "static_analysis",
             }
+            from app.agent.worktree import is_git_repo, ensure_project_ready
+            
+            # Ensure the project directory exists
             if not os.path.exists(project_root):
-                msg = (
-                    f"WARNING: The project directory '{project_root}' does not exist on disk. "
-                    "There are no files to analyze — this is a brand-new or misconfigured project. "
-                    "Feasibility cannot be assessed from codebase evidence."
-                )
-                return {**_STATIC_SKIP,
+                try:
+                    os.makedirs(project_root, exist_ok=True)
+                    logger.info("Created missing project directory: %s", project_root)
+                except OSError as exc:
+                    msg = f"ERROR: Could not create project directory '{project_root}': {exc}"
+                    return {
+                        "stage": "static_analysis",
+                        "verdict": VERDICT_REJECTED,
+                        "confidence": 1.0,
                         "justification": msg,
-                        "static_summary_override": msg}
+                        "raw_response": None,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "model": "static_analysis",
+                        "static_summary_override": msg
+                    }
+
+            # Automatically bootstrap Git if needed
+            if not is_git_repo(project_root):
+                logger.info("Initializing Git repository for project '%s' at '%s'", self.project, project_root)
+                if not ensure_project_ready(project_root):
+                    msg = (
+                        f"ERROR: Failed to initialize Git repository at '{project_root}'. "
+                        "Maestro requires a valid Git repository to manage task branches. "
+                        "Check filesystem permissions and Git installation."
+                    )
+                    return {
+                        "stage": "static_analysis",
+                        "verdict": VERDICT_REJECTED,
+                        "confidence": 1.0,
+                        "justification": msg,
+                        "raw_response": None,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "model": "static_analysis",
+                        "static_summary_override": msg
+                    }
+                else:
+                    # Success - static analysis can proceed (even if 0 files)
+                    pass
 
             # Collect Python files from affected areas in scope analysis
             # and fall back to analyzing all Python files in the project

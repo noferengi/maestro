@@ -743,7 +743,7 @@ function renderTasksFromDatabase() {
         tasks.forEach(task => {
             const container = document.getElementById(`tasks-${colType}`);
             if (container) {
-                const rawCard = createTaskCard(task.id, task.title, task.tags, task.owner, task.type);
+                const rawCard = createTaskCard(task);
                 const element = wrapWithPipGroup(rawCard, task);
                 container.appendChild(element);
                 cardCache[task.id] = element;
@@ -968,7 +968,7 @@ function reconcile(newTasks) {
 
         if (!cardCache[task.id]) {
             // New task — create and insert
-            const rawCard = createTaskCard(task.id, task.title, task.tags, task.owner, task.type);
+            const rawCard = createTaskCard(task);
             _applyHighlightState(rawCard, task.id);
             const element = wrapWithPipGroup(rawCard, task);
             cardCache[task.id] = element;
@@ -984,7 +984,7 @@ function reconcile(newTasks) {
             if (oldTask) {
                 columnsToSort.add(oldTask.type === 'subdividing' ? 'idea' : oldTask.type);
             }
-            const rawCard = createTaskCard(task.id, task.title, task.tags, task.owner, task.type);
+            const rawCard = createTaskCard(task);
             _applyHighlightState(rawCard, task.id);
             const newElement = wrapWithPipGroup(rawCard, task);
             if (old.parentNode) old.parentNode.replaceChild(newElement, old);
@@ -3095,29 +3095,47 @@ async function runAgentFromToolbar(taskId) {
 }
 
 function createTaskCard(id, title, tags, owner, status) {
+    let taskObj = {};
+    if (typeof id === 'object' && id !== null) {
+        taskObj = id;
+        id = taskObj.id;
+        title = taskObj.title;
+        tags = taskObj.tags;
+        owner = taskObj.owner;
+        status = taskObj.type;
+    } else {
+        taskObj = (typeof taskData !== 'undefined' ? taskData[id] : null) || {};
+        title = title || taskObj.title || '';
+        tags = tags || taskObj.tags || [];
+        owner = owner || taskObj.owner || '';
+        status = status || taskObj.type || '';
+    }
+
+    // Ensure we have an array for tags
+    const safeTags = Array.isArray(tags) ? tags : [];
+
     const card = document.createElement('div');
-    card.className = `task-card ${status}`;
+    card.className = `task-card ${status || 'idea'}`;
     card.setAttribute('data-id', id);
     card.setAttribute('data-status', status);
     card.setAttribute('draggable', 'true');
 
     // Check for rejection/processing state from transition cache
-    const cached = transitionCache[id];
-    const latestOutcome = cached && cached.history.length > 0 ? cached.history[0].outcome : null;
-    const rejectionCount = cached ? cached.rejectionCount : 0;
+    const cached = (typeof transitionCache !== 'undefined' ? transitionCache[id] : null);
+    const latestOutcome = cached && cached.history && cached.history.length > 0 ? cached.history[0].outcome : null;
+    const rejectionCount = cached ? (cached.rejectionCount || 0) : 0;
 
     if (latestOutcome === 'rejected' || latestOutcome === 'failed') {
         card.classList.add('rejected');
     }
     // If we have an active poller, card is processing
-    if (transitionPollers[id]) {
+    if (typeof transitionPollers !== 'undefined' && transitionPollers[id]) {
         card.classList.add('processing');
     }
 
-    const tagsHtml = tags.map(tag => `<span class="tag">${tag}</span>`).join('') || '<span class="tag">general</span>';
+    const tagsHtml = safeTags.map(tag => `<span class="tag">${tag}</span>`).join('') || '<span class="tag">general</span>';
     const ownerHtml = owner ? `<span>${owner}</span>` : '';
 
-    const taskObj = taskData[id] || {};
     const rejBadge = rejectionCount > 0 ? `<span class="rejection-badge" title="${rejectionCount} rejection(s)">${rejectionCount}x</span>` : '';
     const processingSpinner = transitionPollers[id] ? '<span class="processing-indicator">\u25E0</span>' : '';
 
@@ -3199,6 +3217,27 @@ function createTaskCard(id, title, tags, owner, status) {
         parentLink = `<div class="parent-link" onclick="scrollToTask('${parentId}')" title="Parent: ${parentTitle}">&#8593; ${parentTitle}</div>`;
     }
 
+    // Consultation interface
+    let consultationHtml = '';
+    if (taskObj.consultation_payload) {
+        try {
+            const cp = JSON.parse(taskObj.consultation_payload);
+            if (cp.question && !cp.hint) {
+                card.classList.add('consulting');
+                consultationHtml = `
+                    <div class="consultation-bubble" style="background:#fff3cd; border:1px solid #ffeeba; border-radius:6px; padding:0.75rem; margin-top:0.5rem; font-size:0.82rem; cursor:default" onclick="event.stopPropagation()">
+                        <div style="font-weight:bold; color:#856404; margin-bottom:0.4rem">\ud83d\udcac Maestro Consultation</div>
+                        <div style="font-style:italic; margin-bottom:0.75rem; color:#533f03">${cp.question}</div>
+                        <textarea class="consult-hint-input" style="width:100%; border:1px solid #ced4da; border-radius:4px; padding:0.4rem; font-size:0.8rem; margin-bottom:0.5rem; color:black" placeholder="Provide steering hint..." rows="2"></textarea>
+                        <div style="display:flex; justify-content:flex-end">
+                            <button class="btn btn-primary btn-sm" onclick="event.stopPropagation();resumeFromConsultation('${id}', this)" style="padding:0.2rem 0.6rem; font-size:0.75rem; height:auto; line-height:1">Resume Agent</button>
+                        </div>
+                    </div>
+                `;
+            }
+        } catch(e) {}
+    }
+
     // Prerequisite labels for zoom view
     let prereqHtml = '';
     if (currentBigIdeaFilter) {
@@ -3207,12 +3246,12 @@ function createTaskCard(id, title, tags, owner, status) {
 
     const showFooter = (status !== 'idea' && status !== 'architecture' && status !== 'subdividing' && status !== 'cancelled');
     const footerHtml = showFooter
-        ? `<div class="card-stage-footer csf-loading" id="csf-${id}" onclick="event.stopPropagation();openStageJournal('${id}')">…</div>`
+        ? `<div class="card-stage-footer csf-loading" id="csf-${id}" onclick="event.stopPropagation();openStageJournal('${id}')">\u2026</div>`
         : '';
 
     const _isStarred = Boolean((taskData[id] || {}).is_starred);
     card.innerHTML = `
-        <button class="card-highlight-btn" title="${_isStarred ? 'Unstar (remove priority boost)' : 'Star (boost scheduler priority)'}" onclick="event.stopPropagation();toggleHighlight('${id}')">${_isStarred ? '★' : '☆'}</button>
+        <button class="card-highlight-btn" title="${_isStarred ? 'Unstar (remove priority boost)' : 'Star (boost scheduler priority)'}" onclick="event.stopPropagation();toggleHighlight('${id}')">${_isStarred ? '\u2605' : '\u2606'}</button>
         ${parentLink}
         <div class="task-title"${isBigIdea ? ` onclick="zoomIntoBigIdea('${id}')" style="cursor:pointer"` : ''}>${title}${rejBadge}${processingSpinner}${subdivBadge}${bigIdeaBadge}${contractIndicator}${pipBadge}</div>
         <div class="task-meta">
@@ -3224,6 +3263,7 @@ function createTaskCard(id, title, tags, owner, status) {
         </div>
         ${pipRequirementsHtml}
         ${prereqHtml}
+        ${consultationHtml}
         ${footerHtml}
         <div class="card-job-indicator" id="ji-${id}"></div>
         <div class="card-toolbar">
@@ -6162,6 +6202,68 @@ const MAP_COLUMN_LABELS = {
     completed:         'COMPLETED MAP',
 };
 
+let mapLinkMode = { active: false, sourceId: null };
+
+function toggleMapLinkMode() {
+    mapLinkMode.active = !mapLinkMode.active;
+    mapLinkMode.sourceId = null;
+
+    const btn = document.getElementById('column-map-link-btn');
+    if (!btn) return;
+
+    if (mapLinkMode.active) {
+        btn.textContent = 'Link Mode: ON (Select Prereq)';
+        btn.classList.add('active');
+        document.getElementById('column-map-scroll-wrap').style.cursor = 'crosshair';
+        showToast('Link Mode: Select the prerequisite task first.', 'info');
+    } else {
+        btn.textContent = 'Link Mode: OFF';
+        btn.classList.remove('active');
+        document.getElementById('column-map-scroll-wrap').style.cursor = '';
+    }
+
+    // Clear any existing highlights
+    document.querySelectorAll('.map-node').forEach(n => {
+        n.style.outline = '';
+        n.style.outlineOffset = '';
+    });
+}
+
+function _handleMapNodeClick(e, id) {
+    if (!mapLinkMode.active) return;
+    
+    // Stop propagation so we don't trigger background clicks
+    e.stopPropagation();
+
+    if (!mapLinkMode.sourceId) {
+        // First click: the prerequisite
+        mapLinkMode.sourceId = id;
+        const el = document.getElementById(`map-node-${id}`);
+        if (el) {
+            el.style.outline = '4px solid #0d6efd';
+            el.style.outlineOffset = '2px';
+        }
+        const btn = document.getElementById('column-map-link-btn');
+        if (btn) btn.textContent = 'Link Mode: ON (Select Dependent)';
+        showToast('Selected prerequisite. Now click the dependent task.', 'info');
+    } else {
+        // Second click: the dependent
+        const prereqId = mapLinkMode.sourceId;
+        const dependentId = id;
+
+        if (prereqId === dependentId) {
+            showToast('Cannot link a task to itself', 'warning');
+            return;
+        }
+
+        // Association: dependentId depends on prereqId (toggle)
+        _toggleMapPrerequisite(dependentId, prereqId);
+        
+        // Turn off link mode
+        toggleMapLinkMode();
+    }
+}
+
 // Called when user clicks a column header or its whitespace.
 // Skips if the click landed on a card/button to avoid accidental triggers.
 function handleColumnClick(e, colType) {
@@ -6177,17 +6279,20 @@ function handleTasksContainerClick(e, colType) {
 
 function openColumnMap(colType, focusNodeId) {
     columnMapActive = true;
-    columnMapType = colType;
+    // Always use 'project' view to span all columns as requested, 
+    // but we can keep the title informative.
+    columnMapType = 'project'; 
     mapTransform = { x: 0, y: 0, scale: 1 };
 
     document.querySelector('.kanban-board').style.display = 'none';
     const container = document.getElementById('column-map-container');
     container.style.display = 'flex';
 
-    const label = MAP_COLUMN_LABELS[colType] || (colType.toUpperCase() + ' MAP');
+    // Global title for the 2D view
+    const label = 'PROJECT MAP (ALL COLUMNS)';
     document.getElementById('column-map-title').textContent = label;
 
-    renderColumnMap(colType);
+    renderColumnMap(columnMapType);
     setupMapInteraction();
 
     // If a specific node was requested, scroll/pan to it and pulse-highlight it
@@ -6231,6 +6336,7 @@ function _mapGetTasksForColumn(colType) {
     return allTasks.filter(t => {
         if (!t || !t.type) return false;
         if (t.type === 'cancelled') return false;
+        if (colType === 'project' || colType === 'all') return true;
         if (colType === 'idea') return t.type === 'idea' || t.type === 'subdividing';
         return t.type === colType;
     });
@@ -6254,23 +6360,23 @@ function _mapComputeLayout(tasks, colType) {
     const edges = [];
     const childrenOf = {};
 
-    if (colType === 'idea' || colType === 'architecture') {
-        tasks.forEach(t => {
-            if (t.parent_task_id && taskMap[t.parent_task_id]) {
-                edges.push({ fromId: t.parent_task_id, toId: t.id });
-                (childrenOf[t.parent_task_id] = childrenOf[t.parent_task_id] || []).push(t.id);
-            }
-        });
-    } else {
-        tasks.forEach(t => {
-            (t.prerequisites || []).forEach(prereqId => {
-                if (taskMap[prereqId]) {
+    tasks.forEach(t => {
+        // 1. Parent-child relationships (IDEAS tree)
+        if (t.parent_task_id && taskMap[t.parent_task_id]) {
+            edges.push({ fromId: t.parent_task_id, toId: t.id });
+            (childrenOf[t.parent_task_id] = childrenOf[t.parent_task_id] || []).push(t.id);
+        }
+        // 2. Prerequisite relationships (PLANNING/INDEV/etc. dependencies)
+        (t.prerequisites || []).forEach(prereqId => {
+            if (taskMap[prereqId]) {
+                // Avoid redundant edges if it's already a parent-child edge
+                if (t.parent_task_id !== prereqId) {
                     edges.push({ fromId: prereqId, toId: t.id });
                     (childrenOf[prereqId] = childrenOf[prereqId] || []).push(t.id);
                 }
-            });
+            }
         });
-    }
+    });
 
     // ── Phase 1: load saved positions ──────────────────────────────────────────
     const nodePositions = {};
@@ -6429,7 +6535,8 @@ function renderColumnMap(colType) {
 
     // Store shared map state (used by _mapRedrawArrows and drag handlers)
     _mapCurrentEdges = edges;
-    _mapCurrentColor = MAP_COLORS[colType] || '#6c757d';
+    const isGlobal = (colType === 'project' || colType === 'all');
+    _mapCurrentColor = isGlobal ? '#adb5bd' : (MAP_COLORS[colType] || '#6c757d');
     _mapOffsetX = OX;
     _mapOffsetY = OY;
     _mapCurrentNodePositions = {};
@@ -6451,10 +6558,11 @@ function renderColumnMap(colType) {
     nodes.forEach(({ id, x, y, task }) => {
         const node = document.createElement('div');
         node.id        = `map-node-${id}`;
+        const nodeColor = MAP_COLORS[task.type] || '#6c757d';
         node.className = `map-node ${task.type || ''}`;
         node.style.left           = (x + OX) + 'px';
         node.style.top            = (y + OY) + 'px';
-        node.style.borderLeftColor = _mapCurrentColor;
+        node.style.borderLeftColor = nodeColor;
 
         // Title + badges
         let badges = '';
@@ -6503,6 +6611,9 @@ function renderColumnMap(colType) {
             <div class="map-node-actions">${actionHtml}</div>`;
 
         _applyHighlightState(node, id);
+
+        // Click-to-link handler
+        node.addEventListener('click', (e) => _handleMapNodeClick(e, id));
 
         // Drag-to-reposition — mousedown on the card body (not buttons/links)
         node.addEventListener('mousedown', (e) => _mapStartNodeDrag(e, id));
@@ -6739,35 +6850,52 @@ function _mapPrereqDragEnd(event) {
     const sourceId = _mapPrereqDrag.sourceId;
     if (!sourceId || sourceId === targetId) { _mapPrereqDrag.sourceId = null; return; }
 
-    // Add target as prerequisite of source
-    _addMapPrerequisite(sourceId, targetId);
+    // Toggle target as prerequisite of source (drag-to-toggle)
+    _toggleMapPrerequisite(sourceId, targetId);
     _mapPrereqDrag.sourceId = null;
 }
 
-async function _addMapPrerequisite(taskId, prereqId) {
+async function _toggleMapPrerequisite(taskId, prereqId) {
     const task = taskData[taskId];
     if (!task) return;
 
     const existing = task.prerequisites || [];
-    if (existing.includes(prereqId)) return; // already a prereq
-
-    const updated = { ...task, prerequisites: [...existing, prereqId] };
+    const isRemoving = existing.includes(prereqId);
+    
+    let updatedPrereqs;
+    if (isRemoving) {
+        updatedPrereqs = existing.filter(id => id !== prereqId);
+    } else {
+        updatedPrereqs = [...existing, prereqId];
+    }
 
     try {
         const resp = await fetch(`${API_BASE}/tasks/${taskId}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ prerequisites: updated.prerequisites })
+            body: JSON.stringify({ prerequisites: updatedPrereqs })
         });
         if (!resp.ok) {
-            showToast('Failed to add prerequisite', 'error');
+            showToast(`Failed to ${isRemoving ? 'remove' : 'add'} prerequisite`, 'error');
             return;
         }
         const result = await resp.json();
         taskData[taskId] = result;
-        showToast(`Added prerequisite: ${taskData[prereqId]?.title?.slice(0, 30) || prereqId}`, 'success');
+        // Update allTasks cache
+        const idx = allTasks.findIndex(t => t.id === taskId);
+        if (idx !== -1) allTasks[idx] = result;
+
+        // Immediately update visual arrows in the map view
+        if (isRemoving) {
+            _mapCurrentEdges = _mapCurrentEdges.filter(e => !(e.fromId === prereqId && e.toId === taskId));
+        } else {
+            _mapCurrentEdges.push({ fromId: prereqId, toId: taskId });
+        }
+        _mapRedrawArrows();
+
+        showToast(`${isRemoving ? 'Removed' : 'Added'} prerequisite: ${taskData[prereqId]?.title?.slice(0, 30) || prereqId}`, 'success');
     } catch (err) {
-        showToast('Failed to add prerequisite: ' + err.message, 'error');
+        showToast(`Failed to ${isRemoving ? 'toggle' : 'add'} prerequisite: ` + err.message, 'error');
     }
 }
 
@@ -7295,5 +7423,210 @@ function toolbarOpenMap(taskId) {
     const task = taskData[taskId];
     if (!task) return;
     openColumnMap(task.type, taskId);
+}
+
+
+// ============================================
+// Maestro Flight Control
+// ============================================
+
+async function openMaestroConfigModal() {
+    document.getElementById('maestro-config-modal').classList.add('active');
+    
+    // Populate dropdowns
+    const enabledCheck = document.getElementById('mcfg-enabled');
+    const llmSelect = document.getElementById('mcfg-llm-id');
+    const budgetSelect = document.getElementById('mcfg-budget-id');
+    const autoSteer = document.getElementById('mcfg-auto-steer');
+    const autoJanitor = document.getElementById('mcfg-auto-janitor');
+    const autoMerge = document.getElementById('mcfg-auto-merge');
+    
+    llmSelect.innerHTML = '<option value="">Loading...</option>';
+    budgetSelect.innerHTML = '<option value="">Loading...</option>';
+    
+    try {
+        const [llms, budgets, config] = await Promise.all([
+            fetch(`${API_BASE}/llms`).then(r => r.json()),
+            fetch(`${API_BASE}/budgets`).then(r => r.json()),
+            fetch(`${API_BASE}/maestro/config`).then(r => r.json())
+        ]);
+        
+        llmSelect.innerHTML = '<option value="">(select an LLM)</option>' + 
+            llms.map(l => `<option value="${l.id}">${l.model} (${l.address}:${l.port})</option>`).join('');
+            
+        budgetSelect.innerHTML = '<option value="">(select a budget)</option>' + 
+            budgets.map(b => `<option value="${b.id}">${b.name}</option>`).join('');
+            
+        enabledCheck.checked = !!config.enabled;
+        if (config.llm_id) llmSelect.value = config.llm_id;
+        if (config.budget_id) budgetSelect.value = config.budget_id;
+        
+        autoSteer.checked = !!config.auto_steer;
+        autoJanitor.checked = !!config.auto_janitor;
+        autoMerge.checked = !!config.auto_merge;
+        
+    } catch (e) {
+        showToast('Error loading Maestro configuration.', 'error');
+        llmSelect.innerHTML = '<option value="">Error loading</option>';
+        budgetSelect.innerHTML = '<option value="">Error loading</option>';
+    }
+}
+
+function closeMaestroConfigModal() {
+    document.getElementById('maestro-config-modal').classList.remove('active');
+}
+
+async function saveMaestroConfig() {
+    const enabled = document.getElementById('mcfg-enabled').checked;
+    const llmId = document.getElementById('mcfg-llm-id').value;
+    const budgetId = document.getElementById('mcfg-budget-id').value;
+    const autoSteer = document.getElementById('mcfg-auto-steer').checked;
+    const autoJanitor = document.getElementById('mcfg-auto-janitor').checked;
+    const autoMerge = document.getElementById('mcfg-auto-merge').checked;
+    
+    const data = {
+        enabled: enabled,
+        auto_steer: autoSteer,
+        auto_janitor: autoJanitor,
+        auto_merge: autoMerge
+    };
+    if (llmId) data.llm_id = parseInt(llmId);
+    if (budgetId) data.budget_id = parseInt(budgetId);
+    
+    try {
+        const resp = await fetch(`${API_BASE}/maestro/config`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+        });
+        
+        if (resp.ok) {
+            showToast('Maestro global configuration saved.', 'success');
+            closeMaestroConfigModal();
+        } else {
+            showToast('Failed to save Maestro configuration.', 'error');
+        }
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+    }
+}
+
+async function openMaestroDecisionsModal() {
+    document.getElementById('maestro-decisions-modal').classList.add('active');
+    await refreshDecisionsList();
+}
+
+function closeMaestroDecisionsModal() {
+    document.getElementById('maestro-decisions-modal').classList.remove('active');
+}
+
+async function refreshDecisionsList() {
+    const list = document.getElementById('decisions-list');
+    list.innerHTML = '<div style="padding:1rem;text-align:center">Loading decisions...</div>';
+    
+    try {
+        const resp = await fetch(`${API_BASE}/maestro/${encodeURIComponent(currentProject)}/decisions`);
+        const decisions = await resp.json();
+        
+        if (decisions.length === 0) {
+            list.innerHTML = '<div style="padding:2rem;text-align:center;color:#6c757d">No binding decisions recorded for this project.</div>';
+            return;
+        }
+        
+        list.innerHTML = decisions.map(d => `
+            <div style="padding:1rem;border-bottom:1px solid #dee2e6;display:flex">
+                <div style="flex:1">
+                    <div style="font-weight:bold;margin-bottom:0.25rem">${d.topic}</div>
+                    <div style="font-size:0.85rem">${d.decision}</div>
+                    ${d.rationale ? `<div style="font-size:0.75rem;color:#6c757d;margin-top:0.3rem">Rationale: ${d.rationale}</div>` : ''}
+                </div>
+                <button class="btn btn-sm btn-outline-danger" style="align-self:center" onclick="deleteMaestroDecision(${d.id})">Delete</button>
+            </div>
+        `).join('');
+    } catch (e) {
+        list.innerHTML = '<div style="padding:1rem;text-align:center;color:red">Error loading decisions.</div>';
+    }
+}
+
+async function addMaestroDecision() {
+    const topic = document.getElementById('dec-topic').value.trim();
+    const decision = document.getElementById('dec-content').value.trim();
+    const rationale = document.getElementById('dec-rationale').value.trim();
+    
+    if (!topic || !decision) {
+        showToast('Topic and Decision are required.', 'warning');
+        return;
+    }
+    
+    try {
+        const resp = await fetch(`${API_BASE}/maestro/${encodeURIComponent(currentProject)}/decisions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ topic, decision, rationale, is_binding: true })
+        });
+        
+        if (resp.ok) {
+            showToast('Decision added and is now BINDING.', 'success');
+            document.getElementById('dec-topic').value = '';
+            document.getElementById('dec-content').value = '';
+            document.getElementById('dec-rationale').value = '';
+            await refreshDecisionsList();
+        } else {
+            showToast('Failed to add decision.', 'error');
+        }
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+    }
+}
+
+async function deleteMaestroDecision(id) {
+    if (!confirm('Are you sure you want to delete this architectural decision?')) return;
+    
+    try {
+        const resp = await fetch(`${API_BASE}/maestro/decisions/${id}`, { method: 'DELETE' });
+        if (resp.ok) {
+            showToast('Decision deleted.', 'success');
+            await refreshDecisionsList();
+        }
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+    }
+}
+
+async function resumeFromConsultation(taskId, btn) {
+    const card = btn.closest('.task-card');
+    const hintInput = card.querySelector('.consult-hint-input');
+    const hint = hintInput.value.trim();
+    
+    if (!hint) {
+        showToast('Please provide a hint to resume the agent.', 'warning');
+        return;
+    }
+    
+    btn.disabled = true;
+    btn.textContent = 'Resuming...';
+    
+    try {
+        const resp = await fetch(`${API_BASE}/tasks/${taskId}/resume`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ hint })
+        });
+        
+        if (resp.ok) {
+            showToast('Hint sent. Agent is resuming...', 'success');
+            // The card will be refreshed by the next background poll
+            await refreshTasks();
+        } else {
+            const d = await resp.json();
+            showToast(d.detail || 'Failed to resume.', 'error');
+            btn.disabled = false;
+            btn.textContent = 'Send Hint & Resume';
+        }
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+        btn.disabled = false;
+        btn.textContent = 'Send Hint & Resume';
+    }
 }
 

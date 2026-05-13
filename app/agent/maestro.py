@@ -1,17 +1,17 @@
 """
-app/agent/dreamer.py
+app/agent/maestro.py
 --------------------
-Dreamer — autonomous project resurrection agent.
+Maestro — autonomous project orchestrator and resurrection agent.
 
 Fires when the scheduler detects a project has had no pipeline activity for
-DREAMER_STALL_TICKS consecutive ticks.  The Dreamer:
+MAESTRO_STALL_TICKS consecutive ticks.  The Maestro:
 
   1. Surveys failing / stalled tasks (pure DB — no LLM).
   2. Makes a single LLM call to generate a mutation plan (JSON).
   3. Acts: clones / mutates failing cards, creates new idea cards, queues
      research jobs for NEEDS_RESEARCH tasks.
 
-One DreamerAgent instance is created per project per stall event.  It runs
+One MaestroAgent instance is created per project per stall event.  It runs
 in its own daemon thread (spawned by the scheduler) with its own event loop.
 """
 
@@ -28,7 +28,7 @@ from typing import Any
 from app.agent.llm_client import is_shutting_down, sanitize_user_content, ShutdownError
 
 logger = logging.getLogger(__name__)
-AGENT_NAME = "Dreamer"
+AGENT_NAME = "Maestro"
 
 
 # ---------------------------------------------------------------------------
@@ -64,13 +64,16 @@ class ProjectState:
     failed: list[FailedTask]        = field(default_factory=list)
     alive_count: int = 0
     arch_context: str = ""
+    project_summary: str = ""
     # Survey-mode fields (populated even when no failures exist)
     has_files: bool = False                              # project path contains source files
+    untracked_files: list[str] = field(default_factory=list) # git untracked files in root
+    git_error: str | None = None                         # any error during git status
     deleted_tasks: list[dict] = field(default_factory=list)  # recently soft-deleted task summaries
 
 
 @dataclass
-class DreamerPlan:
+class MaestroPlan:
     tasks_to_resurrect: list[dict]   # [{task_id, new_title, new_description, reentry_stage}]
     tasks_to_research:  list[str]    # [task_id]
     new_cards:          list[dict]   # [{title, description, rationale}]
@@ -80,7 +83,7 @@ class DreamerPlan:
 # Agent
 # ---------------------------------------------------------------------------
 
-class DreamerAgent:
+class MaestroAgent:
     """Survey → Decide → Act agent for stalled projects."""
 
     def __init__(
@@ -91,6 +94,7 @@ class DreamerAgent:
         budget_id: int,
         llm_base_url: str,
         llm_model: str,
+        is_heartbeat: bool = False,
     ):
         self.project      = project_name
         self.project_path = project_path
@@ -98,6 +102,7 @@ class DreamerAgent:
         self.budget_id    = budget_id
         self.llm_base_url = llm_base_url
         self.llm_model    = llm_model
+        self.is_heartbeat = is_heartbeat
         
         from app.agent.survey_orchestrator import SurveyOrchestrator
         self.orchestrator = SurveyOrchestrator()
@@ -107,21 +112,48 @@ class DreamerAgent:
     # ------------------------------------------------------------------
 
     async def run(self) -> dict:
-        """Full Dreamer lifecycle: survey → decide → act."""
+        """Full Maestro lifecycle: survey → decide → act."""
         from app.agent.llm_client import set_llm_session_context
         set_llm_session_context(AGENT_NAME)
-        from app.database import create_dreamer_run, update_dreamer_run
+        from app.database import create_maestro_run, update_maestro_run
 
-        run = create_dreamer_run(self.project, self.llm_id, self.budget_id)
+        run = create_maestro_run(self.project, self.llm_id, self.budget_id)
         if not run:
-            logger.error("[Dreamer] Failed to create run record for '%s'.", self.project)
+            logger.error("[Maestro] Failed to create run record for '%s'.", self.project)
             return {"status": "error", "reason": "db_error"}
 
         try:
-            # Phase 1: Survey (DB only)
+            if self.is_heartbeat:
+                # HEARTBEAT MODE: System-wide health check
+                logger.info("[Maestro] Heartbeat mode: inspecting system health.")
+                from app.agent.tools import get_system_health
+                health_report = get_system_health()
+                
+                # Use a specialized decide phase for health
+                diagnosis = await self._decide_heartbeat(health_report)
+                logger.info("[Maestro] Heartbeat Report: %s", diagnosis)
+                
+                update_maestro_run(
+                    run.id,
+                    status="completed",
+                    stall_reason="heartbeat_monitor",
+                    actions_taken=[{"type": "heartbeat_report", "diagnosis": diagnosis}],
+                    new_task_ids=[],
+                )
+                return {"status": "completed", "diagnosis": diagnosis}
+
+            # Phase 0: Hygiene — clean up stale worktrees for this project
+            if self.project_path:
+                from app.agent.worktree import prune_orphaned_worktrees
+                try:
+                    prune_orphaned_worktrees([self.project_path])
+                except Exception as exc:
+                    logger.warning("[Maestro] Hygiene: prune_orphaned_worktrees failed: %s", exc)
+
+            # Phase 1: Survey (DB + fast filesystem)
             state = self._survey_project()
             logger.info(
-                "[Dreamer] '%s': %d failed, %d needs_research, %d alive, "
+                "[Maestro] '%s': %d failed, %d needs_research, %d alive, "
                 "%d deleted, has_files=%s.",
                 self.project, len(state.failed), len(state.needs_research),
                 state.alive_count, len(state.deleted_tasks), state.has_files,
@@ -131,23 +163,33 @@ class DreamerAgent:
                 # No failures to resurrect.  Enter survey mode if the project has
                 # substantive content (files or prior history) to reason about.
                 # Otherwise there is nothing to latch onto and we skip this run.
-                has_signal = state.has_files or bool(state.arch_context)
+                has_signal = state.has_files or bool(state.arch_context) or bool(state.project_summary)
                 if not has_signal:
                     logger.info(
-                        "[Dreamer] '%s': no failures and no project signal — skipping.",
+                        "[Maestro] '%s': no failures and no project signal — skipping.",
                         self.project,
                     )
-                    update_dreamer_run(run.id, status="completed",
+                    update_maestro_run(run.id, status="completed",
                                        stall_reason="no_signal",
                                        actions_taken=[], new_task_ids=[])
                     return {"status": "no_action", "reason": "no signal"}
 
                 logger.info(
-                    "[Dreamer] '%s': no failures — survey mode "
-                    "(has_files=%s, arch=%s, deleted=%d).",
+                    "[Maestro] '%s': no failures — survey mode "
+                    "(has_files=%s, arch=%s, summary=%s, deleted=%d).",
                     self.project, state.has_files,
-                    bool(state.arch_context), len(state.deleted_tasks),
+                    bool(state.arch_context), bool(state.project_summary), len(state.deleted_tasks),
                 )
+                
+                # Only enter survey mode (proposing new cards) if auto-janitor is enabled
+                from app.database import get_system_setting
+                if not get_system_setting("maestro_auto_janitor", False):
+                    logger.info("[Maestro] '%s': auto_janitor disabled — skipping survey mode.", self.project)
+                    update_maestro_run(run.id, status="completed",
+                                       stall_reason="auto_janitor_disabled",
+                                       actions_taken=[], new_task_ids=[])
+                    return {"status": "no_action", "reason": "auto_janitor disabled"}
+
                 plan = await self._decide_survey(state)
                 stall_reason = "survey"
             else:
@@ -170,7 +212,7 @@ class DreamerAgent:
             # Phase 3: Act (DB operations only)
             actions, new_task_ids = self._act(plan, state)
 
-            update_dreamer_run(
+            update_maestro_run(
                 run.id,
                 status="completed",
                 stall_reason=stall_reason,
@@ -178,24 +220,22 @@ class DreamerAgent:
                 new_task_ids=new_task_ids,
             )
             logger.info(
-                "[Dreamer] '%s' completed: %d actions, %d new tasks.",
+                "[Maestro] '%s' completed: %d actions, %d new tasks.",
                 self.project, len(actions), len(new_task_ids),
             )
             return {"status": "completed", "actions": actions, "new_task_ids": new_task_ids}
 
         except Exception as exc:
-            logger.exception("[Dreamer] '%s' run failed: %s", self.project, exc)
+            logger.exception("[Maestro] '%s' run failed: %s", self.project, exc)
             try:
-                from app.database import update_dreamer_run as _upd
+                from app.database import update_maestro_run as _upd
                 _upd(run.id, status="failed", stall_reason=str(exc)[:500])
             except Exception:
                 pass
             raise
 
     # ------------------------------------------------------------------
-    # Phase 1: Survey
-    # ------------------------------------------------------------------
-    # Phase 1.5: Research
+    # Phase 1: Research
     # ------------------------------------------------------------------
 
     async def _run_research_phase(self, state: ProjectState) -> "dict[str, str]":
@@ -205,7 +245,7 @@ class DreamerAgent:
         job fails or times out are omitted — Decide still runs; it just won't
         have that task's findings.
 
-        Dreamer threads are not tracked in the scheduler's _active_sessions, so
+        Maestro threads are not tracked in the scheduler's _active_sessions, so
         no park/unpark is needed — the scheduler sees the LLM as free and will
         dispatch research jobs normally.
         """
@@ -237,7 +277,7 @@ class DreamerAgent:
             if job:
                 jobs.append((ft.task_id, job.id))
                 logger.info(
-                    "[Dreamer] Scheduled research job %d for task '%s'.",
+                    "[Maestro] Scheduled research job %d for task '%s'.",
                     job.id, ft.task_id,
                 )
 
@@ -262,7 +302,7 @@ class DreamerAgent:
                     break
                 elapsed += remaining
             if not event.is_set():
-                logger.warning("[Dreamer] Research job %d timed out.", job_id)
+                logger.warning("[Maestro] Research job %d timed out.", job_id)
                 return task_id, ""
             result = _get_rj(job_id)
             if result and result.findings:
@@ -277,29 +317,58 @@ class DreamerAgent:
     # ------------------------------------------------------------------
 
     def _survey_project(self) -> ProjectState:
-        """Pure DB survey — no LLM calls."""
+        """Pure DB + fast filesystem survey — no heavy LLM calls."""
         import os
+        import subprocess
         from app.database import get_tasks_by_project, get_transition_results
         from app.database import get_deleted_tasks_by_project
         from app.agent.project_snapshot import build_architecture_context
+        from app.agent.tools import get_project_summary
 
         tasks = get_tasks_by_project(self.project)
         state = ProjectState(project_name=self.project)
 
+        # 1. Project Summary
+        try:
+            summary = get_project_summary(self.project)
+            if summary and "No fresh project summary" not in summary:
+                state.project_summary = summary
+        except Exception:
+            pass
+
+        # 2. Architecture Context (includes all architecture tasks)
         try:
             state.arch_context = build_architecture_context(self.project, agent_type=None)
         except Exception:
             state.arch_context = ""
 
-        # Detect whether the project path has any source files.
+        # Detect whether the project path has any source files and untracked files.
         if self.project_path and os.path.isdir(self.project_path):
             from app.agent.path_filter import walk_safe
             for _root, dirs, files in walk_safe(self.project_path):
                 if files:
                     state.has_files = True
                     break
+            
+            # Check for untracked files that might be missing from agent worktrees
+            try:
+                # Use --exclude-standard to respect .gitignore
+                res = subprocess.run(
+                    ["git", "ls-files", "--others", "--exclude-standard"],
+                    cwd=self.project_path,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if res.returncode == 0:
+                    state.untracked_files = [
+                        line.strip() for line in res.stdout.splitlines() 
+                        if line.strip() and not line.startswith(".maestro-worktrees")
+                    ]
+            except Exception as exc:
+                state.git_error = str(exc)
 
-        # Collect soft-deleted tasks so the Dreamer can reference prior intent.
+        # Collect soft-deleted tasks so the Maestro can reference prior intent.
         deleted = get_deleted_tasks_by_project(self.project, limit=15)
         for dt in deleted:
             results = get_transition_results(dt.id)
@@ -332,20 +401,36 @@ class DreamerAgent:
                 # Never processed — leave as-is; the scheduler will handle it
                 continue
 
-            # Most recent result (sort descending by created_at)
-            latest = sorted(
+            # Most recent results (sort descending by created_at)
+            sorted_results = sorted(
                 results,
                 key=lambda r: r.created_at or datetime.min,
                 reverse=True,
-            )[0]
-
+            )
+            latest = sorted_results[0]
             outcome = (latest.outcome or "").lower()
 
-            if outcome in ("passed", "accepted", "running", "aborted_infra"):
+            # Detect thrashing: 
+            # 1. High demotion count
+            # 2. Repeated rejections (e.g. 3 in a row without passing)
+            is_thrashing = False
+            if task.demotion_count and task.demotion_count >= 2:
+                is_thrashing = True
+            
+            if not is_thrashing and len(sorted_results) >= 3:
+                last_3 = [r.outcome.lower() for r in sorted_results[:3] if r.outcome]
+                if all(o in ("rejected", "failed", "error") for o in last_3):
+                    is_thrashing = True
+
+            if outcome in ("passed", "accepted", "running", "aborted_infra") and not is_thrashing:
                 state.alive_count += 1
                 continue
 
             reason = self._format_failure_reason(latest)
+            if is_thrashing:
+                dem_note = f" ({task.demotion_count} demotions)" if task.demotion_count else ""
+                reason = f"THRASHING{dem_note}. Last result: {reason}"
+
             ft = FailedTask(
                 task_id=task.id,
                 title=task.title,
@@ -354,7 +439,13 @@ class DreamerAgent:
                 failure_reason=reason,
             )
 
-            if "needs_research" in outcome:
+            if outcome == "consulting":
+                # Only handle consulting if auto-steer is enabled
+                from app.database import get_system_setting
+                if get_system_setting("maestro_auto_steer", False):
+                    state.failed.append(ft)
+                continue
+            elif "needs_research" in outcome:
                 state.needs_research.append(ft)
             else:
                 state.failed.append(ft)
@@ -391,7 +482,7 @@ class DreamerAgent:
         strategy_name: str,
         strategy_desc: str,
         research_findings: "dict[str, str] | None" = None,
-    ) -> DreamerPlan:
+    ) -> MaestroPlan:
         """Single LLM call to produce a mutation plan.
 
         ``research_findings`` maps task_id → findings string for tasks that
@@ -399,8 +490,8 @@ class DreamerAgent:
         into the failed-tasks block so the LLM has root-cause detail, not just
         symptoms.
         """
-        from app.agent.llm_client import call_llm, extract_text_response
-        from app.agent.config import DREAMER_DECIDE_MAX_TOKENS
+        from app.agent.llm_client import call_llm, extract_text_response, sanitize_user_content
+        from app.agent.config import MAESTRO_DECIDE_MAX_TOKENS
         from app.agent.tools import build_tool_schemas, dispatch_tool
 
         rf = research_findings or {}
@@ -423,8 +514,13 @@ class DreamerAgent:
         failed_block = "\n\n".join(failed_block_lines)
 
         arch_block = (
-            f"\nProject Architecture Context:\n{sanitize_user_content(state.arch_context)}\n"
+            f"\nPROJECT ARCHITECTURE & CONSTRAINTS:\n{sanitize_user_content(state.arch_context)}\n"
             if state.arch_context else ""
+        )
+        
+        summary_block = (
+            f"\nPROJECT STATUS SUMMARY:\n{sanitize_user_content(state.project_summary)}\n"
+            if state.project_summary else ""
         )
 
         # Adjust the system prompt when research findings are present
@@ -435,10 +531,38 @@ class DreamerAgent:
             if rf else ""
         )
 
+        # Heartbeat-specific guidance
+        heartbeat_intro = ""
+        if self.is_heartbeat:
+            heartbeat_intro = (
+                "\n\nCRITICAL: You are running in SYSTEM HEARTBEAT MODE. "
+                "Your primary goal is to ensure the entire Maestro server and all projects are healthy. "
+                "Inspect the log tail and system health report for infrastructure failures."
+            )
+
+        from app.database import get_system_setting
+        auto_janitor = get_system_setting("maestro_auto_janitor", False)
+        
+        janitor_guidance = ""
+        if not auto_janitor:
+            janitor_guidance = (
+                "\nNOTE: Autonomous card creation (Janitor Mode) is currently DISABLED. "
+                "Do NOT propose any 'new_cards' in your plan. Focus only on resurrecting existing tasks."
+            )
+
         system_prompt = (
-            "You are the Dreamer — an autonomous project resurrection agent.\n"
-            "Your job is to analyse stalled and failed tasks in a software project "
-            "and propose concrete actions to unblock them.\n\n"
+            "You are Maestro, the autonomous project architect and steward. "
+            "You oversee the Kanban board, ensure architectural integrity, and resolve stalls.\n\n"
+            "YOUR CONTEXT:\n"
+            f"{arch_block}"
+            f"{summary_block}"
+            f"{heartbeat_intro}\n\n"
+            "YOUR MISSION:\n"
+            "1. Analyze the failures and the project big picture.\n"
+            "2. Decide on a recovery plan: should you fix a task, subdivide it, "
+            "provide a steering hint, or trigger infrastructure remediation?\n"
+            "3. Use your tools to ACT. You can advance tasks, add history notes, "
+            "cleanup worktrees, or even restart the server if the logs show catastrophe.\n\n"
             "To submit your plan, call the submit_work tool with:\n"
             "payload={\n"
             "  \"tasks_to_resurrect\": [{\"task_id\": \"...\", \"new_title\": \"...\", \"new_description\": \"...\", \"reentry_stage\": \"idea|planning|indev\"}],\n"
@@ -447,20 +571,40 @@ class DreamerAgent:
             "}\n\n"
             "Limits: max 5 resurrections, max 3 new_cards.\n"
             "new_description must be focused and concrete — not a copy of the original."
-            f"{research_guidance}\n"
+            f"{research_guidance}"
+            f"{janitor_guidance}\n"
             "No prose after calling submit_work."
         )
+
+        git_block = ""
+        if state.untracked_files:
+            git_block = (
+                "\nWARNING: The following files are UNTRACKED in the project root. "
+                "They are EXCLUDED from agent worktrees and may cause ModuleNotFoundError or ImportError if referenced by code or tests:\n"
+                + "\n".join(f"  - {f}" for f in state.untracked_files[:10]) + "\n"
+            )
+            if len(state.untracked_files) > 10:
+                git_block += f"  (... and {len(state.untracked_files)-10} more)\n"
+            git_block += "If a task is failing due to missing files, instruct the resurrected task to add them to the repository.\n"
+        elif state.git_error:
+            git_block = f"\nWARNING: Git health check failed: {state.git_error}\n"
 
         user_msg = (
             f"Project: {self.project}\n"
             f"Mutation strategy: {strategy_name} — {strategy_desc}\n"
-            f"{arch_block}\n"
+            f"{git_block}\n"
             "Stalled / failed tasks:\n\n"
             f"{failed_block}\n"
-            "Generate the DreamerPlan now."
+            "Generate the MaestroPlan now."
         )
 
-        tool_schemas = build_tool_schemas(["submit_work"])
+        # Infrastructure tools are exclusive to Maestro
+        maestro_tools = [
+            "list_tasks", "get_task", "write_task_status", "write_task_history",
+            "get_system_health", "cleanup_ghost_worktrees", "restart_server",
+            "spawn_research_agent", "submit_work"
+        ]
+        tool_schemas = build_tool_schemas(maestro_tools)
 
         try:
             response = await call_llm(
@@ -472,8 +616,8 @@ class DreamerAgent:
                 model=self.llm_model,
                 llm_id=self.llm_id,
                 budget_id=self.budget_id,
-                max_tokens=DREAMER_DECIDE_MAX_TOKENS,
-                agent_name="Dreamer",
+                max_tokens=MAESTRO_DECIDE_MAX_TOKENS,
+                agent_name="Maestro",
                 tools=tool_schemas,
                 tool_choice="auto",
             )
@@ -489,7 +633,11 @@ class DreamerAgent:
                         json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
                     )
                     if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
-                        data = json.loads(tc_result).get("payload")
+                        try:
+                            res_json = json.loads(tc_result)
+                            data = res_json.get("payload")
+                        except:
+                            pass
                         break
             
             if data is None:
@@ -503,10 +651,10 @@ class DreamerAgent:
                 else:
                     data = {}
         except Exception as exc:
-            logger.warning("[Dreamer] LLM call failed: %s — using empty plan.", exc)
+            logger.warning("[Maestro] LLM call failed: %s — using empty plan.", exc)
             data = {}
 
-        return DreamerPlan(
+        return MaestroPlan(
             tasks_to_resurrect=data.get("tasks_to_resurrect") or [],
             tasks_to_research=data.get("tasks_to_research") or [],
             new_cards=data.get("new_cards") or [],
@@ -516,7 +664,7 @@ class DreamerAgent:
     # Phase 2b: Decide (survey mode — no failures, generate from codebase)
     # ------------------------------------------------------------------
 
-    async def _decide_survey(self, state: ProjectState) -> DreamerPlan:
+    async def _decide_survey(self, state: ProjectState) -> MaestroPlan:
         """Generate new idea cards by surveying what the project does and could do.
 
         Called when there are no failed tasks to resurrect.  The LLM receives:
@@ -528,7 +676,7 @@ class DreamerAgent:
         """
         from app.agent.llm_client import call_llm, extract_text_response
         from app.agent.json_utils import extract_json_block
-        from app.agent.config import DREAMER_DECIDE_MAX_TOKENS, DREAMER_SURVEY_TOOLS
+        from app.agent.config import MAESTRO_DECIDE_MAX_TOKENS, MAESTRO_SURVEY_TOOLS
         from app.agent.survey_orchestrator import SurveyOrchestrator
         from app.agent.tools import build_tool_schemas, async_dispatch_tool, _task_project_name, _task_git_cwd
 
@@ -540,8 +688,13 @@ class DreamerAgent:
             )
 
         arch_block = (
-            f"\nArchitecture context:\n{sanitize_user_content(state.arch_context)}\n"
+            f"\nPROJECT ARCHITECTURE & CONSTRAINTS:\n{sanitize_user_content(state.arch_context)}\n"
             if state.arch_context else ""
+        )
+        
+        summary_block = (
+            f"\nPROJECT STATUS SUMMARY:\n{sanitize_user_content(state.project_summary)}\n"
+            if state.project_summary else ""
         )
 
         deleted_block = ""
@@ -558,32 +711,31 @@ class DreamerAgent:
             )
 
         system_prompt = (
-            "You are the Dreamer — an autonomous project discovery agent.\n"
-            "A software project has no active work items.  Your job is to survey "
+            "You are Maestro, the autonomous project architect and steward.\n"
+            "A software project has no active work items. Your job is to survey "
             "its codebase and history, then propose new concrete idea cards for "
             "work that would be valuable, feasible, and not yet tracked.\n\n"
+            "YOUR CONTEXT:\n"
+            f"{arch_block}"
+            f"{summary_block}"
             "You have access to survey tools to explore the project's health and organization. "
             "Use them to understand the project before making your final proposal.\n\n"
             "To submit your new cards, call the submit_work tool with:\n"
             "payload={\"new_cards\": [{\"title\": \"...\", \"description\": \"...\", \"rationale\": \"...\"}]}\n\n"
-            "Focus on:\n"
-            "  1. Features or improvements clearly present in the codebase but untracked\n"
-            "  2. Obvious gaps or natural next steps given the project's current state\n"
-            "  3. High-value technical debt, observability, or quality work\n\n"
             "Rules:\n"
-            "  - If the project is too sparse to determine intent, output new_cards: []\n"
-            "  - new_cards descriptions must be concrete and actionable\n"
-            "  - Max 3 cards\n\n"
+            "  - Max 3 cards\n"
+            "  - Descriptions must be concrete and actionable\n\n"
             "No prose after calling submit_work."
         )
 
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": f"Project: {sanitize_user_content(self.project)}\n{arch_block}{deleted_block}\nSurvey this project and propose up to 3 new idea cards."}
+            {"role": "user",   "content": f"Project: {sanitize_user_content(self.project)}\n{deleted_block}\nSurvey this project and propose up to 3 new idea cards."}
         ]
         
-        # Include submit_work in survey tools
-        tool_schemas = build_tool_schemas(DREAMER_SURVEY_TOOLS + ["submit_work"])
+        # Include submit_work and infra tools in survey context
+        maestro_tools = list(MAESTRO_SURVEY_TOOLS) + ["submit_work", "get_system_health", "cleanup_ghost_worktrees"]
+        tool_schemas = build_tool_schemas(maestro_tools)
         
         # Set context for tools
         _task_project_name.set(self.project)
@@ -612,13 +764,13 @@ class DreamerAgent:
                     model=self.llm_model,
                     llm_id=self.llm_id,
                     budget_id=self.budget_id,
-                    max_tokens=DREAMER_DECIDE_MAX_TOKENS,
-                    agent_name="Dreamer",
+                    max_tokens=MAESTRO_DECIDE_MAX_TOKENS,
+                    agent_name="Maestro",
                     tools=tool_schemas,
                     tool_choice="auto",
                 )
             except Exception as exc:
-                logger.warning("[Dreamer] Survey LLM call failed on turn %d: %s", turn, exc)
+                logger.warning("[Maestro] Survey LLM call failed on turn %d: %s", turn, exc)
                 break
 
             msg = response.get("choices", [{}])[0].get("message", {})
@@ -643,7 +795,7 @@ class DreamerAgent:
                         try:
                             data = json.loads(result)
                             payload = data.get("payload", {})
-                            return DreamerPlan(
+                            return MaestroPlan(
                                 tasks_to_resurrect=[],
                                 tasks_to_research=[],
                                 new_cards=payload.get("new_cards") or [],
@@ -669,7 +821,7 @@ class DreamerAgent:
                     data = {}
                 
                 if data and "new_cards" in data:
-                    return DreamerPlan(
+                    return MaestroPlan(
                         tasks_to_resurrect=[],
                         tasks_to_research=[],
                         new_cards=data.get("new_cards") or [],
@@ -683,7 +835,7 @@ class DreamerAgent:
                 "content": "[SYSTEM] You must call submit_work to output your discovered cards when ready."
             })
 
-        return DreamerPlan(
+        return MaestroPlan(
             tasks_to_resurrect=[],
             tasks_to_research=[],
             new_cards=[],
@@ -695,25 +847,25 @@ class DreamerAgent:
 
     def _act(
         self,
-        plan: DreamerPlan,
+        plan: MaestroPlan,
         state: ProjectState,
     ) -> "tuple[list[dict], list[str]]":
         """Execute the plan — all DB operations, no LLM calls."""
         from app.database import get_task, create_task, create_research_job
-        from app.agent.config import DREAMER_MAX_RESURRECTIONS, DREAMER_MAX_NEW_CARDS
+        from app.agent.config import MAESTRO_MAX_RESURRECTIONS, MAESTRO_MAX_NEW_CARDS
 
         actions: list[dict] = []
         new_task_ids: list[str] = []
 
         # -- Resurrections ------------------------------------------------
-        for item in plan.tasks_to_resurrect[:DREAMER_MAX_RESURRECTIONS]:
+        for item in plan.tasks_to_resurrect[:MAESTRO_MAX_RESURRECTIONS]:
             task_id    = str(item.get("task_id", "")).strip()
             original   = get_task(task_id)
             if not original:
-                logger.warning("[Dreamer] Resurrection: task '%s' not found.", task_id)
+                logger.warning("[Maestro] Resurrection: task '%s' not found.", task_id)
                 continue
 
-            new_title = (item.get("new_title") or "").strip() or f"[Dreamer] {original.title}"
+            new_title = (item.get("new_title") or "").strip() or f"[Maestro] {original.title}"
             new_desc  = (item.get("new_description") or "").strip() or original.description or ""
             reentry   = str(item.get("reentry_stage", "idea")).strip().lower()
             if reentry not in ("idea", "planning", "indev"):
@@ -723,8 +875,8 @@ class DreamerAgent:
                 title=new_title,
                 task_type=reentry,
                 description=new_desc,
-                owner="dreamer",
-                tags=list(original.tags or []) + ["dreamer-resurrected"],
+                owner="maestro",
+                tags=list(original.tags or []) + ["maestro-resurrected"],
                 llm_id=original.llm_id or self.llm_id,
                 budget_id=original.budget_id or self.budget_id,
                 project=self.project,
@@ -739,7 +891,7 @@ class DreamerAgent:
                     "reentry_stage":    reentry,
                 })
                 logger.info(
-                    "[Dreamer] Resurrected '%s' → '%s' (stage=%s).",
+                    "[Maestro] Resurrected '%s' → '%s' (stage=%s).",
                     task_id, clone.id, reentry,
                 )
 
@@ -776,10 +928,10 @@ class DreamerAgent:
                     "task_id":  task_id,
                     "question": question[:120],
                 })
-                logger.info("[Dreamer] Queued research job for task '%s'.", task_id)
+                logger.info("[Maestro] Queued research job for task '%s'.", task_id)
 
         # -- New cards ----------------------------------------------------
-        for item in plan.new_cards[:DREAMER_MAX_NEW_CARDS]:
+        for item in plan.new_cards[:MAESTRO_MAX_NEW_CARDS]:
             title = (item.get("title") or "").strip()
             desc  = (item.get("description") or "").strip()
             if not title:
@@ -789,8 +941,8 @@ class DreamerAgent:
                 title=title,
                 task_type="idea",
                 description=desc,
-                owner="dreamer",
-                tags=["dreamer-generated"],
+                owner="maestro",
+                tags=["maestro-generated"],
                 llm_id=self.llm_id,
                 budget_id=self.budget_id,
                 project=self.project,
@@ -803,6 +955,35 @@ class DreamerAgent:
                     "title":     title,
                     "rationale": (item.get("rationale") or "")[:120],
                 })
-                logger.info("[Dreamer] Created new idea card '%s'.", title)
+                logger.info("[Maestro] Created new idea card '%s'.", title)
 
         return actions, new_task_ids
+
+    async def _decide_heartbeat(self, health_report: str) -> str:
+        """Analyze system health and return a diagnostic opinion."""
+        from app.agent.llm_client import call_llm
+        from app.agent.config import MAESTRO_DECIDE_MAX_TOKENS
+        
+        prompt = (
+            "You are the Maestro Heartbeat Monitor. You have been provided with a system health report "
+            "containing log tails, stagnant task lists, and stuck background jobs.\n\n"
+            f"HEALTH REPORT:\n{health_report}\n\n"
+            "Your job is to analyze this data and report any critical problems you notice. "
+            "Focus on infrastructure failures (LLM capacity, database errors, worker crashes) "
+            "and severe task stagnation. If everything looks healthy, say 'System Healthy'. "
+            "Otherwise, provide a concise diagnostic summary of the problems."
+        )
+        
+        try:
+            response = await call_llm(
+                messages=[{"role": "user", "content": prompt}],
+                llm_id=self.llm_id,
+                budget_id=self.budget_id,
+                base_url=self.llm_base_url,
+                model=self.llm_model,
+                max_tokens=500,
+                agent_name="MaestroHeartbeat",
+            )
+            return response.get("choices", [{}])[0].get("message", {}).get("content", "ERROR: empty heartbeat response")
+        except Exception as exc:
+            return f"ERROR: Heartbeat decision failed: {exc}"

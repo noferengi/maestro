@@ -144,6 +144,7 @@ class Task(Base):
     description_original = Column(Text, nullable=True)  # Raw user input before clarification rewrite
     acceptance_criteria = Column(Text, nullable=True)  # JSON array of strings, extracted from approved clarification draft
     last_progress_at = Column(DateTime, nullable=True, default=datetime.utcnow)
+    consultation_payload = Column(Text, nullable=True)  # JSON: {"question": "...", "hint": "...", "source": "user|maestro"}
     is_starred = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -299,6 +300,7 @@ class PlanningResult(Base):
     prompt_tokens = Column(Integer, default=0)
     completion_tokens = Column(Integer, default=0)
     status = Column(String, nullable=False, default='active')
+    correction_attempts = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     def __repr__(self):
@@ -646,7 +648,7 @@ class AgentSession(Base):
 
     exit_reason values:
         completed, max_turns, stalled, error, shutdown, passed, rejected,
-        subdivide, pip_blocked
+        subdivide, pip_blocked, consulting
 
     scheduler_reason values:
         scheduler, user_triggered
@@ -675,19 +677,36 @@ class AgentSession(Base):
         )
 
 
+class TaskSessionState(Base):
+    """Stores the serialized message history for a suspended agent loop.
+
+    Allows a task in 'CONSULTING' state to resume with its full context intact.
+    """
+    __tablename__ = "task_session_states"
+
+    task_id    = Column(String, ForeignKey("tasks.id"), primary_key=True)
+    session_id = Column(Integer, ForeignKey("agent_sessions.id"), nullable=False)
+    turn_count = Column(Integer, nullable=False)
+    messages   = Column(Text, nullable=False)   # JSON-serialized message list
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<TaskSessionState(task_id={self.task_id!r}, turns={self.turn_count})>"
+
+
 # ---------------------------------------------------------------------------
-# Dreamer run log
+# Maestro run log
 # ---------------------------------------------------------------------------
 
-class DreamerRun(Base):
-    """Audit record for a single Dreamer agent invocation.
+class MaestroRun(Base):
+    """Audit record for a single Maestro agent invocation.
 
-    Dreamer fires when a project has had no pipeline progress for
-    DREAMER_STALL_TICKS consecutive scheduler ticks.  One row per run.
+    Maestro fires when a project has had no pipeline progress for
+    MAESTRO_STALL_TICKS consecutive scheduler ticks.  One row per run.
 
     status values: running | completed | failed
     """
-    __tablename__ = "dreamer_runs"
+    __tablename__ = "maestro_runs"
 
     id           = Column(Integer, primary_key=True, autoincrement=True)
     project_name = Column(String, nullable=False)
@@ -702,9 +721,28 @@ class DreamerRun(Base):
 
     def __repr__(self):
         return (
-            f"<DreamerRun(id={self.id}, project={self.project_name!r}, "
+            f"<MaestroRun(id={self.id}, project={self.project_name!r}, "
             f"status={self.status!r})>"
         )
+
+
+class ProjectDecision(Base):
+    """Persistent architectural decisions for a project.
+
+    These are injected into agent contexts to maintain long-term consistency.
+    """
+    __tablename__ = "project_decisions"
+
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    topic      = Column(String, nullable=False)    # e.g. "caching", "database", "ui-style"
+    decision   = Column(Text, nullable=False)      # e.g. "Use Redis for all session caching"
+    rationale  = Column(Text, nullable=True)
+    is_binding = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<ProjectDecision(id={self.id}, topic={self.topic!r})>"
 
 
 # ---------------------------------------------------------------------------
@@ -848,3 +886,16 @@ class ToolBugReport(Base):
 
     def __repr__(self):
         return f"<ToolBugReport(id={self.id}, task={self.task_id!r}, tool={self.tool_name!r})>"
+
+
+class SystemSettings(Base):
+    """Global configuration settings for the entire Maestro system."""
+    __tablename__ = "system_settings"
+
+    key = Column(String, primary_key=True)
+    value = Column(JSON, nullable=True)
+    description = Column(String, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<SystemSettings(key={self.key!r}, value={self.value!r})>"

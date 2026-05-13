@@ -37,7 +37,9 @@ def test_create_and_get_optimization_benchmark(tmp_path, monkeypatch):
     import importlib
     import app.database as db_mod
     importlib.reload(db_mod)
-    db_mod.Base.metadata.create_all(bind=db_mod.engine)
+    from migrations.runner import migrate as run_migrate, ConnectionWrapper
+    with db_mod.engine.begin() as _conn:
+        run_migrate(ConnectionWrapper(_conn, is_postgres=False))
 
     session = db_mod.SessionLocal()
     parent = db_mod.Task(id="task-parent", title="Parent", type="optimization", project="P", history=[])
@@ -74,7 +76,9 @@ def test_record_benchmark_tool_success(tmp_path, monkeypatch):
     import importlib
     import app.database as db_mod
     importlib.reload(db_mod)
-    db_mod.Base.metadata.create_all(bind=db_mod.engine)
+    from migrations.runner import migrate as run_migrate, ConnectionWrapper
+    with db_mod.engine.begin() as _conn:
+        run_migrate(ConnectionWrapper(_conn, is_postgres=False))
 
     session = db_mod.SessionLocal()
     parent = db_mod.Task(id="t-p", title="P", type="optimization", project="P", history=[])
@@ -130,7 +134,9 @@ async def test_phase_implementation_creates_subtasks(tmp_path, monkeypatch):
     import importlib
     import app.database as db_mod
     importlib.reload(db_mod)
-    db_mod.Base.metadata.create_all(bind=db_mod.engine)
+    from migrations.runner import migrate as run_migrate, ConnectionWrapper
+    with db_mod.engine.begin() as _conn:
+        run_migrate(ConnectionWrapper(_conn, is_postgres=False))
 
     session = db_mod.SessionLocal()
     task = db_mod.Task(
@@ -201,7 +207,9 @@ def test_phase_implementation_prereq_deadlock_avoidance(tmp_path, monkeypatch):
     import importlib
     import app.database as db_mod
     importlib.reload(db_mod)
-    db_mod.Base.metadata.create_all(bind=db_mod.engine)
+    from migrations.runner import migrate as run_migrate, ConnectionWrapper
+    with db_mod.engine.begin() as _conn:
+        run_migrate(ConnectionWrapper(_conn, is_postgres=False))
 
     session = db_mod.SessionLocal()
     # Create a prereq task

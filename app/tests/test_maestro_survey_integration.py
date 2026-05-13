@@ -1,16 +1,16 @@
 """
-app/tests/test_dreamer_survey_integration.py
+app/tests/test_maestro_survey_integration.py
 -------------------------------------------
-Tests for DreamerAgent survey mode integration.
+Tests for MaestroAgent survey mode integration.
 """
 
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
-from app.agent.dreamer import DreamerAgent, ProjectState
+from app.agent.maestro import MaestroAgent, ProjectState
 
 @pytest.fixture
-def dreamer():
-    return DreamerAgent(
+def maestro():
+    return MaestroAgent(
         project_name="TestProj",
         project_path="/tmp/test",
         llm_id=1,
@@ -20,7 +20,7 @@ def dreamer():
     )
 
 @pytest.mark.asyncio
-async def test_decide_survey_initiates_survey(dreamer):
+async def test_decide_survey_initiates_survey(maestro):
     """Verify that _decide_survey calls SurveyOrchestrator.ensure_project_surveyed."""
     state = ProjectState(
         project_name="TestProj",
@@ -35,9 +35,9 @@ async def test_decide_survey_initiates_survey(dreamer):
          patch("app.agent.tools.async_dispatch_tool"):
 
         mock_so = mock_so_cls.return_value
-        mock_call.return_value = {"message": {"content": '{"new_cards": []}'}}
+        mock_call.return_value = {"choices": [{"message": {"content": '{"new_cards": []}'}}]}
 
-        await dreamer._decide_survey(state)
+        await maestro._decide_survey(state)
 
         # Verify ensure_project_surveyed was called
         mock_so.ensure_project_surveyed.assert_called_once_with(
@@ -45,8 +45,8 @@ async def test_decide_survey_initiates_survey(dreamer):
         )
 
 @pytest.mark.asyncio
-async def test_dreamer_uses_survey_tool(dreamer):
-    """Verify that Dreamer can call a survey tool in the loop."""
+async def test_maestro_uses_survey_tool(maestro):
+    """Verify that Maestro can call a survey tool in the loop."""
     state = ProjectState(project_name="TestProj", failed=[], arch_context="", deleted_tasks=[])
 
     # 1st turn: LLM calls get_project_summary
@@ -81,7 +81,7 @@ async def test_dreamer_uses_survey_tool(dreamer):
          patch("app.agent.tools.build_tool_schemas"), \
          patch("app.agent.tools.async_dispatch_tool", return_value="Project health is good.") as mock_dispatch:
 
-        plan = await dreamer._decide_survey(state)
+        plan = await maestro._decide_survey(state)
 
         assert len(plan.new_cards) == 1
         assert plan.new_cards[0]["title"] == "New Idea"

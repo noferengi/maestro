@@ -28,7 +28,7 @@ from app.agent.config import (
     PROJECT_ROOT,
     check_context_saturation,
 )
-from app.agent.llm_client import call_llm, is_shutting_down, sanitize_user_content, ShutdownError
+from app.agent.llm_client import call_llm, is_shutting_down, sanitize_user_content, ShutdownError, TruncatedToolCallError
 from app.agent.tools import dispatch_tool, TOOL_SCHEMAS, _assert_safe_path, build_tool_schemas, get_task_git_cwd
 
 _INDEV_TOOL_SCHEMAS: list[dict] = build_tool_schemas(INDEV_AGENT_TOOLS)
@@ -231,6 +231,7 @@ class ComponentLoop:
         self._recent_calls: collections.deque[tuple[str, str]] = collections.deque(maxlen=4)
         self._repeat_notice_count = 0
         self._context_flushes = 0  # how many times we've reset to fresh context
+        self._truncation_corrections = 0  # consecutive TruncatedToolCallError recoveries
 
     async def run(self) -> ComponentLoopResult:
         """Run the component implementation loop."""
@@ -278,6 +279,58 @@ class ComponentLoop:
                     budget_id=self.budget_id,
                     agent_name=AGENT_NAME,
                 )
+            except TruncatedToolCallError:
+                # max_tokens hit mid-tool-call: inject a correction turn so the
+                # model knows to split the write into smaller chunks and retry.
+                self._truncation_corrections += 1
+                if self._truncation_corrections > 2:
+                    # Repeated truncation: model is stuck generating the same
+                    # large call.  Flush context and let it try again from a
+                    # clean slate; if it already flushed once, give up.
+                    if self._context_flushes < 1:
+                        logger.warning(
+                            "[%s] '%s' truncation correction limit reached (%d consecutive);"
+                            " flushing context.", AGENT_NAME, self.component_name,
+                            self._truncation_corrections,
+                        )
+                        messages = [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": self._build_task_brief()},
+                        ]
+                        self._recent_calls.clear()
+                        self._truncation_corrections = 0
+                        self._context_flushes += 1
+                        continue
+                    logger.warning(
+                        "[%s] '%s' truncation correction limit reached (%d consecutive, post-flush);"
+                        " returning ERROR.", AGENT_NAME, self.component_name,
+                        self._truncation_corrections,
+                    )
+                    return ComponentLoopResult(
+                        component_name=self.component_name,
+                        status="ERROR",
+                        turns=turn + 1,
+                        error_detail=f"max_tokens truncation repeated {self._truncation_corrections} times (post-flush) — model cannot produce valid tool call JSON within token budget",
+                        prompt_tokens=self._total_prompt,
+                        completion_tokens=self._total_completion,
+                    )
+                logger.warning(
+                    "[%s] Tool call arguments truncated (max_tokens hit mid-generation,"
+                    " correction %d/2). Injecting correction message.", AGENT_NAME,
+                    self._truncation_corrections,
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "[SYSTEM] Your previous tool call was cut off: you hit the token limit "
+                        "mid-generation and the tool arguments JSON was incomplete. "
+                        "Please retry your intended action. "
+                        "If you need to write a large file, split it across multiple "
+                        "append_file() calls (each with a manageable chunk of content) "
+                        "rather than a single write_file() call with the full content."
+                    ),
+                })
+                continue
             except Exception as e:
                 consecutive_errors += 1
                 logger.warning("[%s] LLM call failed (error %d): %s", AGENT_NAME, consecutive_errors, e)
@@ -293,6 +346,7 @@ class ComponentLoop:
                 continue
 
             consecutive_errors = 0
+            self._truncation_corrections = 0
             usage = response.get("usage", {})
             prompt_tokens_this_call = usage.get("prompt_tokens", 0)
             self._total_prompt += prompt_tokens_this_call
@@ -323,20 +377,27 @@ class ComponentLoop:
 
             messages.append(msg)
 
-            # No content and no tool calls — nudge the model rather than
-            # silently looping with an empty assistant message at the tail.
-            # (An empty trailing assistant turn looks like a prefill request
-            # to thinking models and causes HTTP 400 on the next call.)
-            if not tool_calls and not content:
-                messages.append({
-                    "role": "user",
-                    "content": (
+            # No tool calls — nudge the model rather than silently looping
+            # with a trailing assistant message.  Any trailing assistant turn
+            # (empty or text-only) looks like a prefill request to thinking
+            # models (enable_thinking) and causes HTTP 400 on the next call.
+            if not tool_calls:
+                if not content:
+                    nudge = (
                         "[SYSTEM] Your last response was empty. "
                         "Please call a tool to make progress. "
                         "To finish: call submit_work(signal='ACCEPTED', summary='...'). "
                         "To abort: call submit_work(signal='REVERT_TO_DESIGN', summary='...')."
-                    ),
-                })
+                    )
+                else:
+                    nudge = (
+                        "[SYSTEM] You responded with text but did not call any tool. "
+                        "In this agent loop you must call a tool on every turn. "
+                        "To finish: call submit_work(signal='ACCEPTED', summary='...'). "
+                        "To abort: call submit_work(signal='REVERT_TO_DESIGN', summary='...'). "
+                        "To continue working: call any other tool."
+                    )
+                messages.append({"role": "user", "content": nudge})
                 continue
 
             # Dispatch tool calls
@@ -364,6 +425,20 @@ class ComponentLoop:
                                     "[component] '%s' context flush after repeated loop on %s — resetting to fresh context.",
                                     self.component_name, fn_name,
                                 )
+                                try:
+                                    from app.database import append_task_history
+                                    _test_hint = _get_test_command_hint()
+                                    append_task_history(
+                                        self.task_id,
+                                        "context_flush",
+                                        f"[ComponentLoop] '{self.component_name}': context flushed after "
+                                        f"`{fn_name}` was called identically {repeat_count}+ times. "
+                                        f"Suggested test command for this project: `{_test_hint}`. "
+                                        "Pass multiple test files via the `path` argument (space-separated), "
+                                        "not as `flags`.",
+                                    )
+                                except Exception:
+                                    pass
                                 messages = [
                                     {"role": "system", "content": system_prompt},
                                     {"role": "user", "content": self._build_task_brief()},

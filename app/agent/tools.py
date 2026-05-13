@@ -680,9 +680,13 @@ def write_file(path: str, content: str) -> str:
         with open(safe_path, "w", encoding="utf-8") as fh:
             fh.write(content)
         _invalidate_prepped_cache(safe_path)
-        _git_run(["git", "add", safe_path])
+        rc, out, err = _git_run(["git", "add", safe_path])
+        git_msg = " and staged for git."
+        if rc != 0:
+            git_msg = f" but STAGING FAILED: {err or out}"
+            
         line_count = content.count('\n') + (1 if content and not content.endswith('\n') else 0)
-        status = f"OK: wrote {line_count} lines to '{path}' and staged for git.{archived_msg}"
+        status = f"OK: wrote {line_count} lines to '{path}'{git_msg}{archived_msg}"
         if line_count <= 250:
             status += f"\n\n== NEW CONTENT: {path} ==\n{content}"
             if content and not content.endswith('\n'):
@@ -908,12 +912,16 @@ def patch_file(path: str, old_str: str, new_str: str) -> str:
     except OSError as exc:
         return f"ERROR writing '{path}': {exc}"
     _invalidate_prepped_cache(safe_path)
-    _git_run(["git", "add", safe_path])
+    rc, out, err = _git_run(["git", "add", safe_path])
+    git_msg = " Staged for git."
+    if rc != 0:
+        git_msg = f" but STAGING FAILED: {err or out}"
+        
     lines_changed = new_str.count("\n") - old_str.count("\n")
     new_end_line = start_line + new_str.count("\n")
     msg = (
         f"OK: patched '{path}' (lines {start_line}-{end_line} -> {start_line}-{new_end_line}, "
-        f"net {lines_changed:+d} lines). Staged for git."
+        f"net {lines_changed:+d} lines).{git_msg}"
     )
     patched_lines = patched.splitlines()
     ctx_start = max(0, start_line - 2)
@@ -1374,7 +1382,12 @@ def _git_run(args: list[str], cwd: str | None = None) -> tuple[int, str, str]:
         stderr = result.stderr.strip()
         logger.debug("git %s rc=%d", args[1:], rc)
         if rc != 0:
-            logger.warning("git %s failed: %s", args[1:], stderr)
+            if stderr:
+                logger.warning("git %s failed: %s", args[1:], stderr)
+            else:
+                # git outputs status messages (e.g. "nothing to commit") to stdout;
+                # empty stderr with non-zero rc is a normal outcome for some commands.
+                logger.debug("git %s exited %d (no stderr): %s", args[1:], rc, stdout[:200])
         return rc, stdout, stderr
     except Exception as exc:
         return 1, "", str(exc)
@@ -1486,13 +1499,14 @@ def write_git_branch(branch_name: str) -> str:
 
 
 def write_git_commit(message: str) -> str:
-    """[WRITE — git] Stage all tracked changes and create a commit. Permanent record — reversible only via a revert commit."""
-    _git_run(["git", "add", "-u"])
+    """[WRITE — git] Stage all changes (including untracked files) and create a commit. Permanent record — reversible only via a revert commit."""
+    _git_run(["git", "add", "-A"])
     rc, out, err = _git_run(["git", "commit", "-m", message])
     if rc != 0:
-        if "nothing to commit" in err or "nothing to commit" in out:
+        combined = (err + "\n" + out).strip()
+        if "nothing to commit" in combined:
             return "OK: nothing to commit - working tree clean."
-        return f"ERROR: git commit failed: {err}"
+        return f"ERROR: git commit failed: {combined}"
     return f"OK: committed.\n{out}"
 
 
@@ -1525,7 +1539,22 @@ def write_git_restore(path: str) -> str:
 
 
 
-def report_tool_bug(tool_name: str, trying_to: str, expected: str, actual: str) -> str:
+def consult_maestro(question: str) -> str:
+    """
+    Pause execution and consult the Maestro (or human) for guidance on a complex decision.
+    Use this when you are stuck, facing an architectural ambiguity, or repeatedly failing a test.
+    Execution will resume once a steering hint is provided.
+    """
+    import json
+    return json.dumps({
+        "__maestro_terminal__": True,
+        "signal": "CONSULT",
+        "payload": {"question": question}
+    })
+
+
+def report_tool_bug(
+tool_name: str, trying_to: str, expected: str, actual: str) -> str:
     """[DIAGNOSTIC] Report a tool malfunction to the Maestro bug tracker.
 
     Use this when a tool behaves in a way that prevents you from making progress —
@@ -1587,6 +1616,18 @@ def submit_work(signal: str, summary: str, payload: dict | None = None) -> str:
         "summary": summary,
         "payload": payload or {}
     })
+
+
+def cleanup_ghost_worktrees(project_path: str | None = None) -> dict:
+    """[INFRA] Scan all projects for orphaned/ghost git worktrees and locked directories."""
+    from mcp_tools.actions import cleanup_ghost_worktrees as _cleanup
+    return _cleanup(project_path)
+
+
+def restart_server() -> str:
+    """[INFRA] Trigger a hot-restart of the Maestro server."""
+    from mcp_tools.actions import restart_server as _restart
+    return _restart()
 
 
 # ---------------------------------------------------------------------------
@@ -2466,12 +2507,26 @@ def run_test_pytest(
     tail: int | None = None,
     grep: str | None = None,
 ) -> str:
-    """[RUN — sandbox] Run pytest. path: file or dir (default '.'). flags: extra pytest flags. Per-test timeout injected automatically. head/tail/grep filter output. No project-file mutation."""
+    """[RUN — sandbox] Run pytest. path: test file, dir, or space-separated list of test files/dirs (default '.'). flags: pytest option flags only (e.g. '-x -v'). Per-test timeout injected automatically. head/tail/grep filter output. No project-file mutation."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
-    safe_path = _validate_tool_path(path, "run_test_pytest") or "."
-    safe_flags, _rejected = _validate_flags(flags, "run_test_pytest", _PYTEST_FLAGS, _PYTEST_VALUE_FLAGS, _task_id_ctx.get())
+
+    # Support space-separated list of test paths (e.g. path="tests/test_a.py tests/test_b.py")
+    raw_paths = path.split() if path.strip() else ["."]
+    safe_paths: list[str] = []
+    rejected_paths: list[str] = []
+    for _p in raw_paths:
+        _validated = _validate_tool_path(_p, "run_test_pytest")
+        if _validated:
+            safe_paths.append(_validated)
+        else:
+            rejected_paths.append(repr(_p))
+    if not safe_paths:
+        safe_paths = ["."]
+
+    safe_flags, _rejected_flags = _validate_flags(flags, "run_test_pytest", _PYTEST_FLAGS, _PYTEST_VALUE_FLAGS, _task_id_ctx.get())
+    _rejected = _rejected_flags + rejected_paths
     _rejection_prefix = ""
     if _rejected:
         _rejection_prefix = (
@@ -2479,9 +2534,11 @@ def run_test_pytest(
             f"{', '.join(_rejected)}.\n"
             "NOTE: A per-test timeout is automatically injected — do not pass "
             "-p no:timeout, -o timeout=0, --override-ini=addopts=, or similar "
-            "timeout-disabling flags. Use --timeout=N if a longer timeout is needed.\n\n"
+            "timeout-disabling flags. Use --timeout=N if a longer timeout is needed.\n"
+            "NOTE: To run multiple test files, pass them space-separated in the path argument, "
+            "e.g. path='tests/test_a.py tests/test_b.py'.\n\n"
         )
-    args = [_venv_python(cwd), "-m", "pytest", safe_path] + safe_flags
+    args = [_venv_python(cwd), "-m", "pytest"] + safe_paths + safe_flags
     # Inject per-test timeout unless the project config already sets one.
     has_timeout = any("--timeout" in f for f in safe_flags)
     if not has_timeout:
@@ -3011,6 +3068,98 @@ def read_test_summary() -> str:
     }, indent=2)
 
 
+def get_system_health() -> str:
+    """[READ] Returns a comprehensive report on system health, including log tail, stagnant tasks, and stuck jobs."""
+    import datetime as _dt_mod
+    from app.database import SessionLocal, Task, TransitionResult, ResearchJob, FileSummaryJob, ArchGenJob
+    from sqlalchemy import func
+
+    report_lines = ["== SYSTEM HEALTH REPORT =="]
+
+    # 1. Log Tail
+    log_path = os.path.join(PROJECT_ROOT, "logs", "maestro.log")
+    if os.path.exists(log_path):
+        report_lines.append("\n-- Recent Log Entries (Last 50 lines) --")
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+                for line in lines[-50:]:
+                    report_lines.append(line.rstrip())
+        except Exception as exc:
+            report_lines.append(f"Error reading log: {exc}")
+    else:
+        report_lines.append(f"\nLog file not found at {log_path}")
+
+    # 2. Stagnant Tasks (>24h)
+    report_lines.append("\n-- Stagnant Tasks (>24h since last progress) --")
+    try:
+        db = SessionLocal()
+        try:
+            # Subquery to get latest transition per task
+            subq = (
+                db.query(TransitionResult.task_id, func.max(TransitionResult.created_at).label("max_ca"))
+                  .join(Task, Task.id == TransitionResult.task_id)
+                  .filter(Task.is_active == True)
+                  .group_by(TransitionResult.task_id)
+                  .subquery()
+            )
+            threshold = _dt_mod.datetime.now() - _dt_mod.timedelta(hours=24)
+            stagnant = db.query(Task.id, Task.title, Task.type, subq.c.max_ca)\
+                         .join(subq, subq.c.task_id == Task.id)\
+                         .filter(subq.c.max_ca < threshold)\
+                         .order_by(subq.c.max_ca.asc())\
+                         .limit(20).all()
+            if not stagnant:
+                report_lines.append("No stagnant tasks detected.")
+            for tid, title, ttype, last_at in stagnant:
+                # Handle last_at as string or datetime
+                if isinstance(last_at, str):
+                    try:
+                        last_at = _dt_mod.datetime.fromisoformat(last_at.replace(" ", "T").replace("Z", "+00:00"))
+                    except ValueError:
+                        last_at = _dt_mod.datetime.now()
+                if last_at.tzinfo is None:
+                    last_at = last_at.replace(tzinfo=_dt_mod.timezone.utc)
+                age_h = (_dt_mod.datetime.now(_dt_mod.timezone.utc) - last_at).total_seconds() / 3600
+                report_lines.append(f"  [{tid}] {title} ({ttype}) - stuck for {age_h:.1f}h")
+        finally:
+            db.close()
+    except Exception as exc:
+        report_lines.append(f"Error checking stagnant tasks: {exc}")
+
+    # 3. Stuck Jobs
+    report_lines.append("\n-- Stuck Background Jobs (running but old) --")
+    try:
+        db = SessionLocal()
+        try:
+            job_count = 0
+            now = _dt_mod.datetime.now(_dt_mod.timezone.utc)
+            for model_cls in [ResearchJob, FileSummaryJob, ArchGenJob]:
+                # 30 minute threshold for "stuck" jobs
+                threshold = _dt_mod.datetime.now() - _dt_mod.timedelta(minutes=30)
+                stuck = db.query(model_cls).filter(model_cls.status == 'running', model_cls.created_at < threshold).all()
+                for job in stuck:
+                    ca = job.created_at
+                    if isinstance(ca, str):
+                        try:
+                            ca = _dt_mod.datetime.fromisoformat(ca.replace(" ", "T").replace("Z", "+00:00"))
+                        except ValueError:
+                            ca = now
+                    if ca.tzinfo is None:
+                        ca = ca.replace(tzinfo=_dt_mod.timezone.utc)
+                    age_m = (now - ca).total_seconds() / 60
+                    report_lines.append(f"  [{model_cls.__name__}] id={job.id} task_id={getattr(job, 'task_id', 'N/A')} age={age_m:.1f}m")
+                    job_count += 1
+            if job_count == 0:
+                report_lines.append("No stuck background jobs.")
+        finally:
+            db.close()
+    except Exception as exc:
+        report_lines.append(f"Error checking background jobs: {exc}")
+
+    return "\n".join(report_lines)
+
+
 # ---------------------------------------------------------------------------
 # Tool registry + schemas
 # ---------------------------------------------------------------------------
@@ -3095,14 +3244,55 @@ TOOL_REGISTRY: dict[str, Any] = {
     # Diagnostic / terminal tools
     "report_tool_bug": report_tool_bug,
     "submit_work": submit_work,
+    "get_system_health": get_system_health,
     # Survey/project summary tools
     "get_project_summary": get_project_summary,
     "get_directory_summary": get_directory_summary,
     "get_module_summary": get_module_summary,
     "list_scope_summaries": list_scope_summaries,
+    # Infrastructure remediation tools (Maestro exclusive)
+    "cleanup_ghost_worktrees": cleanup_ghost_worktrees,
+    "restart_server": restart_server,
 }
 
 TOOL_SCHEMAS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "cleanup_ghost_worktrees",
+            "description": (
+                "[READ] Scan all projects for orphaned/ghost git worktrees and locked directories. "
+                "Use this when the system reports 'worktree lock' or 'directory busy' errors in the log tail."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "restart_server",
+            "description": (
+                "[RUN] Trigger a hot-restart of the Maestro server. Use this as a LAST RESORT "
+                "when logs indicate catastrophic failures or deep-level staleness that cannot be "
+                "resolved by killing sessions."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_system_health",
+            "description": (
+                "[READ] Returns a comprehensive report on system health, including "
+                "the log tail (last 50 lines), stagnant tasks (>24h since progress), "
+                "and stuck background jobs (running for >30m). Use this to identify "
+                "infrastructure-level issues or projects that are failing but not "
+                "triggering normal stall signals."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
     # ---- File read tools ----
     {
         "type": "function",
@@ -3747,8 +3937,8 @@ TOOL_SCHEMAS: list[dict] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File or directory to test (default: '.' for all tests)."},
-                    "flags": {"type": "string", "description": "Additional pytest flags (e.g. '-v', '-k test_foo', '--tb=short')."},
+                    "path": {"type": "string", "description": "Test target(s): a file, directory, or space-separated list of files/dirs (default: '.' for all tests). IMPORTANT: put all test paths here, not in flags. Example: 'tests/test_a.py tests/test_b.py'."},
+                    "flags": {"type": "string", "description": "Pytest option flags ONLY (e.g. '-v', '-k test_foo', '--tb=short'). Do NOT put test file paths here."},
                     "head": {"type": "integer", "description": "Return only the first N output lines."},
                     "tail": {"type": "integer", "description": "Return only the last N output lines."},
                     "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
@@ -4217,6 +4407,27 @@ TOOL_SCHEMAS: list[dict] = [
                     },
                 },
                 "required": ["tool_name", "trying_to", "expected", "actual"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "consult_maestro",
+            "description": (
+                "[RUNS] Pause execution and consult the Maestro orchestrator (or human) for guidance on a complex decision. "
+                "Use this when you are facing an architectural ambiguity, repeatedly failing a test, or unsure of the best implementation path. "
+                "Execution will be suspended until a steering hint is provided. Zero turns are lost during the pause."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The specific question or dilemma you need guidance on. Be clear and provide context.",
+                    },
+                },
+                "required": ["question"],
             },
         },
     },

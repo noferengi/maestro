@@ -16,7 +16,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markup.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-css.min.js"></script>
-    <script src="/static/kanban.js?v=65"></script>
+    <script src="/static/kanban.js?v=66"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -53,6 +53,16 @@
                 <button class="sidebar-action-btn" onclick="refreshTasks()" title="Refresh from database">
                     &#x1F504;
                 </button>
+            </div>
+        </div>
+
+        <h2 style="margin-top:1rem">Maestro Flight Control</h2>
+        <div class="project-tabs">
+            <div class="project-tab" id="maestro-config-btn" style="cursor:pointer" onclick="openMaestroConfigModal()">
+                Maestro Settings
+            </div>
+            <div class="project-tab" id="maestro-decisions-btn" style="cursor:pointer" onclick="openMaestroDecisionsModal()">
+                Decision Log
             </div>
         </div>
 
@@ -184,7 +194,11 @@
         <div id="column-map-container">
             <div id="column-map-header">
                 <span id="column-map-title">MAP VIEW</span>
-                <span id="column-map-hint">Scroll to zoom &middot; Drag to pan &middot; Click card title to edit</span>
+                <span id="column-map-hint">Scroll to zoom &middot; Drag to pan &middot; Click card title to edit &middot; Use Link Mode to set dependencies</span>
+                <div style="flex-grow: 1;"></div>
+                <button id="column-map-link-btn" onclick="toggleMapLinkMode()" title="Click to start linking mode. Select Prerequisite then Dependent to add or remove a link (toggle).">
+                    Link Mode: OFF
+                </button>
                 <button id="column-map-back-btn" onclick="closeColumnMap()">&#8592; Back to Board</button>
             </div>
             <div id="column-map-scroll-wrap">
@@ -969,6 +983,110 @@
                 </div>
                 <!-- Right: chat log -->
                 <div class="ms-right-panel" id="ms-chat-log"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Maestro Config Modal -->
+    <div class="modal-overlay" id="maestro-config-modal">
+        <div class="modal" style="width:520px">
+            <div class="modal-header">
+                <h2 class="modal-title">Maestro Settings</h2>
+                <button class="close-btn" onclick="closeMaestroConfigModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label" style="display:flex;align-items:center;cursor:pointer;font-weight:bold;margin-bottom:1rem">
+                        <input type="checkbox" id="mcfg-enabled" style="width:auto;margin-right:0.5rem">
+                        Enable Maestro Orchestrator
+                    </label>
+                    <div style="font-size:0.75rem;color:#6c757d;margin-left:1.5rem;margin-top:-0.5rem;margin-bottom:1rem">
+                        When disabled, Maestro will not perform heartbeats, survey projects, or take autonomous actions.
+                    </div>
+                    <hr style="border:0;border-top:1px solid #eee;margin-bottom:1rem">
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label" style="display:flex;align-items:center;cursor:pointer">
+                        <input type="checkbox" id="mcfg-auto-steer" style="width:auto;margin-right:0.5rem">
+                        Enable Auto-Steer (Maestro answers consultations)
+                    </label>
+                    <div style="font-size:0.75rem;color:#6c757d;margin-left:1.5rem">
+                        Maestro will automatically provide hints to paused agents using global architectural cards and the decision log.
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" style="display:flex;align-items:center;cursor:pointer">
+                        <input type="checkbox" id="mcfg-auto-janitor" style="width:auto;margin-right:0.5rem">
+                        Enable Janitor Mode (Autonomous card creation)
+                    </label>
+                    <div style="font-size:0.75rem;color:#6c757d;margin-left:1.5rem">
+                        Maestro will scan the codebase during idle time to find tech debt, TODOs, and refactoring opportunities.
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" style="display:flex;align-items:center;cursor:pointer">
+                        <input type="checkbox" id="mcfg-auto-merge" style="width:auto;margin-right:0.5rem">
+                        Enable Big Picture Merge (Autonomous acceptance)
+                    </label>
+                    <div style="font-size:0.75rem;color:#6c757d;margin-left:1.5rem">
+                        Maestro will review completed tasks against the global project roadmap and auto-merge if they meet quality standards.
+                    </div>
+                    </div>
+                    <hr style="border:0;border-top:1px solid #dee2e6;margin:1rem 0">
+                    <div class="form-group">
+                    <label class="form-label">Maestro LLM (Global Heartbeat & Maintenance)</label>
+                    <select id="mcfg-llm-id" class="form-input">
+                        <option value="">(select an LLM)</option>
+                    </select>
+                    </div>
+                    <div class="form-group">
+                    <label class="form-label">Maestro Budget (Global Heartbeat & Maintenance)</label>
+                    <select id="mcfg-budget-id" class="form-input">
+                        <option value="">(select a budget)</option>
+                    </select>
+                    </div>
+                    </div>
+                    <div class="modal-footer">
+
+                <button class="btn btn-secondary" onclick="closeMaestroConfigModal()">Close</button>
+                <button class="btn btn-primary" onclick="saveMaestroConfig()">Save Settings</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Maestro Decision Log Modal -->
+    <div class="modal-overlay" id="maestro-decisions-modal">
+        <div class="modal" style="width:780px">
+            <div class="modal-header">
+                <h2 class="modal-title">Project Decision Log</h2>
+                <button class="close-btn" onclick="closeMaestroDecisionsModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p style="font-size:0.82rem;color:#6c757d;margin-bottom:1rem">
+                    Binding architectural decisions are injected into the system prompt of all implementation agents.
+                </p>
+                <div id="decisions-list" style="max-height:400px;overflow-y:auto;border:1px solid #dee2e6;border-radius:6px;margin-bottom:1rem">
+                    <!-- Populated dynamically -->
+                </div>
+                <hr style="margin:1.5rem 0">
+                <h4 style="margin-bottom:0.75rem">Add New Decision</h4>
+                <div class="form-group">
+                    <label class="form-label">Topic</label>
+                    <input type="text" class="form-input" id="dec-topic" placeholder="e.g. Caching, Database, UI Style">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Decision</label>
+                    <textarea class="form-textarea" id="dec-content" rows="2" placeholder="The binding rule agents must follow..."></textarea>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Rationale (Optional)</label>
+                    <textarea class="form-textarea" id="dec-rationale" rows="2" placeholder="Why this decision was made..."></textarea>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeMaestroDecisionsModal()">Close</button>
+                <button class="btn btn-primary" onclick="addMaestroDecision()">Add Decision</button>
             </div>
         </div>
     </div>

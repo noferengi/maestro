@@ -350,7 +350,7 @@ def cleanup_ghost_worktrees(project_path: str | None = None) -> dict:
         _find_processes_in_worktree,
         _kill_worktree_processes,
         _force_rmtree,
-        _is_git_repo,
+        is_git_repo,
         _run,
     )
 
@@ -373,7 +373,7 @@ def cleanup_ghost_worktrees(project_path: str | None = None) -> dict:
     for proj in projects:
         if not proj or not os.path.isdir(proj):
             continue
-        if not _is_git_repo(proj):
+        if not is_git_repo(proj):
             continue
 
         report["projects_scanned"] += 1

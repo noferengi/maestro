@@ -64,6 +64,7 @@ from mcp_tools.diagnostics import (
     get_capacity_status,
     list_pending_merges,
     get_project_health,
+    get_project_diagnostic,
     preview_dispatch,
     get_task_events,
     get_merge_records,
@@ -103,6 +104,7 @@ mcp.tool()(run_inspect_cards)
 mcp.tool()(get_capacity_status)
 mcp.tool()(list_pending_merges)
 mcp.tool()(get_project_health)
+mcp.tool()(get_project_diagnostic)
 mcp.tool()(preview_dispatch)
 mcp.tool()(get_task_events)
 mcp.tool()(get_merge_records)

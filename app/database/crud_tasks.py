@@ -571,7 +571,7 @@ def get_tasks_by_project(project_name):
 def get_deleted_tasks_by_project(project_name: str, limit: int = 20):
     """Return soft-deleted (is_active=False) tasks for a project, newest first.
 
-    Used by the Dreamer to survey prior intent when no active tasks remain.
+    Used by the Maestro to survey prior intent when no active tasks remain.
     Architecture tasks are excluded — they convey constraints, not work items.
     """
     db = SessionLocal()
@@ -1049,6 +1049,7 @@ def task_to_dict(task):
         "demotion_history": getattr(task, "demotion_history", None),
         "map_x": getattr(task, "map_x", None),
         "map_y": getattr(task, "map_y", None),
+        "consultation_payload": getattr(task, "consultation_payload", None),
         "is_active": bool(getattr(task, "is_active", True)),
         "clarification_status": getattr(task, "clarification_status", "none") or "none",
         "description_original": getattr(task, "description_original", None),

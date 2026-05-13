@@ -1089,6 +1089,18 @@
         }
 
         function createTaskCard(id, title, tags, owner, status) {
+            if (typeof id === 'object' && id !== null) {
+                const t = id;
+                id = t.id;
+                title = t.title;
+                tags = t.tags;
+                owner = t.owner;
+                status = t.type;
+            }
+
+            if (!Array.isArray(tags)) {
+                tags = [];
+            }
             const card = document.createElement('div');
             card.className = `task-card ${status}`;
             card.setAttribute('data-id', id);

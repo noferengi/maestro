@@ -19,6 +19,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from sqlalchemy.orm import Session
 
 # ---------------------------------------------------------------------------
 # Redirect all DB I/O to the test database.
@@ -60,12 +61,22 @@ def _test_schema():
     _TEST_DB.parent.mkdir(parents=True, exist_ok=True)
 
     # Apply any pending migrations (no-op when already current).
-    from migrations.runner import get_connection, migrate as run_migrate
-    conn = get_connection()
+    # get_connection() returns (engine, is_postgres); use engine.begin() for the
+    # ConnectionWrapper the runner expects.
+    from migrations.runner import get_connection, migrate as run_migrate, ConnectionWrapper
+    engine, is_postgres = get_connection()
+    with engine.begin() as conn:
+        run_migrate(ConnectionWrapper(conn, is_postgres))
+
+    # Eagerly import database and main so they are in sys.modules for patching.
+    # main.py adds app/ to sys.path, so 'import database' works here too.
+    import database  # noqa: F401
     try:
-        run_migrate(conn)
-    finally:
-        conn.close()
+        import main  # noqa: F401
+    except Exception:
+        # main.py might fail on import if some env vars are missing, but 
+        # we try our best to get it into sys.modules.
+        pass
 
     # Truncate all user tables (preserve schema_migrations so the runner
     # stays aware of what has been applied).
@@ -87,3 +98,57 @@ def _test_schema():
 
     yield
     # Leave test.db on disk - useful for post-mortem inspection of failures.
+
+
+@pytest.fixture(autouse=True)
+def _db_rollback():
+    """
+    Wrap every test in a transaction that is rolled back after the test completes.
+
+    Mechanism:
+      - Open one connection to the test engine and begin an outer transaction.
+      - Patch SessionLocal in every module that has it (within the app. namespace)
+        to a factory that returns Session objects bound to that connection with
+        join_transaction_mode="create_savepoint". With this mode, session.commit()
+        releases a savepoint instead of committing the outer transaction, so
+        CRUD writes are visible within the test but never hit the database
+        permanently.
+      - On teardown: restore all original SessionLocal references, then roll
+        back the outer transaction and close the connection.
+
+    Safe for Pattern 2 tests (test_research_jobs, test_optimization_subtasks)
+    that use importlib.reload(): those tests redirect MAESTRO_TEST_DB to a
+    tmp_path and reload app.database, which replaces the CRUD module SessionLocal
+    references entirely.  The reload blows away our patches for the duration
+    of the test body—which is correct, since the test is operating on a completely
+    different database.
+    """
+    from app.database.session import engine
+
+    conn = engine.connect()
+    conn.begin()  # outer transaction — never committed
+
+    def make_session():
+        return Session(conn, join_transaction_mode="create_savepoint", autoflush=False)
+
+    originals = []
+    # Dynamically discover all app.* and database.* modules that have SessionLocal.
+    # We must catch both because app/main.py often adds 'app/' to sys.path and 
+    # imports 'database' directly, which can result in duplicate module objects
+    # if app.database was also imported.
+    for modname, mod in list(sys.modules.items()):
+        if (modname.startswith("app.") or modname.startswith("database") or modname == "main") and hasattr(mod, "SessionLocal"):
+            originals.append((mod, mod.SessionLocal))
+            mod.SessionLocal = make_session
+
+    yield
+
+    # Restore originals first, then rollback (order matters: rollback must
+    # happen before the connection is closed so in-flight savepoints resolve).
+    for mod, orig in originals:
+        mod.SessionLocal = orig
+
+    try:
+        conn.rollback()
+    finally:
+        conn.close()

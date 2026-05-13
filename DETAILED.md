@@ -154,7 +154,7 @@ Every demotion writes a **Performance Improvement Plan** (PIP) — hard requirem
 - **Survey orchestrator** — hierarchical project summarization (Files → Directories → Modules → Project)
 - **File summaries** — LLM-generated file summaries cached by SHA1, prewarmed before agent dispatch
 - **Search cache** — web search results cached by (query, provider) for research agents
-- **Dreamer agent** — autonomous project resurrection and maintenance
+- **Maestro agent** — autonomous project resurrection and maintenance
 
 ---
 
@@ -233,7 +233,7 @@ TheMaestro/
 | `[conceptual_review]` | 10-voter panel settings |
 | `[security_review]` | 3-agent veto gate |
 | `[final_review]` | 4-agent final judgment |
-| `[dreamer]` | Autonomous resurrection agent |
+| `[maestro]` | Autonomous resurrection agent |
 | `[pip]` | Performance Improvement Plan resolution |
 | `[subdivision]` | Max depth, retries, total sub-ideas, subdivision tools |
 | `[search]` | Search provider (duckduckgo/brave), API key |

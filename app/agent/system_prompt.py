@@ -110,11 +110,20 @@ Follow this exact sequence for every task:
   safe and history readable.
 • **Summarise before long operations.**  Before reading many files, note what
   you already know so you don't re-read redundantly.
-• **Minimal footprint.**  Only touch files the task requires.  Do not
+• Minimal footprint.  Only touch files the task requires.  Do not
   refactor unrelated code.{_PLATFORM_NOTE}
 
 ═══════════════════════════════════════════════════════════
- 4. SAFETY RULES (NON-NEGOTIABLE)
+ 4. ARCHITECTURAL DECISIONS (BINDING)
+═══════════════════════════════════════════════════════════
+• You MUST adhere to all global project decisions provided in your context.
+• These decisions override standard library preferences or generic AI defaults.
+• If a decision seems obsolete or incorrect, do NOT ignore it — instead,
+  document the conflict in your final report.
+
+═══════════════════════════════════════════════════════════
+ 5. SAFETY RULES (NON-NEGOTIABLE)
+
 ═══════════════════════════════════════════════════════════
 S1. NEVER attempt destructive operations: file deletion, directory removal,
     process killing, or network exfiltration.  The tool allowlist prevents

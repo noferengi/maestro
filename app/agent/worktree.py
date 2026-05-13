@@ -8,6 +8,7 @@ import glob as _glob
 import logging, os, shutil, stat as _stat, subprocess, sys, threading, time
 from typing import Iterable
 from app.agent.config import GIT_SAFETY_BRANCH_PREFIX, GIT_ALLOWED_BASE_BRANCHES, GIT_TIMEOUT_SECONDS
+from app.utils import normalize_path
 
 logger = logging.getLogger(__name__)
 _WORKTREE_SUBDIR = ".maestro-worktrees"
@@ -28,14 +29,14 @@ _GHOST_REMOVAL_COOLDOWN = 300.0  # retry ghost removal at most once per 5 minute
 
 def _find_processes_in_worktree(worktree_path: str) -> list[tuple[int, str]]:
     """Return [(pid, exe)] for all processes whose exe lives inside worktree_path."""
-    norm_wt = os.path.normcase(os.path.normpath(worktree_path)) + os.sep
+    norm_wt = os.name == 'nt' and (os.path.normcase(os.path.normpath(worktree_path)) + os.sep) or (os.path.normpath(worktree_path) + os.sep)
     try:
         import psutil
         hits = []
         for proc in psutil.process_iter(["pid", "exe"]):
             try:
                 exe = proc.info.get("exe") or ""
-                if exe and os.path.normcase(exe).startswith(norm_wt):
+                if exe and (os.name == 'nt' and os.path.normcase(exe).startswith(norm_wt) or exe.startswith(norm_wt)):
                     hits.append((proc.pid, exe))
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
@@ -141,7 +142,11 @@ def _run(args, cwd, timeout=GIT_TIMEOUT_SECONDS):
         return 1, "", str(exc)
 
 
-def _is_git_repo(path):
+def is_git_repo(path):
+    """Return True if path is a git repository."""
+    path = normalize_path(path)
+    if not os.path.isdir(path):
+        return False
     rc, _, _ = _run(["git", "rev-parse", "--git-dir"], path)
     return rc == 0
 
@@ -209,31 +214,56 @@ def detect_project_type(project_path: str) -> str | None:
     return None
 
 
-def ensure_project_ready(project_path: str) -> None:
+def ensure_project_ready(project_path: str) -> bool:
     """
     One-time universal bootstrap: git init + empty initial commit so worktrees
     can branch from HEAD. Language-specific env setup is deferred to
     setup_test_environment(), called lazily before the first shell tool use.
+
+    Returns True if the project is ready (or was already ready), False on error.
     """
-    norm = os.path.normcase(os.path.normpath(project_path))
+    project_path = normalize_path(project_path)
+    if not os.path.isdir(project_path):
+        try:
+            os.makedirs(project_path, exist_ok=True)
+        except OSError as exc:
+            logger.error("[bootstrap] failed to create directory '%s': %s", project_path, exc)
+            return False
+
+    norm = os.path.normcase(project_path)
     with _bootstrap_lock:
         if norm in _bootstrapped_projects:
-            return
-        _bootstrapped_projects.add(norm)
+            return True
+        # Don't add to set yet; only if we successfully ensure it's a repo
 
-    if not _is_git_repo(project_path):
+    if not is_git_repo(project_path):
         logger.info("[bootstrap] git init '%s'", project_path)
-        _run(["git", "init"], project_path)
+        rc, _, err = _run(["git", "init"], project_path)
+        if rc != 0:
+            logger.error("[bootstrap] git init failed for '%s': %s", project_path, err)
+            return False
+
         gitignore = os.path.join(project_path, ".gitignore")
         if not os.path.exists(gitignore):
             try:
-                open(gitignore, "w").write(
-                    "venv/\nnode_modules/\n__pycache__/\n*.pyc\ntarget/\nbuild/\n.gradle/\n"
-                )
+                with open(gitignore, "w", encoding="utf-8") as f:
+                    f.write("venv/\nnode_modules/\n__pycache__/\n*.pyc\ntarget/\nbuild/\n.gradle/\n")
                 _run(["git", "add", ".gitignore"], project_path)
-            except OSError:
-                pass
-        _run(["git", "commit", "--allow-empty", "-m", "chore: initial commit"], project_path)
+            except OSError as exc:
+                logger.warning("[bootstrap] could not create .gitignore in '%s': %s", project_path, exc)
+
+        rc, _, err = _run(["git", "commit", "--allow-empty", "-m", "chore: initial commit"], project_path)
+        if rc != 0:
+            # Check if it's already got commits (is_git_repo might have been false but repo existed)
+            # or if commit simply failed.
+            rc_check, _, _ = _run(["git", "rev-parse", "HEAD"], project_path)
+            if rc_check != 0:
+                logger.error("[bootstrap] initial commit failed for '%s': %s", project_path, err)
+                return False
+
+    with _bootstrap_lock:
+        _bootstrapped_projects.add(norm)
+    return True
 
 
 def setup_test_environment(project_path: str) -> None:
@@ -252,7 +282,8 @@ def setup_test_environment(project_path: str) -> None:
     When dependencies change after this runs, the agent should call
     run_shell_deps() explicitly — this function will not re-run.
     """
-    norm = os.path.normcase(os.path.normpath(project_path))
+    project_path = normalize_path(project_path)
+    norm = os.path.normcase(project_path)
     with _env_setup_lock:
         if norm in _env_setup_done:
             return
@@ -294,10 +325,11 @@ def setup_task_worktree(task_id: str, project_path: str) -> str | None:
     Returns the worktree path, or None if the project is not a git repo
     or worktree creation fails (caller falls back to project_path).
     """
-    if not _is_git_repo(project_path):
+    project_path = normalize_path(project_path)
+    if not is_git_repo(project_path):
         return None
 
-    worktree_dir = os.path.join(project_path, _WORKTREE_SUBDIR, task_id)
+    worktree_dir = normalize_path(os.path.join(project_path, _WORKTREE_SUBDIR, task_id))
     branch_name = f"{GIT_SAFETY_BRANCH_PREFIX}{task_id}"
 
     _ensure_gitignore(project_path)
@@ -375,6 +407,7 @@ def setup_task_worktree(task_id: str, project_path: str) -> str | None:
 
 def teardown_task_worktree(task_id: str, project_path: str) -> None:
     """Remove the worktree for task_id. Safe to call even if no worktree was created."""
+    project_path = normalize_path(project_path)
     with _worktrees_lock:
         worktree_path = _active_worktrees.pop(task_id, None)
     if worktree_path is None:
@@ -402,9 +435,10 @@ def prune_orphaned_worktrees(project_paths: Iterable[str]) -> None:
     for project_path in project_paths:
         if not project_path or not os.path.isdir(project_path):
             continue
-        if not _is_git_repo(project_path):
+        project_path = normalize_path(project_path)
+        if not is_git_repo(project_path):
             continue
-        worktree_base = os.path.normpath(os.path.join(project_path, _WORKTREE_SUBDIR))
+        worktree_base = normalize_path(os.path.join(project_path, _WORKTREE_SUBDIR))
         if not os.path.isdir(worktree_base):
             continue
 

@@ -16,6 +16,10 @@ from __future__ import annotations
 import configparser
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env file if it exists
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Locate and parse maestro.ini
@@ -75,7 +79,7 @@ def _getlist(section: str, key: str, fallback: str) -> list[str]:
 
 LLM_BASE_URL: str = _get("llm", "base_url", "MAESTRO_LLM_BASE_URL", "http://localhost:8008/v1")
 LLM_MODEL: str = _get("llm", "model", "MAESTRO_LLM_MODEL", "omnicoder-9b")
-MAX_TOKENS_PER_TURN: int = _getint("llm", "max_tokens_per_turn", "MAESTRO_MAX_TOKENS", 8192)
+MAX_TOKENS_PER_TURN: int = _getint("llm", "max_tokens_per_turn", "MAESTRO_MAX_TOKENS", 32768)
 LLM_TIMEOUT_SECONDS: int = _getint("llm", "timeout_seconds", "MAESTRO_LLM_TIMEOUT", 120)
 
 # ===========================================================================
@@ -90,7 +94,7 @@ TAVILY_API_KEY: str = _get("search", "tavily_api_key", "TAVILY_API_KEY", "")
 # Loop safety limits
 # ===========================================================================
 
-MAX_TURNS: int = _getint("loop", "max_turns", "MAESTRO_MAX_TURNS", 150)
+MAX_TURNS: int = _getint("loop", "max_turns", "MAESTRO_MAX_TURNS", 200)
 MAX_CONSECUTIVE_ERRORS: int = _getint("loop", "max_consecutive_errors", None, 3)
 MAX_TASK_RETRIES: int = _getint("loop", "max_task_retries", None, 3)
 
@@ -143,6 +147,24 @@ def _resolve_git_root(path: str) -> str | None:
 MAESTRO_GIT_ROOT: str | None = _resolve_git_root(PROJECT_ROOT)
 
 # ===========================================================================
+# Database settings
+# ===========================================================================
+
+USE_POSTGRES: bool = _getbool("database", "use_postgres", "MAESTRO_USE_POSTGRES", False)
+
+# Default SQLite path
+_DB_PATH_DEFAULT = os.path.join(PROJECT_ROOT, "data", "kanban.db")
+
+if USE_POSTGRES:
+    # When using Postgres, we expect URLs to be provided (usually in .env)
+    DATABASE_URL: str = _get("database", "url", "MAESTRO_DATABASE_URL", "postgresql://localhost/maestro_db")
+    ADMIN_DATABASE_URL: str = _get("database", "admin_url", "MAESTRO_ADMIN_DATABASE_URL", DATABASE_URL)
+else:
+    # Fallback to local SQLite
+    DATABASE_URL = f"sqlite:///{_DB_PATH_DEFAULT}"
+    ADMIN_DATABASE_URL = DATABASE_URL
+
+# ===========================================================================
 # Agent status values
 # ===========================================================================
 
@@ -156,6 +178,7 @@ SIGNAL_REVERT: str = "REVERT_TO_DESIGN"
 SIGNAL_ACCEPTED: str = "ACCEPTED"
 SIGNAL_REJECTED: str = "REJECTED"
 SIGNAL_NEEDS_HUMAN: str = "NEEDS_HUMAN"
+SIGNAL_CONSULT: str = "CONSULT"
 SIGNAL_NEEDS_RESEARCH: str = "NEEDS_RESEARCH"
 SIGNAL_CONTEXT_TOO_LARGE: str = "CONTEXT_TOO_LARGE"
 
@@ -328,7 +351,7 @@ VERDICT_RANGES: dict[str, tuple[int, int]] = _build_verdict_ranges()
 PLANNING_BEST_OF_N: int = _getint("planning", "best_of_n", None, 5)
 PLANNING_MAX_FILES: int = _getint("planning", "max_files", None, 8)
 PLANNING_MAX_STEPS: int = _getint("planning", "max_steps", None, 6)
-PLANNING_JUDGE_MAX_TOKENS: int = _getint("planning", "judge_max_tokens", None, 8192)
+PLANNING_JUDGE_MAX_TOKENS: int = _getint("planning", "judge_max_tokens", None, 32768)
 PLANNING_MAX_DESIGN_RETRIES: int = _getint("planning", "max_design_retries", None, 3)
 PLANNING_MAX_REJECTIONS: int = _getint("planning", "max_rejections", None, 5)
 PLANNING_SURVEY_MAX_TURNS: int = _getint("planning", "survey_max_turns", None, 100)
@@ -495,7 +518,7 @@ TOOL_MAX_GIT_LOG_ENTRIES: int = _getint("tools", "max_git_log_entries", None, 10
 GIT_TIMEOUT_SECONDS: int = _getint("tools", "git_timeout_seconds", None, 30)
 
 SNAPSHOT_MAX_DEPTH: int = _getint("snapshot", "max_depth", None, 4)
-SNAPSHOT_MAX_TOKENS: int = _getint("snapshot", "max_tokens", None, 12000)
+SNAPSHOT_MAX_TOKENS: int = _getint("snapshot", "max_tokens", None, 32768)
 SNAPSHOT_CACHE_TTL: int = _getint("snapshot", "cache_ttl_seconds", None, 300)
 SNAPSHOT_CONTEXT_RATIO: float = _getfloat("snapshot", "context_ratio", None, 0.12)
 
@@ -505,8 +528,8 @@ SNAPSHOT_CONTEXT_RATIO: float = _getfloat("snapshot", "context_ratio", None, 0.1
 
 SUMMARY_CONTEXT_RATIO: float = _getfloat("survey", "summary_context_ratio", None, 0.10)
 SUMMARY_MAX_FILE_SIZE: int = _getint("survey", "max_file_size_bytes", None, 1024 * 1024)
-SURVEY_VERDICT_MAX_TOKENS: int = _getint("survey", "verdict_max_tokens", None, 8192)
-SURVEY_SUMMARY_MAX_TOKENS: int = _getint("survey", "summary_max_tokens", None, 8192)
+SURVEY_VERDICT_MAX_TOKENS: int = _getint("survey", "verdict_max_tokens", None, 32768)
+SURVEY_SUMMARY_MAX_TOKENS: int = _getint("survey", "summary_max_tokens", None, 32768)
 SURVEY_STALENESS_ENABLED: bool = _getbool("survey", "staleness_enabled", None, True)
 SURVEY_STALENESS_CHECK_RATIO: float = _getfloat("survey", "staleness_check_ratio", None, 0.05)
 SURVEY_MAX_CONCURRENT_JOBS: int = _getint("survey", "max_concurrent_scope_jobs", None, 3)
@@ -557,21 +580,21 @@ CORRECTION_MAX_TURNS: int = _getint("correction", "max_turns", None, 100)
 CORRECTION_SKIP_AFTER_FAILURES: int = _getint("correction", "correction_skip_after_failures", None, 2)
 
 # ===========================================================================
-# Dreamer — autonomous project resurrection agent
+# Maestro — autonomous project orchestrator and resurrection agent
 # ===========================================================================
 
-DREAMER_ENABLED: bool        = _getbool("dreamer", "enabled",              "MAESTRO_DREAMER_ENABLED", False)
-DREAMER_STALL_TICKS: int     = _getint ("dreamer", "stall_ticks",          None,                      60)
-DREAMER_MAX_RESURRECTIONS: int = _getint("dreamer", "max_cards_to_resurrect", None,                   3)
-DREAMER_MAX_NEW_CARDS: int   = _getint ("dreamer", "max_new_cards",        None,                      2)
-DREAMER_DECIDE_MAX_TOKENS: int = _getint("dreamer", "decide_max_tokens",   None,                      8192)
-DREAMER_SURVEY_TOOLS: list[str] = _getlist("dreamer", "survey_tools", "get_project_summary, get_directory_summary, get_module_summary, list_scope_summaries")
+MAESTRO_ENABLED: bool        = _getbool("maestro", "enabled",              "MAESTRO_ORCHESTRATOR_ENABLED", False)
+MAESTRO_STALL_TICKS: int     = _getint ("maestro", "stall_ticks",          None,                      60)
+MAESTRO_MAX_RESURRECTIONS: int = _getint("maestro", "max_cards_to_resurrect", None,                   3)
+MAESTRO_MAX_NEW_CARDS: int   = _getint ("maestro", "max_new_cards",        None,                      2)
+MAESTRO_DECIDE_MAX_TOKENS: int = _getint("maestro", "decide_max_tokens",   None,                      32768)
+MAESTRO_SURVEY_TOOLS: list[str] = _getlist("maestro", "survey_tools", "get_project_summary, get_directory_summary, get_module_summary, list_scope_summaries")
 
 # ===========================================================================
 # Arch Gen — architecture card population agent
 # ===========================================================================
 
-ARCH_GEN_MAX_TOKENS: int = _getint("arch_gen", "max_tokens", None, 8192)
+ARCH_GEN_MAX_TOKENS: int = _getint("arch_gen", "max_tokens", None, 32768)
 
 # ===========================================================================
 # Server admin

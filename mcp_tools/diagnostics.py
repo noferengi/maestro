@@ -686,15 +686,15 @@ def list_pending_merges(project: str = None) -> list:
 
 def get_project_health(project: str = None) -> dict:
     """
-    Cold-start briefing for a project (or all projects if project=None).
+    High-level Kanban and Budget overview for a project (or all projects).
+    Use this for an 'Executive Summary' of what is on the board.
 
     Returns:
     - Stage distribution: card counts per pipeline stage
-    - Active sessions: tasks currently running
-    - Recent demotions: tasks demoted in the last 24 hours
-    - Pending merges: count of completed-but-unmerged tasks
-    - Budget spend: total token cost (µ¢) in the last 7 days
-    - Stuck candidates: open sessions with no LLM activity in >10 min
+    - Active sessions: summary list of tasks currently running
+    - Recent demotions: tasks that failed a gate in the last 24 hours
+    - Pending merges: count of completed tasks waiting for git merge
+    - Budget spend: token cost in dollars/microcents (last 7 days)
     """
     conn = get_conn()
     try:
@@ -797,6 +797,88 @@ def get_project_health(project: str = None) -> dict:
             "budget_spend_7d_microcents": spend_microcents,
             "budget_spend_7d_dollars": spend_dollars,
             "stuck_candidates": stuck,
+        }
+    finally:
+        conn.close()
+
+
+def get_project_diagnostic(project: str, limit: int = 15) -> dict:
+    """
+    Deep-dive 'Engine Diagnostic' for debugging execution issues in a project.
+    Optimized for maximum speed - avoids large blobs and slow joins.
+    """
+    import os, subprocess
+    conn = get_conn()
+    try:
+        # 1. Project Info
+        p_row = conn.execute(
+            "SELECT id, path FROM projects WHERE name = ?", (project,)
+        ).fetchone()
+        if not p_row:
+            return {"error": f"Project '{project}' not found."}
+        project_id = p_row["id"]
+        project_path = p_row["path"]
+
+        # 2. Stage Distribution (Active Only)
+        stage_rows = conn.execute(
+            "SELECT type, COUNT(*) as cnt FROM tasks "
+            "WHERE project_id = ? AND is_active = 1 GROUP BY type",
+            (project_id,)
+        ).fetchall()
+        stage_dist = {r["type"]: r["cnt"] for r in stage_rows}
+
+        # 3. Active Sessions with Duration and Inferred Phase
+        # Uses fast indexed subqueries for phase inference metadata
+        active_rows = conn.execute(
+            """
+            SELECT s.task_id, t.title, t.type, s.agent_type, s.started_at,
+                   (SELECT agent_name FROM budget_entries WHERE task_id = s.task_id ORDER BY id DESC LIMIT 1) as last_agent
+            FROM agent_sessions s
+            JOIN tasks t ON s.task_id = t.id
+            WHERE t.project_id = ? AND s.ended_at IS NULL
+            """,
+            (project_id,)
+        ).fetchall()
+
+        active_sessions = []
+        now = datetime.now(timezone.utc)
+        for a in active_rows:
+            started = datetime.fromisoformat(a["started_at"].replace(" ", "T"))
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            duration_min = (now - started).total_seconds() / 60
+            
+            active_sessions.append({
+                "task_id": a["task_id"],
+                "title": a["title"],
+                "type": a["type"],
+                "agent_type": a["agent_type"],
+                "started_at": a["started_at"],
+                "duration_minutes": round(duration_min, 1),
+                "last_agent": a["last_agent"]
+            })
+
+        # 4. Recent Activity (Metadata Only - No large blobs)
+        recent_rows = conn.execute(
+            "SELECT b.id, b.task_id, t.title, b.agent_name, b.created_at "
+            "FROM budget_entries b "
+            "JOIN tasks t ON b.task_id = t.id "
+            "WHERE t.project_id = ? "
+            "ORDER BY b.id DESC LIMIT ?",
+            (project_id, limit)
+        ).fetchall()
+        
+        recent_activity = [dict(r) for r in recent_rows]
+
+        return {
+            "project": project,
+            "stage_distribution": stage_dist,
+            "active_sessions": active_sessions,
+            "recent_activity": recent_activity,
+            "summary": {
+                "active_count": len(active_sessions),
+                "total_active_tasks": sum(stage_dist.values())
+            }
         }
     finally:
         conn.close()

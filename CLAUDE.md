@@ -6,7 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Project Maestro — a Kanban board with an agentic LLM orchestration backend. The board is the UI face of a "Wiggum Loop": a Do-While that drives a local LLM through Design → Implement → Test → Verify cycles until all DAG task nodes reach ACCEPTED. Tasks transition IDEA → PLANNING → INDEV → CONCEPTUAL_REVIEW → OPTIMIZATION → SECURITY → FINAL_REVIEW → HUMAN_REVIEW → COMPLETED, gated by a multi-stage intake pipeline with LLM voting.
 
-**See `ARCHITECTURE.md`** for the full system reference: pipeline stages, compute resource model (LLM Endpoints + Compute Nodes), scheduler tick lifecycle, all agent types, planning pipeline deep-dive, git worktree isolation, safety layers, and data schema overview. **See `PRD.md`** for the product roadmap and feature specs.
+**See `ARCHITECTURE.md`** for the full system reference: pipeline stages, compute resource model (LLM Endpoints + Compute Nodes), scheduler tick lifecycle, all agent types, planning pipeline deep-dive, git worktree isolation, safety layers, and data schema overview. **See `plans/PRD.md`** for the product roadmap and feature specs.
+
+## Maestro Server
+
+- **Maestro Server:** Assume the server is ALWAYS running on http://localhost:8000. You can verify this with a simple `curl` or `requests.get`. To apply backend code changes, use the `restart_server` tool.
 
 ## MCP server — primary diagnostic interface
 
@@ -96,6 +100,12 @@ vote, persisting budget entries), MCP reads queue behind it and can appear to ha
 - `planning.correction_attempts > 0` → gate has failed and correction was attempted
 
 ## Shell / path conventions (Windows)
+
+The primary environment is **Windows 11 PowerShell**.
+
+- **PATH**: `C:\Program Files\Git\usr\bin` is included in the PATH, which means Unix-style utilities like `grep`, `ls`, `head`, and `tail` are available. However, PowerShell-native commands (e.g., `Select-String`, `Get-ChildItem`) are often more reliable for complex pipes in this specific terminal context.
+- **Inference Hardware**: The local inference engine (`llama.cpp`) hosting LLM 1 (Qwen 3.6 35B) supports 5 parallel sessions, but **application usage must be limited to 4 sessions** to always keep one spare slot for the Maestro orchestrator and high-priority discovery tasks.
+- **Config Data**: Other LLM endpoints (IDs > 1) in the `llms` table are fictional test data used for configuration validation; only LLM 1 is backed by real hardware.
 
 If you are **Claude**, the shell is virtual bash environment. Use **forward slashes** — backslashes are treated as escape characters and
 silently dropped, mushing the path together:
@@ -199,7 +209,7 @@ For stuck planning tasks use `diagnose_task(task_id)` — covers budget traces, 
 
 ### Backend (`app/`)
 - `main.py` — FastAPI app. All routes. Mounts static files from `app/web/`. On startup calls `init_db()` + `seed_sample_tasks()` (skips seeding if data exists). Quick-action endpoints: `/demote`, `/set-stage`, `/clone`, `/pin`, `/run-planning`, `/run-review`, `/run-security`, `/run-final-review`. Task serialization (`_task_to_dict`) always includes a `"pips"` array. `sync_update_llm_with_cache` / `sync_delete_llm_with_cache` call `invalidate_llm_cache` after LLM record mutations so stale context/capacity state is flushed immediately.
-- `database/` — DB package. `models.py` has SQLAlchemy ORM definitions. `__init__.py` re-exports the main CRUD surface. Specialized modules: `crud_pipeline.py` (planning/review/component results), `crud_tasks.py` (task + PIP CRUD), `crud_sessions.py` (agent sessions), `crud_infra.py` (LLMs, budgets, compute nodes), `crud_jobs.py` (research + file-summary jobs), `crud_costs.py` (budget entries + expenses), `crud_projects.py`, `crud_files.py`, `crud_dreamer.py`, `crud_survey.py`, `crud_inbox.py`, `session.py` (SQLAlchemy session factory). `delete_task()` is a **soft-delete**: sets `is_active=False` on the target and all descendants via BFS. All read queries filter `is_active=True`. `upsert_project()` uses `...` (Ellipsis) sentinel for `llm_id`/`budget_id` — pass Ellipsis to leave unchanged, None to clear. `pip_status_at_stage(pip, stage)` derives status at read time — no stored status column.
+- `database/` — DB package. `models.py` has SQLAlchemy ORM definitions. `__init__.py` re-exports the main CRUD surface. Specialized modules: `crud_pipeline.py` (planning/review/component results), `crud_tasks.py` (task + PIP CRUD), `crud_sessions.py` (agent sessions), `crud_infra.py` (LLMs, budgets, compute nodes), `crud_jobs.py` (research + file-summary jobs), `crud_costs.py` (budget entries + expenses), `crud_projects.py`, `crud_files.py`, `crud_maestro.py`, `crud_survey.py`, `crud_inbox.py`, `session.py` (SQLAlchemy session factory). `delete_task()` is a **soft-delete**: sets `is_active=False` on the target and all descendants via BFS. All read queries filter `is_active=True`. `upsert_project()` uses `...` (Ellipsis) sentinel for `llm_id`/`budget_id` — pass Ellipsis to leave unchanged, None to clear. `pip_status_at_stage(pip, stage)` derives status at read time — no stored status column.
 - `migrations/runner.py` — standalone sqlite3 migration engine, no SQLAlchemy dependency.
 
 ### Agent system (`app/agent/`)

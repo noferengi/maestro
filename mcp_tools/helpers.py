@@ -16,6 +16,12 @@ def get_conn() -> sqlite3.Connection:
     """Read-only SQLite connection to kanban.db."""
     conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=30)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.Error:
+        # mode=ro might prevent setting WAL if the file is truly read-only
+        # at the OS level, but usually it works if the WAL file exists.
+        pass
     return conn
 
 

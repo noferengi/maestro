@@ -748,7 +748,19 @@ class PlanningPipeline:
                             break
                         _tool_call_history.add(call_key)
 
-                        fn_args = fn_args_raw if isinstance(fn_args_raw, dict) else json.loads(fn_args_raw)
+                        try:
+                            fn_args = fn_args_raw if isinstance(fn_args_raw, dict) else json.loads(fn_args_raw)
+                        except json.JSONDecodeError as e:
+                            logger.warning(
+                                f"[{AGENT_NAME}] Malformed tool call args for %s: %s — skipping call",
+                                fn_name, e,
+                            )
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": f"Error: malformed arguments JSON — {e}",
+                            })
+                            continue
                         try:
                             result = dispatch_tool(fn_name, fn_args)
                         except Exception as e:
