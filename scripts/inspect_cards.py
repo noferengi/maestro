@@ -41,13 +41,60 @@ PIPELINE_STAGES = [
 _REJECTION_RETRY_COOLDOWN = 300  # seconds, matches scheduler.py
 
 # -- DB helpers ---------------------------------------------------------------
+def _postgres_configured() -> bool:
+    """
+    Return True if PostgreSQL is enabled via env var or maestro.ini,
+    without importing the app package.
+    """
+    env_val = os.environ.get("MAESTRO_USE_POSTGRES", "").strip().lower()
+    if env_val in ("1", "true", "yes"):
+        return True
+    if env_val in ("0", "false", "no"):
+        return False
+    # Fall through to maestro.ini
+    import configparser
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ini_path = os.path.join(_root, "maestro.ini")
+    if os.path.exists(ini_path):
+        cfg = configparser.ConfigParser()
+        cfg.read(ini_path)
+        val = cfg.get("database", "use_postgres", fallback="false").strip().lower()
+        return val in ("1", "true", "yes")
+    return False
+
+
 def open_db():
-    if not os.path.exists(DB_PATH):
-        print("DB not found at " + DB_PATH)
-        sys.exit(1)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn, conn.cursor()
+    """
+    Open a database connection.  Prefers the shared SQLAlchemy engine (supports
+    both SQLite and PostgreSQL).  Falls back to a raw sqlite3 connection only
+    when the app package is not importable AND PostgreSQL is not configured.
+    If PostgreSQL is configured but the app package is not importable (missing
+    dependencies), the script exits with an error.
+    """
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
+    try:
+        from app.database.session import engine
+        from mcp_tools.helpers import _Conn
+        sa_conn = engine.connect()
+        cur = _Conn(sa_conn)
+        return sa_conn, cur
+    except Exception as exc:
+        if _postgres_configured():
+            print(
+                "ERROR: PostgreSQL is configured but the app package failed to import.\n"
+                "Ensure all dependencies are installed (venv/Scripts/pip install -r requirements.txt).\n"
+                "Detail: {}".format(exc)
+            )
+            sys.exit(1)
+        # SQLite fallback — only when postgres is NOT configured
+        if not os.path.exists(DB_PATH):
+            print("DB not found at " + DB_PATH)
+            sys.exit(1)
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn, conn.cursor()
 
 
 def hdr(text, width=60):
@@ -66,9 +113,13 @@ def get_tasks(cur, project=None):
     """All active tasks, optionally filtered to one project."""
     if project:
         cur.execute(
-            "SELECT id, title, type, prerequisites, parent_task_id, "
-            "llm_id, budget_id, is_active, position, history "
-            "FROM tasks WHERE is_active=1 AND project=? ORDER BY type, position",
+            "SELECT tasks.id, tasks.title, tasks.type, tasks.prerequisites,"
+            " tasks.parent_task_id, tasks.llm_id, tasks.budget_id,"
+            " tasks.is_active, tasks.position, tasks.history"
+            " FROM tasks"
+            " JOIN projects ON projects.id = tasks.project_id"
+            " WHERE tasks.is_active=1 AND projects.name=?"
+            " ORDER BY tasks.type, tasks.position",
             (project,),
         )
     else:

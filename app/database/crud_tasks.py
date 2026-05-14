@@ -428,9 +428,10 @@ def seed_task(db, id, title, task_type, description="", owner="user", tags=None,
 
 def seed_sample_tasks_raw(conn):
     """
-    Seed the 10 canonical sample tasks using a raw sqlite3 connection.
-    Called by the migration runner's reset command — no SQLAlchemy required.
-    conn must already be connected to kanban.db with all migrations applied.
+    Seed the 10 canonical sample tasks.
+    Called by the migration runner's reset command via a ConnectionWrapper.
+    SQLite-specific INSERT OR IGNORE / INSERT OR REPLACE are translated to
+    PostgreSQL ON CONFLICT syntax by ConnectionWrapper.execute().
     """
     import json
     now = datetime.now(timezone.utc).isoformat()

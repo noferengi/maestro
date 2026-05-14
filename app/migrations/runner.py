@@ -90,17 +90,106 @@ class ConnectionWrapper:
 
         # Handle SQLite-specific syntax if we are on Postgres
         if self.is_postgres:
-            # Replace [table] with "table" for Postgres compatibility
+            import re as _re
+
+            # [table] → "table"  (bracket quoting)
             sql = sql.replace("[", "\"").replace("]", "\"")
-            
-            # Simple conversion for common SQLite patterns
-            if "INSERT OR REPLACE" in sql:
+
+            # datetime('now') MUST be replaced before the DATETIME type rename
+            # because the type regex is case-insensitive and would match the
+            # function name first, producing the invalid TIMESTAMP('now').
+            # Only replace the 0-arg form; datetime('now', '-N unit') is a
+            # different beast handled elsewhere via _date_ago().
+            sql = _re.sub(r"datetime\s*\(\s*'now'\s*\)", 'CURRENT_TIMESTAMP', sql)
+
+            # Type names
+            sql = _re.sub(r'\bDATETIME\b',  'TIMESTAMP', sql, flags=_re.IGNORECASE)
+            sql = _re.sub(r'\bBLOB\b',      'BYTEA',     sql, flags=_re.IGNORECASE)
+
+            # Auto-increment: INTEGER PRIMARY KEY AUTOINCREMENT → SERIAL PRIMARY KEY
+            sql = _re.sub(
+                r'\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b',
+                'SERIAL PRIMARY KEY',
+                sql, flags=_re.IGNORECASE,
+            )
+            # Remove any stray AUTOINCREMENT that wasn't caught above
+            sql = _re.sub(r'\s+AUTOINCREMENT\b', '', sql, flags=_re.IGNORECASE)
+
+            # PRAGMA table_info(X) → pg_attribute query that returns the same
+            # column shape: name, type, notnull, dflt_value, pk.
+            # Used by migration guards (_has_column, _is_integer_pk).
+            _pm = _re.match(
+                r'^\s*PRAGMA\s+table_info\s*\(\s*(\w+)\s*\)\s*$',
+                sql.strip(), _re.IGNORECASE,
+            )
+            if _pm:
+                _t = _pm.group(1)
+                sql = f"""
+                    SELECT
+                        a.attnum - 1 AS cid,
+                        a.attname    AS name,
+                        t.typname    AS type,
+                        CASE WHEN a.attnotnull THEN 1 ELSE 0 END AS notnull,
+                        ''           AS dflt_value,
+                        CASE WHEN EXISTS (
+                            SELECT 1 FROM pg_constraint c2
+                            WHERE c2.conrelid = a.attrelid
+                              AND c2.contype = 'p'
+                              AND a.attnum = ANY(c2.conkey)
+                        ) THEN 1 ELSE 0 END AS pk
+                    FROM pg_attribute a
+                    JOIN pg_class c ON c.oid = a.attrelid
+                    JOIN pg_type  t ON t.oid = a.atttypid
+                    WHERE c.relname = '{_t}'
+                      AND a.attnum > 0
+                      AND NOT a.attisdropped
+                    ORDER BY a.attnum
+                """
+
+            # CREATE VIEW IF NOT EXISTS X → CREATE OR REPLACE VIEW X
+            # (PostgreSQL does not support IF NOT EXISTS for views)
+            sql = _re.sub(
+                r'\bCREATE\s+VIEW\s+IF\s+NOT\s+EXISTS\b',
+                'CREATE OR REPLACE VIEW',
+                sql, flags=_re.IGNORECASE,
+            )
+
+            # rowid is SQLite's internal row identifier.  Migrations use it only to
+            # populate a new id column before table rebuilds (0044), always on tables
+            # that are empty during Phase 1 schema build.  Translate to 0 so the SQL
+            # is valid; the UPDATE is a no-op on empty tables.
+            sql = _re.sub(r'\browid\b', '0', sql, flags=_re.IGNORECASE)
+
+            # json_extract(col, '$.key') → (col::json)->>'key'
+            # (SQLite JSON function; PostgreSQL uses the -> / ->> operators)
+            sql = _re.sub(
+                r"\bjson_extract\s*\(\s*([^,]+?)\s*,\s*'\$\.(\w+)'\s*\)",
+                r"(\1::json)->>'\2'",
+                sql, flags=_re.IGNORECASE,
+            )
+
+            # INSERT OR IGNORE → INSERT ... ON CONFLICT DO NOTHING
+            if "INSERT OR IGNORE" in sql:
+                sql = sql.replace("INSERT OR IGNORE", "INSERT")
+                sql += " ON CONFLICT DO NOTHING"
+            # INSERT OR REPLACE → INSERT ... ON CONFLICT DO UPDATE (upsert)
+            elif "INSERT OR REPLACE" in sql:
                 if "tasks" in sql:
-                    # Specific fix for the tasks table seed
                     sql = sql.replace("INSERT OR REPLACE", "INSERT")
-                    sql += " ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title, type=EXCLUDED.type, description=EXCLUDED.description, owner=EXCLUDED.owner, tags=EXCLUDED.tags, content=EXCLUDED.content, history=EXCLUDED.history, position=EXCLUDED.position, updated_at=EXCLUDED.updated_at, prerequisites=EXCLUDED.prerequisites"
+                    sql += (
+                        " ON CONFLICT (id) DO UPDATE SET"
+                        " title=EXCLUDED.title, type=EXCLUDED.type,"
+                        " description=EXCLUDED.description, owner=EXCLUDED.owner,"
+                        " tags=EXCLUDED.tags, content=EXCLUDED.content,"
+                        " history=EXCLUDED.history, position=EXCLUDED.position,"
+                        " updated_at=EXCLUDED.updated_at, prerequisites=EXCLUDED.prerequisites,"
+                        " project=EXCLUDED.project, llm_id=EXCLUDED.llm_id,"
+                        " budget_id=EXCLUDED.budget_id"
+                    )
                 else:
+                    # Generic fallback: treat as insert-if-not-exists
                     sql = sql.replace("INSERT OR REPLACE", "INSERT")
+                    sql += " ON CONFLICT DO NOTHING"
 
         # Use SQLAlchemy text() for execution
         self._last_res = self.conn.execute(text(sql), params or {})

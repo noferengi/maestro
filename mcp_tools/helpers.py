@@ -57,12 +57,17 @@ class _Conn:
     Both get_conn() and get_rw_conn() return one of these.  For read paths,
     close() rolls back the implicit (empty) transaction — safe and fast.
     For write paths, call commit() before close() to persist the changes.
+
+    Also supports the sqlite3.Cursor pattern (execute then fetchone/fetchall on
+    the same object) so scripts like inspect_cards.py can use it as a drop-in
+    cursor replacement.
     """
 
     def __init__(self, sa_conn):
         self._conn = sa_conn
+        self._last_res: _Result | None = None
 
-    def execute(self, sql: str, params=None) -> _Result:
+    def execute(self, sql: str, params=None) -> "_Result":
         """Execute *sql* with optional positional params (?-style)."""
         if params:
             # Convert ?-style positional params to :p0 :p1 ... named params
@@ -74,7 +79,16 @@ class _Conn:
                 named[f"p{i}"] = params[i]
                 new_sql += f":p{i}" + part
             sql, params = new_sql, named
-        return _Result(self._conn.execute(text(sql), params or {}))
+        self._last_res = _Result(self._conn.execute(text(sql), params or {}))
+        return self._last_res
+
+    def fetchone(self):
+        """Return one row from the last execute() — sqlite3.Cursor-compatible."""
+        return self._last_res.fetchone() if self._last_res else None
+
+    def fetchall(self):
+        """Return all rows from the last execute() — sqlite3.Cursor-compatible."""
+        return self._last_res.fetchall() if self._last_res else []
 
     def commit(self):
         self._conn.commit()
