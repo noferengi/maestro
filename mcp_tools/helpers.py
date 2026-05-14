@@ -158,10 +158,12 @@ def extract_response_fields(response_data: str) -> dict:
         return {"finish_reason": "", "content_preview": "", "reasoning_preview": "", "has_tool_calls": False}
 
 
-def parse_gate_checks(vote_summary: str) -> list:
+def parse_gate_checks(vote_summary) -> list:
     """Extract gate_checks array from a transition_result vote_summary blob."""
     try:
-        data = json.loads(vote_summary or "{}")
+        # PostgreSQL json columns are deserialized by psycopg2 into dicts;
+        # SQLite returns the raw JSON string — handle both.
+        data = vote_summary if isinstance(vote_summary, dict) else json.loads(vote_summary or "{}")
         return data.get("checks", [])
     except Exception:
         return []

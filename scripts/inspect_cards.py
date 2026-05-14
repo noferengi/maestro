@@ -118,7 +118,7 @@ def get_tasks(cur, project=None):
             " tasks.is_active, tasks.position, tasks.history"
             " FROM tasks"
             " JOIN projects ON projects.id = tasks.project_id"
-            " WHERE tasks.is_active=1 AND projects.name=?"
+            " WHERE tasks.is_active AND projects.name=?"
             " ORDER BY tasks.type, tasks.position",
             (project,),
         )
@@ -126,7 +126,7 @@ def get_tasks(cur, project=None):
         cur.execute(
             "SELECT id, title, type, prerequisites, parent_task_id, "
             "llm_id, budget_id, is_active, position, history "
-            "FROM tasks WHERE is_active=1 ORDER BY type, position"
+            "FROM tasks WHERE is_active ORDER BY type, position"
         )
     return list(cur.fetchall())
 
@@ -369,7 +369,7 @@ def cmd_scheduler(cur, project=None):
         placeholders = ",".join("?" * len(task_ids))
         cur.execute(
             "SELECT DISTINCT parent_task_id FROM tasks "
-            "WHERE parent_task_id IN ({}) AND is_active=1".format(placeholders),
+            "WHERE parent_task_id IN ({}) AND is_active".format(placeholders),
             task_ids,
         )
         parents_with_children = {r["parent_task_id"] for r in cur.fetchall()}
@@ -489,7 +489,7 @@ def cmd_scheduler(cur, project=None):
     ))
     for t in buckets["stuck_subdividing"]:
         cur.execute(
-            "SELECT COUNT(*) as cnt FROM tasks WHERE parent_task_id=? AND is_active=1", (t["id"],)
+            "SELECT COUNT(*) as cnt FROM tasks WHERE parent_task_id=? AND is_active", (t["id"],)
         )
         n_children = cur.fetchone()["cnt"]
         hist = json.loads(t["history"] or "[]")

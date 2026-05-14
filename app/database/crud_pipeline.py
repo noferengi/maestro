@@ -282,7 +282,7 @@ def get_reusable_planning_result(task_id: str, content_hash: str):
                 .filter(
                     PlanningResult.task_id == task_id,
                     PlanningResult.content_hash == content_hash,
-                    PlanningResult.was_gate_passed == 1,
+                    PlanningResult.was_gate_passed == True,  # noqa: E712
                     PlanningResult.status.in_(['active', 'superseded']),
                 )
                 .order_by(PlanningResult.created_at.desc())
@@ -337,7 +337,7 @@ def mark_gate_passed(result_id: int, content_hash: str = None) -> None:
     try:
         row = db.query(PlanningResult).filter(PlanningResult.id == result_id).first()
         if row:
-            row.was_gate_passed = 1
+            row.was_gate_passed = True
             if content_hash:
                 row.content_hash = content_hash
             db.commit()

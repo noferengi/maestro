@@ -133,18 +133,29 @@ def close_zombie_sessions_for_tasks(exclude_task_ids: set[str]) -> int:
     DB state with in-memory thread state after threads die unexpectedly.
     exclude_task_ids: task IDs that are known-alive; all others are closed.
     """
+    import sqlalchemy as _sa
     db = SessionLocal()
     try:
-        import sqlalchemy as _sa
+        # 1. Identify all open task_ids in the DB
         open_rows = db.execute(
             _sa.text(
                 "SELECT DISTINCT task_id FROM agent_sessions "
                 "WHERE ended_at IS NULL AND task_id IS NOT NULL"
             )
         ).fetchall()
-        zombie_ids = [r[0] for r in open_rows if r[0] not in exclude_task_ids]
+        db_open_ids = {r[0] for r in open_rows}
+        logger.info("[sessions] Reconciling DB: %d open task sessions in DB, %d alive threads.",
+                    len(db_open_ids), len(exclude_task_ids))
+
+        # 2. Find IDs that are in DB but NOT in the exclusion set
+        zombie_ids = [tid for tid in db_open_ids if tid not in exclude_task_ids]
         if not zombie_ids:
             return 0
+
+        logger.info("[sessions] Found %d zombie task(s) to close: %s", len(zombie_ids), zombie_ids)
+
+        # 3. Batch close them
+        # Note: task_id IN (...) is safe here as IDs are generated slugs/uuids
         placeholders = ",".join(f"'{t}'" for t in zombie_ids)
         result = db.execute(
             _sa.text(
@@ -155,7 +166,10 @@ def close_zombie_sessions_for_tasks(exclude_task_ids: set[str]) -> int:
             {"now": _now_iso()},
         )
         db.commit()
-        return result.rowcount
+        count = result.rowcount
+        logger.info("[sessions] Successfully closed %d zombie DB session(s).", count)
+        return count
+
     except Exception as exc:
         db.rollback()
         logger.error("Error in close_zombie_sessions_for_tasks: %s", exc)

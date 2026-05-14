@@ -230,20 +230,30 @@ def get_scheduler_state() -> dict:
     conn = get_conn()
     try:
         # Active agent sessions — one per task, latest session only (avoids zombie duplicates)
-        active_rows = conn.execute(
-            "SELECT task_id, agent_type, started_at FROM agent_sessions s "
-            "WHERE ended_at IS NULL "
-            "AND id = (SELECT MAX(id) FROM agent_sessions WHERE task_id=s.task_id AND ended_at IS NULL) "
-            "ORDER BY id DESC",
-        ).fetchall()
-        active_sessions = [dict(r) for r in active_rows]
+        # Includes latest activity timestamp via JOIN to avoid N+1 queries.
+        active_rows = conn.execute("""
+            SELECT s.task_id, s.agent_type, s.started_at, be.last_activity
+            FROM agent_sessions s
+            LEFT JOIN (
+                SELECT task_id, MAX(created_at) AS last_activity
+                FROM budget_entries
+                GROUP BY task_id
+            ) be ON be.task_id = s.task_id
+            WHERE s.ended_at IS NULL
+            AND s.id = (SELECT MAX(id) FROM agent_sessions WHERE task_id=s.task_id AND ended_at IS NULL)
+            ORDER BY id DESC
+        """).fetchall()
+        active_sessions = [
+            {"task_id": r["task_id"], "agent_type": r["agent_type"], "started_at": r["started_at"]}
+            for r in active_rows
+        ]
         active_task_ids = {r["task_id"] for r in active_rows}
 
         # All pipeline tasks by type
         task_rows = conn.execute(
             "SELECT t.id, t.title, t.type, p.name AS project "
             "FROM tasks t LEFT JOIN projects p ON t.project_id=p.id "
-            "WHERE t.is_active=1 AND t.type NOT IN ('idea','completed','architecture') "
+            "WHERE t.is_active AND t.type NOT IN ('idea','completed','architecture') "
             "ORDER BY t.type, t.title",
         ).fetchall()
         tasks_by_type: dict[str, list] = {}
@@ -263,14 +273,12 @@ def get_scheduler_state() -> dict:
 
         # Stuck candidates: open session + no budget entry in last 10 min
         stuck = []
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.now(timezone.utc)
         for row in active_rows:
             tid = row["task_id"]
-            last_entry = conn.execute(
-                "SELECT created_at FROM budget_entries WHERE task_id=? ORDER BY id DESC LIMIT 1",
-                (tid,),
-            ).fetchone()
-            if last_entry is None:
+            last_activity = row["last_activity"]
+
+            if last_activity is None:
                 stuck.append({
                     "task_id": tid,
                     "agent_type": row["agent_type"],
@@ -280,16 +288,16 @@ def get_scheduler_state() -> dict:
                 })
             else:
                 try:
-                    last_dt = datetime.fromisoformat(last_entry["created_at"].replace(" ", "T"))
+                    last_dt = datetime.fromisoformat(last_activity.replace(" ", "T"))
                     if last_dt.tzinfo is None:
                         last_dt = last_dt.replace(tzinfo=timezone.utc)
-                    age_min = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
+                    age_min = (now - last_dt).total_seconds() / 60
                     if age_min > 10:
                         stuck.append({
                             "task_id": tid,
                             "agent_type": row["agent_type"],
                             "session_started": row["started_at"],
-                            "last_budget_entry": last_entry["created_at"],
+                            "last_budget_entry": last_activity,
                             "idle_minutes": round(age_min, 1),
                             "note": "active session but no LLM call in >10 min",
                         })
@@ -352,7 +360,7 @@ def list_tasks(project: str = None, type: str = None) -> list:
         query = (
             "SELECT t.id, t.title, t.type, p.name AS project "
             "FROM tasks t LEFT JOIN projects p ON t.project_id = p.id "
-            "WHERE t.is_active=1"
+            "WHERE t.is_active"
         )
         params: list = []
         if project:
@@ -421,26 +429,31 @@ def find_stuck_tasks(idle_minutes: int = 10) -> list:
     """
     conn = get_conn()
     try:
-        # One row per task: latest open session only (avoids zombie duplicates)
-        active_rows = conn.execute(
-            "SELECT s.task_id, s.agent_type, s.started_at, t.title, t.type, p.name AS project "
-            "FROM agent_sessions s "
-            "JOIN tasks t ON s.task_id=t.id "
-            "LEFT JOIN projects p ON t.project_id=p.id "
-            "WHERE s.ended_at IS NULL "
-            "AND s.id = (SELECT MAX(id) FROM agent_sessions WHERE task_id=s.task_id AND ended_at IS NULL) "
-            "ORDER BY s.id DESC",
-        ).fetchall()
+        # Batch JOIN: active sessions + title/type/project + latest activity timestamp.
+        # GROUP BY is handled by the subquery to ensure one row per unique task_id.
+        rows = conn.execute("""
+            SELECT s.task_id, s.agent_type, s.started_at, t.title, t.type, p.name AS project,
+                   be.last_activity
+            FROM agent_sessions s
+            JOIN tasks t ON s.task_id = t.id
+            LEFT JOIN projects p ON t.project_id = p.id
+            LEFT JOIN (
+                SELECT task_id, MAX(created_at) AS last_activity
+                FROM budget_entries
+                GROUP BY task_id
+            ) be ON be.task_id = s.task_id
+            WHERE s.ended_at IS NULL
+            AND s.id = (SELECT MAX(id) FROM agent_sessions WHERE task_id=s.task_id AND ended_at IS NULL)
+            ORDER BY s.id DESC
+        """).fetchall()
 
         result = []
-        for row in active_rows:
+        now = datetime.now(timezone.utc)
+        for row in rows:
             tid = row["task_id"]
-            last_entry = conn.execute(
-                "SELECT created_at FROM budget_entries WHERE task_id=? ORDER BY id DESC LIMIT 1",
-                (tid,),
-            ).fetchone()
+            last_activity = row["last_activity"]
 
-            if last_entry is None:
+            if last_activity is None:
                 result.append({
                     "task_id": tid,
                     "title": row["title"],
@@ -455,10 +468,10 @@ def find_stuck_tasks(idle_minutes: int = 10) -> list:
                 continue
 
             try:
-                last_dt = datetime.fromisoformat(last_entry["created_at"].replace(" ", "T"))
+                last_dt = datetime.fromisoformat(last_activity.replace(" ", "T"))
                 if last_dt.tzinfo is None:
                     last_dt = last_dt.replace(tzinfo=timezone.utc)
-                age_min = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
+                age_min = (now - last_dt).total_seconds() / 60
                 if age_min >= idle_minutes:
                     result.append({
                         "task_id": tid,
@@ -467,7 +480,7 @@ def find_stuck_tasks(idle_minutes: int = 10) -> list:
                         "project": row["project"],
                         "agent_type": row["agent_type"],
                         "session_started": row["started_at"],
-                        "last_budget_entry": last_entry["created_at"],
+                        "last_budget_entry": last_activity,
                         "idle_minutes": round(age_min, 1),
                         "status": "idle",
                     })
@@ -657,7 +670,7 @@ def list_pending_merges(project: str = None) -> list:
             FROM tasks t
             LEFT JOIN projects p ON t.project_id = p.id
             LEFT JOIN merge_records mr ON mr.task_id = t.id
-            WHERE t.is_active = 1
+            WHERE t.is_active
               AND t.type = 'completed'
               AND (mr.id IS NULL OR mr.merge_commit_sha IS NULL)
         """
@@ -708,30 +721,41 @@ def get_project_health(project: str = None) -> dict:
         stage_rows = conn.execute(
             "SELECT t.type, COUNT(*) AS cnt "
             "FROM tasks t LEFT JOIN projects p ON t.project_id = p.id "
-            f"WHERE t.is_active = 1{proj_filter} "
+            f"WHERE t.is_active{proj_filter} "
             "GROUP BY t.type ORDER BY t.type",
             params,
         ).fetchall()
         stage_dist = {r["type"]: r["cnt"] for r in stage_rows}
 
-        # Active sessions
-        active_rows = conn.execute(
-            "SELECT s.task_id, t.title, t.type, p.name AS project, s.agent_type, s.started_at "
-            "FROM agent_sessions s "
-            "JOIN tasks t ON s.task_id = t.id "
-            "LEFT JOIN projects p ON t.project_id = p.id "
-            f"WHERE s.ended_at IS NULL{proj_filter.replace('p.name', 'p.name')} "
-            "AND s.id = (SELECT MAX(id) FROM agent_sessions WHERE task_id = s.task_id AND ended_at IS NULL) "
-            "ORDER BY s.started_at DESC",
-            params,
-        ).fetchall()
-        active_sessions = [dict(r) for r in active_rows]
+        # Active sessions with latest activity JOIN
+        active_rows = conn.execute(f"""
+            SELECT s.task_id, t.title, t.type, p.name AS project, s.agent_type, s.started_at,
+                   be.last_activity
+            FROM agent_sessions s
+            JOIN tasks t ON s.task_id = t.id
+            LEFT JOIN projects p ON t.project_id = p.id
+            LEFT JOIN (
+                SELECT task_id, MAX(created_at) AS last_activity
+                FROM budget_entries
+                GROUP BY task_id
+            ) be ON be.task_id = s.task_id
+            WHERE s.ended_at IS NULL{proj_filter}
+            AND s.id = (SELECT MAX(id) FROM agent_sessions WHERE task_id = s.task_id AND ended_at IS NULL)
+            ORDER BY s.started_at DESC
+        """, params).fetchall()
+        active_sessions = [
+            {
+                "task_id": r["task_id"], "title": r["title"], "type": r["type"],
+                "project": r["project"], "agent_type": r["agent_type"], "started_at": r["started_at"]
+            }
+            for r in active_rows
+        ]
 
         # Recent demotions (last 24 h) — tasks whose demotion_count > 0 and updated recently
         demotion_rows = conn.execute(
             "SELECT t.id, t.title, t.type, p.name AS project, t.demotion_count, t.updated_at "
             "FROM tasks t LEFT JOIN projects p ON t.project_id = p.id "
-            f"WHERE t.is_active = 1 AND t.demotion_count > 0{proj_filter} "
+            f"WHERE t.is_active AND t.demotion_count > 0{proj_filter} "
             f"AND t.updated_at >= {_date_ago(1, 'day')} "
             "ORDER BY t.updated_at DESC",
             params,
@@ -743,7 +767,7 @@ def get_project_health(project: str = None) -> dict:
             "SELECT COUNT(*) AS cnt FROM tasks t "
             "LEFT JOIN projects p ON t.project_id = p.id "
             "LEFT JOIN merge_records mr ON mr.task_id = t.id "
-            f"WHERE t.is_active = 1 AND t.type = 'completed'"
+            f"WHERE t.is_active AND t.type = 'completed'"
             f"{proj_filter} AND (mr.id IS NULL OR mr.merge_commit_sha IS NULL)"
         )
         pending_merges = conn.execute(merge_query, params).fetchone()["cnt"]
@@ -762,23 +786,19 @@ def get_project_health(project: str = None) -> dict:
 
         # Stuck candidates: open session, no budget entry in last 10 min
         stuck = []
+        now = datetime.now(timezone.utc)
         for row in active_rows:
             tid = row["task_id"]
-            last_entry = conn.execute(
-                "SELECT created_at FROM budget_entries WHERE task_id = ? "
-                "ORDER BY id DESC LIMIT 1",
-                (tid,),
-            ).fetchone()
-            if last_entry is None:
+            last_activity = row["last_activity"]
+            if last_activity is None:
                 stuck.append({"task_id": tid, "title": row["title"],
                                "idle_minutes": None, "note": "no LLM calls yet"})
                 continue
             try:
-                from datetime import datetime, timezone
-                last_dt = datetime.fromisoformat(last_entry["created_at"].replace(" ", "T"))
+                last_dt = datetime.fromisoformat(last_activity.replace(" ", "T"))
                 if last_dt.tzinfo is None:
                     last_dt = last_dt.replace(tzinfo=timezone.utc)
-                age_min = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
+                age_min = (now - last_dt).total_seconds() / 60
                 if age_min > 10:
                     stuck.append({"task_id": tid, "title": row["title"],
                                   "idle_minutes": round(age_min, 1),
@@ -822,7 +842,7 @@ def get_project_diagnostic(project: str, limit: int = 15) -> dict:
         # 2. Stage Distribution (Active Only)
         stage_rows = conn.execute(
             "SELECT type, COUNT(*) as cnt FROM tasks "
-            "WHERE project_id = ? AND is_active = 1 GROUP BY type",
+            "WHERE project_id = ? AND is_active GROUP BY type",
             (project_id,)
         ).fetchall()
         stage_dist = {r["type"]: r["cnt"] for r in stage_rows}
@@ -955,7 +975,7 @@ def preview_dispatch(project: str = None) -> dict:
             "       t.position, t.clarification_status, t.intake_exhausted_at, "
             "       p.name AS project, p.id AS project_id "
             "FROM tasks t LEFT JOIN projects p ON t.project_id = p.id "
-            "WHERE t.is_active=1",
+            "WHERE t.is_active",
         ).fetchall()
 
         if project:

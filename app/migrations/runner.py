@@ -9,6 +9,7 @@ Usage:
     python app/migrations/runner.py reset     — drop all, re-migrate, seed sample data
 """
 
+import hashlib
 import importlib.util
 import os
 import sys
@@ -25,6 +26,15 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.agent.config import ADMIN_DATABASE_URL
 
 MIGRATIONS_DIR = Path(__file__).parent / "versions"
+
+
+def _find_migration_file(migration_id: str) -> "Path | None":
+    matches = list(MIGRATIONS_DIR.glob(f"{migration_id}_*.py"))
+    return matches[0] if matches else None
+
+
+def _file_checksum(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 # ---------------------------------------------------------------------------
 # Connection helpers
@@ -244,9 +254,35 @@ def ensure_migrations_table(conn_wrapper) -> None:
     conn_wrapper.execute("""
         CREATE TABLE IF NOT EXISTS schema_migrations (
             migration_id TEXT PRIMARY KEY,
-            applied_at   TIMESTAMP NOT NULL
+            applied_at   TIMESTAMP NOT NULL,
+            checksum     TEXT
         )
     """)
+    # Upgrade: add checksum column to installations predating this feature.
+    # Both PG (9.6+) and SQLite (3.37+) support IF NOT EXISTS here.
+    try:
+        conn_wrapper.execute(
+            "ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum TEXT"
+        )
+    except Exception:
+        pass  # already present — older SQLite raises, that's fine
+    _backfill_checksums(conn_wrapper)
+
+
+def _backfill_checksums(conn_wrapper) -> None:
+    """Fill checksum for any applied migration that was recorded before this feature existed."""
+    res = conn_wrapper.execute(
+        "SELECT migration_id FROM schema_migrations WHERE checksum IS NULL"
+    )
+    rows = conn_wrapper.fetchall(res)
+    for row in rows:
+        path = _find_migration_file(row["migration_id"])
+        if path is None:
+            continue
+        conn_wrapper.execute(
+            "UPDATE schema_migrations SET checksum = :chk WHERE migration_id = :mid",
+            {"chk": _file_checksum(path), "mid": row["migration_id"]},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -315,9 +351,15 @@ def migrate(conn_wrapper) -> None:
         print(f"  Applying {migration_id}: {desc} ...", end=" ", flush=True)
         try:
             mod.up(conn_wrapper)
+            path = _find_migration_file(migration_id)
             conn_wrapper.execute(
-                "INSERT INTO schema_migrations (migration_id, applied_at) VALUES (:mid, :at)",
-                {"mid": migration_id, "at": datetime.now(timezone.utc)}
+                "INSERT INTO schema_migrations (migration_id, applied_at, checksum) "
+                "VALUES (:mid, :at, :chk)",
+                {
+                    "mid": migration_id,
+                    "at": datetime.now(timezone.utc),
+                    "chk": _file_checksum(path) if path else None,
+                },
             )
             print("done")
         except Exception as e:
@@ -358,23 +400,40 @@ def status(conn_wrapper) -> None:
     """Print the status of every known migration."""
     ensure_migrations_table(conn_wrapper)
     res = conn_wrapper.execute(
-        "SELECT migration_id, applied_at FROM schema_migrations ORDER BY migration_id"
+        "SELECT migration_id, applied_at, checksum FROM schema_migrations ORDER BY migration_id"
     )
     applied_rows = conn_wrapper.fetchall(res)
-    applied_map = {row["migration_id"]: row["applied_at"] for row in applied_rows}
+    applied_map = {
+        row["migration_id"]: (row["applied_at"], row["checksum"])
+        for row in applied_rows
+    }
     all_migrations = get_all_migrations()
 
-    print(f"{'ID':<8}  {'Status':<10}  {'Applied At':<26}  Description")
-    print("-" * 80)
+    tampered = []
+    print(f"{'ID':<8}  {'Status':<12}  {'Applied At':<26}  Description")
+    print("-" * 84)
     for migration_id, mod in all_migrations:
         desc = getattr(mod, "description", "")
         if migration_id in applied_map:
-            state = "applied"
-            applied_at = str(applied_map[migration_id])
+            applied_at, stored_chk = applied_map[migration_id]
+            path = _find_migration_file(migration_id)
+            if stored_chk and path and _file_checksum(path) != stored_chk:
+                state = "TAMPERED"
+                tampered.append(migration_id)
+            else:
+                state = "applied"
+            applied_at_str = str(applied_at)
         else:
             state = "pending"
-            applied_at = ""
-        print(f"{migration_id:<8}  {state:<10}  {applied_at:<26}  {desc}")
+            applied_at_str = ""
+        print(f"{migration_id:<8}  {state:<12}  {applied_at_str:<26}  {desc}")
+
+    if tampered:
+        print()
+        print(f"WARNING: {len(tampered)} migration file(s) modified after being applied:")
+        for mid in tampered:
+            print(f"  {mid}  — stored checksum does not match current file")
+        print("  Applied migrations must not be edited. Add a new migration instead.")
 
     # Warn about orphaned applied entries (migration file deleted)
     known_ids = {mid for mid, _ in all_migrations}

@@ -694,6 +694,28 @@ def _sanitize_messages(messages: list[dict]) -> list[dict]:
     result = []
     for i, msg in enumerate(messages):
         content = msg.get("content")
+
+        # Multi-part (Anthropic-style list) content: sanitize each text block.
+        if isinstance(content, list):
+            new_blocks = []
+            changed_block = False
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    txt = block.get("text", "")
+                    sanitized = txt
+                    for raw, safe in _XML_TOOL_PAIRS:
+                        sanitized = sanitized.replace(raw, safe)
+                    for raw, safe in _JINJA2_PAIRS:
+                        sanitized = sanitized.replace(raw, safe)
+                    if sanitized != txt:
+                        block = {**block, "text": sanitized}
+                        changed_block = True
+                new_blocks.append(block)
+            if changed_block:
+                msg = {**msg, "content": new_blocks}
+            result.append(msg)
+            continue
+
         if not isinstance(content, str):
             result.append(msg)
             continue

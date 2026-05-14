@@ -295,7 +295,7 @@ class PlanningResult(Base):
     gate_checks = Column(Text, nullable=True)   # JSON: [{name, passed, hard_fail, detail}]
     error_message = Column(Text, nullable=True)  # set on status='failed' rows
     content_hash = Column(String, nullable=True)   # SHA256(title || description) at run time
-    was_gate_passed = Column(Integer, nullable=False, default=0)  # 1 = gate passed; enables cache reuse
+    was_gate_passed = Column(Boolean, nullable=False, default=False)
     confidence = Column(Integer, default=0)
     prompt_tokens = Column(Integer, default=0)
     completion_tokens = Column(Integer, default=0)

@@ -323,8 +323,8 @@ def unpark_session(session_key: str, llm_id: int) -> None:
 
 # Hung session recovery: kill sessions that are alive but have made no LLM call recently.
 # Min age prevents false positives on brand-new sessions still in their survey/setup phase.
-_HUNG_SESSION_MIN_AGE_SECONDS = 600   # 10 min
-_HUNG_SESSION_IDLE_SECONDS    = 1800  # 30 min — kill if no LLM call in this window
+_HUNG_SESSION_MIN_AGE_SECONDS = 60    # 1 min — allow brief startup/survey phase
+_HUNG_SESSION_IDLE_SECONDS    = 300   # 5 min — kill if no LLM call in this window
 
 # task_id -> timestamp of last failed dispatch (cooldown to avoid retry storms)
 _failed_cooldowns: dict[str, float] = {}
@@ -492,6 +492,16 @@ def stop_scheduler(wait_for_sessions: bool = True, timeout: float = 60.0) -> Non
                 "Scheduler shutdown: %d thread(s) did not exit after force shutdown: %s",
                 len(survivors), ", ".join(survivors),
             )
+
+    # Close any DB agent_session rows that threads left open (force-killed threads
+    # never reach their own finally blocks, so their ended_at stays NULL).
+    try:
+        from app.database import close_zombie_sessions_for_tasks
+        closed = close_zombie_sessions_for_tasks(exclude_task_ids=set())
+        if closed:
+            logger.info("Scheduler shutdown: closed %d orphaned DB session(s).", closed)
+    except Exception:
+        logger.exception("Scheduler shutdown: failed to close orphaned DB sessions.")
 
     logger.info("Scheduler stopped.")
 
@@ -4670,20 +4680,20 @@ def _cleanup_finished() -> None:
         _llm_session_counts.clear()
         _llm_session_counts.update(new_counts)
 
-    # When threads actually died, reconcile DB state: close any open agent_sessions
-    # whose task_id is no longer in the alive set (crash-recovery for zombie rows).
-    if finished:
-        with _active_sessions_lock:
-            _alive_ids = set(_active_sessions.keys())
-        with _external_sessions_lock:
-            _alive_ids.update(_external_sessions.keys())
-        try:
-            from app.database import close_zombie_sessions_for_tasks
-            closed = close_zombie_sessions_for_tasks(exclude_task_ids=_alive_ids)
-            if closed:
-                logger.info("[scheduler] Closed %d zombie DB session(s) for dead threads.", closed)
-        except Exception:
-            logger.exception("[scheduler] Failed to reconcile zombie DB sessions.")
+    # Reconcile DB state — close any open agent_sessions whose task_id is no
+    # longer in the alive set (crash-recovery for zombie rows).
+    # This runs every tick to ensure first-tick recovery after a restart.
+    with _active_sessions_lock:
+        _alive_ids = set(_active_sessions.keys())
+    with _external_sessions_lock:
+        _alive_ids.update(_external_sessions.keys())
+    try:
+        from app.database import close_zombie_sessions_for_tasks
+        closed = close_zombie_sessions_for_tasks(exclude_task_ids=_alive_ids)
+        if closed:
+            logger.info("[scheduler] Closed %d zombie DB session(s).", closed)
+    except Exception:
+        logger.exception("[scheduler] Failed to reconcile zombie DB sessions.")
 
 
 def cancel_task_sessions(task_ids: list[str]) -> None:
