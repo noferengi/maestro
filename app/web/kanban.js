@@ -63,6 +63,7 @@ let transitionPollers = {};
 // Inbox
 let inboxMessages = [];
 let _inboxUnreadCount = 0;
+let _inboxHasNeedsHuman = false;
 let _inboxPollInterval = null;
 
 // Big Idea zoom state
@@ -799,26 +800,87 @@ async function populateArchBar() {
     if (!currentProject) return;
     const btn = document.getElementById('arch-bar-populate');
     if (!btn || btn.disabled) return;
-    btn.disabled = true;
-    const orig = btn.textContent;
-    btn.textContent = '…';
+
     try {
-        const r = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/populate-arch`, { method: 'POST' });
+        const r = await fetch(`${API_BASE}/projects/${encodeURIComponent(currentProject)}/populate-arch/preview`);
         const data = await r.json();
         if (!r.ok) throw new Error(data.detail || 'Error');
-        if (data.queued === 0) {
-            btn.textContent = 'All done';
-        } else {
-            btn.textContent = `Queued ${data.queued}`;
-        }
+
+        showArchPopulateModal(data);
     } catch (e) {
-        btn.textContent = 'Error';
-        console.error('populateArchBar:', e);
-    } finally {
+        console.error('populateArchBar preview:', e);
+        showToast('Could not fetch preview: ' + e.message, 'error');
+    }
+}
+
+function showArchPopulateModal(data) {
+    const modal = document.getElementById('arch-populate-modal');
+    const body = document.getElementById('arch-populate-modal-body');
+    const confirmBtn = document.getElementById('arch-populate-confirm-btn');
+
+    let html = '';
+    if (!data.has_file_summaries || data.file_summary_count < 3) {
+        html += `
+            <div style="background:#fff3cd; color:#856404; padding:12px; border-radius:4px; margin-bottom:15px; border:1px solid #ffeeba; font-size: 0.85rem;">
+                <strong>⚠ Limited Context:</strong> This project has only ${data.file_summary_count} file summaries. 
+                Architecture generation works best with more project context. Consider adding source files or a 
+                project description first. Proceed anyway?
+            </div>`;
+    }
+
+    if (data.categories_to_generate.length === 0) {
+        html += `<p style="font-size: 0.9rem;">All architecture categories have already been generated or are currently in progress.</p>`;
+        confirmBtn.style.display = 'none';
+    } else {
+        html += `<p style="font-size: 0.9rem;">The following categories will be analyzed and generated:</p>`;
+        html += `<ul style="margin-top:10px; padding-left:20px; font-size: 0.85rem; color: #495057;">`;
+        data.categories_to_generate.forEach(cat => {
+            html += `<li><strong>${escapeHtml(cat)}</strong></li>`;
+        });
+        html += `</ul>`;
+        confirmBtn.style.display = 'inline-block';
+        confirmBtn.onclick = () => executePopulateArch();
+    }
+
+    body.innerHTML = html;
+    modal.classList.add('active');
+}
+
+async function executePopulateArch() {
+    const modal = document.getElementById('arch-populate-modal');
+    const confirmBtn = document.getElementById('arch-populate-confirm-btn');
+    const body = document.getElementById('arch-populate-modal-body');
+
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = 'Queueing...';
+
+    try {
+        const r = await fetch(`${API_BASE}/projects/${encodeURIComponent(currentProject)}/populate-arch`, { method: 'POST' });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || 'Error');
+        
+        body.innerHTML = `<div style="text-align:center; padding:20px">
+            <div style="font-size:2rem; margin-bottom:10px">✅</div>
+            <p style="font-size: 1rem;">Queued <strong>${data.queued}</strong> generation jobs.</p>
+        </div>`;
+        confirmBtn.style.display = 'none';
+        
+        // Refresh jobs after a short delay
         setTimeout(() => {
-            btn.disabled = false;
-            btn.textContent = orig;
-        }, 3000);
+            loadArchGenJobs().catch(() => {});
+        }, 500);
+
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+    } finally {
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = 'Generate';
+        // Auto close after 2 seconds on success
+        if (!confirmBtn.style.display || confirmBtn.style.display === 'inline-block') {
+            // Error case or nothing happened
+        } else {
+            setTimeout(() => modal.classList.remove('active'), 2000);
+        }
     }
 }
 
@@ -897,9 +959,18 @@ function renderArchBar() {
 
     // Apply collapsed state
     const bar = document.getElementById('arch-bar');
-    if (bar) bar.classList.toggle('collapsed', _archBarCollapsed);
     const btn = document.getElementById('arch-bar-toggle');
-    if (btn) btn.textContent = _archBarCollapsed ? '\u25BC' : '\u25B2';
+    
+    // Auto-collapse if empty and no jobs pending, BUT do not persist to localStorage
+    // Re-expands automatically if items are added because _archBarCollapsed remains at user's manual preference.
+    const isAutoCollapse = (archTasks.length === 0 && _archGenJobs.length === 0);
+    const displayCollapsed = isAutoCollapse || _archBarCollapsed;
+
+    if (bar) bar.classList.toggle('collapsed', displayCollapsed);
+    if (btn) {
+        btn.style.display = isAutoCollapse ? 'none' : '';
+        btn.textContent = displayCollapsed ? '\u25BC' : '\u25B2';
+    }
 }
 
 // Sort a single column's cards into position order using the cache.
@@ -2011,17 +2082,31 @@ function _refreshJobIndicators(schedulerData) {
 
         let html = '';
         if (activeMap[taskId]) {
-            const llm = activeMap[taskId].llm_name || '';
-            html = `<span class="ji-dot"></span><span class="ji-label">Running${llm ? ' \u00b7 ' + escapeHtml(llm) : ''}</span>`;
-            el.className = 'card-job-indicator ji-running';
+            const item = activeMap[taskId];
+            const llm = item.llm_name || '';
+            if (item.zombie) {
+                const idle = item.idle_minutes > 60 
+                    ? Math.round(item.idle_minutes/60) + 'h' 
+                    : Math.round(item.idle_minutes) + 'm';
+                html = `<span class="ji-dot"></span><span class="ji-label">Zombie \u00b7 ${idle} idle</span>`;
+                el.className = 'card-job-indicator ji-zombie';
+            } else {
+                html = `<span class="ji-dot"></span><span class="ji-label">Running${llm ? ' \u00b7 ' + escapeHtml(llm) : ''}</span>`;
+                el.className = 'card-job-indicator ji-running';
+            }
         } else if (stoppedMap[taskId]) {
             const reason = stoppedMap[taskId].reason || 'planning failed';
             html = `<span class="ji-dot"></span><span class="ji-label">Stopped \u00b7 ${escapeHtml(reason)}</span>`;
             el.className = 'card-job-indicator ji-stopped';
         } else if (queuedMap[taskId]) {
             const reason = queuedMap[taskId].reason || 'pending';
-            html = `<span class="ji-dot"></span><span class="ji-label">Queued \u00b7 ${escapeHtml(reason)}</span>`;
-            el.className = 'card-job-indicator ji-queued';
+            if (reason === 'awaiting_approval') {
+                html = `<span class="ji-dot"></span><span class="ji-label">Awaiting approval</span>`;
+                el.className = 'card-job-indicator ji-queued-human';
+            } else {
+                html = `<span class="ji-dot"></span><span class="ji-label">Queued \u00b7 ${escapeHtml(reason)}</span>`;
+                el.className = 'card-job-indicator ji-queued';
+            }
         } else {
             el.className = 'card-job-indicator';
         }
@@ -3250,7 +3335,17 @@ function createTaskCard(id, title, tags, owner, status) {
         : '';
 
     const _isStarred = Boolean((taskData[id] || {}).is_starred);
+
+    // Initiative 4 — Card Visual Differentiation stripes
+    let stripeHtml = '';
+    if (status === 'human_review') {
+        stripeHtml = '<div class="card-stripe card-stripe-review">⚠ Review Required</div>';
+    } else if (status === 'completed') {
+        stripeHtml = '<div class="card-stripe card-stripe-completed">✓ Completed</div>';
+    }
+
     card.innerHTML = `
+        ${stripeHtml}
         <button class="card-highlight-btn" title="${_isStarred ? 'Unstar (remove priority boost)' : 'Star (boost scheduler priority)'}" onclick="event.stopPropagation();toggleHighlight('${id}')">${_isStarred ? '\u2605' : '\u2606'}</button>
         ${parentLink}
         <div class="task-title"${isBigIdea ? ` onclick="zoomIntoBigIdea('${id}')" style="cursor:pointer"` : ''}>${title}${rejBadge}${processingSpinner}${subdivBadge}${bigIdeaBadge}${contractIndicator}${pipBadge}</div>
@@ -3280,8 +3375,7 @@ function createTaskCard(id, title, tags, owner, status) {
             <span class="toolbar-sep"></span>
             <button class="toolbar-btn" title="Run Agent — start MaestroLoop" onclick="event.stopPropagation();runAgentFromToolbar('${id}')">▶</button>
             <button class="toolbar-btn" title="Stop Agent — request graceful halt" onclick="event.stopPropagation();toolbarStopAgent('${id}')">⏹</button>
-            <button class="toolbar-btn" title="Demote — move one stage backward" onclick="event.stopPropagation();toolbarDemote('${id}')">↩</button>
-            <button class="toolbar-btn" title="Set Stage — move to any pipeline stage" onclick="event.stopPropagation();toolbarStagePicker('${id}',this)">⚙</button>
+            <!-- Stage management demoted to overflow menu -->
             <span class="toolbar-sep"></span>
             <button class="toolbar-btn" title="Open in Diagnostics" onclick="event.stopPropagation();toolbarOpenDiagnostics('${id}')">📊</button>
             <button class="toolbar-btn" title="Card Story — agent session timeline" onclick="event.stopPropagation();toolbarOpenStory('${id}')">📜</button>
@@ -3297,6 +3391,18 @@ function createTaskCard(id, title, tags, owner, status) {
             <button class="action-btn action-btn-danger" onclick="deleteTask('${id}')">Delete</button>
         </div>
     `;
+
+    // Initiative 4 — Card overflow button
+    const overflowBtn = document.createElement('button');
+    overflowBtn.className = 'card-overflow-btn';
+    overflowBtn.innerHTML = '&#8942;'; // vertical ellipsis
+    overflowBtn.title = 'Advanced actions';
+    overflowBtn.onclick = (e) => {
+        e.stopPropagation();
+        _showCardOverflowMenu(id, overflowBtn);
+    };
+    card.appendChild(overflowBtn);
+
     _applyHighlightState(card, id);
 
     // Make rejected/failed cards clickable to open transition detail
@@ -3304,7 +3410,7 @@ function createTaskCard(id, title, tags, owner, status) {
         card.style.cursor = 'pointer';
         card.addEventListener('click', (e) => {
             // Don't open overlay if a button was clicked
-            if (e.target.closest('.action-btn')) return;
+            if (e.target.closest('.action-btn, .card-overflow-btn, .toolbar-btn')) return;
             openTransitionModal(id);
         });
     }
@@ -3312,14 +3418,14 @@ function createTaskCard(id, title, tags, owner, status) {
     const ready = canTaskAdvance(id);
 
     if (status === 'subdividing') {
-        // Subdividing — always show View + Edit + View Children + Delete; Advance if ready
+        // Subdividing — always show View + Edit + View Children; Advance if ready
         const actionsDiv = card.querySelector('.task-actions');
         actionsDiv.innerHTML = `
             <button class="action-btn" onclick="viewTask('${id}')">View</button>
             <button class="action-btn" onclick="editTask('${id}')">Edit</button>
             <button class="action-btn" onclick="viewChildren('${id}')">View Children</button>
-            <button class="action-btn action-btn-danger" onclick="deleteTask('${id}')">Delete</button>
         `;
+        // Delete demoted to overflow implicitly via Advanced... (or for all if we want)
         if (canTaskAdvance(id)) {
             const advBtn = document.createElement('button');
             advBtn.className = 'action-btn action-btn-advance';
@@ -3376,13 +3482,15 @@ function createTaskCard(id, title, tags, owner, status) {
         }
     } else if (status === 'human_review') {
         const actionsDiv = card.querySelector('.task-actions');
+        // Replace actions with full-width Accept & Merge
+        actionsDiv.innerHTML = '';
         const mergeBtn = document.createElement('button');
-        mergeBtn.className = 'action-btn action-btn-advance';
+        mergeBtn.className = 'action-btn action-btn-advance full-width';
         mergeBtn.textContent = 'Accept & Merge';
         mergeBtn.onclick = async (e) => {
             e.stopPropagation();
             if (!await showConfirm('Accept & Merge',
-                `Run the git merge pipeline for "${task.title}" and mark it COMPLETED?`,
+                `Run the git merge pipeline for "${taskObj.title}" and mark it COMPLETED?`,
                 'Accept & Merge')) return;
             const r = await fetch(`${API_BASE}/tasks/${id}/merge`, { method: 'POST' });
             const d = await r.json().catch(() => ({}));
@@ -3410,49 +3518,150 @@ function createTaskCard(id, title, tags, owner, status) {
         };
         actionsDiv.appendChild(advanceBtn);
     } else if (status === 'completed') {
-        const viewBtn = card.querySelector('.task-actions');
-        viewBtn.innerHTML = `<button class="action-btn" onclick="viewTaskHistory('${id}')">View Proof</button>
-                             <button class="action-btn action-btn-warn" onclick="unmergeTask('${id}')">Unmerge</button>
-                             <button class="action-btn action-btn-danger" onclick="deleteTask('${id}')">Delete</button>`;
+        const actionsDiv = card.querySelector('.task-actions');
+        actionsDiv.innerHTML = `<button class="action-btn action-btn-primary full-width" onclick="viewTaskHistory('${id}')">View Proof</button>`;
+        // Unmerge and Delete demoted to overflow
     } else if (status === 'architecture') {
-        const editBtn = card.querySelector('.task-actions');
-        if (editBtn) {
-            editBtn.innerHTML = `<button class="action-btn" onclick="editArchitectureTask('${id}')">Edit</button>
+        const actionsDiv = card.querySelector('.task-actions');
+        if (actionsDiv) {
+            actionsDiv.innerHTML = `<button class="action-btn" onclick="editArchitectureTask('${id}')">Edit</button>
                                  <button class="action-btn action-btn-danger" onclick="deleteTask('${id}')">Delete</button>`;
         }
     }
 
-    // Research Jobs button — available on any status that can have research (not idea/subdividing/architecture)
-    if (status !== 'idea' && status !== 'subdividing' && status !== 'architecture') {
-        const researchBtn = document.createElement('button');
-        researchBtn.className = 'action-btn';
-        researchBtn.textContent = 'Research Jobs';
-        researchBtn.onclick = (e) => { e.stopPropagation(); viewResearchJobs(id); };
-        card.querySelector('.task-actions').appendChild(researchBtn);
-    }
+    // Initiative 4 — Research/Benchmarks/Reports are hidden from card body for COMPLETED tasks
+    if (status !== 'completed') {
+        // Research Jobs button — available on any status that can have research (not idea/subdividing/architecture)
+        if (status !== 'idea' && status !== 'subdividing' && status !== 'architecture') {
+            const researchBtn = document.createElement('button');
+            researchBtn.className = 'action-btn';
+            researchBtn.textContent = 'Research Jobs';
+            researchBtn.onclick = (e) => { e.stopPropagation(); viewResearchJobs(id); };
+            card.querySelector('.task-actions').appendChild(researchBtn);
+        }
 
-    // Benchmarks button — visible once optimization stage has run
-    if (status === 'optimization' || status === 'security' || status === 'human_review' || status === 'completed') {
-        const benchBtn = document.createElement('button');
-        benchBtn.className = 'action-btn';
-        benchBtn.textContent = 'Benchmarks';
-        benchBtn.onclick = (e) => { e.stopPropagation(); viewBenchmarks(id); };
-        card.querySelector('.task-actions').appendChild(benchBtn);
-    }
+        // Benchmarks button — visible once optimization stage has run
+        if (status === 'optimization' || status === 'security' || status === 'human_review') {
+            const benchBtn = document.createElement('button');
+            benchBtn.className = 'action-btn';
+            benchBtn.textContent = 'Benchmarks';
+            benchBtn.onclick = (e) => { e.stopPropagation(); viewBenchmarks(id); };
+            card.querySelector('.task-actions').appendChild(benchBtn);
+        }
 
-    // Reports button — always present on pipeline cards; opens Stage Journal
-    if (status !== 'architecture') {
-        const reportsBtn = document.createElement('button');
-        reportsBtn.className = 'action-btn action-btn-reports';
-        reportsBtn.textContent = 'Reports';
-        reportsBtn.onclick = (e) => { e.stopPropagation(); openStageJournal(id); };
-        card.querySelector('.task-actions').appendChild(reportsBtn);
+        // Reports button — always present on pipeline cards; opens Stage Journal
+        if (status !== 'architecture') {
+            const reportsBtn = document.createElement('button');
+            reportsBtn.className = 'action-btn action-btn-reports';
+            reportsBtn.textContent = 'Reports';
+            reportsBtn.onclick = (e) => { e.stopPropagation(); openStageJournal(id); };
+            card.querySelector('.task-actions').appendChild(reportsBtn);
+        }
     }
 
     card.addEventListener('dragstart', handleDragStart);
     card.addEventListener('dragend', handleDragEnd);
 
     return card;
+}
+
+/**
+ * Show a flyout menu with advanced actions for a card.
+ */
+function _showCardOverflowMenu(taskId, anchorEl) {
+    const task = taskData[taskId];
+    if (!task) return;
+    const status = (task.type || '').toLowerCase();
+
+    // Remove any existing flyout
+    const existing = document.getElementById('_card-overflow-flyout');
+    if (existing) existing.remove();
+
+    const flyout = document.createElement('div');
+    flyout.id = '_card-overflow-flyout';
+    flyout.className = 'stage-picker-flyout'; // Reuse existing styles
+    flyout.style.minWidth = '160px';
+
+    const items = [];
+
+    // Common actions for all cards
+    items.push({ label: 'Edit Card', icon: '✎', action: () => editTask(taskId) });
+    
+    if (status === 'completed') {
+        items.push({ label: 'Unmerge Task', icon: '↩', action: () => unmergeTask(taskId), danger: true });
+    }
+
+    if (status !== 'architecture') {
+        items.push({ label: 'Clone Idea', icon: '⧉', action: () => toolbarClone(taskId) });
+    }
+
+    items.push({ label: 'Delete Card', icon: '×', action: () => deleteTask(taskId), danger: true });
+
+    items.push({ separator: true });
+
+    // Reports/Jobs (always available in overflow)
+    if (status !== 'architecture') {
+        items.push({ label: 'Stage Journal', icon: '📋', action: () => openStageJournal(taskId) });
+        items.push({ label: 'Research Jobs', icon: '🗂', action: () => viewResearchJobs(taskId) });
+        if (['optimization', 'security', 'human_review', 'completed'].includes(status)) {
+            items.push({ label: 'Benchmarks', icon: '📊', action: () => viewBenchmarks(taskId) });
+        }
+    }
+
+    items.push({ separator: true });
+
+    // Advanced Stage Controls (Initiative 4 follow-up)
+    items.push({ 
+        label: 'Advanced...', 
+        icon: '⚙', 
+        action: (e) => {
+            e.stopPropagation();
+            _removeCardOverflow();
+            toolbarStagePicker(taskId, anchorEl); // Re-open stage picker at the same spot
+        } 
+    });
+
+    items.forEach(item => {
+        if (item.separator) {
+            const hr = document.createElement('div');
+            hr.style.height = '1px';
+            hr.style.background = '#eee';
+            hr.style.margin = '0.2rem 0';
+            flyout.appendChild(hr);
+            return;
+        }
+        const btn = document.createElement('button');
+        btn.className = 'stage-picker-item';
+        if (item.danger) btn.style.color = '#dc3545';
+        btn.innerHTML = `<span style="display:inline-block;width:20px">${item.icon}</span> ${item.label}`;
+        btn.onclick = (e) => {
+            e.stopPropagation();
+            _removeCardOverflow();
+            item.action(e);
+        };
+        flyout.appendChild(btn);
+    });
+
+    document.body.appendChild(flyout);
+
+    const rect = anchorEl.getBoundingClientRect();
+    flyout.style.left = Math.min(window.innerWidth - 170, rect.left) + 'px';
+    flyout.style.top  = (rect.bottom + 4) + 'px';
+
+    // Close on outside click
+    setTimeout(() => {
+        document.addEventListener('click', function _closeOverflow(e) {
+            if (!flyout.contains(e.target)) {
+                _removeCardOverflow();
+                document.removeEventListener('click', _closeOverflow);
+            }
+        });
+    }, 0);
+}
+
+function _removeCardOverflow() {
+    const el = document.getElementById('_card-overflow-flyout');
+    if (el) el.remove();
 }
 
 // ============================================
@@ -4333,10 +4542,12 @@ function _renderSchedulerModal(data) {
 
 async function loadInbox() {
     try {
-        const resp = await fetch(`${API_BASE}/inbox`);
+        const resp = await fetch(`${API_BASE}/inbox?project=${encodeURIComponent(currentProject)}`);
         if (!resp.ok) return;
         inboxMessages = await resp.json();
         _inboxUnreadCount = inboxMessages.filter(m => !m.read).length;
+        // Check if any unread has source_type="needs_human"
+        _inboxHasNeedsHuman = inboxMessages.some(m => !m.read && m.source_type === 'needs_human');
         _updateInboxBadge();
     } catch (e) {
         console.error('[inbox] load failed:', e);
@@ -4345,22 +4556,33 @@ async function loadInbox() {
 
 async function refreshInboxBadge() {
     try {
-        const resp = await fetch(`${API_BASE}/inbox/unread-count`);
+        const resp = await fetch(`${API_BASE}/inbox/unread-count?project=${encodeURIComponent(currentProject)}`);
         if (!resp.ok) return;
-        const { count } = await resp.json();
-        _inboxUnreadCount = count;
+        const data = await resp.json();
+        _inboxUnreadCount = data.count;
+        _inboxHasNeedsHuman = data.has_needs_human;
         _updateInboxBadge();
     } catch (e) { /* silent */ }
 }
 
 function _updateInboxBadge() {
     const badge = document.getElementById('inbox-badge');
+    const btn = document.getElementById('inbox-btn');
     if (!badge) return;
+
     if (_inboxUnreadCount > 0) {
         badge.textContent = _inboxUnreadCount > 99 ? '99+' : String(_inboxUnreadCount);
         badge.style.display = 'flex';
     } else {
         badge.style.display = 'none';
+    }
+
+    if (btn) {
+        if (_inboxUnreadCount > 0 && _inboxHasNeedsHuman) {
+            btn.classList.add('needs-human-pending');
+        } else {
+            btn.classList.remove('needs-human-pending');
+        }
     }
 }
 
@@ -4554,6 +4776,7 @@ async function _inboxSaveTransitionResult(taskId, taskTitle, data) {
                 subject,
                 source_type: 'intake_result',
                 task_id: taskId,
+                project_id: currentProject,
                 task_title: taskTitle,
                 outcome,
                 data_json: JSON.stringify(data),
@@ -5454,27 +5677,59 @@ function initializeDragAndDrop() {
 setTimeout(initializeDragAndDrop, 100);
 
 // ============================================
-// Global Config: LLM & Budget Management
+// Global Config: Infrastructure Management
 // ============================================
 
 function initializeGlobalConfigButtons() {
-    document.getElementById('manage-llms-btn').addEventListener('click', openLlmModal);
-    document.getElementById('manage-budgets-btn').addEventListener('click', openBudgetModal);
-    document.getElementById('manage-tools-btn').addEventListener('click', openToolsModal);
-    document.getElementById('manage-compute-nodes-btn').addEventListener('click', openComputeNodeModal);
+    // Only one button now
+    const infraBtn = document.getElementById('manage-infra-btn');
+    if (infraBtn) infraBtn.addEventListener('click', () => openInfraModal('llm'));
 
-    document.getElementById('llm-modal').addEventListener('click', function(e) {
-        if (e.target === this && _modalMousedownTarget === this) closeLlmModal();
+    document.getElementById('infra-modal').addEventListener('click', function(e) {
+        if (e.target === this && _modalMousedownTarget === this) closeInfraModal();
     });
-    document.getElementById('budget-modal').addEventListener('click', function(e) {
-        if (e.target === this && _modalMousedownTarget === this) closeBudgetModal();
+}
+
+async function openInfraModal(tab = 'llm') {
+    document.getElementById('infra-modal').classList.add('active');
+    switchInfraTab(tab);
+}
+
+function closeInfraModal() {
+    document.getElementById('infra-modal').classList.remove('active');
+    _llmEditingId = null;
+    _budgetEditingId = null;
+    _cnEditingId = null;
+}
+
+async function switchInfraTab(tab) {
+    // Toggle tab buttons
+    document.querySelectorAll('.infra-tab').forEach(btn => {
+        btn.classList.toggle('active', btn.id === `infra-tab-${tab}`);
     });
-    document.getElementById('tools-modal').addEventListener('click', function(e) {
-        if (e.target === this && _modalMousedownTarget === this) closeToolsModal();
+    // Toggle panes
+    document.querySelectorAll('.infra-pane').forEach(pane => {
+        pane.classList.toggle('active', pane.id === `infra-pane-${tab}`);
     });
-    document.getElementById('compute-node-modal').addEventListener('click', function(e) {
-        if (e.target === this && _modalMousedownTarget === this) closeComputeNodeModal();
-    });
+
+    // Load data for the active tab
+    if (tab === 'llm') {
+        await loadLlmsAndBudgets();
+        renderLlmList();
+        populateComputeNodeSelect('llm-compute-node', null);
+        populateComputeNodeSelect('llm-edit-compute-node', null);
+        switchLlmTab('add');
+    } else if (tab === 'budget') {
+        await loadLlmsAndBudgets();
+        renderBudgetList();
+        switchBudgetTab('add');
+    } else if (tab === 'compute') {
+        await loadLlmsAndBudgets();
+        renderComputeNodeList();
+        switchComputeNodeTab('add');
+    } else if (tab === 'tools') {
+        await openToolsModal();
+    }
 }
 
 function showInlineError(elementId, message, duration = 5000) {
@@ -5490,22 +5745,16 @@ function showInlineError(elementId, message, duration = 5000) {
     el._hideTimer = setTimeout(() => { el.style.display = 'none'; }, duration);
 }
 
-// --- LLM Modal ---
+// --- LLM Modal (Tab) ---
 
 let _llmEditingId = null;  // Currently editing LLM id (null = add mode)
 
 async function openLlmModal() {
-    await loadLlmsAndBudgets();
-    renderLlmList();
-    populateComputeNodeSelect('llm-compute-node', null);
-    populateComputeNodeSelect('llm-edit-compute-node', null);
-    switchLlmTab('add');
-    document.getElementById('llm-modal').classList.add('active');
+    openInfraModal('llm');
 }
 
 function closeLlmModal() {
-    document.getElementById('llm-modal').classList.remove('active');
-    _llmEditingId = null;
+    closeInfraModal();
 }
 
 function switchLlmTab(tab) {
@@ -5654,20 +5903,16 @@ async function deleteLlmEntry(id) {
     renderLlmList();
 }
 
-// --- Budget Modal ---
+// --- Budget Modal (Tab) ---
 
 let _budgetEditingId = null;  // Currently editing budget id (null = add mode)
 
 async function openBudgetModal() {
-    await loadLlmsAndBudgets();
-    renderBudgetList();
-    switchBudgetTab('add');
-    document.getElementById('budget-modal').classList.add('active');
+    openInfraModal('budget');
 }
 
 function closeBudgetModal() {
-    document.getElementById('budget-modal').classList.remove('active');
-    _budgetEditingId = null;
+    closeInfraModal();
 }
 
 function switchBudgetTab(tab) {
@@ -5850,20 +6095,16 @@ const _CATEGORY_LABELS = {
 
 const _CATEGORY_ORDER = ['file', 'search', 'git', 'shell', 'task', 'other'];
 
-// --- Compute Node Modal ---
+// --- Compute Node Modal (Tab) ---
 
 let _cnEditingId = null;  // Currently editing compute node id (null = add mode)
 
 async function openComputeNodeModal() {
-    await loadLlmsAndBudgets();
-    renderComputeNodeList();
-    switchComputeNodeTab('add');
-    document.getElementById('compute-node-modal').classList.add('active');
+    openInfraModal('compute');
 }
 
 function closeComputeNodeModal() {
-    document.getElementById('compute-node-modal').classList.remove('active');
-    _cnEditingId = null;
+    closeInfraModal();
 }
 
 function switchComputeNodeTab(tab) {
@@ -5982,7 +6223,6 @@ async function deleteComputeNodeEntry(id) {
 }
 
 async function openToolsModal() {
-    document.getElementById('tools-modal').classList.add('active');
     if (!_toolsData) {
         document.getElementById('tools-card-container').innerHTML = '<em>Loading tools...</em>';
         try {
@@ -5999,7 +6239,7 @@ async function openToolsModal() {
 }
 
 function closeToolsModal() {
-    document.getElementById('tools-modal').classList.remove('active');
+    closeInfraModal();
 }
 
 function renderToolsAgentTree() {

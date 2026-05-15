@@ -455,6 +455,18 @@ body {
     color: #495057;
 }
 
+#column-idea .add-task-btn {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: #dee2e6;
+    margin-top: 0;
+    margin-bottom: 0.5rem;
+    border-style: solid;
+    border-color: #ced4da;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+}
+
 .tasks-container {
     flex: 1;
     overflow-y: auto;
@@ -2666,7 +2678,9 @@ body {
 }
 .card-job-indicator.ji-running,
 .card-job-indicator.ji-queued,
-.card-job-indicator.ji-stopped {
+.card-job-indicator.ji-queued-human,
+.card-job-indicator.ji-stopped,
+.card-job-indicator.ji-zombie {
     display: flex;
 }
 .card-job-indicator.ji-running {
@@ -2674,10 +2688,28 @@ body {
     color: #93c5fd;
     border: 1px solid rgba(59,130,246,0.20);
 }
+.card-job-indicator.ji-zombie {
+    background: rgba(108,117,125,0.10);
+    color: #adb5bd;
+    border: 1px solid rgba(108,117,125,0.20);
+    font-style: italic;
+}
+.card-job-indicator.ji-zombie .ji-dot {
+    animation: none;
+    background: #6c757d;
+}
 .card-job-indicator.ji-queued {
     background: rgba(245,158,11,0.10);
     color: #fcd34d;
     border: 1px solid rgba(245,158,11,0.18);
+}
+.card-job-indicator.ji-queued-human {
+    background: rgba(245,158,11,0.15);
+    color: #fcd34d;
+    border: 1px solid rgba(245,158,11,0.3);
+}
+.card-job-indicator.ji-queued-human .ji-dot {
+    animation-duration: 4s;
 }
 .card-job-indicator.ji-stopped {
     background: rgba(239,68,68,0.12);
@@ -2702,6 +2734,71 @@ body {
 @keyframes ji-dot-pulse {
     0%, 100% { opacity: 1; }
     50%       { opacity: 0.25; }
+}
+
+/* Initiative 4 — Card Visual Differentiation */
+.card-stripe {
+    font-size: 0.68rem;
+    font-weight: bold;
+    padding: 0.2rem 0.75rem;
+    margin: -0.75rem -0.75rem 0.6rem -0.75rem;
+    border-radius: 4px 4px 0 0;
+    color: #fff;
+    text-align: center;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    pointer-events: none;
+}
+.card-stripe-review {
+    background: #ffc107;
+    color: #453505;
+}
+.card-stripe-completed {
+    background: #198754;
+    color: #fff;
+}
+
+.action-btn.full-width {
+    width: 100%;
+    margin-right: 0;
+    margin-bottom: 0.4rem;
+    justify-content: center;
+}
+.action-btn.action-btn-primary {
+    background: #0d6efd;
+    color: #fff;
+    border-color: #0d6efd;
+}
+.action-btn.action-btn-primary:hover {
+    background: #0b5ed7;
+    border-color: #0a58ca;
+}
+
+.card-overflow-btn {
+    position: absolute;
+    top: 0.25rem;
+    right: 0.35rem;
+    background: none;
+    border: none;
+    font-size: 1rem;
+    line-height: 1;
+    padding: 2px 5px;
+    cursor: pointer;
+    color: #6c757d;
+    border-radius: 3px;
+    z-index: 3;
+    transition: background 0.15s, color 0.15s;
+}
+.card-overflow-btn:hover {
+    background: #f0f2f5;
+    color: #212529;
+}
+.task-card.completed .card-highlight-btn {
+    right: 1.8rem; /* Move star left to make room for overflow menu */
+}
+
+.task-card.human_review .card-job-indicator {
+    display: none !important;
 }
 .ji-label {
     overflow: hidden;
@@ -3305,3 +3402,41 @@ body {
     font-size: 0.76rem;
 }
 .diff-comment-cancel:hover { background: #30363d; color: #c9d1d9; }
+
+/* Initiative 3 � Inbox pulsing glow */
+@keyframes inbox-needs-human {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(220,53,69,0.0); }
+  50%       { box-shadow: 0 0 0 10px rgba(220,53,69,0.35); }
+}
+#inbox-btn.needs-human-pending {
+  animation: inbox-needs-human 3s ease-in-out infinite;
+}
+
+/* Infrastructure Modal Tabs */
+.infra-tab {
+    padding: 0.65rem 1.25rem;
+    border: none;
+    border-bottom: 3px solid transparent;
+    background: transparent;
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: #6c757d;
+    transition: color 0.15s, border-color 0.15s;
+}
+.infra-tab:hover:not(.active) {
+    color: #343a40;
+    background: #e9ecef;
+}
+.infra-tab.active {
+    color: #0d6efd;
+    border-bottom-color: #0d6efd;
+    background: #fff;
+}
+.infra-pane {
+    display: none;
+}
+.infra-pane.active {
+    display: block;
+}
+

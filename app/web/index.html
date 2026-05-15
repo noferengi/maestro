@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kanban Board - TheMaestro</title>
-    <link rel="stylesheet" href="/static/style.css?v=40">
+    <link rel="stylesheet" href="/static/style.css?v=42">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
@@ -16,7 +16,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markup.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-css.min.js"></script>
-    <script src="/static/kanban.js?v=66"></script>
+    <script src="/static/kanban.js?v=67"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -66,27 +66,23 @@
             </div>
         </div>
 
-        <h2 style="margin-top:1rem">Global Config</h2>
+        <h2 style="margin-top:1rem">Infrastructure</h2>
         <div class="project-tabs">
-            <div class="project-tab" id="manage-llms-btn" style="cursor:pointer">
-                LLM Endpoints
-            </div>
-            <div class="project-tab" id="manage-budgets-btn" style="cursor:pointer">
-                Budgets
-            </div>
-            <div class="project-tab" id="manage-tools-btn" style="cursor:pointer">
-                Agent Tools
-            </div>
-            <div class="project-tab" id="manage-compute-nodes-btn" style="cursor:pointer">
-                Compute Nodes
+            <div class="project-tab" id="manage-infra-btn" style="cursor:pointer" onclick="openInfraModal()">
+                Infrastructure
             </div>
         </div>
-        <div class="project-tabs" style="margin-top:0.5rem">
+
+        <h2 style="margin-top:1rem">Diagnostics</h2>
+        <div class="project-tabs">
             <a href="/diagnostics" class="project-tab" style="text-decoration:none;color:inherit;display:block">
                 LLM Diagnostics &rarr;
             </a>
             <a href="/scheduler" class="project-tab" style="text-decoration:none;color:inherit;display:block">
                 Scheduler &rarr;
+            </a>
+            <a href="/stats" class="project-tab" style="text-decoration:none;color:inherit;display:block">
+                Stats &rarr;
             </a>
         </div>
     </div>
@@ -124,10 +120,10 @@
                     <span class="column-title">IDEAS</span>
                     <span class="task-count" id="count-idea">0</span>
                 </div>
+                <button class="add-task-btn" onclick="openAddTaskModal('idea')">+ Add Idea</button>
                 <div class="tasks-container" id="tasks-idea" onclick="handleTasksContainerClick(event,'idea')">
                     <!-- Tasks will be rendered from database -->
                 </div>
-                <button class="add-task-btn" onclick="openAddTaskModal('idea')">+ Add Idea</button>
             </div>
 
             <!-- PLANNING Column -->
@@ -395,197 +391,282 @@
         </div>
     </div>
 
-    <!-- LLM Management Modal -->
-    <div class="modal-overlay" id="llm-modal">
-        <div class="modal" style="width:640px">
+    <!-- Architecture Populate Preview Modal -->
+    <div id="arch-populate-modal" class="modal-overlay">
+        <div class="modal" style="width:520px">
             <div class="modal-header">
-                <h2 class="modal-title">LLM Endpoints</h2>
-                <button class="close-btn" onclick="closeLlmModal()">&times;</button>
+                <h3 id="arch-populate-modal-title">Smart Populate Architecture</h3>
+                <button class="close-btn" onclick="document.getElementById('arch-populate-modal').classList.remove('active')">&times;</button>
             </div>
-            <div class="modal-body">
-                <div id="llm-list"></div>
-                <hr style="margin:1rem 0">
+            <div class="modal-body" id="arch-populate-modal-body" style="padding: 20px;">
+                <!-- Content injected by JS -->
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="document.getElementById('arch-populate-modal').classList.remove('active')">Cancel</button>
+                <button id="arch-populate-confirm-btn" class="btn btn-primary">Generate</button>
+            </div>
+        </div>
+    </div>
 
-                <!-- Tabs -->
-                <div class="llm-tabs">
-                    <a href="#" class="llm-tab active" id="llm-tab-add" onclick="switchLlmTab('add'); return false;">Add New LLM Endpoint</a>
-                    <span class="llm-tab-sep">|</span>
-                    <a href="#" class="llm-tab" id="llm-tab-edit" onclick="switchLlmTab('edit'); return false;">Edit</a>
-                </div>
 
-                <!-- Add tab -->
-                <div class="llm-tab-content active" id="llm-pane-add">
-                    <div class="form-group">
-                        <label class="form-label" for="llm-address">Address</label>
-                        <input type="text" class="form-input" id="llm-address" value="localhost">
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label" for="llm-port">Port</label>
-                        <input type="number" class="form-input" id="llm-port" value="8008">
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label" for="llm-model">Model Name</label>
-                        <input type="text" class="form-input" id="llm-model" placeholder="e.g. Qwen3-Coder-Next-80B">
-                    </div>
-                    <div style="display:flex;gap:1rem">
-                        <div class="form-group" style="flex:1">
-                            <label class="form-label" for="llm-parallel">Parallel Sessions</label>
-                            <input type="number" class="form-input" id="llm-parallel" value="1" min="1" max="1024">
-                        </div>
-                        <div class="form-group" style="flex:1">
-                            <label class="form-label" for="llm-max-context">Max Context (tokens)</label>
-                            <input type="text" class="form-input" id="llm-max-context" value="4096"
-                                   inputmode="numeric" pattern="[0-9]*"
-                                   oninput="this.value = this.value.replace(/[^0-9]/g, '')">
-                        </div>
-                    </div>
-                    <div style="display:flex;gap:1rem">
-                        <div class="form-group" style="flex:1">
-                            <label class="form-label" for="llm-cost-prompt">Prompt $/M tokens</label>
-                            <input type="number" class="form-input" id="llm-cost-prompt" value="0" min="0" step="0.01" placeholder="0.00">
-                        </div>
-                        <div class="form-group" style="flex:1">
-                            <label class="form-label" for="llm-cost-completion">Completion $/M tokens</label>
-                            <input type="number" class="form-input" id="llm-cost-completion" value="0" min="0" step="0.01" placeholder="0.00">
-                        </div>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label" for="llm-compute-node">Compute Node</label>
-                        <select class="form-input" id="llm-compute-node">
-                            <option value="">(none)</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label" for="llm-notes">Notes</label>
-                        <textarea class="form-input" id="llm-notes" rows="2"
-                                  placeholder="e.g. Q8_0 quant of Qwen3-Coder-Next-80B finetune v2.1, SWA enabled"></textarea>
-                    </div>
-                    <div id="llm-error" class="inline-error" style="display:none"></div>
-                </div>
 
-                <!-- Edit tab -->
-                <div class="llm-tab-content" id="llm-pane-edit">
-                    <p id="llm-edit-placeholder" style="color:#6c757d;font-size:0.85rem">Click a model name in the table above to edit it.</p>
-                    <div id="llm-edit-form" style="display:none">
-                        <input type="hidden" id="llm-edit-id">
+    <!-- Infrastructure Management Modal (Consolidated) -->
+    <div class="modal-overlay" id="infra-modal">
+        <div class="modal" style="width:900px; max-height:90vh; display:flex; flex-direction:column">
+            <div class="modal-header">
+                <h2 class="modal-title">Infrastructure Configuration</h2>
+                <button class="close-btn" onclick="closeInfraModal()">&times;</button>
+            </div>
+            
+            <!-- Modal Tabs -->
+            <div class="infra-tabs" style="display:flex; border-bottom:1px solid #dee2e6; background:#f8f9fa">
+                <button class="infra-tab active" id="infra-tab-llm" onclick="switchInfraTab('llm')">LLM Endpoints</button>
+                <button class="infra-tab" id="infra-tab-budget" onclick="switchInfraTab('budget')">Budgets</button>
+                <button class="infra-tab" id="infra-tab-compute" onclick="switchInfraTab('compute')">Compute Nodes</button>
+                <button class="infra-tab" id="infra-tab-tools" onclick="switchInfraTab('tools')">Agent Tools</button>
+            </div>
+
+            <div class="modal-body" style="flex:1; overflow-y:auto; padding:1.5rem">
+                <!-- LLM Tab Pane -->
+                <div class="infra-pane active" id="infra-pane-llm">
+                    <div id="llm-list"></div>
+                    <hr style="margin:1rem 0">
+                    <div class="llm-tabs">
+                        <a href="#" class="llm-tab active" id="llm-tab-add" onclick="switchLlmTab('add'); return false;">Add New LLM Endpoint</a>
+                        <span class="llm-tab-sep">|</span>
+                        <a href="#" class="llm-tab" id="llm-tab-edit" onclick="switchLlmTab('edit'); return false;">Edit</a>
+                    </div>
+                    <div class="llm-tab-content active" id="llm-pane-add">
                         <div class="form-group">
-                            <label class="form-label" for="llm-edit-address">Address</label>
-                            <input type="text" class="form-input" id="llm-edit-address">
+                            <label class="form-label" for="llm-address">Address</label>
+                            <input type="text" class="form-input" id="llm-address" value="localhost">
                         </div>
                         <div class="form-group">
-                            <label class="form-label" for="llm-edit-port">Port</label>
-                            <input type="number" class="form-input" id="llm-edit-port">
+                            <label class="form-label" for="llm-port">Port</label>
+                            <input type="number" class="form-input" id="llm-port" value="8008">
                         </div>
                         <div class="form-group">
-                            <label class="form-label" for="llm-edit-model">Model Name</label>
-                            <input type="text" class="form-input" id="llm-edit-model">
+                            <label class="form-label" for="llm-model">Model Name</label>
+                            <input type="text" class="form-input" id="llm-model" placeholder="e.g. Qwen3-Coder-Next-80B">
                         </div>
                         <div style="display:flex;gap:1rem">
                             <div class="form-group" style="flex:1">
-                                <label class="form-label" for="llm-edit-parallel">Parallel Sessions</label>
-                                <input type="number" class="form-input" id="llm-edit-parallel" min="1" max="1024">
+                                <label class="form-label" for="llm-parallel">Parallel Sessions</label>
+                                <input type="number" class="form-input" id="llm-parallel" value="1" min="1" max="1024">
                             </div>
                             <div class="form-group" style="flex:1">
-                                <label class="form-label" for="llm-edit-max-context">Max Context (tokens)</label>
-                                <input type="text" class="form-input" id="llm-edit-max-context"
+                                <label class="form-label" for="llm-max-context">Max Context (tokens)</label>
+                                <input type="text" class="form-input" id="llm-max-context" value="4096"
                                        inputmode="numeric" pattern="[0-9]*"
                                        oninput="this.value = this.value.replace(/[^0-9]/g, '')">
                             </div>
                         </div>
                         <div style="display:flex;gap:1rem">
                             <div class="form-group" style="flex:1">
-                                <label class="form-label" for="llm-edit-cost-prompt">Prompt $/M tokens</label>
-                                <input type="number" class="form-input" id="llm-edit-cost-prompt" min="0" step="0.01" placeholder="0.00">
+                                <label class="form-label" for="llm-cost-prompt">Prompt $/M tokens</label>
+                                <input type="number" class="form-input" id="llm-cost-prompt" value="0" min="0" step="0.01" placeholder="0.00">
                             </div>
                             <div class="form-group" style="flex:1">
-                                <label class="form-label" for="llm-edit-cost-completion">Completion $/M tokens</label>
-                                <input type="number" class="form-input" id="llm-edit-cost-completion" min="0" step="0.01" placeholder="0.00">
+                                <label class="form-label" for="llm-cost-completion">Completion $/M tokens</label>
+                                <input type="number" class="form-input" id="llm-cost-completion" value="0" min="0" step="0.01" placeholder="0.00">
                             </div>
                         </div>
                         <div class="form-group">
-                            <label class="form-label" for="llm-edit-compute-node">Compute Node</label>
-                            <select class="form-input" id="llm-edit-compute-node">
+                            <label class="form-label" for="llm-compute-node">Compute Node</label>
+                            <select class="form-input" id="llm-compute-node">
                                 <option value="">(none)</option>
                             </select>
                         </div>
                         <div class="form-group">
-                            <label class="form-label" for="llm-edit-notes">Notes</label>
-                            <textarea class="form-input" id="llm-edit-notes" rows="2"
+                            <label class="form-label" for="llm-notes">Notes</label>
+                            <textarea class="form-input" id="llm-notes" rows="2"
                                       placeholder="e.g. Q8_0 quant of Qwen3-Coder-Next-80B finetune v2.1, SWA enabled"></textarea>
                         </div>
-                        <div id="llm-edit-error" class="inline-error" style="display:none"></div>
+                        <div id="llm-error" class="inline-error" style="display:none"></div>
+                        <div style="margin-top:1rem">
+                            <button class="btn btn-primary" id="llm-submit-btn" onclick="addLlm()">Add LLM Endpoint</button>
+                        </div>
+                    </div>
+                    <div class="llm-tab-content" id="llm-pane-edit">
+                        <p id="llm-edit-placeholder" style="color:#6c757d;font-size:0.85rem">Click a model name in the table above to edit it.</p>
+                        <div id="llm-edit-form" style="display:none">
+                            <input type="hidden" id="llm-edit-id">
+                            <div class="form-group">
+                                <label class="form-label" for="llm-edit-address">Address</label>
+                                <input type="text" class="form-input" id="llm-edit-address">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label" for="llm-edit-port">Port</label>
+                                <input type="number" class="form-input" id="llm-edit-port">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label" for="llm-edit-model">Model Name</label>
+                                <input type="text" class="form-input" id="llm-edit-model">
+                            </div>
+                            <div style="display:flex;gap:1rem">
+                                <div class="form-group" style="flex:1">
+                                    <label class="form-label" for="llm-edit-parallel">Parallel Sessions</label>
+                                    <input type="number" class="form-input" id="llm-edit-parallel" min="1" max="1024">
+                                </div>
+                                <div class="form-group" style="flex:1">
+                                    <label class="form-label" for="llm-edit-max-context">Max Context (tokens)</label>
+                                    <input type="text" class="form-input" id="llm-edit-max-context"
+                                           inputmode="numeric" pattern="[0-9]*"
+                                           oninput="this.value = this.value.replace(/[^0-9]/g, '')">
+                                </div>
+                            </div>
+                            <div style="display:flex;gap:1rem">
+                                <div class="form-group" style="flex:1">
+                                    <label class="form-label" for="llm-edit-cost-prompt">Prompt $/M tokens</label>
+                                    <input type="number" class="form-input" id="llm-edit-cost-prompt" min="0" step="0.01" placeholder="0.00">
+                                </div>
+                                <div class="form-group" style="flex:1">
+                                    <label class="form-label" for="llm-edit-cost-completion">Completion $/M tokens</label>
+                                    <input type="number" class="form-input" id="llm-edit-cost-completion" min="0" step="0.01" placeholder="0.00">
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label" for="llm-edit-compute-node">Compute Node</label>
+                                <select class="form-input" id="llm-edit-compute-node">
+                                    <option value="">(none)</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label" for="llm-edit-notes">Notes</label>
+                                <textarea class="form-input" id="llm-edit-notes" rows="2"
+                                          placeholder="e.g. Q8_0 quant of Qwen3-Coder-Next-80B finetune v2.1, SWA enabled"></textarea>
+                            </div>
+                            <div id="llm-edit-error" class="inline-error" style="display:none"></div>
+                            <div style="margin-top:1rem">
+                                <button class="btn btn-primary" onclick="addLlm()">Save Changes</button>
+                            </div>
+                        </div>
                     </div>
                 </div>
-            </div>
-            <div class="modal-footer">
-                <button class="btn btn-secondary" onclick="closeLlmModal()">Close</button>
-                <button class="btn btn-primary" id="llm-submit-btn" onclick="addLlm()">Add LLM Endpoint</button>
-            </div>
-        </div>
-    </div>
 
-    <!-- Budget Management Modal -->
-    <div class="modal-overlay" id="budget-modal">
-        <div class="modal" style="width:640px">
-            <div class="modal-header">
-                <h2 class="modal-title">Budgets</h2>
-                <button class="close-btn" onclick="closeBudgetModal()">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div id="budget-list"></div>
-                <hr style="margin:1rem 0">
-
-                <!-- Tabs -->
-                <div class="llm-tabs">
-                    <a href="#" class="llm-tab active" id="budget-tab-add" onclick="switchBudgetTab('add'); return false;">Add New Budget</a>
-                    <span class="llm-tab-sep">|</span>
-                    <a href="#" class="llm-tab" id="budget-tab-edit" onclick="switchBudgetTab('edit'); return false;">Edit</a>
-                </div>
-
-                <!-- Add tab -->
-                <div class="llm-tab-content active" id="budget-pane-add">
-                    <div class="form-group">
-                        <label class="form-label" for="budget-name">Budget Name</label>
-                        <input type="text" class="form-input" id="budget-name" placeholder="e.g. Premium Budget">
+                <!-- Budget Tab Pane -->
+                <div class="infra-pane" id="infra-pane-budget">
+                    <div id="budget-list"></div>
+                    <hr style="margin:1rem 0">
+                    <div class="llm-tabs">
+                        <a href="#" class="llm-tab active" id="budget-tab-add" onclick="switchBudgetTab('add'); return false;">Add New Budget</a>
+                        <span class="llm-tab-sep">|</span>
+                        <a href="#" class="llm-tab" id="budget-tab-edit" onclick="switchBudgetTab('edit'); return false;">Edit</a>
                     </div>
-                    <div class="form-group">
-                        <label class="form-label" for="budget-dollar-amount">Dollar Limit ($)</label>
-                        <input type="number" class="form-input" id="budget-dollar-amount" value="-1" min="-1" step="0.01"
-                               placeholder="-1 for unlimited">
-                        <div style="font-size:0.75rem;color:#6c757d;margin-top:0.2rem">-1 = unlimited</div>
-                    </div>
-                    <div id="budget-error" class="inline-error" style="display:none"></div>
-                </div>
-
-                <!-- Edit tab -->
-                <div class="llm-tab-content" id="budget-pane-edit">
-                    <p id="budget-edit-placeholder" style="color:#6c757d;font-size:0.85rem">Click a budget name in the table above to edit it.</p>
-                    <div id="budget-edit-form" style="display:none">
-                        <input type="hidden" id="budget-edit-id">
+                    <div class="llm-tab-content active" id="budget-pane-add">
                         <div class="form-group">
-                            <label class="form-label" for="budget-edit-name">Budget Name</label>
-                            <input type="text" class="form-input" id="budget-edit-name">
+                            <label class="form-label" for="budget-name">Budget Name</label>
+                            <input type="text" class="form-input" id="budget-name" placeholder="e.g. Premium Budget">
                         </div>
                         <div class="form-group">
-                            <label class="form-label" for="budget-edit-dollar-amount">Dollar Limit ($)</label>
-                            <input type="number" class="form-input" id="budget-edit-dollar-amount" min="-1" step="0.01"
+                            <label class="form-label" for="budget-dollar-amount">Dollar Limit ($)</label>
+                            <input type="number" class="form-input" id="budget-dollar-amount" value="-1" min="-1" step="0.01"
                                    placeholder="-1 for unlimited">
                             <div style="font-size:0.75rem;color:#6c757d;margin-top:0.2rem">-1 = unlimited</div>
                         </div>
-                        <div id="budget-remaining-box" style="margin-bottom:1rem;padding:0.5rem 0.75rem;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;font-size:0.82rem;color:#166534;display:none">
-                            <span id="budget-remaining-text"></span>
+                        <div id="budget-error" class="inline-error" style="display:none"></div>
+                        <div style="margin-top:1rem">
+                            <button class="btn btn-primary" id="budget-submit-btn" onclick="addBudget()">Add Budget</button>
                         </div>
-                        <div id="budget-summary-box" style="margin-bottom:1rem;padding:0.75rem;background:#f8f9fa;border-radius:6px;font-size:0.85rem;color:#495057">
-                            <strong>Usage Summary</strong>
-                            <div id="budget-summary-content" style="margin-top:0.35rem">Loading...</div>
+                    </div>
+                    <div class="llm-tab-content" id="budget-pane-edit">
+                        <p id="budget-edit-placeholder" style="color:#6c757d;font-size:0.85rem">Click a budget name in the table above to edit it.</p>
+                        <div id="budget-edit-form" style="display:none">
+                            <input type="hidden" id="budget-edit-id">
+                            <div class="form-group">
+                                <label class="form-label" for="budget-edit-name">Budget Name</label>
+                                <input type="text" class="form-input" id="budget-edit-name">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label" for="budget-edit-dollar-amount">Dollar Limit ($)</label>
+                                <input type="number" class="form-input" id="budget-edit-dollar-amount" min="-1" step="0.01"
+                                       placeholder="-1 for unlimited">
+                                <div style="font-size:0.75rem;color:#6c757d;margin-top:0.2rem">-1 = unlimited</div>
+                            </div>
+                            <div id="budget-remaining-box" style="margin-bottom:1rem;padding:0.5rem 0.75rem;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;font-size:0.82rem;color:#166534;display:none">
+                                <span id="budget-remaining-text"></span>
+                            </div>
+                            <div id="budget-summary-box" style="margin-bottom:1rem;padding:0.75rem;background:#f8f9fa;border-radius:6px;font-size:0.85rem;color:#495057">
+                                <strong>Usage Summary</strong>
+                                <div id="budget-summary-content" style="margin-top:0.35rem">Loading...</div>
+                            </div>
+                            <div id="budget-edit-error" class="inline-error" style="display:none"></div>
+                            <div style="margin-top:1rem">
+                                <button class="btn btn-primary" onclick="addBudget()">Save Changes</button>
+                            </div>
                         </div>
-                        <div id="budget-edit-error" class="inline-error" style="display:none"></div>
                     </div>
                 </div>
+
+                <!-- Compute Node Tab Pane -->
+                <div class="infra-pane" id="infra-pane-compute">
+                    <div id="compute-node-list"></div>
+                    <hr style="margin:1rem 0">
+                    <div class="llm-tabs">
+                        <a href="#" class="llm-tab active" id="cn-tab-add" onclick="switchComputeNodeTab('add'); return false;">Add New Compute Node</a>
+                        <span class="llm-tab-sep">|</span>
+                        <a href="#" class="llm-tab" id="cn-tab-edit" onclick="switchComputeNodeTab('edit'); return false;">Edit</a>
+                    </div>
+                    <div class="llm-tab-content active" id="cn-pane-add">
+                        <div class="form-group">
+                            <label class="form-label" for="cn-name">Name</label>
+                            <input type="text" class="form-input" id="cn-name" placeholder="e.g. GPU Server 1">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="cn-description">Description</label>
+                            <input type="text" class="form-input" id="cn-description" placeholder="e.g. RTX 4090 x2, 128GB RAM">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="cn-max-sessions">Max Parallel Sessions (total request throughput cap)</label>
+                            <input type="number" class="form-input" id="cn-max-sessions" value="1" min="1" max="1024">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="cn-max-loaded-models">Max Loaded Models (distinct models in VRAM simultaneously)</label>
+                            <input type="number" class="form-input" id="cn-max-loaded-models" value="1" min="1" max="1024">
+                        </div>
+                        <div id="cn-error" class="inline-error" style="display:none"></div>
+                        <div style="margin-top:1rem">
+                            <button class="btn btn-primary" id="cn-submit-btn" onclick="addComputeNode()">Add Compute Node</button>
+                        </div>
+                    </div>
+                    <div class="llm-tab-content" id="cn-pane-edit">
+                        <p id="cn-edit-placeholder" style="color:#6c757d;font-size:0.85rem">Click a node name in the table above to edit it.</p>
+                        <div id="cn-edit-form" style="display:none">
+                            <input type="hidden" id="cn-edit-id">
+                            <div class="form-group">
+                                <label class="form-label" for="cn-edit-name">Name</label>
+                                <input type="text" class="form-input" id="cn-edit-name">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label" for="cn-edit-description">Description</label>
+                                <input type="text" class="form-input" id="cn-edit-description">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label" for="cn-edit-max-sessions">Max Parallel Sessions (total request throughput cap)</label>
+                                <input type="number" class="form-input" id="cn-edit-max-sessions" min="1" max="1024">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label" for="cn-edit-max-loaded-models">Max Loaded Models (distinct models in VRAM simultaneously)</label>
+                                <input type="number" class="form-input" id="cn-edit-max-loaded-models" min="1" max="1024">
+                            </div>
+                            <div id="cn-edit-error" class="inline-error" style="display:none"></div>
+                            <div style="margin-top:1rem">
+                                <button class="btn btn-primary" onclick="addComputeNode()">Save Changes</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Agent Tools Tab Pane -->
+                <div class="infra-pane" id="infra-pane-tools">
+                    <div id="tools-agent-tree" class="tools-agent-tree"></div>
+                    <hr style="margin:1rem 0; border-color:#dee2e6">
+                    <div id="tools-card-container" class="tools-card-container"></div>
+                </div>
             </div>
+
             <div class="modal-footer">
-                <button class="btn btn-secondary" onclick="closeBudgetModal()">Close</button>
-                <button class="btn btn-primary" id="budget-submit-btn" onclick="addBudget()">Add Budget</button>
+                <button class="btn btn-secondary" onclick="closeInfraModal()">Close</button>
             </div>
         </div>
     </div>
@@ -652,7 +733,6 @@
                 <button class="close-btn" onclick="closeIntakeModal()">&times;</button>
             </div>
             <div class="modal-body" style="flex:1;overflow-y:auto;padding:1rem 1.25rem" id="intake-modal-body-content">
-                <!-- Two-column description pane -->
                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1rem">
                     <div>
                         <div style="font-size:0.8rem;font-weight:600;color:#6c757d;text-transform:uppercase;margin-bottom:0.4rem">Original Description</div>
@@ -663,34 +743,24 @@
                         <textarea id="intake-rewrite-desc" style="width:100%;height:260px;border:1px solid #0d6efd;border-radius:4px;padding:0.75rem;font-size:0.85rem;resize:vertical;font-family:inherit;box-sizing:border-box"></textarea>
                     </div>
                 </div>
-
-                <!-- Design rationale -->
                 <div id="intake-rationale-row" style="margin-bottom:1rem;display:none">
                     <div style="font-size:0.8rem;font-weight:600;color:#6c757d;text-transform:uppercase;margin-bottom:0.25rem">Why the agent rewrote it</div>
                     <div id="intake-rationale" style="font-size:0.82rem;color:#495057;background:#fffdf0;border-left:3px solid #ffc107;padding:0.5rem 0.75rem;border-radius:0 4px 4px 0"></div>
                 </div>
-
-                <!-- Suggested prerequisites -->
                 <div id="intake-prereqs-section" style="margin-bottom:1rem;display:none">
                     <div style="font-size:0.8rem;font-weight:600;color:#6c757d;text-transform:uppercase;margin-bottom:0.5rem">Suggested Prerequisites</div>
                     <div id="intake-prereqs-list"></div>
                 </div>
-
-                <!-- Suggested subtasks -->
                 <div id="intake-subtasks-section" style="margin-bottom:1rem;display:none">
                     <div style="font-size:0.8rem;font-weight:600;color:#6c757d;text-transform:uppercase;margin-bottom:0.5rem">Suggested Subtasks</div>
                     <div id="intake-subtasks-list"></div>
                 </div>
-
-                <!-- Open questions -->
                 <div id="intake-questions-section" style="margin-bottom:1rem;display:none">
                     <div style="background:#fff3cd;border:1px solid #ffc107;border-radius:4px;padding:0.75rem">
                         <div style="font-size:0.8rem;font-weight:700;color:#856404;margin-bottom:0.4rem">Open Questions — resolve before planning</div>
                         <ul id="intake-questions-list" style="margin:0;padding-left:1.25rem;font-size:0.85rem;color:#664d03"></ul>
                     </div>
                 </div>
-
-                <!-- Agent Investigation (collapsible) -->
                 <div id="intake-investigation-section" style="margin-bottom:1rem;border:1px solid #dee2e6;border-radius:4px;overflow:hidden">
                     <button onclick="toggleIntakeInvestigation()" id="intake-investigation-toggle"
                         style="width:100%;text-align:left;background:#f8f9fa;border:none;padding:0.5rem 0.75rem;font-size:0.8rem;font-weight:600;color:#495057;cursor:pointer;display:flex;justify-content:space-between;align-items:center">
@@ -703,8 +773,6 @@
                         </div>
                     </div>
                 </div>
-
-                <!-- Chat section -->
                 <div style="border-top:1px solid #dee2e6;padding-top:1rem">
                     <div style="font-size:0.8rem;font-weight:600;color:#6c757d;text-transform:uppercase;margin-bottom:0.5rem">Ask the agent to refine</div>
                     <div id="intake-chat-history" style="max-height:180px;overflow-y:auto;margin-bottom:0.5rem;display:flex;flex-direction:column;gap:0.4rem"></div>
@@ -724,7 +792,7 @@
         </div>
     </div>
 
-    <!-- Transition Failure Overlay -->
+    <!-- Transition Details Modal -->
     <div class="modal-overlay" id="transition-modal">
         <div class="modal" style="width:700px">
             <div class="modal-header">
@@ -737,97 +805,6 @@
             <div class="modal-footer">
                 <div id="transition-modal-footer-left" style="flex:1;display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap"></div>
                 <button class="btn btn-secondary" onclick="closeTransitionModal()">Close</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- Compute Node Management Modal -->
-    <div class="modal-overlay" id="compute-node-modal">
-        <div class="modal" style="width:640px">
-            <div class="modal-header">
-                <h2 class="modal-title">Compute Nodes</h2>
-                <button class="close-btn" onclick="closeComputeNodeModal()">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div id="compute-node-list"></div>
-                <hr style="margin:1rem 0">
-
-                <!-- Tabs -->
-                <div class="llm-tabs">
-                    <a href="#" class="llm-tab active" id="cn-tab-add" onclick="switchComputeNodeTab('add'); return false;">Add New Compute Node</a>
-                    <span class="llm-tab-sep">|</span>
-                    <a href="#" class="llm-tab" id="cn-tab-edit" onclick="switchComputeNodeTab('edit'); return false;">Edit</a>
-                </div>
-
-                <!-- Add tab -->
-                <div class="llm-tab-content active" id="cn-pane-add">
-                    <div class="form-group">
-                        <label class="form-label" for="cn-name">Name</label>
-                        <input type="text" class="form-input" id="cn-name" placeholder="e.g. GPU Server 1">
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label" for="cn-description">Description</label>
-                        <input type="text" class="form-input" id="cn-description" placeholder="e.g. RTX 4090 x2, 128GB RAM">
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label" for="cn-max-sessions">Max Parallel Sessions (total request throughput cap)</label>
-                        <input type="number" class="form-input" id="cn-max-sessions" value="1" min="1" max="1024">
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label" for="cn-max-loaded-models">Max Loaded Models (distinct models in VRAM simultaneously)</label>
-                        <input type="number" class="form-input" id="cn-max-loaded-models" value="1" min="1" max="1024">
-                    </div>
-                    <div id="cn-error" class="inline-error" style="display:none"></div>
-                </div>
-
-                <!-- Edit tab -->
-                <div class="llm-tab-content" id="cn-pane-edit">
-                    <p id="cn-edit-placeholder" style="color:#6c757d;font-size:0.85rem">Click a node name in the table above to edit it.</p>
-                    <div id="cn-edit-form" style="display:none">
-                        <input type="hidden" id="cn-edit-id">
-                        <div class="form-group">
-                            <label class="form-label" for="cn-edit-name">Name</label>
-                            <input type="text" class="form-input" id="cn-edit-name">
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label" for="cn-edit-description">Description</label>
-                            <input type="text" class="form-input" id="cn-edit-description">
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label" for="cn-edit-max-sessions">Max Parallel Sessions (total request throughput cap)</label>
-                            <input type="number" class="form-input" id="cn-edit-max-sessions" min="1" max="1024">
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label" for="cn-edit-max-loaded-models">Max Loaded Models (distinct models in VRAM simultaneously)</label>
-                            <input type="number" class="form-input" id="cn-edit-max-loaded-models" min="1" max="1024">
-                        </div>
-                        <div id="cn-edit-error" class="inline-error" style="display:none"></div>
-                    </div>
-                </div>
-            </div>
-            <div class="modal-footer">
-                <button class="btn btn-secondary" onclick="closeComputeNodeModal()">Close</button>
-                <button class="btn btn-primary" id="cn-submit-btn" onclick="addComputeNode()">Add Compute Node</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- Agent Tools Modal -->
-    <div class="modal-overlay" id="tools-modal">
-        <div class="modal" style="width:900px">
-            <div class="modal-header">
-                <h2 class="modal-title">Agent Tools</h2>
-                <button class="close-btn" onclick="closeToolsModal()">&times;</button>
-            </div>
-            <div class="modal-body">
-                <!-- Agent Access Tree -->
-                <div id="tools-agent-tree" class="tools-agent-tree"></div>
-                <hr style="margin:1rem 0; border-color:#dee2e6">
-                <!-- Tool Cards -->
-                <div id="tools-card-container" class="tools-card-container"></div>
-            </div>
-            <div class="modal-footer">
-                <button class="btn btn-secondary" onclick="closeToolsModal()">Close</button>
             </div>
         </div>
     </div>
