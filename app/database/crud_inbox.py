@@ -19,6 +19,7 @@ def _row_to_dict(msg: InboxMessage) -> dict:
         "subject": msg.subject,
         "source_type": msg.source_type,
         "task_id": msg.task_id,
+        "project_id": msg.project_id,
         "task_title": msg.task_title,
         "outcome": msg.outcome,
         "data_json": msg.data_json,
@@ -31,6 +32,7 @@ def create_inbox_message(
     subject: str,
     source_type: str = "intake_result",
     task_id: str | None = None,
+    project_id: str | None = None,
     task_title: str | None = None,
     outcome: str | None = None,
     data_json: str | None = None,
@@ -42,6 +44,7 @@ def create_inbox_message(
             subject=subject,
             source_type=source_type,
             task_id=task_id,
+            project_id=project_id,
             task_title=task_title,
             outcome=outcome,
             data_json=data_json,
@@ -54,14 +57,20 @@ def create_inbox_message(
         return _row_to_dict(msg)
 
 
-def get_inbox_messages(unread_only: bool = False, source_type: str | None = None) -> list[dict]:
-    """Return all inbox messages, newest first. Optionally filter to unread or by source_type."""
+def get_inbox_messages(
+    unread_only: bool = False,
+    source_type: str | None = None,
+    project_name: str | None = None,
+) -> list[dict]:
+    """Return all inbox messages, newest first. Optionally filter to unread, by source_type, or by project."""
     with SessionLocal() as db:
         q = db.query(InboxMessage)
         if unread_only:
             q = q.filter(InboxMessage.read == False)  # noqa: E712
         if source_type is not None:
             q = q.filter(InboxMessage.source_type == source_type)
+        if project_name is not None:
+            q = q.filter(InboxMessage.project_id == project_name)
         msgs = q.order_by(InboxMessage.created_at.desc()).all()
         return [_row_to_dict(m) for m in msgs]
 
@@ -105,6 +114,16 @@ def delete_inbox_message(msg_id: str) -> bool:
         return True
 
 
-def count_unread_inbox() -> int:
+def count_unread_inbox(project_name: str | None = None) -> dict:
     with SessionLocal() as db:
-        return db.query(InboxMessage).filter(InboxMessage.read == False).count()  # noqa: E712
+        q = db.query(InboxMessage).filter(InboxMessage.read == False)  # noqa: E712
+        if project_name is not None:
+            q = q.filter(InboxMessage.project_id == project_name)
+        
+        count = q.count()
+        has_needs_human = q.filter(InboxMessage.source_type == "needs_human").count() > 0
+        
+        return {
+            "count": count,
+            "has_needs_human": has_needs_human
+        }

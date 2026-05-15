@@ -16,10 +16,10 @@ import logging
 
 from sqlalchemy import func
 
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from .session import SessionLocal
-from .models import BudgetEntry, Expense, Task
+from .models import BudgetEntry, Expense, Task, AgentSession
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +41,25 @@ def create_budget_entry(llm_id=None, budget_id=None, task_id=None,
             session_id=session_id, agent_name=agent_name,
         )
         db.add(entry)
+        
+        now_iso = datetime.now(timezone.utc).isoformat()
+
         if task_id:
             db.query(Task).filter(Task.id == task_id).update(
                 {"last_progress_at": datetime.utcnow()}, synchronize_session=False
             )
+            # Robust fallback: if task_id is present, update the currently open session for that task.
+            # This covers cases where session_id is a UUID or missing but task_id is known.
+            db.query(AgentSession).filter(
+                AgentSession.task_id == task_id,
+                AgentSession.ended_at.is_(None)
+            ).update({"last_activity_at": now_iso}, synchronize_session=False)
+        
+        if session_id and session_id.isdigit():
+            db.query(AgentSession).filter(AgentSession.id == int(session_id)).update(
+                {"last_activity_at": now_iso}, synchronize_session=False
+            )
+        
         db.commit()
         db.refresh(entry)
         return entry

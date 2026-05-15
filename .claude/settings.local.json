@@ -80,5 +80,6 @@
       "mcp__maestro__get_scheduler_api_status"
     ]
   },
-  "enableAllProjectMcpServers": true
+  "enableAllProjectMcpServers": true,
+  "prefersReducedMotion": true
 }

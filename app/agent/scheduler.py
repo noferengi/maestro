@@ -142,6 +142,31 @@ _external_sessions: dict[str, int] = {}   # session_key -> llm_id
 _external_sessions_lock = threading.Lock()
 
 
+def register_bg_pipeline_thread(key: str, llm_id: int, title: str = "") -> None:
+    """Register the current thread in _active_sessions so stop_scheduler drains it.
+
+    Call this after wait_and_register_pipeline_session() succeeds.  The LLM slot
+    is already counted by that call; this only adds the thread reference so the
+    shutdown sequence can join() it.
+    """
+    with _active_sessions_lock:
+        _active_sessions[key] = threading.current_thread()
+        _session_llm_ids[key] = llm_id
+        _session_titles[key] = title
+        _session_types[key] = "bg_pipeline"
+        _session_started_at[key] = time.time()
+
+
+def unregister_bg_pipeline_thread(key: str) -> None:
+    """Remove the thread from _active_sessions after the pipeline finishes."""
+    with _active_sessions_lock:
+        _active_sessions.pop(key, None)
+        _session_llm_ids.pop(key, None)
+        _session_titles.pop(key, None)
+        _session_types.pop(key, None)
+        _session_started_at.pop(key, None)
+
+
 def register_pipeline_session(key: str, llm_id: int) -> None:
     """Register an API-triggered pipeline so the scheduler's one-LLM policy sees it."""
     with _external_sessions_lock:
@@ -268,14 +293,23 @@ def wait_for_completion(key: str, timeout: float = 120.0) -> bool:
 
     Returns True if the job completed (or was already cleaned up from the
     registry - meaning it finished before we started waiting). Returns False
-    on timeout.
+    on timeout or if the server is shutting down.
     """
     with _pending_completions_lock:
         ev = _pending_completions.get(key)
     if ev is None:
         # Key already removed - job completed before we reached this call.
         return True
-    return ev.wait(timeout=timeout)
+    deadline = time.monotonic() + timeout
+    _POLL = 1.0
+    while True:
+        if is_shutting_down():
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if ev.wait(timeout=min(_POLL, remaining)):
+            return True
 
 
 def park_session(session_key: str, llm_id: int) -> None:
@@ -570,6 +604,19 @@ def get_scheduler_status() -> dict:
     except Exception:
         all_tasks = []
 
+    # Map open sessions to task IDs
+    from app.database import get_open_sessions
+    open_sessions = get_open_sessions()
+    session_map = {}
+    # We might have multiple sessions per task if the DB is messy; 
+    # use the latest started_at for each task_id or job_id.
+    for s in open_sessions:
+        tid = s.task_id
+        if not tid:
+            continue
+        if tid not in session_map or s.started_at > session_map[tid].started_at:
+            session_map[tid] = s
+
     task_dicts = [_task_to_mini_dict(t) for t in all_tasks]
     resolver = DAGResolver(task_dicts)
     ready_tasks = resolver.get_ready_tasks()
@@ -596,6 +643,23 @@ def get_scheduler_status() -> dict:
     # 1. Add scheduler-managed active tasks
     for tid in active_session_ids:
         task = task_by_id.get(tid)
+        session = session_map.get(tid)
+        
+        last_act = session.last_activity_at if session else None
+        idle_mins = 0
+        is_zombie = False
+        if last_act:
+            try:
+                la_dt = datetime.fromisoformat(last_act)
+                # Ensure la_dt is timezone-aware if it's not (SQLite might store it plain)
+                if la_dt.tzinfo is None:
+                    la_dt = la_dt.replace(tzinfo=timezone.utc)
+                idle_mins = (datetime.now(timezone.utc) - la_dt).total_seconds() / 60
+                if idle_mins > 20:
+                    is_zombie = True
+            except Exception:
+                pass
+
         if task:
             info = _llm_info(task.llm_id)
             active_list.append({
@@ -605,6 +669,9 @@ def get_scheduler_status() -> dict:
                 "project": task.project or "",
                 "llm_id": task.llm_id,
                 "llm_name": info["name"] if info else "(no LLM)",
+                "last_activity_at": last_act,
+                "idle_minutes": round(idle_mins, 1),
+                "zombie": is_zombie,
             })
         else:
             # Might be a background job (file summary, research)
@@ -618,6 +685,9 @@ def get_scheduler_status() -> dict:
                 "project": "",
                 "llm_id": llm_id,
                 "llm_name": info["name"] if info else "(no LLM)",
+                "last_activity_at": last_act,
+                "idle_minutes": round(idle_mins, 1),
+                "zombie": is_zombie,
             })
 
     # 2. Add external pipeline sessions
@@ -3563,6 +3633,19 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
                 )
                 _planning_stopped[task_id] = _stop_reason
                 _exit_summary = _stop_reason
+                
+                # Notify Inbox
+                from app.database import create_inbox_message, get_task
+                task_obj = get_task(task_id)
+                create_inbox_message(
+                    subject=f"Planning stopped: {(task_obj.title if task_obj else task_id)[:60]}",
+                    source_type="card_stopped",
+                    task_id=task_id,
+                    project_id=task_obj.project if task_obj else None,
+                    task_title=task_obj.title if task_obj else None,
+                    outcome="stopped",
+                    data_json=__import__("json").dumps({"reason": _stop_reason}),
+                )
             else:
                 # Park the card — requires manual re-trigger via "Run Planning" button.
                 # Do not use _rejection_cooldowns (which would auto-retry after 5 min).
@@ -3628,6 +3711,19 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
                     )
                     _planning_stopped[task_id] = _stop_reason
                     _exit_summary = _stop_reason
+
+                    # Notify Inbox
+                    from app.database import create_inbox_message, get_task
+                    task_obj = get_task(task_id)
+                    create_inbox_message(
+                        subject=f"Planning stopped: {(task_obj.title if task_obj else task_id)[:60]}",
+                        source_type="card_stopped",
+                        task_id=task_id,
+                        project_id=task_obj.project if task_obj else None,
+                        task_title=task_obj.title if task_obj else None,
+                        outcome="stopped",
+                        data_json=__import__("json").dumps({"reason": _stop_reason}),
+                    )
                 else:
                     # Try correction agent before applying cooldown.
                     hard_failures = [
@@ -3839,6 +3935,7 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
                 subject=f"Human review needed: {(task_obj.title if task_obj else task_id)[:60]}",
                 source_type="needs_human",
                 task_id=task_id,
+                project_id=task_obj.project if task_obj else None,
                 task_title=task_obj.title if task_obj else None,
                 outcome="needs_human",
                 data_json=__import__("json").dumps({"summary": _exit_summary}),
@@ -3863,6 +3960,7 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
                 subject=f"Consultation needed: {(task_obj.title if task_obj else task_id)[:60]}",
                 source_type="consultation",
                 task_id=task_id,
+                project_id=task_obj.project if task_obj else None,
                 task_title=task_obj.title if task_obj else None,
                 outcome="consultation",
                 data_json=__import__("json").dumps({
@@ -4164,6 +4262,7 @@ def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
                 subject=f"Human review needed: {(task.title or task_id)[:60]}",
                 source_type="needs_human",
                 task_id=task_id,
+                project_id=task.project,
                 task_title=task.title,
                 outcome="needs_human",
                 data_json=__import__("json").dumps({"summary": _exit_summary}),
@@ -4439,6 +4538,7 @@ def _run_final_review_task(task_id: str, llm_base_url: str, llm_model: str,
                 subject=f"Human review needed: {(task.title or task_id)[:60]}",
                 source_type="needs_human",
                 task_id=task_id,
+                project_id=task.project,
                 task_title=task.title,
                 outcome="needs_human",
                 data_json=__import__("json").dumps({"summary": _exit_summary}),
@@ -4688,10 +4788,21 @@ def _cleanup_finished() -> None:
     with _external_sessions_lock:
         _alive_ids.update(_external_sessions.keys())
     try:
-        from app.database import close_zombie_sessions_for_tasks
-        closed = close_zombie_sessions_for_tasks(exclude_task_ids=_alive_ids)
-        if closed:
-            logger.info("[scheduler] Closed %d zombie DB session(s).", closed)
+        from app.database import close_zombie_sessions_for_tasks, create_inbox_message, get_task
+        closed_ids = close_zombie_sessions_for_tasks(exclude_task_ids=_alive_ids)
+        if closed_ids:
+            logger.info("[scheduler] Closed zombie DB session(s) for tasks: %s", closed_ids)
+            for tid in closed_ids:
+                task = get_task(tid)
+                create_inbox_message(
+                    subject=f"Zombie session closed: {(task.title if task else tid)[:60]}",
+                    source_type="zombie_session",
+                    task_id=tid,
+                    project_id=task.project if task else None,
+                    task_title=task.title if task else None,
+                    outcome="zombie_recovered",
+                    data_json=__import__("json").dumps({"task_id": tid, "reason": "thread no longer alive"}),
+                )
     except Exception:
         logger.exception("[scheduler] Failed to reconcile zombie DB sessions.")
 
@@ -4873,6 +4984,7 @@ def _rescue_stale_jobs() -> None:
                     subject=f"Arch Gen failed: {job.project} / {job.category}",
                     source_type="arch_gen_failure",
                     task_id=None,
+                    project_id=job.project,
                     task_title=f"{job.category} Architecture ({job.project})",
                     outcome="abandoned",
                     data_json=json.dumps({

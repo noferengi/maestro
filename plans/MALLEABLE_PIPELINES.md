@@ -1,10 +1,11 @@
 # Malleable Pipelines — Design Exploration
 
-> **Status:** Brainstorm / Pre-RFC  
+> **Status:** Design locked — phase plans written, implementation not started  
 > **Author:** Exploration session, May 2026  
+> **Detailed phase plans:** `plans/PHASE_1_DATA_MODEL.md` through `plans/PHASE_10_TEMPLATES_GALLERY.md`  
 > **Goal:** Decouple pipeline definition from the scheduler so any project can run
 > any workflow — software development, novel writing, research reports, data
-> analysis, or anything else — with a visual node editor for composing pipelines.
+> analysis, mathematics, or anything else — with a visual node editor for composing pipelines.
 
 ---
 
@@ -17,18 +18,23 @@ IDEA → PLANNING → INDEV → CONCEPTUAL_REVIEW → OPTIMIZATION →
 SECURITY → FINAL_REVIEW → HUMAN_REVIEW → COMPLETED
 ```
 
-This is hardcoded in at least four places:
+This is hardcoded across the codebase. A **codebase survey (May 2026)** identified
+the actual blast radius:
 
 | Location | What's hardcoded |
 |---|---|
-| `scheduler.py` | Stage routing logic, agent dispatch per stage |
-| `agent_loop.py` / `maestro.py` | Loop entry/exit conditions per stage type |
-| `models.py` `Task.type` | String enum implicitly assumes software stages |
-| `app/web/board.js` | Column ordering, column-to-stage mapping |
+| `scheduler.py` (4910 lines) | 9 separate dispatch queues: DAG tasks, file summaries, research jobs, arch-gen jobs, survey jobs, clarification jobs, PIP resolution, subdivision recovery, Maestro orchestrator |
+| `models.py` `Task.type` | String enum; `stage_key` column does not yet exist |
+| `maestro.ini [pipeline] column_order` | Canonical ordering lives in config, not the DB |
+| `kanban.js` `ARCH_CATEGORY_COLORS` | 14 architecture categories hardcoded in JS |
 
-Every agent class (`PlanningAgent`, `DevOrchestrator`, `OptimizationAgent`, etc.)
-is valid only in the context of software development. A novel-writing project has
-no use for `SecurityReviewAgent`.
+There is no `advance_task_type()` function; stage transitions happen via scattered
+`update_task(task_id, type=...)` calls in `main.py`, `crud_tasks.py`, and the
+individual agent files. There is no agent registry — each agent class is instantiated
+by its own dedicated dispatcher function inside `scheduler.py`.
+
+Every agent class is valid only in the context of software development. A novel-writing
+project has no use for `SecurityReviewAgent`.
 
 The consequence: if you want to run a novel-writing project through Maestro today,
 you either abuse the software pipeline (use "INDEV" to mean "draft a chapter",
@@ -114,50 +120,99 @@ position of each token.
 
 ## 4. Data Model Changes
 
+### 4.0 Scope of the Pipeline System
+
+The 8 infrastructure-level scheduler queues (file summaries, research jobs,
+arch-gen, clarification, PIP resolution, survey jobs, subdivision recovery,
+Maestro orchestrator) remain as scheduler internals and are **not** expressed as
+pipeline stage nodes. The pipeline template system governs only the DAG task stages
+that tasks flow through on the kanban board.
+
 ### 4.1 New Tables
+
+All DDL targets PostgreSQL (migrations 0068+). `SERIAL` for auto-increment PKs,
+`TIMESTAMPTZ` for timestamps, `JSONB` for structured config blobs.
 
 ```sql
 -- A named, reusable pipeline topology
 CREATE TABLE pipeline_templates (
-    id          INTEGER PRIMARY KEY,
-    name        TEXT    NOT NULL UNIQUE,
+    id          SERIAL      PRIMARY KEY,
+    name        TEXT        NOT NULL UNIQUE,
     description TEXT,
-    is_default  BOOLEAN NOT NULL DEFAULT 0,
-    version     INTEGER NOT NULL DEFAULT 1,
-    created_at  DATETIME,
-    updated_at  DATETIME
+    is_default  BOOLEAN     NOT NULL DEFAULT FALSE,
+    is_builtin  BOOLEAN     NOT NULL DEFAULT FALSE,
+    version     INTEGER     NOT NULL DEFAULT 1,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- One row per stage node in a template
 CREATE TABLE pipeline_stages (
-    id           INTEGER PRIMARY KEY,
+    id           SERIAL  PRIMARY KEY,
     template_id  INTEGER NOT NULL REFERENCES pipeline_templates(id),
-    stage_key    TEXT    NOT NULL,   -- machine identifier, e.g. "draft", "line_edit"
-    label        TEXT    NOT NULL,   -- display name, e.g. "Draft"
-    agent_type   TEXT    NOT NULL,   -- key into agent_registry
-    position     INTEGER NOT NULL,   -- display order (left to right)
+    stage_key    TEXT    NOT NULL,
+    label        TEXT    NOT NULL,
+    agent_type   TEXT    NOT NULL,
+    position     INTEGER NOT NULL,
     group_id     INTEGER REFERENCES pipeline_stage_groups(id),
-    config       JSON,               -- agent-specific overrides (tool list, gate type, retries, llm_id)
+    config       JSONB,              -- gate, retries, llm_override, tools, intent, system_prompt, …
+    color        TEXT,
     UNIQUE(template_id, stage_key)
 );
 
 -- Stage groups (bracketed columns)
 CREATE TABLE pipeline_stage_groups (
-    id          INTEGER PRIMARY KEY,
+    id          SERIAL  PRIMARY KEY,
     template_id INTEGER NOT NULL REFERENCES pipeline_templates(id),
     name        TEXT    NOT NULL,
-    color       TEXT,               -- CSS colour token
-    position    INTEGER NOT NULL    -- display order of the group itself
+    color       TEXT,
+    position    INTEGER NOT NULL
 );
 
 -- Directed edges between stages
 CREATE TABLE pipeline_transitions (
-    id            INTEGER PRIMARY KEY,
+    id            SERIAL  PRIMARY KEY,
     template_id   INTEGER NOT NULL REFERENCES pipeline_templates(id),
     from_stage_id INTEGER NOT NULL REFERENCES pipeline_stages(id),
     to_stage_id   INTEGER NOT NULL REFERENCES pipeline_stages(id),
-    condition     TEXT    NOT NULL,  -- "pass" | "fail" | "reject" | "always" | "skip"
-    priority      INTEGER NOT NULL DEFAULT 0  -- tie-break when multiple edges match
+    condition     TEXT    NOT NULL CHECK(condition IN ('pass','fail','reject','always','skip')),
+    priority      INTEGER NOT NULL DEFAULT 0
+);
+```
+
+```sql
+-- Arch card categories per pipeline template
+CREATE TABLE pipeline_arch_categories (
+    id          SERIAL  PRIMARY KEY,
+    template_id INTEGER NOT NULL REFERENCES pipeline_templates(id),
+    key         TEXT    NOT NULL,
+    label       TEXT    NOT NULL,
+    color       TEXT,
+    position    INTEGER NOT NULL,
+    UNIQUE(template_id, key)
+);
+
+-- Deleted-file audit trail (deletion protection for workspace scratch pads)
+CREATE TABLE archived_files (
+    id             SERIAL      PRIMARY KEY,
+    task_id        TEXT        NOT NULL REFERENCES tasks(id),
+    original_path  TEXT        NOT NULL,
+    archive_path   TEXT        NOT NULL UNIQUE,
+    deleted_at     TIMESTAMPTZ DEFAULT NOW(),
+    restored_at    TIMESTAMPTZ
+);
+
+-- Global and per-project key/value settings
+CREATE TABLE system_settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE project_settings (
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    key        TEXT    NOT NULL,
+    value      TEXT    NOT NULL,
+    PRIMARY KEY (project_id, key)
 );
 ```
 
@@ -267,7 +322,8 @@ await agent.run()
 
 ### 6.1 Canvas Layout
 
-A new route `/pipelines/{template_id}/edit` renders a full-canvas node editor:
+A new route `/pipelines/{template_id}/edit` renders a full-canvas node editor
+built on **Litegraph.js** (single script tag, no build step):
 
 ```
 ╔══════════════════════════════════════════════════════════════╗
@@ -289,20 +345,33 @@ A new route `/pipelines/{template_id}/edit` renders a full-canvas node editor:
 ╚══════════════════════════════════════════════════════════════╝
 ```
 
+Back-edges (fail/reject loops) render as dashed curved wires in a distinct colour;
+forward edges are solid. Node interiors are canvas-painted — rich controls live in
+the slide-in property panel, not inside the node itself.
+
 **Node controls:**
-- Double-click a node → open property panel (agent type, tools, gate config, LLM override)
+- Double-click a node → open property panel
 - Drag from an output port → draw a new transition edge
 - Right-click edge → set condition (pass / fail / reject / skip)
 - Drag-select multiple nodes → group them
 - Delete key → remove node or edge
 
 **Property panel (slides in from right):**
+
+Every text or select field carries a ⚡ button. Clicking it sends the full current
+state of the panel — every filled field — plus graph context (pipeline name,
+pipeline description, predecessor stage labels, successor stage labels, edge
+conditions in and out) to `POST /api/pipelines/generate-field`. The response
+replaces the content of that field. The user can type a partial value first; ⚡
+treats whatever is in the field as a directional hint, not a blank slate.
+
 ```
 Stage: "Drafting"
-─────────────────────
-Agent type:     [writing_agent       ▼]
-Display label:  [Drafting              ]
+────────────────────────────────────────────────
+Agent type:     [writing_agent       ▼]       ⚡
+Display label:  [Drafting              ]       ⚡
 LLM override:   [inherit from project ▼]
+Intent:         [draft a chapter of prose from an outline] ⚡
 
 Gate type:      [llm_judge           ▼]
 Max retries:    [3                    ]
@@ -311,11 +380,25 @@ Tools allowed:
   ☑ read_file    ☑ write_file
   ☐ web_search   ☐ run_pytest
 
-Custom system prompt:
-  ┌──────────────────────────────────┐
-  │ You are an expert novelist...    │
-  └──────────────────────────────────┘
+System prompt:
+  ┌──────────────────────────────────────────┐ ⚡
+  │ You are an expert novelist...            │
+  └──────────────────────────────────────────┘
 ```
+
+**The Intent field** is the primary authoring surface. It is a short, plain-English
+description of what this stage should accomplish — written by the person building the
+pipeline, not inferred by the system. ⚡ on the system prompt field uses the Intent
+(plus agent type, tools, predecessor/successor labels, and any partial prompt text
+already typed) to generate a complete, specific system prompt. ⚡ on other fields
+(label, gate type, tool selection) uses the Intent similarly to suggest sensible
+defaults.
+
+The system prompt field is **not optional** and **not auto-populated at runtime**.
+The Intent field makes writing it fast — a few words from the pipeline author, one
+click, and the LLM produces a draft the author can review and edit. But the saved
+prompt is what the agent runs on; there is no "infer from graph at dispatch time"
+magic. What you see in the panel is what the agent gets.
 
 ### 6.2 Kanban Derivation
 
@@ -337,6 +420,22 @@ templates:
 | Research Report | Topic → Research → Outline → Draft → Fact Check → Format → Human Review → Published |
 | Data Analysis | Question → Data Collection → Analysis → Visualization → Write-Up → Human Review |
 | Bug Triage | Reproduce → Root Cause → Fix → Regression Test → Human Review |
+
+---
+
+## 6.4 Node Type Taxonomy
+
+All nodes are rectangles of the same shape. User assigns color per node or
+selection. Semantic meaning comes from wiring, not shape. Node types:
+
+| Node type | Ports | What it does |
+|---|---|---|
+| **Stage node** | 1 in, N out (one per condition) | Runs an agent; the primary building block |
+| **Factory node** | 0–1 in (optional trigger), 1 out | Ingests external data and batch-creates cards |
+| **Conditional node** | 1 in, 2–N out | Branches on a content blob key value |
+| **Judgment gate** | N in, 1 out | Fan-in: receives N parallel attempts, selects the best |
+| **Fan-out node** | 1 in, 1 out | Spawns N parallel attempt cards from one input |
+| **Human gate** | 1 in, 2 out (approve / reject) | Blocks until human acts or Maestro autopilot handles it |
 
 ---
 
@@ -444,14 +543,17 @@ custom system prompt and tool set. These are stored in the DB:
 
 ```sql
 CREATE TABLE custom_agent_definitions (
-    id            INTEGER PRIMARY KEY,
-    name          TEXT NOT NULL UNIQUE,   -- used as agent_type key
-    display_name  TEXT NOT NULL,
+    id            SERIAL      PRIMARY KEY,
+    name          TEXT        NOT NULL UNIQUE,
+    display_name  TEXT        NOT NULL,
     description   TEXT,
-    system_prompt TEXT NOT NULL,
-    allowed_tools JSON NOT NULL,          -- list of tool keys
-    gate_type     TEXT NOT NULL DEFAULT 'llm_judge',
-    created_at    DATETIME
+    intent        TEXT,
+    system_prompt TEXT        NOT NULL DEFAULT '',
+    allowed_tools JSONB       NOT NULL DEFAULT '[]',
+    gate_type     TEXT        NOT NULL DEFAULT 'llm_judge',
+    verifier      TEXT        NOT NULL DEFAULT 'none',
+    verifier_cmd  TEXT,
+    created_at    TIMESTAMPTZ DEFAULT NOW()
 );
 ```
 
@@ -534,99 +636,210 @@ QUESTION ──► Data Collection ──────► Analysis ──► Visu
 
 ### Q1: How do we handle agent output schemas across custom pipelines?
 
-Today the flow is tightly typed: planning produces `PlanningResult`, which
-`DevOrchestrator` consumes. In a custom pipeline, the "output" of stage N is
-just the task's `content` JSON blob. We need a lightweight schema system — maybe
-just a JSON Schema doc attached to each agent definition — so the editor can
-warn when you wire incompatible stages together.
+**Decision:** Loose blob, not tight types.
+
+Each stage writes its output into the task's `content` JSON field — a dict with
+any keys it wants. Each agent spec declares `required_input_keys` (list of keys it
+needs present) and `output_keys` (list of keys it guarantees to write). The pipeline
+editor warns visually when stage N's `output_keys` doesn't cover stage N+1's
+`required_input_keys`, but this is advisory — mis-wired pipelines fail at runtime
+with a clear error, not a crash.
+
+The primary goal is to **keep as many DAG edges active and in-flight as possible**
+to saturate inference capacity. Agents must tolerate partial or noisy predecessor
+output and degrade gracefully (skip a check, use a default) rather than stalling.
+Strict schema validation is an opt-in per stage, not the default.
+
+---
 
 ### Q2: What does "subdivide" mean in a custom pipeline?
 
-Subdivision today creates child tasks of the same project. In a novel pipeline,
-a "subdivide" on "Chapter 1 Draft" would create sub-tasks for each section.
-The subdivision agent needs to know what stage the children start in (the
-beginning of the pipeline, or the same stage as the parent?). This is a
-per-pipeline config: `subdivision_entry_stage`.
+**Decision:** Subdivision is a registered agent type that calls a `batch_create_cards`
+tool.
 
-### Q3: Git worktrees for non-code work
+The current `SubdivisionAgent` is refactored to: (1) decide how to break the work,
+then (2) call `batch_create_cards(cards: list[CardSpec])`, where each `CardSpec`
+carries `{title, description, entry_stage, parent_id, tags}`. The tool is the
+mechanism; the LLM decides the segmentation strategy based on its system prompt.
 
-`DevOrchestrator` uses git branches for isolation. A writing agent working on
-chapter files also benefits from isolation. The `worktree.py` module should be
-generalised to work for any file-writing agent, not just software tasks.
+Key design points:
+- `entry_stage` in `CardSpec` is pipeline-configured (`subdivision_entry_stage` on
+  the pipeline template). For software tasks this is the pipeline's first stage; for
+  a writing pipeline that is just logging character names it might be a lightweight
+  "register" stage or even `completed` immediately.
+- `batch_create_cards` may return a new parent card. When it does, the original card
+  is demoted to a "legacy archive" card with `type='archive'` (a new soft-type),
+  recording its role as the origination point.
+- Partial overlap across cards is intentional and expected — the system is designed
+  for redundancy, not exclusivity.
+
+**Arch card categories (CRUD):** Currently hardcoded in `kanban.js` as 14 categories.
+Categories are **per pipeline template** — software dev has Platform/Testing/Security;
+a writing pipeline has Characters/Themes/Plot/WorldBuilding. A `pipeline_arch_categories`
+table replaces the hardcoded JS dict, with rows keyed by `template_id`. Each stage node
+in the template declares which category keys to surface in its system prompt context.
+This is the "knowledge graph" layer: arch cards are the global project memory,
+segmented by category, selectively surfaced per agent role.
+
+---
+
+### Q3: Workspace Isolation for Non-Code Work
+
+**Decision:** Scratch pads replace raw worktrees as the agent file-access primitive.
+
+`worktree.py` is already domain-agnostic (creates `.maestro-worktrees/{task_id}/`).
+The new `workspace.py` layer wraps it with:
+
+1. **Deletion protection** — `delete_file(path)` moves the file to
+   `.archive/YYYY-MM-DD_HH-MM-SS_<hash>/original/path` and inserts an
+   `archived_file` DB record with the original path, archive path, task_id, and
+   a collision-safe name. `undelete_file(archive_record_id)` restores to the exact
+   original path (or a user-chosen path on collision).
+
+2. **Per-card scratch pads** — each task gets its own worktree. Within that worktree,
+   the agent sees a full filesystem view and can rename/delete/create freely without
+   touching other tasks' views or the shared `.archive`.
+
+3. **Tool surface per stage** — the `allowed_tools` in a stage config controls which
+   workspace tools the agent can call: `read_file`, `write_file`, `delete_file`,
+   `rename_file`, `run_pytest`, `run_math_kernel`, `query_knowledge_graph`, etc.
+   The per-stage tool allowlist in `config.py:build_tool_schemas()` is the enforcement
+   point; no changes to the safety model are required.
+
+4. **Collision on merge** — when a task's worktree is merged back to the main branch,
+   file conflicts are surfaced as a diff for human or Maestro review. This is the
+   existing git merge flow; the scratch-pad model doesn't change it.
+
+---
 
 ### Q4: The human_gate agent and async blocking
 
-`HumanGateAgent` needs to pause the task until the user approves via the UI.
-This is fundamentally different from LLM-driven gates. The task sits in the
-`human_review` column, the LLM slot is released, and the scheduler skips it
-until a UI action fires. We already handle this today for `HUMAN_REVIEW` — it
-just needs to be generalisable to any stage.
+**Decision:** Global "Human in the Loop / Leave it to the Maestro" toggle, surfaced
+as a prominent button near the arch bar.
+
+- **"Human in the Loop"** — Maestro scheduler is paused immediately. Any running
+  Maestro sessions receive a graceful stop signal (existing `stop_agent` path). No
+  new tasks are dispatched. Tasks in `human_review` stage (or any `human_gate` stage)
+  surface as pending items for the user.
+- **"Leave it to the Maestro"** — All tasks currently in a `human_gate` stage are
+  fed to the Maestro orchestrator at maximum priority. Maestro decides whether to
+  approve, reject, or request revision based on context. This is "YOLO mode": the
+  user delegates even human-review decisions to the LLM.
+
+State lives in `system_settings` (global default) and an optional
+`project_settings(project_id, key, value)` override — mirroring how LLM overrides
+work per-project today. The scheduler resolves: project override → global default.
+
+The UI toggle is global; individual projects can override via a project settings panel.
+Human-gate stages release their LLM slot immediately (existing behavior for
+`HUMAN_REVIEW`) and the scheduler skips them until either the user approves or
+Maestro autopilot is engaged.
+
+---
 
 ### Q5: Pipeline versioning and running tasks
 
-If a project has 10 tasks in INDEV and you edit the pipeline template, what
-happens to those tasks? Options:
-- **Freeze**: tasks already dispatched continue on the template version at
-  dispatch time. New tasks use the updated template.
-- **Migrate**: all tasks are re-mapped to the new template (risky if stages
-  were renamed or removed).
-- **Snapshot**: templates are immutable once a task has been dispatched against
-  them; edits create a new version.
+**Decision:** Migrate, not snapshot.
 
-The snapshot model (similar to Docker image layers) is safest: template edits
-bump the `version` field and new tasks get the new version. In-flight tasks
-stay on their version.
+When a template is edited, all tasks assigned to that template are remapped to the
+updated stage definitions:
+
+- **Stage renamed:** `stage_key` on affected tasks is updated to the new key.
+- **Stage deleted:** deletion requires choosing a replacement stage. The UI blocks
+  deletion without a redirect — no card is left pointing to a null stage.
+- **Stage added:** existing in-flight tasks are unaffected (they are already past
+  or before the new stage). New tasks pick it up naturally.
+- **Edge changed:** affects future transitions only; in-flight tasks are at their
+  current stage, and the new edge applies when they next transition.
+
+All tasks assigned to a given pipeline template are immediately live on the latest
+definition. There is no version column per task — the template `version` field is
+a change log aid, not a routing key.
 
 ---
 
 ## 13. Implementation Phases
 
-### Phase 0: Fix the scheduler's zombie problem (immediate, ~1 day)
-The prerequisite bug — LLM awaits with no timeout, zombie detector blind to
-alive-but-hung loops — needs to be fixed before we add more complexity.
-See companion investigation notes.
+See individual phase plan files in `plans/` for full detail on each phase.
 
-### Phase 1: Data model + migration (~3 days)
-- Add `pipeline_templates`, `pipeline_stages`, `pipeline_transitions`, `pipeline_stage_groups` tables.
-- Migration that seeds the "Software Development" template from the current hardcoded pipeline.
-- Add `stage_key` to tasks and project `pipeline_template_id` FK.
-- Populate existing rows. System continues to work with zero visible change.
+### Phase 0 ✅ DONE — Zombie session recovery
+Shipped in commit `0126374`.
 
-### Phase 2: Scheduler decoupling (~4 days)
-- Extract stage-routing logic from `scheduler.py` into `pipeline_router.py`.
-- Replace `if task.type == "planning":` dispatch chain with registry lookup.
-- Replace `advance_task_type()` with `get_next_stage()` edge traversal.
-- Existing tests pass on the Software Development template.
+### Phase 1 (~3 days) — Data model & migration  `PHASE_1_DATA_MODEL.md`
+All new tables added in one migration; system behavior is unchanged.  
+New tables: `pipeline_templates`, `pipeline_stages`, `pipeline_transitions`,
+`pipeline_stage_groups`, `pipeline_arch_categories`, `custom_agent_definitions`,
+`project_documents`, `archived_files`, `system_settings`, `project_settings`,
+`factory_runs`.  
+Adds `tasks.stage_key` (nullable) and `projects.pipeline_template_id`.  
+Seeds "Software Development" template from `maestro.ini [pipeline] column_order`.
 
-### Phase 3: Pipeline CRUD API (~2 days)
-- REST endpoints for template CRUD.
-- Endpoints to add/remove/update stages and edges within a template.
-- Assign template to project endpoint.
-- Template export/import as JSON.
+### Phase 2 (~5 days) — Scheduler decoupling  `PHASE_2_SCHEDULER_DECOUPLING.md`
+Only the DAG-task queue is made pipeline-aware; the other 8 infrastructure queues
+are untouched. Introduces `pipeline_router.py` and `agent_registry.py`. Centralises
+all scattered `update_task(type=...)` calls into `pipeline_router.advance_stage()`.
+Both `stage_key` and `type` are kept in sync throughout the transition period.
 
-### Phase 4: Frontend pipeline editor (~1 week)
-- Canvas route `/pipelines/{id}/edit`.
-- Draggable stage nodes with port-based edge wiring.
-- Property panel per node.
-- Kanban board derives columns from template (replaces hardcoded `columnMap`).
+### Phase 3 (~2 days) — Pipeline CRUD API  `PHASE_3_PIPELINE_CRUD_API.md`
+Full REST CRUD for templates, stages, transitions, groups, arch categories.
+Stage deletion requires a redirect target (no card ever ends up in a null stage).
+Template export/import as JSON. `POST /api/pipelines/generate-field` for ⚡.
 
-### Phase 5: Agent registry + custom agents (~3 days)
-- `custom_agent_definitions` table.
-- `CustomLLMAgent` class.
-- Registry CRUD in UI.
-- `WritingAgent`, `FactCheckerAgent` implementations.
+### Phase 4 (~7–9 days) — Litegraph editor  `PHASE_4_LITEGRAPH_EDITOR.md`
+Canvas editor at `/pipelines/{id}/edit` using Litegraph.js (script tag, no bundler).
+All node types (stage, factory, conditional, judgment gate, fan-out, human gate)
+share the same shape; user assigns color. Back-edges are dashed + amber.
+Slide-in property panel with ⚡ on every text field. Kanban derives columns from
+the template, replacing the hardcoded `column_order` config.
 
-### Phase 6: Cross-domain templates + gallery (~2 days)
-- Ship the built-in templates (Novel Writing, Research Report, etc.).
-- Template gallery UI page.
+### Phase 5 (~4 days) — Agent registry & custom agents  `PHASE_5_AGENT_REGISTRY.md`
+`CustomLLMAgent` operational; `batch_create_cards` tool added; subdivision agent
+refactored to call it. Pluggable verifier framework: `none`, `lean4` (stub),
+`coq` (stub), `python_sympy`, `custom_script`. Custom agent definition CRUD API.
+
+### Phase 6 (~3 days) — Workspace isolation & arch CRUD  `PHASE_6_WORKSPACE_ISOLATION.md`
+`workspace.py` wraps worktrees with deletion protection: `delete_file()` moves
+to `.archive/` and creates an `archived_files` DB record; `undelete_file()` restores.
+Arch categories become CRUD-able per pipeline template; `ARCH_CATEGORY_COLORS`
+removed from `kanban.js`; per-stage arch category visibility configured in the editor.
+
+### Phase 7 (~2 days) — Autopilot & mission system  `PHASE_7_AUTOPILOT_MISSION.md`
+"Human in the Loop / Leave it to the Maestro" toggle (global + per-project override).
+Scheduled operating hours (`autopilot_start_hour` / `autopilot_stop_hour`).
+Mission dialog: any combination of time limit, token budget, card count, goal card —
+first condition to fire stops the run. Mission settings persist in browser localStorage
+(no DB record). Completed mission creates a report arch card.
+
+### Phase 8 (~2 days) — Document store  `PHASE_8_DOCUMENT_STORE.md`
+Per-project shared document store (`project_documents` table). Agents write named
+artifacts (`store_document(key, content)`) and retrieve by exact key or fuzzy key
+match (Python-side Levenshtein, no embeddings). Last-write-wins per key; writes
+tagged with writing card ID for provenance. Enables cross-card coordination (e.g.
+math lemmas written by one card, read by a synthesis card).
+
+### Phase 9 (~4 days) — Card factory system  `PHASE_9_CARD_FACTORY.md`
+Factory nodes ingest external data and batch-create cards. Two segmentation modes:
+mechanical (1 item → 1 card) and LLM-segmented (agent decides). Data source adapters:
+`folder`, `file_list`, `csv`, `json_array`, `sqlite_query` (external files), `manual_prompt`,
+`maestro_cards`. Three trigger modes: manual button, predecessor card COMPLETED,
+cron schedule. `factory_runs` audit table tracks each run.
+
+### Phase 10 (~2 days) — Templates gallery  `PHASE_10_TEMPLATES_GALLERY.md`
+Six built-in templates: Software Development, Novel Writing, Research Report,
+Data Analysis, Mathematics/Proof Exploration, Bug Triage, Overnight Story Factory.
+Gallery UI at `/pipelines`: browse, clone, assign, import/export. Built-in templates
+are protected from deletion but can be cloned.
 
 ---
 
 ## 14. Risk Factors
 
-**Scheduler complexity** — the dispatch loop is already 900+ lines. Decoupling
-stage routing requires careful refactoring. Full test coverage of the routing
-layer before touching the dispatch path.
+**Scheduler complexity** — `scheduler.py` is 4910 lines with 9 independent
+dispatch queues. Only the DAG-task queue needs pipeline-awareness in Phase 2;
+the other 8 are left alone. But even the DAG queue dispatches are not a single
+if-else chain — they are scattered across per-queue dispatcher functions each of
+which directly instantiates its agent class. Full test coverage of the routing
+layer is mandatory before touching the dispatch path.
 
 **`task.type` ubiquity** — it's used in 50+ places. An additive migration is
 the right call, but it means living with two sources of truth during the
@@ -638,30 +851,44 @@ either a schema validator or accepting that mis-wired pipelines will fail at
 runtime. A warning in the UI ("these stages have incompatible schemas") is
 probably enough for now.
 
-**ComfyUI canvas library** — we'd be building this from scratch or adopting a
-library like [React Flow](https://reactflow.dev/) or
-[Litegraph.js](https://github.com/jagenjo/litegraph.js) (what ComfyUI uses).
-React Flow is MIT-licensed, well-maintained, and has first-class TypeScript
-support. We'd need to introduce a JS build step (currently the frontend is
-vanilla JS with no bundler). That's a small but real infrastructure step.
+**Canvas library: Litegraph.js (decided)** — [Litegraph.js](https://github.com/jagenjo/litegraph.js)
+is the canvas library, matching ComfyUI's stack. It is a single script-tag drop-in
+with no build step, handles back-edges and typed ports natively, and scales to
+thousands of nodes at 60fps on a 2D canvas. The trade-off vs React Flow: node
+interiors are canvas-painted primitives, so rich HTML (dropdowns, text areas) cannot
+live inside the node itself. This is acceptable — the property panel is a separate
+slide-in panel by design. No bundler, no React, no infrastructure change required.
 
 ---
 
 ## 15. Summary
 
-The core insight is that Maestro's scheduler is already general-purpose: it
-dispatches agents to tasks, tracks capacity, manages budgets, and handles the
-DAG. The only thing tying it to software development is the hardcoded stage →
-agent mapping and the hardcoded column list in the frontend.
+The core insight is that Maestro's scheduler is already general-purpose. The only
+things tying it to software development are the hardcoded stage → agent mapping and
+the hardcoded column list in the frontend. Replacing those with a DB-backed pipeline
+template system gives users a fully malleable orchestration platform.
 
-Replacing those two hardcoded things with a DB-backed pipeline template system
-— and exposing that system through a visual ComfyUI-style editor — gives users
-a fully malleable orchestration platform. The scheduler, DAG, budget system, git
-worktree isolation, and LLM routing all work unchanged. The agents themselves
-(planning, implementation, review) become entries in a registry that pipeline
-templates reference by key.
+**What this becomes:** A Litegraph.js canvas where you draw nodes, connect them with
+wires, write a one-sentence Intent per stage, and click ⚡ to generate the system
+prompt. The kanban board derives its columns from whatever you drew. The scheduler
+dispatches agents by looking up the graph, not by reading Python if/elif chains.
 
-The immediate next step is Phase 0: fixing the zombie session bugs that are
-blocking the current pipeline. Phases 1 and 2 follow immediately after as they
-are low-risk schema additions that lay the foundation without visible behaviour
-change.
+**The five supporting systems** built alongside the pipeline engine:
+
+| System | What it enables |
+|---|---|
+| **Document store** (Phase 8) | Agents share named artifacts across cards; coordination without tight coupling |
+| **Card factory** (Phase 9) | Ingest folders, CSVs, databases, or LLM-segmented prompts → batch of cards |
+| **Workspace isolation** (Phase 6) | Per-card scratch pads with deletion protection and `.archive/` restore |
+| **Autopilot & mission** (Phase 7) | Scheduled overnight runs with first-breach-wins termination conditions |
+| **Arch categories CRUD** (Phase 6) | Per-template knowledge categories injected into agent context |
+
+**What does not change:** the DAG prerequisite system, LLM routing, budget tracking,
+capacity counting, git worktree isolation, and the 8 infrastructure scheduler queues
+(file summaries, research jobs, arch-gen, clarification, PIP resolution, survey,
+subdivision recovery, Maestro orchestrator). These remain as-is.
+
+**Immediate next step:** Phase 1 (data model migration). Low-risk, no behavior
+change, unblocks everything else. Phase 2 (scheduler decoupling) is the highest-risk
+work and must not begin until Phase 1 is fully merged and the test suite covers the
+routing layer.

@@ -282,6 +282,7 @@ from .crud_sessions import (
     close_zombie_sessions,
     close_zombie_sessions_for_tasks,
     get_agent_sessions_for_task,
+    get_open_sessions,
     create_tool_bug_report,
     get_tool_bug_reports,
     mark_tool_bug_reports_viewed,

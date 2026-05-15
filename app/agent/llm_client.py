@@ -260,9 +260,10 @@ def update_llm_context_cache(llm_id: int, max_context: int | None):
 # Graceful shutdown & session killing flags
 #
 # Two-phase shutdown:
-#   Phase 1 — signal_shutdown(): sets _shutdown_event.  In-flight calls exit at
-#     their next between-chunk check (effectively within one token interval for
-#     streaming calls).  No new work is dispatched.
+#   Phase 1 — signal_shutdown(): sets _shutdown_event.  No new turns or agents are
+#     dispatched (all turn-loop guards check is_shutting_down() before starting).
+#     In-flight LLM generations are allowed to complete naturally so the current
+#     turn finishes cleanly.  stop_scheduler waits up to (timeout − 5) seconds.
 #   Phase 2 — signal_force_shutdown(): sets _force_shutdown_event.  The streaming
 #     poll loop checks this flag every _SHUTDOWN_POLL_SLICE seconds even while
 #     waiting for the first token, providing a hard-deadline interrupt for calls
@@ -308,7 +309,7 @@ class TaskDeactivatedError(BaseException):
 
 
 def signal_shutdown() -> None:
-    """Phase-1 shutdown: signal in-flight calls to abort at their next check."""
+    """Phase-1 shutdown: prevent new turns/agents from starting; let current generation finish."""
     _shutdown_event.set()
 
 
@@ -379,7 +380,7 @@ class TruncatedToolCallError(Exception):
 
 
 def signal_shutdown() -> None:
-    """Phase-1 shutdown: signal in-flight calls to abort at their next check."""
+    """Phase-1 shutdown: prevent new turns/agents from starting; let current generation finish."""
     _shutdown_event.set()
 
 
@@ -463,7 +464,7 @@ async def _stream_llm_response(
                     got_stop = False
                     line = ""
                     while elapsed < idle_timeout:
-                        if _shutdown_event.is_set() or _force_shutdown_event.is_set():
+                        if _force_shutdown_event.is_set():
                             next_line_task.cancel()
                             raise ShutdownError("Server is shutting down")
                         if is_session_killed(session_id):

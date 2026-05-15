@@ -669,6 +669,7 @@ class AgentSession(Base):
     budget_id         = Column(Integer, nullable=True)
     prompt_tokens     = Column(Integer, nullable=False, default=0)
     completion_tokens = Column(Integer, nullable=False, default=0)
+    last_activity_at  = Column(String, nullable=True)
 
     def __repr__(self):
         return (
@@ -806,6 +807,7 @@ class InboxMessage(Base):
     subject = Column(String, nullable=False)
     source_type = Column(String, nullable=False, default='intake_result')
     task_id = Column(String, nullable=True)                     # soft ref — no FK (task may be deleted)
+    project_id = Column(String, nullable=True)                  # soft ref to projects.name
     task_title = Column(String, nullable=True)                  # snapshot at creation time
     outcome = Column(String, nullable=True)                     # rejected | passed | failed | subdivide
     data_json = Column(Text, nullable=True)                     # full payload snapshot (JSON string)

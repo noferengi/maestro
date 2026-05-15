@@ -36,10 +36,12 @@ def create_agent_session(
     """
     db = SessionLocal()
     try:
+        now = _now_iso()
         session = AgentSession(
             task_id=task_id,
             agent_type=agent_type,
-            started_at=_now_iso(),
+            started_at=now,
+            last_activity_at=now,
             scheduler_reason=scheduler_reason,
             llm_id=llm_id,
             budget_id=budget_id,
@@ -126,12 +128,14 @@ def close_zombie_sessions() -> int:
         db.close()
 
 
-def close_zombie_sessions_for_tasks(exclude_task_ids: set[str]) -> int:
+def close_zombie_sessions_for_tasks(exclude_task_ids: set[str]) -> list[str]:
     """Close open sessions for tasks whose threads are no longer alive.
 
     Called periodically by _cleanup_finished() in scheduler.py to reconcile
     DB state with in-memory thread state after threads die unexpectedly.
     exclude_task_ids: task IDs that are known-alive; all others are closed.
+    
+    Returns the list of task_ids that were closed.
     """
     import sqlalchemy as _sa
     db = SessionLocal()
@@ -150,14 +154,14 @@ def close_zombie_sessions_for_tasks(exclude_task_ids: set[str]) -> int:
         # 2. Find IDs that are in DB but NOT in the exclusion set
         zombie_ids = [tid for tid in db_open_ids if tid not in exclude_task_ids]
         if not zombie_ids:
-            return 0
+            return []
 
         logger.info("[sessions] Found %d zombie task(s) to close: %s", len(zombie_ids), zombie_ids)
 
         # 3. Batch close them
         # Note: task_id IN (...) is safe here as IDs are generated slugs/uuids
         placeholders = ",".join(f"'{t}'" for t in zombie_ids)
-        result = db.execute(
+        db.execute(
             _sa.text(
                 f"UPDATE agent_sessions SET ended_at=:now, exit_reason='shutdown', "
                 f"exit_summary='Closed by scheduler cleanup: thread no longer alive' "
@@ -166,14 +170,13 @@ def close_zombie_sessions_for_tasks(exclude_task_ids: set[str]) -> int:
             {"now": _now_iso()},
         )
         db.commit()
-        count = result.rowcount
-        logger.info("[sessions] Successfully closed %d zombie DB session(s).", count)
-        return count
+        logger.info("[sessions] Successfully closed zombie DB session(s) for %d tasks.", len(zombie_ids))
+        return zombie_ids
 
     except Exception as exc:
         db.rollback()
         logger.error("Error in close_zombie_sessions_for_tasks: %s", exc)
-        return 0
+        return []
     finally:
         db.close()
 
@@ -190,6 +193,22 @@ def get_agent_sessions_for_task(task_id: str) -> list[AgentSession]:
         )
     except Exception as exc:
         logger.error("Error fetching agent_sessions for task %s: %s", task_id, exc)
+        return []
+    finally:
+        db.close()
+
+
+def get_open_sessions() -> list[AgentSession]:
+    """Return all active (open) agent sessions."""
+    db = SessionLocal()
+    try:
+        return (
+            db.query(AgentSession)
+            .filter(AgentSession.ended_at.is_(None))
+            .all()
+        )
+    except Exception as exc:
+        logger.error("Error fetching open agent_sessions: %s", exc)
         return []
     finally:
         db.close()

@@ -754,6 +754,8 @@ def _pipeline_session(func):
         from app.agent.scheduler import (
             wait_and_register_pipeline_session,
             unregister_pipeline_session,
+            register_bg_pipeline_thread,
+            unregister_bg_pipeline_thread,
         )
         from app.database import create_agent_session, close_agent_session
         task = get_task(task_id)
@@ -767,6 +769,12 @@ def _pipeline_session(func):
                 )
                 return
             agent_type = _AGENT_TYPE_MAP.get(func.__name__, func.__name__.lstrip("_"))
+            # Register this thread in _active_sessions so stop_scheduler can join() it
+            # during shutdown. The LLM slot is already counted by wait_and_register.
+            register_bg_pipeline_thread(
+                key, task.llm_id,
+                title=f"{agent_type}: task {task_id}",
+            )
             _session_id = create_agent_session(
                 task_id=task_id,
                 agent_type=agent_type,
@@ -786,6 +794,7 @@ def _pipeline_session(func):
             finally:
                 close_agent_session(_session_id, _exit_reason)
                 unregister_pipeline_session(key, task.llm_id)
+                unregister_bg_pipeline_thread(key)
         else:
             return func(task_id, *args, **kwargs)
     return wrapper
@@ -3604,6 +3613,64 @@ _ARCH_CATEGORIES = [
 ]
 
 
+@app.get("/api/projects/{project_name}/populate-arch/preview")
+def preview_populate_arch(project_name: str):
+    """Preview which architecture categories will be generated and check context health."""
+    from app.database import get_project, get_tasks_by_project, get_file_summaries_for_project_root
+    from app.database import SessionLocal as _SL
+    from app.database.models import ArchGenJob as _ArchGenJob
+
+    project = get_project(project_name)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Collect categories that already have at least one arch card
+    tasks = get_tasks_by_project(project_name)
+    existing_categories: set[str] = set()
+    for t in tasks:
+        if t.type != 'architecture':
+            continue
+        try:
+            content = t.content if isinstance(t.content, dict) else (
+                json.loads(t.content) if t.content else {}
+            )
+            cat = content.get('category')
+            if cat:
+                existing_categories.add(cat)
+        except Exception:
+            pass
+
+    missing = [c for c in _ARCH_CATEGORIES if c not in existing_categories]
+
+    # Skip categories that already have an active (pending/running) job
+    _db = _SL()
+    try:
+        active_cats: set[str] = set(
+            row.category for row in
+            _db.query(_ArchGenJob.category)
+               .filter(
+                   _ArchGenJob.project_id == project.id,
+                   _ArchGenJob.status.in_(('pending', 'running')),
+               )
+               .all()
+        )
+    finally:
+        _db.close()
+
+    to_generate = [c for c in missing if c not in active_cats]
+    
+    summaries = get_file_summaries_for_project_root(project.path or "")
+    file_summary_count = len(summaries)
+    
+    return {
+        "categories_to_generate": to_generate,
+        "has_file_summaries": file_summary_count > 0,
+        "file_summary_count": file_summary_count,
+        "missing_categories": missing,
+        "active_jobs": list(active_cats)
+    }
+
+
 @app.post("/api/projects/{project_name}/populate-arch")
 def populate_arch(project_name: str):
     """Queue arch_gen_jobs for every architecture category not yet present in the project.
@@ -5413,14 +5480,14 @@ async def admin_restart():
 # ---------------------------------------------------------------------------
 
 @app.get("/api/inbox", response_model=List[dict])
-def list_inbox(unread: bool = False):
+def list_inbox(unread: bool = False, project: Optional[str] = None):
     """Return inbox messages, newest first. ?unread=true filters to unread only."""
-    return get_inbox_messages(unread_only=unread)
+    return get_inbox_messages(unread_only=unread, project_name=project)
 
 
 @app.get("/api/inbox/unread-count", response_model=dict)
-def inbox_unread_count():
-    return {"count": count_unread_inbox()}
+def inbox_unread_count(project: Optional[str] = None):
+    return count_unread_inbox(project_name=project)
 
 
 @app.get("/api/inbox/escalations", response_model=List[dict])
@@ -5436,6 +5503,7 @@ def create_inbox(payload: dict):
         subject=payload.get("subject", "Notification"),
         source_type=payload.get("source_type", "intake_result"),
         task_id=payload.get("task_id"),
+        project_id=payload.get("project_id"),
         task_title=payload.get("task_title"),
         outcome=payload.get("outcome"),
         data_json=payload.get("data_json"),
