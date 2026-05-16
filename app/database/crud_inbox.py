@@ -24,7 +24,7 @@ def _row_to_dict(msg: InboxMessage) -> dict:
         "outcome": msg.outcome,
         "data_json": msg.data_json,
         "read": bool(msg.read),
-        "created_at": msg.created_at.isoformat() if msg.created_at else None,
+        "created_at": msg.created_at if isinstance(msg.created_at, str) else (msg.created_at.isoformat() if msg.created_at else None),
     }
 
 

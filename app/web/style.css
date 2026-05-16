@@ -485,6 +485,7 @@ body {
     transition: transform 0.1s, box-shadow 0.1s, opacity 0.2s;
     border-left: 4px solid #0d6efd;
     position: relative;
+    overflow: hidden;
 }
 
 /* Card highlight (star bookmark) */
@@ -624,13 +625,15 @@ body {
 
 .task-meta {
     display: flex;
-    justify-content: space-between;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
     font-size: 0.75rem;
     color: #6c757d;
 }
 
 .task-meta span:last-child {
-    margin-left: auto;
+    margin-left: 0;
 }
 
 .tag {
@@ -1417,9 +1420,9 @@ body {
     animation: intake-pulse 1.6s ease-in-out infinite;
 }
 .intake-clarification-badge--ready {
-    background: #fff3cd;
-    color: #664d03;
-    border: 1px solid #ffc107;
+    background: #ea580c;
+    color: #fff;
+    border: none;
     cursor: pointer;
 }
 @keyframes intake-pulse {
@@ -2704,9 +2707,9 @@ body {
     border: 1px solid rgba(245,158,11,0.18);
 }
 .card-job-indicator.ji-queued-human {
-    background: rgba(245,158,11,0.15);
-    color: #fcd34d;
-    border: 1px solid rgba(245,158,11,0.3);
+    background: rgba(234,88,12,0.10);
+    color: #c2410c;
+    border: 1px solid rgba(234,88,12,0.25);
 }
 .card-job-indicator.ji-queued-human .ji-dot {
     animation-duration: 4s;
@@ -2750,8 +2753,8 @@ body {
     pointer-events: none;
 }
 .card-stripe-review {
-    background: #ffc107;
-    color: #453505;
+    background: #c2410c;
+    color: #fff;
 }
 .card-stripe-completed {
     background: #198754;
@@ -3440,3 +3443,45 @@ body {
     display: block;
 }
 
+
+/* ── Pipeline selector bar ─────────────────────────────────── */
+#pipeline-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 5px 16px;
+    background: #111827;
+    border-bottom: 1px solid #1f2937;
+    flex-shrink: 0;
+}
+.pipeline-bar-label {
+    color: #6b7280;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    white-space: nowrap;
+}
+#pipeline-select {
+    background: #1f2937;
+    color: #e5e7eb;
+    border: 1px solid #374151;
+    border-radius: 5px;
+    padding: 3px 8px;
+    font-size: 13px;
+    cursor: pointer;
+    min-width: 180px;
+}
+#pipeline-select:focus {
+    outline: none;
+    border-color: #3b82f6;
+}
+.pipeline-edit-link {
+    color: #60a5fa;
+    text-decoration: none;
+    font-size: 12px;
+    white-space: nowrap;
+}
+.pipeline-edit-link:hover {
+    text-decoration: underline;
+}

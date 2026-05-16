@@ -165,16 +165,17 @@ def _branch_exists(project_path, branch_name):
 
 
 def _ensure_gitignore(project_path):
-    entry = f"/{_WORKTREE_SUBDIR}/"
+    entries = [f"/{_WORKTREE_SUBDIR}/", "/.archive/"]
     gitignore = os.path.join(project_path, ".gitignore")
     with _gitignore_lock:
         try:
-            if os.path.exists(gitignore):
-                if entry in open(gitignore, encoding="utf-8").read():
-                    return
-                open(gitignore, "a", encoding="utf-8").write(f"\n{entry}\n")
-            else:
-                open(gitignore, "w", encoding="utf-8").write(f"{entry}\n")
+            existing = open(gitignore, encoding="utf-8").read() if os.path.exists(gitignore) else ""
+            to_add = [e for e in entries if e not in existing]
+            if not to_add:
+                return
+            with open(gitignore, "a", encoding="utf-8") as fh:
+                for e in to_add:
+                    fh.write(f"\n{e}\n")
             _run(["git", "add", ".gitignore"], project_path)
         except OSError as exc:
             logger.warning("[worktree] could not update .gitignore: %s", exc)

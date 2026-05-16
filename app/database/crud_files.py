@@ -8,13 +8,17 @@ FileSummary   — DB-cached natural-language LLM summaries of source files,
 
 SearchCache   — cached web search results, keyed by (query, provider).
                 Prevents redundant Brave/DuckDuckGo API calls.
+
+ArchivedFile  — registry of files moved to .archive/ by workspace.delete_file().
+                Paths are stored relative to the project root for portability.
 """
 
 import logging
 import os
+from datetime import datetime
 
 from .session import SessionLocal
-from .models import FileSummary, SearchCache
+from .models import FileSummary, SearchCache, ArchivedFile
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +212,70 @@ def get_last_search_time() -> "datetime | None":
         from sqlalchemy import desc
         row = db.query(SearchCache).order_by(desc(SearchCache.created_at)).first()
         return row.created_at if row else None
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# ArchivedFile CRUD
+# ---------------------------------------------------------------------------
+
+def create_archived_file(task_id: str, original_path: str, archive_path: str) -> ArchivedFile:
+    """Insert an ArchivedFile record. Paths should be relative to the project root."""
+    db = SessionLocal()
+    try:
+        row = ArchivedFile(
+            task_id=task_id,
+            original_path=original_path,
+            archive_path=archive_path,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def get_archived_files_for_task(task_id: str) -> "list[ArchivedFile]":
+    """Return all archived files for a task, most recent first."""
+    db = SessionLocal()
+    try:
+        return (
+            db.query(ArchivedFile)
+            .filter(ArchivedFile.task_id == task_id)
+            .order_by(ArchivedFile.deleted_at.desc())
+            .all()
+        )
+    finally:
+        db.close()
+
+
+def get_archived_file(archive_id: int) -> "ArchivedFile | None":
+    """Return a single archived file record by ID, or None."""
+    db = SessionLocal()
+    try:
+        return db.query(ArchivedFile).filter(ArchivedFile.id == archive_id).first()
+    finally:
+        db.close()
+
+
+def mark_archived_file_restored(archive_id: int) -> bool:
+    """Set restored_at to now for the given archive record. Returns True on success."""
+    db = SessionLocal()
+    try:
+        row = db.query(ArchivedFile).filter(ArchivedFile.id == archive_id).first()
+        if not row:
+            return False
+        row.restored_at = datetime.utcnow()
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        return False
     finally:
         db.close()
 

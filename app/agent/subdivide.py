@@ -85,6 +85,7 @@ def _build_context_aware_schemas(
     # Planning tools are always available
     allowed = set(SUBDIVISION_PLANNING_TOOLS)
     allowed.add("submit_work")
+    allowed.add("batch_create_cards")
 
     if has_source and SUBDIVISION_CONTEXT_AWARE_TOOLS:
         # Add all codebase read tools
@@ -129,6 +130,7 @@ class SubdivisionResult:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     raw_output: dict | None = None
+    created_ids: list[str] = field(default_factory=list)  # set when batch_create_cards tool was used
 
 
 # ---------------------------------------------------------------------------
@@ -154,12 +156,16 @@ You have access to tools for investigating the project and planning the decompos
 **Investigation tools** (always available):
 - `list_directory`, `find_files`, `get_task`, `list_tasks`
 
+**Card creation tool**:
+- `batch_create_cards`: Create the sub-cards directly in the system. Pass `cards` with title, description, entry_stage ("idea"), optional tags, and prereq_ids (use "sub-N" for same-batch siblings by index). After calling this tool, call `submit_work(signal="ACCEPTED", summary="...")` to finish.
+
 {codebase_tools_section}
 
 == PLANNING GUIDANCE ==
 Use `generate_architecture_doc` to structure your thinking BEFORE decomposing.
 Use `generate_interface_contract` to define the API surface between sub-ideas.
 Use `spawn_research_agent` when you need domain knowledge about unfamiliar technologies.
+**Preferred workflow**: Investigate → plan → call `batch_create_cards` → call `submit_work`.
 
 == DECOMPOSITION RULES ==
 1. Produce 2-7 sub-ideas. Each must be independently implementable and testable.
@@ -299,6 +305,9 @@ class SubdivisionAgent:
         self._has_source = _has_meaningful_source_files(self.project_root or PROJECT_ROOT)
         self._tool_schemas, self._allowed_tools = _build_context_aware_schemas(self._has_source)
 
+        # Tracks IDs returned by batch_create_cards if the LLM uses the tool
+        self._batch_created_ids: list[str] = []
+
         # Token budget enforcement
         self.token_budget = int((max_context or 100_000) * SUBDIVISION_CONTEXT_BUDGET_RATIO)
         self._last_prompt_tokens = 0
@@ -427,6 +436,20 @@ class SubdivisionAgent:
                     if isinstance(tr.get("content"), str) and "__maestro_terminal__" in tr["content"]:
                         try:
                             data = json.loads(tr["content"])
+                            if self._batch_created_ids:
+                                # Tasks already created via batch_create_cards — return success
+                                return SubdivisionResult(
+                                    sub_ideas=[],
+                                    decomposition_rationale=(data.get("payload") or {}).get(
+                                        "decomposition_rationale",
+                                        "Subdivided via batch_create_cards tool",
+                                    ),
+                                    coverage_check="",
+                                    confidence=90,
+                                    prompt_tokens=self._total_prompt_tokens,
+                                    completion_tokens=self._total_completion_tokens,
+                                    created_ids=list(self._batch_created_ids),
+                                )
                             if data.get("payload"):
                                 parsed = self._try_parse_payload(data["payload"])
                                 if parsed:
@@ -634,6 +657,17 @@ class SubdivisionAgent:
                     llm_base_url=self.llm_base_url,
                     llm_model=self.llm_model,
                 )
+
+            # Capture IDs created by batch_create_cards
+            if name == "batch_create_cards" and isinstance(result_content, str):
+                if not result_content.startswith("ERROR"):
+                    try:
+                        payload = json.loads(result_content)
+                        ids = payload.get("created_ids") or []
+                        if ids:
+                            self._batch_created_ids.extend(ids)
+                    except Exception:
+                        pass
 
             results.append({
                 "role": "tool",

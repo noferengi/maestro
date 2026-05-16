@@ -1,6 +1,6 @@
 # Phase 8 — Project Document Store
 
-> **Status:** Not started — requires Phase 1  
+> **Status:** SUBSTANTIALLY COMPLETE — 2026-05-15 ⚠️ (no UI document viewer, no test_document_store.py; see audit)  
 > **Depends on:** Phase 1 (project_documents table); Phase 2 (tool allowlist system)  
 > **Estimated effort:** 2 days  
 > **Goal:** A per-project shared document store that agents can write named artifacts
@@ -251,3 +251,33 @@ existing one.
 is always accurate without application-layer bookkeeping. `list_documents` returns
 the size column but not content, keeping the response payload small even for
 projects with many large documents.
+
+---
+
+## Implementation Audit (2026-05-15)
+
+### What was delivered
+
+`app/agent/doc_store.py` (106 lines) and `app/database/crud_documents.py` (316 lines)
+are fully implemented. Key normalization to lowercase at the agent API boundary, upsert
+semantics, pg_trgm fuzzy matching via native PostgreSQL `similarity()`, soft-delete,
+and tag filtering are all correct. Both project-name and project-ID wrappers exist.
+
+Agent tool wrappers (`store_document`, `get_document`, `search_documents`,
+`list_documents`) exist in `tools.py` and can be added to a stage's `tool_allowlist`.
+
+REST API endpoints for human inspection and editing are implemented in `main.py`.
+
+### Gaps
+
+**No UI document viewer** — The spec called for a "Store" tab or modal in the project
+header with a searchable table of documents. Not found in `index.html`. Human
+inspection requires direct API calls.
+
+**No test file** — There is no `test_document_store.py`. None of the plan's test
+criteria (upsert, fuzzy match, tag filter, soft-delete, tool call via agent) are
+covered by automated tests. This is the largest testing gap across the project.
+
+**`content_size_bytes` generated column** — Omitted from Phase 1 migration (see
+Phase 1 audit). `list_documents` still works but cannot return the size field.
+Can be added as a non-generated computed column or omitted until needed.

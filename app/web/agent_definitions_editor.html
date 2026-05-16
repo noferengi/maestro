@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Editor — Maestro</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  background: #0f172a; color: #e2e8f0; min-height: 100vh;
+}
+
+/* ── Topbar ── */
+#topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 24px;
+  background: #1e293b; border-bottom: 1px solid #334155;
+  position: sticky; top: 0; z-index: 10;
+}
+.logo { color: #60a5fa; text-decoration: none; font-weight: 600; font-size: 15px; }
+.logo:hover { color: #93c5fd; }
+#topbar-center { display: flex; align-items: center; gap: 10px; }
+#ed-title { font-size: 16px; font-weight: 600; color: #f1f5f9; }
+#unsaved-indicator {
+  font-size: 12px; color: #f59e0b; display: none;
+}
+#topbar-actions { display: flex; gap: 8px; align-items: center; }
+
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 14px; border-radius: 6px; border: none;
+  font-size: 13px; font-weight: 500; cursor: pointer;
+  text-decoration: none; transition: background 0.15s, color 0.15s;
+}
+.btn-primary   { background: #3b82f6; color: #fff; }
+.btn-primary:hover   { background: #2563eb; }
+.btn-secondary { background: #334155; color: #e2e8f0; }
+.btn-secondary:hover { background: #475569; }
+.btn-sm { padding: 4px 10px; font-size: 12px; }
+
+/* ── Main form area ── */
+#editor-body {
+  max-width: 860px; margin: 0 auto; padding: 32px 24px 64px;
+  display: flex; flex-direction: column; gap: 32px;
+}
+
+/* ── Section ── */
+.section {
+  background: #1e293b; border: 1px solid #334155; border-radius: 10px;
+  padding: 24px; display: flex; flex-direction: column; gap: 16px;
+}
+.section-title {
+  font-size: 14px; font-weight: 700; color: #94a3b8;
+  text-transform: uppercase; letter-spacing: 0.06em;
+  padding-bottom: 12px; border-bottom: 1px solid #334155;
+}
+
+/* ── Fields ── */
+.field-group { display: flex; flex-direction: column; gap: 6px; }
+.field-group label { font-size: 12px; color: #94a3b8; font-weight: 500; }
+.field-group input[type=text],
+.field-group input[type=number],
+.field-group select,
+.field-group textarea {
+  background: #0f172a; border: 1px solid #334155; border-radius: 6px;
+  color: #e2e8f0; font-size: 13px; padding: 8px 12px;
+  outline: none; width: 100%;
+  font-family: inherit;
+}
+.field-group input:focus,
+.field-group select:focus,
+.field-group textarea:focus { border-color: #3b82f6; }
+.field-group textarea { resize: vertical; line-height: 1.5; }
+.field-hint { font-size: 11px; color: #64748b; margin-top: 2px; }
+
+.field-row { display: flex; gap: 16px; }
+.field-row .field-group { flex: 1; }
+
+/* ── Prompt generate button ── */
+.prompt-header { display: flex; justify-content: space-between; align-items: center; }
+.prompt-header label { font-size: 12px; color: #94a3b8; font-weight: 500; }
+
+/* ── User-prompt template toggle ── */
+.toggle-row {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; color: #94a3b8; cursor: pointer;
+}
+.toggle-row input[type=checkbox] { accent-color: #3b82f6; cursor: pointer; }
+#user-tpl-area { display: none; flex-direction: column; gap: 12px; }
+#user-tpl-area.visible { display: flex; }
+
+/* ── Var reference collapsible ── */
+details.var-ref { border: 1px solid #334155; border-radius: 6px; }
+details.var-ref summary {
+  padding: 8px 12px; font-size: 12px; color: #60a5fa; cursor: pointer;
+  list-style: none; user-select: none;
+}
+details.var-ref summary::-webkit-details-marker { display: none; }
+.var-ref-body {
+  padding: 10px 14px; font-family: monospace; font-size: 12px;
+  color: #94a3b8; line-height: 1.8; background: #0f172a;
+  border-top: 1px solid #334155; border-radius: 0 0 6px 6px;
+}
+
+/* ── Tool access ── */
+#preset-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.btn-preset {
+  padding: 5px 12px; border-radius: 6px; border: 1px solid #334155;
+  background: #0f172a; color: #94a3b8; font-size: 12px; cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.btn-preset:hover { background: #1e293b; color: #e2e8f0; }
+.tool-always-note { font-size: 12px; color: #64748b; font-style: italic; }
+
+details.tool-group { border: 1px solid #2d3748; border-radius: 6px; margin-bottom: 6px; }
+details.tool-group summary {
+  padding: 8px 14px; font-size: 13px; font-weight: 600;
+  color: #cbd5e1; cursor: pointer; user-select: none; list-style: none;
+  background: #0f172a; border-radius: 6px;
+}
+details.tool-group[open] summary { border-radius: 6px 6px 0 0; border-bottom: 1px solid #2d3748; }
+details.tool-group summary::-webkit-details-marker { display: none; }
+.tool-grid {
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px 16px;
+  padding: 10px 14px; background: #0c1322; border-radius: 0 0 6px 6px;
+}
+.tool-item {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: #94a3b8; cursor: pointer;
+}
+.tool-item input[type=checkbox] { accent-color: #3b82f6; cursor: pointer; }
+.tool-item.always-on { color: #64748b; cursor: default; }
+.tool-item.always-on input { cursor: default; }
+
+/* ── Session limits ── */
+.limits-row { display: flex; gap: 16px; }
+.limits-row .field-group { flex: 1; }
+
+/* ── Conclusion gate ── */
+.gate-hint { font-size: 12px; color: #64748b; line-height: 1.5; margin-top: 4px; }
+
+/* ── Toast ── */
+#toast {
+  position: fixed; bottom: 24px; right: 24px;
+  background: #1e293b; border: 1px solid #334155;
+  border-radius: 8px; padding: 12px 18px;
+  font-size: 13px; color: #e2e8f0;
+  box-shadow: 0 4px 20px #00000066;
+  transform: translateY(80px); opacity: 0;
+  transition: transform 0.2s, opacity 0.2s;
+  z-index: 100; max-width: 320px;
+}
+#toast.show { transform: translateY(0); opacity: 1; }
+#toast.toast-error { border-color: #ef4444; color: #fca5a5; }
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <a href="/agents" class="logo">← Agent Definitions</a>
+  <div id="topbar-center">
+    <span id="ed-title">Agent Editor</span>
+    <span id="unsaved-indicator">● Unsaved changes</span>
+  </div>
+  <div id="topbar-actions">
+    <button class="btn btn-primary" onclick="saveDefinition()">Save</button>
+  </div>
+</div>
+
+<div id="editor-body">
+
+  <!-- Section 1: Identity -->
+  <div class="section">
+    <div class="section-title">Identity</div>
+
+    <div class="field-row">
+      <div class="field-group">
+        <label for="ed-name">Slug (name)</label>
+        <input type="text" id="ed-name" placeholder="my-agent" oninput="markUnsaved()">
+        <div class="field-hint">Lowercase letters, numbers, hyphens and underscores only.</div>
+      </div>
+      <div class="field-group">
+        <label for="ed-display-name">Display Name</label>
+        <input type="text" id="ed-display-name" placeholder="My Agent" oninput="markUnsaved()">
+      </div>
+    </div>
+
+    <div class="field-group">
+      <label for="ed-description">Description</label>
+      <textarea id="ed-description" rows="2" placeholder="Short summary of what this agent does." oninput="markUnsaved()"></textarea>
+    </div>
+
+    <div class="field-group">
+      <label for="ed-intent">Intent</label>
+      <textarea id="ed-intent" rows="2" placeholder="High-level goal and context for this agent." oninput="markUnsaved()"></textarea>
+    </div>
+  </div>
+
+  <!-- Section 2: System Prompt -->
+  <div class="section">
+    <div class="prompt-header">
+      <label for="ed-system-prompt" style="font-size:14px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;">System Prompt</label>
+      <button class="btn btn-secondary btn-sm" id="btn-gen-system" onclick="generateSystemPrompt()">⚡ Generate</button>
+    </div>
+    <textarea id="ed-system-prompt" rows="15" placeholder="Enter the system prompt for this agent…" oninput="markUnsaved()"></textarea>
+  </div>
+
+  <!-- Section 3: User Prompt Template -->
+  <div class="section">
+    <div class="section-title">User Prompt Template</div>
+
+    <label class="toggle-row">
+      <input type="checkbox" id="chk-user-tpl" onchange="toggleUserTpl(); markUnsaved()">
+      Use custom user prompt template
+    </label>
+
+    <div id="user-tpl-default-hint" class="field-hint">
+      Default: Task ID, title, and description are injected automatically.
+    </div>
+
+    <div id="user-tpl-area">
+      <div class="field-group">
+        <textarea id="ed-user-tpl" rows="10"
+          placeholder="Write on: {task_title}&#10;&#10;Description: {task_description}&#10;&#10;Plan: {card.plan}&#10;Diff: {card.diff}"
+          oninput="markUnsaved()"></textarea>
+      </div>
+
+      <details class="var-ref">
+        <summary>▸ Available template variables</summary>
+        <div class="var-ref-body">
+{task_id}          — Task's unique ID<br>
+{task_title}       — Task title<br>
+{task_description} — Full description<br>
+{task_stage}       — Current stage key<br>
+{task_project}     — Project name<br>
+{card.plan}        — Planning stage output (if available in card content)<br>
+{card.diff}        — Git diff of all changes in the task's worktree<br>
+{card.&lt;key&gt;}      — Any key from the task content JSON (e.g. {card.genre})<br>
+{content_&lt;key&gt;}   — Alias for {card.&lt;key&gt;} (e.g. {content_genre})<br>
+<br>
+<span style="color:#64748b">Curly braces and brackets in injected values are automatically escaped.</span>
+        </div>
+      </details>
+    </div>
+  </div>
+
+  <!-- Section 4: Tool Access -->
+  <div class="section">
+    <div class="section-title">Tool Access</div>
+
+    <div class="tool-always-note"><code>submit_work</code> and <code>report_tool_bug</code> are always enabled.</div>
+
+    <div id="preset-row">
+      <button class="btn-preset" onclick="applyPreset('none')">None</button>
+      <button class="btn-preset" onclick="applyPreset('files')">Files Only</button>
+      <button class="btn-preset" onclick="applyPreset('development')">Development</button>
+      <button class="btn-preset" onclick="applyPreset('full')">Full Access</button>
+    </div>
+
+    <div id="tool-groups-container">
+      <div style="color:#64748b;font-size:13px">Loading tools…</div>
+    </div>
+  </div>
+
+  <!-- Section 5: Session Limits -->
+  <div class="section">
+    <div class="section-title">Session Limits</div>
+    <div class="limits-row">
+      <div class="field-group">
+        <label for="ed-max-turns">Max Turns</label>
+        <input type="number" id="ed-max-turns" min="1" max="500" placeholder="200 (default from maestro.ini)" oninput="markUnsaved()">
+        <div class="field-hint">Turns per session. Blank = stage config or maestro.ini default.</div>
+      </div>
+      <div class="field-group">
+        <label for="ed-max-tokens">Max Tokens</label>
+        <input type="number" id="ed-max-tokens" min="1" placeholder="Unlimited" oninput="markUnsaved()">
+        <div class="field-hint">Token budget per turn. Blank = no limit.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Section 6: Conclusion Gate -->
+  <div class="section">
+    <div class="section-title">Conclusion Gate</div>
+
+    <div class="field-group">
+      <label for="ed-gate-type">Gate Type</label>
+      <select id="ed-gate-type" onchange="markUnsaved()">
+        <option value="llm_judge">LLM Judge — agent calls submit_work to pass or fail</option>
+        <option value="single_pass">Single Pass — always advance after run completes</option>
+        <option value="none">None — unconditional advance (no gate)</option>
+      </select>
+    </div>
+
+    <div class="field-group">
+      <label for="ed-verifier">Formal Verifier</label>
+      <select id="ed-verifier" onchange="toggleVerifierCmd(); markUnsaved()">
+        <option value="none">None</option>
+        <option value="python_sympy">Python / SymPy</option>
+        <option value="lean4">Lean 4 (stub)</option>
+        <option value="coq">Coq (stub)</option>
+        <option value="custom_script">Custom Script</option>
+      </select>
+      <div class="field-hint">Run a formal verification step after the LLM passes.</div>
+    </div>
+
+    <div class="field-group" id="verifier-cmd-group" style="display:none">
+      <label for="ed-verifier-cmd">Verifier Command / Script</label>
+      <textarea id="ed-verifier-cmd" rows="3" placeholder="Command or script path" oninput="markUnsaved()"></textarea>
+    </div>
+  </div>
+
+</div>
+
+<div id="toast"></div>
+
+<script src="/static/agent_definitions_editor.js?v=1"></script>
+</body>
+</html>

@@ -1,6 +1,6 @@
 # Phase 4 — Litegraph Pipeline Editor
 
-> **Status:** Not started — requires Phase 3  
+> **Status:** COMPLETE — 2026-05-15  
 > **Depends on:** Phase 3 (CRUD API exists); Phase 2 recommended but not blocking  
 > **Estimated effort:** 7–9 days  
 > **Goal:** A full-canvas pipeline editor at `/pipelines/{id}/edit` using Litegraph.js,
@@ -234,3 +234,50 @@ stroke and a different color. This requires hooking `LGraph.prototype.onAfterCha
 **Canvas performance** — for large templates (30+ nodes), Litegraph's default
 canvas renderer is fine. If performance degrades, enable Litegraph's WebGL renderer
 (`graph.use_webgl = true`).
+
+---
+
+## Implementation Audit (2026-05-15)
+
+### What was delivered
+
+`pipeline_editor.html` / `pipeline_editor.js` (1371 lines) / `pipeline_editor.css`
+are all present. All six node types are implemented with correct port counts and
+property panel templates. Back-edge detection and dashed amber rendering works.
+The property panel has ⚡ streaming generation on all specified fields. Tidy Layout
+uses Kahn's algorithm with back-edge exclusion. Simulation mode steps a ghost token
+through pass-condition edges. The save/load cycle round-trips correctly via the Phase 3
+API. `gallery.html` (512 lines) delivers the browsable template grid with clone,
+export, import, and assignment.
+
+### Known defects and gaps
+
+**1. Litegraph.js not vendored ✅ FIXED 2026-05-15**
+`litegraph.js` (1049 KiB) downloaded to `app/web/vendor/` via `scripts/download_vendor.py`.
+Both `litegraph.js` and `litegraph.css` are now self-hosted. CDN fallback in the HTML
+can be removed in a cleanup pass.
+
+**2. Kanban column list still hardcoded (high impact)**
+`kanban.js` has a hardcoded `columns` array:
+```javascript
+const columns = ['idea','planning','indev','conceptual_review','optimization',
+                 'security','final_review','human_review','completed'];
+```
+`applyPipelineTemplateLayout()` only changes CSS `order` on existing DOM columns;
+it does not create or remove columns based on template stage topology. Tasks assigned
+to stages outside this list have no visible column on the board. This is the most
+significant functional gap for non-software pipelines.
+
+**Fix:** Replace the hardcoded array with a derivation from `activePipelineTemplate.stages`
+at render time, creating or removing `.kanban-column` DOM elements as needed.
+
+**3. Gallery endpoint mismatch (runtime breakage)**
+`gallery.html` line 407 calls `POST /api/projects/{name}/use-template` but the actual
+route registered in `main.py` is `POST /api/projects/{name}/pipeline`. The "Use"
+button on every template card will return 404 at runtime. Fix: either add a
+`/use-template` alias in `main.py` or update `gallery.html` to use `/pipeline`.
+
+**4. No visual group representation on canvas**
+Stage groups are stored in the DB and rendered as bracket headers in the kanban, but
+the Litegraph canvas has no group bounding boxes or swimlane coloring. Planned behavior
+was "drag-select → group them." Drag-select exists but does not create a group record.

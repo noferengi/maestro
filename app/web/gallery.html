@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pipeline Templates — Maestro</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  background: #0f172a;
+  color: #e2e8f0;
+  min-height: 100vh;
+}
+
+/* ── Top bar ── */
+#topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 24px;
+  background: #1e293b;
+  border-bottom: 1px solid #334155;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+.logo { color: #60a5fa; text-decoration: none; font-weight: 600; font-size: 15px; }
+.logo:hover { color: #93c5fd; }
+#topbar-title { font-size: 16px; font-weight: 600; color: #f1f5f9; }
+#topbar-actions { display: flex; gap: 8px; }
+
+/* ── Buttons ── */
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 14px; border-radius: 6px; border: none;
+  font-size: 13px; font-weight: 500; cursor: pointer;
+  text-decoration: none; transition: background 0.15s, color 0.15s;
+}
+.btn-primary   { background: #3b82f6; color: #fff; }
+.btn-primary:hover   { background: #2563eb; }
+.btn-secondary { background: #334155; color: #e2e8f0; }
+.btn-secondary:hover { background: #475569; }
+.btn-ghost     { background: transparent; color: #94a3b8; }
+.btn-ghost:hover     { background: #1e293b; color: #e2e8f0; }
+.btn-danger    { background: transparent; color: #f87171; }
+.btn-danger:hover    { background: #450a0a; }
+.btn-sm { padding: 4px 10px; font-size: 12px; }
+
+/* ── Import toolbar ── */
+#toolbar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 16px 24px 0;
+}
+
+/* ── Filter bar ── */
+#filter-bar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 24px 0;
+}
+#search-input {
+  background: #1e293b; border: 1px solid #334155; border-radius: 6px;
+  color: #e2e8f0; font-size: 13px; padding: 6px 12px; width: 220px;
+  outline: none;
+}
+#search-input:focus { border-color: #3b82f6; }
+#filter-builtin { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #94a3b8; cursor: pointer; }
+#filter-builtin input { cursor: pointer; accent-color: #3b82f6; }
+
+/* ── Grid ── */
+#grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 16px;
+  padding: 20px 24px 32px;
+}
+
+/* ── Template card ── */
+.tpl-card {
+  background: #1e293b;
+  border: 1px solid #334155;
+  border-radius: 10px;
+  padding: 20px;
+  display: flex; flex-direction: column; gap: 12px;
+  transition: border-color 0.15s;
+}
+.tpl-card:hover { border-color: #475569; }
+
+.card-header { display: flex; align-items: flex-start; gap: 10px; }
+.card-icon { font-size: 28px; line-height: 1; flex-shrink: 0; margin-top: 2px; }
+.card-title-wrap { flex: 1; min-width: 0; }
+.card-name {
+  font-size: 15px; font-weight: 600; color: #f1f5f9;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.card-meta { display: flex; align-items: center; gap: 6px; margin-top: 4px; flex-wrap: wrap; }
+.badge {
+  display: inline-block; padding: 1px 8px; border-radius: 99px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.02em;
+}
+.badge-builtin { background: #312e81; color: #a5b4fc; }
+.badge-custom  { background: #14532d; color: #86efac; }
+.badge-stages  { background: #0f2231; color: #7dd3fc; }
+
+.card-desc {
+  font-size: 12px; color: #94a3b8; line-height: 1.45;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+  flex: 1;
+}
+
+.card-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+/* ── Empty state ── */
+#empty-state {
+  grid-column: 1/-1;
+  text-align: center; padding: 64px 0;
+  color: #475569; font-size: 14px;
+}
+
+/* ── Toast ── */
+#toast {
+  position: fixed; bottom: 24px; right: 24px;
+  background: #1e293b; border: 1px solid #334155;
+  border-radius: 8px; padding: 12px 18px;
+  font-size: 13px; color: #e2e8f0;
+  box-shadow: 0 4px 20px #00000066;
+  transform: translateY(80px); opacity: 0;
+  transition: transform 0.2s, opacity 0.2s;
+  z-index: 100; max-width: 320px;
+}
+#toast.show { transform: translateY(0); opacity: 1; }
+#toast.toast-error { border-color: #ef4444; color: #fca5a5; }
+
+/* ── Modal ── */
+.modal-overlay {
+  display: none; position: fixed; inset: 0;
+  background: #00000099; z-index: 50;
+  align-items: center; justify-content: center;
+}
+.modal-overlay.open { display: flex; }
+.modal {
+  background: #1e293b; border: 1px solid #334155; border-radius: 12px;
+  padding: 24px; width: 400px; max-width: 95vw;
+  box-shadow: 0 16px 48px #00000088;
+}
+.modal h3 { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: #f1f5f9; }
+.modal label { display: block; font-size: 12px; color: #94a3b8; margin-bottom: 6px; }
+.modal input[type=text] {
+  width: 100%; background: #0f172a; border: 1px solid #334155;
+  border-radius: 6px; color: #e2e8f0; font-size: 13px;
+  padding: 8px 12px; outline: none; margin-bottom: 16px;
+}
+.modal input[type=text]:focus { border-color: #3b82f6; }
+.modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+
+/* ── Builtin warning banner ── */
+#builtin-warning {
+  display: none;
+  margin: 12px 24px 0;
+  background: #451a03; border: 1px solid #92400e;
+  border-radius: 8px; padding: 10px 16px;
+  font-size: 13px; color: #fbbf24;
+}
+
+/* ── Project picker modal ── */
+#use-modal .project-btn {
+  display: block; width: 100%; text-align: left;
+  background: #0f172a; border: 1px solid #334155; border-radius: 6px;
+  color: #e2e8f0; font-size: 13px; padding: 10px 14px;
+  margin-bottom: 8px; cursor: pointer; transition: background 0.12s;
+}
+#use-modal .project-btn:hover { background: #1e3a5f; border-color: #3b82f6; }
+#no-projects { color: #64748b; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<!-- Top bar -->
+<div id="topbar">
+  <a href="/" class="logo">← Maestro</a>
+  <span id="topbar-title">Pipeline Templates</span>
+  <div id="topbar-actions">
+    <a href="/agents" class="btn btn-secondary">Agent Definitions →</a>
+    <button class="btn btn-secondary" onclick="openImportModal()">Import JSON</button>
+    <button class="btn btn-primary" onclick="createBlank()">+ New Template</button>
+  </div>
+</div>
+
+<!-- Filter bar -->
+<div id="filter-bar">
+  <input id="search-input" type="text" placeholder="Search templates…" oninput="applyFilters()">
+  <label id="filter-builtin">
+    <input type="checkbox" id="chk-builtin" onchange="applyFilters()">
+    Built-in only
+  </label>
+  <span id="count-label" style="margin-left:auto;font-size:12px;color:#64748b"></span>
+</div>
+
+<!-- Grid -->
+<div id="grid"></div>
+
+<!-- Toast -->
+<div id="toast"></div>
+
+<!-- Clone modal -->
+<div id="clone-modal" class="modal-overlay" onclick="if(event.target===this)closeModal('clone-modal')">
+  <div class="modal">
+    <h3>Clone Template</h3>
+    <label>New template name</label>
+    <input type="text" id="clone-name" placeholder="My Pipeline" onkeydown="if(event.key==='Enter')doClone()">
+    <div id="clone-warning" style="display:none;font-size:12px;color:#fbbf24;margin-bottom:12px">
+      Cloning a built-in template creates a private copy you can freely edit.
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal('clone-modal')">Cancel</button>
+      <button class="btn btn-primary" onclick="doClone()">Clone</button>
+    </div>
+  </div>
+</div>
+
+<!-- Use-template modal (project picker) -->
+<div id="use-modal" class="modal-overlay" onclick="if(event.target===this)closeModal('use-modal')">
+  <div class="modal">
+    <h3>Assign to Project</h3>
+    <div id="project-list"></div>
+    <div class="modal-actions" style="margin-top:8px">
+      <button class="btn btn-ghost" onclick="closeModal('use-modal')">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Import modal -->
+<div id="import-modal" class="modal-overlay" onclick="if(event.target===this)closeModal('import-modal')">
+  <div class="modal">
+    <h3>Import Template JSON</h3>
+    <label>Paste JSON or load a file</label>
+    <textarea id="import-json" rows="8" style="
+      width:100%;background:#0f172a;border:1px solid #334155;border-radius:6px;
+      color:#e2e8f0;font-size:12px;padding:8px 12px;margin-bottom:12px;
+      font-family:monospace;resize:vertical;outline:none;
+    " placeholder='{"schema_version":1,"name":"My Pipeline","stages":[...]}'></textarea>
+    <input type="file" id="import-file" accept=".json" style="display:none" onchange="loadImportFile(event)">
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="document.getElementById('import-file').click()">Load file…</button>
+      <button class="btn btn-ghost" onclick="closeModal('import-modal')">Cancel</button>
+      <button class="btn btn-primary" onclick="doImport()">Import</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ─────────────────────────── state ─────────────────────────── */
+let _templates = [];
+let _cloneTargetId = null;
+let _useTargetId   = null;
+let _projects      = [];
+
+const ICONS = {
+  "Software Development":            "💻",
+  "Novel Writing":                   "✍️",
+  "Research Report":                 "🔬",
+  "Data Analysis":                   "📊",
+  "Mathematics / Proof Exploration": "📐",
+  "Bug Triage":                      "🐛",
+  "Overnight Generation":            "🌙",
+};
+function iconFor(name) {
+  return ICONS[name] || "🔧";
+}
+
+/* ─────────────────────────── init ─────────────────────────── */
+async function init() {
+  await Promise.all([loadTemplates(), loadProjects()]);
+}
+
+async function loadTemplates() {
+  try {
+    const r = await fetch("/api/pipeline-templates");
+    const data = await r.json();
+    _templates = data;
+    applyFilters();
+  } catch (e) {
+    showToast("Failed to load templates: " + e.message, true);
+  }
+}
+
+async function loadProjects() {
+  try {
+    const r = await fetch("/api/projects");
+    _projects = await r.json();
+  } catch {}
+}
+
+/* ─────────────────────────── render ─────────────────────────── */
+function applyFilters() {
+  const q     = document.getElementById("search-input").value.toLowerCase();
+  const onlyB = document.getElementById("chk-builtin").checked;
+  let filtered = _templates.filter(t => {
+    if (onlyB && !t.is_builtin) return false;
+    if (q && !t.name.toLowerCase().includes(q) && !(t.description||"").toLowerCase().includes(q)) return false;
+    return true;
+  });
+  renderGrid(filtered);
+  document.getElementById("count-label").textContent =
+    filtered.length === _templates.length
+      ? `${_templates.length} template${_templates.length === 1 ? "" : "s"}`
+      : `${filtered.length} of ${_templates.length}`;
+}
+
+function renderGrid(templates) {
+  const grid = document.getElementById("grid");
+  if (!templates.length) {
+    grid.innerHTML = '<div id="empty-state">No templates match your filter.</div>';
+    return;
+  }
+  grid.innerHTML = templates.map(t => {
+    const stageCount = (t.stages || []).length;
+    const builtin = t.is_builtin;
+    return `
+<div class="tpl-card" data-id="${t.id}">
+  <div class="card-header">
+    <div class="card-icon">${iconFor(t.name)}</div>
+    <div class="card-title-wrap">
+      <div class="card-name" title="${esc(t.name)}">${esc(t.name)}</div>
+      <div class="card-meta">
+        ${builtin ? '<span class="badge badge-builtin">Built-in</span>' : '<span class="badge badge-custom">Custom</span>'}
+        <span class="badge badge-stages">${stageCount} stage${stageCount === 1 ? "" : "s"}</span>
+      </div>
+    </div>
+  </div>
+  <div class="card-desc">${esc(t.description || "No description.")}</div>
+  <div class="card-actions">
+    <button class="btn btn-primary btn-sm" onclick="openUseModal(${t.id})">Use</button>
+    <button class="btn btn-secondary btn-sm" onclick="openCloneModal(${t.id}, ${builtin})">Clone</button>
+    <a class="btn btn-secondary btn-sm" href="/pipelines/${t.id}/edit">Edit${builtin ? " ⚠" : ""}</a>
+    ${!builtin ? `<button class="btn btn-danger btn-sm" onclick="deleteTemplate(${t.id}, '${esc(t.name)}')">Delete</button>` : ""}
+    <button class="btn btn-ghost btn-sm" onclick="exportTemplate(${t.id}, '${esc(t.name)}')">Export</button>
+  </div>
+</div>`;
+  }).join("");
+}
+
+function esc(s) {
+  return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+/* ─────────────────────────── actions ─────────────────────────── */
+async function createBlank() {
+  try {
+    const r = await fetch("/pipelines/new");
+    // /pipelines/new redirects to the editor; follow it
+    window.location.href = r.url;
+  } catch (e) {
+    showToast("Failed to create template: " + e.message, true);
+  }
+}
+
+function openCloneModal(id, isBuiltin) {
+  _cloneTargetId = id;
+  const tmpl = _templates.find(t => t.id === id);
+  document.getElementById("clone-name").value = tmpl ? tmpl.name + " (copy)" : "";
+  document.getElementById("clone-warning").style.display = isBuiltin ? "block" : "none";
+  openModal("clone-modal");
+  setTimeout(() => document.getElementById("clone-name").focus(), 80);
+}
+
+async function doClone() {
+  const name = document.getElementById("clone-name").value.trim();
+  if (!name) { showToast("Name is required", true); return; }
+  try {
+    const r = await fetch(`/api/pipelines/${_cloneTargetId}/clone`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({name}),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.detail || r.statusText);
+    }
+    const cloned = await r.json();
+    closeModal("clone-modal");
+    showToast(`Cloned as "${name}"`);
+    await loadTemplates();
+    // Navigate to the editor for the clone
+    window.location.href = `/pipelines/${cloned.id}/edit`;
+  } catch (e) {
+    showToast("Clone failed: " + e.message, true);
+  }
+}
+
+function openUseModal(id) {
+  _useTargetId = id;
+  const list = document.getElementById("project-list");
+  if (!_projects.length) {
+    list.innerHTML = '<div id="no-projects">No projects found. Create one on the board first.</div>';
+  } else {
+    list.innerHTML = _projects.map(p =>
+      `<button class="project-btn" onclick="assignTemplate('${p.name}')">${esc(p.name)}</button>`
+    ).join("");
+  }
+  openModal("use-modal");
+}
+
+async function assignTemplate(projectName) {
+  try {
+    const r = await fetch(`/api/projects/${encodeURIComponent(projectName)}/use-template`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({template_id: _useTargetId}),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.detail || r.statusText);
+    }
+    const tmpl = _templates.find(t => t.id === _useTargetId);
+    closeModal("use-modal");
+    showToast(`"${tmpl ? tmpl.name : "Template"}" assigned to ${projectName}`);
+  } catch (e) {
+    showToast("Failed: " + e.message, true);
+  }
+}
+
+async function deleteTemplate(id, name) {
+  if (!confirm(`Delete template "${name}"?\nThis cannot be undone.`)) return;
+  try {
+    const r = await fetch(`/api/pipelines/${id}`, {method: "DELETE"});
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.detail || r.statusText);
+    }
+    showToast(`Deleted "${name}"`);
+    await loadTemplates();
+  } catch (e) {
+    showToast("Delete failed: " + e.message, true);
+  }
+}
+
+async function exportTemplate(id, name) {
+  try {
+    const r = await fetch(`/api/pipelines/${id}/export`);
+    if (!r.ok) throw new Error(r.statusText);
+    const blob = await r.blob();
+    const url  = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = (name || "pipeline") + ".json";
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    showToast("Export failed: " + e.message, true);
+  }
+}
+
+function openImportModal() {
+  document.getElementById("import-json").value = "";
+  openModal("import-modal");
+}
+
+function loadImportFile(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = ev => { document.getElementById("import-json").value = ev.target.result; };
+  reader.readAsText(file);
+}
+
+async function doImport() {
+  const raw = document.getElementById("import-json").value.trim();
+  if (!raw) { showToast("Paste or load a JSON file first", true); return; }
+  let blob;
+  try { blob = JSON.parse(raw); } catch { showToast("Invalid JSON", true); return; }
+  try {
+    const r = await fetch("/api/pipelines/import", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(blob),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.detail || r.statusText);
+    }
+    const imported = await r.json();
+    closeModal("import-modal");
+    showToast(`Imported "${imported.name}"`);
+    await loadTemplates();
+  } catch (e) {
+    showToast("Import failed: " + e.message, true);
+  }
+}
+
+/* ─────────────────────────── modal helpers ─────────────────────────── */
+function openModal(id)  { document.getElementById(id).classList.add("open"); }
+function closeModal(id) { document.getElementById(id).classList.remove("open"); }
+
+/* ─────────────────────────── toast ─────────────────────────── */
+let _toastTimer = null;
+function showToast(msg, isError = false) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.classList.toggle("toast-error", isError);
+  el.classList.add("show");
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => el.classList.remove("show"), 3500);
+}
+
+/* ─────────────────────────── boot ─────────────────────────── */
+init();
+</script>
+</body>
+</html>

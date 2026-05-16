@@ -1,6 +1,6 @@
 # Phase 6 — Workspace Isolation & Arch Category CRUD
 
-> **Status:** Not started — requires Phase 1  
+> **Status:** SUBSTANTIALLY COMPLETE — 2026-05-15 ⚠️ (workspace.py coded but not exposed as agent tools; see audit)  
 > **Depends on:** Phase 1 (archived_files table, pipeline_arch_categories table);  
 >   Phase 2 recommended (stage_config available) but not strictly blocking  
 > **Estimated effort:** 3 days  
@@ -211,3 +211,47 @@ archived files don't appear as untracked changes in the agent's worktree view. A
 On Windows these contain drive letters (`D:\workspace\...`). If the project is moved
 to a different drive, `undelete_file` will fail to find the archive. Store paths
 relative to the project root instead, and resolve at runtime.
+
+---
+
+## Implementation Audit (2026-05-15)
+
+### What was delivered
+
+`app/agent/workspace.py` is fully coded and correct: `delete_file`, `undelete_file`,
+`rename_file`, `write_file`, `read_file`, `list_dir` all exist with proper collision
+handling (timestamp-suffixed folders) and relative-path storage in `archived_files`
+(addressing the cross-platform risk noted above — paths are stored relative to
+project root, not absolute).
+
+`/.archive/` and `/.maestro-worktrees/` are added to `.gitignore` both statically and
+via `worktree.py:_ensure_gitignore()` on worktree creation.
+
+Arch category CRUD is fully implemented: DB model, `crud_malleable.py` functions, all
+four API endpoints, and the frontend (`kanban.js`) loads categories dynamically from
+`GET /api/projects/{name}/arch-categories` with a fallback to the hardcoded
+`ARCH_CATEGORY_COLORS` constant. The arch category edit modal in the kanban board is
+functional.
+
+### Critical gap: workspace tools not exposed to agents
+
+The workspace module functions are **not registered** in the agent tool system
+(`tools.py` TOOL_SCHEMAS / TOOL_REGISTRY). Agents cannot call `delete_file`,
+`undelete_file`, `rename_file` etc. via tool calls. The only deletion available to
+agents is the pre-existing `write_archive` tool (a different, older implementation).
+
+Human-triggered undelete works via `POST /api/tasks/{task_id}/undelete`, but the
+plan explicitly specified these as **agent-callable tools** so that agents can report
+`archive_id` values and the user can reverse deletions from the LLM's description.
+
+**Fix:** Register `delete_file`, `rename_file` (and optionally `undelete_file`) in
+`config.py:build_tool_schemas()` and add them to `TOOL_SCHEMAS` in `tools.py`, pointing
+at the `workspace` module implementations.
+
+### ARCH_CATEGORY_COLORS still present (hardcoded fallback)
+
+`kanban.js` still contains the hardcoded `ARCH_CATEGORY_COLORS` constant. It is used
+as a fallback when the API call fails and as a color-resolution fallback per-key. This
+is appropriate defensive behavior; the plan called for the constant to be "removed" but
+keeping it as a fallback is more robust. Consider renaming it `DEFAULT_ARCH_CATEGORY_COLORS`
+to make the intent clear.

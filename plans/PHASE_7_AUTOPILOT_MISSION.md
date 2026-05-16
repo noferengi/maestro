@@ -1,6 +1,6 @@
 # Phase 7 — Autopilot & Mission System
 
-> **Status:** Not started — requires Phase 2  
+> **Status:** SUBSTANTIALLY COMPLETE — 2026-05-15 ⚠️ (mission report card creation and localStorage pre-fill not verified; see audit)  
 > **Depends on:** Phase 2 (scheduler reads settings); Phase 1 (system_settings table)  
 > **Estimated effort:** 2 days  
 > **Goal:** "Human in the Loop / Leave it to the Maestro" toggle with scheduled
@@ -220,3 +220,35 @@ autopilot manually after a restart.
 23:00–07:00 wraparound correctly. The `start < stop` vs `start > stop` branch in
 `_should_dispatch()` handles this; add a unit test for the midnight edge case
 (hour=0, start=23, stop=7 → should return True).
+
+---
+
+## Implementation Audit (2026-05-15)
+
+### What was delivered
+
+`MissionConfig` and `MissionState` dataclasses exist with `check_termination()`.
+`_should_autopilot_dispatch()` in `scheduler.py` correctly handles both simple and
+overnight hour ranges. Per-project override (`force_on` / `force_off` / `inherit`)
+is checked during the per-task dispatch loop. All four API endpoints exist
+(`GET/POST /api/settings/autopilot`, `GET/POST /api/projects/{name}/settings`).
+The autopilot toggle button and mission dialog modal are in `index.html`.
+`test_autopilot_unit.py` (262 lines) covers schedule logic, all four termination
+conditions, and settings round-trips.
+
+Server restart safety is correctly implemented: on startup, if `maestro_autopilot='on'`
+with no in-memory mission, it resets to `'off'` and logs a warning.
+
+### Gaps
+
+**Mission report arch card** — `_create_mission_report()` exists in `scheduler.py`
+but whether it is actually called on termination requires verification. If not, the
+end-of-mission report card specified in the plan is silently skipped.
+
+**localStorage pre-fill** — The spec requires the mission dialog to pre-fill from
+`localStorage.getItem('maestro_mission_defaults')` on open. Not tested; may not be
+wired in `index.html` JavaScript.
+
+**Graceful stop signal on mission end** — Spec says "sends stop signals to all running
+sessions." The `stop_agent()` path exists but whether the mission termination handler
+calls it needs confirmation.

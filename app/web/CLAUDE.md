@@ -9,14 +9,19 @@ All files in this directory are served as static files by FastAPI from the `/sta
 
 ### Board (`index.html` + `kanban.js` + `style.css`)
 
-The main Kanban board. Layout: a **`#arch-bar`** horizontal band spanning full width at the top, followed by eight pipeline columns: IDEAS → PLANNING → INDEV → CONCEPTUAL_REVIEW → OPTIMIZATION → SECURITY → FINAL_REVIEW → COMPLETED. Tasks are draggable within a column to reorder. Column transitions are gated by the backend intake pipeline. Clicking a column header opens the **Column Map View**.
+The main Kanban board. Layout: a **`#arch-bar`** horizontal band spanning full width at the top, followed by pipeline columns derived from the project's active `pipeline_template`. The default Software Development template has 9 columns (idea → planning → indev → conceptual_review → optimization → security → final_review → human_review → completed). For other templates, `buildKanbanColumns(stages)` creates DOM columns dynamically from `activePipelineTemplate.stages`. Tasks are draggable within a column. Column transitions are gated by the backend intake pipeline. Clicking a column header opens the **Column Map View**.
+
+**New pages (malleable pipeline system):**
+- `pipeline_editor.html` — Litegraph.js canvas editor at `/pipelines/{id}/edit`. Draw stage nodes, wire transition edges, open the slide-in property panel, use ⚡ to generate system prompts. Six node types. Back-edges render dashed in amber. Tidy Layout + Simulation mode.
+- `gallery.html` — Template gallery at `/pipelines`. Browse, clone, export/import, assign templates. Built-in templates are labelled; deletion blocked by backend. [Use] calls `POST /api/projects/{name}/use-template`.
 
 **`index.html`** — Board shell. Project tabs, the `#arch-bar` architecture bar, eight pipeline column containers, the Column Map overlay (`#column-map-container`), nine modals (task create/edit, new project, edit project, transition, LLM endpoints, budgets, tools, compute nodes). Both New Project and Edit Project modals have **Default LLM** and **Budget** dropdowns. The task create/edit modal has shared `#arch-category` and `#arch-priority` selects for architecture cards (shown/hidden by `showArchContentFields()`).
 
 **`kanban.js`** — All board behaviour. Key globals:
 - `taskData`, `allTasks`, `currentProject` — task state
-- `allLlms`, `allBudgets`, `allProjects` — endpoint/budget/project caches; `allProjects` is `[{name, path, description, llm_id, budget_id}]`
-- `ARCH_CATEGORY_COLORS` — `{category: hexColor}` map for the 14 architecture card category badges
+- `allLlms`, `allBudgets`, `allProjects` — endpoint/budget/project caches
+- `activePipelineTemplate` — the project's active `pipeline_template` object (stages, transitions, groups); used to derive kanban columns
+- `archCategoryMap` — `{key: {label, color}}` loaded from `GET /api/projects/{name}/arch-categories`; falls back to hardcoded `ARCH_CATEGORY_COLORS` constant if the API call fails
 - `_archBarCollapsed` — boolean persisted in `localStorage`; drives `#arch-bar.collapsed` CSS class
 - `transitionCache`, `transitionPollers` — intake pipeline polling
 - `columnMapActive`, `columnMapType` — Column Map View active flag and which column
@@ -49,11 +54,11 @@ Stage Journal functions (all global, called from inline `onclick` attributes):
 A dark navy band spanning the full board width above the pipeline columns. Architecture cards are stored as `type='architecture'` tasks in the DB and rendered **only** here — never in kanban columns.
 
 **Card schema** (`content` JSON field):
-- `category` — one of 14 fixed values: `Platform`, `Design`, `Testing`, `Security`, `Performance`, `API`, `Tooling`, `Data`, `UX`, `Accessibility`, `Compliance`, `Deployment`, `Observability`, `General`
-- `priority` — `critical` | `high` | `normal` | `low`; controls injection order in agent context and left-border stripe colour on the card
+- `category` — one of the template's arch categories (loaded from `archCategoryMap`; default Software Dev categories: Platform, Design, Testing, Security, Performance, API, Tooling, Data, UX, Accessibility, Compliance, Deployment, Observability, General)
+- `priority` — `critical` | `high` | `normal` | `low`; controls injection order in agent context and left-border stripe colour
 - Card body text is the task's `description` field
 
-Each card shows a coloured category badge (`ARCH_CATEGORY_COLORS`), title, 3-line body excerpt, and a priority stripe (red=critical, orange=high, blue=normal, grey=low). Hover reveals Edit/Del buttons. The bar is collapsible; state persists in `localStorage`.
+Each card shows a coloured category badge (`archCategoryMap` or fallback `ARCH_CATEGORY_COLORS`), title, 3-line body excerpt, and a priority stripe. Hover reveals Edit/Del buttons. The arch bar header has an ⚙ button for arch category management (add, rename, recolor, reorder, delete per-template categories). The bar is collapsible; state persists in `localStorage`.
 
 **Agent injection** — `build_architecture_context(project_name, agent_type)` in `project_snapshot.py` fetches arch cards and formats them as a `== PROJECT ARCHITECTURE & CONSTRAINTS ==` block. `ARCH_CATEGORY_RELEVANCE` maps agent type to a category set filter:
 

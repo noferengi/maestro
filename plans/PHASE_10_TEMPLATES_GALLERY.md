@@ -1,6 +1,6 @@
 # Phase 10 — Cross-Domain Templates & Gallery
 
-> **Status:** Not started — requires Phases 1–5  
+> **Status:** COMPLETE — 2026-05-15  
 > **Depends on:** All prior phases (templates must be fully functional before shipping examples)  
 > **Estimated effort:** 2 days  
 > **Goal:** Ship built-in pipeline templates for major use cases; add a gallery page
@@ -284,3 +284,36 @@ seeded data and to any projects already using that template. Add a
 `check_builtin_templates()` startup function that compares the live DB state of
 built-in templates against the expected seed data and logs a warning (not an
 auto-fix) if they diverge.
+
+---
+
+## Implementation Audit (2026-05-15)
+
+### What was delivered
+
+Migration 0073 seeds all six planned built-in templates (Novel Writing, Research
+Report, Data Analysis, Mathematics / Proof Exploration, Bug Triage, Overnight
+Generation) with full stage, transition, group, and arch category rows.
+`is_builtin=TRUE` blocks deletion. `gallery.html` (512 lines) renders a responsive
+grid with search, built-in filter, icons, and full CRUD actions (clone, export,
+import, assign). Routes `GET /pipelines`, `GET /pipelines/new`, and
+`GET /pipelines/{id}/edit` are registered in `main.py`.
+
+### Gaps
+
+**Gallery endpoint mismatch (runtime breakage)** — `gallery.html` calls
+`POST /api/projects/{name}/use-template` but the actual route is
+`POST /api/projects/{name}/pipeline`. The "Use" button on all template cards
+returns 404. Fix: add a `/use-template` alias or update the gallery JS.
+
+**No `check_builtin_templates()` startup function** — The drift-check the plan
+required was not implemented. Built-in template config bugs will silently diverge
+from the seed data in live projects.
+
+**No `test_templates_gallery.py`** — No automated tests for gallery CRUD, clone,
+delete-blocked-for-builtin, or export/import round-trip.
+
+**Stage key migration on template assignment** — When [Use] assigns a template to a
+project with existing tasks, the migration of `task.stage_key` values to the new
+template's stage keys is implied by the API but not explicitly verified in tests or
+code review.

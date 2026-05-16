@@ -28,6 +28,7 @@ import asyncio
 import logging
 import os
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone as _tz
 
 
@@ -35,7 +36,7 @@ def _now_utc() -> str:
     return datetime.now(_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
 import threading
 from collections import defaultdict
-from typing import Any
+from typing import Any, Callable
 
 import json
 
@@ -55,6 +56,156 @@ from app.agent.llm_client import is_shutting_down, signal_shutdown, signal_force
 
 logger = logging.getLogger(__name__)
 AGENT_NAME = "Scheduler"
+
+
+# ---------------------------------------------------------------------------
+# Autopilot / Mission state machine
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MissionConfig:
+    time_limit_seconds: "int | None" = None
+    token_budget: "int | None" = None
+    card_count_target: "int | None" = None
+    goal_card_id: "str | None" = None
+
+
+@dataclass
+class MissionState:
+    config: MissionConfig
+    started_at: datetime = field(default_factory=datetime.utcnow)
+    completed_cards: int = 0
+    tokens_used: int = 0
+    active: bool = True
+
+    def check_termination(self) -> "str | None":
+        """Returns the fired condition name, or None if the mission is still running."""
+        if self.config.time_limit_seconds:
+            elapsed = (datetime.utcnow() - self.started_at).total_seconds()
+            if elapsed >= self.config.time_limit_seconds:
+                return "time_limit"
+        if self.config.token_budget and self.tokens_used >= self.config.token_budget:
+            return "token_budget"
+        if self.config.card_count_target and self.completed_cards >= self.config.card_count_target:
+            return "card_count"
+        if self.config.goal_card_id:
+            from app.database import get_task as _get_task
+            card = _get_task(self.config.goal_card_id)
+            if card and card.type == "completed":
+                return "goal_card"
+        return None
+
+
+# Module-level mission state — None means no active mission
+_mission_state: "MissionState | None" = None
+_mission_lock = threading.Lock()
+
+
+def set_mission(config: "MissionConfig | None") -> None:
+    """Install (or clear) the active mission.  Called by the /api/settings/autopilot endpoint."""
+    global _mission_state
+    with _mission_lock:
+        if config is None:
+            _mission_state = None
+        else:
+            _mission_state = MissionState(config=config)
+
+
+def get_mission_state() -> "MissionState | None":
+    with _mission_lock:
+        return _mission_state
+
+
+def _should_autopilot_dispatch() -> bool:
+    """Return True if the global autopilot setting allows dispatching right now."""
+    from app.database import get_system_setting as _gs
+    autopilot = _gs("maestro_autopilot", "off")
+    if autopilot != "on":
+        return False
+    try:
+        start = int(_gs("autopilot_start_hour", 0) or 0)
+        stop  = int(_gs("autopilot_stop_hour",  24) or 24)
+    except (TypeError, ValueError):
+        return True  # malformed config → don't block
+    now_hour = datetime.utcnow().hour
+    if start == stop or stop == 24:
+        return True  # no schedule restriction
+    if start < stop:
+        return start <= now_hour < stop
+    # overnight wrap: e.g. 23–07
+    return now_hour >= start or now_hour < stop
+
+
+def _tick_mission() -> None:
+    """Check mission termination conditions; fire mission report if any condition is met."""
+    global _mission_state
+    with _mission_lock:
+        ms = _mission_state
+    if ms is None or not ms.active:
+        return
+
+    reason = ms.check_termination()
+    if reason is None:
+        return
+
+    logger.info("[Autopilot] Mission terminated: %s", reason)
+
+    # 1. Flip autopilot off
+    from app.database import set_system_setting as _ss
+    _ss("maestro_autopilot", "off", "Global autopilot switch: on|off")
+
+    # 2. Stop all running MaestroLoop sessions
+    from app.agent.loop import request_stop as _request_stop
+    with _active_sessions_lock:
+        task_ids = list(_active_sessions.keys())
+    for tid in task_ids:
+        try:
+            _request_stop(tid)
+        except Exception:
+            pass
+
+    # 3. Create mission report arch card
+    _create_mission_report(ms, reason)
+
+    with _mission_lock:
+        if _mission_state is ms:
+            _mission_state = None
+
+
+def _create_mission_report(ms: MissionState, reason: str) -> None:
+    """Persist a mission report as an architecture task card."""
+    from app.database import create_task, get_all_projects
+    elapsed = int((datetime.utcnow() - ms.started_at).total_seconds())
+    hours, rem = divmod(elapsed, 3600)
+    mins = rem // 60
+
+    reason_labels = {
+        "time_limit":        "Time limit reached",
+        "token_budget":      "Token budget exhausted",
+        "card_count":        "Card count target met",
+        "goal_card":         "Goal card completed",
+    }
+    label = reason_labels.get(reason, reason)
+
+    body = (
+        f"Mission completed — {label}\n"
+        f"Duration: {hours}h {mins}m\n"
+        f"Cards completed: {ms.completed_cards}\n"
+        f"Tokens used: {ms.tokens_used:,}"
+    )
+
+    projects = get_all_projects()
+    project_name = projects[0].name if projects else "TheMaestro"
+    try:
+        create_task(
+            title="Mission Report",
+            description=body,
+            task_type="architecture",
+            project=project_name,
+            content={"category": "General", "priority": "normal"},
+        )
+    except Exception as exc:
+        logger.warning("[Autopilot] Could not create mission report card: %s", exc)
 
 
 class WorktreeIsolationError(Exception):
@@ -379,6 +530,12 @@ _MAX_PLANNING_GATE_FAILURES = 5
 # Cleared by clear_planning_stopped() which is called from /run-planning endpoint.
 _planning_stopped: dict[str, str] = {}
 
+# Stage type names that should NEVER be auto-dispatched.
+# 'human_review' is the canonical built-in stage key for the human gate.
+# Custom pipelines using a non-standard stage_key with agent_type='human_gate'
+# are caught by the agent_type check inside dispatch_task() (returns False).
+_SCHEDULER_SKIP_STAGE_TYPES: frozenset[str] = frozenset({"human_review"})
+
 # Background job retry / rescue parameters.
 # Failed file-summary and research jobs are reset to 'pending' after these cooldowns
 # so they flow through the existing dispatch machinery on the next tick.
@@ -447,6 +604,19 @@ def start_scheduler() -> None:
         prune_orphaned_worktrees([p.path for p in _get_all_projects() if p.path])
     except Exception:
         logger.exception("startup: prune_orphaned_worktrees failed (non-fatal)")
+
+    # Safety: if autopilot was 'on' when the server crashed (no in-memory mission),
+    # reset it to 'off' so the user must re-engage manually.
+    try:
+        from app.database import get_system_setting as _gss, set_system_setting as _sss
+        if _gss("maestro_autopilot", "off") == "on":
+            _sss("maestro_autopilot", "off", "Global autopilot switch: on|off")
+            logger.warning(
+                "Startup: autopilot was 'on' with no mission state (server restarted) — "
+                "reset to 'off'. Re-engage autopilot from the UI."
+            )
+    except Exception:
+        logger.exception("Startup: autopilot safety reset failed (non-fatal).")
 
     _scheduler_stop.clear()
     _scheduler_thread = threading.Thread(
@@ -1086,8 +1256,10 @@ def _tick() -> None:
         task_id = task_dict["id"]
         task_type = task_dict.get("type", "")
 
-        # Only auto-dispatch task types configured in SCHEDULER_DISPATCHABLE_TYPES.
-        if task_type not in SCHEDULER_DISPATCHABLE_TYPES:
+        # Skip stages that are never auto-dispatched (human gate, terminal states).
+        # 'human_review' is the built-in stage name; custom human_gate stages with
+        # non-standard names are caught by the agent_type check in dispatch_task().
+        if task_type in _SCHEDULER_SKIP_STAGE_TYPES:
             continue
 
         # For 'idea' tasks: skip exhausted tasks (human reset required)
@@ -1115,10 +1287,11 @@ def _tick() -> None:
             if task_id in _active_sessions and _active_sessions[task_id].is_alive():
                 continue
 
-        # PIP resolution guard: don't re-dispatch a review stage while resolution
-        # agents are still working on its PIPs.  The stage will re-enter naturally
-        # on the next tick after all jobs reach 'done'.
-        if task_type in {"conceptual_review", "optimization", "security", "human_review"}:
+        # PIP resolution guard: don't re-dispatch any non-intake stage while PIP
+        # resolution agents are still working.  'idea', 'planning', 'architecture'
+        # pre-date the PIP system and never generate PIPs.
+        # Custom stages with pip_skip:true in stage.config are exempted below.
+        if task_type not in {"idea", "planning", "architecture"}:
             from app.database import get_active_pip_resolution_jobs_for_task
             if get_active_pip_resolution_jobs_for_task(task_id):
                 logger.debug(
@@ -1144,6 +1317,12 @@ def _tick() -> None:
         # Resolve the LLM for capacity check
         db_task = get_task(task_id)
         if not db_task or not db_task.llm_id:
+            continue
+
+        # Circuit-breaker park guard: skip stages that have been explicitly parked
+        # by a circuit_breaker executor (content._parked_at_stage set).
+        _content_blob = db_task.content or {}
+        if _content_blob.get("_parked_at_stage") == task_type:
             continue
 
         # CONSULTATION GUARD: Skip tasks that are paused for consultation
@@ -1268,6 +1447,9 @@ def _tick() -> None:
     _dispatch_heartbeat_maestro(
         allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
     )
+
+    # 9. Card factory: predecessor_complete and cron triggers (Phase 9)
+    _dispatch_factory_triggers(allowed_llm_id)
 
 
 def _dispatch_heartbeat_maestro(
@@ -1467,6 +1649,13 @@ def _dispatch_maestro(
     if not maestro_enabled:
         return
 
+    # Autopilot gate: honour the on/off toggle and scheduled hours
+    if not _should_autopilot_dispatch():
+        return
+
+    # Tick mission state machine (check termination conditions)
+    _tick_mission()
+
     if is_shutting_down():        return
 
     from app.database import get_all_projects, get_tasks_by_project, get_llm
@@ -1484,6 +1673,12 @@ def _dispatch_maestro(
         # Skip projects without an LLM or budget configured
         if not project.llm_id or not project.budget_id:
             continue
+
+        # Per-project autopilot override
+        from app.database import get_project_setting as _gps
+        proj_override = _gps(project.id, "autopilot_override", "inherit")
+        if proj_override == "force_off":
+            continue  # this project opts out of autonomous dispatch
 
         # Skip if a Maestro is already running for this project
         with _active_maestro_lock:
@@ -3207,22 +3402,31 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
         llm_id = llm.id
         budget_id = db_task.budget_id if db_task else None
 
-        if task_type == "idea":
-            _run_intake(task_id, llm_base_url, llm_model, max_context, worktree_path)
-        elif task_type == "planning":
-            _run_planning_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
-        elif task_type == "indev":
-            _run_dev_orchestrator_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
-        elif task_type == "conceptual_review":
-            _run_conceptual_review_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
-        elif task_type == "optimization":
-            _run_optimization_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
-        elif task_type == "security":
-            _run_security_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
-        elif task_type == "final_review":
-            _run_final_review_task(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
-        else:
-            _run_maestro_loop(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
+        from app.agent.pipeline_router import dispatch_task as _pipeline_dispatch
+        dispatched = _pipeline_dispatch(
+            task_id,
+            task_type,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            max_context=max_context,
+            llm_id=llm_id,
+            budget_id=budget_id,
+            project_path=worktree_path,
+        )
+        if not dispatched:
+            # dispatch_task() returns False for: (a) no stage config found (legacy
+            # tasks without a pipeline template), or (b) human_gate / terminal
+            # agent types.  Only fall back to MaestroLoop for case (a).
+            from app.agent.pipeline_router import get_stage_config as _get_sc
+            _sc = _get_sc(task_id)
+            if _sc is not None:
+                logger.info(
+                    "[scheduler] Task '%s' stage '%s' (agent_type='%s') not auto-dispatched — skipping.",
+                    task_id, task_type, _sc.agent_type,
+                )
+            else:
+                # No pipeline template — legacy fallback to MaestroLoop
+                _run_maestro_loop(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path)
     except TaskDeactivatedError as exc:
         logger.info("Task '%s' session halted: %s", task_id, exc)
     except WorktreeIsolationError as exc:
@@ -3252,6 +3456,8 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
 
 def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
                 max_context: int | None = None,
+                llm_id: int | None = None,
+                budget_id: int | None = None,
                 project_path: str | None = None) -> None:
     """Run the intake pipeline for an IDEA task."""
     from app.agent.intake import run_intake_pipeline
@@ -3261,6 +3467,7 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
         create_transition_vote, create_transition_result,
         create_agent_session, close_agent_session,
     )
+    from app.agent.pipeline_router import advance_stage
 
     task = get_task(task_id)
     if not task:
@@ -3365,7 +3572,7 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
             )
 
         if result["outcome"] == "passed":
-            update_task(task_id, type="planning")
+            advance_stage(task_id, "pass", from_stage="idea")
             logger.info("Task '%s' advanced to PLANNING via scheduler.", task_id)
         elif result["outcome"] == "subdivide":
             # Lazy import avoids circular import; main.py is fully loaded by call time.
@@ -3511,6 +3718,7 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
     from app.agent.planning_gate import run_planning_gate
     from app.database import update_task, get_task, get_all_tasks, create_transition_result, task_to_dict
     from app.database import create_agent_session, close_agent_session
+    from app.agent.pipeline_router import advance_stage
 
     task = get_task(task_id)
     if not task:
@@ -3535,7 +3743,7 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
             if _cached:
                 _spr_cache(task_id)
                 restore_planning_result(_cached.id)
-                update_task(task_id, type='indev')
+                advance_stage(task_id, "pass", from_stage="planning")
                 logger.info(
                     "[planning] Cache HIT task '%s' — reusing plan %d, skipping 40-min pipeline.",
                     task_id, _cached.id,
@@ -3679,7 +3887,7 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
                 except Exception:
                     pass
                 _exit_summary = "Planning passed and gate checks confirmed. Advanced to INDEV."
-                update_task(task_id, type="indev")
+                advance_stage(task_id, "pass", from_stage="planning")
                 logger.info("[planning] Task '%s' advanced to IN DEV.", task_id)
             else:
                 _exit_reason = "rejected"
@@ -3790,7 +3998,7 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
                                         "Correction agent patched plan; gate now passes. "
                                         "Advanced to INDEV."
                                     )
-                                    update_task(task_id, type="indev")
+                                    advance_stage(task_id, "pass", from_stage="planning")
                                     logger.info(
                                         "[planning] Task '%s' advanced to INDEV after correction.",
                                         task_id,
@@ -3830,7 +4038,7 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
                     "[planning] Task '%s' planning voted subdivide — demoting to IDEA.",
                     task_id,
                 )
-                update_task(task_id, type="idea")
+                advance_stage(task_id, "subdivide", from_stage="planning")
                 create_transition_result(
                     task_id=task_id,
                     transition="idea_to_planning",
@@ -3877,6 +4085,7 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
     from app.agent.config import MAX_TURNS as _MAX_TURNS
     from app.database import update_task, get_task, get_pips_for_task
     from app.database import create_agent_session, close_agent_session
+    from app.agent.pipeline_router import advance_stage
 
     _session_id = None
     _exit_reason = "error"
@@ -3916,19 +4125,16 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
                 return
 
             current_type = (task.type or "").lower()
-            if current_type == "planning":
-                update_task(task_id, type="indev")
-                logger.info("Task '%s' advanced from PLANNING to INDEV via scheduler.", task_id)
-            elif current_type == "indev":
-                update_task(task_id, type="conceptual_review")
-                logger.info("Task '%s' advanced from INDEV to CONCEPTUAL REVIEW via scheduler.", task_id)
+            if current_type in ("planning", "indev"):
+                advance_stage(task_id, "pass", from_stage=current_type)
+                logger.info("Task '%s' advanced from %s via scheduler (ACCEPTED).", task_id, current_type.upper())
             else:
                 logger.info("Task '%s' reached ACCEPTED but current type '%s' has no auto-transition.", task_id, current_type)
 
         elif result.status == "NEEDS_HUMAN":
             _exit_reason = "needs_human"
             _exit_summary = result.final_message or "Agent escalated for human review."
-            update_task(task_id, type="human_review")
+            advance_stage(task_id, "pass", from_stage="indev")
             from app.database import create_inbox_message as _create_inbox
             task_obj = get_task(task_id)
             _create_inbox(
@@ -3972,7 +4178,7 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
 
         elif result.status in ("REVERT_TO_DESIGN", "REJECTED"):
             _exit_reason = "rejected"
-            update_task(task_id, type="planning")
+            advance_stage(task_id, "fail", from_stage="indev")
             _record_demotion_inline(task_id, "indev", "planning", result.final_message or "Agent requested revert")
             logger.warning("Task '%s' reverted to PLANNING via scheduler: %s", task_id, result.final_message)
 
@@ -3984,12 +4190,9 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
 
             current_type = (task.type or "").lower()
             if current_type in ("planning", "indev"):
-                # Hit the turn limit without submitting.  Demote to planning
-                # so the system re-evaluates the strategy rather than pushing
-                # a likely-incomplete implementation forward.
                 logger.warning("Task '%s' demoted to PLANNING (max_turns).", task_id)
                 _record_demotion_inline(task_id, current_type, "planning", f"Max turns ({_MAX_TURNS}) exceeded without completion.")
-                update_task(task_id, type="planning")
+                advance_stage(task_id, "fail", from_stage=current_type)
             else:
                 logger.warning("Task '%s' reached terminal state (MAX_TURNS) but current type '%s' has no auto-transition.", task_id, current_type)
 
@@ -4001,10 +4204,9 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
 
             current_type = (task.type or "").lower()
             if current_type in ("planning", "indev"):
-                # Execution error.  Demote to planning for retry/re-think.
                 logger.warning("Task '%s' demoted to PLANNING (error).", task_id)
                 _record_demotion_inline(task_id, current_type, "planning", f"Execution error in {current_type} stage.")
-                update_task(task_id, type="planning")
+                advance_stage(task_id, "fail", from_stage=current_type)
             else:
                 logger.warning("Task '%s' reached terminal state (ERROR) but current type '%s' has no auto-transition.", task_id, current_type)
 
@@ -4020,12 +4222,9 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
         task = get_task(task_id)
         if task:
             current_type = (task.type or "").lower()
-            if current_type == "planning":
-                update_task(task_id, type="indev")
-                logger.warning("Task '%s' advanced from PLANNING to INDEV (exception).", task_id)
-            elif current_type == "indev":
-                update_task(task_id, type="conceptual_review")
-                logger.warning("Task '%s' advanced from INDEV to CONCEPTUAL REVIEW (exception).", task_id)
+            if current_type in ("planning", "indev"):
+                advance_stage(task_id, "fail", from_stage=current_type)
+                logger.warning("Task '%s' demoted via advance_stage (exception in %s).", task_id, current_type)
     finally:
         close_agent_session(_session_id, _exit_reason, _exit_summary, turn_count=_turn_count)
         try:
@@ -4048,6 +4247,7 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
     from app.agent.tools import set_task_git_cwd
     from app.database import get_planning_result, update_task
     from app.database import create_agent_session, close_agent_session
+    from app.agent.pipeline_router import advance_stage
     import json
 
     set_task_git_cwd(project_path, task_id=task_id)
@@ -4055,7 +4255,7 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
     planning_result_obj = get_planning_result(task_id)
     if not planning_result_obj:
         logger.warning("No planning result for task '%s', demoting to planning.", task_id)
-        update_task(task_id, type="planning")
+        advance_stage(task_id, "fail", from_stage="indev")
         _record_demotion_inline(task_id, "indev", "planning", "Missing planning results")
         return
 
@@ -4069,7 +4269,7 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
         }
     except json.JSONDecodeError as exc:
         logger.warning("Corrupt planning result JSON for task '%s' (%s), demoting to planning.", task_id, exc)
-        update_task(task_id, type="planning")
+        advance_stage(task_id, "fail", from_stage="indev")
         _record_demotion_inline(task_id, "indev", "planning", f"Corrupt planning result JSON: {exc}")
         return
 
@@ -4134,14 +4334,14 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
         if result.get("status") == "ACCEPTED":
             _exit_reason = "completed"
             _exit_summary = f"Dev orchestrator completed. {result.get('batches_completed', 0)}/{result.get('total_batches', 0)} batches done."
-            update_task(task_id, type="conceptual_review")
+            advance_stage(task_id, "pass", from_stage="indev")
             logger.info("Task '%s' advanced to CONCEPTUAL REVIEW via scheduler.", task_id)
         elif result.get("status") == "REVERT_TO_DESIGN":
             # Agent explicitly signalled the design is wrong — demote to planning.
             _exit_reason = "rejected"
             _error_detail = result.get("error_detail") or "Agent requested design revision."
             _exit_summary = _error_detail[:300]
-            update_task(task_id, type="planning")
+            advance_stage(task_id, "reject", from_stage="indev")
             _record_demotion_inline(task_id, "indev", "planning", _exit_summary)
             logger.warning("Task '%s' reverted to PLANNING (agent REVERT_TO_DESIGN): %s", task_id, _exit_summary)
         else:
@@ -4185,6 +4385,7 @@ def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
         create_transition_vote, create_transition_result,
         create_agent_session, close_agent_session,
     )
+    from app.agent.pipeline_router import advance_stage
     from datetime import datetime
     import json as _json
 
@@ -4197,7 +4398,7 @@ def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
     planning_result_obj = get_planning_result(task_id)
     if not planning_result_obj:
         logger.warning("No planning result for task '%s' in conceptual review. Demoting to indev.", task_id)
-        update_task(task_id, type="indev")
+        advance_stage(task_id, "fail", from_stage="conceptual_review")
         _record_demotion_inline(task_id, "conceptual_review", "indev", "Missing planning results")
         return
 
@@ -4256,7 +4457,7 @@ def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
         if result.get("outcome") == "needs_human":
             _exit_reason = "needs_human"
             _exit_summary = result.get("summary", "Reviewer escalated for human judgment.")
-            update_task(task_id, type="human_review")
+            advance_stage(task_id, "pass", from_stage="conceptual_review")
             from app.database import create_inbox_message as _create_inbox_cr
             _create_inbox_cr(
                 subject=f"Human review needed: {(task.title or task_id)[:60]}",
@@ -4269,10 +4470,10 @@ def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
             )
             logger.info("Task '%s' escalated to HUMAN REVIEW by conceptual reviewer.", task_id)
         elif result.get("outcome") == "passed":
-            update_task(task_id, type="optimization")
+            advance_stage(task_id, "pass", from_stage="conceptual_review")
             logger.info("Task '%s' advanced to OPTIMIZATION via scheduler.", task_id)
         else:
-            update_task(task_id, type="indev")
+            advance_stage(task_id, "fail", from_stage="conceptual_review")
             _record_demotion_inline(task_id, "conceptual_review", "indev", result.get("summary", ""))
             logger.info("Task '%s' demoted to INDEV from conceptual review via scheduler.", task_id)
     except ShutdownError:
@@ -4283,7 +4484,7 @@ def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
         _exit_reason = "error"
         _exit_summary = "Conceptual review raised an unexpected exception."
         logger.exception(f"[{AGENT_NAME}] Conceptual review for task '%s' failed.", task_id)
-        update_task(task_id, type="indev")
+        advance_stage(task_id, "fail", from_stage="conceptual_review")
         _record_demotion_inline(task_id, "conceptual_review", "indev", "Exception in conceptual review")
     finally:
         close_agent_session(_session_id, _exit_reason, _exit_summary,
@@ -4308,6 +4509,7 @@ def _run_optimization_task(task_id: str, llm_base_url: str, llm_model: str,
     from app.agent.tools import set_task_git_cwd
     from app.database import get_task, update_task
     from app.database import create_agent_session, close_agent_session
+    from app.agent.pipeline_router import advance_stage
 
     set_task_git_cwd(project_path, task_id=task_id)
 
@@ -4349,7 +4551,7 @@ def _run_optimization_task(task_id: str, llm_base_url: str, llm_model: str,
         _compl = opt_result.get("total_completion_tokens", 0)
         logger.info("[optimization] Task '%s' via scheduler: %s", task_id, opt_result.get("outcome"))
 
-        update_task(task_id, type="security")
+        advance_stage(task_id, "pass", from_stage="optimization")
         logger.info("[optimization] Task '%s' advanced to SECURITY via scheduler.", task_id)
     except ShutdownError:
         _exit_reason = "shutdown"
@@ -4359,7 +4561,7 @@ def _run_optimization_task(task_id: str, llm_base_url: str, llm_model: str,
         _exit_reason = "error"
         _exit_summary = "Exception during optimization pipeline."
         logger.exception(f"[{AGENT_NAME}] Optimization for task '%s' failed.", task_id)
-        update_task(task_id, type="indev")
+        advance_stage(task_id, "fail", from_stage="optimization")
         _record_demotion_inline(task_id, "optimization", "indev", "Exception in optimization")
     finally:
         close_agent_session(_session_id, _exit_reason, _exit_summary,
@@ -4389,6 +4591,7 @@ def _run_security_task(task_id: str, llm_base_url: str, llm_model: str,
     from app.agent.tools import set_task_git_cwd
     from app.database import get_task, update_task
     from app.database import create_transition_result, create_agent_session, close_agent_session
+    from app.agent.pipeline_router import advance_stage
 
     set_task_git_cwd(project_path, task_id=task_id)
 
@@ -4438,11 +4641,14 @@ def _run_security_task(task_id: str, llm_base_url: str, llm_model: str,
         )
 
         if sec_result.get("outcome") == "passed":
-            update_task(task_id, type="final_review")
+            advance_stage(task_id, "pass", from_stage="security")
             logger.info("[security] Task '%s' advanced to FINAL REVIEW via scheduler.", task_id)
         else:
+            # Demotion target is determined by the reviewer (variable: "indev" or "optimization").
+            # Use update_task directly since advance_stage has a single fail edge that may
+            # not match the reviewer's chosen target.
             demotion = sec_result.get("demotion_target", "indev")
-            update_task(task_id, type=demotion)
+            update_task(task_id, type=demotion, stage_key=demotion)
             _record_demotion_inline(task_id, "security", demotion, sec_result.get("summary", ""))
             logger.warning("[security] Task '%s' demoted to %s via scheduler.", task_id, demotion)
     except ShutdownError:
@@ -4453,7 +4659,7 @@ def _run_security_task(task_id: str, llm_base_url: str, llm_model: str,
         _exit_reason = "error"
         _exit_summary = "Security pipeline raised an unexpected exception."
         logger.exception(f"[{AGENT_NAME}] Security for task '%s' failed.", task_id)
-        update_task(task_id, type="indev")
+        advance_stage(task_id, "fail", from_stage="security")
         _record_demotion_inline(task_id, "security", "indev", "Exception in security pipeline")
     finally:
         close_agent_session(_session_id, _exit_reason, _exit_summary,
@@ -4482,6 +4688,7 @@ def _run_final_review_task(task_id: str, llm_base_url: str, llm_model: str,
         create_transition_vote, create_transition_result,
         create_agent_session, close_agent_session,
     )
+    from app.agent.pipeline_router import advance_stage
 
     set_task_git_cwd(project_path, task_id=task_id)
 
@@ -4532,7 +4739,7 @@ def _run_final_review_task(task_id: str, llm_base_url: str, llm_model: str,
         if result.get("outcome") == "needs_human":
             _exit_reason = "needs_human"
             _exit_summary = result.get("summary", "Reviewer escalated for human judgment.")
-            update_task(task_id, type="human_review")
+            advance_stage(task_id, "pass", from_stage="final_review")
             from app.database import create_inbox_message as _create_inbox_fr
             _create_inbox_fr(
                 subject=f"Human review needed: {(task.title or task_id)[:60]}",
@@ -4559,7 +4766,7 @@ def _run_final_review_task(task_id: str, llm_base_url: str, llm_model: str,
             if merge_test.status == "virtual_passed":
                 _exit_summary = "Final AI review passed. Virtual merge SUCCEEDED. Ready for human review."
                 append_task_history(task_id, "ready_for_review", message=_exit_summary)
-                update_task(task_id, type="human_review")
+                advance_stage(task_id, "pass", from_stage="final_review")
                 logger.info("[final_review] Task '%s' passed. Advanced to HUMAN REVIEW.", task_id)
             elif merge_test.status in ("conflict", "test_failure"):
                 _exit_summary = f"Final AI review passed, but virtual merge {merge_test.status.upper()}. Demoting to indev."
@@ -4567,7 +4774,7 @@ def _run_final_review_task(task_id: str, llm_base_url: str, llm_model: str,
                     task_id, "merge_test_failed",
                     message=f"{_exit_summary}\n\n{merge_test.error_detail or ''}",
                 )
-                update_task(task_id, type="indev")
+                advance_stage(task_id, "fail", from_stage="final_review")
                 _record_demotion_inline(task_id, "final_review", "indev", _exit_summary)
                 logger.warning("[final_review] Task '%s' virtual merge %s. Demoted to indev.", task_id, merge_test.status)
             else:
@@ -4577,11 +4784,13 @@ def _run_final_review_task(task_id: str, llm_base_url: str, llm_model: str,
                     task_id, "merge_test_failed",
                     message=f"{_exit_summary} Detail: {merge_test.error_detail}",
                 )
-                update_task(task_id, type="human_review")
+                advance_stage(task_id, "pass", from_stage="final_review")
                 logger.warning("[final_review] Task '%s' virtual merge infrastructure error (%s). Advanced to HUMAN REVIEW with warning.", task_id, merge_test.status)
         else:
+            # Demotion target is determined by the reviewer (variable).
+            # Use update_task directly since advance_stage has a single fail edge.
             demotion = result.get("demotion_target", "indev")
-            update_task(task_id, type=demotion)
+            update_task(task_id, type=demotion, stage_key=demotion)
             _record_demotion_inline(task_id, "final_review", demotion, result.get("summary", ""))
             logger.warning("[final_review] Task '%s' demoted to %s via scheduler.", task_id, demotion)
     except ShutdownError:
@@ -4592,7 +4801,7 @@ def _run_final_review_task(task_id: str, llm_base_url: str, llm_model: str,
         _exit_reason = "error"
         _exit_summary = "Final review raised an unexpected exception."
         logger.exception(f"[{AGENT_NAME}] Final review for task '%s' failed.", task_id)
-        update_task(task_id, type="indev")
+        advance_stage(task_id, "fail", from_stage="final_review")
         _record_demotion_inline(task_id, "final_review", "indev", "Exception in final review")
     finally:
         close_agent_session(_session_id, _exit_reason, _exit_summary,
@@ -4637,6 +4846,153 @@ def _record_demotion_inline(task_id: str, from_stage: str, to_stage: str, reason
 
 
 
+
+# ---------------------------------------------------------------------------
+# Pipeline dispatch handler registrations (Phase 2: Scheduler Decoupling)
+#
+# Each _run_* function is registered into pipeline_router so that _run_task()
+# can dispatch without a per-stage if/elif block.  New stage types added in
+# future phases register here; no code changes needed in _run_task().
+# ---------------------------------------------------------------------------
+
+from app.agent.pipeline_router import register_handler as _register_stage_handler
+import sys as _sys
+
+# ---------------------------------------------------------------------------
+# Phase 9 — Card Factory dispatch helpers
+# ---------------------------------------------------------------------------
+
+def _dispatch_factory_triggers(allowed_llm_id: "int | None") -> None:
+    """Fire predecessor_complete and cron factory triggers on each tick."""
+    try:
+        from app.database import get_llm as _get_llm
+        llm = _get_llm(allowed_llm_id) if allowed_llm_id else None
+        llm_base_url = f"http://{llm.address}:{llm.port}/v1" if llm else "http://localhost:8008/v1"
+        llm_model = llm.model if llm else "local"
+        max_context = llm.max_context if llm else None
+        llm_id = llm.id if llm else None
+
+        from app.agent.card_factory import check_predecessor_triggers, check_cron_triggers
+        check_predecessor_triggers(
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            max_context=max_context,
+            llm_id=llm_id,
+            budget_id=None,
+        )
+        check_cron_triggers(
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            max_context=max_context,
+            llm_id=llm_id,
+            budget_id=None,
+        )
+    except Exception:
+        logger.exception("[scheduler] _dispatch_factory_triggers error")
+
+
+def _run_factory_node(
+    task_id: str,
+    llm_base_url: str,
+    llm_model: str,
+    max_context: "int | None" = None,
+    llm_id: "int | None" = None,
+    budget_id: "int | None" = None,
+    project_path: "str | None" = None,
+) -> None:
+    """Scheduler handler for factory_node stage type.
+
+    A task whose stage_key is 'factory_node' (or any stage with agent_type
+    'factory_node') is dispatched here.  The factory reads its configuration
+    from the pipeline_stage.config JSON and creates sub-cards, then advances
+    the triggering task to the next stage (single_pass gate).
+    """
+    from app.database import get_task, get_stage_by_key, get_default_template
+    from app.agent.card_factory import run_factory
+    from app.agent.pipeline_router import advance_stage
+
+    task = get_task(task_id)
+    if not task:
+        return
+
+    # Resolve pipeline stage
+    stage = None
+    stage_key = task.stage_key or task.type or ""
+    template_id = None
+    if hasattr(task, "project_ref") and task.project_ref:
+        template_id = getattr(task.project_ref, "pipeline_template_id", None)
+    if template_id is None:
+        tmpl = get_default_template()
+        if tmpl:
+            template_id = tmpl.id
+    if template_id:
+        stage = get_stage_by_key(template_id, stage_key)
+
+    if stage is None:
+        logger.warning("[factory] No pipeline stage found for task %s stage_key=%r", task_id, stage_key)
+        return
+
+    project_id = task.project_id
+    if project_id is None:
+        logger.warning("[factory] Task %s has no project_id", task_id)
+        return
+
+    try:
+        run_factory(
+            stage.id,
+            project_id,
+            "pipeline",
+            trigger_card_id=task_id,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            max_context=max_context,
+            llm_id=llm_id,
+            budget_id=budget_id,
+        )
+    except Exception:
+        logger.exception("[factory] run_factory failed for task %s", task_id)
+
+    # Advance the triggering card to the next stage (single_pass)
+    advance_stage(task_id, "pass", from_stage=stage_key)
+
+_SCHEDULER_MODULE = _sys.modules[__name__]
+
+
+def _make_late_handler(fn_name: str) -> Callable:
+    """Return a handler that looks up fn_name on this module at call time.
+
+    This ensures that patch("app.agent.scheduler.<fn_name>") in tests correctly
+    intercepts the call, because the lookup happens via getattr at dispatch time
+    rather than at registration time.
+    """
+    def _handler(*args, **kw):
+        return getattr(_SCHEDULER_MODULE, fn_name)(*args, **kw)
+    return _handler
+
+
+_register_stage_handler("idea",              _make_late_handler("_run_intake"))
+_register_stage_handler("planning",          _make_late_handler("_run_planning_task"))
+_register_stage_handler("indev",             _make_late_handler("_run_dev_orchestrator_task"))
+_register_stage_handler("conceptual_review", _make_late_handler("_run_conceptual_review_task"))
+_register_stage_handler("optimization",      _make_late_handler("_run_optimization_task"))
+_register_stage_handler("security",          _make_late_handler("_run_security_task"))
+_register_stage_handler("final_review",      _make_late_handler("_run_final_review_task"))
+_register_stage_handler("factory_node",      _make_late_handler("_run_factory_node"))
+
+# ---------------------------------------------------------------------------
+# Agent-type executor registrations (generic pipeline nodes)
+# ---------------------------------------------------------------------------
+
+from app.agent.stage_executors import (  # noqa: E402
+    _run_circuit_breaker,
+    _run_voting_panel,
+    _run_fan_out_judge,
+)
+from app.agent.pipeline_router import register_agent_type_executor as _reg_executor  # noqa: E402
+
+_reg_executor("circuit_breaker", _run_circuit_breaker)
+_reg_executor("voting_panel",    _run_voting_panel)
+_reg_executor("fan_out_judge",   _run_fan_out_judge)
 
 # ---------------------------------------------------------------------------
 # Helpers

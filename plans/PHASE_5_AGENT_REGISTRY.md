@@ -1,6 +1,6 @@
 # Phase 5 — Agent Registry & Custom Agents
 
-> **Status:** Not started — requires Phase 2  
+> **Status:** SUBSTANTIALLY COMPLETE — 2026-05-15 ⚠️ (verifier framework coded but not wired into gate; see audit)  
 > **Depends on:** Phase 2 (registry stub exists); Phase 3 (API for custom_agent_definitions)  
 > **Estimated effort:** 4 days  
 > **Goal:** Make `CustomLLMAgent` fully operational, refactor subdivision into the
@@ -271,3 +271,51 @@ acceptable. Document the limitation; do not add sandboxing now.
 while a task is mid-dispatch, `AGENT_REGISTRY[stage_config.agent_type]` will
 KeyError. Add a try/except that logs and leaves the task in place (scheduler will
 retry next tick).
+
+---
+
+## Implementation Audit (2026-05-15)
+
+### What was delivered
+
+`CustomLLMAgent` in `app/agent/custom_llm_agent.py` is fully functional: reads
+`custom_agent_definitions` by name, injects system_prompt, enforces allowed_tools
+(always appends `submit_work`), handles ACCEPTED/REJECTED/MAX_TURNS exits, and
+correctly advances stage via `pipeline_router`.
+
+`batch_create_cards` tool in `app/agent/tools.py` is fully implemented with the
+specified schema: `cards`, `new_parent`, `archive_origin`. It resolves `sub-N`
+prerequisite references, inherits LLM/budget IDs from the parent task, and
+archives the origin task when `archive_origin=True`.
+
+`SubdivisionAgent` in `subdivide.py` was refactored: `batch_create_cards` is in
+its tool allowlist, the system prompt documents the tool, and the handler captures
+created IDs on success without requiring a legacy structured-output parse.
+
+All five custom agent definition CRUD endpoints in `main.py` are functional including
+the deletion-blocked-if-in-use guard. `load_custom_agents_into_registry()` populates
+the registry both at startup and on create/update.
+
+The verifier framework (`app/agent/verifiers.py`) implements all five verifier types
+with correct subprocess isolation and timeouts.
+
+### Critical gap: verifier framework not wired in
+
+`run_verifier()` **is never called**. `CustomLLMAgent` does not invoke the verifier
+after its LLM loop even when `stage_config.verifier != "none"`. The plan's spec
+(`app/agent/custom_llm_agent.py` excerpt, lines 43–50) shows the call sequence:
+```python
+if self.verifier != "none":
+    passed = run_verifier(self.task.id, self.stage_config)
+    condition = "pass" if passed else "fail"
+```
+This block was not implemented. Any stage configured with a verifier (python_sympy,
+custom_script) will silently skip verification and gate on the LLM's own output instead.
+
+**Fix:** In `custom_llm_agent.py`, after `result = await self._llm_loop()`, add the
+verifier call before calling `pipeline_router.advance_stage()`.
+
+### No test for `_run_llm_segmented` (Phase 9 overlap)
+
+The custom agent test path is covered by `test_pipeline_router.py` dispatch tests but
+there is no end-to-end test of `CustomLLMAgent.run()` with a mocked LLM.

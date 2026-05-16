@@ -485,7 +485,7 @@ def seed_sample_tasks_raw(conn):
 # Task CRUD
 # ---------------------------------------------------------------------------
 
-def create_task(title, task_type, description="", owner="user", tags=None, content=None, llm_id=None, budget_id=None, prerequisites=None, project='TheMaestro', project_id=None, position=None):
+def create_task(title, task_type, description="", owner="user", tags=None, content=None, llm_id=None, budget_id=None, prerequisites=None, project='TheMaestro', project_id=None, position=None, stage_key=None):
     """Create a new task.
 
     Pass either ``project`` (name string) or ``project_id`` (integer).  If both
@@ -500,6 +500,7 @@ def create_task(title, task_type, description="", owner="user", tags=None, conte
             id=f"task-{datetime.now().timestamp()}",
             title=title,
             type=task_type,
+            stage_key=stage_key or task_type,
             description=description,
             owner=owner,
             tags=tags or [],
@@ -654,12 +655,16 @@ def update_task(task_id, **kwargs):
         if not task:
             return None
 
+        # If type is updated but stage_key isn't, keep them in sync for Phase 1
+        if 'type' in kwargs and 'stage_key' not in kwargs:
+            kwargs['stage_key'] = kwargs['type']
+
         for key, value in kwargs.items():
             if hasattr(task, key):
                 setattr(task, key, value)
 
         task.history.append({
-            "status": kwargs.get('type') or 'updated',
+            "status": kwargs.get('type') or kwargs.get('stage_key') or 'updated',
             "timestamp": datetime.now().isoformat()
         })
 
@@ -1029,6 +1034,7 @@ def task_to_dict(task):
         "id": task.id,
         "title": task.title,
         "type": task.type,
+        "stage_key": getattr(task, "stage_key", None) or task.type,
         "description": task.description,
         "owner": task.owner,
         "tags": task.tags,

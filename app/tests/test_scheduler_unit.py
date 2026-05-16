@@ -441,7 +441,10 @@ class TestRunTaskSlotLifecycle:
         with _llm_counts_lock:
             _llm_session_counts[15] = 1
 
-        with patch("app.agent.scheduler._run_dev_orchestrator_task") as mock_dev, \
+        mock_dev = MagicMock()
+        # Phase 2: dispatch goes through pipeline_router._stage_handlers, not a scheduler if/elif.
+        # Patch the handler registry entry so the mock is invoked.
+        with patch.dict("app.agent.pipeline_router._stage_handlers", {"indev": mock_dev}), \
              patch("app.agent.scheduler._run_maestro_loop") as mock_loop:
             _run_task("t-indev", "indev", llm, db_task, None)
 
@@ -455,9 +458,10 @@ class TestRunTaskSlotLifecycle:
         with _llm_counts_lock:
             _llm_session_counts[16] = 1
 
-        with patch("app.agent.scheduler._run_planning_task") as mock_plan, \
-             patch("app.agent.scheduler._run_maestro_loop") as mock_loop, \
-             patch("app.agent.scheduler._run_dev_orchestrator_task") as mock_dev:
+        mock_plan = MagicMock()
+        mock_dev = MagicMock()
+        with patch.dict("app.agent.pipeline_router._stage_handlers", {"planning": mock_plan, "indev": mock_dev}), \
+             patch("app.agent.scheduler._run_maestro_loop") as mock_loop:
             _run_task("t-plan", "planning", llm, db_task, None)
 
         mock_plan.assert_called_once()

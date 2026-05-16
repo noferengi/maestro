@@ -1,8 +1,7 @@
 # app/database — Database Layer
 
-SQLite-backed persistence for Maestro.  All SQLAlchemy models and CRUD
-functions live here.  The monolithic `database.py` was split into this
-package to keep individual files under ~300–400 lines.
+PostgreSQL-backed persistence for Maestro (SQLite only in tests via `MAESTRO_TEST_DB`).
+All SQLAlchemy models and CRUD functions live here.
 
 ## Import contract
 
@@ -32,6 +31,9 @@ monkeypatching on `app.database.X` works correctly.
 | `crud_jobs.py` | ResearchJob + FileSummaryJob + OptimizationBenchmark | 220 |
 | `crud_files.py` | FileSummary + SearchCache | 100 |
 | `crud_inbox.py` | InboxMessage CRUD (create, list, get, mark read, mark all read, delete, count unread) | 90 |
+| `crud_malleable.py` | Pipeline templates, stages, transitions, groups, arch categories, custom agent defs, system_settings, project_settings — 50+ functions including clone/export/import and `load_custom_agents_into_registry()` | 600+ |
+| `crud_documents.py` | `project_documents` table: upsert, exact get, pg_trgm fuzzy get, list, soft-delete; both project-name and project-ID wrappers | 316 |
+| `crud_factory.py` | `factory_runs` audit table CRUD + helpers for checking predecessor triggers and cron scheduling | 150 |
 | `__init__.py` | Re-exports everything from the above modules | 160 |
 
 ## Dependency graph (no cycles)
@@ -113,3 +115,16 @@ __init__.py        (imports from all of the above)
 
 **Inbox / notifications**
 - `InboxMessage` — persistent user notification (id=UUID, subject, source_type, task_id, task_title, outcome, data_json, read, created_at). No FK on task_id — the task may be deleted but the message should survive. `data_json` stores the full transition-status payload snapshot so the message can be re-rendered in the transition modal without re-fetching.
+
+**Malleable pipeline (added Phase 1–10)**
+- `PipelineTemplate` — named reusable workflow graph (`name`, `description`, `is_default`, `is_builtin`, `version`)
+- `PipelineStage` — one stage node: `stage_key`, `label`, `agent_type`, `position`, `group_id`, `config` (JSONB: gate, retries, intent, system_prompt, tool_allowlist, required_input_keys, output_keys, verifier, arch_category_keys)
+- `PipelineTransition` — directed edge: `from_stage_id → to_stage_id`, `condition`, `priority`
+- `PipelineStageGroup` — visual bracket around related stages
+- `PipelineArchCategory` — per-template arch card category (replaces hardcoded JS dict)
+- `CustomAgentDefinition` — user-defined agent: `name`, `system_prompt`, `allowed_tools` (JSONB), `gate_type`, `verifier`, `verifier_cmd`
+- `ProjectDocument` — shared document store: `(project_id, key)` unique; `content`, `tags` (JSONB), `written_by_task_id`, soft-delete via `deleted_at`
+- `ArchivedFile` — deletion-protection audit: `task_id`, `original_path`, `archive_path` (relative to project root), `deleted_at`, `restored_at`
+- `SystemSetting` — global key/value settings (`maestro_autopilot`, `autopilot_start_hour`, `autopilot_stop_hour`)
+- `ProjectSetting` — per-project key/value overrides (e.g. `autopilot_override`)
+- `FactoryRun` — factory trigger audit: `factory_stage_id`, `project_id`, `trigger_type`, `trigger_card_id`, `cards_created`, `status`

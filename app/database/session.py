@@ -6,7 +6,7 @@ This module is imported by models.py (for Base) and by all crud_*.py modules
 doing so would create a circular import.
 """
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 import logging
 import os
@@ -81,4 +81,26 @@ def init_db_tables():
     # hasn't been imported yet by the caller.
     from . import models  # noqa: F401
     Base.metadata.create_all(bind=engine)
+
+    # For SQLite (tests), Base.metadata.create_all doesn't add missing columns
+    # to existing tables.  We manually ensure Phase 1 additive columns exist
+    # so existing tests don't break.
+    if DATABASE_URL.startswith("sqlite"):
+        try:
+            with engine.connect() as conn:
+                # tasks.stage_key
+                try:
+                    conn.execute(text("ALTER TABLE tasks ADD COLUMN stage_key TEXT"))
+                except Exception:
+                    pass
+                # projects.pipeline_template_id
+                try:
+                    conn.execute(text("ALTER TABLE projects ADD COLUMN pipeline_template_id INTEGER"))
+                except Exception:
+                    pass
+                conn.execute(text("UPDATE tasks SET stage_key = type WHERE stage_key IS NULL"))
+                conn.commit()
+        except Exception as e:
+            logger.debug("Minor: could not verify SQLite additive columns: %s", e)
+
     logger.info("Database tables initialized: %s", DATABASE_URL)

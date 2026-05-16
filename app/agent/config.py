@@ -99,6 +99,14 @@ MAX_CONSECUTIVE_ERRORS: int = _getint("loop", "max_consecutive_errors", None, 3)
 MAX_TASK_RETRIES: int = _getint("loop", "max_task_retries", None, 3)
 
 # ===========================================================================
+# Custom agent defaults
+# ===========================================================================
+
+CUSTOM_AGENT_DEFAULT_MAX_TURNS: int = _getint(
+    "custom_agent", "default_max_turns", "MAESTRO_CUSTOM_AGENT_DEFAULT_MAX_TURNS", 200
+)
+
+# ===========================================================================
 # Shell
 # ===========================================================================
 

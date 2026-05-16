@@ -1,7 +1,7 @@
 @echo off
 if "%1"=="" (
-    echo TheMaestro Database Migration Utility
-    echo -------------------------------------
+    echo TheMaestro Database Migration Utility (PostgreSQL only)
+    echo -------------------------------------------------------
     echo Usage: .\migrate.bat ^<command^>
     echo.
     echo Commands:

@@ -1,6 +1,6 @@
 """
 Migration runner for TheMaestro Kanban DB.
-Supports both SQLite and PostgreSQL based on maestro.ini configuration.
+PostgreSQL only — SQLite is not supported.
 
 Usage:
     python app/migrations/runner.py migrate   — apply all pending migrations

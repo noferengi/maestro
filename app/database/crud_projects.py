@@ -14,7 +14,7 @@ upsert_project() uses Ellipsis (...) as a sentinel for llm_id / budget_id:
 import logging
 
 from .session import SessionLocal
-from .models import Project
+from .models import Project, ProjectSettings
 from app.utils import normalize_path
 
 logger = logging.getLogger(__name__)
@@ -61,15 +61,16 @@ def upsert_project(
     description: "str | None" = None,
     llm_id: "int | None" = ...,     # type: ignore[assignment]
     budget_id: "int | None" = ...,  # type: ignore[assignment]
+    pipeline_template_id: "int | None" = ...,  # type: ignore[assignment]
 ) -> "Project | None":
     """
     Create or update a project.  ``path`` is the absolute filesystem root of
     the project's git repository.  Passing path=None leaves an existing path
     unchanged (use empty string to explicitly clear it).
 
-    ``llm_id`` and ``budget_id`` follow the same sentinel pattern: the default
-    value of ``...`` (Ellipsis) means "don't change the existing value".
-    Pass an int or None explicitly to set/clear either field.
+    ``llm_id``, ``budget_id``, and ``pipeline_template_id`` follow the same sentinel
+    pattern: the default value of ``...`` (Ellipsis) means "don't change the
+    existing value". Pass an int or None explicitly to set/clear any field.
     """
     db = SessionLocal()
     try:
@@ -85,6 +86,8 @@ def upsert_project(
                 existing.llm_id = llm_id
             if budget_id is not ...:
                 existing.budget_id = budget_id
+            if pipeline_template_id is not ...:
+                existing.pipeline_template_id = pipeline_template_id
             db.commit()
             db.refresh(existing)
             return existing
@@ -95,6 +98,7 @@ def upsert_project(
                 description=description,
                 llm_id=llm_id if llm_id is not ... else None,
                 budget_id=budget_id if budget_id is not ... else None,
+                pipeline_template_id=pipeline_template_id if pipeline_template_id is not ... else None,
             )
             db.add(project)
             db.commit()
@@ -171,3 +175,68 @@ def delete_project(name: str) -> bool:
         return False
     finally:
         db.close()
+
+
+def get_project_setting(project_id: int, key: str, default=None):
+    """Read a per-project setting value, or *default* if not set."""
+    db = SessionLocal()
+    try:
+        row = (db.query(ProjectSettings)
+               .filter(ProjectSettings.project_id == project_id,
+                       ProjectSettings.key == key)
+               .first())
+        return row.value if row else default
+    except Exception as e:
+        logger.error("Error getting project setting %s/%s: %s", project_id, key, e)
+        return default
+    finally:
+        db.close()
+
+
+def set_project_setting(project_id: int, key: str, value: str) -> None:
+    """Upsert a per-project setting."""
+    db = SessionLocal()
+    try:
+        row = (db.query(ProjectSettings)
+               .filter(ProjectSettings.project_id == project_id,
+                       ProjectSettings.key == key)
+               .first())
+        if row:
+            row.value = value
+        else:
+            db.add(ProjectSettings(project_id=project_id, key=key, value=value))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error("Error setting project setting %s/%s: %s", project_id, key, e)
+    finally:
+        db.close()
+
+
+def get_all_project_settings(project_id: int) -> dict:
+    """Return all settings for a project as {key: value}."""
+    db = SessionLocal()
+    try:
+        rows = db.query(ProjectSettings).filter(ProjectSettings.project_id == project_id).all()
+        return {r.key: r.value for r in rows}
+    except Exception as e:
+        logger.error("Error getting all project settings for %s: %s", project_id, e)
+        return {}
+    finally:
+        db.close()
+
+
+def project_to_dict(project: Project) -> dict:
+    """Convert Project SQLAlchemy model to dictionary."""
+    if not project:
+        return {}
+    return {
+        "id": project.id,
+        "name": project.name,
+        "path": project.path,
+        "description": project.description,
+        "llm_id": project.llm_id,
+        "budget_id": project.budget_id,
+        "pipeline_template_id": getattr(project, "pipeline_template_id", None),
+        "created_at": (project.created_at.isoformat() if hasattr(project.created_at, 'isoformat') else str(project.created_at)) if project.created_at else None,
+    }

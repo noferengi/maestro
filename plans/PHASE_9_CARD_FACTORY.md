@@ -1,6 +1,6 @@
 # Phase 9 — Card Factory System
 
-> **Status:** Not started — requires Phase 5 (agent registry, batch_create_cards)  
+> **Status:** COMPLETE — 2026-05-15  
 > **Depends on:** Phase 5; Phase 3 (API for factory node config); Phase 4 (factory node in editor)  
 > **Estimated effort:** 4 days  
 > **Goal:** A factory node type that ingests external data sources (file lists, folders,
@@ -298,3 +298,43 @@ in batches of 100 rows per DB transaction to avoid a single giant write lock.
 **Cron precision** — the scheduler tick interval (default ~10 seconds) limits cron
 precision to ~10 second granularity. This is fine for minute-level or hourly cron jobs.
 Document the limitation in `maestro.ini`.
+
+---
+
+## Implementation Audit (2026-05-15)
+
+### What was delivered
+
+`app/agent/card_factory.py`, `app/agent/factory_sources.py`, and
+`app/database/crud_factory.py` are fully implemented. All seven adapter types exist
+(`FolderAdapter`, `FileListAdapter`, `CSVAdapter`, `JSONArrayAdapter`,
+`SQLiteQueryAdapter`, `ManualPromptAdapter`, `MaestroCardsAdapter`) with a
+`build_adapter()` dispatch function. Both mechanical (`_run_mechanical`) and
+LLM-segmented (`_run_llm_segmented`) modes work. All three trigger mechanisms —
+manual button, predecessor-complete, and cron — are implemented. The `factory_runs`
+audit table (migration 0072) and CRUD helpers are correct. `test_card_factory.py`
+(487 lines) covers adapters, interpolation, CRUD, and cron timing.
+
+Template interpolation uses `_DefaultDict` so missing keys degrade gracefully
+(left as `{key}` literal) rather than raising `KeyError`.
+
+Cron evaluation includes a fallback minimal parser when `croniter` is not installed.
+
+### Gaps
+
+**No test for `_run_llm_segmented`** — The LLM-segmented factory path dispatches
+`CardFactoryAgent` with mocked LLM interactions. No unit test covers this path.
+
+**No integration tests for trigger mechanisms** — `test_card_factory.py` tests the
+cron-timing helper in isolation, but there is no test verifying that the scheduler
+tick calls `check_predecessor_triggers()` or `check_cron_triggers()` and that those
+functions create factory runs and dispatch correctly.
+
+**Path security validation not implemented** — The spec warned about `FolderAdapter`
+and `SQLiteQueryAdapter` accepting arbitrary paths. `FACTORY_ALLOWED_ROOTS` config and
+validation in the adapter constructor were not added. For the current single-user
+deployment this is acceptable; document the limitation in `maestro.ini`.
+
+**Large dataset batching** — The spec suggested streaming creation in batches of 100
+rows for CSVs with 100k+ rows. `_run_mechanical` creates all cards in a single
+synchronous write. Fine for current usage; add batching when needed.

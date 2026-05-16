@@ -85,6 +85,11 @@ _ctx_session_id: ContextVar[str | None] = ContextVar('llm_session_id', default=N
 _ctx_agent_name: ContextVar[str | None] = ContextVar('llm_agent_name', default=None)
 
 
+def new_session_id() -> str:
+    """Generate a fresh UUID string for a new LLM agent session."""
+    return str(uuid.uuid4())
+
+
 def set_llm_session_context(agent_name: str, session_id: str | None = None) -> str:
     """Set the session identity for all subsequent call_llm() calls on this task.
 

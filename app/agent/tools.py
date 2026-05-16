@@ -1219,10 +1219,66 @@ def write_archive(path: str, reason: str = "") -> str:
         with open(reason_file, "w", encoding="utf-8") as fh:
             fh.write(f"Archived at: {timestamp}\nReason: {reason}\n")
 
+    # Create a DB record so the file can be found and restored via the API.
+    archive_id_msg = ""
+    task_id = _task_id_ctx.get()
+    if task_id:
+        try:
+            from app.database import create_archived_file as _caf
+            from app.database import get_project_path as _gpp
+            project_name = _task_project_name.get()
+            project_root = (_gpp(project_name) if project_name else None) or effective_root
+            original_rel = os.path.relpath(safe_path, project_root)
+            archive_rel = os.path.relpath(dest, project_root)
+            record = _caf(task_id, original_rel, archive_rel)
+            archive_id_msg = f"\narchive_id={record.id} (use POST /api/tasks/{task_id}/undelete to restore)"
+        except Exception as exc:
+            logger.warning("write_archive: failed to create DB record: %s", exc)
+
     return (
-        f"OK: archived '{path}' -> '{dest}'.\n"
+        f"OK: archived '{path}' -> '{dest}'.{archive_id_msg}\n"
         f"Restore by copying: shutil.copy(r'{dest}', r'{safe_path}')"
     )
+
+
+def workspace_delete_file(path: str, reason: str = "") -> str:
+    """[WRITE — safe delete] Move a file to .archive/ and create a recovery record. Returns archive_id."""
+    from app.agent import workspace as _ws
+    task_id = _task_id_ctx.get()
+    effective_root = _task_git_cwd.get() or PROJECT_ROOT
+    project_name = _task_project_name.get() or ""
+    try:
+        from app.database import get_project_path as _gpp
+        project_root = (_gpp(project_name) if project_name else None) or effective_root
+    except Exception:
+        project_root = effective_root
+    try:
+        record = _ws.delete_file(
+            task_id=task_id or "unknown",
+            path=path,
+            effective_root=effective_root,
+            project_root=project_root,
+        )
+        return json.dumps({
+            "archive_id": record.id,
+            "archive_path": record.archive_path,
+            "message": f"File archived (id={record.id}). Use POST /api/tasks/{task_id}/undelete to restore.",
+        })
+    except Exception as exc:
+        return f"ERROR: {exc}"
+
+
+def workspace_rename_file(src: str, dst: str) -> str:
+    """[WRITE — rename] Rename src to dst within the current worktree. Fails if dst already exists."""
+    from app.agent import workspace as _ws
+    effective_root = _task_git_cwd.get() or PROJECT_ROOT
+    try:
+        _ws.rename_file(src=src, dst=dst, effective_root=effective_root)
+        return json.dumps({"ok": True, "src": src, "dst": dst})
+    except FileExistsError as exc:
+        return f"ERROR: destination already exists — {exc}"
+    except Exception as exc:
+        return f"ERROR: {exc}"
 
 
 def move_file(src: str, dst: str) -> str:
@@ -2127,6 +2183,92 @@ def write_task_history(task_id: str, entry: str) -> str:
         return f"OK: history entry appended to task '{task_id}'."
     except Exception as exc:
         return f"ERROR appending history: {exc}"
+
+
+def batch_create_cards(
+    cards: list,
+    new_parent: "dict | None" = None,
+    archive_origin: bool = False,
+) -> str:
+    """[WRITE — db] Create multiple new task cards in the current task's project.
+
+    Each card is created at its specified entry_stage.  If new_parent is
+    provided, a parent card is created first and the new cards are parented
+    under it.  If archive_origin is True, the current task is demoted to type
+    'archive' after the cards are created.
+
+    Returns JSON: {"created_ids": [...], "parent_id": "..." | null}
+    """
+    import json as _json
+    task_id = _task_id_ctx.get()
+    if not task_id:
+        return "ERROR: batch_create_cards requires an active task context"
+
+    try:
+        db = _import_db()
+        task = db.get_task(task_id)
+        if not task:
+            return f"ERROR: task {task_id!r} not found"
+        project_name = task.project or "TheMaestro"
+        llm_id = task.llm_id
+        budget_id = task.budget_id
+
+        parent_id = None
+        if new_parent and isinstance(new_parent, dict):
+            p_title = new_parent.get("title", "Parent")
+            p_desc = new_parent.get("description", "")
+            p_task = db.create_task(
+                title=p_title,
+                task_type="idea",
+                description=p_desc,
+                owner="system",
+                llm_id=llm_id,
+                budget_id=budget_id,
+                project=project_name,
+            )
+            if p_task:
+                parent_id = p_task.id
+
+        created_ids: list[str] = []
+        actual_id_map: dict[str, str] = {}  # "sub-{i}" → real task ID
+
+        for i, card in enumerate(cards or []):
+            if not isinstance(card, dict):
+                continue
+            entry_stage = card.get("entry_stage") or "idea"
+            prereqs = [
+                actual_id_map[p]
+                for p in (card.get("prereq_ids") or [])
+                if p in actual_id_map
+            ]
+            t = db.create_task(
+                title=card.get("title", "Untitled"),
+                task_type=entry_stage,
+                description=card.get("description", ""),
+                owner="system",
+                tags=card.get("tags") or [],
+                llm_id=llm_id,
+                budget_id=budget_id,
+                prerequisites=prereqs,
+                project=project_name,
+                position=i,
+                stage_key=entry_stage,
+            )
+            if t:
+                # Re-fetch to set parent_task_id (create_task doesn't accept it)
+                db.update_task(
+                    t.id,
+                    parent_task_id=parent_id or task_id,
+                )
+                actual_id_map[f"sub-{i}"] = t.id
+                created_ids.append(t.id)
+
+        if archive_origin:
+            db.update_task(task_id, type="archive", stage_key="archive")
+
+        return _json.dumps({"created_ids": created_ids, "parent_id": parent_id})
+    except Exception as exc:
+        return f"ERROR in batch_create_cards: {exc}"
 
 
 def write_plan_fields(result_id: int, fields_json: str) -> str:
@@ -3161,6 +3303,90 @@ def get_system_health() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Document store tools
+# ---------------------------------------------------------------------------
+
+def _doc_project_id() -> int | None:
+    """Resolve the current agent's project_id from context."""
+    project_name = _task_project_name.get()
+    if not project_name:
+        return None
+    from app.database.session import SessionLocal
+    from app.database.models import Project
+    with SessionLocal() as db:
+        row = db.query(Project).filter(Project.name == project_name).first()
+        return row.id if row else None
+
+
+def tool_store_document(key: str, content: str, tags: list | None = None) -> str:
+    import json as _json
+    pid = _doc_project_id()
+    if pid is None:
+        return "ERROR: No project context — cannot store document."
+    task_id = _task_id_ctx.get()
+    from app.database.crud_documents import store_document as _store
+    doc = _store(pid, key, content, list(tags) if tags else None, task_id)
+    return f"OK: document stored — key={doc['key']!r} size={len(content.encode())} bytes"
+
+
+def tool_get_document(key: str) -> str:
+    import json as _json
+    pid = _doc_project_id()
+    if pid is None:
+        return "ERROR: No project context — cannot retrieve document."
+    from app.database.crud_documents import get_document as _get
+    doc = _get(pid, key)
+    if doc is None:
+        return f"NOT FOUND: No document with key {key!r}"
+    return (
+        f"key: {doc['key']}\n"
+        f"written_by: {doc['written_by_task_id'] or 'human'}\n"
+        f"updated_at: {doc['updated_at']}\n"
+        f"tags: {doc['tags']}\n"
+        f"---\n{doc['content']}"
+    )
+
+
+def tool_search_documents(query: str, threshold: float = 0.3) -> str:
+    import json as _json
+    pid = _doc_project_id()
+    if pid is None:
+        return "ERROR: No project context — cannot search documents."
+    from app.database.crud_documents import fuzzy_get_document as _fuzzy
+    results = _fuzzy(pid, query, threshold)
+    if not results:
+        return f"No documents found matching {query!r} (threshold={threshold})"
+    lines = [f"Found {len(results)} result(s) for {query!r}:"]
+    for r in results:
+        size = len((r.get("content") or "").encode())
+        lines.append(
+            f"  [{r['similarity']:.2f}] {r['key']} "
+            f"({size} bytes, written_by={r['written_by_task_id'] or 'human'})"
+        )
+    return "\n".join(lines)
+
+
+def tool_list_documents(tag: str | None = None) -> str:
+    pid = _doc_project_id()
+    if pid is None:
+        return "ERROR: No project context — cannot list documents."
+    from app.database.crud_documents import list_documents as _list
+    docs = _list(pid, tag)
+    if not docs:
+        prefix = f"[tag={tag}] " if tag else ""
+        return f"{prefix}No documents in project store."
+    lines = [f"{len(docs)} document(s)" + (f" tagged {tag!r}" if tag else "") + ":"]
+    for d in docs:
+        lines.append(
+            f"  {d['key']}  ({d['content_size_bytes']} bytes)"
+            f"  written_by={d['written_by_task_id'] or 'human'}"
+            f"  tags={d['tags']}"
+            f"  updated={d['updated_at']}"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Tool registry + schemas
 # ---------------------------------------------------------------------------
 
@@ -3175,6 +3401,8 @@ TOOL_REGISTRY: dict[str, Any] = {
     "patch_file": patch_file,
     "move_file": move_file,
     "write_archive": write_archive,
+    "workspace_delete_file": workspace_delete_file,
+    "workspace_rename_file": workspace_rename_file,
     # Directory / search tools
     "list_directory": list_directory,
     "find_files": find_files,
@@ -3203,6 +3431,7 @@ TOOL_REGISTRY: dict[str, Any] = {
     "list_tasks": list_tasks,
     "write_task_status": write_task_status,
     "write_task_history": write_task_history,
+    "batch_create_cards": batch_create_cards,
     "write_plan_fields": write_plan_fields,
     # Web tools
     "web_search": web_search,
@@ -3253,6 +3482,11 @@ TOOL_REGISTRY: dict[str, Any] = {
     # Infrastructure remediation tools (Maestro exclusive)
     "cleanup_ghost_worktrees": cleanup_ghost_worktrees,
     "restart_server": restart_server,
+    # Document store tools
+    "store_document": tool_store_document,
+    "get_document": tool_get_document,
+    "search_documents": tool_search_documents,
+    "list_documents": tool_list_documents,
 }
 
 TOOL_SCHEMAS: list[dict] = [
@@ -3432,6 +3666,40 @@ TOOL_SCHEMAS: list[dict] = [
                     "reason": {"type": "string", "description": "Human-readable reason for archiving.", "default": ""},
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace_delete_file",
+            "description": (
+                "[WRITE — safe delete] Move a file to .archive/ with a DB recovery record. "
+                "The file is gone from the worktree but fully restorable via the UI or workspace_undelete_file. "
+                "Returns archive_id you can report to the user."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to the worktree root."},
+                    "reason": {"type": "string", "description": "Why you are deleting this file.", "default": ""},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace_rename_file",
+            "description": "[WRITE — rename] Rename (move) a file within the worktree. Fails if destination already exists.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "src": {"type": "string", "description": "Source path relative to worktree root."},
+                    "dst": {"type": "string", "description": "Destination path relative to worktree root."},
+                },
+                "required": ["src", "dst"],
             },
         },
     },
@@ -4431,6 +4699,61 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    # ---- Card factory tool (Phase 5) ----
+    {
+        "type": "function",
+        "function": {
+            "name": "batch_create_cards",
+            "description": (
+                "[WRITE — db] Create multiple new task cards in the current task's project. "
+                "Each card enters the pipeline at its entry_stage. "
+                "Use this to decompose the current task into sub-tasks. "
+                "If new_parent is provided, a parent card is created and the new cards are nested under it. "
+                "If archive_origin is true, the current task is demoted to 'archive' after creation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cards": {
+                        "type": "array",
+                        "description": "List of cards to create.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title":        {"type": "string"},
+                                "description":  {"type": "string"},
+                                "entry_stage":  {
+                                    "type": "string",
+                                    "description": "stage_key where the card starts (default: 'idea')",
+                                },
+                                "tags":         {"type": "array", "items": {"type": "string"}},
+                                "prereq_ids":   {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "IDs of prerequisite cards (use 'sub-N' for same-batch siblings by index)",
+                                },
+                            },
+                            "required": ["title"],
+                        },
+                    },
+                    "new_parent": {
+                        "type": ["object", "null"],
+                        "description": "If provided, creates this parent card and nests the new cards under it.",
+                        "properties": {
+                            "title":       {"type": "string"},
+                            "description": {"type": "string"},
+                        },
+                    },
+                    "archive_origin": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "If true, demote the current card to 'archive' after creating sub-cards.",
+                    },
+                },
+                "required": ["cards"],
+            },
+        },
+    },
     # ---- Terminal tool ----
     {
         "type": "function",
@@ -4478,12 +4801,207 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    # ----- Document store tools -----
+    {
+        "type": "function",
+        "function": {
+            "name": "store_document",
+            "description": (
+                "[WRITE — doc-store] Write a named document to the project's shared document store. "
+                "Other agents in this project can read it by key. "
+                "Use path-style keys like 'proofs/lemma_3' or 'characters/elara'. "
+                "If a document with the same key already exists it is overwritten (last-write-wins). "
+                "Use unique keys for distinct artifacts — 'proofs/attempt_1', 'proofs/attempt_2', etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "Unique name for this document, e.g. 'proofs/lemma_3' or 'characters/elara'",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The document body to store.",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional tags for categorisation, e.g. ['math', 'proof']",
+                    },
+                },
+                "required": ["key", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_document",
+            "description": (
+                "[READ] Retrieve a document from the project's shared document store by exact key. "
+                "Returns the full content. Returns NOT FOUND if the key does not exist. "
+                "Use search_documents if you are unsure of the exact key."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "Exact key of the document to retrieve.",
+                    },
+                },
+                "required": ["key"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_documents",
+            "description": (
+                "[READ] Find documents whose key is similar to the query using fuzzy matching. "
+                "Returns up to 10 results sorted by similarity (0.0–1.0). "
+                "Use this when you are not sure of the exact key or want to discover related documents."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Key fragment or approximate key to search for.",
+                    },
+                    "threshold": {
+                        "type": "number",
+                        "description": "Minimum similarity score (0.0–1.0). Default 0.3. Lower = more results.",
+                        "default": 0.3,
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_documents",
+            "description": (
+                "[READ] List all document keys in the project store (metadata only, no content). "
+                "Optionally filter by tag. Use to discover what has been stored before reading."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tag": {
+                        "type": "string",
+                        "description": "Optional tag to filter by.",
+                    },
+                },
+            },
+        },
+    },
 ]
 
 
 # ---------------------------------------------------------------------------
 # Tool list for PlanningCorrectionAgent
 # ---------------------------------------------------------------------------
+
+TOOL_CATEGORIES: dict[str, str] = {
+    # Infrastructure — always-on tools and system control
+    "submit_work":            "Infrastructure",
+    "report_tool_bug":        "Infrastructure",
+    "consult_maestro":        "Infrastructure",
+    "cleanup_ghost_worktrees": "Infrastructure",
+    "restart_server":         "Infrastructure",
+    "get_system_health":      "Infrastructure",
+    # Files — reading, writing, searching the filesystem
+    "read_file":              "Files",
+    "read_file_metadata":     "Files",
+    "read_last_output":       "Files",
+    "write_file":             "Files",
+    "append_file":            "Files",
+    "patch_file":             "Files",
+    "write_archive":          "Files",
+    "workspace_delete_file":  "Files",
+    "workspace_rename_file":  "Files",
+    "move_file":              "Files",
+    "list_directory":         "Files",
+    "find_in_files":          "Files",
+    "find_files":             "Files",
+    # Code Analysis — symbol and import graph navigation
+    "find_symbol":            "Code Analysis",
+    "find_callers":           "Code Analysis",
+    "find_imports_of":        "Code Analysis",
+    # Git — version control operations
+    "read_git_status":        "Git",
+    "read_git_diff":          "Git",
+    "read_git_log":           "Git",
+    "read_git_blame":         "Git",
+    "read_git_show":          "Git",
+    "read_diff_stat":         "Git",
+    "write_git_branch":       "Git",
+    "write_git_commit":       "Git",
+    "write_git_checkout":     "Git",
+    "write_git_restore":      "Git",
+    # Tasks — kanban card management
+    "get_task":               "Tasks",
+    "list_tasks":             "Tasks",
+    "write_task_status":      "Tasks",
+    "write_task_history":     "Tasks",
+    "batch_create_cards":     "Tasks",
+    # Planning — design documents and architectural artifacts
+    "write_arch_doc":         "Planning",
+    "write_mermaid":          "Planning",
+    "write_interface_contract": "Planning",
+    "write_benchmark":        "Planning",
+    "write_plan_fields":      "Planning",
+    # Testing — test execution and result parsing
+    "run_test_pytest":        "Testing",
+    "run_test_unittest":      "Testing",
+    "run_test_npm":           "Testing",
+    "run_test_cargo":         "Testing",
+    "run_test_go":            "Testing",
+    "read_test_summary":      "Testing",
+    # Code Quality — linting and formatting checks
+    "run_check_mypy":         "Code Quality",
+    "run_check_ruff":         "Code Quality",
+    "run_check_black":        "Code Quality",
+    # Build — compilation and bundling
+    "run_build_make":         "Build",
+    "run_build_cargo":        "Build",
+    "run_build_go":           "Build",
+    "run_build_npm":          "Build",
+    "run_build_tsc":          "Build",
+    "run_build_gradle":       "Build",
+    "run_build_mvn":          "Build",
+    # Dependencies — package installation
+    "run_deps_pip":           "Dependencies",
+    "run_deps_npm":           "Dependencies",
+    "run_deps_cargo":         "Dependencies",
+    # Security — vulnerability scanning
+    "run_audit_bandit":       "Security",
+    "run_audit_pip":          "Security",
+    "run_audit_semgrep":      "Security",
+    "run_audit_npm":          "Security",
+    # Web — external search and fetch
+    "web_search":             "Web",
+    "web_fetch":              "Web",
+    # Research — spawning sub-agents
+    "spawn_research_agent":   "Research",
+    "launch_research_agent":  "Research",
+    # Documents — project document store
+    "store_document":         "Documents",
+    "get_document":           "Documents",
+    "search_documents":       "Documents",
+    "list_documents":         "Documents",
+    # Summaries — hierarchical scope summaries
+    "get_project_summary":    "Summaries",
+    "get_directory_summary":  "Summaries",
+    "get_module_summary":     "Summaries",
+    "list_scope_summaries":   "Summaries",
+}
+
 
 CORRECTION_AGENT_TOOLS: list[str] = [
     "read_file",

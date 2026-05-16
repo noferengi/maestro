@@ -51,11 +51,13 @@ class AgentLoop(ABC):
         llm_base_url: str | None = None,
         llm_model: str | None = None,
         max_context: int | None = None,
+        max_tokens: int | None = None,
     ) -> None:
         self.task_id = task_id
         self.llm_id = llm_id
         self.budget_id = budget_id
         self.max_turns = max_turns
+        self.max_tokens = max_tokens
         self.llm_base_url = llm_base_url or LLM_BASE_URL
         self.llm_model = llm_model or LLM_MODEL
         self.max_context = max_context or 0

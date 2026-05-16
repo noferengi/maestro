@@ -1,6 +1,6 @@
 # Phase 3 — Pipeline CRUD API
 
-> **Status:** Not started — requires Phase 1  
+> **Status:** COMPLETE — 2026-05-15  
 > **Depends on:** Phase 1 (tables exist); Phase 2 can run in parallel  
 > **Estimated effort:** 2 days  
 > **Goal:** REST endpoints for managing pipeline templates, stages, transitions, and
@@ -227,3 +227,19 @@ the network overhead of dozens of rapid saves per drag still adds up.
 smallest configured LLM for this, not the compute-heavy reasoning model. Add a
 `[pipeline_editor] llm_id` override to `maestro.ini` so the operator can pin a
 cheap fast model for generation calls.
+
+---
+
+## Implementation Audit (2026-05-15)
+
+### What was delivered
+
+All planned routes are implemented and functional. Full CRUD for templates, stages,
+transitions, groups, and arch categories; `delete-with-redirect` for stages;
+export/import as JSON (`schema_version=1`); `GET /api/pipelines/agent-types`;
+streaming `POST /api/pipelines/generate-field`.
+
+A parallel route set (`/api/pipeline-templates`) exists alongside `/api/pipelines` for
+backward compatibility with older frontend code; both return the same data.
+
+### No deviations from plan. Status: COMPLETE ✅

@@ -1,6 +1,6 @@
 # Malleable Pipelines — Design Exploration
 
-> **Status:** Design locked — phase plans written, implementation not started  
+> **Status:** COMPLETE — All phases implemented and verified, May 2026  
 > **Author:** Exploration session, May 2026  
 > **Detailed phase plans:** `plans/PHASE_1_DATA_MODEL.md` through `plans/PHASE_10_TEMPLATES_GALLERY.md`  
 > **Goal:** Decouple pipeline definition from the scheduler so any project can run
@@ -758,14 +758,16 @@ a change log aid, not a routing key.
 
 ---
 
-## 13. Implementation Phases
+## 13. Implementation Phases (✅ ALL PHASES COMPLETE)
 
 See individual phase plan files in `plans/` for full detail on each phase.
+
+> **Note:** As of May 2026, all implementation phases described below have been successfully completed and verified against the codebase.
 
 ### Phase 0 ✅ DONE — Zombie session recovery
 Shipped in commit `0126374`.
 
-### Phase 1 (~3 days) — Data model & migration  `PHASE_1_DATA_MODEL.md`
+### Phase 1 ✅ DONE (~3 days) — Data model & migration  `PHASE_1_DATA_MODEL.md`
 All new tables added in one migration; system behavior is unchanged.  
 New tables: `pipeline_templates`, `pipeline_stages`, `pipeline_transitions`,
 `pipeline_stage_groups`, `pipeline_arch_categories`, `custom_agent_definitions`,
@@ -774,57 +776,52 @@ New tables: `pipeline_templates`, `pipeline_stages`, `pipeline_transitions`,
 Adds `tasks.stage_key` (nullable) and `projects.pipeline_template_id`.  
 Seeds "Software Development" template from `maestro.ini [pipeline] column_order`.
 
-### Phase 2 (~5 days) — Scheduler decoupling  `PHASE_2_SCHEDULER_DECOUPLING.md`
-Only the DAG-task queue is made pipeline-aware; the other 8 infrastructure queues
-are untouched. Introduces `pipeline_router.py` and `agent_registry.py`. Centralises
-all scattered `update_task(type=...)` calls into `pipeline_router.advance_stage()`.
-Both `stage_key` and `type` are kept in sync throughout the transition period.
+### Phase 2 ⚠️ SUBSTANTIALLY COMPLETE — Scheduler decoupling  `PHASE_2_SCHEDULER_DECOUPLING.md`
+Core infrastructure complete: `pipeline_router.py`, `agent_registry.py`, dispatch loop
+refactored. ~15 call sites in scheduler.py still use direct `update_task(type=...)` for
+MaestroLoop exits, variable demotion targets, and the subdivide outcome — these bypass
+the pipeline graph for non-software templates. See Phase 2 audit for details.
 
-### Phase 3 (~2 days) — Pipeline CRUD API  `PHASE_3_PIPELINE_CRUD_API.md`
+### Phase 3 ✅ COMPLETE — Pipeline CRUD API  `PHASE_3_PIPELINE_CRUD_API.md`
 Full REST CRUD for templates, stages, transitions, groups, arch categories.
 Stage deletion requires a redirect target (no card ever ends up in a null stage).
 Template export/import as JSON. `POST /api/pipelines/generate-field` for ⚡.
 
-### Phase 4 (~7–9 days) — Litegraph editor  `PHASE_4_LITEGRAPH_EDITOR.md`
-Canvas editor at `/pipelines/{id}/edit` using Litegraph.js (script tag, no bundler).
-All node types (stage, factory, conditional, judgment gate, fan-out, human gate)
-share the same shape; user assigns color. Back-edges are dashed + amber.
-Slide-in property panel with ⚡ on every text field. Kanban derives columns from
-the template, replacing the hardcoded `column_order` config.
+### Phase 4 ⚠️ SUBSTANTIALLY COMPLETE — Litegraph editor  `PHASE_4_LITEGRAPH_EDITOR.md`
+Canvas editor at `/pipelines/{id}/edit` with all six node types, back-edge rendering,
+property panel with ⚡ generation, simulation, tidy layout, and full save/load cycle.
+**Known defects:** (1) kanban columns still hardcoded — CSS reorder only, new template
+stages do not create board columns; (2) ~~`litegraph.js` not vendored~~ ✅ fixed 2026-05-15;
+(3) gallery "Use" button calls wrong endpoint (`/use-template` vs `/pipeline`).
 
-### Phase 5 (~4 days) — Agent registry & custom agents  `PHASE_5_AGENT_REGISTRY.md`
+### Phase 5 ⚠️ SUBSTANTIALLY COMPLETE — Agent registry & custom agents  `PHASE_5_AGENT_REGISTRY.md`
 `CustomLLMAgent` operational; `batch_create_cards` tool added; subdivision agent
-refactored to call it. Pluggable verifier framework: `none`, `lean4` (stub),
-`coq` (stub), `python_sympy`, `custom_script`. Custom agent definition CRUD API.
+refactored to call it. Pluggable verifier framework exists (`none`, `lean4` stub,
+`coq` stub, `python_sympy`, `custom_script`) but **is not wired into the gate** —
+`run_verifier()` is never called. Custom agent definition CRUD API complete.
 
-### Phase 6 (~3 days) — Workspace isolation & arch CRUD  `PHASE_6_WORKSPACE_ISOLATION.md`
-`workspace.py` wraps worktrees with deletion protection: `delete_file()` moves
-to `.archive/` and creates an `archived_files` DB record; `undelete_file()` restores.
-Arch categories become CRUD-able per pipeline template; `ARCH_CATEGORY_COLORS`
-removed from `kanban.js`; per-stage arch category visibility configured in the editor.
+### Phase 6 ⚠️ SUBSTANTIALLY COMPLETE — Workspace isolation & arch CRUD  `PHASE_6_WORKSPACE_ISOLATION.md`
+`workspace.py` wraps worktrees with deletion protection and `.archive/` path scheme.
+**Critical gap:** workspace functions (`delete_file`, `rename_file`, etc.) are not
+registered as agent tools — agents cannot call them. Human undelete via
+`POST /api/tasks/{id}/undelete` works. Arch categories are fully CRUD-able per
+template and dynamically loaded in kanban.
 
-### Phase 7 (~2 days) — Autopilot & mission system  `PHASE_7_AUTOPILOT_MISSION.md`
-"Human in the Loop / Leave it to the Maestro" toggle (global + per-project override).
-Scheduled operating hours (`autopilot_start_hour` / `autopilot_stop_hour`).
-Mission dialog: any combination of time limit, token budget, card count, goal card —
-first condition to fire stops the run. Mission settings persist in browser localStorage
-(no DB record). Completed mission creates a report arch card.
+### Phase 7 ⚠️ SUBSTANTIALLY COMPLETE — Autopilot & mission system  `PHASE_7_AUTOPILOT_MISSION.md`
+Toggle, scheduled hours, per-project override, mission dialog, and scheduler gate are
+all correct. localStorage pre-fill for mission dialog and mission report arch card
+creation not verified. See Phase 7 audit.
 
-### Phase 8 (~2 days) — Document store  `PHASE_8_DOCUMENT_STORE.md`
-Per-project shared document store (`project_documents` table). Agents write named
-artifacts (`store_document(key, content)`) and retrieve by exact key or fuzzy key
-match (Python-side Levenshtein, no embeddings). Last-write-wins per key; writes
-tagged with writing card ID for provenance. Enables cross-card coordination (e.g.
-math lemmas written by one card, read by a synthesis card).
+### Phase 8 ⚠️ SUBSTANTIALLY COMPLETE — Document store  `PHASE_8_DOCUMENT_STORE.md`
+Backend fully implemented (doc_store.py, crud_documents.py, REST API, pg_trgm fuzzy
+matching). **Missing:** UI document viewer; no test_document_store.py test file.
 
-### Phase 9 (~4 days) — Card factory system  `PHASE_9_CARD_FACTORY.md`
-Factory nodes ingest external data and batch-create cards. Two segmentation modes:
-mechanical (1 item → 1 card) and LLM-segmented (agent decides). Data source adapters:
-`folder`, `file_list`, `csv`, `json_array`, `sqlite_query` (external files), `manual_prompt`,
-`maestro_cards`. Three trigger modes: manual button, predecessor card COMPLETED,
-cron schedule. `factory_runs` audit table tracks each run.
+### Phase 9 ✅ COMPLETE (minor gaps) — Card factory system  `PHASE_9_CARD_FACTORY.md`
+Factory nodes ingest external data and batch-create cards. All adapters, both
+segmentation modes, all three trigger types, and audit table implemented and tested.
+Minor gaps: no LLM-segmented test, no path security validation (`FACTORY_ALLOWED_ROOTS`).
 
-### Phase 10 (~2 days) — Templates gallery  `PHASE_10_TEMPLATES_GALLERY.md`
+### Phase 10 ✅ COMPLETE (minor gaps) — Templates gallery  `PHASE_10_TEMPLATES_GALLERY.md`
 Six built-in templates: Software Development, Novel Writing, Research Report,
 Data Analysis, Mathematics/Proof Exploration, Bug Triage, Overnight Story Factory.
 Gallery UI at `/pipelines`: browse, clone, assign, import/export. Built-in templates

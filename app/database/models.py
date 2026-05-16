@@ -20,6 +20,93 @@ from .session import Base
 # Infrastructure / configuration tables
 # ---------------------------------------------------------------------------
 
+class PipelineTemplate(Base):
+    """Topology template for a Maestro pipeline (Software Dev, Research, etc)."""
+    __tablename__ = "pipeline_templates"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String, nullable=False, unique=True)
+    description = Column(Text, nullable=True)
+    is_default = Column(Boolean, nullable=False, default=False)
+    is_builtin = Column(Boolean, nullable=False, default=False)
+    version = Column(Integer, nullable=False, default=1)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<PipelineTemplate(id={self.id}, name='{self.name}', version={self.version})>"
+
+
+class PipelineStageGroup(Base):
+    """Logical grouping of stages in a pipeline (e.g. 'Optimization + Security')."""
+    __tablename__ = "pipeline_stage_groups"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    template_id = Column(Integer, ForeignKey("pipeline_templates.id"), nullable=False)
+    name = Column(String, nullable=False)
+    color = Column(String, nullable=True)
+    position = Column(Integer, nullable=False)
+
+    def __repr__(self):
+        return f"<PipelineStageGroup(id={self.id}, name='{self.name}', pos={self.position})>"
+
+
+class PipelineStage(Base):
+    """A single stage in a pipeline template."""
+    __tablename__ = "pipeline_stages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    template_id = Column(Integer, ForeignKey("pipeline_templates.id"), nullable=False)
+    stage_key = Column(String, nullable=False)   # internal ID (e.g. 'planning')
+    label = Column(String, nullable=False)       # Display name (e.g. 'Planning')
+    agent_type = Column(String, nullable=False)  # type code used for agent dispatch
+    position = Column(Integer, nullable=False)
+    group_id = Column(Integer, ForeignKey("pipeline_stage_groups.id"), nullable=True)
+    config = Column(JSON, nullable=True)         # JSONB config (gates, tools, etc)
+    color = Column(String, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint('template_id', 'stage_key', name='uq_pipeline_stage_key'),
+    )
+
+    def __repr__(self):
+        return f"<PipelineStage(id={self.id}, key='{self.stage_key}', label='{self.label}')>"
+
+
+class PipelineTransition(Base):
+    """Directed edge between two stages in a pipeline template."""
+    __tablename__ = "pipeline_transitions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    template_id = Column(Integer, ForeignKey("pipeline_templates.id"), nullable=False)
+    from_stage_id = Column(Integer, ForeignKey("pipeline_stages.id"), nullable=False)
+    to_stage_id = Column(Integer, ForeignKey("pipeline_stages.id"), nullable=False)
+    condition = Column(String, nullable=False)   # pass | fail | reject | always | skip
+    priority = Column(Integer, nullable=False, default=0)
+
+    def __repr__(self):
+        return f"<PipelineTransition(id={self.id}, from={self.from_stage_id}, to={self.to_stage_id}, cond='{self.condition}')>"
+
+
+class PipelineArchCategory(Base):
+    """Architecture categories available in a specific pipeline template."""
+    __tablename__ = "pipeline_arch_categories"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    template_id = Column(Integer, ForeignKey("pipeline_templates.id"), nullable=False)
+    key = Column(String, nullable=False)
+    label = Column(String, nullable=False)
+    color = Column(String, nullable=True)
+    position = Column(Integer, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('template_id', 'key', name='uq_pipeline_arch_cat_key'),
+    )
+
+    def __repr__(self):
+        return f"<PipelineArchCategory(id={self.id}, key='{self.key}', label='{self.label}')>"
+
+
 class ComputeNode(Base):
     """Physical or virtual compute resource that hosts one or more LLM endpoints."""
     __tablename__ = "compute_nodes"
@@ -94,10 +181,83 @@ class Project(Base):
     description = Column(Text, nullable=True)
     llm_id = Column(Integer, ForeignKey("llms.id"), nullable=True)     # Default LLM for maintenance jobs
     budget_id = Column(Integer, ForeignKey("budgets.id"), nullable=True)  # Default budget for maintenance jobs
+    pipeline_template_id = Column(Integer, ForeignKey("pipeline_templates.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     def __repr__(self):
         return f"<Project(id={self.id}, name='{self.name}', path='{self.path}')>"
+
+
+class ProjectSettings(Base):
+    """Per-project configuration settings."""
+    __tablename__ = "project_settings"
+
+    project_id = Column(Integer, ForeignKey("projects.id"), primary_key=True)
+    key        = Column(String, primary_key=True)
+    value      = Column(String, nullable=False)
+
+    def __repr__(self):
+        return f"<ProjectSettings(project={self.project_id}, key={self.key!r})>"
+
+
+class ProjectDocument(Base):
+    """Knowledge store for project-specific documentation and state."""
+    __tablename__ = "project_documents"
+
+    id                 = Column(Integer, primary_key=True, autoincrement=True)
+    project_id         = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    key                = Column(String, nullable=False)
+    content            = Column(Text, nullable=False)
+    tags               = Column(JSON, nullable=True)
+    written_by_task_id = Column(String, ForeignKey("tasks.id"), nullable=True)
+    created_at         = Column(DateTime, default=datetime.utcnow)
+    updated_at         = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    deleted_at         = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint('project_id', 'key', name='uq_project_doc_key'),
+    )
+
+    def __repr__(self):
+        return f"<ProjectDocument(id={self.id}, project={self.project_id}, key={self.key!r})>"
+
+
+class ArchivedFile(Base):
+    """Registry of files moved to the .archive directory by archive_file()."""
+    __tablename__ = "archived_files"
+
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    task_id        = Column(String, ForeignKey("tasks.id"), nullable=False)
+    original_path  = Column(String, nullable=False)
+    archive_path   = Column(String, nullable=False, unique=True)
+    deleted_at     = Column(DateTime, default=datetime.utcnow)
+    restored_at    = Column(DateTime, nullable=True)
+
+    def __repr__(self):
+        return f"<ArchivedFile(id={self.id}, task={self.task_id!r}, orig='{self.original_path}')>"
+
+
+class CustomAgentDefinition(Base):
+    """User-defined agent blueprints that can be used in pipeline stages."""
+    __tablename__ = "custom_agent_definitions"
+
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+    name          = Column(String, nullable=False, unique=True)
+    display_name  = Column(String, nullable=False)
+    description   = Column(Text, nullable=True)
+    intent        = Column(Text, nullable=True)
+    system_prompt = Column(Text, nullable=False, default='')
+    allowed_tools = Column(JSON, nullable=False, default=list)
+    gate_type     = Column(String, nullable=False, default='llm_judge')
+    verifier      = Column(String, nullable=False, default='none')
+    verifier_cmd  = Column(Text, nullable=True)
+    max_turns              = Column(Integer,  nullable=True)
+    max_tokens             = Column(Integer,  nullable=True)
+    user_prompt_template   = Column(Text,     nullable=True)
+    created_at    = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<CustomAgentDefinition(id={self.id}, name='{self.name}')>"
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +306,7 @@ class Task(Base):
     last_progress_at = Column(DateTime, nullable=True, default=datetime.utcnow)
     consultation_payload = Column(Text, nullable=True)  # JSON: {"question": "...", "hint": "...", "source": "user|maestro"}
     is_starred = Column(Boolean, nullable=False, default=False)
+    stage_key = Column(String, nullable=True)  # Phase 1: mirrors type; Phase 2+: follows pipeline_stages.stage_key
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -218,6 +379,28 @@ class Expense(Base):
 
     def __repr__(self):
         return f"<Expense(id={self.id}, budget={self.budget_id}, tokens={self.total_tokens}, total_µ¢={self.total_cost_microcents})>"
+
+
+# ---------------------------------------------------------------------------
+# Factory runs audit table
+# ---------------------------------------------------------------------------
+
+class FactoryRun(Base):
+    """Audit row for each card factory execution."""
+    __tablename__ = "factory_runs"
+
+    id               = Column(Integer, primary_key=True, autoincrement=True)
+    factory_stage_id = Column(Integer, ForeignKey("pipeline_stages.id"), nullable=False)
+    project_id       = Column(Integer, ForeignKey("projects.id"),        nullable=False)
+    trigger_type     = Column(String,  nullable=False)   # manual | predecessor_complete | cron
+    trigger_card_id  = Column(String,  ForeignKey("tasks.id"), nullable=True)
+    started_at       = Column(DateTime, default=datetime.utcnow)
+    completed_at     = Column(DateTime, nullable=True)
+    cards_created    = Column(Integer, default=0)
+    status           = Column(String, nullable=False, default="running")  # running | completed | failed
+
+    def __repr__(self):
+        return f"<FactoryRun(id={self.id}, stage={self.factory_stage_id}, trigger={self.trigger_type}, status={self.status})>"
 
 
 # ---------------------------------------------------------------------------

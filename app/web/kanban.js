@@ -10,7 +10,8 @@ const API_BASE = '/api';
 let _modalMousedownTarget = null;
 document.addEventListener('mousedown', function(e) { _modalMousedownTarget = e.target; });
 
-// Category colours for architecture cards (displayed as badge text colour)
+// Default category colours — used as fallback before the API responds.
+// After loadTasksFromDatabase(), archCategoryMap is populated from the API.
 const ARCH_CATEGORY_COLORS = {
     Platform:      '#17a2b8',
     Design:        '#a78bfa',
@@ -27,6 +28,12 @@ const ARCH_CATEGORY_COLORS = {
     Observability: '#38bdf8',
     General:       '#6c757d',
 };
+
+// Dynamic arch category map — populated from GET /api/projects/{name}/arch-categories.
+// Each entry: { key, label, color, position, id? }
+// Falls back to ARCH_CATEGORY_COLORS if the API is unreachable.
+let archCategoryMap = {...ARCH_CATEGORY_COLORS};
+let _archCategoryList = [];  // ordered list of {key, label, color, position, id}
 
 // Whether the arch bar is collapsed (persisted in localStorage)
 let _archBarCollapsed = localStorage.getItem('archBarCollapsed') === '1';
@@ -51,6 +58,7 @@ let allTasks = [];
 // Global LLM, Budget, and Compute Node caches
 let allLlms = [];
 let allProjects = [];  // [{name, path, description, llm_id, budget_id}] — kept in sync with loadProjects()
+let allPipelineTemplates = [];  // [{id, name, description, is_builtin}] — populated once at init
 let allBudgets = [];
 let allComputeNodes = [];  // [{id, name, description, max_parallel_sessions, max_loaded_models}]
 
@@ -197,6 +205,9 @@ const cardCache = {};
 // Render fingerprint cache: taskId -> string, detects which cards need updating
 const fingerprintCache = {};
 
+// Active pipeline template for the current project (null = use default column order)
+let activePipelineTemplate = null;
+
 // Load tasks from database on startup (scoped to currentProject)
 async function loadTasksFromDatabase() {
     try {
@@ -215,12 +226,169 @@ async function loadTasksFromDatabase() {
 
         console.log(`Loaded ${allTasks.length} tasks from database for project "${currentProject}"`);
         buildDescendantIndex();
+
+        // Load the project's pipeline template and arch categories in parallel
+        await Promise.all([
+            _loadActivePipelineTemplate(),
+            _loadArchCategories(),
+        ]);
+
+        // Build/update kanban columns from the active template
+        buildKanbanColumns(activePipelineTemplate?.stages?.length ? activePipelineTemplate.stages : null);
+
+        // Sync the pipeline dropdown to the newly loaded template
+        populatePipelineDropdown();
+
         return true;
     } catch (error) {
         console.error('Error loading tasks from database:', error);
-        // Fallback to empty state
         return false;
     }
+}
+
+async function _loadActivePipelineTemplate() {
+    activePipelineTemplate = null;
+    const project = (allProjects || []).find(p => p.name === currentProject);
+    const templateId = project?.pipeline_template_id;
+    if (!templateId) return;
+    try {
+        activePipelineTemplate = await fetch(`${API_BASE}/pipelines/${templateId}`)
+            .then(r => r.ok ? r.json() : null);
+    } catch (_) {
+        activePipelineTemplate = null;
+    }
+}
+
+async function _loadArchCategories() {
+    try {
+        const r = await fetch(`${API_BASE}/projects/${encodeURIComponent(currentProject)}/arch-categories`);
+        if (!r.ok) return;
+        const cats = await r.json();
+        if (!cats || !cats.length) return;
+        _archCategoryList = cats;
+        archCategoryMap = {};
+        for (const c of cats) {
+            // Resolve color: prefer DB value, then fall back to ARCH_CATEGORY_COLORS by
+            // exact key match or title-cased key match (handles lowercase DB keys).
+            const titleKey = c.key.charAt(0).toUpperCase() + c.key.slice(1);
+            const fallback = ARCH_CATEGORY_COLORS[c.key] || ARCH_CATEGORY_COLORS[titleKey] || '#6c757d';
+            const color = c.color || fallback;
+            archCategoryMap[c.key] = color;
+            // Also register the title-cased key so existing arch cards (stored with title
+            // case, e.g. "Platform") still resolve a color.
+            if (titleKey !== c.key) archCategoryMap[titleKey] = color;
+        }
+    } catch (_) {
+        // Keep the defaults on network error
+    }
+}
+
+// Apply column ordering and group bracket indicators from the active pipeline template.
+// Runs after renderTasksFromDatabase() — mutates CSS only, never rebuilds DOM cards.
+function applyPipelineTemplateLayout() {
+    if (!activePipelineTemplate) {
+        document.querySelectorAll('.column[data-pipeline-order]').forEach(col => {
+            col.style.order = '';
+            col.removeAttribute('data-pipeline-order');
+        });
+        return;
+    }
+
+    const stages = (activePipelineTemplate.stages || [])
+        .sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+
+    // Apply CSS order to columns; grouped stages share one column-group div.
+    const renderedGroups = new Set();
+    stages.forEach((stage, idx) => {
+        let col;
+        if (stage.group_id) {
+            if (renderedGroups.has(stage.group_id)) return;
+            renderedGroups.add(stage.group_id);
+            col = document.getElementById(`column-group-${stage.group_id}`);
+        } else {
+            col = document.getElementById(`column-${stage.stage_key}`);
+        }
+        if (!col) return;
+        col.style.order = idx;
+        col.dataset.pipelineOrder = idx;
+    });
+}
+
+// Build kanban columns entirely from the active pipeline template.
+// All columns are created dynamically; there are no static column elements.
+// Called after _loadActivePipelineTemplate() resolves.
+function buildKanbanColumns(stages) {
+    const board = document.querySelector('.kanban-board');
+    if (!board) return;
+
+    // Remove all columns from the previous template
+    board.querySelectorAll('.column[data-board-col]').forEach(col => col.remove());
+
+    if (!stages || !stages.length) return;
+
+    // Architecture stages render in the arch bar only — never as kanban columns.
+    const sortedStages = [...stages]
+        .filter(s => s.agent_type !== 'arch_agent' && s.stage_key !== 'architecture')
+        .sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+
+    // Build group map: group_id → { group, stages: [] } ordered by position
+    const groups = activePipelineTemplate?.groups || [];
+    const groupMap = {};
+    groups.forEach(g => { groupMap[g.id] = { group: g, stages: [] }; });
+    sortedStages.forEach(s => {
+        if (s.group_id && groupMap[s.group_id]) groupMap[s.group_id].stages.push(s);
+    });
+
+    const renderedGroupIds = new Set();
+
+    sortedStages.forEach(stage => {
+        if (stage.group_id && groupMap[stage.group_id]) {
+            // Grouped stage — render the whole group column once on first encounter
+            if (renderedGroupIds.has(stage.group_id)) return;
+            renderedGroupIds.add(stage.group_id);
+
+            const { group, stages: groupStages } = groupMap[stage.group_id];
+            const groupName = (group.name || 'Group').toUpperCase();
+            const firstKey = groupStages[0]?.stage_key || '';
+
+            const col = document.createElement('div');
+            col.className = 'column column-group';
+            col.id = `column-group-${group.id}`;
+            col.dataset.boardCol = '1';
+            col.innerHTML =
+                `<div class="column-header" onclick="openColumnMap('${firstKey}')" ` +
+                `title="Click to open ${groupName} Map">` +
+                `<span class="column-title">${groupName}</span>` +
+                `<span class="task-count" id="count-group-${group.id}">0</span>` +
+                `</div>` +
+                groupStages.map(s =>
+                    `<div class="tasks-container" id="tasks-${s.stage_key}" ` +
+                    `onclick="handleTasksContainerClick(event,'${s.stage_key}')"></div>`
+                ).join('');
+            board.appendChild(col);
+        } else {
+            // Standalone stage column
+            const label = (stage.label || stage.stage_key).toUpperCase();
+            const isEntryStage = stage.agent_type === 'intake_agent';
+
+            const col = document.createElement('div');
+            col.className = 'column';
+            col.id = `column-${stage.stage_key}`;
+            col.dataset.boardCol = '1';
+            col.innerHTML =
+                `<div class="column-header" onclick="openColumnMap('${stage.stage_key}')" ` +
+                `title="Click to open ${label} Map">` +
+                `<span class="column-title">${label}</span>` +
+                `<span class="task-count" id="count-${stage.stage_key}">0</span>` +
+                `</div>` +
+                (isEntryStage
+                    ? `<button class="add-task-btn" onclick="openAddTaskModal('idea')">+ Add Idea</button>`
+                    : '') +
+                `<div class="tasks-container" id="tasks-${stage.stage_key}" ` +
+                `onclick="handleTasksContainerClick(event,'${stage.stage_key}')"></div>`;
+            board.appendChild(col);
+        }
+    });
 }
 
 // Build child and descendant indexes from taskData
@@ -415,9 +583,6 @@ const COLUMN_DISPLAY = {
     'human_review': 'Human Review',
     'completed': 'Completed',
 };
-
-// Backend stages that are visually merged into the "AI REVIEW" column.
-const AI_REVIEW_STAGES = ['conceptual_review', 'optimization', 'security', 'final_review'];
 
 // Returns the label for an advance button given a task's current type.
 function _advanceBtnLabel(taskType, hasRejections) {
@@ -702,7 +867,12 @@ function renderTasksFromDatabase() {
     Object.keys(fingerprintCache).forEach(id => delete fingerprintCache[id]);
 
     // Clear ALL existing task cards from ALL columns
-    const columns = ['idea', 'planning', 'indev', 'conceptual_review', 'optimization', 'security', 'final_review', 'human_review', 'completed'];
+    const _defaultColumns = ['idea', 'planning', 'indev', 'conceptual_review', 'optimization', 'security', 'final_review', 'human_review', 'completed'];
+    const columns = activePipelineTemplate?.stages
+        ? activePipelineTemplate.stages
+              .sort((a, b) => (a.position ?? 0) - (b.position ?? 0))
+              .map(s => s.stage_key)
+        : _defaultColumns;
 
     columns.forEach(columnType => {
         const container = document.getElementById(`tasks-${columnType}`);
@@ -759,28 +929,74 @@ function renderTasksFromDatabase() {
     updateTaskCounts();
     renderArchBar();
     _scheduleStageFooterBatch();
+
+    // Apply column ordering and group brackets from the active pipeline template
+    applyPipelineTemplateLayout();
 }
 
 function updateTaskCounts() {
-    const columns = ['idea', 'planning', 'indev', 'conceptual_review', 'optimization', 'security', 'final_review', 'human_review', 'completed'];
+    if (!activePipelineTemplate?.stages?.length) return;
+    const stages = activePipelineTemplate.stages;
+    const groups = activePipelineTemplate.groups || [];
 
-    columns.forEach(columnType => {
-        const container = document.getElementById(`tasks-${columnType}`);
-        const countElement = document.getElementById(`count-${columnType}`);
-
-        if (container && countElement) {
-            const count = container.querySelectorAll('.task-card').length;
-            countElement.textContent = count;
+    // Standalone stage columns have a count-{stage_key} badge in their header.
+    stages.forEach(stage => {
+        const container = document.getElementById(`tasks-${stage.stage_key}`);
+        const countEl = document.getElementById(`count-${stage.stage_key}`);
+        if (container && countEl) {
+            countEl.textContent = container.querySelectorAll('.task-card').length;
         }
     });
 
-    // Aggregate count badge for the merged AI REVIEW column header.
-    const aiCount = AI_REVIEW_STAGES.reduce((sum, col) => {
-        const c = document.getElementById(`tasks-${col}`);
-        return sum + (c ? c.querySelectorAll('.task-card').length : 0);
-    }, 0);
-    const aiCountEl = document.getElementById('count-ai-review');
-    if (aiCountEl) aiCountEl.textContent = aiCount;
+    // Group column headers have a count-group-{groupId} badge; value = sum of member stages.
+    groups.forEach(g => {
+        const memberKeys = stages.filter(s => s.group_id === g.id).map(s => s.stage_key);
+        const total = memberKeys.reduce((sum, key) => {
+            const c = document.getElementById(`tasks-${key}`);
+            return sum + (c ? c.querySelectorAll('.task-card').length : 0);
+        }, 0);
+        const countEl = document.getElementById(`count-group-${g.id}`);
+        if (countEl) countEl.textContent = total;
+    });
+}
+
+// ============================================
+// DOCUMENT STORE modal
+// ============================================
+
+async function openDocumentStore() {
+    if (!currentProject) { showToast('Select a project first.', 'warning'); return; }
+    const res = await fetch(`${API_BASE}/projects/${encodeURIComponent(currentProject)}/documents`);
+    const docs = res.ok ? await res.json() : [];
+    const tbody = document.getElementById('doc-list');
+    document.getElementById('doc-viewer').style.display = 'none';
+    document.getElementById('doc-search').value = '';
+    tbody.innerHTML = docs.length ? docs.map(d =>
+        `<tr style="border-top:1px solid #2d3748;cursor:pointer" onclick="viewDoc('${d.key.replace(/'/g, "\\'")}')">
+          <td style="padding:4px 8px;font-family:monospace;color:#60a5fa">${d.key}</td>
+          <td style="padding:4px 8px">${(d.tags || []).join(', ') || '—'}</td>
+          <td style="padding:4px 8px;color:#94a3b8">${d.written_by_task_id || '—'}</td>
+          <td style="padding:4px 8px;color:#94a3b8">${d.updated_at ? new Date(d.updated_at).toLocaleString() : '—'}</td>
+        </tr>`
+    ).join('') : '<tr><td colspan="4" style="padding:12px 8px;color:#64748b;text-align:center">No documents yet.</td></tr>';
+    document.getElementById('doc-store-modal').style.display = 'flex';
+}
+
+async function viewDoc(key) {
+    const res = await fetch(`${API_BASE}/projects/${encodeURIComponent(currentProject)}/documents/${encodeURIComponent(key)}`);
+    const doc = res.ok ? await res.json() : null;
+    if (!doc) return;
+    const viewer = document.getElementById('doc-viewer');
+    viewer.textContent = doc.content || '';
+    viewer.style.display = 'block';
+}
+
+function closeDocStore() { document.getElementById('doc-store-modal').style.display = 'none'; }
+
+function filterDocList(q) {
+    document.querySelectorAll('#doc-list tr').forEach(row => {
+        row.style.display = row.textContent.toLowerCase().includes(q.toLowerCase()) ? '' : 'none';
+    });
 }
 
 // ============================================
@@ -794,6 +1010,131 @@ function toggleArchBar() {
     if (bar) bar.classList.toggle('collapsed', _archBarCollapsed);
     const btn = document.getElementById('arch-bar-toggle');
     if (btn) btn.textContent = _archBarCollapsed ? '\u25BC' : '\u25B2';
+}
+
+// ============================================
+// Arch Category Management Modal
+// ============================================
+
+function openArchCategoryModal() {
+    const modal = document.getElementById('arch-category-modal');
+    if (!modal) return;
+    const project = (allProjects || []).find(p => p.name === currentProject);
+    const hasTemplate = !!project?.pipeline_template_id;
+    const addBtn = document.getElementById('arch-cat-add-btn');
+    if (addBtn) addBtn.style.display = hasTemplate ? '' : 'none';
+    _renderArchCatList(hasTemplate);
+    modal.classList.add('active');
+}
+
+function closeArchCategoryModal() {
+    const modal = document.getElementById('arch-category-modal');
+    if (modal) modal.classList.remove('active');
+}
+
+function _renderArchCatList(editable) {
+    const list = document.getElementById('arch-cat-list');
+    if (!list) return;
+    list.innerHTML = '';
+    if (!_archCategoryList.length) {
+        list.innerHTML = '<p style="color:#6c757d;font-size:0.85rem">No categories loaded.</p>';
+        return;
+    }
+    for (const cat of _archCategoryList) {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;align-items:center;gap:0.5rem;padding:0.4rem 0.5rem;background:#1e2635;border-radius:4px';
+        row.dataset.catId = cat.id || '';
+        row.dataset.catKey = cat.key;
+
+        const swatch = document.createElement('span');
+        swatch.style.cssText = `display:inline-block;width:20px;height:20px;border-radius:3px;background:${cat.color || '#6c757d'};flex-shrink:0`;
+
+        const label = document.createElement('span');
+        label.textContent = cat.label || cat.key;
+        label.style.cssText = 'flex:1;font-size:0.9rem;color:#e2e8f0';
+
+        const keyBadge = document.createElement('span');
+        keyBadge.textContent = cat.key;
+        keyBadge.style.cssText = 'font-size:0.75rem;color:#6c757d;font-family:monospace';
+
+        row.appendChild(swatch);
+        row.appendChild(label);
+        row.appendChild(keyBadge);
+
+        if (editable && cat.id) {
+            const colorInput = document.createElement('input');
+            colorInput.type = 'color';
+            colorInput.value = cat.color || '#6c757d';
+            colorInput.title = 'Change colour';
+            colorInput.style.cssText = 'width:28px;height:24px;padding:0;border:none;cursor:pointer;background:none';
+            colorInput.addEventListener('change', () => _archCatUpdateColor(cat.id, colorInput.value));
+
+            const delBtn = document.createElement('button');
+            delBtn.textContent = '\u2715';
+            delBtn.title = 'Delete category';
+            delBtn.style.cssText = 'background:none;border:none;color:#ef4444;cursor:pointer;font-size:0.85rem;padding:2px 4px';
+            delBtn.addEventListener('click', () => _archCatDelete(cat.id, cat.key));
+
+            row.appendChild(colorInput);
+            row.appendChild(delBtn);
+        }
+
+        list.appendChild(row);
+    }
+}
+
+async function _archCatUpdateColor(catId, newColor) {
+    const project = (allProjects || []).find(p => p.name === currentProject);
+    if (!project?.pipeline_template_id) return;
+    try {
+        await fetch(`${API_BASE}/pipelines/${project.pipeline_template_id}/arch-categories/${catId}`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({color: newColor}),
+        });
+        await _loadArchCategories();
+        renderArchBar();
+        const hasTemplate = true;
+        _renderArchCatList(hasTemplate);
+    } catch (err) {
+        console.error('Failed to update arch category color:', err);
+    }
+}
+
+async function _archCatDelete(catId, key) {
+    const project = (allProjects || []).find(p => p.name === currentProject);
+    if (!project?.pipeline_template_id) return;
+    if (!confirm(`Delete category "${key}"? Arch cards with this category will keep their category tag but it won't be shown in the bar.`)) return;
+    try {
+        await fetch(`${API_BASE}/pipelines/${project.pipeline_template_id}/arch-categories/${catId}`, {method: 'DELETE'});
+        await _loadArchCategories();
+        renderArchBar();
+        _renderArchCatList(true);
+    } catch (err) {
+        console.error('Failed to delete arch category:', err);
+    }
+}
+
+async function archCatAddNew() {
+    const project = (allProjects || []).find(p => p.name === currentProject);
+    if (!project?.pipeline_template_id) return;
+    const key = prompt('Category key (no spaces, e.g. "Infrastructure"):');
+    if (!key || !key.trim()) return;
+    const label = prompt('Display label:', key.trim()) || key.trim();
+    const color = prompt('Hex color (e.g. #60a5fa):', '#60a5fa') || '#60a5fa';
+    try {
+        const nextPos = _archCategoryList.length;
+        await fetch(`${API_BASE}/pipelines/${project.pipeline_template_id}/arch-categories`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({key: key.trim(), label: label.trim(), color, position: nextPos}),
+        });
+        await _loadArchCategories();
+        renderArchBar();
+        _renderArchCatList(true);
+    } catch (err) {
+        console.error('Failed to add arch category:', err);
+    }
 }
 
 async function populateArchBar() {
@@ -919,7 +1260,7 @@ function renderArchBar() {
         const content  = task.content || {};
         const category = content.category || 'General';
         const priority = content.priority || 'normal';
-        const color    = ARCH_CATEGORY_COLORS[category] || ARCH_CATEGORY_COLORS.General;
+        const color    = archCategoryMap[category] || archCategoryMap.General || '#6c757d';
         const body     = (task.description || '').trim();
 
         const card = document.createElement('div');
@@ -943,7 +1284,7 @@ function renderArchBar() {
     const existingCategories = new Set(archTasks.map(t => (t.content || {}).category || 'General'));
     _archGenJobs.forEach(job => {
         if (existingCategories.has(job.category)) return;
-        const color   = ARCH_CATEGORY_COLORS[job.category] || ARCH_CATEGORY_COLORS.General;
+        const color   = archCategoryMap[job.category] || archCategoryMap.General || '#6c757d';
         const isRunning = job.status === 'running';
         const ghost = document.createElement('div');
         ghost.className = 'arch-card ghost';
@@ -1989,8 +2330,8 @@ let _archGenJobs = [];
 let _schedulerState = { active: [], queued: [] };
 
 document.addEventListener('DOMContentLoaded', async function() {
-    // Load projects first so the sidebar is populated before tasks load
-    await loadProjects();
+    // Load projects and pipeline template list in parallel before tasks load
+    await Promise.all([loadProjects(), loadPipelineTemplates()]);
     await Promise.all([loadTasksFromDatabase(), loadLlmsAndBudgets()]);
 
     // Fetch transition statuses for idea tasks before first render
@@ -2145,6 +2486,52 @@ async function switchProject(projectName) {
         mapTransform = { x: 0, y: 0, scale: 1 };
         renderColumnMap(columnMapType);
     }
+}
+
+// ============================================================
+// Pipeline template switcher
+// ============================================================
+
+async function loadPipelineTemplates() {
+    try {
+        const resp = await fetch(`${API_BASE}/pipelines`);
+        allPipelineTemplates = resp.ok ? await resp.json() : [];
+    } catch (_) {
+        allPipelineTemplates = [];
+    }
+}
+
+function populatePipelineDropdown() {
+    const sel = document.getElementById('pipeline-select');
+    if (!sel) return;
+    const activeProject = allProjects.find(p => p.name === currentProject);
+    const activeTid = activeProject?.pipeline_template_id ?? null;
+    sel.innerHTML = allPipelineTemplates.map(t =>
+        `<option value="${t.id}"${t.id === activeTid ? ' selected' : ''}>${t.name}</option>`
+    ).join('');
+    const editLink = document.getElementById('pipeline-edit-link');
+    if (editLink) {
+        const tid = activePipelineTemplate?.id || activeTid;
+        editLink.href = tid ? `/pipelines/${tid}/edit` : '/pipelines';
+    }
+}
+
+async function onPipelineSelectChange(templateIdStr) {
+    const templateId = parseInt(templateIdStr, 10);
+    if (!currentProject) return;
+    const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(currentProject)}/pipeline`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({template_id: templateId}),
+    });
+    if (!resp.ok) {
+        console.error('Failed to switch pipeline:', await resp.text());
+        return;
+    }
+    const proj = allProjects.find(p => p.name === currentProject);
+    if (proj) proj.pipeline_template_id = templateId;
+    await loadTasksFromDatabase();
+    renderTasksFromDatabase();
 }
 
 // Load projects from the API and render the sidebar tabs
@@ -7868,5 +8255,377 @@ async function resumeFromConsultation(taskId, btn) {
         btn.disabled = false;
         btn.textContent = 'Send Hint & Resume';
     }
+}
+
+// =============================================================================
+// Autopilot / Mission Dialog  (Phase 7)
+// =============================================================================
+
+let _autopilotOn = false;
+
+async function _refreshAutopilotState() {
+    try {
+        const r = await fetch('/api/settings/autopilot');
+        if (!r.ok) return;
+        const d = await r.json();
+        _autopilotOn = d.autopilot === 'on';
+        _applyAutopilotBtn();
+        // Sync hour fields if the dialog is open
+        const sh = document.getElementById('mc-start-hour');
+        const eh = document.getElementById('mc-stop-hour');
+        if (sh) sh.value = d.start_hour;
+        if (eh) eh.value = d.stop_hour;
+    } catch (_) {}
+}
+
+function _applyAutopilotBtn() {
+    const btn = document.getElementById('autopilot-btn');
+    if (!btn) return;
+    if (_autopilotOn) {
+        btn.textContent = '⏸ Human in the Loop';
+        btn.style.background = '#d97706';
+        btn.style.borderColor = '#b45309';
+        btn.style.color = '#fff';
+    } else {
+        btn.textContent = '⚡ Leave it to the Maestro';
+        btn.style.background = '';
+        btn.style.borderColor = '';
+        btn.style.color = '';
+    }
+}
+
+function handleAutopilotClick() {
+    if (_autopilotOn) {
+        // Pause immediately — no dialog
+        _disengageAutopilot();
+    } else {
+        openMissionModal();
+    }
+}
+
+async function _disengageAutopilot() {
+    showToast('Pausing Maestro…', 'info');
+    try {
+        const r = await fetch('/api/settings/autopilot', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ autopilot: 'off' }),
+        });
+        if (r.ok) {
+            _autopilotOn = false;
+            _applyAutopilotBtn();
+            showToast('Maestro paused — Human in the Loop.', 'success');
+        } else {
+            showToast('Failed to pause Maestro.', 'error');
+        }
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+    }
+}
+
+async function openMissionModal() {
+    // Load persistent defaults from localStorage
+    const raw = localStorage.getItem('maestro_mission_defaults');
+    const defaults = raw ? JSON.parse(raw) : {};
+
+    document.getElementById('mc-time-enabled').checked  = defaults.time_enabled  ?? true;
+    document.getElementById('mc-time-hours').value       = defaults.time_hours    ?? 8;
+    document.getElementById('mc-tokens-enabled').checked = defaults.tokens_enabled ?? true;
+    document.getElementById('mc-tokens-k').value         = defaults.tokens_k      ?? 500;
+    document.getElementById('mc-cards-enabled').checked  = defaults.cards_enabled  ?? false;
+    document.getElementById('mc-cards-n').value           = defaults.cards_n       ?? 5;
+    document.getElementById('mc-goal-enabled').checked   = defaults.goal_enabled   ?? false;
+    document.getElementById('mc-save-schedule').checked  = defaults.save_schedule  ?? false;
+
+    // Populate goal-card select from current project tasks
+    const sel = document.getElementById('mc-goal-card');
+    sel.innerHTML = '<option value="">Select card…</option>';
+    for (const t of allTasks) {
+        if (t.type !== 'architecture' && t.type !== 'completed') {
+            const opt = document.createElement('option');
+            opt.value = t.id;
+            opt.textContent = t.title || t.id;
+            if (defaults.goal_card_id === t.id) opt.selected = true;
+            sel.appendChild(opt);
+        }
+    }
+
+    // Prefill hours from API
+    const r = await fetch('/api/settings/autopilot').catch(() => null);
+    if (r && r.ok) {
+        const d = await r.json();
+        document.getElementById('mc-start-hour').value = d.start_hour;
+        document.getElementById('mc-stop-hour').value  = d.stop_hour;
+    }
+
+    document.getElementById('mission-modal').style.display = 'flex';
+}
+
+function closeMissionModal() {
+    document.getElementById('mission-modal').style.display = 'none';
+}
+
+async function startMission() {
+    const timeEnabled   = document.getElementById('mc-time-enabled').checked;
+    const timeHours     = parseFloat(document.getElementById('mc-time-hours').value) || 0;
+    const tokensEnabled = document.getElementById('mc-tokens-enabled').checked;
+    const tokensK       = parseFloat(document.getElementById('mc-tokens-k').value) || 0;
+    const cardsEnabled  = document.getElementById('mc-cards-enabled').checked;
+    const cardsN        = parseInt(document.getElementById('mc-cards-n').value) || 0;
+    const goalEnabled   = document.getElementById('mc-goal-enabled').checked;
+    const goalCardId    = document.getElementById('mc-goal-card').value || null;
+    const saveSchedule  = document.getElementById('mc-save-schedule').checked;
+    const startHour     = parseInt(document.getElementById('mc-start-hour').value) || 0;
+    const stopHour      = parseInt(document.getElementById('mc-stop-hour').value) || 24;
+
+    // Save to localStorage
+    localStorage.setItem('maestro_mission_defaults', JSON.stringify({
+        time_enabled: timeEnabled, time_hours: timeHours,
+        tokens_enabled: tokensEnabled, tokens_k: tokensK,
+        cards_enabled: cardsEnabled, cards_n: cardsN,
+        goal_enabled: goalEnabled, goal_card_id: goalCardId,
+        save_schedule: saveSchedule,
+    }));
+
+    const mission = {
+        time_limit_seconds: timeEnabled && timeHours > 0 ? Math.round(timeHours * 3600) : null,
+        token_budget:       tokensEnabled && tokensK > 0 ? Math.round(tokensK * 1024) : null,
+        card_count_target:  cardsEnabled && cardsN > 0   ? cardsN : null,
+        goal_card_id:       goalEnabled ? goalCardId : null,
+    };
+
+    const body = {
+        autopilot: 'on',
+        start_hour: startHour,
+        stop_hour:  stopHour,
+        save_schedule: saveSchedule,
+        mission,
+    };
+
+    try {
+        const r = await fetch('/api/settings/autopilot', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        if (r.ok) {
+            _autopilotOn = true;
+            _applyAutopilotBtn();
+            closeMissionModal();
+            showToast('Maestro engaged — Leave it to the Maestro!', 'success');
+        } else {
+            const d = await r.json().catch(() => ({}));
+            showToast(d.detail || 'Failed to engage Maestro.', 'error');
+        }
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+    }
+}
+
+// Poll autopilot state on startup and every 30 s (mission may terminate server-side)
+_refreshAutopilotState();
+setInterval(_refreshAutopilotState, 30000);
+
+// ---------------------------------------------------------------------------
+// Document Store modal
+// ---------------------------------------------------------------------------
+
+let _docStoreAllDocs = [];   // full list from last fetch
+let _docStoreSelectedKey = null;
+
+async function openDocStoreModal() {
+    if (!currentProject) {
+        showToast('Select a project first.', 'error');
+        return;
+    }
+    document.getElementById('doc-store-modal-title').textContent =
+        `Document Store — ${currentProject}`;
+    document.getElementById('doc-store-modal').style.display = 'flex';
+    document.getElementById('doc-store-search').value = '';
+    _docStoreSelectedKey = null;
+    document.getElementById('doc-store-detail').innerHTML =
+        '<p style="color:#6c757d;font-style:italic;text-align:center;margin-top:3rem">Select a document to view its content.</p>';
+    await docStoreRefresh();
+}
+
+function closeDocStoreModal() {
+    document.getElementById('doc-store-modal').style.display = 'none';
+}
+
+async function docStoreRefresh() {
+    if (!currentProject) return;
+    try {
+        const r = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/documents`);
+        if (!r.ok) throw new Error(await r.text());
+        _docStoreAllDocs = await r.json();
+        _renderDocStoreList(_docStoreAllDocs);
+    } catch (e) {
+        document.getElementById('doc-store-list').innerHTML =
+            `<p style="color:#dc3545;padding:1rem">Error: ${escapeHtml(e.message)}</p>`;
+    }
+}
+
+function docStoreFilter() {
+    const q = document.getElementById('doc-store-search').value.toLowerCase();
+    const filtered = q
+        ? _docStoreAllDocs.filter(d => d.key.toLowerCase().includes(q))
+        : _docStoreAllDocs;
+    _renderDocStoreList(filtered);
+}
+
+function _renderDocStoreList(docs) {
+    const el = document.getElementById('doc-store-list');
+    if (!docs.length) {
+        el.innerHTML = '<p style="color:#6c757d;padding:1rem;font-style:italic">No documents.</p>';
+        return;
+    }
+    el.innerHTML = docs.map(d => {
+        const active = d.key === _docStoreSelectedKey;
+        const tagsHtml = (d.tags || []).map(t =>
+            `<span style="background:#e9ecef;border-radius:3px;padding:1px 5px;font-size:0.75rem;margin-right:3px">${escapeHtml(t)}</span>`
+        ).join('');
+        const size = d.content_size_bytes != null
+            ? ` <span style="color:#adb5bd">${_fmtBytes(d.content_size_bytes)}</span>` : '';
+        return `<div class="doc-store-item${active ? ' doc-store-item--active' : ''}"
+                     style="padding:0.5rem 0.9rem;cursor:pointer;border-bottom:1px solid #f0f0f0;
+                            ${active ? 'background:#e8f0fe;' : ''}"
+                     onclick="docStoreSelect(${JSON.stringify(d.key)})">
+            <div style="font-weight:500;font-size:0.88rem;word-break:break-all">${escapeHtml(d.key)}</div>
+            <div style="margin-top:2px">${tagsHtml}${size}</div>
+            <div style="color:#adb5bd;font-size:0.75rem">${_relTime(d.updated_at)}</div>
+        </div>`;
+    }).join('');
+}
+
+async function docStoreSelect(key) {
+    _docStoreSelectedKey = key;
+    // Re-render list to show active highlight
+    const q = document.getElementById('doc-store-search').value.toLowerCase();
+    _renderDocStoreList(q ? _docStoreAllDocs.filter(d => d.key.toLowerCase().includes(q)) : _docStoreAllDocs);
+
+    const detail = document.getElementById('doc-store-detail');
+    detail.innerHTML = '<p style="color:#6c757d;padding:1rem">Loading…</p>';
+    try {
+        const r = await fetch(
+            `/api/projects/${encodeURIComponent(currentProject)}/documents/${encodeURIComponent(key)}`
+        );
+        if (!r.ok) throw new Error(await r.text());
+        const doc = await r.json();
+        const tagsHtml = (doc.tags || []).map(t =>
+            `<span style="background:#e9ecef;border-radius:3px;padding:2px 6px;font-size:0.8rem">${escapeHtml(t)}</span>`
+        ).join(' ');
+        detail.innerHTML = `
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:0.75rem">
+                <div>
+                    <div style="font-weight:600;font-size:1rem;word-break:break-all">${escapeHtml(doc.key)}</div>
+                    <div style="color:#6c757d;font-size:0.8rem;margin-top:2px">
+                        Written by: ${escapeHtml(doc.written_by_task_id || 'human')} &nbsp;·&nbsp;
+                        Updated: ${_relTime(doc.updated_at)}
+                    </div>
+                    <div style="margin-top:4px">${tagsHtml}</div>
+                </div>
+                <button class="btn btn-sm" onclick="docStoreOpenEdit(${JSON.stringify(doc.key)})"
+                    style="flex-shrink:0;margin-left:1rem">Edit</button>
+            </div>
+            <pre style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;
+                        padding:0.75rem;font-size:0.83rem;overflow-x:auto;white-space:pre-wrap;
+                        word-break:break-word;max-height:60vh;overflow-y:auto">${escapeHtml(doc.content)}</pre>`;
+    } catch (e) {
+        detail.innerHTML = `<p style="color:#dc3545;padding:1rem">Error: ${escapeHtml(e.message)}</p>`;
+    }
+}
+
+function docStoreOpenNew() {
+    document.getElementById('doc-edit-modal-title').textContent = 'New Document';
+    document.getElementById('doc-edit-key').value = '';
+    document.getElementById('doc-edit-key').disabled = false;
+    document.getElementById('doc-edit-tags').value = '';
+    document.getElementById('doc-edit-content').value = '';
+    document.getElementById('doc-edit-delete-btn').style.display = 'none';
+    document.getElementById('doc-store-edit-modal').style.display = 'flex';
+}
+
+async function docStoreOpenEdit(key) {
+    try {
+        const r = await fetch(
+            `/api/projects/${encodeURIComponent(currentProject)}/documents/${encodeURIComponent(key)}`
+        );
+        if (!r.ok) throw new Error(await r.text());
+        const doc = await r.json();
+        document.getElementById('doc-edit-modal-title').textContent = 'Edit Document';
+        document.getElementById('doc-edit-key').value = doc.key;
+        document.getElementById('doc-edit-key').disabled = true;
+        document.getElementById('doc-edit-tags').value = (doc.tags || []).join(', ');
+        document.getElementById('doc-edit-content').value = doc.content || '';
+        document.getElementById('doc-edit-delete-btn').style.display = 'inline-block';
+        document.getElementById('doc-store-edit-modal').style.display = 'flex';
+    } catch (e) {
+        showToast('Error loading document: ' + e.message, 'error');
+    }
+}
+
+async function docStoreSave() {
+    const key = document.getElementById('doc-edit-key').value.trim();
+    const content = document.getElementById('doc-edit-content').value;
+    const rawTags = document.getElementById('doc-edit-tags').value.trim();
+    const tags = rawTags ? rawTags.split(',').map(t => t.trim()).filter(Boolean) : null;
+    if (!key) { showToast('Key is required.', 'error'); return; }
+    if (!currentProject) { showToast('No project selected.', 'error'); return; }
+    try {
+        const r = await fetch(
+            `/api/projects/${encodeURIComponent(currentProject)}/documents/${encodeURIComponent(key)}`,
+            {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content, tags }),
+            }
+        );
+        if (!r.ok) throw new Error(await r.text());
+        document.getElementById('doc-store-edit-modal').style.display = 'none';
+        showToast('Document saved.', 'success');
+        _docStoreSelectedKey = key;
+        await docStoreRefresh();
+        await docStoreSelect(key);
+    } catch (e) {
+        showToast('Save failed: ' + e.message, 'error');
+    }
+}
+
+async function docStoreDelete() {
+    const key = document.getElementById('doc-edit-key').value.trim();
+    if (!key || !currentProject) return;
+    if (!confirm(`Delete document "${key}"?`)) return;
+    try {
+        const r = await fetch(
+            `/api/projects/${encodeURIComponent(currentProject)}/documents/${encodeURIComponent(key)}`,
+            { method: 'DELETE' }
+        );
+        if (!r.ok) throw new Error(await r.text());
+        document.getElementById('doc-store-edit-modal').style.display = 'none';
+        showToast('Document deleted.', 'success');
+        _docStoreSelectedKey = null;
+        document.getElementById('doc-store-detail').innerHTML =
+            '<p style="color:#6c757d;font-style:italic;text-align:center;margin-top:3rem">Select a document to view its content.</p>';
+        await docStoreRefresh();
+    } catch (e) {
+        showToast('Delete failed: ' + e.message, 'error');
+    }
+}
+
+function _fmtBytes(n) {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+    return `${(n / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function _relTime(iso) {
+    if (!iso) return '';
+    const diff = Date.now() - new Date(iso).getTime();
+    const m = Math.floor(diff / 60000);
+    if (m < 1) return 'just now';
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    return `${Math.floor(h / 24)}d ago`;
 }
 

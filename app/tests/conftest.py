@@ -37,6 +37,13 @@ os.environ["MAESTRO_TEST_DB"] = str(_TEST_DB)
 # take 30+ seconds, which makes individual tests appear to hang forever.
 import app.database  # noqa: F401
 
+# Ensure the SQLite test DB has all current ORM-defined tables (including
+# Phase 1 pipeline_* tables).  The migration runner in _test_schema targets
+# Postgres; create_all() handles the SQLite schema so pipeline_router queries
+# don't raise OperationalError during tests.
+from app.database.session import init_db_tables
+init_db_tables()
+
 
 # ---------------------------------------------------------------------------
 # Session fixture: apply migrations then wipe all data rows.

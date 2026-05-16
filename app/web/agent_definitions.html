@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Definitions — Maestro</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  background: #0f172a;
+  color: #e2e8f0;
+  min-height: 100vh;
+}
+
+#topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 24px;
+  background: #1e293b; border-bottom: 1px solid #334155;
+  position: sticky; top: 0; z-index: 10;
+}
+.logo { color: #60a5fa; text-decoration: none; font-weight: 600; font-size: 15px; }
+.logo:hover { color: #93c5fd; }
+#topbar-title { font-size: 16px; font-weight: 600; color: #f1f5f9; }
+#topbar-actions { display: flex; gap: 8px; }
+
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 14px; border-radius: 6px; border: none;
+  font-size: 13px; font-weight: 500; cursor: pointer;
+  text-decoration: none; transition: background 0.15s, color 0.15s;
+}
+.btn-primary   { background: #3b82f6; color: #fff; }
+.btn-primary:hover   { background: #2563eb; }
+.btn-secondary { background: #334155; color: #e2e8f0; }
+.btn-secondary:hover { background: #475569; }
+.btn-danger    { background: transparent; color: #f87171; }
+.btn-danger:hover    { background: #450a0a; }
+.btn-sm { padding: 4px 10px; font-size: 12px; }
+
+#filter-bar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 24px 0;
+}
+#search-input {
+  background: #1e293b; border: 1px solid #334155; border-radius: 6px;
+  color: #e2e8f0; font-size: 13px; padding: 6px 12px; width: 240px; outline: none;
+}
+#search-input:focus { border-color: #3b82f6; }
+#count-label { margin-left: auto; font-size: 12px; color: #64748b; }
+
+#grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 16px;
+  padding: 20px 24px 32px;
+}
+
+.tpl-card {
+  background: #1e293b; border: 1px solid #334155; border-radius: 10px;
+  padding: 20px; display: flex; flex-direction: column; gap: 12px;
+  transition: border-color 0.15s;
+}
+.tpl-card:hover { border-color: #475569; }
+
+.card-header { display: flex; align-items: flex-start; gap: 10px; }
+.card-icon { font-size: 28px; line-height: 1; flex-shrink: 0; margin-top: 2px; }
+.card-title-wrap { flex: 1; min-width: 0; }
+.card-name {
+  font-size: 15px; font-weight: 600; color: #f1f5f9;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.card-slug {
+  font-family: monospace; font-size: 11px; color: #64748b; margin-top: 2px;
+}
+.card-meta { display: flex; align-items: center; gap: 6px; margin-top: 4px; flex-wrap: wrap; }
+.badge {
+  display: inline-block; padding: 1px 8px; border-radius: 99px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.02em;
+}
+.badge-llm_judge  { background: #1e3a5f; color: #7dd3fc; }
+.badge-single_pass { background: #14532d; color: #86efac; }
+.badge-none       { background: #1e1e2e; color: #94a3b8; }
+.badge-tools      { background: #2d1b4e; color: #c4b5fd; }
+
+.card-desc {
+  font-size: 12px; color: #94a3b8; line-height: 1.45;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden; flex: 1;
+}
+
+.card-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+#empty-state {
+  grid-column: 1/-1; text-align: center; padding: 64px 0;
+  color: #475569; font-size: 14px;
+}
+
+#toast {
+  position: fixed; bottom: 24px; right: 24px;
+  background: #1e293b; border: 1px solid #334155;
+  border-radius: 8px; padding: 12px 18px;
+  font-size: 13px; color: #e2e8f0;
+  box-shadow: 0 4px 20px #00000066;
+  transform: translateY(80px); opacity: 0;
+  transition: transform 0.2s, opacity 0.2s;
+  z-index: 100; max-width: 320px;
+}
+#toast.show { transform: translateY(0); opacity: 1; }
+#toast.toast-error { border-color: #ef4444; color: #fca5a5; }
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <a href="/pipelines" class="logo">← Pipelines</a>
+  <span id="topbar-title">Agent Definitions</span>
+  <div id="topbar-actions">
+    <button class="btn btn-primary" onclick="createBlank()">+ New Agent</button>
+  </div>
+</div>
+
+<div id="filter-bar">
+  <input id="search-input" type="text" placeholder="Search agents…" oninput="applyFilter()">
+  <span id="count-label"></span>
+</div>
+
+<div id="grid"></div>
+
+<div id="toast"></div>
+
+<script src="/static/agent_definitions.js?v=1"></script>
+</body>
+</html>

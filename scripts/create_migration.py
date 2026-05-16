@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Maestro Migration Creator
--------------------------
+Maestro Migration Creator (PostgreSQL only)
+-------------------------------------------
 Creates a new numbered migration file template in app/migrations/versions/.
 
 Usage:
@@ -9,7 +9,7 @@ Usage:
 
 Next Steps:
     1. Open the created file (path printed below).
-    2. Edit the 'up(conn)' function with your SQL changes.
+    2. Edit the 'up(conn)' function with your PostgreSQL SQL changes.
     3. Edit the 'down(conn)' function with the rollback SQL.
     4. Run '.\migrate.bat status' to verify the new file is detected as 'pending'.
     5. Run '.\migrate.bat migrate' to apply the changes.
@@ -35,9 +35,8 @@ def up(conn):
 
 
 def down(conn):
-    # SQLite has no DROP COLUMN before 3.35.
-    # If adding columns: recreate the table(s) without them.
-    # If creating tables: drop them.
+    # To undo column additions: ALTER TABLE ... DROP COLUMN ...
+    # To undo table creation: DROP TABLE IF EXISTS ...
     conn.executescript("""
         -- TODO: write your rollback SQL here
     """)

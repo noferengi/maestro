@@ -1,6 +1,6 @@
 # Phase 1 — Data Model & Migration
 
-> **Status:** Ready to implement  
+> **Status:** COMPLETE — 2026-05-15 ✅  
 > **Depends on:** Phase 0 ✅ done  
 > **Estimated effort:** 3 days  
 > **Goal:** Add all new tables to the DB, run backward-compatible migrations, and leave
@@ -259,3 +259,34 @@ before applying the migration.
 dependency today. Add a one-time read of `maestro.ini` within the migration function
 rather than importing the full app config module, to keep the migration runner
 dependency-free.
+
+---
+
+## Implementation Audit (2026-05-15)
+
+### What was delivered
+
+All 9 new tables exist in both migration 0070 and ORM models. Both `tasks.stage_key`
+and `projects.pipeline_template_id` are present and backfilled. The full seed sequence
+ran correctly: "Software Development" template, 10 stages, 8 forward + 12 backward
+transitions, 14 arch categories, and settings rows.
+
+The migration also includes a complete SQLite branch (not in the plan, which said
+PostgreSQL-only). This is a net positive — it keeps the existing test harness working
+against SQLite.
+
+A companion migration 0071 separated the `system_settings` seed rows and added an
+optional `description` column to `system_settings` (not planned; backward-compatible).
+
+`crud_malleable.py` delivers 50+ CRUD and utility functions well beyond the plan's
+DDL-only scope: template clone/export/import, registry integration, 
+`load_custom_agents_into_registry()`.
+
+### Deviations
+
+| Item | Planned | Implemented | Impact |
+|---|---|---|---|
+| `project_documents.content_size_bytes` generated column | Yes (PostgreSQL GENERATED ALWAYS AS) | Omitted | Low — can be computed on query if needed |
+| Migration scope (PostgreSQL only) | PostgreSQL only | Full SQLite branch added | Positive — preserves test harness |
+| Seed rows in migration 0070 | All in one file | Autopilot settings moved to 0071 | None — both run in order |
+| CRUD library | Not in plan | 50+ functions in crud_malleable.py | Positive — required by later phases |

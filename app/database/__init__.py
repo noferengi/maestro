@@ -52,8 +52,9 @@ if globals().get('_initialized'):
         'app.database.crud_sessions',
         'app.database.crud_maestro',
         'app.database.crud_survey', 'app.database.crud_clarification',
-        'app.database.crud_settings',
-        ]:  # NOTE: keep this list in sync with the from-imports below
+        'app.database.crud_settings', 'app.database.crud_malleable',
+        'app.database.crud_documents',
+    ]:  # NOTE: keep this list in sync with the from-imports below
 
         if _sub in _sys.modules:
             _il.reload(_sys.modules[_sub])
@@ -105,6 +106,15 @@ from .models import (
     ScopeSurveyJob,
     IntakeDraft,
     ToolBugReport,
+    PipelineTemplate,
+    PipelineStage,
+    PipelineTransition,
+    PipelineStageGroup,
+    PipelineArchCategory,
+    ProjectDocument,
+    ArchivedFile,
+    ProjectSettings,
+    CustomAgentDefinition,
 )
 
 # Task CRUD + seeding + helpers
@@ -156,6 +166,10 @@ from .crud_projects import (
     upsert_project,
     rename_project,
     delete_project,
+    project_to_dict,
+    get_project_setting,
+    set_project_setting,
+    get_all_project_settings,
 )
 
 # LLM + Budget + ComputeNode CRUD
@@ -252,16 +266,21 @@ from .crud_jobs import (
     get_retriable_arch_gen_jobs,
 )
 
-# File + search caches
+# File + search caches + archived files
 from .crud_files import (
     get_file_summary,
     create_file_summary,
     get_file_summary_by_path,
     get_file_summaries_for_project_root,
+    delete_file_summary,
     get_search_cache,
     create_search_cache,
     delete_search_cache,
     get_last_search_time,
+    create_archived_file,
+    get_archived_files_for_task,
+    get_archived_file,
+    mark_archived_file_restored,
 )
 
 # Inbox / notifications
@@ -329,6 +348,75 @@ from .crud_settings import (
     get_all_system_settings,
 )
 
+from .crud_documents import (
+    store_document,
+    get_document,
+    fuzzy_get_document,
+    list_documents,
+    delete_document,
+    store_document_by_project,
+    get_document_by_project,
+    fuzzy_get_document_by_project,
+    list_documents_by_project,
+    delete_document_by_project,
+    list_documents_written_by_task,
+)
+
+# Factory runs audit
+from .crud_factory import (
+    create_factory_run,
+    update_factory_run,
+    get_factory_run,
+    get_factory_runs_for_stage,
+    get_last_cron_run_at,
+    predecessor_already_triggered,
+    factory_run_to_dict,
+)
+
+from .crud_malleable import (
+    get_all_templates,
+    get_template,
+    get_template_by_name,
+    get_default_template,
+    create_template,
+    update_template,
+    delete_template,
+    clone_template,
+    get_stages_for_template,
+    get_stage_by_key,
+    get_stage_by_id,
+    create_stage,
+    update_stage,
+    delete_stage,
+    delete_stage_with_redirect,
+    get_transitions_for_template,
+    get_transition_by_id,
+    create_transition,
+    update_transition,
+    delete_transition,
+    get_arch_categories_for_template,
+    get_arch_category_by_id,
+    create_arch_category,
+    update_arch_category,
+    delete_arch_category,
+    get_stage_groups_for_template,
+    get_group_by_id,
+    create_stage_group,
+    update_stage_group,
+    delete_stage_group,
+    template_to_dict,
+    export_template,
+    import_template,
+    get_all_custom_agent_definitions,
+    get_custom_agent_definition_by_id,
+    get_custom_agent_definition_by_name,
+    create_custom_agent_definition,
+    update_custom_agent_definition,
+    delete_custom_agent_definition,
+    custom_agent_definition_to_dict,
+    load_custom_agents_into_registry,
+)
+
 __all__ = [
     # session
     "DATABASE_PATH", "engine", "SessionLocal", "Base", "get_db", "init_db_tables",
@@ -342,6 +430,9 @@ __all__ = [
     "AgentSession", "FileSummary", "SearchCache", "InboxMessage",
     "MaestroRun", "ProjectDecision", "TaskSessionState",
     "ScopeSummary", "ScopeSurveyJob", "IntakeDraft", "ToolBugReport",
+    "PipelineTemplate", "PipelineStage", "PipelineTransition",
+    "PipelineStageGroup", "PipelineArchCategory", "ProjectDocument",
+    "ArchivedFile", "ProjectSettings", "CustomAgentDefinition",
     # crud_tasks
     "init_db", "seed_sample_tasks", "seed_task", "seed_sample_tasks_raw",
     "create_task", "get_task", "get_tasks_by_type", "get_tasks_by_project",
@@ -356,7 +447,8 @@ __all__ = [
     "create_pip_resolution_job", "get_pending_pip_resolution_jobs",
     "get_active_pip_resolution_jobs_for_task", "update_pip_resolution_job",
     # crud_projects
-    "get_all_projects", "get_project", "get_project_path", "upsert_project", "rename_project", "delete_project",
+    "get_all_projects", "get_project", "get_project_path", "upsert_project", "rename_project", "delete_project", "project_to_dict",
+    "get_project_setting", "set_project_setting", "get_all_project_settings",
     # crud_infra
     "get_all_llms", "get_llm", "create_llm", "update_llm", "delete_llm",
     "get_all_budgets", "get_budget", "create_budget", "update_budget", "delete_budget",
@@ -394,6 +486,8 @@ __all__ = [
     "get_file_summary", "create_file_summary", "get_file_summary_by_path",
     "get_file_summaries_for_project_root",
     "get_search_cache", "create_search_cache", "delete_search_cache", "get_last_search_time",
+    "delete_file_summary",
+    "create_archived_file", "get_archived_files_for_task", "get_archived_file", "mark_archived_file_restored",
     # crud_inbox
     "create_inbox_message", "get_inbox_messages", "get_inbox_message",
     "mark_inbox_read", "mark_all_inbox_read", "delete_inbox_message", "count_unread_inbox",
@@ -413,6 +507,27 @@ __all__ = [
     # crud_clarification
     "create_intake_draft", "get_intake_draft", "update_intake_draft",
     "append_conversation_message", "intake_draft_to_dict",
+    # crud_malleable
+    "get_all_templates", "get_template", "get_template_by_name",
+    "get_default_template", "create_template", "update_template", "delete_template", "clone_template",
+    "get_stages_for_template", "get_stage_by_key", "get_stage_by_id",
+    "create_stage", "update_stage", "delete_stage", "delete_stage_with_redirect",
+    "get_transitions_for_template", "get_transition_by_id",
+    "create_transition", "update_transition", "delete_transition",
+    "get_arch_categories_for_template", "get_arch_category_by_id",
+    "create_arch_category", "update_arch_category", "delete_arch_category",
+    "get_stage_groups_for_template", "get_group_by_id",
+    "create_stage_group", "update_stage_group", "delete_stage_group",
+    "template_to_dict", "export_template", "import_template",
+    "get_all_custom_agent_definitions", "get_custom_agent_definition_by_id",
+    "get_custom_agent_definition_by_name", "create_custom_agent_definition",
+    "update_custom_agent_definition", "delete_custom_agent_definition",
+    "custom_agent_definition_to_dict", "load_custom_agents_into_registry",
+    # crud_documents
+    "store_document", "get_document", "fuzzy_get_document", "list_documents",
+    "delete_document", "store_document_by_project", "get_document_by_project",
+    "fuzzy_get_document_by_project", "list_documents_by_project",
+    "delete_document_by_project", "list_documents_written_by_task",
 ]
 
 # Sentinel — presence of this flag on a subsequent execution means we're

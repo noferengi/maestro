@@ -1,6 +1,6 @@
 # Phase 2 — Scheduler Decoupling
 
-> **Status:** Not started — requires Phase 1  
+> **Status:** SUBSTANTIALLY COMPLETE — 2026-05-15 ⚠️ (core infrastructure done; ~15 scheduler call sites still bypass pipeline router — see audit)  
 > **Depends on:** Phase 1 (all new tables present, `stage_key` populated)  
 > **Estimated effort:** 5 days  
 > **Goal:** Replace scattered `update_task(type=...)` mutations and the hardcoded
@@ -69,11 +69,10 @@ def get_stage_config(task_id: str) -> StageConfig | None:
     required_input_keys, upstream_task_gate, verifier, system_prompt).
     """
 
-def dispatch_task(task_id: str) -> bool:
+def dispatch_task(task_id: str, stage_key: str | None = None, **llm_config) -> bool:
     """
-    Look up the task's stage config, resolve the agent_type via AGENT_REGISTRY,
-    instantiate the agent with (task, stage_config), and run it. Returns True
-    if dispatch succeeded. Replaces the per-stage if/elif block in scheduler.py.
+    Look up the registered handler for stage_key (or current task stage)
+    and call it with llm_config.
     """
 ```
 
@@ -222,3 +221,47 @@ after each migrated call site, not just at the end.
 `pipeline_router.advance_stage()` calls back to direct `update_task(type=...)` calls.
 Because Phase 1 left the system in a state where `type` and `stage_key` are both
 present, the rollback does not require a schema change.
+
+---
+
+## Implementation Audit (2026-05-15)
+
+### What was delivered
+
+All four planned functions exist in `app/agent/pipeline_router.py` with the specified
+signatures (plus a bonus `from_stage` kwarg on `advance_stage` for idempotency).
+`AGENT_REGISTRY` in `app/agent/agent_registry.py` has 12 entries covering all built-in
+and custom types. The DAG dispatch loop in `scheduler.py` was refactored: the per-stage
+`if/elif` block is gone, replaced by `dispatch_task()` plus a late-binding handler
+registration pattern that avoids circular imports. 12 unit tests in
+`test_pipeline_router.py` cover the primary code paths.
+
+Approximately 20+ call sites properly use `advance_stage()` with explicit conditions.
+
+### Remaining hardcoded `update_task(type=...)` bypasses
+
+~15 sites in `scheduler.py` still write `task.type` directly rather than going through
+`advance_stage()`:
+
+| Context | Lines (approx) | Why bypassed |
+|---|---|---|
+| MaestroLoop ACCEPTED / NEEDS_HUMAN / REVERT_TO_DESIGN / MAX_TURNS / ERROR exits | 4102–4209 | Complex multi-condition exits not modelled as graph edges |
+| Planning correction-agent → INDEV path | ~3975 | Special case after PlanningCorrectionAgent patch |
+| Planning → IDEA (subdivide outcome) | ~4015 | No "subdivide" condition in graph; handled as one-off |
+| Security/FinalReview variable demotion targets | ~4633, ~4774 | Dynamic target (indev or conceptual_review) may not have a graph edge |
+
+The plan's primary goal — removing the routing `if/elif` dispatch block — was achieved.
+The remaining bypasses are in **outcome/error paths** inside individual agent runners,
+not in the central dispatch. They do not break correctness (both `type` and `stage_key`
+stay in sync via the caller's own `update_task` call) but they do mean those transitions
+are not graph-driven and will not respect custom pipeline topology for non-software
+templates.
+
+### What still needs completing to call this 100%
+
+1. Map MaestroLoop exits to graph conditions (`pass`, `fail`, `reject`, `escalate`) and
+   remove the direct `update_task` calls in the DevOrchestrator exit handler.
+2. Decide whether "subdivide" should be a first-class graph condition or remain a
+   scheduler-level special case.
+3. Replace variable-target demotions in security/final_review with a `fail` condition
+   that follows the graph's default fail edge.

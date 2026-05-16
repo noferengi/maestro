@@ -89,6 +89,19 @@ async def lifespan(app: FastAPI):
     # Ensure TheMaestro always has a project record (migration backfill covers
     # existing names, but a fresh DB after reset needs it too).
     upsert_project("TheMaestro")
+    # Load custom agent definitions from the DB and register them in AGENT_REGISTRY
+    try:
+        from app.database import load_custom_agents_into_registry
+        n_custom = load_custom_agents_into_registry()
+        if n_custom:
+            logger.info("Loaded %d custom agent definition(s) into AGENT_REGISTRY.", n_custom)
+    except Exception as exc:
+        logger.warning("Failed to load custom agent definitions: %s", exc)
+    # Validate built-in template integrity (logs warnings on drift, never auto-fixes)
+    try:
+        _check_builtin_templates()
+    except Exception as exc:
+        logger.warning("check_builtin_templates failed: %s", exc)
     from app.agent.scheduler import start_scheduler
     start_scheduler()
     try:
@@ -137,6 +150,48 @@ def read_task(task_id: str):
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return task_to_dict(task)
+
+
+def _check_builtin_templates() -> None:
+    """Compare live DB state of built-in templates against expected stage counts.
+
+    Logs a warning for missing templates or stage count mismatches.
+    Never auto-fixes — run migrations to resolve diverged state.
+    """
+    _EXPECTED_STAGES: dict[str, int] = {
+        "Software Development":        10,
+        "Novel Writing":                8,
+        "Research Report":              9,
+        "Data Analysis":                7,
+        "Mathematics / Proof Exploration": 8,
+        "Bug Triage":                   7,
+        "Overnight Generation":         7,
+    }
+    try:
+        from app.database import get_all_templates
+        from app.database.crud_malleable import get_stages_for_template
+        templates = {t.name: t for t in get_all_templates() if t.is_builtin}
+        for name, expected_count in _EXPECTED_STAGES.items():
+            tmpl = templates.get(name)
+            if not tmpl:
+                logger.warning(
+                    "check_builtin_templates: built-in template %r not found in DB — "
+                    "run pending migrations to seed it.",
+                    name,
+                )
+                continue
+            try:
+                actual = len(get_stages_for_template(tmpl.id))
+                if actual != expected_count:
+                    logger.warning(
+                        "check_builtin_templates: template %r has %d stages, expected %d — possible drift.",
+                        name, actual, expected_count,
+                    )
+            except Exception:
+                pass
+        logger.debug("check_builtin_templates: checked %d built-in template(s).", len(_EXPECTED_STAGES))
+    except Exception as exc:
+        logger.warning("check_builtin_templates error: %s", exc)
 
 
 @app.get("/api/tasks/by-type/{task_type}", response_model=List[dict])
@@ -534,55 +589,67 @@ def _handle_subdivision_outcome(task, result, llm_base_url, llm_model, max_conte
         loop=loop,
     )
 
-    if not sub_result.sub_ideas or sub_result.confidence < 50:
-        logger.warning(
-            "[subdivide] Subdivision for task '%s' failed to produce confident children "
-            "(sub_ideas=%d, confidence=%d). Reverting to IDEA.",
-            task.id, len(sub_result.sub_ideas), sub_result.confidence
+    if sub_result.created_ids:
+        # Fast path: tasks already created by batch_create_cards tool
+        child_ids = sub_result.created_ids
+        set_big_idea_flag(task.id)
+        create_subdivision_record(
+            parent_task_id=task.id,
+            child_task_ids=child_ids,
+            generation=generation,
+            attempt_number=1,
+            agent_vote={"method": "batch_create_cards", "created_ids": child_ids},
+            prompt_tokens=sub_result.prompt_tokens,
+            completion_tokens=sub_result.completion_tokens,
+            status="active",
+            interface_contracts=None,
         )
-        update_task(task.id, type="idea")
-        return
+    else:
+        # Legacy path: agent returned structured sub_ideas, create tasks here
+        if not sub_result.sub_ideas or sub_result.confidence < 50:
+            logger.warning(
+                "[subdivide] Subdivision for task '%s' failed to produce confident children "
+                "(sub_ideas=%d, confidence=%d). Reverting to IDEA.",
+                task.id, len(sub_result.sub_ideas), sub_result.confidence
+            )
+            update_task(task.id, type="idea")
+            return
 
-    # Validate sub-idea DAG
-    temp_tasks = []
-    for i, si in enumerate(sub_result.sub_ideas):
-        temp_tasks.append({
-            "id": f"sub-{i}",
-            "type": "idea",
-            "position": i,
-            "prerequisites": si.prerequisites,
-        })
-    dag = DAGResolver(temp_tasks)
-    errors = dag.validate_dag()
-    cycle_errors = [e for e in errors if "Cycle" in e]
-    if cycle_errors:
-        logger.warning("[intake] Subdivision produced cyclic DAG: %s. Reverting to idea.", cycle_errors)
-        update_task(task.id, type="idea")
-        return
+        # Validate sub-idea DAG
+        temp_tasks = []
+        for i, si in enumerate(sub_result.sub_ideas):
+            temp_tasks.append({
+                "id": f"sub-{i}",
+                "type": "idea",
+                "position": i,
+                "prerequisites": si.prerequisites,
+            })
+        dag = DAGResolver(temp_tasks)
+        errors = dag.validate_dag()
+        cycle_errors = [e for e in errors if "Cycle" in e]
+        if cycle_errors:
+            logger.warning("[intake] Subdivision produced cyclic DAG: %s. Reverting to idea.", cycle_errors)
+            update_task(task.id, type="idea")
+            return
 
-    # Create child tasks (with interface contracts)
-    child_ids = _create_sub_idea_tasks(task, sub_result, generation)
+        child_ids = _create_sub_idea_tasks(task, sub_result, generation)
+        set_big_idea_flag(task.id)
 
-    # Set the Big Idea flag on the parent
-    set_big_idea_flag(task.id)
+        contracts_json = None
+        if sub_result.interface_contracts:
+            contracts_json = json.dumps(sub_result.interface_contracts)
 
-    # Serialize interface contracts for the subdivision record
-    contracts_json = None
-    if sub_result.interface_contracts:
-        contracts_json = json.dumps(sub_result.interface_contracts)
-
-    # Create subdivision record
-    create_subdivision_record(
-        parent_task_id=task.id,
-        child_task_ids=child_ids,
-        generation=generation,
-        attempt_number=1,
-        agent_vote=sub_result.raw_output,
-        prompt_tokens=sub_result.prompt_tokens,
-        completion_tokens=sub_result.completion_tokens,
-        status="active",
-        interface_contracts=contracts_json,
-    )
+        create_subdivision_record(
+            parent_task_id=task.id,
+            child_task_ids=child_ids,
+            generation=generation,
+            attempt_number=1,
+            agent_vote=sub_result.raw_output,
+            prompt_tokens=sub_result.prompt_tokens,
+            completion_tokens=sub_result.completion_tokens,
+            status="active",
+            interface_contracts=contracts_json,
+        )
 
     # Transition parent back to 'idea' so it is visible on the board and the
     # Regenerate button works.  The transition_result with outcome="subdivide"
@@ -2774,6 +2841,67 @@ def get_task_research_jobs(task_id: str):
 
 
 # ============================================
+# Workspace: archived files & undelete
+# ============================================
+
+def _archived_file_to_dict(rec) -> dict:
+    return {
+        "id": rec.id,
+        "task_id": rec.task_id,
+        "original_path": rec.original_path,
+        "archive_path": rec.archive_path,
+        "deleted_at": rec.deleted_at.isoformat() if rec.deleted_at else None,
+        "restored_at": rec.restored_at.isoformat() if rec.restored_at else None,
+    }
+
+
+@app.get("/api/tasks/{task_id}/archived-files", response_model=List[dict])
+def list_archived_files(task_id: str):
+    """List files archived (soft-deleted) by this task, most recent first."""
+    from app.database import get_archived_files_for_task as _list
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return [_archived_file_to_dict(r) for r in _list(task_id)]
+
+
+@app.post("/api/tasks/{task_id}/undelete", response_model=dict)
+def undelete_archived_file(task_id: str, data: dict = Body(...)):
+    """Restore a previously archived file.
+
+    Body: { archive_id: int, restore_path?: str }
+    Returns { restored_path: str }
+    """
+    from app.database import get_archived_file as _get, get_project_path as _gpp
+    from app.agent.workspace import undelete_file as _undelete
+
+    archive_id = data.get("archive_id")
+    if archive_id is None:
+        raise HTTPException(status_code=400, detail="archive_id is required")
+    restore_path = data.get("restore_path")
+
+    record = _get(int(archive_id))
+    if not record or record.task_id != task_id:
+        raise HTTPException(status_code=404, detail="Archived file not found for this task")
+
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    project_root = _gpp(task.project) if task.project else None
+    if not project_root:
+        raise HTTPException(status_code=400, detail="Task has no associated project path")
+
+    try:
+        restored = _undelete(int(archive_id), project_root, restore_path)
+        return {"restored_path": restored}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+# ============================================
 # Ad-hoc Agent Toolbar Routes
 # ============================================
 
@@ -3494,13 +3622,8 @@ def _trigger_project_prewarm(
 # ============================================
 
 def _project_to_dict(p) -> dict:
-    return {
-        "name": p.name,
-        "path": p.path or "",
-        "description": p.description or "",
-        "llm_id": p.llm_id,
-        "budget_id": p.budget_id,
-    }
+    from database import project_to_dict
+    return project_to_dict(p)
 
 
 @app.get("/api/projects", response_model=List[dict])
@@ -3556,7 +3679,18 @@ def create_project(data: dict):
     budget_id = data.get("budget_id") or None
     if budget_id is not None:
         budget_id = int(budget_id)
-    project = upsert_project(name, path=path, description=description, llm_id=llm_id, budget_id=budget_id)
+    pipeline_template_id = data.get("pipeline_template_id") or None
+    if pipeline_template_id is not None:
+        pipeline_template_id = int(pipeline_template_id)
+
+    project = upsert_project(
+        name=name,
+        path=path,
+        description=description,
+        llm_id=llm_id if llm_id is not None else ...,
+        budget_id=budget_id if budget_id is not None else ...,
+        pipeline_template_id=pipeline_template_id if pipeline_template_id is not None else ...,
+    )
     if not project:
         raise HTTPException(status_code=500, detail="Failed to create project.")
     if project.path:
@@ -3590,12 +3724,67 @@ def update_project(project_name: str, data: dict):
     budget_id = data.get("budget_id", ...)  # Ellipsis = don't change; None = clear
     if budget_id is not ... and budget_id is not None:
         budget_id = int(budget_id)
-    project = upsert_project(effective_name, path=path, description=description, llm_id=llm_id, budget_id=budget_id)
+    pipeline_template_id = data.get("pipeline_template_id", ...)
+    if pipeline_template_id is not ... and pipeline_template_id is not None:
+        pipeline_template_id = int(pipeline_template_id)
+
+    project = upsert_project(
+        effective_name,
+        path=path,
+        description=description,
+        llm_id=llm_id,
+        budget_id=budget_id,
+        pipeline_template_id=pipeline_template_id
+    )
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or update failed.")
     if project.path:
         _trigger_project_prewarm(project.name, project.path, project_llm_id=project.llm_id, project_budget_id=project.budget_id)
     return _project_to_dict(project)
+
+
+# ============================================
+# Malleable Pipeline Configuration Endpoints
+# ============================================
+
+@app.get("/api/pipeline-templates", response_model=List[dict])
+def read_pipeline_templates():
+    """List all pipeline templates with their topology"""
+    from database import get_all_templates, template_to_dict
+    templates = get_all_templates()
+    return [template_to_dict(t) for t in templates]
+
+
+@app.get("/api/pipeline-templates/{template_id}", response_model=dict)
+def read_pipeline_template(template_id: int):
+    """Get a single pipeline template with full topology"""
+    from database import get_template, template_to_dict
+    template = get_template(template_id)
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return template_to_dict(template)
+
+
+@app.get("/api/projects/{project_name}/pipeline", response_model=dict)
+def read_project_pipeline(project_name: str):
+    """Get the full pipeline topology for a specific project"""
+    from database import get_project, get_template, get_default_template, template_to_dict
+    project = get_project(project_name)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    tid = project.pipeline_template_id
+    template = None
+    if tid:
+        template = get_template(tid)
+    
+    if not template:
+        template = get_default_template()
+    
+    if not template:
+        raise HTTPException(status_code=404, detail="No pipeline template found")
+        
+    return template_to_dict(template)
 
 
 @app.delete("/api/projects/{project_name}")
@@ -4298,9 +4487,8 @@ def get_stats_throughput(bucket_minutes: int = 5, hours: int = 24):
 
         buckets = db.execute(text("""
             SELECT
-                datetime(
-                    CAST(strftime('%s', created_at) / :bsecs AS INTEGER) * :bsecs,
-                    'unixepoch'
+                to_timestamp(
+                    FLOOR(EXTRACT(EPOCH FROM created_at) / :bsecs) * :bsecs
                 ) AS bucket,
                 COALESCE(SUM(prompt_cost), 0)     AS pp,
                 COALESCE(SUM(generation_cost), 0) AS tg,
@@ -4478,6 +4666,845 @@ def read_scheduler():
 def read_tail():
     """Session tail page — live log of active agent LLM calls."""
     return FileResponse("app/web/tail.html")
+
+
+# ============================================
+# Pipeline (Malleable) CRUD API — Phase 3
+# ============================================
+
+def _stage_to_dict(s) -> dict:
+    return {
+        "id": s.id, "template_id": s.template_id, "stage_key": s.stage_key,
+        "label": s.label, "agent_type": s.agent_type, "position": s.position,
+        "group_id": s.group_id, "config": s.config, "color": s.color,
+    }
+
+
+def _transition_to_dict(t) -> dict:
+    return {
+        "id": t.id, "template_id": t.template_id,
+        "from_stage_id": t.from_stage_id, "to_stage_id": t.to_stage_id,
+        "condition": t.condition, "priority": t.priority,
+    }
+
+
+def _group_to_dict(g) -> dict:
+    return {"id": g.id, "template_id": g.template_id, "name": g.name, "color": g.color, "position": g.position}
+
+
+def _arch_cat_to_dict(c) -> dict:
+    return {"id": c.id, "template_id": c.template_id, "key": c.key, "label": c.label, "color": c.color, "position": c.position}
+
+
+def _template_meta_to_dict(t) -> dict:
+    return {
+        "id": t.id, "name": t.name, "description": t.description,
+        "is_default": t.is_default, "is_builtin": t.is_builtin, "version": t.version,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+        "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+    }
+
+
+# NOTE: fixed-path routes (/agent-types, /import) must appear before /{id} to avoid
+# FastAPI trying to cast the literal string as an integer.
+
+@app.get("/api/pipelines/agent-types", response_model=List[dict])
+def list_agent_types():
+    """Return all registered agent types from AGENT_REGISTRY."""
+    from app.agent.agent_registry import AGENT_REGISTRY
+    return [
+        {
+            "key": key,
+            "display_name": spec.display_name,
+            "description": spec.description,
+            "default_tools": spec.default_tools,
+            "gate_type": spec.gate_type,
+        }
+        for key, spec in AGENT_REGISTRY.items()
+    ]
+
+
+@app.get("/api/agent-definitions", response_model=List[dict])
+def list_agent_definitions():
+    """List all custom agent definitions."""
+    from app.database import get_all_custom_agent_definitions, custom_agent_definition_to_dict as _to_dict
+    return [_to_dict(d) for d in get_all_custom_agent_definitions()]
+
+
+@app.post("/api/agent-definitions", response_model=dict, status_code=201)
+def create_agent_definition(body: dict = Body(...)):
+    """Create a new custom agent definition."""
+    from app.database import (
+        create_custom_agent_definition as _create,
+        custom_agent_definition_to_dict as _to_dict,
+        load_custom_agents_into_registry,
+    )
+    name = (body.get("name") or "").strip()
+    display_name = (body.get("display_name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    if not display_name:
+        raise HTTPException(status_code=400, detail="display_name is required")
+    d = _create(
+        name=name,
+        display_name=display_name,
+        description=body.get("description") or "",
+        intent=body.get("intent") or "",
+        system_prompt=body.get("system_prompt") or "",
+        allowed_tools=body.get("allowed_tools") or [],
+        gate_type=body.get("gate_type") or "llm_judge",
+        verifier=body.get("verifier") or "none",
+        verifier_cmd=body.get("verifier_cmd"),
+        max_turns=body.get("max_turns"),
+        max_tokens=body.get("max_tokens"),
+        user_prompt_template=body.get("user_prompt_template"),
+    )
+    if not d:
+        raise HTTPException(status_code=409, detail=f"Failed to create definition (name may already exist: {name!r})")
+    load_custom_agents_into_registry()
+    return _to_dict(d)
+
+
+@app.get("/api/agent-definitions/tool-manifest", response_model=List[dict])
+def get_agent_tool_manifest():
+    """Return all available tools with name, description, category, and always_on flag."""
+    from app.agent.tools import TOOL_SCHEMAS, TOOL_CATEGORIES
+    _ALWAYS_ON = {"submit_work", "report_tool_bug"}
+    return [
+        {
+            "name":        s["function"]["name"],
+            "description": s["function"].get("description", ""),
+            "category":    TOOL_CATEGORIES.get(s["function"]["name"], "Other"),
+            "always_on":   s["function"]["name"] in _ALWAYS_ON,
+        }
+        for s in TOOL_SCHEMAS
+    ]
+
+
+@app.get("/api/agent-definitions/{defn_id}", response_model=dict)
+def get_agent_definition(defn_id: int):
+    """Get one custom agent definition by ID."""
+    from app.database import get_custom_agent_definition_by_id, custom_agent_definition_to_dict as _to_dict
+    d = get_custom_agent_definition_by_id(defn_id)
+    if not d:
+        raise HTTPException(status_code=404, detail="Not found")
+    return _to_dict(d)
+
+
+@app.put("/api/agent-definitions/{defn_id}", response_model=dict)
+def update_agent_definition(defn_id: int, body: dict = Body(...)):
+    """Update a custom agent definition."""
+    from app.database import (
+        update_custom_agent_definition as _update,
+        custom_agent_definition_to_dict as _to_dict,
+        load_custom_agents_into_registry,
+    )
+    kwargs = {}
+    for field in ("name", "display_name", "description", "intent", "system_prompt",
+                  "allowed_tools", "gate_type", "verifier", "verifier_cmd",
+                  "max_turns", "max_tokens", "user_prompt_template"):
+        if field in body:
+            kwargs[field] = body[field]
+    if not kwargs:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    d = _update(defn_id, **kwargs)
+    if not d:
+        raise HTTPException(status_code=404, detail="Not found")
+    load_custom_agents_into_registry()
+    return _to_dict(d)
+
+
+@app.delete("/api/agent-definitions/{defn_id}", response_model=dict)
+def delete_agent_definition(defn_id: int):
+    """Delete a custom agent definition (blocked if used in any pipeline stage)."""
+    from app.database import delete_custom_agent_definition as _delete
+    result = _delete(defn_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error", "Delete failed"))
+    return {"deleted": True}
+
+
+@app.post("/api/pipelines/import", response_model=dict, status_code=201)
+def import_pipeline_template(blob: dict = Body(...)):
+    """Create a new template from an export blob. Never overwrites existing templates."""
+    from app.database import import_template as _import
+    try:
+        t = _import(blob)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not t:
+        raise HTTPException(status_code=500, detail="Import failed")
+    from app.database import template_to_dict as _ttd
+    return _ttd(t)
+
+
+@app.post("/api/pipelines/generate-field")
+async def generate_pipeline_field(body: dict = Body(...)):
+    """⚡ Generate a field value for a pipeline stage using the configured LLM.
+
+    Streams the response so the field populates progressively.
+    Falls back to the first available LLM if no project context is given.
+    """
+    field = (body.get("field") or "").strip()
+    valid_fields = {"system_prompt", "label", "intent", "gate_type", "tool_allowlist"}
+    if field not in valid_fields:
+        raise HTTPException(status_code=400, detail=f"field must be one of {valid_fields}")
+
+    node_state = body.get("node_state") or {}
+    graph_context = body.get("graph_context") or {}
+    partial_value = body.get("partial_value") or ""
+
+    # Resolve LLM — use the smallest/fastest available
+    from app.database import get_all_llms as _all_llms
+    llms = _all_llms()
+    if not llms:
+        raise HTTPException(status_code=503, detail="No LLM endpoint configured")
+    llm = llms[0]  # cheapest/first
+
+    llm_base_url = f"http://{llm.address}:{llm.port}/v1"
+    llm_model = llm.model
+
+    system_prompt = (
+        f'You are a pipeline designer assistant for Maestro, an AI orchestration system.\n\n'
+        f'Pipeline: "{graph_context.get("pipeline_name", "(unnamed)")}"\n'
+        f'Pipeline description: "{graph_context.get("pipeline_description", "")}"\n\n'
+        f'The node being designed:\n'
+        f'  Stage key: {node_state.get("stage_key", "")}\n'
+        f'  Agent type: {node_state.get("agent_type", "")}\n'
+        f'  Display label: {node_state.get("label", "")}\n'
+        f'  Intent: {node_state.get("intent", "")}\n'
+        f'  Gate type: {node_state.get("gate_type", "")}\n'
+        f'  Tools allowed: {node_state.get("tool_allowlist", "")}\n'
+        f'  Predecessor stages: {graph_context.get("predecessor_labels", [])}\n'
+        f'  Successor stages: {graph_context.get("successor_labels", [])}\n'
+        f'  Incoming conditions: {graph_context.get("in_conditions", [])}\n'
+        f'  Outgoing conditions: {graph_context.get("out_conditions", [])}\n\n'
+        f'The user has started typing the following for the "{field}" field:\n'
+        f'  "{partial_value}"\n\n'
+        f'Generate a {field} for this stage. Use the intent, label, agent type, tool list, '
+        f'and graph position as your primary signal. Return only the generated value — '
+        f'no explanation, no markdown fencing.'
+    )
+
+    import httpx
+
+    async def _stream():
+        payload = {
+            "model": llm_model,
+            "stream": True,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Generate the {field} field."},
+            ],
+            "max_tokens": 1024,
+        }
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            try:
+                async with client.stream("POST", f"{llm_base_url}/chat/completions", json=payload) as resp:
+                    async for line in resp.aiter_lines():
+                        if line.startswith("data: "):
+                            chunk = line[6:]
+                            if chunk == "[DONE]":
+                                break
+                            try:
+                                data = json.loads(chunk)
+                                token = (data.get("choices") or [{}])[0].get("delta", {}).get("content") or ""
+                                if token:
+                                    yield token
+                            except (json.JSONDecodeError, KeyError):
+                                pass
+            except Exception as exc:
+                logger.warning("[generate-field] LLM stream failed: %s", exc)
+                yield ""
+
+    return StreamingResponse(_stream(), media_type="text/plain")
+
+
+@app.get("/api/pipelines", response_model=List[dict])
+def list_pipeline_templates():
+    """List all pipeline templates (id, name, is_default, version)."""
+    from app.database import get_all_templates as _all
+    return [_template_meta_to_dict(t) for t in _all()]
+
+
+@app.post("/api/pipelines", response_model=dict, status_code=201)
+def create_pipeline_template(data: dict = Body(...)):
+    """Create a new pipeline template."""
+    from app.database import create_template as _create
+    name = (data.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    t = _create(
+        name=name,
+        description=data.get("description"),
+        is_default=bool(data.get("is_default", False)),
+    )
+    if not t:
+        raise HTTPException(status_code=409, detail=f"A template named '{name}' already exists")
+    return _template_meta_to_dict(t)
+
+
+@app.get("/api/pipelines/{template_id}", response_model=dict)
+def get_pipeline_template(template_id: int):
+    """Return the full template: stages + transitions + groups + arch_categories."""
+    from app.database import get_template as _get, template_to_dict as _ttd
+    t = _get(template_id)
+    if not t:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return _ttd(t)
+
+
+@app.put("/api/pipelines/{template_id}", response_model=dict)
+def update_pipeline_template(template_id: int, data: dict = Body(...)):
+    """Update template metadata (name, description, is_default)."""
+    from app.database import update_template as _update
+    t = _update(
+        template_id,
+        name=data.get("name"),
+        description=data.get("description"),
+        is_default=data.get("is_default"),
+        version_bump=bool(data.get("version_bump", False)),
+    )
+    if not t:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return _template_meta_to_dict(t)
+
+
+@app.delete("/api/pipelines/{template_id}", response_model=dict)
+def delete_pipeline_template(template_id: int, force: bool = False):
+    """Delete a template.  Blocked if builtin or if any project uses it (pass force=true to override in-use check)."""
+    from app.database import delete_template as _delete
+    try:
+        ok = _delete(template_id, force=force)
+    except ValueError as exc:
+        s = str(exc)
+        if "template_is_builtin" in s:
+            raise HTTPException(
+                status_code=400,
+                detail="Built-in templates cannot be deleted.",
+            )
+        if "template_in_use" in s:
+            raise HTTPException(
+                status_code=409,
+                detail="Template is assigned to one or more projects. Pass force=true to delete anyway.",
+            )
+        raise
+    if not ok:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return {"deleted": True, "template_id": template_id}
+
+
+@app.post("/api/pipelines/{template_id}/clone", response_model=dict, status_code=201)
+def clone_pipeline_template(template_id: int, data: dict = Body(...)):
+    """Clone a template (including built-in ones) under a new name."""
+    from app.database import clone_template as _clone, template_to_dict as _ttd
+    new_name = (data.get("name") or "").strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="'name' is required")
+    t = _clone(template_id, new_name)
+    if t is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Template not found or a template named '{new_name}' already exists",
+        )
+    return _ttd(t)
+
+
+@app.get("/api/pipelines/{template_id}/export", response_model=dict)
+def export_pipeline_template(template_id: int):
+    """Export a template as a portable JSON blob (schema_version=1)."""
+    from app.database import export_template as _export
+    blob = _export(template_id)
+    if blob is None:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return blob
+
+
+@app.post("/api/projects/{project_name}/use-template", response_model=dict)
+def use_template_for_project(project_name: str, data: dict = Body(...)):
+    """Assign a pipeline template to a project.
+
+    Sets projects.pipeline_template_id.  Returns the updated project dict.
+    """
+    from app.database import get_project, get_template, upsert_project, project_to_dict
+    template_id = data.get("template_id")
+    if not template_id:
+        raise HTTPException(status_code=400, detail="'template_id' is required")
+    template_id = int(template_id)
+
+    proj = get_project(project_name)
+    if not proj:
+        raise HTTPException(status_code=404, detail=f"Project '{project_name}' not found")
+    tmpl = get_template(template_id)
+    if not tmpl:
+        raise HTTPException(status_code=404, detail=f"Template {template_id} not found")
+
+    updated = upsert_project(project_name, pipeline_template_id=template_id)
+    return project_to_dict(updated)
+
+
+# --- Stages ---
+
+@app.get("/api/pipelines/{template_id}/stages", response_model=List[dict])
+def list_stages(template_id: int):
+    from app.database import get_template as _get, get_stages_for_template as _stages
+    if not _get(template_id):
+        raise HTTPException(status_code=404, detail="Template not found")
+    return [_stage_to_dict(s) for s in _stages(template_id)]
+
+
+@app.post("/api/pipelines/{template_id}/stages", response_model=dict, status_code=201)
+def add_stage(template_id: int, data: dict = Body(...)):
+    from app.database import get_template as _get, create_stage as _create
+    if not _get(template_id):
+        raise HTTPException(status_code=404, detail="Template not found")
+    for f in ("stage_key", "label", "agent_type"):
+        if not (data.get(f) or "").strip():
+            raise HTTPException(status_code=400, detail=f"'{f}' is required")
+    s = _create(
+        template_id=template_id,
+        stage_key=data["stage_key"].strip(),
+        label=data["label"].strip(),
+        agent_type=data["agent_type"].strip(),
+        position=data.get("position", 0),
+        group_id=data.get("group_id"),
+        config=data.get("config"),
+        color=data.get("color"),
+    )
+    if not s:
+        raise HTTPException(status_code=409, detail="Stage key already exists in this template")
+    return _stage_to_dict(s)
+
+
+@app.put("/api/pipelines/{template_id}/stages/{stage_id}", response_model=dict)
+def update_stage_endpoint(template_id: int, stage_id: int, data: dict = Body(...)):
+    from app.database import get_stage_by_id as _get, update_stage as _update
+    existing = _get(stage_id)
+    if not existing or existing.template_id != template_id:
+        raise HTTPException(status_code=404, detail="Stage not found in this template")
+    sentinel = object()
+    s = _update(
+        stage_id,
+        label=data.get("label"),
+        agent_type=data.get("agent_type"),
+        position=data.get("position"),
+        group_id=data.get("group_id", ...),
+        config=data.get("config", ...),
+        color=data.get("color", ...),
+    )
+    if not s:
+        raise HTTPException(status_code=404, detail="Stage not found")
+    return _stage_to_dict(s)
+
+
+@app.delete("/api/pipelines/{template_id}/stages/{stage_id}", response_model=dict)
+def delete_stage_endpoint(template_id: int, stage_id: int):
+    from app.database import get_stage_by_id as _get, delete_stage as _delete
+    existing = _get(stage_id)
+    if not existing or existing.template_id != template_id:
+        raise HTTPException(status_code=404, detail="Stage not found in this template")
+    result = _delete(stage_id)
+    if not result.get("ok"):
+        err = result.get("error")
+        if err == "tasks_assigned":
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "tasks_assigned",
+                    "task_count": result.get("task_count", 0),
+                    "message": "Cannot delete stage with assigned tasks. Use delete-with-redirect.",
+                },
+            )
+        raise HTTPException(status_code=500, detail=err)
+    return {"deleted": True, "stage_id": stage_id}
+
+
+@app.post("/api/pipelines/{template_id}/stages/{stage_id}/delete-with-redirect", response_model=dict)
+def delete_stage_with_redirect_endpoint(template_id: int, stage_id: int, data: dict = Body(...)):
+    from app.database import get_stage_by_id as _get, delete_stage_with_redirect as _dwr
+    redirect_key = (data.get("redirect_stage_key") or "").strip()
+    if not redirect_key:
+        raise HTTPException(status_code=400, detail="redirect_stage_key is required")
+    existing = _get(stage_id)
+    if not existing or existing.template_id != template_id:
+        raise HTTPException(status_code=404, detail="Stage not found in this template")
+    result = _dwr(stage_id, redirect_key)
+    if not result.get("ok"):
+        err = result.get("error", "internal_error")
+        if err == "redirect_stage_not_found":
+            raise HTTPException(status_code=400, detail=f"Redirect stage '{redirect_key}' not found in template")
+        raise HTTPException(status_code=500, detail=err)
+    return {"deleted": True, "stage_id": stage_id, "migrated_tasks": result.get("migrated_tasks", 0)}
+
+
+# --- Factory trigger ---
+
+@app.post("/api/pipelines/stages/{stage_id}/trigger-factory", response_model=dict)
+def trigger_factory(stage_id: int, project: str = "", body: dict = Body(default={})):
+    """Manually trigger a card factory stage for a given project.
+
+    Query param `project` is the project name.  Falls back to body["project"].
+    Returns the factory_run audit row.
+    """
+    from app.database import (
+        get_stage_by_id as _get_stage,
+        get_project as _get_project,
+        factory_run_to_dict as _run_to_dict,
+    )
+    from app.agent.card_factory import run_factory as _run_factory
+
+    project_name = project or body.get("project") or ""
+    stage = _get_stage(stage_id)
+    if not stage:
+        raise HTTPException(status_code=404, detail="Stage not found")
+
+    proj = _get_project(project_name) if project_name else None
+    if proj is None:
+        raise HTTPException(status_code=400, detail="project query param required and must exist")
+
+    trigger_card_id = body.get("trigger_card_id") or None
+
+    llm_id = proj.llm_id
+    budget_id = proj.budget_id
+    llm_base_url = "http://localhost:8008/v1"
+    llm_model = "local"
+    max_context = None
+    if llm_id:
+        from app.database import get_llm as _get_llm
+        llm = _get_llm(llm_id)
+        if llm:
+            llm_base_url = f"http://{llm.address}:{llm.port}/v1"
+            llm_model = llm.model
+            max_context = llm.max_context
+
+    try:
+        run = _run_factory(
+            stage_id,
+            proj.id,
+            "manual",
+            trigger_card_id=trigger_card_id,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            max_context=max_context,
+            llm_id=llm_id,
+            budget_id=budget_id,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return _run_to_dict(run) if run else {"status": "error", "detail": "factory run failed"}
+
+
+@app.get("/api/pipelines/stages/{stage_id}/factory-runs", response_model=List[dict])
+def list_factory_runs(stage_id: int):
+    """Return the last 20 factory run audit rows for a stage."""
+    from app.database import (
+        get_stage_by_id as _get_stage,
+        get_factory_runs_for_stage as _get_runs,
+        factory_run_to_dict as _run_to_dict,
+    )
+    if not _get_stage(stage_id):
+        raise HTTPException(status_code=404, detail="Stage not found")
+    return [_run_to_dict(r) for r in _get_runs(stage_id)]
+
+
+# --- Transitions ---
+
+@app.get("/api/pipelines/{template_id}/transitions", response_model=List[dict])
+def list_transitions(template_id: int):
+    from app.database import get_template as _get, get_transitions_for_template as _list
+    if not _get(template_id):
+        raise HTTPException(status_code=404, detail="Template not found")
+    return [_transition_to_dict(t) for t in _list(template_id)]
+
+
+@app.post("/api/pipelines/{template_id}/transitions", response_model=dict, status_code=201)
+def add_transition(template_id: int, data: dict = Body(...)):
+    from app.database import get_template as _get, create_transition as _create
+    if not _get(template_id):
+        raise HTTPException(status_code=404, detail="Template not found")
+    from_id = data.get("from_stage_id")
+    to_id = data.get("to_stage_id")
+    cond = (data.get("condition") or "").strip()
+    if not from_id or not to_id or not cond:
+        raise HTTPException(status_code=400, detail="from_stage_id, to_stage_id, condition are required")
+    try:
+        tr = _create(template_id=template_id, from_stage_id=from_id, to_stage_id=to_id, condition=cond, priority=data.get("priority", 0))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not tr:
+        raise HTTPException(status_code=500, detail="Failed to create transition")
+    return _transition_to_dict(tr)
+
+
+@app.put("/api/pipelines/{template_id}/transitions/{transition_id}", response_model=dict)
+def update_transition_endpoint(template_id: int, transition_id: int, data: dict = Body(...)):
+    from app.database import get_transition_by_id as _get, update_transition as _update
+    existing = _get(transition_id)
+    if not existing or existing.template_id != template_id:
+        raise HTTPException(status_code=404, detail="Transition not found in this template")
+    try:
+        tr = _update(transition_id, condition=data.get("condition"), priority=data.get("priority"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not tr:
+        raise HTTPException(status_code=404, detail="Transition not found")
+    return _transition_to_dict(tr)
+
+
+@app.delete("/api/pipelines/{template_id}/transitions/{transition_id}", response_model=dict)
+def delete_transition_endpoint(template_id: int, transition_id: int):
+    from app.database import get_transition_by_id as _get, delete_transition as _delete
+    existing = _get(transition_id)
+    if not existing or existing.template_id != template_id:
+        raise HTTPException(status_code=404, detail="Transition not found in this template")
+    if not _delete(transition_id):
+        raise HTTPException(status_code=404, detail="Transition not found")
+    return {"deleted": True, "transition_id": transition_id}
+
+
+# --- Stage Groups ---
+
+@app.post("/api/pipelines/{template_id}/groups", response_model=dict, status_code=201)
+def create_group(template_id: int, data: dict = Body(...)):
+    from app.database import get_template as _get, create_stage_group as _create
+    if not _get(template_id):
+        raise HTTPException(status_code=404, detail="Template not found")
+    name = (data.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    g = _create(template_id=template_id, name=name, position=data.get("position", 0), color=data.get("color"))
+    if not g:
+        raise HTTPException(status_code=500, detail="Failed to create group")
+    return _group_to_dict(g)
+
+
+@app.put("/api/pipelines/{template_id}/groups/{group_id}", response_model=dict)
+def update_group(template_id: int, group_id: int, data: dict = Body(...)):
+    from app.database import get_group_by_id as _get, update_stage_group as _update
+    existing = _get(group_id)
+    if not existing or existing.template_id != template_id:
+        raise HTTPException(status_code=404, detail="Group not found in this template")
+    g = _update(group_id, name=data.get("name"), color=data.get("color", ...), position=data.get("position"))
+    if not g:
+        raise HTTPException(status_code=404, detail="Group not found")
+    return _group_to_dict(g)
+
+
+@app.delete("/api/pipelines/{template_id}/groups/{group_id}", response_model=dict)
+def delete_group(template_id: int, group_id: int):
+    from app.database import get_group_by_id as _get, delete_stage_group as _delete
+    existing = _get(group_id)
+    if not existing or existing.template_id != template_id:
+        raise HTTPException(status_code=404, detail="Group not found in this template")
+    if not _delete(group_id):
+        raise HTTPException(status_code=404, detail="Group not found")
+    return {"deleted": True, "group_id": group_id}
+
+
+# --- Arch Categories ---
+
+@app.get("/api/pipelines/{template_id}/arch-categories", response_model=List[dict])
+def list_arch_categories(template_id: int):
+    from app.database import get_template as _get, get_arch_categories_for_template as _list
+    if not _get(template_id):
+        raise HTTPException(status_code=404, detail="Template not found")
+    return [_arch_cat_to_dict(c) for c in _list(template_id)]
+
+
+@app.post("/api/pipelines/{template_id}/arch-categories", response_model=dict, status_code=201)
+def add_arch_category(template_id: int, data: dict = Body(...)):
+    from app.database import get_template as _get, create_arch_category as _create
+    if not _get(template_id):
+        raise HTTPException(status_code=404, detail="Template not found")
+    for f in ("key", "label"):
+        if not (data.get(f) or "").strip():
+            raise HTTPException(status_code=400, detail=f"'{f}' is required")
+    c = _create(template_id=template_id, key=data["key"].strip(), label=data["label"].strip(),
+                position=data.get("position", 0), color=data.get("color"))
+    if not c:
+        raise HTTPException(status_code=409, detail="Arch category key already exists in this template")
+    return _arch_cat_to_dict(c)
+
+
+@app.put("/api/pipelines/{template_id}/arch-categories/{cat_id}", response_model=dict)
+def update_arch_category_endpoint(template_id: int, cat_id: int, data: dict = Body(...)):
+    from app.database import get_arch_category_by_id as _get, update_arch_category as _update
+    existing = _get(cat_id)
+    if not existing or existing.template_id != template_id:
+        raise HTTPException(status_code=404, detail="Arch category not found in this template")
+    c = _update(cat_id, key=data.get("key"), label=data.get("label"), color=data.get("color", ...), position=data.get("position"))
+    if not c:
+        raise HTTPException(status_code=404, detail="Arch category not found")
+    return _arch_cat_to_dict(c)
+
+
+@app.delete("/api/pipelines/{template_id}/arch-categories/{cat_id}", response_model=dict)
+def delete_arch_category_endpoint(template_id: int, cat_id: int):
+    from app.database import get_arch_category_by_id as _get, delete_arch_category as _delete
+    existing = _get(cat_id)
+    if not existing or existing.template_id != template_id:
+        raise HTTPException(status_code=404, detail="Arch category not found in this template")
+    if not _delete(cat_id):
+        raise HTTPException(status_code=404, detail="Arch category not found")
+    return {"deleted": True, "cat_id": cat_id}
+
+
+# --- Template Export ---
+
+@app.get("/api/pipelines/{template_id}/export", response_model=dict)
+def export_pipeline_template(template_id: int):
+    """Return full template as a portable JSON blob."""
+    from app.database import export_template as _export
+    blob = _export(template_id)
+    if blob is None:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return blob
+
+
+# --- Project Pipeline Assignment ---
+
+@app.post("/api/projects/{project_name}/pipeline", response_model=dict)
+def assign_pipeline_to_project(project_name: str, data: dict = Body(...)):
+    """Assign a pipeline template to a project.
+
+    Migrates all active tasks whose stage_key no longer exists in the new template
+    to the first stage of the new template (position=0).
+    """
+    from app.database import get_project as _get_proj, upsert_project as _upsert
+    from app.database import get_template as _get_tmpl, get_stages_for_template as _stages
+    from app.database import get_tasks_by_project as _tasks, update_task
+
+    project = _get_proj(project_name)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    template_id = data.get("template_id")
+    if template_id is None:
+        raise HTTPException(status_code=400, detail="template_id is required")
+
+    template = _get_tmpl(int(template_id))
+    if not template:
+        raise HTTPException(status_code=404, detail="Pipeline template not found")
+
+    stages = _stages(template.id)
+    valid_keys = {s.stage_key for s in stages}
+    fallback_key = stages[0].stage_key if stages else None
+
+    # Migrate tasks whose current stage_key is no longer in the new template
+    migrated = 0
+    if fallback_key:
+        tasks = _tasks(project_name)
+        for task in tasks:
+            sk = getattr(task, "stage_key", None) or task.type
+            if sk not in valid_keys:
+                update_task(task.id, stage_key=fallback_key, type=fallback_key)
+                migrated += 1
+
+    _upsert(project_name, pipeline_template_id=int(template_id))
+
+    return {
+        "project": project_name,
+        "template_id": template.id,
+        "template_name": template.name,
+        "migrated_tasks": migrated,
+    }
+
+
+# Hardcoded fallback arch categories (used when the project has no template assigned)
+_DEFAULT_ARCH_CATEGORIES = [
+    {"key": "Platform",      "label": "Platform",      "color": "#17a2b8", "position": 0},
+    {"key": "Design",        "label": "Design",        "color": "#a78bfa", "position": 1},
+    {"key": "Testing",       "label": "Testing",       "color": "#20c997", "position": 2},
+    {"key": "Security",      "label": "Security",      "color": "#f87171", "position": 3},
+    {"key": "Performance",   "label": "Performance",   "color": "#fb923c", "position": 4},
+    {"key": "API",           "label": "API",           "color": "#60a5fa", "position": 5},
+    {"key": "Tooling",       "label": "Tooling",       "color": "#fbbf24", "position": 6},
+    {"key": "Data",          "label": "Data",          "color": "#818cf8", "position": 7},
+    {"key": "UX",            "label": "UX",            "color": "#f472b6", "position": 8},
+    {"key": "Accessibility", "label": "Accessibility", "color": "#34d399", "position": 9},
+    {"key": "Compliance",    "label": "Compliance",    "color": "#e879f9", "position": 10},
+    {"key": "Deployment",    "label": "Deployment",    "color": "#4ade80", "position": 11},
+    {"key": "Observability", "label": "Observability", "color": "#38bdf8", "position": 12},
+    {"key": "General",       "label": "General",       "color": "#6c757d", "position": 13},
+]
+
+
+@app.get("/api/projects/{project_name}/arch-categories", response_model=List[dict])
+def get_project_arch_categories(project_name: str):
+    """Return arch categories for the project's assigned pipeline template.
+
+    Falls back to the default hardcoded set if the project has no template.
+    Used by kanban.js on load to populate the dynamic archCategoryMap.
+    """
+    from app.database import get_project as _get_proj, get_arch_categories_for_template as _list_cats
+
+    project = _get_proj(project_name)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if project.pipeline_template_id:
+        cats = _list_cats(project.pipeline_template_id)
+        if cats:
+            return [_arch_cat_to_dict(c) for c in cats]
+
+    # No template assigned or template has no categories — return the default set
+    return _DEFAULT_ARCH_CATEGORIES
+
+
+# ============================================
+# Pipeline Editor Page Routes (Phase 4)
+# ============================================
+
+@app.get("/pipelines")
+def gallery_page():
+    """Pipeline template gallery (Phase 10)."""
+    return FileResponse("app/web/gallery.html")
+
+
+@app.get("/pipelines/new")
+def new_pipeline_page():
+    """Create a new blank template and redirect to its editor."""
+    from app.database import create_template as _create_tpl
+    t = _create_tpl(name="Untitled Pipeline")
+    if not t:
+        raise HTTPException(status_code=500, detail="Failed to create template")
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=f"/pipelines/{t.id}/edit", status_code=303)
+
+
+@app.get("/pipelines/{template_id}/edit")
+def edit_pipeline_page(template_id: int):
+    """Canvas pipeline editor for the given template."""
+    return FileResponse("app/web/pipeline_editor.html")
+
+
+@app.get("/agents")
+def agent_definitions_gallery_page():
+    """Agent definitions gallery."""
+    return FileResponse("app/web/agent_definitions.html")
+
+
+@app.get("/agents/new")
+def new_agent_definition_page():
+    """Create a blank agent definition and redirect to its editor."""
+    import time
+    from app.database import (
+        create_custom_agent_definition as _create,
+        load_custom_agents_into_registry,
+    )
+    defn = _create(name=f"agent-{int(time.time())}", display_name="New Agent")
+    if not defn:
+        raise HTTPException(status_code=500, detail="Failed to create agent definition")
+    load_custom_agents_into_registry()
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=f"/agents/{defn.id}/edit", status_code=303)
+
+
+@app.get("/agents/{defn_id}/edit")
+def edit_agent_definition_page(defn_id: int):
+    """Agent definition editor."""
+    return FileResponse("app/web/agent_definitions_editor.html")
 
 
 # ============================================
@@ -5680,3 +6707,182 @@ def update_maestro_config(data: dict = Body(...)):
     if "auto_merge" in data:
         set_system_setting("maestro_auto_merge", bool(data["auto_merge"]), "Enable autonomous acceptance and merging")
     return {"status": "updated", "config": data}
+
+
+# ===========================================================================
+# Autopilot API  (Phase 7)
+# ===========================================================================
+
+@app.get("/api/settings/autopilot", response_model=dict)
+def get_autopilot_settings():
+    """Return the current autopilot state and scheduled hours."""
+    return {
+        "autopilot":   get_system_setting("maestro_autopilot", "off"),
+        "start_hour":  int(get_system_setting("autopilot_start_hour", 0) or 0),
+        "stop_hour":   int(get_system_setting("autopilot_stop_hour",  24) or 24),
+    }
+
+
+@app.post("/api/settings/autopilot", response_model=dict)
+def set_autopilot_settings(data: dict = Body(...)):
+    """
+    Toggle autopilot on/off and (optionally) start a mission.
+
+    Body fields:
+      autopilot      — 'on' | 'off'
+      start_hour     — int 0-23  (optional; persists if save_schedule=true)
+      stop_hour      — int 0-24  (optional; persists if save_schedule=true)
+      save_schedule  — bool; if true, write start/stop hours to system_settings
+      mission        — {time_limit_seconds, token_budget, card_count_target, goal_card_id}
+    """
+    from app.agent.scheduler import set_mission, MissionConfig
+
+    autopilot = data.get("autopilot")
+    if autopilot not in ("on", "off", None):
+        raise HTTPException(status_code=400, detail="autopilot must be 'on' or 'off'")
+
+    if data.get("save_schedule"):
+        if "start_hour" in data:
+            set_system_setting("autopilot_start_hour", int(data["start_hour"]),
+                               "Hour (0-23) when autopilot schedule activates")
+        if "stop_hour" in data:
+            set_system_setting("autopilot_stop_hour",  int(data["stop_hour"]),
+                               "Hour (0-24) when autopilot schedule deactivates; 24 = always")
+
+    if autopilot == "on":
+        m = data.get("mission") or {}
+        cfg = MissionConfig(
+            time_limit_seconds=m.get("time_limit_seconds"),
+            token_budget=m.get("token_budget"),
+            card_count_target=m.get("card_count_target"),
+            goal_card_id=m.get("goal_card_id"),
+        )
+        set_mission(cfg)
+        set_system_setting("maestro_autopilot", "on", "Global autopilot switch: on|off")
+        logger.info("[Autopilot] Engaged — mission config: %s", cfg)
+
+    elif autopilot == "off":
+        set_system_setting("maestro_autopilot", "off", "Global autopilot switch: on|off")
+        set_mission(None)
+        # Send stop signals to all running MaestroLoop sessions
+        from app.agent.loop import request_stop as _request_stop
+        from app.agent.scheduler import _active_sessions, _active_sessions_lock
+        with _active_sessions_lock:
+            task_ids = list(_active_sessions.keys())
+        stopped = 0
+        for tid in task_ids:
+            try:
+                if _request_stop(tid):
+                    stopped += 1
+            except Exception:
+                pass
+        logger.info("[Autopilot] Disengaged — stop signals sent to %d session(s).", stopped)
+
+    return {
+        "autopilot":  get_system_setting("maestro_autopilot", "off"),
+        "start_hour": int(get_system_setting("autopilot_start_hour", 0) or 0),
+        "stop_hour":  int(get_system_setting("autopilot_stop_hour",  24) or 24),
+        "status": "updated",
+    }
+
+
+# ===========================================================================
+# Per-project settings API  (Phase 7)
+# ===========================================================================
+
+@app.get("/api/projects/{name}/settings", response_model=dict)
+def get_project_settings_api(name: str):
+    """Return all per-project settings as {key: value}."""
+    from database import get_project, get_all_project_settings
+    project = get_project(name)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
+    return get_all_project_settings(project.id)
+
+
+@app.post("/api/projects/{name}/settings", response_model=dict)
+def set_project_settings_api(name: str, data: dict = Body(...)):
+    """Upsert one or more per-project settings.  Body: {key: value, ...}"""
+    from database import get_project, set_project_setting as _sps
+    project = get_project(name)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
+    for key, value in data.items():
+        _sps(project.id, key, str(value))
+    return {"status": "updated", "project": name, "keys": list(data.keys())}
+
+
+# ---------------------------------------------------------------------------
+# Document store API
+# ---------------------------------------------------------------------------
+
+def _require_project(name: str):
+    from database import get_project
+    project = get_project(name)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
+    return project
+
+
+@app.get("/api/projects/{name}/documents", response_model=List[dict])
+def list_project_documents(name: str, tag: Optional[str] = None):
+    """List all documents for a project (metadata only, no content body)."""
+    project = _require_project(name)
+    from database import list_documents
+    return list_documents(project.id, tag=tag)
+
+
+@app.get("/api/projects/{name}/documents/{key:path}", response_model=dict)
+def get_project_document(name: str, key: str):
+    """Retrieve a single document by exact key."""
+    project = _require_project(name)
+    from database import get_document
+    doc = get_document(project.id, key)
+    if doc is None:
+        raise HTTPException(status_code=404, detail=f"Document '{key}' not found")
+    return doc
+
+
+@app.put("/api/projects/{name}/documents/{key:path}", response_model=dict, status_code=200)
+def upsert_project_document(name: str, key: str, data: dict = Body(...)):
+    """Create or update a document. Body: {content, tags?}"""
+    project = _require_project(name)
+    content = data.get("content")
+    if content is None:
+        raise HTTPException(status_code=400, detail="'content' field is required")
+    tags = data.get("tags") or None
+    from database import store_document
+    doc = store_document(
+        project_id=project.id,
+        key=key,
+        content=str(content),
+        tags=tags,
+        written_by_task_id=data.get("written_by_task_id"),
+    )
+    return doc
+
+
+@app.delete("/api/projects/{name}/documents/{key:path}", status_code=200)
+def delete_project_document(name: str, key: str):
+    """Soft-delete a document."""
+    project = _require_project(name)
+    from database import delete_document
+    deleted = delete_document(project.id, key)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Document '{key}' not found")
+    return {"status": "deleted", "key": key}
+
+
+@app.get("/api/projects/{name}/documents-search", response_model=List[dict])
+def search_project_documents(name: str, q: str, threshold: float = 0.3):
+    """Fuzzy-search documents by key similarity."""
+    project = _require_project(name)
+    from database import fuzzy_get_document
+    return fuzzy_get_document(project.id, q, threshold)
+
+
+@app.get("/api/tasks/{task_id}/documents", response_model=List[dict])
+def list_task_documents(task_id: str):
+    """List all documents written by a specific task (metadata only)."""
+    from database import list_documents_written_by_task
+    return list_documents_written_by_task(task_id)
