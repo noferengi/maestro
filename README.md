@@ -253,7 +253,7 @@ Default monitoring workflow: `/loop` → each iteration calls `monitor()` and re
 python -m pytest app/tests/ -v
 ```
 
-**~700 tests** across 44 files covering pipeline, agents, scheduler, DAG resolution, tool safety, LLM client resilience, subdivision, and PIP resolution.
+**819 tests** across 49 files covering pipeline routing, agents, scheduler, DAG resolution, tool safety, LLM client resilience, subdivision, PIP resolution, document store, card factory, autopilot, and templates gallery.
 
 ---
 
@@ -273,8 +273,9 @@ python -m pytest app/tests/ -v
 
 | Document | Purpose |
 |---|---|
+| [INSTRUCTIONS.md](INSTRUCTIONS.md) | **User manual** — pipeline gallery, editor, agent designer, document store, card factory, autopilot |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Full system reference — topology, pipeline, agents, safety, data |
-| [PRD.md](PRD.md) | Product roadmap, shipped capabilities, forward themes |
+| [CLAUDE_PIPELINE.md](CLAUDE_PIPELINE.md) | Malleable pipeline developer reference — templates, registry, CRUD API, editor, factory |
 | [CLAUDE.md](CLAUDE.md) | Agent-facing reference — key files, patterns, conventions |
 | [CLAUDE_SCHEMA.md](CLAUDE_SCHEMA.md) | Complete database schema reference |
 
