@@ -71,15 +71,14 @@ five pattern flags: `rapid_cycling`, `token_limited`, `zombie_sessions`, `stage_
 
 ### When MCP tool calls hang or return no result
 
-MCP tools in this project are **synchronous** and make direct SQLite calls with no timeout
-configured (`mcp_tools/helpers.py:15-26`). SQLite's default lock-wait timeout is 5 seconds;
-if the scheduler is holding a write lock (e.g., committing a task update, running an intake
-vote, persisting budget entries), MCP reads queue behind it and can appear to hang.
+MCP tools in this project are **synchronous** and make direct PostgreSQL calls via
+SQLAlchemy with no timeout configured (`mcp_tools/helpers.py:15-26`). If the scheduler
+is holding a write lock (e.g., committing a task update, running an intake vote, persisting
+budget entries), MCP reads queue behind it and can appear to hang.
 
 **Root causes (structural — can happen any time):**
 - `mcp_tools/helpers.py` — `get_conn()` / `get_rw_conn()` have no `timeout=` argument
-- `app/database/session.py` — no `PRAGMA journal_mode=WAL`, so writes exclusively lock the DB;
-  also no `connect_args={"timeout": N}` on the SQLAlchemy engine
+- `app/database/session.py` — no `connect_args={"connect_timeout": N}` on the SQLAlchemy engine
 - High-query tools (`get_scheduler_state`, `diagnose_task`, `find_stuck_tasks`) issue 4–8+
   SELECT statements per call, each of which must wait for any in-progress write lock
 

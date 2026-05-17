@@ -259,7 +259,7 @@ def update_existing_task(task_id: str, task_data: dict):
         raise HTTPException(status_code=404, detail="Task not found")
 
     # Only allow updating specific fields
-    allowed_fields = ['title', 'description', 'owner', 'tags', 'content', 'llm_id', 'budget_id', 'type', 'prerequisites', 'map_x', 'map_y', 'review_notes']
+    allowed_fields = ['title', 'description', 'owner', 'tags', 'content', 'llm_id', 'budget_id', 'type', 'prerequisites', 'map_x', 'map_y', 'review_notes', 'stage_key', 'pipeline_template_id']
     update_data = {key: value for key, value in task_data.items() if key in allowed_fields}
 
     # Gate: advancing a task requires description, llm_id, and budget_id
@@ -3508,6 +3508,8 @@ def task_to_dict(task):
         "clarification_status": getattr(task, "clarification_status", "none") or "none",
         "is_starred": bool(getattr(task, "is_starred", False)),
         "last_progress_at": task.last_progress_at.isoformat() if getattr(task, "last_progress_at", None) else None,
+        "pipeline_template_id": getattr(task, "pipeline_template_id", None),
+        "stage_key": getattr(task, "stage_key", None) or task.type,
     }
 
 
@@ -4434,15 +4436,15 @@ def list_budget_entries(budget_id: int = None, llm_id: int = None, task_id: str 
 
 @app.get("/api/budget-entries/{entry_id}/full", response_model=dict)
 def read_budget_entry_full(entry_id: int):
-    """Get a single budget entry including full prompt/response payloads and expense cost data."""
-    from database import SessionLocal, BudgetEntry as BE, Expense
+    """Get a single budget entry including full reconstructed prompt/response payloads and expense cost data."""
+    from database import SessionLocal, BudgetEntry as BE, Expense, reconstruct_messages_for_entry
     db = SessionLocal()
     try:
         entry = db.query(BE).filter(BE.id == entry_id).first()
         if not entry:
             raise HTTPException(status_code=404, detail="Budget entry not found")
         result = budget_entry_to_dict(entry)
-        result["prompt_data"] = json.loads(entry.prompt_data) if entry.prompt_data else None
+        result["prompt_data"] = reconstruct_messages_for_entry(entry_id, db)
         result["response_data"] = json.loads(entry.response_data) if entry.response_data else None
         expense = db.query(Expense).filter(Expense.budget_entry_id == entry_id).first()
         result["expense"] = {
@@ -4451,6 +4453,40 @@ def read_budget_entry_full(entry_id: int):
             "total_cost_microcents": expense.total_cost_microcents,
         } if expense else None
         return result
+    finally:
+        db.close()
+
+
+@app.get("/api/sessions/{session_id}/entries/full", response_model=list)
+def read_session_entries_full(session_id: str):
+    """Get all budget entries for a session with prompt_delta (raw stored delta, not reconstructed).
+
+    Returns entries ordered by id ASC.  Each entry's prompt_delta is the raw
+    delta stored for that turn; the client accumulates to reconstruct full
+    context.  This replaces N individual /full calls for the diagnostics viewer.
+    """
+    from database import SessionLocal, BudgetEntry as BE, Expense
+    db = SessionLocal()
+    try:
+        entries = (
+            db.query(BE)
+            .filter(BE.session_id == session_id)
+            .order_by(BE.id.asc())
+            .all()
+        )
+        results = []
+        for entry in entries:
+            d = budget_entry_to_dict(entry)
+            d["prompt_delta"] = json.loads(entry.prompt_data) if entry.prompt_data else []
+            d["response_data"] = json.loads(entry.response_data) if entry.response_data else None
+            expense = db.query(Expense).filter(Expense.budget_entry_id == entry.id).first()
+            d["expense"] = {
+                "prompt_cost_microcents": expense.prompt_cost_microcents,
+                "completion_cost_microcents": expense.completion_cost_microcents,
+                "total_cost_microcents": expense.total_cost_microcents,
+            } if expense else None
+            results.append(d)
+        return results
     finally:
         db.close()
 
@@ -4758,6 +4794,8 @@ def create_agent_definition(body: dict = Body(...)):
         max_turns=body.get("max_turns"),
         max_tokens=body.get("max_tokens"),
         user_prompt_template=body.get("user_prompt_template"),
+        behavior_type=body.get("behavior_type"),
+        behavior_config=body.get("behavior_config"),
     )
     if not d:
         raise HTTPException(status_code=409, detail=f"Failed to create definition (name may already exist: {name!r})")
@@ -4793,35 +4831,57 @@ def get_agent_definition(defn_id: int):
 
 @app.put("/api/agent-definitions/{defn_id}", response_model=dict)
 def update_agent_definition(defn_id: int, body: dict = Body(...)):
-    """Update a custom agent definition."""
+    """Update a custom agent definition (blocked for is_builtin=True rows)."""
     from app.database import (
+        get_custom_agent_definition_by_id,
         update_custom_agent_definition as _update,
         custom_agent_definition_to_dict as _to_dict,
         load_custom_agents_into_registry,
     )
+    existing = get_custom_agent_definition_by_id(defn_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Not found")
+    if getattr(existing, "is_builtin", False):
+        raise HTTPException(status_code=409, detail="Built-in definitions cannot be modified. Clone it first.")
     kwargs = {}
     for field in ("name", "display_name", "description", "intent", "system_prompt",
                   "allowed_tools", "gate_type", "verifier", "verifier_cmd",
-                  "max_turns", "max_tokens", "user_prompt_template"):
+                  "max_turns", "max_tokens", "user_prompt_template",
+                  "behavior_type", "behavior_config"):
         if field in body:
             kwargs[field] = body[field]
     if not kwargs:
         raise HTTPException(status_code=400, detail="No fields to update")
     d = _update(defn_id, **kwargs)
     if not d:
-        raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=404, detail="Not found or update blocked")
     load_custom_agents_into_registry()
     return _to_dict(d)
 
 
 @app.delete("/api/agent-definitions/{defn_id}", response_model=dict)
 def delete_agent_definition(defn_id: int):
-    """Delete a custom agent definition (blocked if used in any pipeline stage)."""
+    """Delete a custom agent definition (blocked for is_builtin=True rows or stages in use)."""
     from app.database import delete_custom_agent_definition as _delete
     result = _delete(defn_id)
     if not result.get("ok"):
         raise HTTPException(status_code=409, detail=result.get("error", "Delete failed"))
     return {"deleted": True}
+
+
+@app.post("/api/agent-definitions/{defn_id}/clone", response_model=dict, status_code=201)
+def clone_agent_definition(defn_id: int):
+    """Clone an agent definition (works for both built-in and custom definitions)."""
+    from app.database import (
+        clone_custom_agent_definition as _clone,
+        custom_agent_definition_to_dict as _to_dict,
+        load_custom_agents_into_registry,
+    )
+    cloned = _clone(defn_id)
+    if not cloned:
+        raise HTTPException(status_code=404, detail="Source definition not found")
+    load_custom_agents_into_registry()
+    return _to_dict(cloned)
 
 
 @app.post("/api/pipelines/import", response_model=dict, status_code=201)
@@ -4942,6 +5002,44 @@ def create_pipeline_template(data: dict = Body(...)):
     if not t:
         raise HTTPException(status_code=409, detail=f"A template named '{name}' already exists")
     return _template_meta_to_dict(t)
+
+
+@app.get("/api/pipelines/stage-map", response_model=dict)
+def get_pipeline_stage_map(from_id: int, to_id: int):
+    """Compare two pipeline templates and return a stage mapping descriptor.
+
+    Returns {auto_map, unmapped, dest_stages} that the UI uses to pre-fill the
+    stage-mapping dialog before a card transfer.
+    """
+    from app.database import compute_stage_map as _csm
+    return _csm(from_id, to_id)
+
+
+@app.post("/api/pipelines/transfer-cards", response_model=dict)
+def transfer_pipeline_cards(data: dict = Body(...)):
+    """Move cards from one pipeline template to another using a caller-supplied stage map.
+
+    Body: {
+      "from_template_id": int,
+      "to_template_id":   int,
+      "stage_map":        {from_stage_key: to_stage_key, ...},
+      "project_name":     str  (optional — if omitted, transfers across all projects)
+    }
+    """
+    from app.database import transfer_cards as _tc, get_project
+    from_id = data.get("from_template_id")
+    to_id = data.get("to_template_id")
+    stage_map = data.get("stage_map") or {}
+    project_name = data.get("project_name")
+    if not from_id or not to_id:
+        raise HTTPException(status_code=400, detail="from_template_id and to_template_id are required")
+    project_id = None
+    if project_name:
+        proj = get_project(project_name)
+        if proj:
+            project_id = proj.id
+    count = _tc(int(from_id), int(to_id), stage_map, project_id=project_id)
+    return {"transferred": count}
 
 
 @app.get("/api/pipelines/{template_id}", response_model=dict)

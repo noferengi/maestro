@@ -213,9 +213,50 @@ body {
     <div id="clone-warning" style="display:none;font-size:12px;color:#fbbf24;margin-bottom:12px">
       Cloning a built-in template creates a private copy you can freely edit.
     </div>
+    <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px;cursor:pointer">
+      <input type="checkbox" id="clone-transfer">
+      <span style="font-size:13px">Transfer existing cards to the clone</span>
+    </label>
     <div class="modal-actions">
       <button class="btn btn-ghost" onclick="closeModal('clone-modal')">Cancel</button>
       <button class="btn btn-primary" onclick="doClone()">Clone</button>
+    </div>
+  </div>
+</div>
+
+<!-- Transfer Cards — target picker modal -->
+<div id="transfer-pick-modal" class="modal-overlay" onclick="if(event.target===this)closeModal('transfer-pick-modal')">
+  <div class="modal">
+    <h3>Transfer Cards To…</h3>
+    <p style="font-size:13px;color:#94a3b8;margin-bottom:12px">
+      Select the destination pipeline. You'll map stages before any cards move.
+    </p>
+    <div id="transfer-pick-list" style="display:flex;flex-direction:column;gap:6px;max-height:300px;overflow-y:auto"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal('transfer-pick-modal')">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Stage-mapping modal -->
+<div id="stagemap-modal" class="modal-overlay" onclick="if(event.target===this)closeModal('stagemap-modal')">
+  <div class="modal" style="max-width:580px">
+    <h3>Map Stages</h3>
+    <p style="font-size:13px;color:#94a3b8;margin-bottom:14px">
+      <strong id="smap-src-name"></strong> → <strong id="smap-dst-name"></strong>
+    </p>
+    <table style="width:100%;border-collapse:collapse;margin-bottom:14px">
+      <thead>
+        <tr>
+          <th style="text-align:left;padding:6px 8px;font-size:12px;color:#64748b;border-bottom:1px solid #334155">Source Stage</th>
+          <th style="text-align:left;padding:6px 8px;font-size:12px;color:#64748b;border-bottom:1px solid #334155">Destination Stage</th>
+        </tr>
+      </thead>
+      <tbody id="smap-tbody"></tbody>
+    </table>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal('stagemap-modal')">Cancel</button>
+      <button class="btn btn-primary" onclick="applyStageMap()">Transfer Cards</button>
     </div>
   </div>
 </div>
@@ -256,6 +297,14 @@ let _templates = [];
 let _cloneTargetId = null;
 let _useTargetId   = null;
 let _projects      = [];
+
+// stage-map flow state
+let _smapFromId   = null;
+let _smapToId     = null;
+let _smapFromName = "";
+let _smapToName   = "";
+let _smapData     = null;   // {auto_map, unmapped, dest_stages}
+let _smapOnApply  = null;   // callback(stageMap) after user confirms
 
 const ICONS = {
   "Software Development":            "💻",
@@ -335,6 +384,7 @@ function renderGrid(templates) {
     <button class="btn btn-primary btn-sm" onclick="openUseModal(${t.id})">Use</button>
     <button class="btn btn-secondary btn-sm" onclick="openCloneModal(${t.id}, ${builtin})">Clone</button>
     <a class="btn btn-secondary btn-sm" href="/pipelines/${t.id}/edit">Edit${builtin ? " ⚠" : ""}</a>
+    <button class="btn btn-ghost btn-sm" onclick="openTransferModal(${t.id}, '${esc(t.name)}')">Transfer Cards ↗</button>
     ${!builtin ? `<button class="btn btn-danger btn-sm" onclick="deleteTemplate(${t.id}, '${esc(t.name)}')">Delete</button>` : ""}
     <button class="btn btn-ghost btn-sm" onclick="exportTemplate(${t.id}, '${esc(t.name)}')">Export</button>
   </div>
@@ -362,13 +412,16 @@ function openCloneModal(id, isBuiltin) {
   const tmpl = _templates.find(t => t.id === id);
   document.getElementById("clone-name").value = tmpl ? tmpl.name + " (copy)" : "";
   document.getElementById("clone-warning").style.display = isBuiltin ? "block" : "none";
+  document.getElementById("clone-transfer").checked = false;
   openModal("clone-modal");
   setTimeout(() => document.getElementById("clone-name").focus(), 80);
 }
 
 async function doClone() {
   const name = document.getElementById("clone-name").value.trim();
+  const doTransfer = document.getElementById("clone-transfer").checked;
   if (!name) { showToast("Name is required", true); return; }
+  let cloned;
   try {
     const r = await fetch(`/api/pipelines/${_cloneTargetId}/clone`, {
       method: "POST",
@@ -379,14 +432,140 @@ async function doClone() {
       const err = await r.json().catch(() => ({}));
       throw new Error(err.detail || r.statusText);
     }
-    const cloned = await r.json();
-    closeModal("clone-modal");
-    showToast(`Cloned as "${name}"`);
-    await loadTemplates();
-    // Navigate to the editor for the clone
-    window.location.href = `/pipelines/${cloned.id}/edit`;
+    cloned = await r.json();
   } catch (e) {
     showToast("Clone failed: " + e.message, true);
+    return;
+  }
+
+  closeModal("clone-modal");
+  await loadTemplates();
+
+  if (!doTransfer) {
+    showToast(`Cloned as "${name}"`);
+    window.location.href = `/pipelines/${cloned.id}/edit`;
+    return;
+  }
+
+  // Transfer flow: fetch stage map and either auto-transfer or show dialog
+  const srcTmpl = _templates.find(t => t.id === _cloneTargetId);
+  await _startTransferFlow(
+    _cloneTargetId,
+    cloned.id,
+    srcTmpl ? srcTmpl.name : "Source",
+    name,
+    () => { window.location.href = `/pipelines/${cloned.id}/edit`; }
+  );
+}
+
+/* ─────────────────────────── transfer cards ─────────────────────────── */
+
+function openTransferModal(fromId, fromName) {
+  _smapFromId   = fromId;
+  _smapFromName = fromName;
+  const others = _templates.filter(t => t.id !== fromId);
+  const list   = document.getElementById("transfer-pick-list");
+  if (!others.length) {
+    list.innerHTML = '<p style="color:#94a3b8;font-size:13px">No other templates available.</p>';
+  } else {
+    list.innerHTML = others.map(t =>
+      `<button class="project-btn" onclick="pickTransferTarget(${t.id},'${esc(t.name)}')">${esc(t.name)}</button>`
+    ).join("");
+  }
+  openModal("transfer-pick-modal");
+}
+
+async function pickTransferTarget(toId, toName) {
+  closeModal("transfer-pick-modal");
+  await _startTransferFlow(_smapFromId, toId, _smapFromName, toName, null);
+}
+
+async function _startTransferFlow(fromId, toId, fromName, toName, onDone) {
+  let mapData;
+  try {
+    const r = await fetch(`/api/pipelines/stage-map?from_id=${fromId}&to_id=${toId}`);
+    if (!r.ok) throw new Error(r.statusText);
+    mapData = await r.json();
+  } catch (e) {
+    showToast("Could not load stage map: " + e.message, true);
+    if (onDone) onDone();
+    return;
+  }
+
+  if (mapData.unmapped.length === 0) {
+    // All stages auto-match — transfer silently
+    await _executeTransfer(fromId, toId, mapData.auto_map, fromName, toName);
+    if (onDone) onDone();
+    return;
+  }
+
+  // Some stages differ — show the mapping dialog
+  _smapFromId   = fromId;
+  _smapToId     = toId;
+  _smapFromName = fromName;
+  _smapToName   = toName;
+  _smapData     = mapData;
+  _smapOnApply  = onDone;
+
+  document.getElementById("smap-src-name").textContent = fromName;
+  document.getElementById("smap-dst-name").textContent = toName;
+
+  const destOptions = [
+    '<option value="">── skip / don\'t transfer ──</option>',
+    ...mapData.dest_stages.map(d => `<option value="${esc(d.stage_key)}">${esc(d.label)}</option>`)
+  ].join("");
+
+  const srcStages = [...Object.keys(mapData.auto_map), ...mapData.unmapped];
+  // fetch source stage labels from templates in memory
+  const srcTmpl = _templates.find(t => t.id === fromId);
+  const srcLabelMap = {};
+  (srcTmpl ? srcTmpl.stages || [] : []).forEach(s => { srcLabelMap[s.stage_key] = s.label; });
+
+  document.getElementById("smap-tbody").innerHTML = srcStages.map(sk => {
+    const label   = srcLabelMap[sk] || sk;
+    const autoVal = mapData.auto_map[sk] || "";
+    return `<tr>
+      <td style="padding:6px 8px;font-size:13px">${esc(label)}</td>
+      <td style="padding:6px 8px">
+        <select data-src="${esc(sk)}" style="width:100%;background:#1e293b;border:1px solid #334155;
+          border-radius:4px;color:#e2e8f0;padding:4px 8px;font-size:13px">
+          ${destOptions}
+        </select>
+      </td>
+    </tr>`;
+  }).join("");
+
+  // Pre-select auto-mapped values
+  document.querySelectorAll("#smap-tbody select").forEach(sel => {
+    const src = sel.dataset.src;
+    if (mapData.auto_map[src]) sel.value = mapData.auto_map[src];
+  });
+
+  openModal("stagemap-modal");
+}
+
+async function applyStageMap() {
+  const stageMap = {};
+  document.querySelectorAll("#smap-tbody select").forEach(sel => {
+    if (sel.value) stageMap[sel.dataset.src] = sel.value;
+  });
+  closeModal("stagemap-modal");
+  await _executeTransfer(_smapFromId, _smapToId, stageMap, _smapFromName, _smapToName);
+  if (_smapOnApply) _smapOnApply();
+}
+
+async function _executeTransfer(fromId, toId, stageMap, fromName, toName) {
+  try {
+    const r = await fetch("/api/pipelines/transfer-cards", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({from_template_id: fromId, to_template_id: toId, stage_map: stageMap}),
+    });
+    if (!r.ok) throw new Error((await r.json().catch(()=>({}))).detail || r.statusText);
+    const result = await r.json();
+    showToast(`Transferred ${result.transferred} card${result.transferred === 1 ? "" : "s"} to "${toName}"`);
+  } catch (e) {
+    showToast("Transfer failed: " + e.message, true);
   }
 }
 

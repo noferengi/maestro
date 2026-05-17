@@ -718,6 +718,95 @@ def clone_template(template_id: int, new_name: str) -> Optional[PipelineTemplate
 
 
 # ---------------------------------------------------------------------------
+# Stage-map & Card Transfer
+# ---------------------------------------------------------------------------
+
+def compute_stage_map(from_template_id: int, to_template_id: int) -> Dict[str, Any]:
+    """Compare two templates and return a stage-mapping descriptor.
+
+    Returns:
+        {
+          "auto_map":    {from_stage_key: to_stage_key, ...},   # keys present in both
+          "unmapped":    [from_stage_key, ...],                  # keys only in source
+          "dest_stages": [{"stage_key": ..., "label": ...}, ...]  # all dest stages
+        }
+    """
+    db = SessionLocal()
+    try:
+        src_stages = (
+            db.query(PipelineStage)
+            .filter(PipelineStage.template_id == from_template_id)
+            .order_by(PipelineStage.position)
+            .all()
+        )
+        dst_stages = (
+            db.query(PipelineStage)
+            .filter(PipelineStage.template_id == to_template_id)
+            .order_by(PipelineStage.position)
+            .all()
+        )
+        dst_keys = {s.stage_key for s in dst_stages}
+        auto_map: Dict[str, str] = {}
+        unmapped: List[str] = []
+        for s in src_stages:
+            if s.stage_key in dst_keys:
+                auto_map[s.stage_key] = s.stage_key
+            else:
+                unmapped.append(s.stage_key)
+        dest_stages_list = [{"stage_key": s.stage_key, "label": s.label} for s in dst_stages]
+        return {"auto_map": auto_map, "unmapped": unmapped, "dest_stages": dest_stages_list}
+    except Exception:
+        logger.exception("compute_stage_map failed from=%d to=%d", from_template_id, to_template_id)
+        return {"auto_map": {}, "unmapped": [], "dest_stages": []}
+    finally:
+        db.close()
+
+
+def transfer_cards(
+    from_template_id: int,
+    to_template_id: int,
+    stage_map: Dict[str, str],
+    project_id: "int | None" = None,
+) -> int:
+    """Move tasks from one pipeline template to another using the provided stage map.
+
+    Only moves tasks whose stage_key appears as a key in ``stage_map`` (skipped
+    stages are left untouched).  Updates both ``pipeline_template_id`` and
+    ``stage_key``/``type`` on each task.
+
+    Returns the number of tasks updated.
+    """
+    from .models import Task
+    db = SessionLocal()
+    try:
+        q = db.query(Task).filter(
+            Task.pipeline_template_id == from_template_id,
+            Task.is_active == True,
+        )
+        if project_id is not None:
+            q = q.filter(Task.project_id == project_id)
+        tasks = q.all()
+        count = 0
+        for task in tasks:
+            src_key = task.stage_key or task.type
+            dest_key = stage_map.get(src_key)
+            if dest_key is None:
+                continue  # stage not in map — skip
+            task.pipeline_template_id = to_template_id
+            task.stage_key = dest_key
+            task.type = dest_key  # keep in sync during phase-out period
+            count += 1
+        db.commit()
+        return count
+    except Exception:
+        db.rollback()
+        logger.exception("transfer_cards failed from=%d to=%d", from_template_id, to_template_id)
+        return 0
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
 # Serialization Helpers
 # ---------------------------------------------------------------------------
 
@@ -964,6 +1053,9 @@ def create_custom_agent_definition(
     max_turns: Optional[int] = None,
     max_tokens: Optional[int] = None,
     user_prompt_template: Optional[str] = None,
+    behavior_type: Optional[str] = None,
+    behavior_config: Optional[Dict[str, Any]] = None,
+    is_builtin: bool = False,
 ) -> Optional[CustomAgentDefinition]:
     db = SessionLocal()
     try:
@@ -980,6 +1072,9 @@ def create_custom_agent_definition(
             max_turns=max_turns,
             max_tokens=max_tokens,
             user_prompt_template=user_prompt_template,
+            behavior_type=behavior_type,
+            behavior_config=behavior_config,
+            is_builtin=is_builtin,
         )
         db.add(defn)
         db.commit()
@@ -1010,12 +1105,16 @@ def update_custom_agent_definition(
     max_turns=_SENTINEL,
     max_tokens=_SENTINEL,
     user_prompt_template=_SENTINEL,
+    behavior_type=_SENTINEL,
+    behavior_config=_SENTINEL,
 ) -> Optional[CustomAgentDefinition]:
     db = SessionLocal()
     try:
         defn = db.query(CustomAgentDefinition).filter(CustomAgentDefinition.id == defn_id).first()
         if not defn:
             return None
+        if getattr(defn, "is_builtin", False):
+            return None  # built-in definitions are immutable; caller should clone first
         if name is not _SENTINEL:
             defn.name = name
         if display_name is not _SENTINEL:
@@ -1040,6 +1139,10 @@ def update_custom_agent_definition(
             defn.max_tokens = max_tokens
         if user_prompt_template is not _SENTINEL:
             defn.user_prompt_template = user_prompt_template
+        if behavior_type is not _SENTINEL:
+            defn.behavior_type = behavior_type
+        if behavior_config is not _SENTINEL:
+            defn.behavior_config = behavior_config
         db.commit()
         db.refresh(defn)
         return defn
@@ -1055,14 +1158,17 @@ def delete_custom_agent_definition(defn_id: int) -> Dict[str, Any]:
     """
     Delete a custom agent definition.
 
-    Blocked if any pipeline_stages row references this definition's name as
-    agent_type.  Returns {"ok": True} or {"ok": False, "error": "...", "stage_count": N}.
+    Blocked if the definition is a built-in, or if any pipeline_stages row
+    references this definition's name as agent_type.
+    Returns {"ok": True} or {"ok": False, "error": "...", "stage_count": N}.
     """
     db = SessionLocal()
     try:
         defn = db.query(CustomAgentDefinition).filter(CustomAgentDefinition.id == defn_id).first()
         if not defn:
             return {"ok": False, "error": "not found"}
+        if getattr(defn, "is_builtin", False):
+            return {"ok": False, "error": "built-in definitions cannot be deleted"}
         # Check for pipeline stages that use this agent_type
         stage_count = (
             db.query(PipelineStage)
@@ -1086,6 +1192,55 @@ def delete_custom_agent_definition(defn_id: int) -> Dict[str, Any]:
         db.close()
 
 
+def clone_custom_agent_definition(defn_id: int) -> Optional[CustomAgentDefinition]:
+    """
+    Clone a custom agent definition (including built-ins).
+
+    The clone gets is_builtin=False, a unique name prefixed with 'copy-of-',
+    and a display name prefixed with 'Copy of '.  All other fields are copied verbatim.
+    """
+    db = SessionLocal()
+    try:
+        src = db.query(CustomAgentDefinition).filter(CustomAgentDefinition.id == defn_id).first()
+        if not src:
+            return None
+
+        base_name = f"copy-of-{src.name}"
+        name = base_name
+        suffix = 2
+        while db.query(CustomAgentDefinition).filter(CustomAgentDefinition.name == name).first():
+            name = f"{base_name}-{suffix}"
+            suffix += 1
+
+        clone = CustomAgentDefinition(
+            name=name,
+            display_name=f"Copy of {src.display_name}",
+            description=src.description,
+            intent=src.intent,
+            system_prompt=src.system_prompt,
+            allowed_tools=list(src.allowed_tools or []),
+            gate_type=src.gate_type,
+            verifier=src.verifier,
+            verifier_cmd=src.verifier_cmd,
+            max_turns=src.max_turns,
+            max_tokens=src.max_tokens,
+            user_prompt_template=src.user_prompt_template,
+            behavior_type=src.behavior_type,
+            behavior_config=dict(src.behavior_config) if src.behavior_config else None,
+            is_builtin=False,
+        )
+        db.add(clone)
+        db.commit()
+        db.refresh(clone)
+        return clone
+    except Exception:
+        db.rollback()
+        logger.exception("clone_custom_agent_definition failed for id=%d", defn_id)
+        return None
+    finally:
+        db.close()
+
+
 def custom_agent_definition_to_dict(defn: CustomAgentDefinition) -> Dict[str, Any]:
     return {
         "id": defn.id,
@@ -1101,6 +1256,9 @@ def custom_agent_definition_to_dict(defn: CustomAgentDefinition) -> Dict[str, An
         "max_turns": defn.max_turns,
         "max_tokens": defn.max_tokens,
         "user_prompt_template": defn.user_prompt_template,
+        "behavior_type": getattr(defn, "behavior_type", None),
+        "behavior_config": getattr(defn, "behavior_config", None) or {},
+        "is_builtin": bool(getattr(defn, "is_builtin", False)),
         "created_at": defn.created_at.isoformat() if defn.created_at else None,
     }
 

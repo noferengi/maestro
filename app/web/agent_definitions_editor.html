@@ -141,6 +141,51 @@ details.tool-group summary::-webkit-details-marker { display: none; }
 /* ── Conclusion gate ── */
 .gate-hint { font-size: 12px; color: #64748b; line-height: 1.5; margin-top: 4px; }
 
+/* ── Built-in read-only banner ── */
+#builtin-banner {
+  display: none;
+  background: #1e3a5f; border: 1px solid #3b82f6; border-radius: 8px;
+  padding: 14px 18px; font-size: 13px; color: #93c5fd;
+  display: flex; align-items: center; gap: 12px;
+}
+#builtin-banner.visible { display: flex; }
+#builtin-banner .bb-icon { font-size: 20px; flex-shrink: 0; }
+#builtin-banner .bb-text { flex: 1; line-height: 1.5; }
+#builtin-banner .bb-clone {
+  padding: 6px 14px; border-radius: 6px; border: 1px solid #3b82f6;
+  background: transparent; color: #93c5fd; font-size: 13px;
+  cursor: pointer; white-space: nowrap; transition: background 0.15s;
+}
+#builtin-banner .bb-clone:hover { background: #1d4ed8; color: #fff; }
+
+/* ── Behavior section ── */
+.behavior-config-area {
+  display: flex; flex-direction: column; gap: 12px; margin-top: 8px;
+}
+.behavior-config-area textarea {
+  font-family: ui-monospace, monospace; font-size: 12px;
+  line-height: 1.5; min-height: 120px;
+}
+.behavior-type-badge {
+  display: inline-block; padding: 2px 10px; border-radius: 99px;
+  font-size: 12px; font-weight: 600;
+  background: #1e1b2e; color: #a78bfa; margin-left: 8px;
+  vertical-align: middle;
+}
+
+/* ── Disabled overlay for built-in fields ── */
+body.is-builtin .field-group input,
+body.is-builtin .field-group select,
+body.is-builtin .field-group textarea {
+  opacity: 0.6; pointer-events: none; cursor: not-allowed;
+}
+body.is-builtin .btn-preset,
+body.is-builtin .tool-item input,
+body.is-builtin #chk-user-tpl {
+  pointer-events: none; opacity: 0.5;
+}
+body.is-builtin #btn-gen-system { display: none; }
+
 /* ── Toast ── */
 #toast {
   position: fixed; bottom: 24px; right: 24px;
@@ -162,14 +207,26 @@ details.tool-group summary::-webkit-details-marker { display: none; }
   <a href="/agents" class="logo">← Agent Definitions</a>
   <div id="topbar-center">
     <span id="ed-title">Agent Editor</span>
+    <span id="ed-builtin-badge" style="display:none" class="behavior-type-badge">Built-in</span>
     <span id="unsaved-indicator">● Unsaved changes</span>
   </div>
   <div id="topbar-actions">
-    <button class="btn btn-primary" onclick="saveDefinition()">Save</button>
+    <button class="btn btn-secondary" id="btn-clone" style="display:none" onclick="cloneAndRedirect()">Clone to Edit</button>
+    <button class="btn btn-primary" id="btn-save" onclick="saveDefinition()">Save</button>
   </div>
 </div>
 
 <div id="editor-body">
+
+  <!-- Built-in read-only banner (shown for is_builtin definitions) -->
+  <div id="builtin-banner">
+    <div class="bb-icon">⚙️</div>
+    <div class="bb-text">
+      <strong>Built-in definition — read only.</strong><br>
+      This agent is part of Maestro's core pipeline. Clone it to create an editable copy you can customize and assign to stages.
+    </div>
+    <button class="bb-clone" onclick="cloneAndRedirect()">Clone to Edit →</button>
+  </div>
 
   <!-- Section 1: Identity -->
   <div class="section">
@@ -281,6 +338,50 @@ details.tool-group summary::-webkit-details-marker { display: none; }
     </div>
   </div>
 
+  <!-- Section 5b: Behavior Type & Config -->
+  <div class="section" id="behavior-section">
+    <div class="section-title">Behavior Type <span id="ed-behavior-badge" class="behavior-type-badge" style="display:none"></span></div>
+
+    <div class="field-group">
+      <label for="ed-behavior-type">Execution Strategy</label>
+      <select id="ed-behavior-type" onchange="onBehaviorTypeChange(); markUnsaved()">
+        <option value="">— None (custom LLM agent) —</option>
+        <option value="intake_pipeline">Intake Pipeline</option>
+        <option value="planning_pipeline">Planning Pipeline</option>
+        <option value="maestro_loop">MaestroLoop (implementation)</option>
+        <option value="conceptual_review">Conceptual Review</option>
+        <option value="optimization">Optimization</option>
+        <option value="security">Security Review</option>
+        <option value="final_review">Final Review</option>
+        <option value="factory">Card Factory</option>
+        <option value="voting_panel">Voting Panel</option>
+        <option value="circuit_breaker">Circuit Breaker</option>
+        <option value="fan_out_judge">Fan-Out + Judge</option>
+        <option value="human_gate">Human Gate</option>
+        <option value="arch_gen">Architecture Gen</option>
+        <option value="single_pass_llm">Single-Pass LLM</option>
+      </select>
+      <div class="field-hint">
+        Maps this definition to a built-in dispatch strategy. When a pipeline stage's
+        <code>agent_type</code> matches this definition's name, Maestro routes it through
+        the selected behavior instead of the generic LLM loop.
+      </div>
+    </div>
+
+    <div class="behavior-config-area" id="behavior-config-area">
+      <div class="field-group">
+        <label for="ed-behavior-config">Behavior Config (JSON)</label>
+        <textarea id="ed-behavior-config" rows="8"
+          placeholder='{"num_voters": 3, "threshold": 0.6}'
+          oninput="markUnsaved()"></textarea>
+        <div class="field-hint">
+          Parameters for the selected behavior. Keys vary by strategy — see the built-in
+          definition for the canonical defaults (clone it to compare).
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Section 6: Conclusion Gate -->
   <div class="section">
     <div class="section-title">Conclusion Gate</div>
@@ -316,6 +417,6 @@ details.tool-group summary::-webkit-details-marker { display: none; }
 
 <div id="toast"></div>
 
-<script src="/static/agent_definitions_editor.js?v=1"></script>
+<script src="/static/agent_definitions_editor.js?v=2"></script>
 </body>
 </html>

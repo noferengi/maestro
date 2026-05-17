@@ -4,7 +4,7 @@
 > A Kanban board whose cards are executed by LLMs, not tracked by humans.
 
 [![FastAPI](https://img.shields.io/badge/FastAPI-005571?logo=fastapi)](https://fastapi.tiangolo.com/)
-[![SQLite](https://img.shields.io/badge/SQLite-003B57?logo=sqlite)](https://www.sqlite.org/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python)](https://www.python.org/)
 
 ---
@@ -77,7 +77,7 @@ The server runs on **http://localhost:8000**. The Kanban board is at `/kanban.ht
 └───────────────────────────────────────────────────────────┘
                        │
 ┌──────────────────────▼───────────────────────────────────┐
-│              SQLite Database (data/kanban.db)             │
+│              PostgreSQL Database (MAESTRO_DATABASE_URL)   │
 └───────────────────────────────────────────────────────────┘
 ```
 
@@ -191,7 +191,7 @@ TheMaestro/
 │   │   ├── project_snapshot.py     # Project structure snapshots
 │   │   ├── path_filter.py        # Path exclusion authority
 │   │   └── ...                 # review, security, optimization, etc.
-│   ├── migrations/             # 54 standalone SQLite migrations
+│   ├── migrations/             # PostgreSQL migrations (76 versions)
 │   │   ├── runner.py           # Standalone migration engine
 │   │   └── versions/           # NNNN_description.py migration files
 │   ├── tests/                  # 44 test files (~700 tests)
@@ -202,7 +202,7 @@ TheMaestro/
 │       ├── diagnostics.css     # Diagnostics styles
 │       └── kanban.js           # All board behaviour
 ├── data/
-│   └── kanban.db               # SQLite database (auto-created)
+│   └── test.db                 # SQLite test database (auto-created by test suite)
 ├── scripts/
 │   └── create_migration.py     # Migration scaffolding tool
 ├── mcp_server.py               # MCP server for Claude Code integration
@@ -248,7 +248,7 @@ All sections have sensible defaults. The system runs out-of-the-box with a local
 
 ## Database Migrations
 
-Migrations use SQLite and live in `app/migrations/versions/`. Never edit existing migrations — always add a new one.
+Migrations target PostgreSQL and live in `app/migrations/versions/`. Never edit existing migrations — always add a new one.
 
 ```bash
 migrate.bat status      # see applied vs pending
@@ -478,15 +478,14 @@ mcp__maestro__diagnose_task task-1746000000.123
 ```
 
 ### MCP Tool Calls Hang
-MCP tools are synchronous and make direct SQLite calls. If the scheduler is holding a write lock, reads can queue behind it.
+MCP tools are synchronous and make direct PostgreSQL calls. If the scheduler is holding a write lock, reads can queue behind it.
 - **Quick fix:** Wait a few seconds and retry
 - **Nuclear option:** `mcp__maestro__restart_server()` — drains sessions, clears lock contention
 - **Fallback:** `venv/Scripts/python.exe scripts/inspect_cards.py <section>` bypasses the MCP layer
 
 ### Reset Database
 ```bash
-del data\kanban.db
-python -c "from app.database import init_db; init_db()"
+migrate.bat reset
 ```
 
 ---

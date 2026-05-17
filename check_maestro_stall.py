@@ -1,3 +1,4 @@
+# DEPRECATED: Uses SQLite direct. Use MCP tools (find_stuck_tasks, monitor) instead.
 import time
 from datetime import datetime
 import sqlite3

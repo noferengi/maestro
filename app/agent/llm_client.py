@@ -1624,7 +1624,7 @@ def _log_budget_entry(
 ) -> None:
     """Persist a budget entry from an LLM response. Best-effort, never raises."""
     try:
-        from app.database import create_budget_entry
+        from app.database import create_budget_entry, BudgetEntry as _BE, SessionLocal as _SL
 
         usage = response.get("usage", {})
         prompt_tokens = usage.get("prompt_tokens", 0)
@@ -1640,8 +1640,27 @@ def _log_budget_entry(
         # Every response is at least 1 LLM turn
         total_turns = max(1, tool_call_count)
 
-        # Serialize payloads
-        prompt_json = json.dumps(messages, ensure_ascii=False, default=str)
+        # Compute delta: only store messages added since the last entry in this session.
+        prev_count = 0
+        if session_id:
+            _db = _SL()
+            try:
+                last = (
+                    _db.query(_BE)
+                    .filter(
+                        _BE.session_id == session_id,
+                        _BE.prompt_message_count.isnot(None),
+                    )
+                    .order_by(_BE.id.desc())
+                    .first()
+                )
+                if last is not None:
+                    prev_count = last.prompt_message_count
+            finally:
+                _db.close()
+
+        delta_messages = messages[prev_count:]
+        prompt_json = json.dumps(delta_messages, ensure_ascii=False, default=str)
         response_json = json.dumps(response, ensure_ascii=False, default=str)
 
         entry = create_budget_entry(
@@ -1655,6 +1674,7 @@ def _log_budget_entry(
             response_data=response_json,
             session_id=session_id,
             agent_name=agent_name,
+            prompt_message_count=len(messages),
         )
         if entry and budget_id is not None:
             from app.database import get_llm, create_expense

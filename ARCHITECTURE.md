@@ -56,8 +56,8 @@ The core design principle is **irreversibility prevention**: every agent action 
         └─────────────────────────────────────────────┘
                               │
         ┌─────────────────────▼──────────────────────┐
-        │           SQLite Database                   │
-        │           data/kanban.db                    │
+        │           PostgreSQL Database               │
+        │           (MAESTRO_DATABASE_URL)            │
         └─────────────────────────────────────────────┘
 ```
 
@@ -468,8 +468,8 @@ Layer 5: Review Chain (multi-stage acceptance before merge)
 
 ## 11. Data Layer
 
-**Database:** SQLite at `data/kanban.db`  
-**Migration engine:** `app/migrations/runner.py` — standalone sqlite3, no SQLAlchemy dependency  
+**Database:** PostgreSQL (configured via `MAESTRO_DATABASE_URL` in `.env`)  
+**Migration engine:** `app/migrations/runner.py` — uses `psycopg2` via `MAESTRO_ADMIN_DATABASE_URL`  
 **Migration files:** `app/migrations/versions/NNNN_description.py`, each with `up(conn)`, `down(conn)`, `description`
 
 ### Core Tables (abbreviated)

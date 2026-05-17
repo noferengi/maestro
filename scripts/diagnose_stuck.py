@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# DEPRECATED: Uses SQLite direct. Use MCP tools (diagnose_task, find_stuck_tasks) instead.
 """Diagnose stuck scheduler tasks."""
 import os
 import sqlite3

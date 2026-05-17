@@ -198,6 +198,7 @@ from .crud_costs import (
     create_budget_entry,
     get_budget_entries,
     get_budget_entry,
+    reconstruct_messages_for_entry,
     create_expense,
     get_budget_spent_microcents,
     get_budget_remaining_microcents,
@@ -413,8 +414,11 @@ from .crud_malleable import (
     create_custom_agent_definition,
     update_custom_agent_definition,
     delete_custom_agent_definition,
+    clone_custom_agent_definition,
     custom_agent_definition_to_dict,
     load_custom_agents_into_registry,
+    compute_stage_map,
+    transfer_cards,
 )
 
 __all__ = [
@@ -457,6 +461,7 @@ __all__ = [
     "llm_to_dict", "budget_to_dict",
     # crud_costs
     "create_budget_entry", "get_budget_entries", "get_budget_entry",
+    "reconstruct_messages_for_entry",
     "create_expense", "get_budget_spent_microcents", "get_budget_remaining_microcents",
     "budget_has_capacity", "get_budget_summary",
     # crud_pipeline
@@ -522,7 +527,9 @@ __all__ = [
     "get_all_custom_agent_definitions", "get_custom_agent_definition_by_id",
     "get_custom_agent_definition_by_name", "create_custom_agent_definition",
     "update_custom_agent_definition", "delete_custom_agent_definition",
+    "clone_custom_agent_definition",
     "custom_agent_definition_to_dict", "load_custom_agents_into_registry",
+    "compute_stage_map", "transfer_cards",
     # crud_documents
     "store_document", "get_document", "fuzzy_get_document", "list_documents",
     "delete_document", "store_document_by_project", "get_document_by_project",

@@ -71,15 +71,14 @@ five pattern flags: `rapid_cycling`, `token_limited`, `zombie_sessions`, `stage_
 
 ### When MCP tool calls hang or return no result
 
-MCP tools in this project are **synchronous** and make direct SQLite calls with no timeout
-configured (`mcp_tools/helpers.py:15-26`). SQLite's default lock-wait timeout is 5 seconds;
-if the scheduler is holding a write lock (e.g., committing a task update, running an intake
-vote, persisting budget entries), MCP reads queue behind it and can appear to hang.
+MCP tools in this project are **synchronous** and make direct PostgreSQL calls via
+SQLAlchemy with no timeout configured (`mcp_tools/helpers.py:15-26`). If the scheduler
+is holding a write lock (e.g., committing a task update, running an intake vote, persisting
+budget entries), MCP reads queue behind it and can appear to hang.
 
 **Root causes (structural — can happen any time):**
 - `mcp_tools/helpers.py` — `get_conn()` / `get_rw_conn()` have no `timeout=` argument
-- `app/database/session.py` — no `PRAGMA journal_mode=WAL`, so writes exclusively lock the DB;
-  also no `connect_args={"timeout": N}` on the SQLAlchemy engine
+- `app/database/session.py` — no `connect_args={"connect_timeout": N}` on the SQLAlchemy engine
 - High-query tools (`get_scheduler_state`, `diagnose_task`, `find_stuck_tasks`) issue 4–8+
   SELECT statements per call, each of which must wait for any in-progress write lock
 
@@ -210,7 +209,7 @@ For stuck planning tasks use `diagnose_task(task_id)` — covers budget traces, 
 ### Backend (`app/`)
 - `main.py` — FastAPI app. All routes. Mounts static files from `app/web/`. On startup calls `init_db()` + `seed_sample_tasks()` (skips seeding if data exists). Quick-action endpoints: `/demote`, `/set-stage`, `/clone`, `/pin`, `/run-planning`, `/run-review`, `/run-security`, `/run-final-review`. Task serialization (`_task_to_dict`) always includes a `"pips"` array. `sync_update_llm_with_cache` / `sync_delete_llm_with_cache` call `invalidate_llm_cache` after LLM record mutations so stale context/capacity state is flushed immediately.
 - `database/` — DB package. `models.py` has SQLAlchemy ORM definitions. `__init__.py` re-exports the main CRUD surface. Specialized modules: `crud_pipeline.py` (planning/review/component results), `crud_tasks.py` (task + PIP CRUD), `crud_sessions.py` (agent sessions), `crud_infra.py` (LLMs, budgets, compute nodes), `crud_jobs.py` (research + file-summary jobs), `crud_costs.py` (budget entries + expenses), `crud_projects.py`, `crud_files.py`, `crud_maestro.py`, `crud_survey.py`, `crud_inbox.py`, `session.py` (SQLAlchemy session factory). `delete_task()` is a **soft-delete**: sets `is_active=False` on the target and all descendants via BFS. All read queries filter `is_active=True`. `upsert_project()` uses `...` (Ellipsis) sentinel for `llm_id`/`budget_id` — pass Ellipsis to leave unchanged, None to clear. `pip_status_at_stage(pip, stage)` derives status at read time — no stored status column.
-- `migrations/runner.py` — standalone sqlite3 migration engine, no SQLAlchemy dependency.
+- `migrations/runner.py` — PostgreSQL migration engine using psycopg2 via `MAESTRO_ADMIN_DATABASE_URL`.
 
 ### Agent system (`app/agent/`)
 

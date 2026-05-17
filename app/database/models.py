@@ -254,6 +254,9 @@ class CustomAgentDefinition(Base):
     max_turns              = Column(Integer,  nullable=True)
     max_tokens             = Column(Integer,  nullable=True)
     user_prompt_template   = Column(Text,     nullable=True)
+    behavior_type          = Column(String,   nullable=True)   # e.g. "intake_pipeline", "maestro_loop"
+    behavior_config        = Column(JSON,     nullable=True)   # configurable params for the behavior
+    is_builtin             = Column(Boolean,  nullable=False, default=False)
     created_at    = Column(DateTime, default=datetime.utcnow)
 
     def __repr__(self):
@@ -287,6 +290,7 @@ class Task(Base):
     position = Column(Integer, nullable=True, default=0)  # Position within column (0 = first)
     project_id = Column(Integer, ForeignKey('projects.id'), nullable=True)  # Numeric FK (migration 0044)
     project_ref = relationship('Project', foreign_keys=[project_id], lazy='joined')
+    pipeline_template_id = Column(Integer, ForeignKey('pipeline_templates.id'), nullable=True, index=True)  # which pipeline owns this card (migration 0077); NULL = arch task (project-scoped)
     parent_task_id = Column(String, ForeignKey('tasks.id'), nullable=True)  # Links sub-ideas to origin
     subdivision_generation = Column(Integer, nullable=False, default=0)  # Recursion depth (0=human)
     is_big_idea = Column(Boolean, nullable=False, default=False)  # Flagged when subdivision produces children
@@ -344,10 +348,11 @@ class BudgetEntry(Base):
     prompt_cost = Column(Integer, nullable=False, default=0)        # total prompt tokens
     generation_cost = Column(Integer, nullable=False, default=0)    # total completion tokens
     tool_calls = Column(Integer, nullable=False, default=0)         # total LLM turns
-    prompt_data = Column(Text, nullable=True)                       # full prompt messages (JSON)
+    prompt_data = Column(Text, nullable=True)                       # delta prompt messages (JSON); NULL=legacy full history
     response_data = Column(Text, nullable=True)                     # full response (JSON)
     session_id = Column(String, nullable=True)                      # UUID shared by all calls in one agent run
     agent_name = Column(String, nullable=True)                      # e.g. "Subdivision Agent"
+    prompt_message_count = Column(Integer, nullable=True)           # cumulative msg count after this turn; NULL=legacy full history
     created_at = Column(DateTime, default=datetime.utcnow)
 
     def __repr__(self):

@@ -31,6 +31,11 @@ if _test_db_path:
     DATABASE_URL = f"sqlite:///{_test_db_path}"
 else:
     DATABASE_URL = CFG_DATABASE_URL
+    if DATABASE_URL.startswith("sqlite"):
+        raise RuntimeError(
+            "SQLite is only supported in tests (set MAESTRO_TEST_DB). "
+            "For production set MAESTRO_USE_POSTGRES=true and MAESTRO_DATABASE_URL in .env."
+        )
 
 # Create database engine
 if DATABASE_URL.startswith("sqlite"):
@@ -99,6 +104,11 @@ def init_db_tables():
                 except Exception:
                     pass
                 conn.execute(text("UPDATE tasks SET stage_key = type WHERE stage_key IS NULL"))
+                # budget_entries.prompt_message_count (delta storage)
+                try:
+                    conn.execute(text("ALTER TABLE budget_entries ADD COLUMN prompt_message_count INTEGER"))
+                except Exception:
+                    pass
                 conn.commit()
         except Exception as e:
             logger.debug("Minor: could not verify SQLite additive columns: %s", e)

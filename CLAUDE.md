@@ -248,12 +248,32 @@ Key diagnostics to check first when cards are stuck:
 
 For stuck planning tasks use `diagnose_task(task_id)` — covers budget traces, gate history, and session state in one call.
 
+## Direct PostgreSQL access
+
+`scripts/psql.py` — runs SQL against the live database using credentials from `.env`. No
+connection string needed; the script loads `MAESTRO_DATABASE_URL` (app user, default) or
+`MAESTRO_ADMIN_DATABASE_URL` (`--admin`, required for VACUUM / DDL).
+
+```bash
+# Common one-liners
+venv/Scripts/python.exe scripts/psql.py --list-tables               # all tables: size, live/dead rows
+venv/Scripts/python.exe scripts/psql.py --budget-entries            # heap vs TOAST vs indexes for budget_entries
+venv/Scripts/python.exe scripts/psql.py "SELECT count(*) FROM tasks WHERE is_active"
+venv/Scripts/python.exe scripts/psql.py --admin "SELECT pg_size_pretty(pg_database_size('maestro_db'))"
+venv/Scripts/python.exe scripts/psql.py --vacuum-full budget_entries  # VACUUM FULL shortcut (admin + autocommit)
+echo "SELECT version()" | venv/Scripts/python.exe scripts/psql.py --admin -  # stdin
+```
+
+Use `--admin` for anything that needs DDL privileges: `VACUUM FULL`, `ALTER TABLE`,
+`GRANT`, `REINDEX`. The `--vacuum-full <table>` shorthand handles autocommit automatically
+and prints the new size when done.
+
 ## Architecture
 
 ### Backend (`app/`)
 - `main.py` — FastAPI app. All routes. Mounts static files from `app/web/`. On startup calls `init_db()` + `seed_sample_tasks()` (skips seeding if data exists) + `_check_builtin_templates()` (drift warning). Quick-action endpoints: `/demote`, `/set-stage`, `/clone`, `/pin`, `/run-planning`, `/run-review`, `/run-security`, `/run-final-review`. Task serialization (`_task_to_dict`) always includes a `"pips"` array. `sync_update_llm_with_cache` / `sync_delete_llm_with_cache` call `invalidate_llm_cache` after LLM record mutations.
-- `database/` — DB package. See `app/database/CLAUDE.md` for full file map. Core modules: `models.py` (all ORM models), `crud_tasks.py` (task + PIP CRUD), `crud_projects.py`, `crud_infra.py`, `crud_costs.py`, `crud_pipeline.py`, `crud_jobs.py`, `crud_files.py`, `crud_malleable.py` (pipeline templates, stages, transitions, arch categories, custom agent defs, system_settings, project_settings — 50+ functions), `crud_documents.py` (project document store), `crud_factory.py` (factory_runs audit), `session.py`. `delete_task()` is a **soft-delete** (BFS, sets `is_active=False`). `upsert_project()` uses `...` (Ellipsis) sentinel for `llm_id`/`budget_id`.
-- `migrations/runner.py` — PostgreSQL migration engine (SQLite only for tests via `MAESTRO_TEST_DB`). Latest migrations: 0070 (malleable pipeline tables baseline), 0071 (autopilot settings), 0072 (factory_runs), 0073 (built-in template seeds).
+- `database/` — DB package. See `app/database/CLAUDE.md` for full file map. Core modules: `models.py` (all ORM models), `crud_tasks.py` (task + PIP CRUD), `crud_projects.py`, `crud_infra.py`, `crud_costs.py` (budget entries store **deltas** only since migration 0076; `reconstruct_messages_for_entry(entry_id, db)` accumulates them back to full history), `crud_pipeline.py`, `crud_jobs.py`, `crud_files.py`, `crud_malleable.py` (pipeline templates, stages, transitions, arch categories, custom agent defs, system_settings, project_settings — 50+ functions), `crud_documents.py` (project document store), `crud_factory.py` (factory_runs audit), `session.py`. `delete_task()` is a **soft-delete** (BFS, sets `is_active=False`). `upsert_project()` uses `...` (Ellipsis) sentinel for `llm_id`/`budget_id`.
+- `migrations/runner.py` — PostgreSQL migration engine (SQLite only for tests via `MAESTRO_TEST_DB`). Latest migrations: 0074 (expand AI review group), 0075 (custom agent definition extensions), 0076 (budget_entries delta storage — adds `prompt_message_count`).
 
 ### Agent system (`app/agent/`)
 
@@ -328,7 +348,8 @@ CRUD   /api/llms[/{id}]                   — LLM endpoints
 CRUD   /api/budgets[/{id}]                — budgets
 CRUD   /api/compute-nodes[/{id}]          — compute nodes
 GET    /api/budget-entries                — budget entries (task_id=__file_summaries__ for prewarm)
-GET    /api/budget-entries/{id}/full      — full prompt/response
+GET    /api/budget-entries/{id}/full      — full reconstructed prompt/response (accumulates deltas)
+GET    /api/sessions/{session_id}/entries/full — all entries for a session with raw prompt_delta per entry
 GET    /api/budgets/{id}/summary          — aggregated usage
 
 # Diagnostics / task detail

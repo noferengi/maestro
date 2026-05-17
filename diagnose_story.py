@@ -1,3 +1,4 @@
+# DEPRECATED: Uses SQLite direct. Use MCP tools (diagnose_task, get_budget_trace) instead.
 import sqlite3
 import json
 from pathlib import Path

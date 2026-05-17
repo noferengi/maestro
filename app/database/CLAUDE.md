@@ -50,6 +50,25 @@ crud_costs.py      (also imports get_budget from crud_infra — local import ins
 __init__.py        (imports from all of the above)
 ```
 
+## Ad-hoc SQL access
+
+Use `scripts/psql.py` to run queries or admin commands against the live database without
+opening a separate psql session. It reads credentials from `.env` automatically:
+
+```bash
+# app user (read queries, DML)
+venv/Scripts/python.exe scripts/psql.py --list-tables
+venv/Scripts/python.exe scripts/psql.py "SELECT count(*) FROM budget_entries"
+
+# admin user (DDL, VACUUM, GRANT)
+venv/Scripts/python.exe scripts/psql.py --admin --budget-entries
+venv/Scripts/python.exe scripts/psql.py --vacuum-full budget_entries
+```
+
+`--list-tables` shows every user table with total size, heap size, indexes+TOAST, and
+live/dead row counts — useful for spotting bloat. `--budget-entries` gives a focused
+heap-vs-TOAST breakdown for the largest table in the schema.
+
 ## Key design rules
 
 - **`init_db()` lives in `crud_tasks.py`**, not `session.py`.  It queries the

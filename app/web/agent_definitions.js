@@ -24,6 +24,32 @@ function applyFilter() {
   renderGrid(filtered);
 }
 
+const GATE_LABELS = {
+  llm_judge:   "LLM Judge",
+  single_pass: "Single Pass",
+  voting:      "Voting",
+  test_suite:  "Test Suite",
+  human:       "Human",
+  none:        "No Gate",
+};
+
+const BEHAVIOR_LABELS = {
+  intake_pipeline:   "Intake Pipeline",
+  planning_pipeline: "Planning Pipeline",
+  maestro_loop:      "MaestroLoop",
+  conceptual_review: "Conceptual Review",
+  optimization:      "Optimization",
+  security:          "Security",
+  final_review:      "Final Review",
+  factory:           "Card Factory",
+  voting_panel:      "Voting Panel",
+  circuit_breaker:   "Circuit Breaker",
+  fan_out_judge:     "Fan-Out + Judge",
+  human_gate:        "Human Gate",
+  arch_gen:          "Arch Gen",
+  single_pass_llm:   "Single-Pass LLM",
+};
+
 function renderGrid(defs) {
   const grid = document.getElementById("grid");
   const count = document.getElementById("count-label");
@@ -37,25 +63,46 @@ function renderGrid(defs) {
   grid.innerHTML = defs.map(d => {
     const toolCount = (d.allowed_tools || []).length;
     const gateClass = `badge-${d.gate_type || "none"}`;
-    const gateLabel = { llm_judge: "LLM Judge", single_pass: "Single Pass", none: "No Gate" }[d.gate_type] || d.gate_type;
-    const initials = (d.display_name || d.name || "?").slice(0, 2).toUpperCase();
+    const gateLabel = GATE_LABELS[d.gate_type] || d.gate_type;
+    const isBuiltin = !!d.is_builtin;
+    const cardClass = isBuiltin ? "tpl-card is-builtin" : "tpl-card";
+    const icon = isBuiltin ? "⚙️" : "🤖";
+
+    const builtinBadge = isBuiltin
+      ? `<span class="badge badge-builtin">Built-in</span>`
+      : "";
+    const behaviorBadge = d.behavior_type
+      ? `<span class="badge badge-behavior" title="Behavior type">${esc(BEHAVIOR_LABELS[d.behavior_type] || d.behavior_type)}</span>`
+      : "";
+
+    const editBtn = isBuiltin
+      ? `<a href="/agents/${d.id}/edit" class="btn btn-secondary btn-sm">View →</a>`
+      : `<a href="/agents/${d.id}/edit" class="btn btn-secondary btn-sm">Edit →</a>`;
+
+    const deleteBtn = isBuiltin
+      ? ""
+      : `<button class="btn btn-danger btn-sm" onclick="deleteDefinition(${d.id}, ${JSON.stringify(d.display_name)})">Delete</button>`;
+
     return `
-<div class="tpl-card">
+<div class="${cardClass}">
   <div class="card-header">
-    <div class="card-icon">🤖</div>
+    <div class="card-icon">${icon}</div>
     <div class="card-title-wrap">
       <div class="card-name" title="${esc(d.display_name)}">${esc(d.display_name)}</div>
       <div class="card-slug">${esc(d.name)}</div>
     </div>
   </div>
   <div class="card-meta">
+    ${builtinBadge}
     <span class="badge ${gateClass}">${esc(gateLabel)}</span>
+    ${behaviorBadge}
     <span class="badge badge-tools">${toolCount} tool${toolCount !== 1 ? "s" : ""}</span>
   </div>
   <div class="card-desc">${esc(d.description || "No description.")}</div>
   <div class="card-actions">
-    <a href="/agents/${d.id}/edit" class="btn btn-secondary btn-sm">Edit →</a>
-    <button class="btn btn-danger btn-sm" onclick="deleteDefinition(${d.id}, ${JSON.stringify(d.display_name)})">Delete</button>
+    ${editBtn}
+    <button class="btn btn-secondary btn-sm" onclick="cloneDefinition(${d.id}, ${JSON.stringify(d.display_name)})">Clone</button>
+    ${deleteBtn}
   </div>
 </div>`;
   }).join("");
@@ -76,6 +123,25 @@ async function deleteDefinition(id, name) {
     } else {
       const err = await res.json().catch(() => ({}));
       showToast(err.detail || "Delete failed", true);
+    }
+  } catch (e) {
+    showToast("Network error", true);
+  }
+}
+
+async function cloneDefinition(id, name) {
+  try {
+    const res = await fetch(`/api/agent-definitions/${id}/clone`, { method: "POST" });
+    if (res.ok) {
+      const cloned = await res.json();
+      _definitions.push(cloned);
+      applyFilter();
+      showToast(`Cloned "${name}" → "${cloned.display_name}"`);
+      // Navigate to the editor for the new clone
+      setTimeout(() => { window.location.href = `/agents/${cloned.id}/edit`; }, 800);
+    } else {
+      const err = await res.json().catch(() => ({}));
+      showToast(err.detail || "Clone failed", true);
     }
   } catch (e) {
     showToast("Network error", true);

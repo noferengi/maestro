@@ -1,17 +1,19 @@
 """
 CRUD operations for BudgetEntry and Expense, plus budget math helpers.
 
-BudgetEntry — one row per LLM call (full prompt + response JSON stored).
+BudgetEntry — one row per LLM call (delta prompt messages + full response JSON stored).
 Expense     — one row per LLM call with microcent (µ¢) cost breakdown.
               1 µ¢ = 1/1,000,000 of a US cent.  dollar_amount == -1 → infinite.
 
 Key helpers:
-  get_budget_spent_microcents  — SUM(expenses) for a budget
-  get_budget_remaining_microcents — remaining capacity (None if infinite)
-  budget_has_capacity          — pre-flight check before dispatching a job
-  get_budget_summary           — aggregate totals from BudgetEntry rows
+  get_budget_spent_microcents      — SUM(expenses) for a budget
+  get_budget_remaining_microcents  — remaining capacity (None if infinite)
+  budget_has_capacity              — pre-flight check before dispatching a job
+  get_budget_summary               — aggregate totals from BudgetEntry rows
+  reconstruct_messages_for_entry   — accumulate session deltas → full message list
 """
 
+import json
 import logging
 
 from sqlalchemy import func
@@ -31,7 +33,8 @@ logger = logging.getLogger(__name__)
 def create_budget_entry(llm_id=None, budget_id=None, task_id=None,
                         prompt_cost=0, generation_cost=0, tool_calls=0,
                         prompt_data=None, response_data=None,
-                        session_id=None, agent_name=None):
+                        session_id=None, agent_name=None,
+                        prompt_message_count=None):
     db = SessionLocal()
     try:
         entry = BudgetEntry(
@@ -39,6 +42,7 @@ def create_budget_entry(llm_id=None, budget_id=None, task_id=None,
             prompt_cost=prompt_cost, generation_cost=generation_cost,
             tool_calls=tool_calls, prompt_data=prompt_data, response_data=response_data,
             session_id=session_id, agent_name=agent_name,
+            prompt_message_count=prompt_message_count,
         )
         db.add(entry)
         
@@ -125,6 +129,43 @@ def delete_budget_entry(entry_id: int) -> bool:
         return False
     finally:
         db.close()
+
+
+def reconstruct_messages_for_entry(entry_id: int, db=None) -> list[dict]:
+    """Rebuild the full message list for a budget entry by accumulating deltas.
+
+    For legacy rows (prompt_message_count IS NULL), prompt_data is the full
+    history and is returned as-is.  For delta rows, all prior deltas in the
+    session are concatenated in order.
+    """
+    _own_db = db is None
+    if _own_db:
+        db = SessionLocal()
+    try:
+        entry = db.query(BudgetEntry).filter(BudgetEntry.id == entry_id).first()
+        if not entry:
+            return []
+        if entry.prompt_message_count is None:
+            return json.loads(entry.prompt_data) if entry.prompt_data else []
+        if not entry.session_id:
+            return json.loads(entry.prompt_data) if entry.prompt_data else []
+        prior = (
+            db.query(BudgetEntry)
+            .filter(
+                BudgetEntry.session_id == entry.session_id,
+                BudgetEntry.id <= entry_id,
+                BudgetEntry.prompt_data.isnot(None),
+            )
+            .order_by(BudgetEntry.id.asc())
+            .all()
+        )
+        full: list[dict] = []
+        for e in prior:
+            full.extend(json.loads(e.prompt_data))
+        return full
+    finally:
+        if _own_db:
+            db.close()
 
 
 # ---------------------------------------------------------------------------

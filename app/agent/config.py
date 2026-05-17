@@ -168,7 +168,14 @@ if USE_POSTGRES:
     DATABASE_URL: str = _get("database", "url", "MAESTRO_DATABASE_URL", "postgresql://localhost/maestro_db")
     ADMIN_DATABASE_URL: str = _get("database", "admin_url", "MAESTRO_ADMIN_DATABASE_URL", DATABASE_URL)
 else:
-    # Fallback to local SQLite
+    # SQLite is only allowed when MAESTRO_TEST_DB is set (test suite).
+    # session.py enforces this at engine-creation time; config.py sets the URL
+    # so the migration runner can still reference it for test paths.
+    if not os.environ.get("MAESTRO_TEST_DB"):
+        raise RuntimeError(
+            "SQLite is only supported in tests (set MAESTRO_TEST_DB). "
+            "For production set MAESTRO_USE_POSTGRES=true and MAESTRO_DATABASE_URL in .env."
+        )
     DATABASE_URL = f"sqlite:///{_DB_PATH_DEFAULT}"
     ADMIN_DATABASE_URL = DATABASE_URL
 

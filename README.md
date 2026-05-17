@@ -4,7 +4,7 @@
 > A Kanban board whose cards are executed by LLMs, not tracked by humans.
 
 [![FastAPI](https://img.shields.io/badge/FastAPI-005571?logo=fastapi)](https://fastapi.tiangolo.com/)
-[![SQLite](https://img.shields.io/badge/SQLite-003B57?logo=sqlite)](https://www.sqlite.org/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python)](https://www.python.org/)
 
 ---
@@ -131,7 +131,7 @@ The server runs on **http://localhost:8000**. The Kanban board is at `/kanban.ht
 └───────────────────────────────────────────────────────────┘
                        │
 ┌──────────────────────▼───────────────────────────────────┐
-│              SQLite Database (data/kanban.db)             │
+│              PostgreSQL Database (MAESTRO_DATABASE_URL)   │
 └───────────────────────────────────────────────────────────┘
 ```
 
@@ -264,8 +264,8 @@ python -m pytest app/tests/ -v
 | Port in use | `python -m uvicorn app.main:app --port 8002` |
 | Import errors | `venv/Scripts/activate && pip install -r requirements.txt` |
 | Stuck cards | `mcp__maestro__diagnose_task(task_id)` in Claude Code |
-| MCP hangs | Wait a few seconds (SQLite lock contention), or `mcp__maestro__restart_server()` |
-| Reset DB | `del data\kanban.db && python -c "from app.database import init_db; init_db()"` |
+| MCP hangs | Wait a few seconds (DB lock contention), or `mcp__maestro__restart_server()` |
+| Reset DB | Run `migrate.bat reset` (drops and re-creates all tables) |
 
 ---
 

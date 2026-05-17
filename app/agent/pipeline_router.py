@@ -50,6 +50,23 @@ _agent_type_executors: dict[str, Callable] = {}
 # Agent types that should never be auto-dispatched (require human action or are terminal).
 _NO_AUTO_DISPATCH_AGENT_TYPES: frozenset[str] = frozenset({"human_gate", "terminal"})
 
+# behavior_type values that require no auto-dispatch (same semantics, but arrived via a definition).
+_NO_AUTO_DISPATCH_BEHAVIOR_TYPES: frozenset[str] = frozenset({"human_gate", "arch_gen"})
+
+# Maps behavior_type → the stage-handler key registered by scheduler.py.
+# When dispatch_task resolves a definition with behavior_type in this map, it
+# calls _stage_handlers[mapped_key] so the full built-in pipeline runs.
+_BEHAVIOR_TYPE_TO_STAGE_HANDLER: dict[str, str] = {
+    "intake_pipeline":   "idea",
+    "planning_pipeline": "planning",
+    "maestro_loop":      "indev",
+    "conceptual_review": "conceptual_review",
+    "optimization":      "optimization",
+    "security":          "security",
+    "final_review":      "final_review",
+    "factory":           "factory_node",
+}
+
 
 def register_handler(stage_key: str, fn: Callable) -> None:
     """Register `fn` as the dispatch handler for `stage_key`."""
@@ -320,15 +337,78 @@ def dispatch_task(
         )
         return False
 
-    # 2b. Agent-type-specific executor
+    # 2b. Definition-driven dispatch: agent_type may name a custom_agent_definitions row.
+    #     If the definition has a behavior_type, route to the corresponding handler/executor
+    #     so that built-in pipeline semantics fire even for user-named stages.
+    defn = _load_definition_by_name(agent_type)
+    if defn is not None and getattr(defn, "behavior_type", None):
+        behavior_type = defn.behavior_type
+        if behavior_type in _NO_AUTO_DISPATCH_BEHAVIOR_TYPES:
+            logger.debug(
+                "[pipeline_router] Stage '%s' definition behavior_type='%s' is not auto-dispatchable (task=%s).",
+                stage_key, behavior_type, task_id,
+            )
+            return False
+        # Merge behavior_config into stage_config.config (stage wins on conflict)
+        merged_config = {**(defn.behavior_config or {}), **(stage_config.config or {})}
+        merged_stage = StageConfig(
+            stage_key=stage_config.stage_key,
+            label=stage_config.label,
+            agent_type=stage_config.agent_type,
+            position=stage_config.position,
+            config=merged_config,
+            template_id=stage_config.template_id,
+            stage_id=stage_config.stage_id,
+        )
+        # Try executor registry first (voting_panel, circuit_breaker, fan_out_judge)
+        executor = _agent_type_executors.get(behavior_type)
+        if executor is not None:
+            logger.debug(
+                "[pipeline_router] Definition '%s' behavior_type='%s' -> executor (task=%s).",
+                agent_type, behavior_type, task_id,
+            )
+            executor(task_id, merged_stage, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
+            return True
+        # Try stage-handler map (intake_pipeline, planning_pipeline, maestro_loop, …)
+        handler_key = _BEHAVIOR_TYPE_TO_STAGE_HANDLER.get(behavior_type)
+        if handler_key:
+            handler = _stage_handlers.get(handler_key)
+            if handler is not None:
+                logger.debug(
+                    "[pipeline_router] Definition '%s' behavior_type='%s' -> stage handler '%s' (task=%s).",
+                    agent_type, behavior_type, handler_key, task_id,
+                )
+                handler(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
+                return True
+        # single_pass_llm and unknown behavior types fall through to GenericStageAgent below
+
+    # 2c. Agent-type-specific executor (registered directly, e.g. custom executor keys)
     executor = _agent_type_executors.get(agent_type)
     if executor is not None:
         executor(task_id, stage_config, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
         return True
 
-    # 2c. Universal fallback: GenericStageAgent
+    # 2d. Universal fallback: GenericStageAgent
     _run_generic_stage(task_id, stage_config, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
     return True
+
+
+def _load_definition_by_name(name: str):
+    """Load a custom_agent_definitions row by name, returning None on miss or error."""
+    try:
+        from app.database.session import SessionLocal
+        from app.database.models import CustomAgentDefinition
+        db = SessionLocal()
+        try:
+            return (
+                db.query(CustomAgentDefinition)
+                .filter(CustomAgentDefinition.name == name)
+                .first()
+            )
+        finally:
+            db.close()
+    except Exception:
+        return None
 
 
 def _run_generic_stage(

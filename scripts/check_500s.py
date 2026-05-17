@@ -1,52 +1,40 @@
-#!/usr/bin/env python
 """
-scripts/check_500s.py
-----------------------
-Diagnose LLM 500 errors by correlating log timestamps with budget_entries
-payload sizes.
+check_500s.py — Diagnose LLM 500 errors by correlating log events with DB state.
+
+What this shows:
+  - Every 500/error event in the log with its timestamp and error body
+  - Budget entries whose calls landed within +/-N seconds of each 500
+  - Top sessions by token spend (via expenses table — accurate with delta storage)
+  - Seconds where >1 call completed (concurrent request slot contention)
+  - Root cause analysis summary
 
 Usage:
     venv/Scripts/python.exe scripts/check_500s.py              # last 2 hours
     venv/Scripts/python.exe scripts/check_500s.py --hours 12   # last 12 hours
     venv/Scripts/python.exe scripts/check_500s.py --all        # all time
-
-What this shows
----------------
-- Every 500/error event in the log file with its timestamp and (after today's
-  fix) the actual error body from llama.cpp
-- For each 500 cluster: the budget_entries whose calls landed within ±10 s,
-  showing prompt sizes, estimated token counts, and task/agent context
-- A summary table of the 10 largest prompts ever sent so you can spot
-  runaway context growth
-- A concurrency timeline: calls that overlapped within the same second
-  (concurrent requests → slot exhaustion)
-
-All output is ASCII-safe (Windows cp1252 terminal compatible).
+    venv/Scripts/python.exe scripts/check_500s.py --task <id>  # token growth for task
 """
 from __future__ import annotations
 
 import argparse
 import os
 import re
-import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from sqlalchemy import text
+from app.database.session import engine
+
+_LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "logs", "maestro.log")
 
 # ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
-
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_ROOT = os.path.dirname(_SCRIPT_DIR)
-_LOG_PATH = os.path.join(_ROOT, "logs", "maestro.log")
-_DB_PATH  = os.path.join(_ROOT, "data", "kanban.db")
-
-# ---------------------------------------------------------------------------
-# Helpers
+# Token estimate
 # ---------------------------------------------------------------------------
 
 def _tok(chars: int) -> int:
-    """Rough token estimate: 1 token ~ 4 chars."""
     return chars // 4
 
 
@@ -60,180 +48,151 @@ def _fmt_size(chars: int) -> str:
         return f"{chars/1024/1024:.1f}MB / ~{tok:,}tok"
 
 
-def _parse_log_ts(ts_str: str) -> "datetime | None":
-    """Parse '2026-04-04T18:05:27' from log lines.
-
-    Log timestamps are in local time; DB stores UTC.  We convert here so
-    all comparisons against DB values work correctly.
-    """
-    try:
-        import time as _time
-        local_dt = datetime.fromisoformat(ts_str)
-        # utcoffset in seconds (negative west of UTC, positive east)
-        utc_offset_s = -_time.timezone if not _time.daylight else -_time.altzone
-        import datetime as _dt
-        utc_dt = local_dt - _dt.timedelta(seconds=utc_offset_s)
-        return utc_dt
-    except (ValueError, Exception):
-        return None
-
-
-def _db_ts(ts_str: str) -> "datetime | None":
-    """Parse SQLite created_at like '2026-04-04 22:08:36.663454' (UTC)."""
-    try:
-        return datetime.fromisoformat(ts_str.replace(" ", "T"))
-    except ValueError:
-        return None
-
-
-def _local_to_utc(dt: "datetime") -> "datetime":
-    """Convert a local naive datetime to UTC."""
-    import time as _time
-    import datetime as _dt
-    utc_offset_s = -_time.timezone if not _time.daylight else -_time.altzone
-    return dt - _dt.timedelta(seconds=utc_offset_s)
-
 # ---------------------------------------------------------------------------
-# Log parsing
+# Log parsing  (unchanged from original — no DB dependency here)
 # ---------------------------------------------------------------------------
 
-# Matches lines like:
-#   2026-04-04T18:05:27 [INFO] httpx: HTTP Request: POST http://...  "HTTP/1.1 500 ..."
 _HTTP_LINE_RE = re.compile(
     r'^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})'
     r'\s+\[\w+\]\s+httpx:.*?"HTTP/1\.1\s+(?P<code>\d{3})\s+(?P<reason>[^"]*)"'
 )
-
-# Matches new-style WARNING lines (after our fix):
-#   2026-04-04T18:05:27 [WARNING] app.agent.llm_client: LLM call to ... returned 500 — body: ...
 _BODY_LINE_RE = re.compile(
     r'^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})'
     r'\s+\[WARNING\].*?returned (?P<code>\d{3}) -- body: (?P<body>.+)$'
 )
-
-# "back online" recovery lines
 _RECOVER_RE = re.compile(
     r'^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})'
     r'.*?back online.*?(?P<attempts>\d+) attempt'
 )
 
 
-def parse_log(path: str, since: "datetime | None") -> dict:
-    """
-    Returns:
-        {
-          'errors':    [(ts, code, reason)],
-          'bodies':    [(ts, code, body)],       # only after logging fix
-          'recoveries':[(ts, attempts)],
-          'all_lines': [str],
-        }
-    """
-    result = {"errors": [], "bodies": [], "recoveries": [], "all_lines": []}
+def _parse_log_ts(ts_str: str) -> datetime | None:
+    try:
+        import time as _time
+        local_dt = datetime.fromisoformat(ts_str)
+        utc_offset_s = -_time.timezone if not _time.daylight else -_time.altzone
+        return local_dt - timedelta(seconds=utc_offset_s)
+    except Exception:
+        return None
+
+
+def _local_to_utc(dt: datetime) -> datetime:
+    import time as _time
+    utc_offset_s = -_time.timezone if not _time.daylight else -_time.altzone
+    return dt - timedelta(seconds=utc_offset_s)
+
+
+def parse_log(path: str, since: datetime | None) -> dict:
+    result = {"errors": [], "bodies": [], "recoveries": []}
     if not os.path.exists(path):
         print(f"[WARN] Log file not found: {path}")
         return result
-
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
             line = line.rstrip()
-            result["all_lines"].append(line)
-
             m = _HTTP_LINE_RE.match(line)
             if m:
                 ts = _parse_log_ts(m.group("ts"))
                 code = int(m.group("code"))
-                reason = m.group("reason").strip()
-                if code >= 500:
-                    if since is None or (ts and ts >= since):
-                        result["errors"].append((ts, code, reason))
+                if code >= 500 and (since is None or (ts and ts >= since)):
+                    result["errors"].append((ts, code, m.group("reason").strip()))
                 continue
-
             m = _BODY_LINE_RE.match(line)
             if m:
                 ts = _parse_log_ts(m.group("ts"))
                 code = int(m.group("code"))
-                body = m.group("body").strip()
-                if code >= 500:
-                    if since is None or (ts and ts >= since):
-                        result["bodies"].append((ts, code, body))
+                if code >= 500 and (since is None or (ts and ts >= since)):
+                    result["bodies"].append((ts, code, m.group("body").strip()))
                 continue
-
             m = _RECOVER_RE.match(line)
             if m:
                 ts = _parse_log_ts(m.group("ts"))
-                attempts = int(m.group("attempts"))
                 if since is None or (ts and ts >= since):
-                    result["recoveries"].append((ts, attempts))
-
+                    result["recoveries"].append((ts, int(m.group("attempts"))))
     return result
 
 
 # ---------------------------------------------------------------------------
-# DB queries
+# DB queries — PostgreSQL
 # ---------------------------------------------------------------------------
 
-def get_entries_near(conn: sqlite3.Connection, ts: "datetime", window_s: int = 10) -> list:
-    """Return budget_entries within ±window_s seconds of ts."""
-    lo = ts.isoformat(sep=" ").replace("T", " ")
-    # Cheap: just grab entries within a larger range and filter in Python
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, task_id, created_at,
-               length(prompt_data)   AS prompt_len,
-               length(response_data) AS resp_len,
-               tool_calls
+def get_entries_near(conn, ts: datetime, window_s: int = 10) -> list:
+    """Budget entries within ±window_s seconds of ts."""
+    rows = conn.execute(text("""
+        SELECT be.id, be.task_id, be.created_at,
+               be.prompt_cost, be.generation_cost,
+               be.tool_calls, be.session_id, be.agent_name,
+               be.prompt_message_count
+        FROM budget_entries be
+        WHERE be.created_at BETWEEN :lo AND :hi
+        ORDER BY be.created_at
+    """), {
+        "lo": ts - timedelta(seconds=window_s),
+        "hi": ts + timedelta(seconds=window_s),
+    }).fetchall()
+    return rows
+
+
+def get_top_sessions_by_tokens(conn, limit: int = 15, since: datetime | None = None) -> list:
+    """Top sessions by total prompt tokens (from expenses — accurate with delta storage)."""
+    params = {}
+    since_clause = ""
+    if since:
+        since_clause = "WHERE be.created_at >= :since"
+        params["since"] = since
+    rows = conn.execute(text(f"""
+        SELECT
+            be.session_id,
+            be.task_id,
+            be.agent_name,
+            SUM(e.prompt_tokens)      AS total_prompt_tok,
+            SUM(e.completion_tokens)  AS total_completion_tok,
+            COUNT(be.id)              AS turns,
+            MIN(be.created_at)        AS first_call
+        FROM budget_entries be
+        JOIN expenses e ON e.budget_entry_id = be.id
+        {since_clause}
+        GROUP BY be.session_id, be.task_id, be.agent_name
+        ORDER BY total_prompt_tok DESC
+        LIMIT {limit}
+    """), params).fetchall()
+    return rows
+
+
+def get_concurrent_calls(conn, since: datetime | None) -> list:
+    """Seconds where >1 call completed — potential slot contention."""
+    params = {}
+    since_clause = ""
+    if since:
+        since_clause = "WHERE created_at >= :since"
+        params["since"] = since
+    rows = conn.execute(text(f"""
+        SELECT
+            date_trunc('second', created_at) AS second,
+            COUNT(*)                          AS call_count,
+            STRING_AGG(DISTINCT task_id, ', ') AS tasks
         FROM budget_entries
-        WHERE created_at >= datetime(?, '-{w} seconds')
-          AND created_at <= datetime(?, '+{w} seconds')
-        ORDER BY created_at
-    """.format(w=window_s), (lo, lo))
-    return cursor.fetchall()
-
-
-def get_top_prompts(conn: sqlite3.Connection, limit: int = 15) -> list:
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, task_id, created_at,
-               length(prompt_data)   AS prompt_len,
-               length(response_data) AS resp_len
-        FROM budget_entries
-        ORDER BY prompt_len DESC
-        LIMIT ?
-    """, (limit,))
-    return cursor.fetchall()
-
-
-def get_concurrent_calls(conn: sqlite3.Connection, since: "datetime | None") -> list:
-    """Find seconds where >1 call completed (potential slot contention)."""
-    since_str = since.isoformat(sep=" ") if since else "1970-01-01 00:00:00"
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT strftime('%Y-%m-%d %H:%M:%S', created_at) AS second,
-               count(*) AS call_count,
-               group_concat(DISTINCT task_id) AS tasks
-        FROM budget_entries
-        WHERE created_at >= ?
+        {since_clause}
         GROUP BY second
-        HAVING call_count > 1
+        HAVING COUNT(*) > 1
         ORDER BY call_count DESC
         LIMIT 20
-    """, (since_str,))
-    return cursor.fetchall()
+    """), params).fetchall()
+    return rows
 
 
-def get_prompt_growth(conn: sqlite3.Connection, task_id: str) -> list:
-    """Return all entries for a task ordered by time, showing prompt growth."""
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, created_at,
-               length(prompt_data)   AS prompt_len,
-               length(response_data) AS resp_len,
-               tool_calls
-        FROM budget_entries
-        WHERE task_id = ?
-        ORDER BY created_at
-    """, (task_id,))
-    return cursor.fetchall()
+def get_task_token_growth(conn, task_id: str) -> list:
+    """Token growth per entry for a task (uses expenses for accurate counts)."""
+    rows = conn.execute(text("""
+        SELECT be.id, be.created_at, be.session_id,
+               e.prompt_tokens, e.completion_tokens, be.tool_calls,
+               be.prompt_message_count
+        FROM budget_entries be
+        LEFT JOIN expenses e ON e.budget_entry_id = be.id
+        WHERE be.task_id = :tid
+        ORDER BY be.id
+    """), {"tid": task_id}).fetchall()
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -251,23 +210,17 @@ def section(title: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Diagnose LLM 500 errors")
-    parser.add_argument("--hours", type=float, default=2.0,
-                        help="Look back N hours (default: 2)")
-    parser.add_argument("--all", action="store_true",
-                        help="Analyse all time (ignores --hours)")
-    parser.add_argument("--task", default=None,
-                        help="Show prompt growth for a specific task ID")
-    parser.add_argument("--window", type=int, default=10,
-                        help="Seconds either side of a 500 to search DB (default: 10)")
+    parser.add_argument("--hours",  type=float, default=2.0)
+    parser.add_argument("--all",    action="store_true")
+    parser.add_argument("--task",   default=None)
+    parser.add_argument("--window", type=int, default=10)
     args = parser.parse_args()
 
-    since: "datetime | None" = None
+    since: datetime | None = None
     if not args.all:
-        import datetime as _dt
-        # Use UTC throughout so log timestamps (converted) match DB timestamps
-        since = _local_to_utc(datetime.now()) - _dt.timedelta(hours=args.hours)
+        since = _local_to_utc(datetime.now()) - timedelta(hours=args.hours)
 
-    # ── Parse log ──────────────────────────────────────────────────────────
+    # -- Parse log -----------------------------------------------------------
     log = parse_log(_LOG_PATH, since)
 
     section(f"500 ERRORS IN LOG  (since {since or 'all time'})")
@@ -279,103 +232,95 @@ def main() -> None:
 
     if log["bodies"]:
         print()
-        print("  Error bodies (from WARNING log — what the LLM server said):")
+        print("  Error bodies (what the LLM server said):")
         for ts, code, body in log["bodies"]:
             print(f"  {ts}  {code}  {body[:200]}")
     else:
         print()
-        print("  NOTE: No error bodies found. This is expected if the server was")
-        print("  started BEFORE today's fix (which raised 500 logging to WARNING).")
-        print("  Restart the server to start capturing error bodies going forward.")
+        print("  NOTE: No error bodies logged. Restart the server to start capturing them.")
 
     if log["recoveries"]:
         print()
-        print("  Recoveries (each = one 500 -> retry -> success cycle):")
+        print("  Recoveries:")
         for ts, attempts in log["recoveries"]:
             print(f"  {ts}  recovered after {attempts} attempt(s)")
 
-    # ── DB correlation ─────────────────────────────────────────────────────
-    if not os.path.exists(_DB_PATH):
-        print(f"\n[WARN] DB not found: {_DB_PATH}")
-        return
+    # -- DB queries ----------------------------------------------------------
+    with engine.connect() as conn:
 
-    conn = sqlite3.connect(_DB_PATH)
-
-    if log["errors"]:
-        section("BUDGET ENTRIES NEAR EACH 500  (+/- %ds)" % args.window)
-        seen_ids: set[int] = set()
-        for ts, code, reason in log["errors"]:
-            if ts is None:
-                continue
-            rows = get_entries_near(conn, ts, args.window)
-            if not rows:
-                print(f"\n  {ts}  HTTP {code} — no DB entries within +/-{args.window}s")
-                continue
-            print(f"\n  {ts}  HTTP {code}")
-            for eid, task_id, cat, plen, rlen, tcalls in rows:
-                if eid in seen_ids:
+        if log["errors"]:
+            section(f"BUDGET ENTRIES NEAR EACH 500  (+/-{args.window}s)")
+            seen_ids: set[int] = set()
+            for ts, code, reason in log["errors"]:
+                if ts is None:
                     continue
-                seen_ids.add(eid)
-                flag = " <<< OVERSIZED" if _tok(plen or 0) > 30_000 else ""
-                flag = " <<< VERY LARGE" if _tok(plen or 0) > 20_000 else flag
-                print(f"    entry {eid:>6}  {cat}  task={task_id}")
-                print(f"             prompt={_fmt_size(plen or 0)}  "
-                      f"resp={_fmt_size(rlen or 0)}  tools={tcalls}{flag}")
+                rows = get_entries_near(conn, ts, args.window)
+                if not rows:
+                    print(f"\n  {ts}  HTTP {code} — no DB entries within +/-{args.window}s")
+                    continue
+                print(f"\n  {ts}  HTTP {code}")
+                for eid, task_id, cat, pp, tg, tool_calls, sid, aname, pmc in rows:
+                    if eid in seen_ids:
+                        continue
+                    seen_ids.add(eid)
+                    flag = " <<< HEAVY" if (pp or 0) > 30_000 else ""
+                    dtype = "delta" if pmc is not None else "legacy"
+                    print(f"    entry {eid:>6}  {cat}  task={task_id}  [{dtype}]")
+                    print(f"             prompt_tok={pp:,}  completion_tok={tg:,}"
+                          f"  tools={tool_calls}  agent={aname}{flag}")
 
-    # ── Top prompts ever ───────────────────────────────────────────────────
-    section("TOP 15 LARGEST PROMPTS EVER SENT")
-    top = get_top_prompts(conn, 15)
-    if not top:
-        print("  (no budget entries)")
-    for eid, task_id, cat, plen, rlen in top:
-        flag = " <<< LIKELY OVERFLOW" if _tok(plen or 0) > 40_000 else ""
-        flag = " <<< WARN >20k tok"   if _tok(plen or 0) > 20_000 and not flag else flag
-        print(f"  entry {eid:>6}  {_fmt_size(plen or 0):>30}  task={task_id}  {cat}{flag}")
+        section("TOP 15 SESSIONS BY PROMPT TOKENS")
+        top_sessions = get_top_sessions_by_tokens(conn, limit=15, since=since)
+        if not top_sessions:
+            print("  (no expenses records in window)")
+        for sid, tid, aname, ptok, ctok, turns, first in top_sessions:
+            flag = " <<< LIKELY OVERFLOW" if (ptok or 0) > 40_000 else ""
+            flag = " <<< WARN >20k tok"   if (ptok or 0) > 20_000 and not flag else flag
+            sid_short = (str(sid)[:12] + "...") if sid and len(str(sid)) > 12 else sid
+            print(f"  {sid_short}  {(ptok or 0):>10,} prompt tok  "
+                  f"{turns:>4} turns  task={tid}  {flag}")
 
-    # ── Concurrent calls ───────────────────────────────────────────────────
-    section("SECONDS WITH >1 CONCURRENT CALL COMPLETING  (potential slot contention)")
-    conc = get_concurrent_calls(conn, since)
-    if not conc:
-        print("  None.")
-    else:
-        print(f"  {'Second':<22} {'Count':>5}  Tasks")
-        for second, count, tasks in conc:
-            print(f"  {second:<22} {count:>5}  {tasks}")
-
-    # ── Per-task growth ────────────────────────────────────────────────────
-    if args.task:
-        section(f"PROMPT GROWTH FOR TASK: {args.task}")
-        rows = get_prompt_growth(conn, args.task)
-        if not rows:
-            print("  No entries found.")
+        section("SECONDS WITH >1 CONCURRENT CALL  (potential slot contention)")
+        conc = get_concurrent_calls(conn, since)
+        if not conc:
+            print("  None.")
         else:
-            prev_len = 0
-            for eid, cat, plen, rlen, tcalls in rows:
-                delta = (plen or 0) - prev_len
-                flag = " <<<" if _tok(plen or 0) > 20_000 else ""
-                delta_str = f"+{_tok(delta):,}tok" if delta > 0 else f"{_tok(delta):,}tok"
-                print(f"  entry {eid:>6}  {cat}  "
-                      f"prompt={_fmt_size(plen or 0):>30}  "
-                      f"delta={delta_str:>12}  tools={tcalls}{flag}")
-                prev_len = plen or 0
+            print(f"  {'Second':<22} {'Count':>5}  Tasks")
+            for second, count, tasks in conc:
+                print(f"  {str(second):<22} {count:>5}  {str(tasks)[:60]}")
 
-    # ── Infer root cause ───────────────────────────────────────────────────
+        if args.task:
+            section(f"TOKEN GROWTH FOR TASK: {args.task}")
+            rows = get_task_token_growth(conn, args.task)
+            if not rows:
+                print("  No entries found.")
+            else:
+                prev_tok = 0
+                for eid, cat, sid, pp, tg, tool_calls, pmc in rows:
+                    pp = pp or 0
+                    delta = pp - prev_tok
+                    flag = " <<<" if pp > 20_000 else ""
+                    dtype = "delta" if pmc is not None else "legacy"
+                    delta_str = f"+{delta:,}" if delta >= 0 else f"{delta:,}"
+                    print(f"  entry {eid:>6}  {cat}  prompt={pp:>10,} tok  "
+                          f"delta={delta_str:>10}  [{dtype}]{flag}")
+                    prev_tok = pp
+
+        top_tok = top_sessions[0][3] if top_sessions else 0
+
     section("ROOT CAUSE ANALYSIS")
-    top_tok = _tok(top[0][3] or 0) if top else 0
-
     causes: list[str] = []
 
-    if top_tok > 40_000:
+    if top_tok and top_tok > 40_000:
         causes.append(
-            f"CONTEXT OVERFLOW: largest prompt is ~{top_tok:,} tokens. "
-            "llama.cpp returns 500 when a request exceeds the server's --ctx-size. "
-            "Fix: lower RESEARCH_CONTEXT_BUDGET_RATIO in maestro.ini, or increase "
-            "--ctx-size on the llama.cpp server."
+            f"CONTEXT OVERFLOW: largest session sent ~{top_tok:,} tokens. "
+            "llama.cpp returns 500 when a request exceeds --ctx-size. "
+            "Fix: lower context_budget_ratio in maestro.ini, or increase --ctx-size."
         )
-    elif top_tok > 20_000:
+    elif top_tok and top_tok > 20_000:
         causes.append(
-            f"LARGE CONTEXT: largest prompt is ~{top_tok:,} tokens. "
-            "Getting close to typical llama.cpp limits. Monitor for overflow."
+            f"LARGE CONTEXT: largest session is ~{top_tok:,} tokens. "
+            "Getting close to typical llama.cpp limits."
         )
 
     if conc:
@@ -383,28 +328,22 @@ def main() -> None:
         if max_conc >= 3:
             causes.append(
                 f"SLOT CONTENTION: up to {max_conc} calls completed in the same second. "
-                "If llama.cpp --parallel < this count, extra requests get a 500. "
-                "Fix: raise --parallel on the server, or lower max_parallel_sessions "
-                "for this LLM endpoint in the board UI."
+                "Fix: raise --parallel on llama.cpp, or lower max_parallel_sessions in the UI."
             )
 
-    if len(log["errors"]) > 0 and not log["bodies"]:
+    if log["errors"] and not log["bodies"]:
         causes.append(
-            "BLIND SPOT: 500 error bodies were not logged (old server version). "
-            "Restart the server — the logging fix is now live and will show "
-            "exactly what llama.cpp said for every future 500."
+            "BLIND SPOT: 500 error bodies not logged (old server). "
+            "Restart — the fix is live and will capture bodies going forward."
         )
 
     if not causes:
         causes.append(
-            "No clear pattern detected in this time window. "
-            "Try --hours 24 or --all to see more history."
+            "No clear pattern in this window. Try --hours 24 or --all."
         )
 
     for i, c in enumerate(causes, 1):
         print(f"\n  [{i}] {c}")
-
-    conn.close()
     print()
 
 

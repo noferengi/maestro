@@ -3,6 +3,7 @@
 let _defnId = null;
 let _toolManifest = [];
 let _unsaved = false;
+let _isBuiltin = false;
 
 // ── Preset tool sets ──────────────────────────────────────────────────────────
 
@@ -145,6 +146,8 @@ function getCheckedTools() {
 // ── Form population ───────────────────────────────────────────────────────────
 
 function populateForm(d) {
+  _isBuiltin = !!d.is_builtin;
+
   document.getElementById("ed-title").textContent = d.display_name || "Agent Editor";
   document.getElementById("ed-name").value = d.name || "";
   document.getElementById("ed-display-name").value = d.display_name || "";
@@ -162,10 +165,8 @@ function populateForm(d) {
   setCheckedTools(d.allowed_tools || []);
 
   // Limits
-  const mt = document.getElementById("ed-max-turns");
-  const mk = document.getElementById("ed-max-tokens");
-  mt.value = d.max_turns != null ? d.max_turns : "";
-  mk.value = d.max_tokens != null ? d.max_tokens : "";
+  document.getElementById("ed-max-turns").value = d.max_turns != null ? d.max_turns : "";
+  document.getElementById("ed-max-tokens").value = d.max_tokens != null ? d.max_tokens : "";
 
   // Gate
   document.getElementById("ed-gate-type").value = d.gate_type || "llm_judge";
@@ -173,15 +174,66 @@ function populateForm(d) {
   document.getElementById("ed-verifier-cmd").value = d.verifier_cmd || "";
   toggleVerifierCmd();
 
+  // Behavior type & config
+  const btSelect = document.getElementById("ed-behavior-type");
+  btSelect.value = d.behavior_type || "";
+  const bc = d.behavior_config && Object.keys(d.behavior_config).length
+    ? JSON.stringify(d.behavior_config, null, 2)
+    : "";
+  document.getElementById("ed-behavior-config").value = bc;
+  onBehaviorTypeChange();
+
+  // Built-in mode
+  if (_isBuiltin) {
+    document.body.classList.add("is-builtin");
+    document.getElementById("builtin-banner").classList.add("visible");
+    document.getElementById("ed-builtin-badge").style.display = "";
+    document.getElementById("btn-clone").style.display = "";
+    document.getElementById("btn-save").style.display = "none";
+  } else {
+    document.body.classList.remove("is-builtin");
+    document.getElementById("builtin-banner").classList.remove("visible");
+    document.getElementById("ed-builtin-badge").style.display = "none";
+    document.getElementById("btn-clone").style.display = "none";
+    document.getElementById("btn-save").style.display = "";
+  }
+
   clearUnsaved();
+}
+
+function onBehaviorTypeChange() {
+  const bt = document.getElementById("ed-behavior-type").value;
+  const badge = document.getElementById("ed-behavior-badge");
+  if (bt) {
+    badge.textContent = bt.replace(/_/g, " ");
+    badge.style.display = "";
+  } else {
+    badge.style.display = "none";
+  }
 }
 
 // ── Save ──────────────────────────────────────────────────────────────────────
 
 async function saveDefinition() {
+  if (_isBuiltin) {
+    showToast("Built-in definitions cannot be saved. Clone it first.", true);
+    return;
+  }
+
   const maxTurnsRaw = document.getElementById("ed-max-turns").value.trim();
   const maxTokensRaw = document.getElementById("ed-max-tokens").value.trim();
   const hasTpl = document.getElementById("chk-user-tpl").checked;
+  const behaviorConfigRaw = document.getElementById("ed-behavior-config").value.trim();
+
+  let behaviorConfig = null;
+  if (behaviorConfigRaw) {
+    try {
+      behaviorConfig = JSON.parse(behaviorConfigRaw);
+    } catch {
+      showToast("Behavior Config is not valid JSON", true);
+      return;
+    }
+  }
 
   const body = {
     name:                 document.getElementById("ed-name").value.trim(),
@@ -196,6 +248,8 @@ async function saveDefinition() {
     max_turns:            maxTurnsRaw ? parseInt(maxTurnsRaw, 10) : null,
     max_tokens:           maxTokensRaw ? parseInt(maxTokensRaw, 10) : null,
     user_prompt_template: hasTpl ? document.getElementById("ed-user-tpl").value : null,
+    behavior_type:        document.getElementById("ed-behavior-type").value || null,
+    behavior_config:      behaviorConfig,
   };
 
   if (!body.name) { showToast("Slug (name) is required", true); return; }
@@ -216,6 +270,22 @@ async function saveDefinition() {
     document.getElementById("ed-title").textContent = d.display_name || "Agent Editor";
     clearUnsaved();
     showToast("Saved");
+  } catch (e) {
+    showToast("Network error", true);
+  }
+}
+
+async function cloneAndRedirect() {
+  try {
+    const res = await fetch(`/api/agent-definitions/${_defnId}/clone`, { method: "POST" });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      showToast(err.detail || "Clone failed", true);
+      return;
+    }
+    const cloned = await res.json();
+    showToast(`Cloned → "${cloned.display_name}"`);
+    setTimeout(() => { window.location.href = `/agents/${cloned.id}/edit`; }, 600);
   } catch (e) {
     showToast("Network error", true);
   }

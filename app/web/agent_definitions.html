@@ -81,8 +81,16 @@ body {
 }
 .badge-llm_judge  { background: #1e3a5f; color: #7dd3fc; }
 .badge-single_pass { background: #14532d; color: #86efac; }
+.badge-voting     { background: #1c2e1c; color: #86efac; }
+.badge-test_suite { background: #2d2000; color: #fde68a; }
+.badge-human      { background: #2d1b00; color: #fdba74; }
 .badge-none       { background: #1e1e2e; color: #94a3b8; }
 .badge-tools      { background: #2d1b4e; color: #c4b5fd; }
+.badge-builtin    { background: #1c2e4a; color: #93c5fd; border: 1px solid #3b82f655; }
+.badge-behavior   { background: #1e1b2e; color: #a78bfa; }
+
+.tpl-card.is-builtin { border-color: #3b82f640; }
+.tpl-card.is-builtin:hover { border-color: #3b82f6; }
 
 .card-desc {
   font-size: 12px; color: #94a3b8; line-height: 1.45;
@@ -130,6 +138,6 @@ body {
 
 <div id="toast"></div>
 
-<script src="/static/agent_definitions.js?v=1"></script>
+<script src="/static/agent_definitions.js?v=2"></script>
 </body>
 </html>

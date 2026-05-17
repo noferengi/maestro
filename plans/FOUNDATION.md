@@ -5,7 +5,7 @@
 - **Name**: TheMaestro
 - **Type**: Kanban board with an agentic LLM orchestration backend
 - **Location**: `D:\workspace\TheMaestro`
-- **Stack**: FastAPI + Uvicorn (backend), Vanilla JS + HTML (frontend), SQLite (database), llama.cpp / OmniCoder 9B (agent LLM)
+- **Stack**: FastAPI + Uvicorn (backend), Vanilla JS + HTML (frontend), PostgreSQL (database), llama.cpp / OmniCoder 9B (agent LLM)
 
 ---
 
@@ -22,7 +22,7 @@ D:\workspace\TheMaestro\
 │   │   ├── system_prompt.py  # MAESTRO_SYSTEM_PROMPT
 │   │   └── tools.py          # 16 tools with OpenAI JSON schemas + dispatch_tool()
 │   ├── migrations/
-│   │   ├── runner.py         # Standalone sqlite3 migration engine (no SQLAlchemy dep)
+│   │   ├── runner.py         # Migration engine (psycopg2, uses MAESTRO_ADMIN_DATABASE_URL)
 │   │   └── versions/
 │   │       ├── 0001_initial_schema.py
 │   │       ├── 0002_add_prerequisites.py
@@ -44,7 +44,7 @@ D:\workspace\TheMaestro\
 │   ├── database.py           # SQLAlchemy Task model + all DB functions
 │   └── main.py               # FastAPI app, all routes, mounts static files from app/web/
 ├── data/
-│   └── kanban.db             # SQLite database (auto-created on first run)
+│   └── test.db               # SQLite test database (auto-created by test suite)
 ├── venv/                     # Python virtual environment
 ├── AGENTS.md
 ├── ARCHITECTURE.md
@@ -59,7 +59,7 @@ D:\workspace\TheMaestro\
 
 ## Task Data Structure
 
-This is the canonical shape of a task — both in the SQLite DB (via SQLAlchemy) and as returned by the API.
+This is the canonical shape of a task — both in the PostgreSQL DB (via SQLAlchemy) and as returned by the API.
 
 ```javascript
 {

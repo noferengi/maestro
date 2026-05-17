@@ -485,17 +485,25 @@ def seed_sample_tasks_raw(conn):
 # Task CRUD
 # ---------------------------------------------------------------------------
 
-def create_task(title, task_type, description="", owner="user", tags=None, content=None, llm_id=None, budget_id=None, prerequisites=None, project='TheMaestro', project_id=None, position=None, stage_key=None):
+def create_task(title, task_type, description="", owner="user", tags=None, content=None, llm_id=None, budget_id=None, prerequisites=None, project='TheMaestro', project_id=None, position=None, stage_key=None, pipeline_template_id=None):
     """Create a new task.
 
     Pass either ``project`` (name string) or ``project_id`` (integer).  If both
     are given, ``project_id`` takes precedence.  ``project`` is kept for
     backward compatibility with all existing callers.
+
+    ``pipeline_template_id`` is auto-resolved from the project when not provided
+    (architecture tasks should pass pipeline_template_id=None explicitly).
     """
     db = SessionLocal()
     try:
         if project_id is None and project:
             project_id = _resolve_project_id(db, project)
+        # Auto-inherit pipeline from the project unless the caller overrides
+        if pipeline_template_id is None and task_type != 'architecture' and project_id is not None:
+            proj_row = db.query(Project.pipeline_template_id).filter(Project.id == project_id).first()
+            if proj_row:
+                pipeline_template_id = proj_row[0]
         task = Task(
             id=f"task-{datetime.now().timestamp()}",
             title=title,
@@ -509,6 +517,7 @@ def create_task(title, task_type, description="", owner="user", tags=None, conte
             budget_id=budget_id,
             prerequisites=prerequisites or [],
             project_id=project_id,
+            pipeline_template_id=pipeline_template_id,
             position=position,
             history=[{"status": "created", "timestamp": datetime.now().isoformat()}]
         )
@@ -553,15 +562,27 @@ def get_tasks_by_type(task_type):
 
 
 def get_tasks_by_project(project_name):
-    """Get all active tasks belonging to a specific project, ordered by position then created_at."""
+    """Get active tasks for a project, scoped to the project's active pipeline template.
+
+    Architecture tasks (pipeline_template_id IS NULL) are always included so they
+    continue to appear in the arch bar regardless of which pipeline is active.
+    """
+    from sqlalchemy import or_
     db = SessionLocal()
     try:
-        project_id = _resolve_project_id(db, project_name)
-        if project_id is None:
+        proj = db.query(Project).filter(Project.name == project_name).first()
+        if proj is None:
             return []
-        tasks = (db.query(Task)
-                 .filter(Task.project_id == project_id, Task.is_active == True)
-                 .order_by(Task.position, Task.created_at).all())
+        pipeline_tmpl_id = proj.pipeline_template_id
+        q = db.query(Task).filter(Task.project_id == proj.id, Task.is_active == True)
+        if pipeline_tmpl_id is not None:
+            q = q.filter(
+                or_(
+                    Task.pipeline_template_id == pipeline_tmpl_id,
+                    Task.pipeline_template_id == None,  # arch tasks and legacy NULLs
+                )
+            )
+        tasks = q.order_by(Task.position, Task.created_at).all()
         return tasks
     except Exception as e:
         logger.error("Error getting tasks by project: %s", e)

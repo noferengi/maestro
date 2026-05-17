@@ -1,6 +1,6 @@
-# Database Schema — data/kanban.db
+# Database Schema — PostgreSQL (MAESTRO_DATABASE_URL)
 
-SQLite database. All tables listed with columns, types, nullability, and defaults.
+PostgreSQL database. All tables listed with columns, types, nullability, and defaults.
 
 ---
 
@@ -97,6 +97,9 @@ Valid `type` values (pipeline stages): `idea`, `planning`, `indev`, `conceptual_
 
 ## budget_entries
 One row per LLM API call. `task_id` is NULL for project-level prewarm calls (file summaries).
+`prompt_data` stores only the **delta** (new messages added since the last turn in the session).
+`prompt_message_count` is the cumulative message count after this turn; NULL = legacy row
+(full history stored in prompt_data, not yet backfilled).
 
 | Column | Type | Nullable | Default |
 |---|---|---|---|
@@ -109,7 +112,10 @@ One row per LLM API call. `task_id` is NULL for project-level prewarm calls (fil
 | tool_calls | INTEGER | no | `0` |
 | prompt_data | TEXT | yes | — |
 | response_data | TEXT | yes | — |
+| session_id | TEXT | yes | — |
+| agent_name | TEXT | yes | — |
 | created_at | DATETIME | no | CURRENT_TIMESTAMP |
+| prompt_message_count | INTEGER | yes | NULL |
 
 ---
 
@@ -452,11 +458,6 @@ Queue for pending/in-progress file summary generation.
 |---|---|---|---|
 | migration_id | TEXT | yes | — |
 | applied_at | DATETIME | no | — |
-
----
-
-## sqlite_sequence
-Internal SQLite auto-increment tracking table. Do not modify directly.
 
 ---
 

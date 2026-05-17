@@ -1,3 +1,4 @@
+# DEPRECATED: Uses SQLite direct. Use MCP tools or inspect_cards.py instead.
 import sqlite3
 from pathlib import Path
 
