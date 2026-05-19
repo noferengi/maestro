@@ -31,18 +31,26 @@ tick lifecycle, all agent types, git worktree isolation, and safety layers. **Se
 registry, CRUD API, editor, document store, card factory, autopilot). **See
 `plans/PRD.md`** for the product roadmap.
 
+## Database: PostgreSQL only
+
+**Maestro runs on PostgreSQL. SQLite is abandoned.** Do not add SQLite compatibility shims,
+`IF NOT EXISTS` fallbacks, `conn.is_postgres` branches, or any other SQLite workarounds to
+new code or migrations. SQLite support constrained every migration and test; it is gone.
+Any effort spent preserving SQLite compatibility is unwelcome and will be reverted.
+
+The test suite uses a real PostgreSQL database (configured via `MAESTRO_TEST_DB` →
+`MAESTRO_DATABASE_URL`). There is no `data/test.db`. There is no `data/kanban.db`.
+
 ## Environment & configuration
 
 **Database:** Configured via `.env` (loaded by `python-dotenv` in `app/agent/config.py`).
 Copy `.env.example` to `.env` and fill in credentials. Key variables:
 
 ```
-MAESTRO_USE_POSTGRES=false               # set true to use PostgreSQL
-MAESTRO_DATABASE_URL=postgresql://...    # required when use_postgres=true
-MAESTRO_ADMIN_DATABASE_URL=postgresql:// # used by migration runner (needs schema perms)
+MAESTRO_DATABASE_URL=postgresql://...    # application connection
+MAESTRO_ADMIN_DATABASE_URL=postgresql:// # migration runner (needs schema perms)
 TAVILY_API_KEY=                          # optional; for Tavily web search
 BRAVE_API_KEY=                           # optional; for Brave web search
-MAESTRO_TEST_DB=data/test.db            # set in tests to use SQLite, never production
 ```
 
 Config load order (highest priority wins): env vars → `maestro.ini` → built-in defaults.
@@ -273,7 +281,7 @@ and prints the new size when done.
 ### Backend (`app/`)
 - `main.py` — FastAPI app. All routes. Mounts static files from `app/web/`. On startup calls `init_db()` + `seed_sample_tasks()` (skips seeding if data exists) + `_check_builtin_templates()` (drift warning). Quick-action endpoints: `/demote`, `/set-stage`, `/clone`, `/pin`, `/run-planning`, `/run-review`, `/run-security`, `/run-final-review`. Task serialization (`_task_to_dict`) always includes a `"pips"` array. `sync_update_llm_with_cache` / `sync_delete_llm_with_cache` call `invalidate_llm_cache` after LLM record mutations.
 - `database/` — DB package. See `app/database/CLAUDE.md` for full file map. Core modules: `models.py` (all ORM models), `crud_tasks.py` (task + PIP CRUD), `crud_projects.py`, `crud_infra.py`, `crud_costs.py` (budget entries store **deltas** only since migration 0076; `reconstruct_messages_for_entry(entry_id, db)` accumulates them back to full history), `crud_pipeline.py`, `crud_jobs.py`, `crud_files.py`, `crud_malleable.py` (pipeline templates, stages, transitions, arch categories, custom agent defs, system_settings, project_settings — 50+ functions), `crud_documents.py` (project document store), `crud_factory.py` (factory_runs audit), `session.py`. `delete_task()` is a **soft-delete** (BFS, sets `is_active=False`). `upsert_project()` uses `...` (Ellipsis) sentinel for `llm_id`/`budget_id`.
-- `migrations/runner.py` — PostgreSQL migration engine (SQLite only for tests via `MAESTRO_TEST_DB`). Latest migrations: 0074 (expand AI review group), 0075 (custom agent definition extensions), 0076 (budget_entries delta storage — adds `prompt_message_count`).
+- `migrations/runner.py` — PostgreSQL migration engine. Latest migrations: 0074 (expand AI review group), 0075 (custom agent definition extensions), 0076 (budget_entries delta storage — adds `prompt_message_count`).
 
 ### Agent system (`app/agent/`)
 

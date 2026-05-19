@@ -957,8 +957,8 @@ def _get_cached_summary_for_listing(abs_path: str) -> "str | None":
     return None
 
 
-def list_directory(path: str = ".") -> str:
-    """[READ] List files and directories at the given path. No state change.
+def list_directory(path: str = ".", head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[READ] List files and directories at the given path. head/tail/grep filter output. No state change.
 
     Maestro allows navigation of the entire PC. Files are shown with their
     cached summary if available. Entries are annotated but never hidden (except
@@ -1050,7 +1050,7 @@ def list_directory(path: str = ".") -> str:
             else:
                 lines.append(f"{kind}  {entry}  - (SUMMARY NOT AVAILABLE)")
 
-    return "\n".join(lines) if lines else "(empty directory)"
+    return _slice_output("\n".join(lines) if lines else "(empty directory)", head=head, tail=tail, grep=grep)
 
 
 def find_in_files(
@@ -1130,10 +1130,10 @@ def read_file_metadata(path: str) -> str:
         return f"ERROR reading metadata for '{path}': {exc}"
 
 
-def find_files(glob_pattern: str, directory: str = ".") -> str:
+def find_files(glob_pattern: str, directory: str = ".", head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
     """
     Find files matching a glob pattern under directory.
-    Returns one path per line (up to 200 results).
+    Returns one path per line (up to 200 results). head/tail/grep filter output.
     """
     safe_dir = _assert_safe_path(directory)
     full_pattern = os.path.join(safe_dir, "**", glob_pattern)
@@ -1149,7 +1149,7 @@ def find_files(glob_pattern: str, directory: str = ".") -> str:
     if not filtered:
         return "No files found matching the pattern."
     lines = [os.path.relpath(m, safe_dir) for m in sorted(filtered)[:TOOL_MAX_SEARCH_RESULTS]]
-    return "\n".join(lines)
+    return _slice_output("\n".join(lines), head=head, tail=tail, grep=grep)
 
 
 # ---------------------------------------------------------------------------
@@ -1449,12 +1449,12 @@ def _git_run(args: list[str], cwd: str | None = None) -> tuple[int, str, str]:
         return 1, "", str(exc)
 
 
-def read_git_status() -> str:
-    """[READ] Return the current git status of the project. No state change."""
+def read_git_status(head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[READ] Return the current git status of the project. head/tail/grep filter output. No state change."""
     rc, out, err = _git_run(["git", "status"])
     if rc != 0:
         return f"ERROR: git status failed: {err}"
-    return out
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
 def read_git_diff(
@@ -1503,8 +1503,8 @@ def read_git_log(
     return _slice_output(result, head=head, tail=tail, grep=grep)
 
 
-def read_git_blame(path: str) -> str:
-    """[READ] Show git blame for a file (last-modified info per line). No state change."""
+def read_git_blame(path: str, head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[READ] Show git blame for a file (last-modified info per line). head/tail/grep filter output. No state change."""
     try:
         safe_path = _assert_safe_path(path)
     except ValueError as exc:
@@ -1514,11 +1514,11 @@ def read_git_blame(path: str) -> str:
     rc, out, err = _git_run(["git", "blame", safe_path])
     if rc != 0:
         return f"ERROR: git blame failed: {err}"
-    return out or "(no blame output)"
+    return _slice_output(out or "(no blame output)", head=head, tail=tail, grep=grep)
 
 
-def read_git_show(ref: str, path: str | None = None) -> str:
-    """[READ] Show a file at a git ref, or commit details (message + diffstat). No state change."""
+def read_git_show(ref: str, path: str | None = None, head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[READ] Show a file at a git ref, or commit details (message + diffstat). head/tail/grep filter output. No state change."""
     if not re.match(r'^[A-Za-z0-9\-_./~^@]+$', ref):
         return "ERROR: ref contains invalid characters. Only alphanumeric, -, _, ., /, ~, ^, @ are allowed."
     if path:
@@ -1534,7 +1534,7 @@ def read_git_show(ref: str, path: str | None = None) -> str:
     rc, out, err = _git_run(args)
     if rc != 0:
         return f"ERROR: git show failed: {err}"
-    return out or "(no output)"
+    return _slice_output(out or "(no output)", head=head, tail=tail, grep=grep)
 
 
 def write_git_branch(branch_name: str) -> str:
@@ -2707,8 +2707,8 @@ def run_test_pytest(
     return _rejection_prefix + _slice_output(result, head=head, tail=tail, grep=grep)
 
 
-def run_check_mypy(path: str, flags: str = "") -> str:
-    """[RUN — sandbox] Run mypy type-checker. path: file or package. flags: extra mypy flags. No project-file mutation."""
+def run_check_mypy(path: str, flags: str = "", head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — sandbox] Run mypy type-checker. path: file or package. flags: extra mypy flags. head/tail/grep filter output. No project-file mutation."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
@@ -2716,11 +2716,11 @@ def run_check_mypy(path: str, flags: str = "") -> str:
     safe_flags, _ = _validate_flags(flags, "run_check_mypy", _MYPY_FLAGS, _MYPY_VALUE_FLAGS)
     args = [_venv_python(cwd), "-m", "mypy", safe_path] + safe_flags
     rc, out = _run_tool_subprocess(args, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: mypy timed out after {SHELL_TIMEOUT_SECONDS}s.")
-    return out
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
-def run_check_ruff(path: str = ".", flags: str = "") -> str:
-    """[RUN — sandbox] Run ruff linter. path: file or dir (default '.'). flags: extra ruff flags. No project-file mutation."""
+def run_check_ruff(path: str = ".", flags: str = "", head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — sandbox] Run ruff linter. path: file or dir (default '.'). flags: extra ruff flags. head/tail/grep filter output. No project-file mutation."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
@@ -2728,22 +2728,22 @@ def run_check_ruff(path: str = ".", flags: str = "") -> str:
     safe_flags, _ = _validate_flags(flags, "run_check_ruff", _RUFF_FLAGS, _RUFF_VALUE_FLAGS)
     args = [_venv_python(cwd), "-m", "ruff", "check", safe_path] + safe_flags
     rc, out = _run_tool_subprocess(args, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: ruff timed out after {SHELL_TIMEOUT_SECONDS}s.")
-    return out
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
-def run_check_black(path: str = ".") -> str:
-    """[RUN — sandbox] Check formatting with black (read-only — does not modify files). path: file or dir (default '.')."""
+def run_check_black(path: str = ".", head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — sandbox] Check formatting with black (read-only — does not modify files). path: file or dir (default '.'). head/tail/grep filter output."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
     safe_path = _validate_tool_path(path, "run_check_black") or "."
     args = [_venv_python(cwd), "-m", "black", "--check", safe_path]
     rc, out = _run_tool_subprocess(args, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: black timed out after {SHELL_TIMEOUT_SECONDS}s.")
-    return out
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
-def run_test_unittest(module: str = "", pattern: str = "") -> str:
-    """[RUN — sandbox] Run Python unittest. module: dotted module name (e.g. 'tests.test_foo'). pattern: file pattern for discover (e.g. 'test_*.py'). No project-file mutation."""
+def run_test_unittest(module: str = "", pattern: str = "", head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — sandbox] Run Python unittest. module: dotted module name (e.g. 'tests.test_foo'). pattern: file pattern for discover (e.g. 'test_*.py'). head/tail/grep filter output. No project-file mutation."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
@@ -2762,30 +2762,30 @@ def run_test_unittest(module: str = "", pattern: str = "") -> str:
     else:
         args.append("discover")
     rc, out = _run_tool_subprocess(args, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: unittest timed out after {SHELL_TIMEOUT_SECONDS}s.")
-    return out
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
-def run_test_npm() -> str:
-    """[RUN — sandbox] Run npm test in the task's project directory. No project-file mutation."""
+def run_test_npm(head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — sandbox] Run npm test in the task's project directory. head/tail/grep filter output. No project-file mutation."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
     rc, out = _run_tool_subprocess(["npm", "test"], cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: npm test timed out after {SHELL_TIMEOUT_SECONDS}s.")
-    return out
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
-def run_test_cargo(args: str = "") -> str:
-    """[RUN — sandbox] Run cargo test. args: extra cargo test flags. No project-file mutation."""
+def run_test_cargo(args: str = "", head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — sandbox] Run cargo test. args: extra cargo test flags. head/tail/grep filter output. No project-file mutation."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
     safe_flags, _ = _validate_flags(args, "run_test_cargo", _CARGO_TEST_FLAGS, _CARGO_TEST_VALUE_FLAGS)
     rc, out = _run_tool_subprocess(["cargo", "test"] + safe_flags, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: cargo test timed out after {SHELL_TIMEOUT_SECONDS}s.")
-    return out
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
-def run_test_go(path: str = "./...", flags: str = "") -> str:
-    """[RUN — sandbox] Run go test. path: package path (default './...'). flags: extra go test flags. No project-file mutation."""
+def run_test_go(path: str = "./...", flags: str = "", head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — sandbox] Run go test. path: package path (default './...'). flags: extra go test flags. head/tail/grep filter output. No project-file mutation."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
@@ -2793,13 +2793,13 @@ def run_test_go(path: str = "./...", flags: str = "") -> str:
     safe_flags, _ = _validate_flags(flags, "run_test_go", _GO_TEST_FLAGS, _GO_TEST_VALUE_FLAGS)
     args = ["go", "test"] + safe_flags + [safe_path]
     rc, out = _run_tool_subprocess(args, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: go test timed out after {SHELL_TIMEOUT_SECONDS}s.")
-    return out
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
 # --- Build ---
 
-def run_build_make(target: str) -> str:
-    """[RUN — build] Run a Makefile target. target: e.g. 'build', 'test', 'all'. Creates build artifacts inside the project."""
+def run_build_make(target: str, head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — build] Run a Makefile target. target: e.g. 'build', 'test', 'all'. head/tail/grep filter output. Creates build artifacts inside the project."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
@@ -2807,30 +2807,30 @@ def run_build_make(target: str) -> str:
         logger.warning("[security] run_build_make rejected target=%r", target)
         return f"[security] make target {target!r} rejected: must match ^[a-zA-Z0-9_.\\-/]+$"
     rc, out = _run_tool_subprocess(["make", target], cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: make timed out after {_BUILD_TIMEOUT_SECONDS}s.")
-    return out
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
-def run_build_cargo(args: str = "") -> str:
-    """[RUN — build] Build a Rust/Cargo project (cargo build). Creates build artifacts inside the project."""
+def run_build_cargo(args: str = "", head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — build] Build a Rust/Cargo project (cargo build). head/tail/grep filter output. Creates build artifacts inside the project."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
     safe_flags, _ = _validate_flags(args, "run_build_cargo", _CARGO_BUILD_FLAGS, _CARGO_BUILD_VALUE_FLAGS)
     rc, out = _run_tool_subprocess(["cargo", "build"] + safe_flags, cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: cargo build timed out after {_BUILD_TIMEOUT_SECONDS}s.")
-    return out
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
-def run_build_go() -> str:
-    """[RUN — build] Build a Go project (go build ./...). Creates build artifacts inside the project."""
+def run_build_go(head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — build] Build a Go project (go build ./...). head/tail/grep filter output. Creates build artifacts inside the project."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
     rc, out = _run_tool_subprocess(["go", "build", "./..."], cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: go build timed out after {_BUILD_TIMEOUT_SECONDS}s.")
-    return out
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
-def run_build_npm(script: str = "build") -> str:
-    """[RUN — build] Run an npm build script (npm run <script>). Creates build artifacts inside the project."""
+def run_build_npm(script: str = "build", head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — build] Run an npm build script (npm run <script>). head/tail/grep filter output. Creates build artifacts inside the project."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
@@ -2838,21 +2838,21 @@ def run_build_npm(script: str = "build") -> str:
         logger.warning("[security] run_build_npm rejected script=%r", script)
         return f"[security] npm script {script!r} rejected: must match ^[a-zA-Z0-9_\\-:.]+$"
     rc, out = _run_tool_subprocess(["npm", "run", script], cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: npm build timed out after {_BUILD_TIMEOUT_SECONDS}s.")
-    return out
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
-def run_build_tsc(args: str = "") -> str:
-    """[RUN — build] Run the TypeScript compiler (tsc). Creates build artifacts inside the project."""
+def run_build_tsc(args: str = "", head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — build] Run the TypeScript compiler (tsc). head/tail/grep filter output. Creates build artifacts inside the project."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
     safe_flags, _ = _validate_flags(args, "run_build_tsc", _TSC_FLAGS, _TSC_VALUE_FLAGS)
     rc, out = _run_tool_subprocess(["tsc"] + safe_flags, cwd, _BUILD_TIMEOUT_SECONDS, f"ERROR: tsc timed out after {_BUILD_TIMEOUT_SECONDS}s.")
-    return out
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
-def run_build_gradle(target: str) -> str:
-    """[RUN — build] Run a Gradle task. target: e.g. 'build', 'assemble'. Creates build artifacts inside the project."""
+def run_build_gradle(target: str, head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — build] Run a Gradle task. target: e.g. 'build', 'assemble'. head/tail/grep filter output. Creates build artifacts inside the project."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
@@ -2861,11 +2861,11 @@ def run_build_gradle(target: str) -> str:
         return f"[security] gradle target {target!r} rejected"
     gradle_exe = "./gradlew" if os.path.isfile(os.path.join(cwd, "gradlew")) else "gradle"
     rc, out = _run_tool_subprocess([gradle_exe, target], cwd, _BUILD_TIMEOUT_SECONDS * 2, f"ERROR: gradle timed out after {_BUILD_TIMEOUT_SECONDS * 2}s.")
-    return out
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
-def run_build_mvn(goal: str) -> str:
-    """[RUN — build] Run a Maven goal. goal: e.g. 'package', 'compile'. Creates build artifacts inside the project."""
+def run_build_mvn(goal: str, head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — build] Run a Maven goal. goal: e.g. 'package', 'compile'. head/tail/grep filter output. Creates build artifacts inside the project."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
@@ -2873,13 +2873,13 @@ def run_build_mvn(goal: str) -> str:
         logger.warning("[security] run_build_mvn rejected goal=%r", goal)
         return f"[security] mvn goal {goal!r} rejected"
     rc, out = _run_tool_subprocess(["mvn", goal, "--batch-mode", "--no-transfer-progress"], cwd, _BUILD_TIMEOUT_SECONDS * 2, f"ERROR: mvn timed out after {_BUILD_TIMEOUT_SECONDS * 2}s.")
-    return out
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
 # --- Dependencies ---
 
-def run_deps_pip(args: str) -> str:
-    """[RUN — deps] Install Python packages with pip. MUTATES environment. args: e.g. '-r requirements.txt', 'requests>=2.28'."""
+def run_deps_pip(args: str, head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — deps] Install Python packages with pip. MUTATES environment. args: e.g. '-r requirements.txt', 'requests>=2.28'. head/tail/grep filter output."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
@@ -2917,53 +2917,57 @@ def run_deps_pip(args: str) -> str:
             return f"[security] pip argument {tok!r} rejected"
     args_list = [_venv_python(cwd), "-m", "pip", "install"] + clean_tokens
     rc, out = _run_tool_subprocess(args_list, cwd, _DEPS_TIMEOUT_SECONDS, f"ERROR: pip install timed out after {_DEPS_TIMEOUT_SECONDS}s.")
-    return out
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
-def run_deps_npm() -> str:
-    """[RUN — deps] Install Node.js dependencies (npm install). MUTATES environment. Call after modifying package.json."""
+def run_deps_npm(head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — deps] Install Node.js dependencies (npm install). MUTATES environment. head/tail/grep filter output. Call after modifying package.json."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
     rc, out = _run_tool_subprocess(["npm", "install"], cwd, _DEPS_TIMEOUT_SECONDS, f"ERROR: npm install timed out after {_DEPS_TIMEOUT_SECONDS}s.")
-    return out
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
-def run_deps_cargo() -> str:
-    """[RUN — deps] Fetch Rust/Cargo dependencies (cargo fetch). MUTATES environment. Call after modifying Cargo.toml."""
+def run_deps_cargo(head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — deps] Fetch Rust/Cargo dependencies (cargo fetch). MUTATES environment. head/tail/grep filter output. Call after modifying Cargo.toml."""
     cwd = _task_git_cwd.get()
     if cwd is None:
         return "ERROR: No task git working directory configured."
     rc, out = _run_tool_subprocess(["cargo", "fetch"], cwd, _DEPS_TIMEOUT_SECONDS, f"ERROR: cargo fetch timed out after {_DEPS_TIMEOUT_SECONDS}s.")
-    return out
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
 # --- Security scanners ---
 
-def run_audit_bandit(path: str = ".") -> str:
-    """[RUN — audit] Run bandit Python security linter. No project-file mutation. path: dir or file (default '.')."""
+def run_audit_bandit(path: str = ".", head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — audit] Run bandit Python security linter. No project-file mutation. path: dir or file (default '.'). head/tail/grep filter output."""
     from app.agent.security_review import run_shell_security
-    return run_shell_security("bandit", path)
+    out = run_shell_security("bandit", path)
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
-def run_audit_pip() -> str:
-    """[RUN — audit] Audit installed Python packages for known vulnerabilities (pip-audit). No project-file mutation."""
+def run_audit_pip(head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — audit] Audit installed Python packages for known vulnerabilities (pip-audit). No project-file mutation. head/tail/grep filter output."""
     from app.agent.security_review import run_shell_security
-    return run_shell_security("pip-audit")
+    out = run_shell_security("pip-audit")
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
-def run_audit_semgrep(path: str = ".", config: str = "auto") -> str:
-    """[RUN — audit] Run semgrep static analysis. No project-file mutation. config: ruleset (default 'auto', always used)."""
+def run_audit_semgrep(path: str = ".", config: str = "auto", head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — audit] Run semgrep static analysis. No project-file mutation. config: ruleset (default 'auto', always used). head/tail/grep filter output."""
     if config != "auto":
         logger.warning("[security] run_audit_semgrep: config=%r ignored, using 'auto'", config)
     from app.agent.security_review import run_shell_security
-    return run_shell_security("semgrep", path)
+    out = run_shell_security("semgrep", path)
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
-def run_audit_npm() -> str:
-    """[RUN — audit] Run npm audit to check Node.js dependencies for vulnerabilities. No project-file mutation."""
+def run_audit_npm(head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[RUN — audit] Run npm audit to check Node.js dependencies for vulnerabilities. No project-file mutation. head/tail/grep filter output."""
     from app.agent.security_review import run_shell_security
-    return run_shell_security("npm-audit")
+    out = run_shell_security("npm-audit")
+    return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
 # ---------------------------------------------------------------------------
@@ -3041,8 +3045,8 @@ def read_last_output(
     return _slice_output(buf, head=head, tail=tail, grep=grep, offset=offset, limit=limit)
 
 
-def read_diff_stat(since: str = "main") -> str:
-    """[READ] git diff --stat from <since> to HEAD, parsed into added/removed per file. No state change."""
+def read_diff_stat(since: str = "main", head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[READ] git diff --stat from <since> to HEAD, parsed into added/removed per file. head/tail/grep filter output. No state change."""
     effective_cwd = _task_git_cwd.get()
     if not effective_cwd:
         return "ERROR: No task git working directory configured."
@@ -3055,7 +3059,7 @@ def read_diff_stat(since: str = "main") -> str:
             timeout=30,
         )
         if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
+            return _slice_output(result.stdout.strip(), head=head, tail=tail, grep=grep)
         return f"No changes since '{since}'."
     except Exception as exc:
         return f"Unable to compute diff stat: {exc}"
@@ -3210,8 +3214,8 @@ def read_test_summary() -> str:
     }, indent=2)
 
 
-def get_system_health() -> str:
-    """[READ] Returns a comprehensive report on system health, including log tail, stagnant tasks, and stuck jobs."""
+def get_system_health(head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
+    """[READ] Returns a comprehensive report on system health, including log tail, stagnant tasks, and stuck jobs. head/tail/grep filter output."""
     import datetime as _dt_mod
     from app.database import SessionLocal, Task, TransitionResult, ResearchJob, FileSummaryJob, ArchGenJob
     from sqlalchemy import func
@@ -3299,7 +3303,7 @@ def get_system_health() -> str:
     except Exception as exc:
         report_lines.append(f"Error checking background jobs: {exc}")
 
-    return "\n".join(report_lines)
+    return _slice_output("\n".join(report_lines), head=head, tail=tail, grep=grep)
 
 
 # ---------------------------------------------------------------------------
@@ -3384,6 +3388,383 @@ def tool_list_documents(tag: str | None = None) -> str:
             f"  updated={d['updated_at']}"
         )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline management tools
+# ---------------------------------------------------------------------------
+
+
+def list_pipelines() -> str:
+    """[READ] List all pipeline templates with stage summaries."""
+    import json
+    from app.database.crud_malleable import get_all_templates, get_stages_for_template
+    templates = get_all_templates()
+    result = []
+    for t in templates:
+        stages = get_stages_for_template(t.id)
+        result.append({
+            "id": t.id,
+            "name": t.name,
+            "description": t.description,
+            "is_default": t.is_default,
+            "is_builtin": t.is_builtin,
+            "version": t.version,
+            "stages": [
+                {
+                    "id": s.id,
+                    "stage_key": s.stage_key,
+                    "label": s.label,
+                    "agent_type": s.agent_type,
+                    "position": s.position,
+                    "has_system_prompt": bool((s.config or {}).get("system_prompt")),
+                    "tool_allowlist": (s.config or {}).get("tool_allowlist") or [],
+                }
+                for s in stages
+            ],
+        })
+    return json.dumps(result, indent=2)
+
+
+def get_pipeline(template_id: int) -> str:
+    """[READ] Get full details of a pipeline template: stages, transitions, groups, arch categories."""
+    import json
+    from app.database.crud_malleable import get_template, template_to_dict
+    t = get_template(template_id)
+    if not t:
+        return f"ERROR: No pipeline template with id={template_id}"
+    return json.dumps(template_to_dict(t), indent=2)
+
+
+def clone_pipeline(template_id: int, new_name: str) -> str:
+    """[WRITE] Deep-copy a pipeline template under a new name. The clone is never builtin."""
+    import json
+    from app.database.crud_malleable import clone_template
+    result = clone_template(template_id, new_name)
+    if not result:
+        return (
+            f"ERROR: Failed to clone template id={template_id}. "
+            f"The name '{new_name}' may already be taken, or the source template does not exist."
+        )
+    return json.dumps({
+        "id": result.id,
+        "name": result.name,
+        "message": f"Pipeline cloned successfully as '{result.name}' (id={result.id}).",
+    })
+
+
+def update_pipeline(
+    template_id: int,
+    name: str | None = None,
+    description: str | None = None,
+    is_default: bool | None = None,
+) -> str:
+    """[WRITE] Update pipeline template metadata (name, description, is_default)."""
+    import json
+    from app.database.crud_malleable import update_template
+    result = update_template(
+        template_id,
+        name=name,
+        description=description,
+        is_default=is_default,
+        version_bump=True,
+    )
+    if not result:
+        return f"ERROR: Failed to update pipeline template id={template_id}"
+    return json.dumps({"id": result.id, "name": result.name, "version": result.version, "message": "Pipeline updated."})
+
+
+def update_pipeline_stage(
+    stage_id: int,
+    label: str | None = None,
+    agent_type: str | None = None,
+    system_prompt: str | None = None,
+    tool_allowlist: list | None = None,
+    intent: str | None = None,
+    gate: str | None = None,
+    retries: int | None = None,
+    verifier: str | None = None,
+    extra_config: dict | None = None,
+) -> str:
+    """[WRITE] Update a pipeline stage. Merges config keys — does not replace the whole config.
+    system_prompt, tool_allowlist, intent, gate, retries, verifier live inside the stage config dict.
+    extra_config is merged last (use for any config key not listed above).
+    """
+    import json
+    from app.database.crud_malleable import get_stage_by_id, update_stage
+    s = get_stage_by_id(stage_id)
+    if not s:
+        return f"ERROR: No stage with id={stage_id}"
+
+    # Merge into existing config rather than overwrite
+    config = dict(s.config or {})
+    if system_prompt is not None:
+        config["system_prompt"] = system_prompt
+    if tool_allowlist is not None:
+        config["tool_allowlist"] = tool_allowlist
+    if intent is not None:
+        config["intent"] = intent
+    if gate is not None:
+        config["gate"] = gate
+    if retries is not None:
+        config["retries"] = retries
+    if verifier is not None:
+        config["verifier"] = verifier
+    if extra_config:
+        config.update(extra_config)
+
+    result = update_stage(
+        stage_id,
+        label=label,
+        agent_type=agent_type,
+        config=config,
+    )
+    if not result:
+        return f"ERROR: Failed to update stage id={stage_id}"
+    updated_cfg = result.config or {}
+    return json.dumps({
+        "id": result.id,
+        "stage_key": result.stage_key,
+        "label": result.label,
+        "agent_type": result.agent_type,
+        "config_keys": sorted(updated_cfg.keys()),
+        "tool_allowlist": updated_cfg.get("tool_allowlist") or [],
+        "has_system_prompt": bool(updated_cfg.get("system_prompt")),
+        "message": "Stage updated.",
+    })
+
+
+def assign_project_pipeline(project_name: str, template_id: int) -> str:
+    """[WRITE] Assign a pipeline template to a project.
+    Tasks whose stage_key no longer exists in the new template are migrated to the first stage.
+    """
+    import json
+    from app.database import get_project, upsert_project, get_tasks_by_project, update_task
+    from app.database.crud_malleable import get_template, get_stages_for_template
+
+    project = get_project(project_name)
+    if not project:
+        return f"ERROR: Project '{project_name}' not found."
+    template = get_template(template_id)
+    if not template:
+        return f"ERROR: Pipeline template id={template_id} not found."
+
+    stages = get_stages_for_template(template_id)
+    valid_keys = {s.stage_key for s in stages}
+    fallback_key = stages[0].stage_key if stages else None
+
+    migrated = 0
+    if fallback_key:
+        tasks = get_tasks_by_project(project_name)
+        for task in tasks:
+            sk = getattr(task, "stage_key", None) or task.type
+            if sk not in valid_keys:
+                update_task(task.id, stage_key=fallback_key, type=fallback_key)
+                migrated += 1
+
+    upsert_project(project_name, pipeline_template_id=template_id)
+    return json.dumps({
+        "project": project_name,
+        "template_id": template.id,
+        "template_name": template.name,
+        "migrated_tasks": migrated,
+        "message": f"Project '{project_name}' now uses pipeline '{template.name}'. {migrated} card(s) migrated to '{fallback_key}'.",
+    })
+
+
+def transfer_pipeline_cards(
+    from_template_id: int,
+    to_template_id: int,
+    stage_map: dict,
+    project_name: str | None = None,
+) -> str:
+    """[WRITE] Move cards from one pipeline to another using an explicit stage key map.
+    stage_map: {"old_stage_key": "new_stage_key", ...}  — unmapped stage keys are left untouched.
+    project_name: optional filter to only move cards for a specific project.
+    Use get_pipeline to inspect stage keys before mapping.
+    """
+    import json
+    from app.database.crud_malleable import compute_stage_map, transfer_cards, get_template
+    from app.database import get_project
+
+    src = get_template(from_template_id)
+    dst = get_template(to_template_id)
+    if not src:
+        return f"ERROR: Source pipeline id={from_template_id} not found."
+    if not dst:
+        return f"ERROR: Destination pipeline id={to_template_id} not found."
+
+    project_id = None
+    if project_name:
+        proj = get_project(project_name)
+        if not proj:
+            return f"ERROR: Project '{project_name}' not found."
+        project_id = proj.id
+
+    count = transfer_cards(from_template_id, to_template_id, stage_map, project_id=project_id)
+    return json.dumps({
+        "from_pipeline": src.name,
+        "to_pipeline": dst.name,
+        "stage_map": stage_map,
+        "cards_moved": count,
+        "message": f"Transferred {count} card(s) from '{src.name}' to '{dst.name}'.",
+    })
+
+
+# ---------------------------------------------------------------------------
+# Log analysis tools
+# ---------------------------------------------------------------------------
+
+
+def read_log_window(
+    hours: int = 1,
+    head: int | None = None,
+    tail: int | None = None,
+    grep: str | None = None,
+) -> str:
+    """[READ] Read log entries from the past N hours with anomaly pattern counts.
+    head/tail/grep filter the log lines returned. head/tail/grep filter output.
+    """
+    import datetime as _dt
+    import re as _re
+
+    log_path = os.path.join(PROJECT_ROOT, "logs", "maestro.log")
+    if not os.path.exists(log_path):
+        return f"No log file at {log_path}"
+
+    cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=hours)
+
+    # Patterns that indicate anomalies
+    ANOMALY_PATTERNS = {
+        "ERROR": _re.compile(r"\bERROR\b", _re.IGNORECASE),
+        "CRITICAL": _re.compile(r"\bCRITICAL\b", _re.IGNORECASE),
+        "WARNING": _re.compile(r"\bWARNING\b", _re.IGNORECASE),
+        "finish_reason=length": _re.compile(r"finish_reason.*length|reason.*length", _re.IGNORECASE),
+        "ContextTooLarge": _re.compile(r"ContextTooLargeError|context.*too.*large", _re.IGNORECASE),
+        "tool_failure": _re.compile(r"tool.*fail|consecutive.*fail|REVERT_TO_DESIGN", _re.IGNORECASE),
+        "timeout": _re.compile(r"\btimeout\b|\btimed out\b", _re.IGNORECASE),
+        "stage_thrash": _re.compile(r"demotion|demoted|reverted.*stage|REVERT", _re.IGNORECASE),
+        "zombie": _re.compile(r"zombie|orphan.*session|idle.*session", _re.IGNORECASE),
+        "DB_lock": _re.compile(r"deadlock|lock.*timeout|locked.*table|OperationalError", _re.IGNORECASE),
+    }
+
+    # Timestamp pattern (ISO-like): 2025-01-15 12:34:56
+    TS_RE = _re.compile(r"^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})")
+
+    counts: dict[str, int] = {k: 0 for k in ANOMALY_PATTERNS}
+    matched_lines: list[str] = []
+    total_lines = 0
+    in_window = False
+
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                line = raw.rstrip()
+                m = TS_RE.match(line)
+                if m:
+                    ts_str = m.group(1).replace("T", " ")
+                    try:
+                        ts = _dt.datetime.fromisoformat(ts_str).replace(tzinfo=_dt.timezone.utc)
+                        in_window = ts >= cutoff
+                    except ValueError:
+                        pass
+                if not in_window:
+                    continue
+                total_lines += 1
+                for name, pat in ANOMALY_PATTERNS.items():
+                    if pat.search(line):
+                        counts[name] += 1
+                matched_lines.append(line)
+    except OSError as exc:
+        return f"ERROR reading log: {exc}"
+
+    anomaly_summary = "  ".join(
+        f"{k}={v}" for k, v in counts.items() if v > 0
+    ) or "none"
+
+    header = (
+        f"== LOG WINDOW: last {hours}h | {total_lines} lines | anomalies: {anomaly_summary} =="
+    )
+    body = _slice_output("\n".join(matched_lines), head=head, tail=tail, grep=grep)
+    return _cap_tool_result("read_log_window", f"{header}\n{body}")
+
+
+def get_budget_history(
+    task_id: str | None = None,
+    hours: int = 4,
+    limit: int = 50,
+    head: int | None = None,
+    tail: int | None = None,
+    grep: str | None = None,
+) -> str:
+    """[READ] Summarize recent LLM call history from budget_entries.
+    Shows finish_reason breakdown, token counts, agent names, and error patterns.
+    task_id: filter to one task (omit for all tasks).
+    hours: how far back to look (default 4).
+    limit: max rows to include in detail table (default 50).
+    head/tail/grep filter the detail table output.
+    """
+    import json as _json
+    import datetime as _dt
+    from app.database import SessionLocal
+    from app.database.models import BudgetEntry
+
+    cutoff = _dt.datetime.utcnow() - _dt.timedelta(hours=hours)
+    db = SessionLocal()
+    try:
+        q = db.query(BudgetEntry).filter(BudgetEntry.created_at >= cutoff)
+        if task_id:
+            q = q.filter(BudgetEntry.task_id == task_id)
+        entries = q.order_by(BudgetEntry.created_at.asc()).all()
+    finally:
+        db.close()
+
+    if not entries:
+        scope = f"task {task_id}" if task_id else "all tasks"
+        return f"No budget entries in the last {hours}h for {scope}."
+
+    finish_reasons: dict[str, int] = {}
+    agent_counts: dict[str, int] = {}
+    total_prompt = 0
+    total_gen = 0
+    detail_rows: list[str] = []
+
+    for e in entries:
+        # Extract finish_reason from response_data JSON
+        finish_reason = "?"
+        if e.response_data:
+            try:
+                resp = _json.loads(e.response_data)
+                choices = resp.get("choices") or []
+                if choices:
+                    finish_reason = choices[0].get("finish_reason") or "?"
+            except Exception:
+                pass
+        finish_reasons[finish_reason] = finish_reasons.get(finish_reason, 0) + 1
+
+        agent = e.agent_name or "unknown"
+        agent_counts[agent] = agent_counts.get(agent, 0) + 1
+        total_prompt += e.prompt_cost or 0
+        total_gen += e.generation_cost or 0
+
+        ts = (e.created_at or _dt.datetime.utcnow()).isoformat()[:16]
+        detail_rows.append(
+            f"{ts}  task={e.task_id or '-':12s}  agent={agent:22s}  "
+            f"finish={finish_reason:8s}  prompt={e.prompt_cost or 0:6d}  gen={e.generation_cost or 0:6d}"
+        )
+
+    reason_str = "  ".join(f"{k}={v}" for k, v in sorted(finish_reasons.items(), key=lambda x: -x[1]))
+    agent_str = "  ".join(f"{k}={v}" for k, v in sorted(agent_counts.items(), key=lambda x: -x[1]))
+
+    summary = (
+        f"== BUDGET HISTORY: last {hours}h | {len(entries)} calls | "
+        f"total prompt={total_prompt} gen={total_gen} ==\n"
+        f"finish_reason: {reason_str}\n"
+        f"agents: {agent_str}\n"
+        f"--- detail (newest last, capped at {limit} rows) ---"
+    )
+    detail = _slice_output("\n".join(detail_rows[-limit:]), head=head, tail=tail, grep=grep)
+    return _cap_tool_result("get_budget_history", f"{summary}\n{detail}")
 
 
 # ---------------------------------------------------------------------------
@@ -3474,6 +3855,7 @@ TOOL_REGISTRY: dict[str, Any] = {
     "report_tool_bug": report_tool_bug,
     "submit_work": submit_work,
     "get_system_health": get_system_health,
+    "consult_maestro": consult_maestro,
     # Survey/project summary tools
     "get_project_summary": get_project_summary,
     "get_directory_summary": get_directory_summary,
@@ -3482,6 +3864,17 @@ TOOL_REGISTRY: dict[str, Any] = {
     # Infrastructure remediation tools (Maestro exclusive)
     "cleanup_ghost_worktrees": cleanup_ghost_worktrees,
     "restart_server": restart_server,
+    # Pipeline management tools (Maestro exclusive)
+    "list_pipelines": list_pipelines,
+    "get_pipeline": get_pipeline,
+    "clone_pipeline": clone_pipeline,
+    "update_pipeline": update_pipeline,
+    "update_pipeline_stage": update_pipeline_stage,
+    "assign_project_pipeline": assign_project_pipeline,
+    "transfer_pipeline_cards": transfer_pipeline_cards,
+    # Log and diagnostic history tools
+    "read_log_window": read_log_window,
+    "get_budget_history": get_budget_history,
     # Document store tools
     "store_document": tool_store_document,
     "get_document": tool_get_document,
@@ -3522,9 +3915,211 @@ TOOL_SCHEMAS: list[dict] = [
                 "the log tail (last 50 lines), stagnant tasks (>24h since progress), "
                 "and stuck background jobs (running for >30m). Use this to identify "
                 "infrastructure-level issues or projects that are failing but not "
-                "triggering normal stall signals."
+                "triggering normal stall signals. head/tail/grep filter output."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
+                },
+            },
+        },
+    },
+    # ---- Pipeline management tools ----
+    {
+        "type": "function",
+        "function": {
+            "name": "list_pipelines",
+            "description": (
+                "[READ] List all pipeline templates with their stages. "
+                "Returns id, name, description, is_default, is_builtin, and stage summaries "
+                "(stage_key, label, agent_type, tool_allowlist, has_system_prompt). "
+                "Start here before editing or cloning a pipeline."
             ),
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_pipeline",
+            "description": (
+                "[READ] Get full details of a pipeline template: all stages with their full config "
+                "(system_prompt, tool_allowlist, intent, gate, retries, verifier), transitions, "
+                "groups, and arch categories. Use this to inspect a pipeline before modifying it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "template_id": {"type": "integer", "description": "Pipeline template ID (from list_pipelines)."},
+                },
+                "required": ["template_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "clone_pipeline",
+            "description": (
+                "[WRITE] Deep-copy a pipeline template under a new name. The clone is editable and "
+                "never marked builtin. Use this to safely experiment with a pipeline: clone it, "
+                "edit the clone, then assign projects to the clone with assign_project_pipeline."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "template_id": {"type": "integer", "description": "Source pipeline template ID."},
+                    "new_name":    {"type": "string",  "description": "Name for the new clone (must be unique)."},
+                },
+                "required": ["template_id", "new_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_pipeline",
+            "description": (
+                "[WRITE] Update a pipeline template's top-level metadata: name, description, or "
+                "is_default flag. Automatically bumps the version. "
+                "To change stage behaviour, use update_pipeline_stage instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "template_id": {"type": "integer", "description": "Pipeline template ID."},
+                    "name":        {"type": "string",  "description": "New name (optional)."},
+                    "description": {"type": "string",  "description": "New description (optional)."},
+                    "is_default":  {"type": "boolean", "description": "Make this the default template (optional)."},
+                },
+                "required": ["template_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_pipeline_stage",
+            "description": (
+                "[WRITE] Update a stage's configuration. Config keys are MERGED — passing "
+                "system_prompt only changes that key, leaving others intact. "
+                "Use this to fix broken agent prompts, adjust tool allowlists, change agent_type, "
+                "set gate/retries/verifier, or update intent descriptions. "
+                "Get stage IDs from get_pipeline."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "stage_id":      {"type": "integer", "description": "Stage ID (from get_pipeline stages list)."},
+                    "label":         {"type": "string",  "description": "Display label for the stage column."},
+                    "agent_type":    {"type": "string",  "description": "Agent type key (from agent registry)."},
+                    "system_prompt": {"type": "string",  "description": "Full system prompt for the agent at this stage."},
+                    "tool_allowlist":{"type": "array", "items": {"type": "string"}, "description": "List of tool names the agent may use at this stage."},
+                    "intent":        {"type": "string",  "description": "Short description of what this stage should accomplish."},
+                    "gate":          {"type": "string",  "description": "Gate type: 'none', 'vote', or 'strict'."},
+                    "retries":       {"type": "integer", "description": "Max retry attempts before demotion."},
+                    "verifier":      {"type": "string",  "description": "Verifier type: 'none', 'python_sympy', 'lean4', 'coq', 'custom_script'."},
+                    "extra_config":  {"type": "object",  "description": "Additional config keys to merge in (for any key not listed above)."},
+                },
+                "required": ["stage_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "assign_project_pipeline",
+            "description": (
+                "[WRITE] Assign a pipeline template to a project. "
+                "Cards whose current stage_key does not exist in the new template are automatically "
+                "migrated to the first stage of the new template. "
+                "Use after clone_pipeline + update_pipeline_stage to switch a project to a fixed pipeline."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_name": {"type": "string",  "description": "Project name (case-sensitive)."},
+                    "template_id":  {"type": "integer", "description": "Pipeline template ID to assign."},
+                },
+                "required": ["project_name", "template_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "transfer_pipeline_cards",
+            "description": (
+                "[WRITE] Move cards from one pipeline to another using an explicit stage key mapping. "
+                "Use this when you want fine-grained control over which stages map to which — "
+                "for example when merging two pipelines or migrating a project. "
+                "Cards whose stage_key is not in stage_map are left untouched. "
+                "Use get_pipeline to inspect stage keys before building the map."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "from_template_id": {"type": "integer", "description": "Source pipeline template ID."},
+                    "to_template_id":   {"type": "integer", "description": "Destination pipeline template ID."},
+                    "stage_map": {
+                        "type": "object",
+                        "description": "Mapping of old stage_key -> new stage_key, e.g. {\"indev\": \"implementation\"}.",
+                        "additionalProperties": {"type": "string"},
+                    },
+                    "project_name": {"type": "string", "description": "Restrict to one project (omit for all)."},
+                },
+                "required": ["from_template_id", "to_template_id", "stage_map"],
+            },
+        },
+    },
+    # ---- Log and diagnostic history tools ----
+    {
+        "type": "function",
+        "function": {
+            "name": "read_log_window",
+            "description": (
+                "[READ] Read log entries from the past N hours and count anomaly patterns "
+                "(ERROR, WARNING, finish_reason=length, ContextTooLarge, tool_failure, timeout, "
+                "stage_thrash, zombie, DB_lock). Returns a summary header then the raw log lines. "
+                "Use grep to focus on a specific task ID, agent name, or error keyword. "
+                "head/tail/grep filter output."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hours": {"type": "integer", "description": "How many hours back to read (default 1)."},
+                    "head":  {"type": "integer", "description": "Return only the first N log lines."},
+                    "tail":  {"type": "integer", "description": "Return only the last N log lines."},
+                    "grep":  {"type": "string",  "description": "Filter log lines matching this regex/substring (applied after time filter)."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_budget_history",
+            "description": (
+                "[READ] Summarize LLM call history from budget_entries for a time window. "
+                "Shows finish_reason breakdown (stop/length/tool_calls), agent name counts, "
+                "total token usage, and a per-call detail table. "
+                "Use to identify which agents are hitting token limits, which tasks are looping, "
+                "or which stages are spending the most tokens. head/tail/grep filter the detail table."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string",  "description": "Filter to a single task ID (omit for all tasks)."},
+                    "hours":   {"type": "integer", "description": "Look back this many hours (default 4)."},
+                    "limit":   {"type": "integer", "description": "Max rows in the detail table (default 50)."},
+                    "head":    {"type": "integer", "description": "Return only the first N detail rows."},
+                    "tail":    {"type": "integer", "description": "Return only the last N detail rows."},
+                    "grep":    {"type": "string",  "description": "Filter detail rows matching this regex/substring."},
+                },
+            },
         },
     },
     # ---- File read tools ----
@@ -3728,11 +4323,14 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "list_directory",
-            "description": "[READ] List files and subdirectories at a given path with annotations for gitignored/excluded/protected entries. No state change.",
+            "description": "[READ] List files and subdirectories at a given path with annotations for gitignored/excluded/protected entries. head/tail/grep filter output. No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Directory path to list.", "default": "."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": [],
             },
@@ -3760,12 +4358,15 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "find_files",
-            "description": "[READ] Find files by glob pattern (e.g. '*.py', 'test_*.py'). No state change.",
+            "description": "[READ] Find files by glob pattern (e.g. '*.py', 'test_*.py'). head/tail/grep filter output. No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "glob_pattern": {"type": "string", "description": "Glob pattern to match filenames."},
                     "directory": {"type": "string", "description": "Root directory to search from.", "default": "."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": ["glob_pattern"],
             },
@@ -3819,11 +4420,14 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "read_diff_stat",
-            "description": "[READ] git diff --stat from <since> to HEAD, showing added/removed lines per file. No state change.",
+            "description": "[READ] git diff --stat from <since> to HEAD, showing added/removed lines per file. head/tail/grep filter output. No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "since": {"type": "string", "description": "Base ref (branch, tag, or commit). Default: 'main'.", "default": "main"},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": [],
             },
@@ -3841,19 +4445,30 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "read_git_status",
-            "description": "[READ] Return the current git status of the project. No state change.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
+            "description": "[READ] Return the current git status of the project. head/tail/grep filter output. No state change.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
+                },
+                "required": [],
+            },
         },
     },
     {
         "type": "function",
         "function": {
             "name": "read_git_diff",
-            "description": "[READ] Return git diff (staged + unstaged). Optionally scoped to a path. No state change.",
+            "description": "[READ] Return git diff (staged + unstaged). Optionally scoped to a path. head/tail/grep filter output. No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Optional path to scope the diff."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": [],
             },
@@ -3863,12 +4478,15 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "read_git_log",
-            "description": "[READ] Return recent git log entries. Optionally scoped to a specific file. No state change.",
+            "description": "[READ] Return recent git log entries. Optionally scoped to a specific file. head/tail/grep filter output. No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Optional file path to scope the log to."},
                     "max_count": {"type": "integer", "description": "Maximum number of log entries to return (1-100, default 20).", "default": 20},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": [],
             },
@@ -3878,11 +4496,14 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "read_git_blame",
-            "description": "[READ] Show git blame for a file (last-modified info per line). No state change.",
+            "description": "[READ] Show git blame for a file (last-modified info per line). head/tail/grep filter output. No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Path to the file to blame."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": ["path"],
             },
@@ -3892,12 +4513,15 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "read_git_show",
-            "description": "[READ] Show a file's content at a specific git ref, or show commit details (message + diffstat). No state change.",
+            "description": "[READ] Show a file's content at a specific git ref, or show commit details (message + diffstat). head/tail/grep filter output. No state change.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "ref": {"type": "string", "description": "Git ref (commit hash, branch, tag, HEAD~N, etc.)."},
                     "path": {"type": "string", "description": "Optional file path to show at the given ref. If omitted, shows commit details + diffstat."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": ["ref"],
             },
@@ -4219,12 +4843,15 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_check_mypy",
-            "description": "[RUN — sandbox] Run mypy type-checker on the given path. The project venv's Python is used. Does not modify files.",
+            "description": "[RUN — sandbox] Run mypy type-checker on the given path. The project venv's Python is used. head/tail/grep filter output. Does not modify files.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File or package to type-check."},
                     "flags": {"type": "string", "description": "Additional mypy flags (e.g. '--strict', '--ignore-missing-imports')."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": ["path"],
             },
@@ -4234,12 +4861,15 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_check_ruff",
-            "description": "[RUN — sandbox] Run ruff linter on the given path. Check-only; does not modify files.",
+            "description": "[RUN — sandbox] Run ruff linter on the given path. Check-only; head/tail/grep filter output. Does not modify files.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File or directory to lint (default: '.')."},
                     "flags": {"type": "string", "description": "Additional ruff flags (e.g. '--fix', '--select E,F')."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": [],
             },
@@ -4249,11 +4879,14 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_check_black",
-            "description": "[RUN — sandbox] Check code formatting with black. Read-only — does not modify files.",
+            "description": "[RUN — sandbox] Check code formatting with black. Read-only — head/tail/grep filter output. Does not modify files.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File or directory to check (default: '.')."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": [],
             },
@@ -4263,12 +4896,15 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_test_unittest",
-            "description": "[RUN — sandbox] Run Python unittest discovery or a specific test module. Does not modify project files.",
+            "description": "[RUN — sandbox] Run Python unittest discovery or a specific test module. head/tail/grep filter output. Does not modify project files.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "module": {"type": "string", "description": "Dotted module name to run (e.g. 'tests.test_foo'). Leave empty for full discovery."},
                     "pattern": {"type": "string", "description": "File pattern for discover (e.g. 'test_*.py'). Ignored if module is set."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": [],
             },
@@ -4278,10 +4914,14 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_test_npm",
-            "description": "[RUN — sandbox] Run npm test in the task's project directory. Does not modify project files.",
+            "description": "[RUN — sandbox] Run npm test in the task's project directory. head/tail/grep filter output. Does not modify project files.",
             "parameters": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
+                },
                 "required": [],
             },
         },
@@ -4290,11 +4930,14 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_test_cargo",
-            "description": "[RUN — sandbox] Run cargo test in the task's project directory. Does not modify project files.",
+            "description": "[RUN — sandbox] Run cargo test in the task's project directory. head/tail/grep filter output. Does not modify project files.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "args": {"type": "string", "description": "Additional cargo test flags (e.g. '--release', '-- --nocapture')."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": [],
             },
@@ -4304,12 +4947,15 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_test_go",
-            "description": "[RUN — sandbox] Run go test in the task's project directory. Does not modify project files.",
+            "description": "[RUN — sandbox] Run go test in the task's project directory. head/tail/grep filter output. Does not modify project files.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Package path to test (default: './...' for all packages)."},
                     "flags": {"type": "string", "description": "Additional go test flags (e.g. '-v', '-run TestFoo')."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": [],
             },
@@ -4320,11 +4966,14 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_build_make",
-            "description": "[RUN — build] Run a Makefile target in the task's project directory. May write build artifacts.",
+            "description": "[RUN — build] Run a Makefile target in the task's project directory. head/tail/grep filter output. May write build artifacts.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "target": {"type": "string", "description": "Makefile target (e.g. 'build', 'test', 'lint', 'all'). Must be alphanumeric/underscore/dash/dot/slash only."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": ["target"],
             },
@@ -4334,11 +4983,14 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_build_cargo",
-            "description": "[RUN — build] Build a Rust/Cargo project (cargo build). Writes build artifacts to target/.",
+            "description": "[RUN — build] Build a Rust/Cargo project (cargo build). head/tail/grep filter output. Writes build artifacts to target/.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "args": {"type": "string", "description": "Additional cargo build flags (e.g. '--release')."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": [],
             },
@@ -4348,10 +5000,14 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_build_go",
-            "description": "[RUN — build] Build a Go project (go build ./...). Writes binary output inside the project.",
+            "description": "[RUN — build] Build a Go project (go build ./...). head/tail/grep filter output. Writes binary output inside the project.",
             "parameters": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
+                },
                 "required": [],
             },
         },
@@ -4360,11 +5016,14 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_build_npm",
-            "description": "[RUN — build] Run an npm build script (npm run <script>). Writes build artifacts inside the project.",
+            "description": "[RUN — build] Run an npm build script (npm run <script>). head/tail/grep filter output. Writes build artifacts inside the project.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "script": {"type": "string", "description": "The npm script name (default: 'build')."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": [],
             },
@@ -4374,11 +5033,14 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_build_tsc",
-            "description": "[RUN — build] Run the TypeScript compiler (tsc). Writes compiled output inside the project.",
+            "description": "[RUN — build] Run the TypeScript compiler (tsc). head/tail/grep filter output. Writes compiled output inside the project.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "args": {"type": "string", "description": "Additional tsc flags (e.g. '--noEmit', '--watch')."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": [],
             },
@@ -4388,11 +5050,14 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_build_gradle",
-            "description": "[RUN — build] Run a Gradle task in the task's project directory. May write build artifacts.",
+            "description": "[RUN — build] Run a Gradle task in the task's project directory. head/tail/grep filter output. May write build artifacts.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "target": {"type": "string", "description": "Gradle task name (e.g. 'build', 'test', 'assemble'). Must be alphanumeric/underscore/dash/dot/slash only."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": ["target"],
             },
@@ -4402,11 +5067,14 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_build_mvn",
-            "description": "[RUN — build] Run a Maven goal in the task's project directory. May write build artifacts.",
+            "description": "[RUN — build] Run a Maven goal in the task's project directory. head/tail/grep filter output. May write build artifacts.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "goal": {"type": "string", "description": "Maven lifecycle phase or plugin goal (e.g. 'package', 'test', 'compile')."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": ["goal"],
             },
@@ -4419,13 +5087,16 @@ TOOL_SCHEMAS: list[dict] = [
             "name": "run_deps_pip",
             "description": (
                 "[RUN — deps] Install Python packages with pip. Mutates the venv environment. "
-                "Call after modifying requirements.txt or pyproject.toml. "
+                "Call after modifying requirements.txt or pyproject.toml. head/tail/grep filter output. "
                 "Examples: run_deps_pip('-r requirements.txt'), run_deps_pip('requests>=2.28')."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "args": {"type": "string", "description": "pip install arguments (e.g. '-r requirements.txt', 'requests>=2.28', '-e .')."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": ["args"],
             },
@@ -4435,10 +5106,14 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_deps_npm",
-            "description": "[RUN — deps] Install Node.js dependencies (npm install). Mutates node_modules. Call after modifying package.json.",
+            "description": "[RUN — deps] Install Node.js dependencies (npm install). Mutates node_modules. head/tail/grep filter output. Call after modifying package.json.",
             "parameters": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
+                },
                 "required": [],
             },
         },
@@ -4447,10 +5122,14 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_deps_cargo",
-            "description": "[RUN — deps] Fetch Rust/Cargo dependencies (cargo fetch). Mutates the local cargo registry cache. Call after modifying Cargo.toml.",
+            "description": "[RUN — deps] Fetch Rust/Cargo dependencies (cargo fetch). Mutates the local cargo registry cache. head/tail/grep filter output. Call after modifying Cargo.toml.",
             "parameters": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
+                },
                 "required": [],
             },
         },
@@ -4460,11 +5139,14 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_audit_bandit",
-            "description": "[RUN — audit] Run the bandit Python security linter. Read-only; does not modify project files.",
+            "description": "[RUN — audit] Run the bandit Python security linter. Read-only; head/tail/grep filter output. Does not modify project files.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Directory or file to scan (default: '.')."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": [],
             },
@@ -4474,10 +5156,14 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_audit_pip",
-            "description": "[RUN — audit] Audit installed Python packages for known vulnerabilities (pip-audit). Read-only.",
+            "description": "[RUN — audit] Audit installed Python packages for known vulnerabilities (pip-audit). Read-only; head/tail/grep filter output.",
             "parameters": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
+                },
                 "required": [],
             },
         },
@@ -4486,12 +5172,15 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_audit_semgrep",
-            "description": "[RUN — audit] Run semgrep static analysis. Read-only; does not modify project files.",
+            "description": "[RUN — audit] Run semgrep static analysis. Read-only; head/tail/grep filter output. Does not modify project files.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File or directory to scan (default: '.')."},
                     "config": {"type": "string", "description": "Semgrep config/ruleset (default: 'auto')."},
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
                 },
                 "required": [],
             },
@@ -4501,10 +5190,14 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_audit_npm",
-            "description": "[RUN — audit] Run npm audit to check Node.js dependencies for known vulnerabilities. Read-only.",
+            "description": "[RUN — audit] Run npm audit to check Node.js dependencies for known vulnerabilities. Read-only; head/tail/grep filter output.",
             "parameters": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "head": {"type": "integer", "description": "Return only the first N output lines."},
+                    "tail": {"type": "integer", "description": "Return only the last N output lines."},
+                    "grep": {"type": "string", "description": "Filter output lines matching this regex/substring."},
+                },
                 "required": [],
             },
         },
@@ -4915,6 +5608,16 @@ TOOL_CATEGORIES: dict[str, str] = {
     "cleanup_ghost_worktrees": "Infrastructure",
     "restart_server":         "Infrastructure",
     "get_system_health":      "Infrastructure",
+    "read_log_window":        "Infrastructure",
+    "get_budget_history":     "Infrastructure",
+    # Pipelines — pipeline template management
+    "list_pipelines":          "Pipelines",
+    "get_pipeline":            "Pipelines",
+    "clone_pipeline":          "Pipelines",
+    "update_pipeline":         "Pipelines",
+    "update_pipeline_stage":   "Pipelines",
+    "assign_project_pipeline": "Pipelines",
+    "transfer_pipeline_cards": "Pipelines",
     # Files — reading, writing, searching the filesystem
     "read_file":              "Files",
     "read_file_metadata":     "Files",

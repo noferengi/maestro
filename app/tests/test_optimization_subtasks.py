@@ -8,45 +8,19 @@ import json
 import pytest
 
 
-@pytest.fixture(autouse=True)
-def _restore_database_module():
-    """Reload app.database after each test to undo any importlib.reload() side-effects.
-
-    Tests in this file redirect app.database to a tmp_path DB via
-    monkeypatch.setenv + importlib.reload.  When monkeypatch teardown runs
-    (before this fixture teardown, because LIFO), it restores MAESTRO_TEST_DB
-    to the session test.db path.  We then reload the module so that
-    app.database.SessionLocal points at test.db again — preventing DB-path
-    pollution for every test file that runs afterwards.
-    """
-    yield
-    import importlib
-    import app.database as db_mod
-    importlib.reload(db_mod)
-
-
 # ---------------------------------------------------------------------------
 # OptimizationBenchmark CRUD
 # ---------------------------------------------------------------------------
 
-def test_create_and_get_optimization_benchmark(tmp_path, monkeypatch):
+def test_create_and_get_optimization_benchmark():
     """create_optimization_benchmark + get_optimization_benchmarks round-trip."""
-    db_path = str(tmp_path / "bench.db")
-    monkeypatch.setenv("MAESTRO_TEST_DB", db_path)
-
-    import importlib
     import app.database as db_mod
-    importlib.reload(db_mod)
-    from migrations.runner import migrate as run_migrate, ConnectionWrapper
-    with db_mod.engine.begin() as _conn:
-        run_migrate(ConnectionWrapper(_conn, is_postgres=False))
 
-    session = db_mod.SessionLocal()
-    parent = db_mod.Task(id="task-parent", title="Parent", type="optimization", project="P", history=[])
-    child = db_mod.Task(id="task-child", title="Child", type="idea", project="P", history=[])
-    session.add_all([parent, child])
-    session.commit()
-    session.close()
+    db = db_mod.SessionLocal()
+    db.add(db_mod.Task(id="task-parent", title="Parent", type="optimization", project="P", history=[]))
+    db.add(db_mod.Task(id="task-child", title="Child", type="idea", project="P", history=[]))
+    db.commit()
+    db.close()
 
     metrics = {"test_duration_ms": 1200, "memory_peak_mb": 80, "complexity_score": 42}
     bench = db_mod.create_optimization_benchmark(
@@ -60,32 +34,22 @@ def test_create_and_get_optimization_benchmark(tmp_path, monkeypatch):
 
     results = db_mod.get_optimization_benchmarks("task-parent")
     assert len(results) == 1
-    stored_metrics = json.loads(results[0].metrics)
-    assert stored_metrics["test_duration_ms"] == 1200
+    assert json.loads(results[0].metrics)["test_duration_ms"] == 1200
 
 
 # ---------------------------------------------------------------------------
 # record_benchmark tool
 # ---------------------------------------------------------------------------
 
-def test_record_benchmark_tool_success(tmp_path, monkeypatch):
+def test_record_benchmark_tool_success():
     """record_benchmark tool returns OK on valid input."""
-    db_path = str(tmp_path / "bench2.db")
-    monkeypatch.setenv("MAESTRO_TEST_DB", db_path)
-
-    import importlib
     import app.database as db_mod
-    importlib.reload(db_mod)
-    from migrations.runner import migrate as run_migrate, ConnectionWrapper
-    with db_mod.engine.begin() as _conn:
-        run_migrate(ConnectionWrapper(_conn, is_postgres=False))
 
-    session = db_mod.SessionLocal()
-    parent = db_mod.Task(id="t-p", title="P", type="optimization", project="P", history=[])
-    child = db_mod.Task(id="t-c", title="C", type="idea", project="P", history=[])
-    session.add_all([parent, child])
-    session.commit()
-    session.close()
+    db = db_mod.SessionLocal()
+    db.add(db_mod.Task(id="t-p", title="P", type="optimization", project="P", history=[]))
+    db.add(db_mod.Task(id="t-c", title="C", type="idea", project="P", history=[]))
+    db.commit()
+    db.close()
 
     import app.agent.tools as tools_mod
     result = tools_mod.write_benchmark(
@@ -126,20 +90,12 @@ def test_record_benchmark_tool_bad_json(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_phase_implementation_creates_subtasks(tmp_path, monkeypatch):
+async def test_phase_implementation_creates_subtasks():
     """_phase_implementation creates Kanban cards and marks parent as big_idea."""
-    db_path = str(tmp_path / "opt.db")
-    monkeypatch.setenv("MAESTRO_TEST_DB", db_path)
-
-    import importlib
     import app.database as db_mod
-    importlib.reload(db_mod)
-    from migrations.runner import migrate as run_migrate, ConnectionWrapper
-    with db_mod.engine.begin() as _conn:
-        run_migrate(ConnectionWrapper(_conn, is_postgres=False))
 
-    session = db_mod.SessionLocal()
-    task = db_mod.Task(
+    db = db_mod.SessionLocal()
+    db.add(db_mod.Task(
         id="task-opt-parent",
         title="Optimize sorting",
         type="optimization",
@@ -149,10 +105,9 @@ async def test_phase_implementation_creates_subtasks(tmp_path, monkeypatch):
         llm_id=None,
         budget_id=None,
         subdivision_generation=0,
-    )
-    session.add(task)
-    session.commit()
-    session.close()
+    ))
+    db.commit()
+    db.close()
 
     from app.agent.optimization import OptimizationPipeline
 
@@ -188,6 +143,7 @@ async def test_phase_implementation_creates_subtasks(tmp_path, monkeypatch):
     assert result is True
 
     # Verify a sub-task was created
+    import app.database as db_mod
     all_tasks = db_mod.get_all_tasks()
     subtasks = [t for t in all_tasks if t.parent_task_id == "task-opt-parent"]
     assert len(subtasks) == 1
@@ -199,22 +155,13 @@ async def test_phase_implementation_creates_subtasks(tmp_path, monkeypatch):
     assert parent.is_big_idea is True
 
 
-def test_phase_implementation_prereq_deadlock_avoidance(tmp_path, monkeypatch):
+def test_phase_implementation_prereq_deadlock_avoidance():
     """Sub-tasks must inherit parent's prerequisites, NOT the parent's own ID."""
-    db_path = str(tmp_path / "dl.db")
-    monkeypatch.setenv("MAESTRO_TEST_DB", db_path)
-
-    import importlib
     import app.database as db_mod
-    importlib.reload(db_mod)
-    from migrations.runner import migrate as run_migrate, ConnectionWrapper
-    with db_mod.engine.begin() as _conn:
-        run_migrate(ConnectionWrapper(_conn, is_postgres=False))
 
-    session = db_mod.SessionLocal()
-    # Create a prereq task
-    prereq = db_mod.Task(id="task-prereq", title="Prereq", type="completed", project="P", history=[])
-    parent = db_mod.Task(
+    db = db_mod.SessionLocal()
+    db.add(db_mod.Task(id="task-prereq", title="Prereq", type="completed", project="P", history=[]))
+    db.add(db_mod.Task(
         id="task-dl-parent",
         title="Parent",
         type="optimization",
@@ -222,10 +169,9 @@ def test_phase_implementation_prereq_deadlock_avoidance(tmp_path, monkeypatch):
         history=[],
         prerequisites=["task-prereq"],
         subdivision_generation=0,
-    )
-    session.add_all([prereq, parent])
-    session.commit()
-    session.close()
+    ))
+    db.commit()
+    db.close()
 
     from app.agent.optimization import OptimizationPipeline
     import asyncio
@@ -255,6 +201,7 @@ def test_phase_implementation_prereq_deadlock_avoidance(tmp_path, monkeypatch):
 
     asyncio.run(run())
 
+    import app.database as db_mod
     all_tasks = db_mod.get_all_tasks()
     subtasks = [t for t in all_tasks if t.parent_task_id == "task-dl-parent"]
     assert len(subtasks) == 1
@@ -286,7 +233,8 @@ def test_compute_dag_depth_chain():
 
 
 def test_compute_priority_tiers():
-    """Priority tiers: idea < starred < regular, stalest within tier wins."""
+    """Priority tiers: Tier 0 (human/starred) < Tier 1 (maestro) < Tier 3 (system/subdivision).
+    Within each tier, most stale task wins (lowest score = dispatched first)."""
     import datetime as _dt
     from app.agent.scheduler import _compute_priority
 
@@ -294,23 +242,37 @@ def test_compute_priority_tiers():
     new_ts = _dt.datetime.utcnow().isoformat()
 
     by_id = {
-        "idea":    {"id": "idea",    "prerequisites": [], "type": "idea",     "position": 0,
-                    "last_progress_at": new_ts, "is_starred": False},
-        "starred": {"id": "starred", "prerequisites": [], "type": "planning", "position": 0,
-                    "last_progress_at": new_ts, "is_starred": True},
-        "regular": {"id": "regular", "prerequisites": [], "type": "planning", "position": 0,
-                    "last_progress_at": new_ts, "is_starred": False},
-        "stale":   {"id": "stale",   "prerequisites": [], "type": "planning", "position": 0,
-                    "last_progress_at": old_ts, "is_starred": False},
+        # Tier 0: human-created (owner='user', sub_gen=0)
+        "human":     {"id": "human",     "prerequisites": [], "type": "idea",     "position": 0,
+                      "last_progress_at": new_ts, "is_starred": False,
+                      "owner": "user", "subdivision_generation": 0},
+        # Tier 0: starred card (is_starred=True overrides everything)
+        "starred":   {"id": "starred",   "prerequisites": [], "type": "planning", "position": 0,
+                      "last_progress_at": new_ts, "is_starred": True,
+                      "owner": "system", "subdivision_generation": 1},
+        # Tier 1: maestro-created
+        "maestro":   {"id": "maestro",   "prerequisites": [], "type": "planning", "position": 0,
+                      "last_progress_at": new_ts, "is_starred": False,
+                      "owner": "maestro", "subdivision_generation": 0},
+        # Tier 3: system subdivision child
+        "system":    {"id": "system",    "prerequisites": [], "type": "planning", "position": 0,
+                      "last_progress_at": new_ts, "is_starred": False,
+                      "owner": "system", "subdivision_generation": 1},
+        # Tier 3 stale: same tier as system but older — wins within tier
+        "stale_sys": {"id": "stale_sys", "prerequisites": [], "type": "planning", "position": 0,
+                      "last_progress_at": old_ts, "is_starred": False,
+                      "owner": "system", "subdivision_generation": 1},
     }
-    p_idea    = _compute_priority(by_id["idea"],    by_id)
-    p_starred = _compute_priority(by_id["starred"], by_id)
-    p_regular = _compute_priority(by_id["regular"], by_id)
-    p_stale   = _compute_priority(by_id["stale"],   by_id)
+    p_human     = _compute_priority(by_id["human"],     by_id)
+    p_starred   = _compute_priority(by_id["starred"],   by_id)
+    p_maestro   = _compute_priority(by_id["maestro"],   by_id)
+    p_system    = _compute_priority(by_id["system"],    by_id)
+    p_stale_sys = _compute_priority(by_id["stale_sys"], by_id)
 
-    assert p_idea < p_starred,  "idea must beat starred"
-    assert p_starred < p_regular, "starred must beat regular"
-    assert p_stale < p_regular,   "stalest regular task dispatched before fresher one"
+    assert p_human   < p_maestro, "Tier 0 (human) must beat Tier 1 (maestro)"
+    assert p_starred < p_maestro, "Tier 0 (starred) must beat Tier 1 (maestro)"
+    assert p_maestro < p_system,  "Tier 1 (maestro) must beat Tier 3 (system)"
+    assert p_stale_sys < p_system, "stalest Tier 3 task dispatched before fresher Tier 3"
 
 
 # ---------------------------------------------------------------------------

@@ -2,6 +2,10 @@
 
 Per-file descriptions, key invariants, and project isolation rules for the Maestro agent subsystem.
 
+**See `app/agent/TOOLS.md`** for the full tool philosophy: no-shell guarantee, no-chaining guarantee,
+universal head/tail/grep requirement, TOOL_REGISTRY vs TOOL_SCHEMAS sync rules, known tech debt
+(stale names in migration 0079, missing `consult_maestro` registry entry), and the new-tool checklist.
+
 ## Source files
 
 - `loop.py` — `MaestroLoop` class. `_ACTIVE_LOOPS` / `_LOOP_STATUS` dicts power the status/stop API endpoints. Drives Design → Implement → Test → Verify cycles. `_build_messages()` injects both the file-structure snapshot and the full architecture context (all categories) derived from the task's project.

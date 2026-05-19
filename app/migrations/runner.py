@@ -22,8 +22,8 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Import the database URL from the agent config (respects maestro.ini and env)
-from app.agent.config import ADMIN_DATABASE_URL
+# Import the database URLs from the agent config (respects maestro.ini and env)
+from app.agent.config import ADMIN_DATABASE_URL, TEST_ADMIN_DATABASE_URL
 
 MIGRATIONS_DIR = Path(__file__).parent / "versions"
 
@@ -243,11 +243,20 @@ class ConnectionWrapper:
             return self._last_res.rowcount
         return 0
 
-def get_connection():
-    """Create a database engine and return engine and is_postgres flag."""
-    is_postgres = ADMIN_DATABASE_URL.startswith("postgresql")
-    engine = create_engine(ADMIN_DATABASE_URL)
-    return engine, is_postgres
+def get_connection(target: str = "prod"):
+    """Create a database engine and return (engine, is_postgres).
+
+    target: "prod" (default) — production ADMIN_DATABASE_URL
+            "test"           — test MAESTRO_TEST_ADMIN_DATABASE_URL
+    """
+    url = TEST_ADMIN_DATABASE_URL if target == "test" else ADMIN_DATABASE_URL
+    if not url:
+        raise RuntimeError(
+            f"No database URL configured for target={target!r}. "
+            "Check MAESTRO_TEST_ADMIN_DATABASE_URL in .env."
+        )
+    is_postgres = url.startswith("postgresql")
+    return create_engine(url), is_postgres
 
 
 def ensure_migrations_table(conn_wrapper) -> None:
@@ -533,34 +542,53 @@ def _inline_seed(conn_wrapper) -> None:
 # CLI entry point
 # ---------------------------------------------------------------------------
 
+def _run_on(target: str, cmd: str) -> None:
+    """Run a single migration command against one target database."""
+    eng, is_pg = get_connection(target)
+    if cmd == "reset":
+        reset(eng, is_pg)
+        return
+    with eng.begin() as conn:
+        wrap = ConnectionWrapper(conn, is_pg)
+        if cmd == "migrate":
+            migrate(wrap)
+        elif cmd == "status":
+            status(wrap)
+        elif cmd == "rollback":
+            rollback(wrap)
+
+
 def main():
-    commands = ("migrate", "status", "rollback", "reset")
+    commands = ("migrate", "status", "rollback", "reset", "test", "prod")
     if len(sys.argv) < 2 or sys.argv[1] not in commands:
         print("TheMaestro Database Migration Runner")
         print("-" * 36)
         print("Usage: python app/migrations/runner.py <command>")
         print("\nCommands:")
-        print("  status    - Show applied vs pending migrations (Recommended first step)")
-        print("  migrate   - Apply all pending migrations to the database")
-        print("  rollback  - Revert the last applied migration")
-        print("  reset     - DESTROY all data and re-apply all migrations (Dev only)")
+        print("  status    - Show applied vs pending migrations for BOTH databases")
+        print("  migrate   - Apply pending migrations: test DB first, then prod DB")
+        print("  rollback  - Revert the last migration on BOTH databases")
+        print("  reset     - DESTROY all data on BOTH databases and re-migrate (Dev only)")
+        print("  test      - Run 'migrate' on the test database only")
+        print("  prod      - Run 'migrate' on the production database only")
         sys.exit(1)
 
     cmd = sys.argv[1]
-    engine, is_postgres = get_connection()
-    
-    if cmd == "reset":
-        reset(engine, is_postgres)
-        return
 
-    with engine.begin() as conn:
-        conn_wrapper = ConnectionWrapper(conn, is_postgres)
-        if cmd == "migrate":
-            migrate(conn_wrapper)
-        elif cmd == "status":
-            status(conn_wrapper)
-        elif cmd == "rollback":
-            rollback(conn_wrapper)
+    if cmd == "test":
+        print("=== Test DB ===")
+        _run_on("test", "migrate")
+    elif cmd == "prod":
+        print("=== Production DB ===")
+        _run_on("prod", "migrate")
+    else:
+        # Default: apply to test first, then prod (test, status, rollback, reset all touch both)
+        if TEST_ADMIN_DATABASE_URL:
+            print("=== Test DB ===")
+            _run_on("test", cmd)
+            print()
+        print("=== Production DB ===")
+        _run_on("prod", cmd)
 
 if __name__ == "__main__":
     main()

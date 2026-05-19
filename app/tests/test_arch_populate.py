@@ -4,7 +4,7 @@ from app.main import app
 from app.database import SessionLocal, Project, Task, FileSummary, ArchGenJob
 import json
 import os
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 
 client = TestClient(app)
 
@@ -13,19 +13,16 @@ def cleanup_project(db, project_name):
     if p:
         db.query(ArchGenJob).filter(ArchGenJob.project_id == p.id).delete()
         db.query(Task).filter(or_(Task.project == project_name, Task.project_id == p.id)).delete()
-        
-        # We don't have project_id on FileSummary, so we cleanup by path prefix
-        # We need to be careful here to match what's in the DB.
+
+        # Normalize both sides to lowercase forward-slashes so the LIKE matches on
+        # PostgreSQL (which treats \ as an escape char and is case-sensitive).
         root = os.path.normpath(os.path.abspath(p.path))
-        prefix = root.replace("\\", "/") + "/"
-        prefix_back = root + "\\"
-        db.query(FileSummary).filter(
-            or_(
-                FileSummary.file_path.like(prefix + "%"),
-                FileSummary.file_path.like(prefix_back + "%")
-            )
-        ).delete(synchronize_session=False)
-        
+        prefix = root.replace("\\", "/").lower() + "/"
+        normalized = func.lower(func.replace(FileSummary.file_path, "\\", "/"))
+        db.query(FileSummary).filter(normalized.like(prefix + "%")).delete(
+            synchronize_session=False
+        )
+
         db.query(Project).filter(Project.id == p.id).delete()
         db.commit()
 

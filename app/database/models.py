@@ -10,6 +10,7 @@ from sqlalchemy import (
     Column, Integer, String, Text, DateTime, JSON,
     ForeignKey, UniqueConstraint, Boolean, Float,
 )
+from sqlalchemy.schema import FetchedValue
 from sqlalchemy.orm import relationship, object_session
 from datetime import datetime, timezone
 
@@ -208,6 +209,7 @@ class ProjectDocument(Base):
     project_id         = Column(Integer, ForeignKey("projects.id"), nullable=False)
     key                = Column(String, nullable=False)
     content            = Column(Text, nullable=False)
+    content_size_bytes = Column(Integer, nullable=True, server_default=FetchedValue(), server_onupdate=FetchedValue())
     tags               = Column(JSON, nullable=True)
     written_by_task_id = Column(String, ForeignKey("tasks.id"), nullable=True)
     created_at         = Column(DateTime, default=datetime.utcnow)
@@ -311,6 +313,7 @@ class Task(Base):
     consultation_payload = Column(Text, nullable=True)  # JSON: {"question": "...", "hint": "...", "source": "user|maestro"}
     is_starred = Column(Boolean, nullable=False, default=False)
     stage_key = Column(String, nullable=True)  # Phase 1: mirrors type; Phase 2+: follows pipeline_stages.stage_key
+    goal_id = Column(Integer, ForeignKey("maestro_goals.id"), nullable=True, index=True)  # primary goal this card serves
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -713,6 +716,7 @@ class ResearchJob(Base):
     completion_tokens = Column(Integer, default=0)
     llm_id = Column(Integer, ForeignKey('llms.id'), nullable=True)
     budget_id = Column(Integer, ForeignKey('budgets.id'), nullable=True)
+    tier = Column(Integer, nullable=False, default=2)  # 0=human, 1=maestro, 2=maintenance, 3=background
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
 
@@ -734,6 +738,7 @@ class FileSummaryJob(Base):
     priority = Column(Float, nullable=False, default=-1.0)  # negative = above research (0.0)
     llm_id = Column(Integer, ForeignKey('llms.id'), nullable=True)
     budget_id = Column(Integer, ForeignKey('budgets.id'), nullable=True)
+    tier = Column(Integer, nullable=False, default=2)
     task_id = Column(String, nullable=True)
     prompt_tokens = Column(Integer, default=0)
     completion_tokens = Column(Integer, default=0)
@@ -776,6 +781,7 @@ class PipResolutionJob(Base):
     stage_blocked_at = Column(String, nullable=False)
     research_findings = Column(Text, nullable=True)
     status = Column(String, nullable=False, default="pending")
+    tier = Column(Integer, nullable=False, default=2)
     created_at = Column(String, nullable=False)
 
     def __repr__(self):
@@ -797,6 +803,7 @@ class ArchGenJob(Base):
     budget_id = Column(Integer, ForeignKey('budgets.id'), nullable=True)
     status = Column(String, nullable=False, default='pending')
     priority = Column(Float, nullable=False, default=1.0)
+    tier = Column(Integer, nullable=False, default=2)
     prompt_tokens = Column(Integer, default=0)
     completion_tokens = Column(Integer, default=0)
     error_message = Column(Text, nullable=True)
@@ -934,6 +941,59 @@ class ProjectDecision(Base):
         return f"<ProjectDecision(id={self.id}, topic={self.topic!r})>"
 
 
+class MaestroGoal(Base):
+    """Persistent goal — a direction the system is moving toward.
+
+    Visible as an arch card (category='Goals'), linked to pipeline cards via
+    tasks.goal_id, and verified by GoalVerifierAgent on demand or on card completion.
+    """
+    __tablename__ = "maestro_goals"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    project_id   = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    title        = Column(String, nullable=False)
+    statement    = Column(Text, nullable=False)
+    criteria     = Column(JSON, nullable=True)       # [{text, verifier_type, verifier_arg}]
+    status       = Column(String, nullable=False, default="active")  # active|paused|completed|abandoned
+    evidence     = Column(Text, nullable=True)        # append-only markdown evidence log
+    progress     = Column(Float, nullable=False, default=0.0)
+    last_verdict = Column(JSON, nullable=True)
+    parent_id    = Column(Integer, ForeignKey("maestro_goals.id"), nullable=True)
+    priority     = Column(Integer, nullable=False, default=1)
+    color        = Column(String, nullable=True)      # hex for card badge
+    created_by   = Column(String, nullable=False, default="human")  # human|maestro
+    arch_card_id = Column(String, ForeignKey("tasks.id"), nullable=True)
+    created_at   = Column(DateTime, default=datetime.utcnow)
+    updated_at   = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<MaestroGoal(id={self.id}, title={self.title!r}, status={self.status!r})>"
+
+
+class GoalVerificationJob(Base):
+    """Async job that evaluates progress toward a MaestroGoal."""
+    __tablename__ = "goal_verification_jobs"
+
+    id                = Column(Integer, primary_key=True, autoincrement=True)
+    goal_id           = Column(Integer, ForeignKey("maestro_goals.id"), nullable=False, index=True)
+    status            = Column(String, nullable=False, default="pending")  # pending|running|done|failed
+    triggered_by      = Column(String, nullable=True)   # manual|card_completion|cron
+    result            = Column(JSON, nullable=True)
+    error_msg         = Column(Text, nullable=True)
+    llm_id            = Column(Integer, ForeignKey("llms.id"), nullable=True)
+    budget_id         = Column(Integer, ForeignKey("budgets.id"), nullable=True)
+    priority          = Column(Float, nullable=False, default=0.0)
+    tier              = Column(Integer, nullable=False, default=2)
+    prompt_tokens     = Column(Integer, nullable=False, default=0)
+    completion_tokens = Column(Integer, nullable=False, default=0)
+    retry_count       = Column(Integer, nullable=False, default=0)
+    created_at        = Column(DateTime, default=datetime.utcnow)
+    completed_at      = Column(DateTime, nullable=True)
+
+    def __repr__(self):
+        return f"<GoalVerificationJob(id={self.id}, goal_id={self.goal_id}, status={self.status!r})>"
+
+
 # ---------------------------------------------------------------------------
 # Cache tables
 # ---------------------------------------------------------------------------
@@ -1047,6 +1107,7 @@ class ScopeSurveyJob(Base):
     action          = Column(String, nullable=False, default='generate') # generate | staleness_check | edit_summary
     status          = Column(String, nullable=False, default='pending')  # pending | running | done | failed
     priority        = Column(Float, nullable=False, default=0.0)
+    tier            = Column(Integer, nullable=False, default=2)
     llm_id          = Column(Integer, nullable=True)
     budget_id       = Column(Integer, nullable=True)
     prompt_tokens   = Column(Integer, default=0)

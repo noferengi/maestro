@@ -1,10 +1,7 @@
 """
 Tests for pipeline_router — Phase 2 stage transition and dispatch.
 """
-import importlib
 import pytest
-
-from sqlalchemy import create_engine
 
 
 # ---------------------------------------------------------------------------
@@ -12,17 +9,13 @@ from sqlalchemy import create_engine
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def router_db(tmp_path, monkeypatch):
-    """Fresh SQLite DB with pipeline template seeded for router tests."""
-    db_path = str(tmp_path / "router_test.db")
-    monkeypatch.setenv("MAESTRO_TEST_DB", db_path)
+def router_db():
+    """Seed a pipeline template into the shared test DB for router tests.
 
+    The _db_rollback fixture in conftest wraps each test in a rolled-back
+    transaction, so this data is automatically cleaned up after the test.
+    """
     import app.database as db_mod
-    importlib.reload(db_mod)
-
-    from migrations.runner import migrate as run_migrate, ConnectionWrapper
-    with db_mod.engine.begin() as conn:
-        run_migrate(ConnectionWrapper(conn, is_postgres=False))
 
     db = db_mod.SessionLocal()
     try:

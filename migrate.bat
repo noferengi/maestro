@@ -5,10 +5,12 @@ if "%1"=="" (
     echo Usage: .\migrate.bat ^<command^>
     echo.
     echo Commands:
-    echo   status    - Show applied vs pending migrations
-    echo   migrate   - Apply all pending migrations
-    echo   rollback  - Revert the last migration
-    echo   reset     - DESTROY all data and start fresh
+    echo   migrate   - Apply pending migrations: TEST DB first, then PROD DB
+    echo   status    - Show applied vs pending for both databases
+    echo   rollback  - Revert the last migration on both databases
+    echo   reset     - DESTROY all data on both databases and re-migrate (Dev only)
+    echo   test      - Apply pending migrations to the TEST database only
+    echo   prod      - Apply pending migrations to the PROD database only
     echo.
     echo Recommended Workflow:
     echo   .\migrate.bat status

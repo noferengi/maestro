@@ -1041,16 +1041,42 @@ def _compute_dag_depth(task_id: str, by_id: dict) -> int:
     ) + 1
 
 
+def _task_priority_tier(task_dict: dict) -> int:
+    """Classify a pipeline task into dispatch tier.
+
+    Tier 0: Human-created (owner='user', subdivision_generation=0) or starred.
+            Always dispatched before Maestro work.
+    Tier 1: Maestro-originated (owner='maestro').
+            Dispatched before maintenance jobs (file summaries etc.).
+    Tier 3: Everything else — subdivision children, factory-created, system work.
+            Only dispatched when tiers 0–2 have no pending work.
+
+    Tier 2 is deliberately unused for pipeline tasks; it is reserved for background
+    job tables (file summaries, surveys, PIP resolution) which are dispatched as a
+    separate phase in _tick().
+    """
+    if task_dict.get("is_starred"):
+        return 0
+    owner = task_dict.get("owner", "user") or "user"
+    sub_gen = task_dict.get("subdivision_generation", 0) or 0
+    if owner == "user" and sub_gen == 0:
+        return 0
+    if owner == "maestro":
+        return 1
+    return 3
+
+
 def _compute_priority(task_dict: dict, by_id: dict) -> float:
     """Lower score = higher priority.
 
-    Tier 0 (score ≤ 0):              type='idea'   — new human work, always first
-    Tier 1 (0 < score < 10_000_000): is_starred    — starred tasks jump the general queue
-    Tier 2 (score ≥ 10_000_000):     everyone else — pure staleness round-robin
+    Tier 0 (score ≤ 0):              human-created or starred
+    Tier 1 (0 < score < 10_000_000): Maestro-originated tasks
+    Tier 3 (score ≥ 30_000_000):     subdivision children, factory cards, system work
 
-    Within each tier the most stale task (largest staleness_seconds) wins because
-    subtracting a larger number yields a lower score.  Tier gaps are 10 M seconds
-    (~115 days) so tiers never overlap regardless of staleness.
+    Within each tier the most stale task (largest staleness_seconds) wins.
+    Tier gaps of 10 M seconds (~115 days) ensure tiers never overlap regardless of
+    staleness.  The 10–30 M range is intentionally unused, reserved for tier 2
+    pipeline tasks if needed in future.
     """
     import datetime as _dt
     now = _dt.datetime.utcnow()
@@ -1063,11 +1089,27 @@ def _compute_priority(task_dict: dict, by_id: dict) -> float:
     last_progress: _dt.datetime = raw if raw is not None else now
     staleness = (now - last_progress).total_seconds()
 
-    if task_dict.get("type") == "idea":
-        return -staleness                   # Tier 0: most stale idea dispatched first
-    if task_dict.get("is_starred"):
-        return 10_000_000.0 - staleness    # Tier 1: most stale starred task first
-    return 20_000_000.0 - staleness        # Tier 2: most stale task first
+    tier = _task_priority_tier(task_dict)
+    base = {0: 0.0, 1: 10_000_000.0, 3: 30_000_000.0}[tier]
+    return base - staleness
+
+
+def _free_slots(allowed_llm_id: "int | None") -> int:
+    """Return the number of free parallel slots for the currently pinned LLM.
+
+    Returns a large number when no LLM is pinned yet (nothing running) so the
+    first dispatch is never gated.
+    """
+    if allowed_llm_id is None:
+        return 999  # nothing pinned; let first dispatch pin it
+    from app.database import get_llm as _get_llm
+    llm = _get_llm(allowed_llm_id)
+    if llm is None:
+        return 0
+    cap = getattr(llm, "parallel_sessions", 1) or 1
+    with _llm_counts_lock:
+        active = _llm_session_counts.get(allowed_llm_id, 0)
+    return max(0, cap - active)
 
 
 def _check_and_reserve_slot(
@@ -1144,23 +1186,175 @@ def _check_and_reserve_slot(
     return True
 
 
+def _dispatch_pipeline_tasks_tiered(
+    tier: int,
+    ready_tasks: list,
+    allowed_llm_id: "int | None",
+    node_active_counts: dict,
+    node_session_counts: dict,
+    node_obj_cache: dict,
+    llm_node_cache: dict,
+) -> "int | None":
+    """Dispatch pipeline tasks of *tier* from the pre-sorted *ready_tasks* list.
+
+    Returns the (possibly updated) allowed_llm_id.
+    Tasks in *ready_tasks* are already DAG-ready and sorted by _compute_priority.
+    Only tasks whose _task_priority_tier() equals *tier* are considered.
+    """
+    from app.database import get_task, get_llm, budget_has_capacity
+    from app.database import get_project_path as _get_project_path
+    from app.database import get_active_pip_resolution_jobs_for_task
+
+    for task_dict in ready_tasks:
+        if _task_priority_tier(task_dict) != tier:
+            continue
+
+        task_id = task_dict["id"]
+        task_type = task_dict.get("type", "")
+
+        if task_type in _SCHEDULER_SKIP_STAGE_TYPES:
+            continue
+
+        if task_type == "idea":
+            from app.database import get_task as _get_task_dispatch
+            _db_task = _get_task_dispatch(task_id)
+            if _db_task and _db_task.intake_exhausted_at:
+                continue
+            cs = getattr(_db_task, 'clarification_status', 'none') if _db_task else 'none'
+            if cs not in ('approved', 'skipped'):
+                continue
+            if task_id in _rejection_cooldowns:
+                if time.time() - _rejection_cooldowns[task_id] < _REJECTION_RETRY_COOLDOWN:
+                    continue
+
+        with _active_sessions_lock:
+            if task_id in _active_sessions and _active_sessions[task_id].is_alive():
+                continue
+
+        if task_type not in {"idea", "planning", "architecture"}:
+            if get_active_pip_resolution_jobs_for_task(task_id):
+                logger.debug(
+                    "[pip] Skipping dispatch of '%s' (%s) — pip_resolution_jobs active.",
+                    task_id, task_type,
+                )
+                continue
+
+        if task_type == "planning":
+            if task_id in _planning_stopped:
+                continue
+            if task_id in _rejection_cooldowns:
+                if time.time() - _rejection_cooldowns[task_id] < _REJECTION_RETRY_COOLDOWN:
+                    continue
+
+        if task_id in _failed_cooldowns:
+            if time.time() - _failed_cooldowns[task_id] < _FAIL_COOLDOWN_SECONDS:
+                continue
+
+        db_task = get_task(task_id)
+        if not db_task or not db_task.llm_id:
+            continue
+
+        _content_blob = db_task.content or {}
+        if _content_blob.get("_parked_at_stage") == task_type:
+            continue
+
+        if db_task.consultation_payload:
+            try:
+                cp = __import__("json").loads(db_task.consultation_payload)
+                if cp.get("question") and not cp.get("hint"):
+                    logger.debug("Skipping task '%s' - awaiting consultation hint.", task_id)
+                    continue
+            except Exception:
+                pass
+
+        llm = get_llm(db_task.llm_id)
+        if not llm:
+            continue
+
+        if allowed_llm_id is not None and llm.id != allowed_llm_id:
+            continue
+        if allowed_llm_id is None:
+            allowed_llm_id = llm.id
+            logger.info("[%s] One-LLM policy: pinning to LLM %d (%s).", AGENT_NAME, llm.id, llm.model)
+
+        worst = _estimate_worst_case_microcents(db_task.llm_id, db_task.budget_id)
+        if worst > 0 and not budget_has_capacity(db_task.budget_id, worst):
+            logger.info(
+                "[%s] Skipping task '%s' - budget %s insufficient (%d µ¢ worst-case).",
+                AGENT_NAME, task_id, db_task.budget_id, worst,
+            )
+            from app.database import append_task_history
+            append_task_history(
+                task_id, "budget_skip",
+                message=f"Budget {db_task.budget_id} insufficient ({worst} µ¢ worst-case needed)",
+            )
+            continue
+
+        project_path = None
+        if db_task.project:
+            project_path = _get_project_path(db_task.project)
+            if project_path is None:
+                logger.warning(
+                    "Task '%s' project '%s' has no path - git tools use PROJECT_ROOT.",
+                    task_id, db_task.project,
+                )
+
+        if not _check_and_reserve_slot(
+            llm, node_active_counts, node_session_counts, node_obj_cache, llm_node_cache,
+            label=f"task '{task_id}'",
+        ):
+            continue
+
+        logger.info(
+            "Dispatching task '%s' (type=%s, tier=%d) to LLM %d (%s:%d %s) [slot %d/%d].",
+            task_id, task_type, tier, llm.id, llm.address, llm.port, llm.model,
+            _llm_session_counts[llm.id], llm.parallel_sessions,
+        )
+
+        thread = threading.Thread(
+            target=_run_task,
+            args=(task_id, task_type, llm, db_task, project_path),
+            daemon=True,
+            name=f"maestro-task-{task_id}",
+        )
+        with _active_sessions_lock:
+            _active_sessions[task_id] = thread
+            _session_llm_ids[task_id] = llm.id
+            _session_types[task_id] = task_type
+            _session_started_at[task_id] = time.time()
+        try:
+            thread.start()
+        except Exception:
+            logger.exception("Failed to start thread for task '%s'.", task_id)
+            with _active_sessions_lock:
+                _active_sessions.pop(task_id, None)
+                _session_llm_ids.pop(task_id, None)
+                _session_types.pop(task_id, None)
+                _session_started_at.pop(task_id, None)
+            with _llm_counts_lock:
+                _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
+
+    return allowed_llm_id
+
+
 def _tick() -> None:
     """
-    Single scheduler tick:
-      0. Clean up finished sessions.
-      1. Determine which LLM (if any) is already active - one-LLM-at-a-time policy.
-      2. Dispatch file summary jobs (highest priority - agents are blocked waiting).
-      3. Discover DAG-ready tasks and sort by priority.
-      4. For each ready task, check LLM capacity and dispatch if possible.
-      5. Dispatch pending research jobs.
-      6. Recover stranded subdivision tasks (voted SUBDIVIDE but have no children).
+    Single scheduler tick — tiered priority dispatch.
+
+    Tiers (higher tiers never wait for lower tiers to clear):
+      Tier 0: Human-initiated work — clarification, Populate arch-gen, human pipeline cards
+      Tier 1: Maestro-originated  — MaestroAgent stall/heartbeat, Maestro-created cards
+      Tier 2: Maintenance         — file summaries, scope surveys, PIP resolution, research
+      Tier 3: Background pipeline — subdivision children, factory cards, system-owned tasks
+
+    Free LLM slots are filled from top tier downward each tick.  A lower tier only
+    gets slots if there are no pending higher-tier jobs AND slots remain after dispatching
+    higher-tier work.
 
     One-LLM-at-a-time policy: the llama.cpp router can only run one model at a time.
     Switching models requires unloading the current model first.  If we dispatch to
     multiple LLM IDs simultaneously the router thrashes between models and nothing
-    makes progress.  Solution: once a session is active for a given LLM, only dispatch
-    more work to that same LLM until ALL its sessions finish, then pick the next LLM.
-    File summary jobs respect the same constraint (they use the same LLM as their task).
+    makes progress.
     """
     # Do not dispatch new work once shutdown has been signalled.
     from app.agent.llm_client import is_shutting_down
@@ -1222,8 +1416,6 @@ def _tick() -> None:
     # 1. Determine the currently pinned LLM (one-at-a-time policy).
     #    allowed_llm_id = None  → nothing is running; first dispatch pins a new LLM.
     #    allowed_llm_id = N     → only dispatch to LLM N until it drains completely.
-    #    Includes both scheduler-dispatched sessions (thread liveness check) AND
-    #    API-triggered pipeline sessions registered via register_pipeline_session().
     with _active_sessions_lock:
         active_llm_ids: set[int] = {
             lid for key, lid in _session_llm_ids.items()
@@ -1233,223 +1425,59 @@ def _tick() -> None:
         active_llm_ids.update(_external_sessions.values())
     allowed_llm_id: int | None = next(iter(active_llm_ids)) if active_llm_ids else None
     if allowed_llm_id is not None:
-        logger.debug(f"[{AGENT_NAME}] One-LLM policy: pinned to LLM %d.", allowed_llm_id)
+        logger.debug("[%s] One-LLM policy: pinned to LLM %d.", AGENT_NAME, allowed_llm_id)
 
-    # 2. File summary jobs first - blocked agents are waiting on these.
-    #    Pass allowed_llm_id and node-state dicts so they respect all capacity caps.
-    allowed_llm_id = _dispatch_file_summary_jobs(
-        allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
-    )
-
-    # 3. Get all tasks, compute DAG readiness, sort by priority
+    # 2. Pre-fetch all ready tasks (single DB round-trip) and sort by priority.
+    #    Tasks are partitioned into tiers by _task_priority_tier() during dispatch.
     all_tasks = get_all_tasks()
     task_dicts = [_task_to_mini_dict(t) for t in all_tasks]
     resolver = DAGResolver(task_dicts)
     ready_tasks = resolver.get_ready_tasks()
-
     if ready_tasks:
         by_id = {t["id"]: t for t in task_dicts}
         ready_tasks.sort(key=lambda t: _compute_priority(t, by_id))
 
-    # 4. Try to dispatch each ready task
-    for task_dict in ready_tasks:
-        task_id = task_dict["id"]
-        task_type = task_dict.get("type", "")
+    _cap_args = (node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache)
 
-        # Skip stages that are never auto-dispatched (human gate, terminal states).
-        # 'human_review' is the built-in stage name; custom human_gate stages with
-        # non-standard names are caught by the agent_type check in dispatch_task().
-        if task_type in _SCHEDULER_SKIP_STAGE_TYPES:
-            continue
+    # ── TIER 0: Human-initiated ──────────────────────────────────────────────
+    # Populate button arch-gen (tier=0), human-created pipeline tasks + starred cards.
+    if _free_slots(allowed_llm_id) > 0:
+        allowed_llm_id = _dispatch_arch_gen_jobs(allowed_llm_id, *_cap_args, only_tier=0)
+    if _free_slots(allowed_llm_id) > 0:
+        allowed_llm_id = _dispatch_pipeline_tasks_tiered(0, ready_tasks, allowed_llm_id, *_cap_args)
 
-        # For 'idea' tasks: skip exhausted tasks (human reset required)
-        # and retry rejected ones after a cooldown.
-        if task_type == "idea":
-            from app.database import get_task as _get_task_dispatch
-            _db_task = _get_task_dispatch(task_id)
-            if _db_task and _db_task.intake_exhausted_at:
-                continue  # Intake exhausted — human must reset via /reset-intake
+    # ── TIER 1: Maestro-originated ───────────────────────────────────────────
+    # MaestroAgent (stall recovery, heartbeat) and Maestro-created pipeline tasks.
+    if _free_slots(allowed_llm_id) > 0:
+        allowed_llm_id = _dispatch_maestro(allowed_llm_id, *_cap_args)
+    if _free_slots(allowed_llm_id) > 0:
+        allowed_llm_id = _dispatch_heartbeat_maestro(allowed_llm_id, *_cap_args)
+    if _free_slots(allowed_llm_id) > 0:
+        allowed_llm_id = _dispatch_pipeline_tasks_tiered(1, ready_tasks, allowed_llm_id, *_cap_args)
 
-            # Human approval gate: only dispatch intake after the clarification draft
-            # has been reviewed and approved. 'awaiting_user' and 'pending' block here.
-            # 'skipped' bypasses the draft UI entirely and is treated as approved.
-            cs = getattr(_db_task, 'clarification_status', 'none') if _db_task else 'none'
-            if cs not in ('approved', 'skipped'):
-                continue
-
-            # Rejected / needs_research / etc.: retry after cooldown
-            if task_id in _rejection_cooldowns:
-                if time.time() - _rejection_cooldowns[task_id] < _REJECTION_RETRY_COOLDOWN:
-                    continue
-
-        # Already running?
-        with _active_sessions_lock:
-            if task_id in _active_sessions and _active_sessions[task_id].is_alive():
-                continue
-
-        # PIP resolution guard: don't re-dispatch any non-intake stage while PIP
-        # resolution agents are still working.  'idea', 'planning', 'architecture'
-        # pre-date the PIP system and never generate PIPs.
-        # Custom stages with pip_skip:true in stage.config are exempted below.
-        if task_type not in {"idea", "planning", "architecture"}:
-            from app.database import get_active_pip_resolution_jobs_for_task
-            if get_active_pip_resolution_jobs_for_task(task_id):
-                logger.debug(
-                    "[pip] Skipping dispatch of '%s' (%s) — pip_resolution_jobs active.",
-                    task_id, task_type,
-                )
-                continue
-
-        # Planning-gate rejection cooldown (5 min) — mirrors the intake rejection
-        # cooldown so a task that keeps failing the gate doesn't spin hot.
-        if task_type == "planning":
-            if task_id in _planning_stopped:
-                continue  # requires manual re-trigger via /run-planning
-            if task_id in _rejection_cooldowns:
-                if time.time() - _rejection_cooldowns[task_id] < _REJECTION_RETRY_COOLDOWN:
-                    continue
-
-        # Cooldown after failure - don't retry for 60s
-        if task_id in _failed_cooldowns:
-            if time.time() - _failed_cooldowns[task_id] < _FAIL_COOLDOWN_SECONDS:
-                continue
-
-        # Resolve the LLM for capacity check
-        db_task = get_task(task_id)
-        if not db_task or not db_task.llm_id:
-            continue
-
-        # Circuit-breaker park guard: skip stages that have been explicitly parked
-        # by a circuit_breaker executor (content._parked_at_stage set).
-        _content_blob = db_task.content or {}
-        if _content_blob.get("_parked_at_stage") == task_type:
-            continue
-
-        # CONSULTATION GUARD: Skip tasks that are paused for consultation
-        # but don't have a steering hint yet.
-        if db_task.consultation_payload:
-            try:
-                cp = __import__("json").loads(db_task.consultation_payload)
-                if cp.get("question") and not cp.get("hint"):
-                    logger.debug("Skipping task '%s' - awaiting consultation hint.", task_id)
-                    continue
-            except:
-                pass
-
-        llm = get_llm(db_task.llm_id)
-        if not llm:
-            continue
-
-        # One-LLM-at-a-time: skip tasks whose LLM differs from the active one.
-        if allowed_llm_id is not None and llm.id != allowed_llm_id:
-            continue
-        # Pin to this LLM for the rest of this tick.
-        if allowed_llm_id is None:
-            allowed_llm_id = llm.id
-            logger.info(f"[{AGENT_NAME}] One-LLM policy: pinning to LLM %d (%s).", llm.id, llm.model)
-
-        # Budget pre-flight: skip if worst-case cost exceeds remaining budget
-        from app.database import budget_has_capacity
-        worst = _estimate_worst_case_microcents(db_task.llm_id, db_task.budget_id)
-        if worst > 0 and not budget_has_capacity(db_task.budget_id, worst):
-            logger.info(
-                f"[{AGENT_NAME}] Skipping task '%s' - budget %s insufficient (%d µ¢ worst-case).",
-                task_id, db_task.budget_id, worst,
-            )
-            from app.database import append_task_history
-            append_task_history(
-                task_id, "budget_skip",
-                message=f"Budget {db_task.budget_id} insufficient ({worst} µ¢ worst-case needed)",
-            )
-            continue
-
-        # Resolve project path for git tool isolation
-        from app.database import get_project_path as _get_project_path
-        project_path = None
-        if db_task.project:
-            project_path = _get_project_path(db_task.project)
-            if project_path is None:
-                logger.warning(
-                    "Task '%s' project '%s' has no path - git tools use PROJECT_ROOT.",
-                    task_id, db_task.project,
-                )
-
-        # Check and reserve capacity (node-level + per-LLM, updates tick-local counters)
-        if not _check_and_reserve_slot(
-            llm, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
-            label=f"task '{task_id}'",
-        ):
-            continue
-
-        # Dispatch
-        logger.info(
-            "Dispatching task '%s' (type=%s) to LLM %d (%s:%d %s) [slot %d/%d].",
-            task_id, task_type, llm.id, llm.address, llm.port, llm.model,
-            _llm_session_counts[llm.id], llm.parallel_sessions,
-        )
-
-        thread = threading.Thread(
-            target=_run_task,
-            args=(task_id, task_type, llm, db_task, project_path),
-            daemon=True,
-            name=f"maestro-task-{task_id}",
-        )
-        with _active_sessions_lock:
-            _active_sessions[task_id] = thread
-            _session_llm_ids[task_id] = llm.id
-            _session_types[task_id] = task_type
-            _session_started_at[task_id] = time.time()
-        try:
-            thread.start()
-        except Exception:
-            logger.exception("Failed to start thread for task '%s'.", task_id)
-            with _active_sessions_lock:
-                _active_sessions.pop(task_id, None)
-                _session_llm_ids.pop(task_id, None)
-                _session_types.pop(task_id, None)
-                _session_started_at.pop(task_id, None)
-            with _llm_counts_lock:
-                _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
-            # local tick counters (node_active_counts, _node_session_counts) aren't
-            # corrected here, but they only affect the remainder of this tick.
-
-    # 5. Dispatch pending research jobs (respects one-LLM policy + full capacity caps)
-    _dispatch_research_jobs(
-        allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
-    )
-
-    # 5.5. Dispatch pending arch gen jobs (lower priority than research; no caller blocking)
-    _dispatch_arch_gen_jobs(
-        allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
-    )
-
-    # 5.5.5. Dispatch project survey jobs (hierarchical summarization)
-    _dispatch_scope_survey_jobs(
-        allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
-    )
-
-    # 5.6. Dispatch pending PIP resolution jobs (research + resolution agents for blocked PIPs)
-    _dispatch_pip_resolution_jobs(
-        allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
-    )
-
-    # 6. Recover stranded subdivision tasks (respects one-LLM policy + full capacity caps)
-    _dispatch_stranded_subdivisions(
-        allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
-    )
-
-    # 7. Maestro: resurrect stalled projects (fires when no pipeline progress for N ticks)
-    _dispatch_maestro(
-        allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
-    )
-
-    # 8. Heartbeat: periodic system health survey (fires every 5 minutes)
-    _dispatch_heartbeat_maestro(
-        allowed_llm_id, node_active_counts, _node_session_counts, _node_obj_cache, _llm_node_cache,
-    )
-
-    # 9. Card factory: predecessor_complete and cron triggers (Phase 9)
+    # ── TIER 2: Maintenance / bookkeeping ────────────────────────────────────
+    # File summaries, scope surveys, auto arch-gen, PIP resolution, research.
+    # Stranded subdivision recovery and factory triggers are no-slot ops; always run.
+    if _free_slots(allowed_llm_id) > 0:
+        allowed_llm_id = _dispatch_file_summary_jobs(allowed_llm_id, *_cap_args)
+    if _free_slots(allowed_llm_id) > 0:
+        allowed_llm_id = _dispatch_scope_survey_jobs(allowed_llm_id, *_cap_args)
+    if _free_slots(allowed_llm_id) > 0:
+        allowed_llm_id = _dispatch_arch_gen_jobs(allowed_llm_id, *_cap_args, only_tier=2)
+    if _free_slots(allowed_llm_id) > 0:
+        allowed_llm_id = _dispatch_pip_resolution_jobs(allowed_llm_id, *_cap_args)
+    if _free_slots(allowed_llm_id) > 0:
+        allowed_llm_id = _dispatch_goal_verification_jobs(allowed_llm_id, *_cap_args)
+    if _free_slots(allowed_llm_id) > 0:
+        allowed_llm_id = _dispatch_research_jobs(allowed_llm_id, *_cap_args)
+    _dispatch_stranded_subdivisions(allowed_llm_id, *_cap_args)
     _dispatch_factory_triggers(allowed_llm_id)
+
+    # ── TIER 3: Background pipeline cards ────────────────────────────────────
+    # Subdivision children, factory-created cards, system-owned tasks.
+    # Only run when all higher-tier work is satisfied.
+    if _free_slots(allowed_llm_id) > 0:
+        _dispatch_pipeline_tasks_tiered(3, ready_tasks, allowed_llm_id, *_cap_args)
 
 
 def _dispatch_heartbeat_maestro(
@@ -1458,7 +1486,7 @@ def _dispatch_heartbeat_maestro(
     node_session_counts: "dict[int, int]",
     node_obj_cache: "dict[int, Any]",
     llm_node_cache: "dict[int, int | None]",
-) -> None:
+) -> "int | None":
     """Fire a MaestroAgent in heartbeat mode to survey system health every 5 minutes."""
     global _last_global_heartbeat
     from app.agent.config import MAESTRO_ENABLED
@@ -1467,27 +1495,27 @@ def _dispatch_heartbeat_maestro(
     # Check if Maestro is enabled (dynamically or via config)
     maestro_enabled = get_system_setting("maestro_enabled", MAESTRO_ENABLED)
     if not maestro_enabled:
-        return
+        return allowed_llm_id
     if is_shutting_down():
-        return
+        return allowed_llm_id
 
     now = time.time()
     if (now - _last_global_heartbeat) < _HEARTBEAT_INTERVAL_SECONDS:
-        return
+        return allowed_llm_id
 
     # Check if a heartbeat is already running
     session_key = "maestro-heartbeat"
     with _active_sessions_lock:
         if session_key in _active_sessions:
-            return
+            return allowed_llm_id
 
     # 1. Try to get global Maestro config from system settings
     llm_id = get_system_setting("maestro_llm_id")
     budget_id = get_system_setting("maestro_budget_id")
-    
+
     steward_name = "GlobalHeartbeat"
     steward_path = None
-    
+
     # 2. Fallback to a steward project if not configured
     if not llm_id or not budget_id:
         projects = get_all_projects()
@@ -1498,25 +1526,26 @@ def _dispatch_heartbeat_maestro(
                 steward_name = p.name
                 steward_path = p.path
                 break
-    
+
     if not llm_id or not budget_id:
-        # Still no LLM/Budget? We can't run.
-        return
+        return allowed_llm_id
 
     llm = get_llm(llm_id)
     if not llm:
-        return
+        return allowed_llm_id
 
     # Respect one-LLM policy
     if allowed_llm_id is not None and llm.id != allowed_llm_id:
-        return
+        return allowed_llm_id
+    if allowed_llm_id is None:
+        allowed_llm_id = llm.id
 
     # Reserve slot
     if not _check_and_reserve_slot(
         llm, node_active_counts, node_session_counts, node_obj_cache, llm_node_cache,
         label="maestro-heartbeat",
     ):
-        return
+        return allowed_llm_id
 
     logger.info("[Heartbeat] Triggering system health survey via MaestroAgent (LLM %d).", llm.id)
     _last_global_heartbeat = now
@@ -1529,6 +1558,7 @@ def _dispatch_heartbeat_maestro(
         llm_base_url=f"http://{llm.address}:{llm.port}/v1",
         llm_model=llm.model,
     )
+    return allowed_llm_id
 
 
 def _start_maestro_heartbeat_thread(
@@ -1805,6 +1835,8 @@ def _dispatch_maestro(
                 f"[Maestro] Skipping '{project_name}' — LLM {llm.id} not pinned (pinned={allowed_llm_id})."
             )
             continue
+        if allowed_llm_id is None:
+            allowed_llm_id = llm.id
 
         # Check and reserve a capacity slot — Maestros must not bypass limits
         if not _check_and_reserve_slot(
@@ -1850,6 +1882,8 @@ def _dispatch_maestro(
             llm_base_url=llm_base_url,
             llm_model=llm_model,
         )
+
+    return allowed_llm_id
 
 
 def _start_maestro_thread(
@@ -2156,10 +2190,11 @@ def _dispatch_research_jobs(
     node_session_counts: "dict[int, int]",
     node_obj_cache: "dict[int, Any]",
     llm_node_cache: "dict[int, int | None]",
-) -> None:
+) -> "int | None":
     """Dispatch pending research jobs that have an LLM assigned.
 
     Respects the one-LLM-at-a-time policy and full node/LLM capacity caps.
+    Returns the (possibly updated) allowed_llm_id.
     """
     from app.database import get_pending_research_jobs, update_research_job, get_llm, get_task as _get_task
 
@@ -2189,6 +2224,8 @@ def _dispatch_research_jobs(
         # One-LLM-at-a-time gate
         if allowed_llm_id is not None and llm.id != allowed_llm_id:
             continue
+        if allowed_llm_id is None:
+            allowed_llm_id = llm.id
 
         if not _check_and_reserve_slot(
             llm, node_active_counts, node_session_counts, node_obj_cache, llm_node_cache,
@@ -2207,6 +2244,8 @@ def _dispatch_research_jobs(
             _session_llm_ids[job_key] = llm.id
             _session_titles[job_key] = f"Research: {job.question[:60]}..." if len(job.question) > 60 else f"Research: {job.question}"
         thread.start()
+
+    return allowed_llm_id
 
 
 def _run_research_job(job: Any, llm: Any) -> None:
@@ -2273,23 +2312,126 @@ def _run_research_job(job: Any, llm: Any) -> None:
             pass
 
 
+def _dispatch_goal_verification_jobs(
+    allowed_llm_id: "int | None",
+    node_active_counts: "dict[int, int]",
+    node_session_counts: "dict[int, int]",
+    node_obj_cache: "dict[int, Any]",
+    llm_node_cache: "dict[int, int | None]",
+) -> "int | None":
+    """Dispatch pending goal verification jobs. Runs in the maintenance tier."""
+    from app.database import get_pending_goal_verification_jobs, update_goal_verification_job, get_llm
+
+    pending = get_pending_goal_verification_jobs(limit=3)
+    for job in pending:
+        if not job.llm_id:
+            continue
+
+        job_key = f"goal-verify-{job.id}"
+        with _active_sessions_lock:
+            if job_key in _active_sessions and _active_sessions[job_key].is_alive():
+                continue
+
+        llm = get_llm(job.llm_id)
+        if not llm:
+            continue
+
+        if allowed_llm_id is not None and llm.id != allowed_llm_id:
+            continue
+        if allowed_llm_id is None:
+            allowed_llm_id = llm.id
+
+        if not _check_and_reserve_slot(
+            llm, node_active_counts, node_session_counts, node_obj_cache, llm_node_cache,
+            label=job_key,
+        ):
+            continue
+
+        update_goal_verification_job(job.id, status="running")
+
+        thread = threading.Thread(
+            target=_run_goal_verification_job,
+            args=(job, llm),
+            daemon=True,
+            name=f"maestro-goal-verify-{job.id}",
+        )
+        with _active_sessions_lock:
+            _active_sessions[job_key] = thread
+            _session_llm_ids[job_key] = llm.id
+            _session_titles[job_key] = f"Goal Verify: goal {job.goal_id}"
+        thread.start()
+
+    return allowed_llm_id
+
+
+def _run_goal_verification_job(job: Any, llm: Any) -> None:
+    """Worker thread for a single goal verification job."""
+    from app.database import update_goal_verification_job
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    job_key = f"goal-verify-{job.id}"
+    try:
+        from app.agent.goal_verifier import run_goal_verification
+        result = loop.run_until_complete(run_goal_verification(
+            job_id=job.goal_id,
+            llm_id=job.llm_id,
+            budget_id=job.budget_id,
+        ))
+        update_goal_verification_job(
+            job.id,
+            status="done",
+            result=result.get("verdict"),
+            prompt_tokens=result.get("prompt_tokens", 0),
+            completion_tokens=result.get("completion_tokens", 0),
+        )
+        logger.debug("[goal_verify] job %d completed (goal=%d).", job.id, job.goal_id)
+    except ShutdownError:
+        logger.info("[goal_verify] job %d aborted due to server shutdown.", job.id)
+        update_goal_verification_job(job.id, status="failed", error_msg="Server shutdown")
+    except Exception as exc:
+        logger.exception("[goal_verify] job %d failed.", job.id)
+        update_goal_verification_job(job.id, status="failed", error_msg=str(exc))
+    finally:
+        with _llm_counts_lock:
+            _llm_session_counts[llm.id] = max(0, _llm_session_counts[llm.id] - 1)
+        with _active_sessions_lock:
+            _active_sessions.pop(job_key, None)
+            _session_llm_ids.pop(job_key, None)
+            _session_titles.pop(job_key, None)
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
 def _dispatch_arch_gen_jobs(
     allowed_llm_id: "int | None",
     node_active_counts: "dict[int, int]",
     node_session_counts: "dict[int, int]",
     node_obj_cache: "dict[int, Any]",
     llm_node_cache: "dict[int, int | None]",
-) -> None:
-    """Dispatch pending arch gen jobs - fire-and-forget card generation from file summaries.
+    only_tier: "int | None" = None,
+) -> "int | None":
+    """Dispatch pending arch gen jobs.
 
-    Lower priority than research (1.0 vs 0.0).  Respects the one-LLM-at-a-time
-    policy and full node/LLM capacity caps.
+    If *only_tier* is given, only dispatch jobs whose tier matches that value.
+    Respects the one-LLM-at-a-time policy and full node/LLM capacity caps.
+    Returns the (possibly updated) allowed_llm_id.
     """
     from app.database import get_pending_arch_gen_jobs, update_arch_gen_job, get_llm
 
     pending = get_pending_arch_gen_jobs(limit=5)
     for job in pending:
         if not job.llm_id:
+            continue
+
+        # Tier filter: skip jobs that don't match the requested tier
+        if only_tier is not None and getattr(job, "tier", 2) != only_tier:
             continue
 
         # Throttling: Skip projects with recent failures/rescues
@@ -2312,6 +2454,8 @@ def _dispatch_arch_gen_jobs(
         # One-LLM-at-a-time gate
         if allowed_llm_id is not None and llm.id != allowed_llm_id:
             continue
+        if allowed_llm_id is None:
+            allowed_llm_id = llm.id
 
         if not _check_and_reserve_slot(
             llm, node_active_counts, node_session_counts, node_obj_cache, llm_node_cache,
@@ -2333,6 +2477,8 @@ def _dispatch_arch_gen_jobs(
             _session_titles[job_key] = f"Arch Gen: {job.project} ({job.category})"
         thread.start()
 
+    return allowed_llm_id
+
 
 def _dispatch_scope_survey_jobs(
     allowed_llm_id: "int | None",
@@ -2340,8 +2486,10 @@ def _dispatch_scope_survey_jobs(
     node_session_counts: "dict[int, int]",
     node_obj_cache: "dict[int, Any]",
     llm_node_cache: "dict[int, int | None]",
-) -> None:
-    """Dispatch pending ScopeSurveyJobs. Runs after arch gen jobs."""
+) -> "int | None":
+    """Dispatch pending ScopeSurveyJobs. Runs in the maintenance tier.
+    Returns the (possibly updated) allowed_llm_id.
+    """
     from app.database import get_pending_scope_survey_jobs, get_llm, update_scope_survey_job
     from app.agent.config import SURVEY_MAX_CONCURRENT_JOBS
 
@@ -2362,6 +2510,8 @@ def _dispatch_scope_survey_jobs(
         # One-LLM-at-a-time gate
         if allowed_llm_id is not None and llm.id != allowed_llm_id:
             continue
+        if allowed_llm_id is None:
+            allowed_llm_id = llm.id
 
         if not _check_and_reserve_slot(
             llm, node_active_counts, node_session_counts, node_obj_cache, llm_node_cache,
@@ -2382,6 +2532,8 @@ def _dispatch_scope_survey_jobs(
             _session_llm_ids[job_key] = llm.id
             _session_titles[job_key] = f"Survey: {job.project_name} ({job.scope_key})"
         thread.start()
+
+    return allowed_llm_id
 
 
 def _run_scope_survey_job(job: Any, llm: Any) -> None:
@@ -2916,7 +3068,7 @@ def _dispatch_pip_resolution_jobs(
     node_session_counts: "dict[int, int]",
     node_obj_cache: "dict[int, Any]",
     llm_node_cache: "dict[int, int | None]",
-) -> None:
+) -> "int | None":
     """Dispatch pending PIP resolution jobs through research → resolution pipeline.
 
     Job lifecycle:
@@ -2942,6 +3094,8 @@ def _dispatch_pip_resolution_jobs(
 
         if allowed_llm_id is not None and llm.id != allowed_llm_id:
             continue
+        if allowed_llm_id is None:
+            allowed_llm_id = llm.id
 
         if job.status == "pending":
             job_key = f"pip-research-{job.pip_id}"
@@ -3016,6 +3170,8 @@ def _dispatch_pip_resolution_jobs(
                 "[pip_resolution] Resolution agent complete for pip %d (task '%s').",
                 job.pip_id, job.task_id,
             )
+
+    return allowed_llm_id
 
 
 def _run_pip_resolution_research(job: Any, task: Any, llm: Any) -> None:
@@ -5375,4 +5531,6 @@ def _task_to_mini_dict(task: Any) -> dict:
         "parent_task_id": getattr(task, "parent_task_id", None),
         "last_progress_at": getattr(task, "last_progress_at", None),
         "is_starred": bool(getattr(task, "is_starred", False)),
+        "owner": getattr(task, "owner", "user") or "user",
+        "subdivision_generation": getattr(task, "subdivision_generation", 0) or 0,
     }

@@ -259,7 +259,7 @@ def update_existing_task(task_id: str, task_data: dict):
         raise HTTPException(status_code=404, detail="Task not found")
 
     # Only allow updating specific fields
-    allowed_fields = ['title', 'description', 'owner', 'tags', 'content', 'llm_id', 'budget_id', 'type', 'prerequisites', 'map_x', 'map_y', 'review_notes', 'stage_key', 'pipeline_template_id']
+    allowed_fields = ['title', 'description', 'owner', 'tags', 'content', 'llm_id', 'budget_id', 'type', 'prerequisites', 'map_x', 'map_y', 'review_notes', 'stage_key', 'pipeline_template_id', 'goal_id']
     update_data = {key: value for key, value in task_data.items() if key in allowed_fields}
 
     # Gate: advancing a task requires description, llm_id, and budget_id
@@ -3946,7 +3946,7 @@ def populate_arch(project_name: str):
         )
 
     for category in to_queue:
-        create_arch_gen_job(project_name, category, llm_id=llm_id, budget_id=budget_id)
+        create_arch_gen_job(project_name, category, llm_id=llm_id, budget_id=budget_id, tier=0)
 
     logger.info(
         "populate-arch: queued %d arch_gen_jobs for project '%s': %s",
@@ -4946,36 +4946,54 @@ async def generate_pipeline_field(body: dict = Body(...)):
         f'no explanation, no markdown fencing.'
     )
 
+    import asyncio as _asyncio
     import httpx
+    from uuid import uuid4 as _uuid4
+    from app.agent.scheduler import wait_and_register_pipeline_session, unregister_pipeline_session
+
+    session_key = f"generate-field-{_uuid4().hex[:8]}"
+
+    # Wait for a free slot (tier 0 — highest priority).  Block the async event loop
+    # on a thread so we don't hold the GIL.  No timeout: the user asked us to
+    # wait for the current session to finish rather than erroring out.
+    registered = await _asyncio.to_thread(
+        wait_and_register_pipeline_session,
+        session_key, llm.id, 3.0, 600.0,
+    )
+    if not registered:
+        raise HTTPException(status_code=503, detail="LLM slot unavailable after waiting — try again shortly")
 
     async def _stream():
-        payload = {
-            "model": llm_model,
-            "stream": True,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Generate the {field} field."},
-            ],
-            "max_tokens": 1024,
-        }
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            try:
-                async with client.stream("POST", f"{llm_base_url}/chat/completions", json=payload) as resp:
-                    async for line in resp.aiter_lines():
-                        if line.startswith("data: "):
-                            chunk = line[6:]
-                            if chunk == "[DONE]":
-                                break
-                            try:
-                                data = json.loads(chunk)
-                                token = (data.get("choices") or [{}])[0].get("delta", {}).get("content") or ""
-                                if token:
-                                    yield token
-                            except (json.JSONDecodeError, KeyError):
-                                pass
-            except Exception as exc:
-                logger.warning("[generate-field] LLM stream failed: %s", exc)
-                yield ""
+        try:
+            payload = {
+                "model": llm_model,
+                "stream": True,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Generate the {field} field."},
+                ],
+                "max_tokens": 1024,
+            }
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                try:
+                    async with client.stream("POST", f"{llm_base_url}/chat/completions", json=payload) as resp:
+                        async for line in resp.aiter_lines():
+                            if line.startswith("data: "):
+                                chunk = line[6:]
+                                if chunk == "[DONE]":
+                                    break
+                                try:
+                                    data = json.loads(chunk)
+                                    token = (data.get("choices") or [{}])[0].get("delta", {}).get("content") or ""
+                                    if token:
+                                        yield token
+                                except (json.JSONDecodeError, KeyError):
+                                    pass
+                except Exception as exc:
+                    logger.warning("[generate-field] LLM stream failed: %s", exc)
+                    yield ""
+        finally:
+            unregister_pipeline_session(session_key, llm.id)
 
     return StreamingResponse(_stream(), media_type="text/plain")
 
@@ -5511,6 +5529,7 @@ def assign_pipeline_to_project(project_name: str, data: dict = Body(...)):
 
 # Hardcoded fallback arch categories (used when the project has no template assigned)
 _DEFAULT_ARCH_CATEGORIES = [
+    {"key": "Goals",         "label": "Goals",         "color": "#f59e0b", "position": -1},
     {"key": "Platform",      "label": "Platform",      "color": "#17a2b8", "position": 0},
     {"key": "Design",        "label": "Design",        "color": "#a78bfa", "position": 1},
     {"key": "Testing",       "label": "Testing",       "color": "#20c997", "position": 2},
@@ -6717,6 +6736,177 @@ def delete_decision(decision_id: int):
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
         db.close()
+
+
+# ===========================================================================
+# Goals API
+# ===========================================================================
+
+class GoalCreate(BaseModel):
+    title: str
+    statement: str
+    criteria: Optional[List[dict]] = None
+    parent_id: Optional[int] = None
+    priority: int = 1
+    color: Optional[str] = None
+    created_by: str = "human"
+
+
+class GoalUpdate(BaseModel):
+    title: Optional[str] = None
+    statement: Optional[str] = None
+    criteria: Optional[List[dict]] = None
+    status: Optional[str] = None
+    priority: Optional[int] = None
+    color: Optional[str] = None
+
+
+@app.post("/api/projects/{project_name}/goals", response_model=dict)
+def create_project_goal(project_name: str, data: GoalCreate):
+    """Create a goal and auto-generate its arch card."""
+    from app.database import create_goal, update_goal, create_task, get_project, goal_to_dict
+
+    project = get_project(project_name)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    goal = create_goal(
+        project_id=project.id,
+        title=data.title,
+        statement=data.statement,
+        criteria=data.criteria,
+        parent_id=data.parent_id,
+        priority=data.priority,
+        color=data.color,
+        created_by=data.created_by,
+    )
+    if not goal:
+        raise HTTPException(status_code=500, detail="Failed to create goal")
+
+    # Auto-create arch card
+    progress_pct = 0
+    arch_card = create_task(
+        title=data.title,
+        task_type="architecture",
+        description=(
+            f"**Status:** active | **Progress:** {progress_pct}% | **Verdict:** —\n\n"
+            f"{data.statement}\n\n"
+            f"**Criteria:** 0/{len(data.criteria or [])} met"
+        ),
+        project=project_name,
+        content={"category": "Goals", "goal_id": goal.id, "priority": "high"},
+        pipeline_template_id=None,
+    )
+    if arch_card:
+        update_goal(goal.id, arch_card_id=arch_card.id)
+        goal.arch_card_id = arch_card.id
+
+    return goal_to_dict(goal)
+
+
+@app.get("/api/projects/{project_name}/goals", response_model=List[dict])
+def list_project_goals(project_name: str, include_inactive: bool = False):
+    """List goals for a project."""
+    from app.database import get_goals_for_project, get_active_goals_for_project, goal_to_dict
+    goals = get_goals_for_project(project_name) if include_inactive else get_active_goals_for_project(project_name)
+    return [goal_to_dict(g) for g in goals]
+
+
+@app.get("/api/projects/{project_name}/goals/{goal_id}", response_model=dict)
+def get_project_goal(project_name: str, goal_id: int):
+    """Get a single goal with verification job history."""
+    from app.database import get_goal, get_verification_jobs_for_goal, goal_to_dict
+    goal = get_goal(goal_id)
+    if not goal:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    d = goal_to_dict(goal)
+    jobs = get_verification_jobs_for_goal(goal_id, limit=10)
+    d["verification_jobs"] = [
+        {
+            "id": j.id,
+            "status": j.status,
+            "triggered_by": j.triggered_by,
+            "result": j.result,
+            "created_at": j.created_at.isoformat() if j.created_at else None,
+            "completed_at": j.completed_at.isoformat() if j.completed_at else None,
+        }
+        for j in jobs
+    ]
+    return d
+
+
+@app.put("/api/projects/{project_name}/goals/{goal_id}", response_model=dict)
+def update_project_goal(project_name: str, goal_id: int, data: GoalUpdate):
+    """Update a goal's fields."""
+    from app.database import update_goal, goal_to_dict
+    updates = {k: v for k, v in data.dict().items() if v is not None}
+    goal = update_goal(goal_id, **updates)
+    if not goal:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    return goal_to_dict(goal)
+
+
+@app.delete("/api/projects/{project_name}/goals/{goal_id}")
+def delete_project_goal(project_name: str, goal_id: int):
+    """Soft-delete a goal by setting status='abandoned'."""
+    from app.database import update_goal
+    goal = update_goal(goal_id, status="abandoned")
+    if not goal:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    return {"status": "abandoned", "id": goal_id}
+
+
+@app.post("/api/projects/{project_name}/goals/{goal_id}/verify", response_model=dict)
+def trigger_goal_verification(project_name: str, goal_id: int):
+    """Queue a manual goal verification job."""
+    from app.database import get_goal, create_goal_verification_job, get_project
+    goal = get_goal(goal_id)
+    if not goal:
+        raise HTTPException(status_code=404, detail="Goal not found")
+
+    project = get_project(goal.project_id)
+    llm_id = goal.llm_id
+    budget_id = project.budget_id if project else None
+
+    if not llm_id:
+        # Fall back to project's LLM
+        if project and project.llm_id:
+            llm_id = project.llm_id
+
+    if not llm_id:
+        raise HTTPException(status_code=422, detail="Goal or project must have an LLM configured to run verification")
+
+    job = create_goal_verification_job(
+        goal_id,
+        triggered_by="manual",
+        llm_id=llm_id,
+        budget_id=budget_id,
+        tier=0,  # human-initiated = highest priority
+    )
+    if not job:
+        raise HTTPException(status_code=500, detail="Failed to queue verification job")
+    return {"job_id": job.id, "status": "pending"}
+
+
+@app.get("/api/projects/{project_name}/goals/{goal_id}/jobs", response_model=List[dict])
+def list_goal_verification_jobs(project_name: str, goal_id: int):
+    """List verification job history for a goal."""
+    from app.database import get_verification_jobs_for_goal
+    jobs = get_verification_jobs_for_goal(goal_id, limit=20)
+    return [
+        {
+            "id": j.id,
+            "status": j.status,
+            "triggered_by": j.triggered_by,
+            "result": j.result,
+            "error_msg": j.error_msg,
+            "prompt_tokens": j.prompt_tokens,
+            "completion_tokens": j.completion_tokens,
+            "created_at": j.created_at.isoformat() if j.created_at else None,
+            "completed_at": j.completed_at.isoformat() if j.completed_at else None,
+        }
+        for j in jobs
+    ]
 
 
 class ResumeRequest(BaseModel):

@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def create_research_job(task_id, question, context=None, priority=0.0, depth=0,
-                        llm_id=None, budget_id=None, parent_job_id=None):
+                        llm_id=None, budget_id=None, parent_job_id=None, tier=2):
     """Create a new research job record."""
     db = SessionLocal()
     try:
@@ -40,6 +40,7 @@ def create_research_job(task_id, question, context=None, priority=0.0, depth=0,
             llm_id=llm_id,
             budget_id=budget_id,
             parent_job_id=parent_job_id,
+            tier=tier,
         )
         db.add(job)
         db.commit()
@@ -76,7 +77,7 @@ def get_pending_research_jobs(limit=10):
             db.query(ResearchJob)
             .join(Task, ResearchJob.task_id == Task.id)
             .filter(ResearchJob.status == 'pending', Task.is_active == True)
-            .order_by(ResearchJob.priority, ResearchJob.created_at)
+            .order_by(ResearchJob.tier, ResearchJob.priority, ResearchJob.created_at)
             .limit(limit)
             .all()
         )
@@ -241,7 +242,7 @@ def get_pending_file_summary_jobs(limit: int = 20) -> "list[FileSummaryJob]":
                 FileSummaryJob.status == 'pending',
                 or_(FileSummaryJob.task_id == None, Task.is_active == True)
             )
-            .order_by(FileSummaryJob.priority.asc(), FileSummaryJob.created_at.asc())
+            .order_by(FileSummaryJob.tier.asc(), FileSummaryJob.priority.asc(), FileSummaryJob.created_at.asc())
             .limit(limit)
             .all()
         )
@@ -337,7 +338,7 @@ def get_retriable_file_summary_jobs(
                     FileSummaryJob.status == 'running',
                 )
             )
-            .order_by(FileSummaryJob.priority.asc(), FileSummaryJob.created_at.asc())
+            .order_by(FileSummaryJob.tier.asc(), FileSummaryJob.priority.asc(), FileSummaryJob.created_at.asc())
             .limit(limit)
             .all()
         )
@@ -440,6 +441,7 @@ def create_arch_gen_job(
     llm_id: "int | None" = None,
     budget_id: "int | None" = None,
     priority: float = 1.0,
+    tier: int = 2,
 ) -> "ArchGenJob | None":
     """Insert a new pending arch gen job."""
     db = SessionLocal()
@@ -451,6 +453,7 @@ def create_arch_gen_job(
             llm_id=llm_id,
             budget_id=budget_id,
             priority=priority,
+            tier=tier,
         )
         db.add(job)
         db.commit()
@@ -475,7 +478,7 @@ def get_pending_arch_gen_jobs(limit: int = 10) -> "list[ArchGenJob]":
             db.query(ArchGenJob)
             .join(Project, ArchGenJob.project_id == Project.id)
             .filter(ArchGenJob.status == 'pending')
-            .order_by(ArchGenJob.priority.asc(), ArchGenJob.created_at.asc())
+            .order_by(ArchGenJob.tier.asc(), ArchGenJob.priority.asc(), ArchGenJob.created_at.asc())
             .limit(limit)
             .all()
         )

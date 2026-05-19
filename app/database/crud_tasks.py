@@ -1081,6 +1081,7 @@ def task_to_dict(task):
         "is_active": bool(getattr(task, "is_active", True)),
         "clarification_status": getattr(task, "clarification_status", "none") or "none",
         "description_original": getattr(task, "description_original", None),
+        "goal_id": getattr(task, "goal_id", None),
         "created_at": task.created_at.isoformat() if task.created_at else None,
         "updated_at": task.updated_at.isoformat() if task.updated_at else None,
         "pips": [

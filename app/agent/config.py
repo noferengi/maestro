@@ -160,24 +160,21 @@ MAESTRO_GIT_ROOT: str | None = _resolve_git_root(PROJECT_ROOT)
 
 USE_POSTGRES: bool = _getbool("database", "use_postgres", "MAESTRO_USE_POSTGRES", False)
 
-# Default SQLite path
-_DB_PATH_DEFAULT = os.path.join(PROJECT_ROOT, "data", "kanban.db")
+if not USE_POSTGRES:
+    raise RuntimeError(
+        "SQLite is no longer supported. "
+        "Set MAESTRO_USE_POSTGRES=true and MAESTRO_DATABASE_URL in .env."
+    )
 
-if USE_POSTGRES:
-    # When using Postgres, we expect URLs to be provided (usually in .env)
-    DATABASE_URL: str = _get("database", "url", "MAESTRO_DATABASE_URL", "postgresql://localhost/maestro_db")
-    ADMIN_DATABASE_URL: str = _get("database", "admin_url", "MAESTRO_ADMIN_DATABASE_URL", DATABASE_URL)
-else:
-    # SQLite is only allowed when MAESTRO_TEST_DB is set (test suite).
-    # session.py enforces this at engine-creation time; config.py sets the URL
-    # so the migration runner can still reference it for test paths.
-    if not os.environ.get("MAESTRO_TEST_DB"):
-        raise RuntimeError(
-            "SQLite is only supported in tests (set MAESTRO_TEST_DB). "
-            "For production set MAESTRO_USE_POSTGRES=true and MAESTRO_DATABASE_URL in .env."
-        )
-    DATABASE_URL = f"sqlite:///{_DB_PATH_DEFAULT}"
-    ADMIN_DATABASE_URL = DATABASE_URL
+# Production database (app user — no DDL privileges)
+DATABASE_URL: str = _get("database", "url", "MAESTRO_DATABASE_URL", "postgresql://localhost/maestro_db")
+# Admin database (DDL privileges — used only by migration runner)
+ADMIN_DATABASE_URL: str = _get("database", "admin_url", "MAESTRO_ADMIN_DATABASE_URL", DATABASE_URL)
+
+# Test database — separate PostgreSQL DB on the same server.
+# Used when MAESTRO_TEST=1 is set (by the test suite).
+TEST_DATABASE_URL: str = os.environ.get("MAESTRO_TEST_DATABASE_URL", "")
+TEST_ADMIN_DATABASE_URL: str = os.environ.get("MAESTRO_TEST_ADMIN_DATABASE_URL", TEST_DATABASE_URL)
 
 # ===========================================================================
 # Agent status values

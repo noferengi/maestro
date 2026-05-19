@@ -22,6 +22,9 @@ let _agentTypes = [];     // [{type_key, display_name, …}]
 // Maps litegraph node.id → DB stage.position (used for back-edge detection)
 let _stagePosMap = {};
 
+// Maps stage_key → LGraph node (populated by buildGraphFromTemplate, used by overlay renderer)
+let _nodeByKey = {};
+
 // Tracks DB transition IDs for the current graph (transition_id → {from_key, to_key, condition})
 let _dbTransitions = {};
 
@@ -244,7 +247,7 @@ class HumanGateNode extends LiteGraph.LGraphNode {
         super();
         this.title = "Human Gate";
         this.addInput("in", "task");
-        this.addOutput("approve", "task");
+        this.addOutput("pass", "task");
         this.addOutput("reject", "task");
         this.properties = { autopilot_hours: 0 };
         this.color = "#be185d"; this.bgcolor = "#500724";
@@ -390,8 +393,9 @@ function buildGraphFromTemplate(data) {
     // --- create nodes for each stage ---
     const stages = (data.stages || []).sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
     stages.forEach((stage, idx) => {
-        const isFactory = stage.agent_type === "factory_node";
-        const nodeType  = isFactory ? "maestro/factory" : "maestro/stage";
+        const isFactory   = stage.agent_type === "factory_node";
+        const isHumanGate = stage.agent_type === "human_gate";
+        const nodeType    = isFactory ? "maestro/factory" : isHumanGate ? "maestro/human_gate" : "maestro/stage";
         const node      = LiteGraph.createNode(nodeType);
         const x = 80 + idx * 280;
         const y = 200 + (idx % 2) * 120;
@@ -426,7 +430,7 @@ function buildGraphFromTemplate(data) {
                 stage_key:            stage.stage_key,
                 label:                stage.label || stage.stage_key,
                 agent_type:           stage.agent_type || "planning_agent",
-                color:                stage.color || "#1e40af",
+                color:                stage.color || (isHumanGate ? "#be185d" : "#1e40af"),
                 intent:               cfg.intent || "",
                 system_prompt:        cfg.system_prompt || "",
                 gate_type:            cfg.gate_type || "llm_judge",
@@ -440,7 +444,7 @@ function buildGraphFromTemplate(data) {
             };
         }
 
-        node.color   = node.properties.color || (isFactory ? "#065f46" : "#1e40af");
+        node.color   = node.properties.color || (isFactory ? "#065f46" : isHumanGate ? "#be185d" : "#1e40af");
         node.bgcolor = _darken(node.color);
 
         _graph.add(node);
@@ -449,6 +453,10 @@ function buildGraphFromTemplate(data) {
     });
 
     // --- connect transitions ---
+    // Forward edges (pass from lower→higher stage position) become LiteGraph wires.
+    // Back-edges (fail/reject from higher→lower) are stored as node annotations —
+    // they show as amber text inside the target node rather than extra input slots,
+    // because multiple inputs imply "AND" semantics but pipeline stages use "OR".
     const transitions = data.transitions || [];
     transitions.forEach(t => {
         const fromNode = nodeByKey[t.from_stage_key];
@@ -462,6 +470,21 @@ function buildGraphFromTemplate(data) {
             fromNode.addOutput(t.condition, "task");
         }
 
+        const fromPos = _stagePosMap[fromNode.id] ?? 0;
+        const toPos   = _stagePosMap[toNode.id] ?? 0;
+
+        if (fromPos > toPos) {
+            // Back-edge: annotate the target node; no LiteGraph wire
+            if (!toNode._backSources) toNode._backSources = [];
+            toNode._backSources.push({
+                from_key: t.from_stage_key, to_key: t.to_stage_key,
+                condition: t.condition, db_id: t.id,
+            });
+            _dbTransitions[t.id] = { from_key: t.from_stage_key, to_key: t.to_stage_key, condition: t.condition };
+            return;
+        }
+
+        // Forward edge: connect to the single "in" slot
         fromNode.connect(slotIdx, toNode, 0);
 
         // Record DB ID so we can delete by ID on save
@@ -472,8 +495,106 @@ function buildGraphFromTemplate(data) {
         }
     });
 
+    _nodeByKey = nodeByKey;
+    _annotateBackEdges(nodeByKey);
     classifyBackEdges();
     _canvas.setDirty(true, true);
+}
+
+function _annotateBackEdges(nodeByKey) {
+    const LINE_H = 14, PAD = 5;
+    for (const node of Object.values(nodeByKey)) {
+        const props = node.properties || {};
+        const inKeys  = (props.required_input_keys || "").trim();
+        const outKeys = (props.output_keys || "").trim();
+        const lines   = [];
+        if (inKeys)  lines.push(`in:  ${inKeys}`);
+        if (outKeys) lines.push(`out: ${outKeys}`);
+        if (!lines.length) continue;
+
+        const extraH = lines.length * LINE_H + PAD * 2 + 6;
+        node.size[1] += extraH;
+        node._backAnnotationLines = lines;
+        node._backAnnotationH = extraH;
+
+        node.onDrawForeground = function(ctx) {
+            if (!this._backAnnotationLines?.length) return;
+            const sepY = this.size[1] - this._backAnnotationH + 3;
+            ctx.save();
+            ctx.strokeStyle = "rgba(245,158,11,0.35)";
+            ctx.lineWidth = 1;
+            ctx.setLineDash([3, 3]);
+            ctx.beginPath();
+            ctx.moveTo(4, sepY); ctx.lineTo(this.size[0] - 4, sepY);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.font = "10px monospace";
+            ctx.fillStyle = "#f59e0b";
+            this._backAnnotationLines.forEach((line, i) => {
+                ctx.fillText(line, 6, sepY + PAD + i * LINE_H + 9);
+            });
+            ctx.restore();
+        };
+    }
+}
+
+function drawBackEdgeOverlays(ctx) {
+    if (!_graph) return;
+    const TH = LiteGraph.NODE_TITLE_HEIGHT || 20;
+    ctx.save();
+    ctx.strokeStyle = "rgba(245,158,11,0.7)";
+    ctx.lineWidth   = 1.5;
+    ctx.lineJoin    = "round";
+    ctx.lineCap     = "round";
+
+    for (const node of _graph._nodes) {
+        if (!node._backSources?.length) continue;
+        const tx = node.pos[0];
+        const ty = node.pos[1];
+        const th = node.size[1];
+
+        for (const be of node._backSources) {
+            const src = _nodeByKey[be.from_key];
+            if (!src) continue;
+            const sx = src.pos[0];
+            const sy = src.pos[1];
+            const sh = src.size[1];
+            const sw = src.size[0];
+
+            // Start: right edge of source node at output-slot height
+            const startX = sx + sw;
+            const startY = sy + TH + 12;
+            // End: left edge of target node at input-slot height
+            const endX = tx;
+            const endY = ty + TH + 12;
+
+            // Control points arc below both nodes
+            const belowY = Math.max(sy + sh, ty + th) + 38;
+            const cp1x = startX + 48;
+            const cp1y = belowY;
+            const cp2x = endX - 48;
+            const cp2y = belowY;
+
+            ctx.setLineDash([6, 4]);
+            ctx.beginPath();
+            ctx.moveTo(startX, startY);
+            ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, endX, endY);
+            ctx.stroke();
+
+            // Arrowhead at target
+            const angle = Math.atan2(endY - cp2y, endX - cp2x);
+            const AL = 9;
+            ctx.setLineDash([]);
+            ctx.beginPath();
+            ctx.moveTo(endX, endY);
+            ctx.lineTo(endX - AL * Math.cos(angle - 0.38), endY - AL * Math.sin(angle - 0.38));
+            ctx.moveTo(endX, endY);
+            ctx.lineTo(endX - AL * Math.cos(angle + 0.38), endY - AL * Math.sin(angle + 0.38));
+            ctx.stroke();
+        }
+    }
+
+    ctx.restore();
 }
 
 function _lastCreatedLink(node, slotIdx) {
@@ -587,7 +708,7 @@ async function saveGraph() {
             const fromNode = nodeById[link.origin_id];
             const toNode   = nodeById[link.target_id];
             if (!fromNode || !toNode) continue;
-            const validTypes = new Set(["maestro/stage", "maestro/factory"]);
+            const validTypes = new Set(["maestro/stage", "maestro/factory", "maestro/human_gate"]);
             if (!validTypes.has(fromNode.type) || !validTypes.has(toNode.type)) continue;
 
             const condition = fromNode.outputs?.[link.origin_slot]?.name || "pass";
@@ -599,6 +720,19 @@ async function saveGraph() {
                 condition,
                 priority,
             });
+        }
+
+        // Save back-edges stored as node annotations (not LiteGraph links)
+        for (const n of _graph._nodes) {
+            if (!n._backSources?.length) continue;
+            for (const be of n._backSources) {
+                await apiPost(`/pipelines/${_templateId}/transitions`, {
+                    from_stage_key: be.from_key,
+                    to_stage_key:   be.to_key,
+                    condition:      be.condition,
+                    priority:       10,
+                });
+            }
         }
 
         // Re-classify back edges after save
@@ -1342,6 +1476,9 @@ document.addEventListener("DOMContentLoaded", async function () {
 
     // Patch rendering
     patchLinkRendering();
+
+    // Draw back-edge overlay arrows above all LiteGraph content
+    _canvas.onDrawForeground = function(ctx) { drawBackEdgeOverlays(ctx); };
 
     // Wire up events
     setupEvents();

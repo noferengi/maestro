@@ -5,7 +5,6 @@ Tests for research job CRUD, MaestroLoop NEEDS_RESEARCH handler, and scheduler d
 from __future__ import annotations
 
 import json
-import os
 import pytest
 
 
@@ -13,34 +12,15 @@ import pytest
 # Research job CRUD
 # ---------------------------------------------------------------------------
 
-def test_create_and_get_research_job(tmp_path, monkeypatch):
+def test_create_and_get_research_job():
     """create_research_job + get_research_job round-trip."""
-    db_path = str(tmp_path / "test.db")
-    monkeypatch.setenv("MAESTRO_TEST_DB", db_path)
-
-    # Re-import with patched env
-    import importlib
     import app.database as db_mod
-    importlib.reload(db_mod)
 
-    # Need at least the tables - create them
-    from migrations.runner import migrate as run_migrate, ConnectionWrapper
-    with db_mod.engine.begin() as _conn:
-        run_migrate(ConnectionWrapper(_conn, is_postgres=False))
-
-    # Create a minimal task row first (FK)
-    from datetime import datetime
-    task = db_mod.Task(
-        id="task-test-1",
-        title="Test",
-        type="idea",
-        project="TestProj",
-        history=[],
-    )
-    session = db_mod.SessionLocal()
-    session.add(task)
-    session.commit()
-    session.close()
+    db = db_mod.SessionLocal()
+    task = db_mod.Task(id="task-test-1", title="Test", type="idea", project="TestProj", history=[])
+    db.add(task)
+    db.commit()
+    db.close()
 
     job = db_mod.create_research_job(
         task_id="task-test-1",
@@ -60,23 +40,15 @@ def test_create_and_get_research_job(tmp_path, monkeypatch):
     assert fetched.id == job.id
 
 
-def test_get_pending_research_jobs_ordering(tmp_path, monkeypatch):
+def test_get_pending_research_jobs_ordering():
     """Pending jobs are returned ordered by priority ASC, created_at ASC."""
-    db_path = str(tmp_path / "test2.db")
-    monkeypatch.setenv("MAESTRO_TEST_DB", db_path)
-
-    import importlib
     import app.database as db_mod
-    importlib.reload(db_mod)
-    from migrations.runner import migrate as run_migrate, ConnectionWrapper
-    with db_mod.engine.begin() as _conn:
-        run_migrate(ConnectionWrapper(_conn, is_postgres=False))
 
-    session = db_mod.SessionLocal()
+    db = db_mod.SessionLocal()
     task = db_mod.Task(id="task-ord", title="T", type="idea", project="P", history=[])
-    session.add(task)
-    session.commit()
-    session.close()
+    db.add(task)
+    db.commit()
+    db.close()
 
     db_mod.create_research_job(task_id="task-ord", question="q3", priority=10.0, depth=0)
     db_mod.create_research_job(task_id="task-ord", question="q1", priority=1.0, depth=0)
@@ -87,23 +59,15 @@ def test_get_pending_research_jobs_ordering(tmp_path, monkeypatch):
     assert priorities == sorted(priorities)
 
 
-def test_update_research_job(tmp_path, monkeypatch):
+def test_update_research_job():
     """update_research_job persists changes and sets completed_at on terminal status."""
-    db_path = str(tmp_path / "test3.db")
-    monkeypatch.setenv("MAESTRO_TEST_DB", db_path)
-
-    import importlib
     import app.database as db_mod
-    importlib.reload(db_mod)
-    from migrations.runner import migrate as run_migrate, ConnectionWrapper
-    with db_mod.engine.begin() as _conn:
-        run_migrate(ConnectionWrapper(_conn, is_postgres=False))
 
-    session = db_mod.SessionLocal()
+    db = db_mod.SessionLocal()
     task = db_mod.Task(id="task-upd", title="T", type="idea", project="P", history=[])
-    session.add(task)
-    session.commit()
-    session.close()
+    db.add(task)
+    db.commit()
+    db.close()
 
     job = db_mod.create_research_job(task_id="task-upd", question="q", priority=0.0)
     db_mod.update_research_job(job.id, status="running")
@@ -118,22 +82,14 @@ def test_update_research_job(tmp_path, monkeypatch):
     assert completed.completed_at is not None
 
 
-def test_count_pending_research_jobs(tmp_path, monkeypatch):
-    db_path = str(tmp_path / "test4.db")
-    monkeypatch.setenv("MAESTRO_TEST_DB", db_path)
-
-    import importlib
+def test_count_pending_research_jobs():
     import app.database as db_mod
-    importlib.reload(db_mod)
-    from migrations.runner import migrate as run_migrate, ConnectionWrapper
-    with db_mod.engine.begin() as _conn:
-        run_migrate(ConnectionWrapper(_conn, is_postgres=False))
 
-    session = db_mod.SessionLocal()
+    db = db_mod.SessionLocal()
     task = db_mod.Task(id="task-cnt", title="T", type="idea", project="P", history=[])
-    session.add(task)
-    session.commit()
-    session.close()
+    db.add(task)
+    db.commit()
+    db.close()
 
     assert db_mod.count_pending_research_jobs() == 0
 

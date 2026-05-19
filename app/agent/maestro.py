@@ -563,6 +563,14 @@ class MaestroAgent:
             "provide a steering hint, or trigger infrastructure remediation?\n"
             "3. Use your tools to ACT. You can advance tasks, add history notes, "
             "cleanup worktrees, or even restart the server if the logs show catastrophe.\n\n"
+            "PIPELINE SELF-REPAIR:\n"
+            "You have full access to pipeline management tools. If a stage is systematically "
+            "failing (repeated demotions, finish_reason=length, tool errors), you can:\n"
+            "  a) list_pipelines / get_pipeline — inspect the current pipeline\n"
+            "  b) clone_pipeline — create a safe editable copy\n"
+            "  c) update_pipeline_stage — fix system_prompt, tool_allowlist, agent_type, or retries\n"
+            "  d) assign_project_pipeline — switch the project to the repaired pipeline\n"
+            "Use read_log_window and get_budget_history FIRST to diagnose root causes before editing.\n\n"
             "To submit your plan, call the submit_work tool with:\n"
             "payload={\n"
             "  \"tasks_to_resurrect\": [{\"task_id\": \"...\", \"new_title\": \"...\", \"new_description\": \"...\", \"reentry_stage\": \"idea|planning|indev\"}],\n"
@@ -602,7 +610,10 @@ class MaestroAgent:
         maestro_tools = [
             "list_tasks", "get_task", "write_task_status", "write_task_history",
             "get_system_health", "cleanup_ghost_worktrees", "restart_server",
-            "spawn_research_agent", "submit_work"
+            "read_log_window", "get_budget_history",
+            "list_pipelines", "get_pipeline", "clone_pipeline", "update_pipeline",
+            "update_pipeline_stage", "assign_project_pipeline", "transfer_pipeline_cards",
+            "spawn_research_agent", "submit_work",
         ]
         tool_schemas = build_tool_schemas(maestro_tools)
 
@@ -734,7 +745,11 @@ class MaestroAgent:
         ]
         
         # Include submit_work and infra tools in survey context
-        maestro_tools = list(MAESTRO_SURVEY_TOOLS) + ["submit_work", "get_system_health", "cleanup_ghost_worktrees"]
+        maestro_tools = list(MAESTRO_SURVEY_TOOLS) + [
+            "submit_work", "get_system_health", "cleanup_ghost_worktrees",
+            "read_log_window", "get_budget_history",
+            "list_pipelines", "get_pipeline",
+        ]
         tool_schemas = build_tool_schemas(maestro_tools)
         
         # Set context for tools

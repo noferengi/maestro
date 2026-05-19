@@ -14,6 +14,9 @@ project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
+# Signal test mode so session.py uses MAESTRO_TEST_DATABASE_URL.
+os.environ["MAESTRO_TEST"] = "1"
+
 
 @pytest.fixture(scope="session")
 def test_db_path(tmp_path_factory):

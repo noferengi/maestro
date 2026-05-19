@@ -239,8 +239,33 @@ def advance_stage(task_id: str, condition: str, *, from_stage: "str | None" = No
         )
         return False
 
-    from app.database import update_task
+    from app.database import update_task, get_task
     update_task(task_id, type=next_stage, stage_key=next_stage)
+
+    # When a card reaches 'completed', auto-trigger goal verification if linked.
+    if next_stage == "completed":
+        try:
+            task = get_task(task_id)
+            if task and task.goal_id:
+                from app.database import create_goal_verification_job, get_goal
+                goal = get_goal(task.goal_id)
+                if goal and goal.llm_id and goal.status == "active":
+                    from app.database import get_project
+                    proj = get_project(goal.project_id)
+                    budget_id = proj.budget_id if proj else None
+                    create_goal_verification_job(
+                        goal.id,
+                        triggered_by="card_completion",
+                        llm_id=goal.llm_id,
+                        budget_id=budget_id,
+                    )
+                    logger.info(
+                        "[pipeline_router] queued goal verification for goal %d (task %s completed)",
+                        goal.id, task_id,
+                    )
+        except Exception:
+            logger.debug("[pipeline_router] goal auto-trigger skipped", exc_info=True)
+
     return True
 
 

@@ -99,22 +99,16 @@ def get_file_summary_by_path(abs_path: str) -> "FileSummary | None":
 def get_file_summaries_for_project_root(project_root: str) -> "list[FileSummary]":
     """Return all cached summaries whose file_path is under project_root, ordered by path."""
     root = os.path.normpath(os.path.abspath(project_root))
-    # SQLite LIKE is case-insensitive on Windows; use a trailing separator so we
-    # don't accidentally match a sibling directory with the same prefix.
-    prefix = root.replace("\\", "/") + "/"
-    prefix_back = root + "\\"
+    # Normalize to lowercase forward-slashes so PostgreSQL LIKE works correctly:
+    # backslashes are escape chars in PG LIKE, and PG LIKE is case-sensitive.
+    prefix = root.replace("\\", "/").lower() + "/"
     db = SessionLocal()
     try:
-        # Match both slash styles since file_path values may use either separator.
-        from sqlalchemy import or_
+        from sqlalchemy import func
+        normalized = func.lower(func.replace(FileSummary.file_path, "\\", "/"))
         return (
             db.query(FileSummary)
-            .filter(
-                or_(
-                    FileSummary.file_path.like(prefix + "%"),
-                    FileSummary.file_path.like(prefix_back + "%"),
-                )
-            )
+            .filter(normalized.like(prefix + "%"))
             .order_by(FileSummary.file_path)
             .all()
         )

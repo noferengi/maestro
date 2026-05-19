@@ -195,7 +195,7 @@ def list_documents(
         if tag is not None:
             # JSON array containment: tags @> '["tag"]'::jsonb
             q = q.filter(
-                text("tags @> :tag_json::jsonb").bindparams(
+                text("tags @> cast(:tag_json as jsonb)").bindparams(
                     tag_json=json.dumps([tag])
                 )
             )

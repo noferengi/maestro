@@ -153,7 +153,7 @@ def get_pending_scope_survey_jobs(limit: int = 10) -> list[ScopeSurveyJob]:
     with SessionLocal() as db:
         return db.query(ScopeSurveyJob).filter(
             ScopeSurveyJob.status == "pending"
-        ).order_by(ScopeSurveyJob.priority, ScopeSurveyJob.created_at).limit(limit).all()
+        ).order_by(ScopeSurveyJob.tier, ScopeSurveyJob.priority, ScopeSurveyJob.created_at).limit(limit).all()
 
 def update_scope_survey_job(
     job_id: int,

@@ -404,6 +404,23 @@ class MaestroLoop:
                         if d.rationale:
                             pip_block += f"  Rationale: {sanitize_user_content(d.rationale)}\n"
 
+                # Inject active goals so the agent knows the direction to move in
+                try:
+                    from app.database import get_active_goals_for_project
+                    goals = get_active_goals_for_project(_task_rec.project)
+                    if goals:
+                        pip_block += "\n\n### ACTIVE PROJECT GOALS\n"
+                        pip_block += "These goals define the direction this project is moving. Let them guide your implementation choices:\n"
+                        for g in goals:
+                            pip_block += f"\n**{sanitize_user_content(g.title)}** [{g.status}] — {int(g.progress * 100)}% complete\n"
+                            pip_block += f"{sanitize_user_content(g.statement)}\n"
+                            if g.criteria:
+                                crit_texts = [c.get("text", "") for c in g.criteria if c.get("text")]
+                                if crit_texts:
+                                    pip_block += "Criteria: " + "; ".join(sanitize_user_content(t) for t in crit_texts) + "\n"
+                except Exception:
+                    pass  # goal injection is best-effort, never block the agent
+
                 # Inject demotion history so re-entering dev sessions know why they were sent back
                 if _task_rec and _task_rec.demotion_history:
                     recent = _task_rec.demotion_history[-3:]

@@ -54,6 +54,7 @@ if globals().get('_initialized'):
         'app.database.crud_survey', 'app.database.crud_clarification',
         'app.database.crud_settings', 'app.database.crud_malleable',
         'app.database.crud_documents',
+        'app.database.crud_goals',
     ]:  # NOTE: keep this list in sync with the from-imports below
 
         if _sub in _sys.modules:
@@ -115,6 +116,8 @@ from .models import (
     ArchivedFile,
     ProjectSettings,
     CustomAgentDefinition,
+    MaestroGoal,
+    GoalVerificationJob,
 )
 
 # Task CRUD + seeding + helpers
@@ -363,6 +366,21 @@ from .crud_documents import (
     list_documents_written_by_task,
 )
 
+# Goals + verification jobs
+from .crud_goals import (
+    create_goal,
+    get_goal,
+    get_active_goals_for_project,
+    get_goals_for_project,
+    update_goal,
+    append_goal_evidence,
+    goal_to_dict,
+    create_goal_verification_job,
+    get_pending_goal_verification_jobs,
+    update_goal_verification_job,
+    get_verification_jobs_for_goal,
+)
+
 # Factory runs audit
 from .crud_factory import (
     create_factory_run,
@@ -437,6 +455,7 @@ __all__ = [
     "PipelineTemplate", "PipelineStage", "PipelineTransition",
     "PipelineStageGroup", "PipelineArchCategory", "ProjectDocument",
     "ArchivedFile", "ProjectSettings", "CustomAgentDefinition",
+    "MaestroGoal", "GoalVerificationJob",
     # crud_tasks
     "init_db", "seed_sample_tasks", "seed_task", "seed_sample_tasks_raw",
     "create_task", "get_task", "get_tasks_by_type", "get_tasks_by_project",
@@ -535,6 +554,11 @@ __all__ = [
     "delete_document", "store_document_by_project", "get_document_by_project",
     "fuzzy_get_document_by_project", "list_documents_by_project",
     "delete_document_by_project", "list_documents_written_by_task",
+    # crud_goals
+    "create_goal", "get_goal", "get_active_goals_for_project", "get_goals_for_project",
+    "update_goal", "append_goal_evidence", "goal_to_dict",
+    "create_goal_verification_job", "get_pending_goal_verification_jobs",
+    "update_goal_verification_job", "get_verification_jobs_for_goal",
 ]
 
 # Sentinel — presence of this flag on a subsequent execution means we're
