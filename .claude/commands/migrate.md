@@ -2,15 +2,15 @@
 description: Scaffold, check, and apply Maestro DB migrations
 ---
 
-Two modes depending on whether arguments are provided:
+Three modes depending on whether arguments are provided:
 
 ---
 
-## Mode A — Scaffold a new migration (arguments provided)
+## Mode A — Scaffold a new migration (name argument provided)
 
 Arguments: `$ARGUMENTS`
 
-If `$ARGUMENTS` is non-empty, the user wants to create a new migration file. Do this:
+If `$ARGUMENTS` is non-empty and does **not** start with `rehash`, the user wants to create a new migration file. Do this:
 
 1. Run the scaffolder with the provided name:
    ```
@@ -25,7 +25,31 @@ Do NOT open or edit the file yourself unless the user explicitly asks.
 
 ---
 
-## Mode B — Check status and apply pending migrations (no arguments)
+## Mode B — Rehash stored checksums (`rehash NNNN [NNNN...]`)
+
+If `$ARGUMENTS` starts with `rehash`, the user wants to re-stamp the stored checksum(s) for one or more already-applied migrations.
+
+**When to use:** Only when a migration file was edited for cosmetic reasons only — adding or fixing a `description` variable, fixing a comment — and the `up()` and `down()` functions are **byte-for-byte identical** to what was applied. Rehash after any behavioural change is falsifying history and must be refused.
+
+**Before running rehash, you MUST:**
+
+1. Read the listed migration file(s) and verify the diff is truly cosmetic: no change to SQL statements, no new or removed operations in `up()` or `down()`. If you cannot confirm this, refuse and tell the user to add a new corrective migration instead.
+
+2. Extract the migration IDs from the arguments (e.g. `rehash 0079 0080` → IDs `0079 0080`).
+
+3. Run:
+   ```
+   venv/Scripts/python.exe app/migrations/runner.py rehash <ID> [<ID> ...]
+   ```
+   This re-stamps both the test DB and the production DB in one command.
+
+4. Report which IDs were rehashed and what the old → new checksum transition was (the runner prints this). Confirm both DBs are now clean by running status.
+
+If the user asks to rehash a migration whose `up()` or `down()` was changed, refuse and explain: the correct fix is a new corrective migration, not falsifying the stored checksum.
+
+---
+
+## Mode C — Check status and apply pending migrations (no arguments)
 
 ### Step 1 — Run status against both DBs
 
@@ -39,8 +63,10 @@ This is equivalent to `migrate.bat status`. The runner reports two sections: `==
 
 **TAMPERED migrations** (`TAMPERED` in the Status column):
 - A migration file was edited after being applied — its current checksum does not match what was recorded.
-- Do NOT attempt to re-apply or auto-fix.
-- Surface the migration IDs to the user and stop. Tell them: applied migrations must never be edited; add a new corrective migration instead.
+- Read the affected file(s) and check whether the change is purely cosmetic (description variable, a comment) with **no change** to `up()` or `down()`.
+  - **Cosmetic only:** inform the user and offer to run `rehash` (Mode B above) to re-stamp the checksum. Wait for explicit approval before doing so.
+  - **Behavioural change detected (up/down modified):** Do NOT rehash. Surface the IDs and tell the user: applied migrations must never be edited for behaviour; add a new corrective migration instead.
+- Never rehash without first confirming the diff is cosmetic.
 
 **Orphan entries** (applied in DB but no matching file):
 - Surface the IDs to the user and stop. The file may have been deleted or renamed. They need to investigate before proceeding.

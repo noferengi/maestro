@@ -47,7 +47,13 @@ from app.agent.config import (
     TOOL_MAX_GIT_LOG_ENTRIES,
     TOOL_LISTING_EXCLUDED_DIRS,
     MAESTRO_GIT_ROOT,
+    MAESTRO_CAPABILITIES,
+    SELF_MODIFICATION_PROJECT,
+    SELF_MOD_INTEGRATION_BRANCH,
+    SELF_MOD_REVERT_VOTE_THRESHOLD,
 )
+from app.agent.self_modification_allowlist import ALLOWED_PATHS as _SELF_MOD_ALLOWED_PATHS
+from app.agent.self_modification_allowlist import HARD_BLOCKED as _SELF_MOD_HARD_BLOCKED
 from app.agent.llm_client import is_shutting_down, ShutdownError
 
 # ---------------------------------------------------------------------------
@@ -79,6 +85,12 @@ _session_id_ctx: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "_session_id_ctx", default=None
 )
 
+# Current inter-agent ask depth — incremented by each nested ask_agent hop.
+# Reset to 0 at the start of every root MaestroLoop session.
+_ask_depth_ctx: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "_ask_depth_ctx", default=0
+)
+
 # ---------------------------------------------------------------------------
 # Per-call output buffer — enables read_last_output slicing
 # ---------------------------------------------------------------------------
@@ -92,6 +104,29 @@ _MAX_BUFFER_BYTES = 4 * 1024 * 1024  # 4 MiB per task
 _last_test_output: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_last_test_output", default=""
 )
+
+
+# ---------------------------------------------------------------------------
+# consult_maestro per-session call counter
+# ---------------------------------------------------------------------------
+# Maps task_id → number of consult_maestro calls in the current session.
+# Reset by reset_consult_count() at the start of each MaestroLoop run.
+_consult_call_counts: dict[str, int] = {}
+_consult_call_counts_lock = threading.Lock()
+
+
+def reset_consult_count(task_id: str) -> None:
+    """Reset the consult_maestro call counter for a task session."""
+    with _consult_call_counts_lock:
+        _consult_call_counts[task_id] = 0
+
+
+def _increment_consult_count(task_id: str) -> int:
+    """Increment and return the new consult call count for a task."""
+    with _consult_call_counts_lock:
+        count = _consult_call_counts.get(task_id, 0) + 1
+        _consult_call_counts[task_id] = count
+        return count
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +445,24 @@ _WRITE_BLOCKED_SEGMENTS: frozenset[str] = frozenset({
 })
 
 
+def _assert_on_allowlist(resolved: str) -> None:
+    """Validate a resolved path against the self-modification allowlist."""
+    # Normalize case for cross-platform comparison (critical on Windows).
+    nc = os.path.normcase(resolved)
+    hard_blocked_nc = {os.path.normcase(p) for p in _SELF_MOD_HARD_BLOCKED}
+    allowed_nc = {os.path.normcase(p) for p in _SELF_MOD_ALLOWED_PATHS}
+    if nc in hard_blocked_nc:
+        raise ValueError(
+            f"WRITE REJECTED: '{resolved}' is permanently off-limits for self-modification. "
+            "This path cannot be modified by agents even with all toggles enabled."
+        )
+    if nc not in allowed_nc:
+        raise ValueError(
+            f"WRITE REJECTED: '{resolved}' is not on the self-modification allowlist. "
+            "Add it to app/agent/self_modification_allowlist.py ALLOWED_PATHS to permit this write."
+        )
+
+
 def _assert_safe_write_path(path: str) -> str:
     """
     Safety check for all write operations (write_file, append_file).
@@ -429,12 +482,29 @@ def _assert_safe_write_path(path: str) -> str:
       3. Gitignored paths are refused to prevent accidental writes to
          secrets, data files, or other protected content.
 
+    Self-modification exemption: _maestro_self project with can_self_modify=true
+    may write to the Maestro source tree, but only to allowlisted paths.
+
     Returns the resolved absolute path.
     Raises ValueError with a descriptive message on any violation.
     """
     resolved = _assert_safe_path(path)   # Layer 0: blocks .git + .archive
     effective_root = _task_git_cwd.get() or PROJECT_ROOT
     root = os.path.realpath(effective_root)
+
+    # Self-modification exemption: _maestro_self project with can_self_modify enabled
+    # may write to the Maestro source tree, but only to allowlisted paths.
+    # Normcase comparison is required on Windows (MAESTRO_GIT_ROOT is normcased).
+    if MAESTRO_GIT_ROOT and os.path.normcase(resolved).startswith(MAESTRO_GIT_ROOT + os.sep):
+        project_name = _task_project_name.get() or ""
+        if project_name == SELF_MODIFICATION_PROJECT and MAESTRO_CAPABILITIES.can_self_modify:
+            _assert_on_allowlist(resolved)
+            return resolved
+        raise ValueError(
+            f"WRITE REJECTED: '{path}' is inside the Maestro source tree. "
+            f"Only the '{SELF_MODIFICATION_PROJECT}' project with can_self_modify=true "
+            "may write here, and only to allowlisted paths."
+        )
 
     # 1. Containment: writes must stay inside the project root
     if not resolved.startswith(root + os.sep) and resolved != root:
@@ -1597,16 +1667,18 @@ def write_git_restore(path: str) -> str:
 
 def consult_maestro(question: str) -> str:
     """
-    Pause execution and consult the Maestro (or human) for guidance on a complex decision.
-    Use this when you are stuck, facing an architectural ambiguity, or repeatedly failing a test.
-    Execution will resume once a steering hint is provided.
+    Escalate a question to the Maestro orchestrator and receive an answer inline.
+    Use this when you are stuck, facing an architectural ambiguity, or repeatedly
+    failing a test and need a higher-level perspective.
+
+    Execution continues after you receive the answer — this tool is non-terminal.
+    A per-session call cap applies; when exceeded the tool returns a hard-stop message.
+    This tool requires async dispatch; calling it via the synchronous path returns an error.
     """
-    import json
-    return json.dumps({
-        "__maestro_terminal__": True,
-        "signal": "CONSULT",
-        "payload": {"question": question}
-    })
+    return (
+        "ERROR: consult_maestro requires async dispatch.  "
+        "Use async_dispatch_tool() instead of dispatch_tool()."
+    )
 
 
 def report_tool_bug(
@@ -3391,6 +3463,92 @@ def tool_list_documents(tag: str | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Episodic memory tools (Gap 7)
+# ---------------------------------------------------------------------------
+
+def handle_query_episodes(
+    question: str,
+    k: int = 5,
+    episode_type: "str | None" = None,
+) -> str:
+    """[READ] Search episodic memory for past attempts, failures, or conclusions."""
+    import json as _json
+    import app.agent.config as _cfg
+
+    if not _cfg.EPISODIC_MEMORY_ENABLED:
+        return _json.dumps({"episodes": [], "note": "Episodic memory is not enabled."})
+
+    pid = _doc_project_id()
+    if pid is None:
+        return _json.dumps({"error": "No project context for episodic memory query."})
+
+    k = max(1, min(int(k), 20))
+
+    from app.agent.episodic_memory import query_episodes
+    episodes = query_episodes(
+        project_id=pid,
+        question=question,
+        k=k,
+        settings=_cfg,
+        episode_type=episode_type or None,
+    )
+
+    result = []
+    for ep in episodes:
+        result.append({
+            "episode_type": ep["episode_type"],
+            "content": ep["content"],
+            "created_at": ep["created_at"].isoformat() if ep.get("created_at") else None,
+            "metadata": ep.get("metadata", {}),
+            "relevance_score": round(ep.get("relevance_score", 0.0), 4),
+        })
+
+    return _json.dumps({"episodes": result, "count": len(result)}, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Autopilot objective tools (Gap 4)
+# ---------------------------------------------------------------------------
+
+def tool_get_objective_detail(objective_id: int) -> str:
+    """[READ] Return full details of an autopilot objective including its direct children."""
+    import json as _json
+    from app.database import get_objective, list_objectives, objective_to_dict
+    obj = get_objective(objective_id)
+    if not obj:
+        return _json.dumps({"error": "objective not found"})
+    detail = objective_to_dict(obj)
+    children = list_objectives(obj.project_id, status=None, parent_id=objective_id)
+    detail["children"] = [objective_to_dict(c) for c in children]
+    return _json.dumps(detail, indent=2)
+
+
+def tool_get_objective_evidence(objective_id: int) -> str:
+    """[READ] Return the full evidence log for an autopilot objective."""
+    from app.database import get_objective_evidence
+    return get_objective_evidence(objective_id)
+
+
+def tool_append_objective_evidence(objective_id: int, entry: str) -> str:
+    """[WRITE] Append a timestamped note to an objective's evidence log."""
+    from app.database import append_objective_evidence
+    ok = append_objective_evidence(objective_id, entry)
+    return "ok" if ok else "error: objective not found"
+
+
+def tool_list_objectives(status: str = "active") -> str:
+    """[READ] List autopilot objectives for the current project."""
+    import json as _json
+    pid = _doc_project_id()
+    if pid is None:
+        return "ERROR: No project context — cannot list objectives."
+    from app.database import list_objectives, objective_to_dict
+    normalized_status: str | None = status if status != "all" else None
+    objs = list_objectives(pid, status=normalized_status)
+    return _json.dumps([objective_to_dict(o) for o in objs], indent=2)
+
+
+# ---------------------------------------------------------------------------
 # Pipeline management tools
 # ---------------------------------------------------------------------------
 
@@ -3767,6 +3925,231 @@ def get_budget_history(
     return _cap_tool_result("get_budget_history", f"{summary}\n{detail}")
 
 
+def get_task_history_recent(task_id: str, max_turns: int = 20) -> str:
+    """[READ] Return the most recent N LLM turns for a task as a JSON list.
+
+    Each entry includes entry_id, agent_name, created_at, prompt_tokens,
+    completion_tokens, finish_reason, and a 500-char content_preview of the
+    assistant message.  max_turns is clamped to [1, 50].
+    """
+    import json as _json
+    from app.database import get_budget_entries
+
+    max_turns = max(1, min(50, int(max_turns)))
+    entries = get_budget_entries(task_id=str(task_id), limit=max_turns)
+    result = []
+    for e in entries:
+        content_preview = ""
+        finish_reason = ""
+        try:
+            resp = _json.loads(e.response_data or "{}")
+            choices = resp.get("choices") or []
+            if choices:
+                content = (choices[0].get("message") or {}).get("content") or ""
+                content_preview = content[:500]
+                finish_reason = choices[0].get("finish_reason") or ""
+        except Exception:
+            pass
+        result.append({
+            "entry_id": e.id,
+            "agent_name": e.agent_name,
+            "created_at": e.created_at.isoformat() if e.created_at else None,
+            "prompt_tokens": e.prompt_cost,
+            "completion_tokens": e.generation_cost,
+            "finish_reason": finish_reason,
+            "content_preview": content_preview,
+        })
+    return _cap_tool_result("get_task_history_recent", _json.dumps(result, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Math tools
+# ---------------------------------------------------------------------------
+
+def run_sympy(code: str, timeout: int = 120) -> str:
+    """[RUN — docker-sandbox] Execute Python/SymPy code for mathematical exploration. Returns stdout and stderr from an isolated Docker container. Use for scratch computation; commit final results via write_file + run_test_pytest."""
+    timeout = max(10, min(600, int(timeout)))
+    from app.agent.sandbox import run_in_sandbox
+    result = run_in_sandbox(code, lang="python", timeout=timeout)
+    if "error" in result and "stdout" not in result:
+        return f"[run_sympy] Error: {result['error']}"
+    parts = []
+    out = result.get("stdout", "")[:8192]
+    err = result.get("stderr", "")[:8192]
+    if out:
+        parts.append(f"stdout:\n{out}")
+    if err:
+        parts.append(f"stderr:\n{err}")
+    if result.get("timed_out"):
+        parts.append("[timed out]")
+    elif result.get("ok") is False:
+        parts.append("[process exited with non-zero code]")
+    return "\n".join(parts) or "[no output]"
+
+
+from app.agent.tools_math import search_arxiv as _search_arxiv_impl, search_oeis as _search_oeis_impl, search_mathlib as _search_mathlib_impl  # noqa: E402
+
+
+def _get_lean4_proof_state_tool(lean_source: str, line: int, col: int = 0) -> str:
+    """[RUN — docker-sandbox] Get Lean4 proof state at a line. Returns JSON."""
+    import json as _json
+    from app.agent.sandbox import get_lean4_proof_state
+    result = get_lean4_proof_state(lean_source, line, col)
+    return _json.dumps(result, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Gap 5 — vote_to_revert tool
+# ---------------------------------------------------------------------------
+
+def handle_vote_to_revert(reason: str) -> str:
+    """Cast a vote to revert the most recent self-modification merge commit."""
+    from app.database import (
+        cast_revert_vote, get_revert_votes,
+        get_latest_self_mod_merge, mark_self_mod_reverted,
+    )
+    from app.database.crud_tasks import create_pip
+
+    project_name = _task_project_name.get() or ""
+    if project_name != SELF_MODIFICATION_PROJECT:
+        return (
+            f"[vote_to_revert] ERROR: This tool is only available in the "
+            f"'{SELF_MODIFICATION_PROJECT}' project (current: {project_name!r})."
+        )
+
+    merge_commit = get_latest_self_mod_merge()
+    if not merge_commit:
+        return "[vote_to_revert] ERROR: No self-modification merge recorded yet. Nothing to revert."
+
+    task_id = _task_id_ctx.get() or ""
+    vote_count = cast_revert_vote(task_id, merge_commit, reason)
+    threshold = SELF_MOD_REVERT_VOTE_THRESHOLD
+
+    if vote_count < threshold:
+        return (
+            f"[vote_to_revert] Vote recorded. {vote_count}/{threshold} votes needed "
+            f"to auto-revert merge {merge_commit[:8]}."
+        )
+
+    # Threshold reached — execute revert
+    import subprocess as _sp
+    revert_result = _sp.run(
+        ["git", "revert", merge_commit, "--no-edit"],
+        capture_output=True, text=True, timeout=60,
+        cwd=MAESTRO_GIT_ROOT or PROJECT_ROOT,
+    )
+    if revert_result.returncode != 0:
+        return (
+            f"[vote_to_revert] Threshold reached ({vote_count}/{threshold}) but "
+            f"git revert failed:\n{revert_result.stderr}"
+        )
+
+    # Create PIP card documenting the revert
+    votes = get_revert_votes(merge_commit)
+    vote_log = "\n".join(
+        f"- task {v['task_id']} at {v['created_at']}: {v['reason']}" for v in votes
+    )
+    pip_desc = (
+        f"AUTO-REVERT triggered for merge {merge_commit[:8]}.\n\n"
+        f"Vote log ({vote_count} votes):\n{vote_log}"
+    )
+    try:
+        create_pip(
+            task_id=task_id,
+            origin_stage="self_modification",
+            reason=pip_desc,
+        )
+    except Exception:
+        pass  # PIP creation failure must not block the revert confirmation
+
+    mark_self_mod_reverted(merge_commit)
+    return (
+        f"[vote_to_revert] AUTO-REVERT COMPLETE. Merge {merge_commit[:8]} has been "
+        f"reverted on {SELF_MOD_INTEGRATION_BRANCH}. A PIP card was created."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Event watch tools (GAP 9)
+# ---------------------------------------------------------------------------
+
+def handle_register_watch(
+    event_type: str,
+    label: str,
+    source_config: dict,
+    fire_config: dict | None = None,
+    *,
+    task_id: str | None = None,
+    **_,
+) -> str:
+    from app.database.crud_events import create_watch
+    from app.database import get_task as _get_task
+
+    project_id = None
+    if task_id:
+        task = _get_task(task_id)
+        if task:
+            project_id = task.project_id
+    if project_id is None:
+        return "[register_watch] ERROR: could not resolve project_id from task_id"
+
+    watch = create_watch(
+        project_id=project_id,
+        event_type=event_type,
+        label=label,
+        source_config=source_config,
+        fire_config=fire_config or {},
+    )
+    if not watch:
+        return "[register_watch] ERROR: DB insert failed"
+
+    if event_type == "file_watch":
+        from app.agent.file_watcher import get_file_watcher
+        fw = get_file_watcher()
+        if fw:
+            fw.add_watch(watch)
+
+    result = {"watch_id": watch.id, "event_type": event_type, "label": label}
+    if event_type == "webhook":
+        result["inbound_url"] = f"/api/events/inbound/{watch.id}"
+    elif event_type == "api_poll":
+        result["message"] = "Will fire on next scheduler tick when interval elapses"
+
+    import json as _json
+    return _json.dumps(result)
+
+
+def handle_list_watches(
+    status: str = "active",
+    *,
+    task_id: str | None = None,
+    **_,
+) -> str:
+    import json as _json
+    from app.database.crud_events import list_watches
+    from app.database import get_task as _get_task
+
+    project_id = None
+    if task_id:
+        task = _get_task(task_id)
+        if task:
+            project_id = task.project_id
+
+    watches = list_watches(project_id=project_id, status=status)
+    rows = [
+        {
+            "id": w.id,
+            "event_type": w.event_type,
+            "label": w.label,
+            "status": w.status,
+            "fire_count": w.fire_count,
+            "last_fired_at": str(w.last_fired_at) if w.last_fired_at else None,
+        }
+        for w in watches
+    ]
+    return _json.dumps(rows)
+
+
 # ---------------------------------------------------------------------------
 # Tool registry + schemas
 # ---------------------------------------------------------------------------
@@ -3875,11 +4258,34 @@ TOOL_REGISTRY: dict[str, Any] = {
     # Log and diagnostic history tools
     "read_log_window": read_log_window,
     "get_budget_history": get_budget_history,
+    "get_task_history_recent": get_task_history_recent,
     # Document store tools
     "store_document": tool_store_document,
     "get_document": tool_get_document,
     "search_documents": tool_search_documents,
     "list_documents": tool_list_documents,
+    # Autopilot objective tools (Gap 4)
+    "get_objective_detail":       tool_get_objective_detail,
+    "get_objective_evidence":     tool_get_objective_evidence,
+    "append_objective_evidence":  tool_append_objective_evidence,
+    "list_objectives":            tool_list_objectives,
+    # Math tools
+    "run_sympy": run_sympy,
+    "search_arxiv": _search_arxiv_impl,
+    "search_oeis": _search_oeis_impl,
+    "search_mathlib": _search_mathlib_impl,
+    "get_lean4_proof_state": _get_lean4_proof_state_tool,
+    # Self-modification tools (Gap 5)
+    "vote_to_revert": handle_vote_to_revert,
+    # Episodic memory tools (Gap 7)
+    "query_episodes": handle_query_episodes,
+    # Inter-agent messaging tools (Gap 8)
+    # Handlers live in async_dispatch_tool; stubs here satisfy build_tool_schemas lookups.
+    "ask_agent": lambda **_: "ERROR: ask_agent requires async dispatch.",
+    "list_active_sessions": lambda **_: "ERROR: list_active_sessions requires async dispatch.",
+    # Event watch tools (Gap 9)
+    "register_watch": handle_register_watch,
+    "list_watches_for_project": handle_list_watches,
 }
 
 TOOL_SCHEMAS: list[dict] = [
@@ -4119,6 +4525,27 @@ TOOL_SCHEMAS: list[dict] = [
                     "tail":    {"type": "integer", "description": "Return only the last N detail rows."},
                     "grep":    {"type": "string",  "description": "Filter detail rows matching this regex/substring."},
                 },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_task_history_recent",
+            "description": (
+                "[READ] Read the most recent N LLM turns for a task. "
+                "Returns agent_name, timestamp, token counts, finish_reason, and a 500-char "
+                "content_preview of the assistant message per turn. "
+                "Use to inspect a worker agent's reasoning when base context is insufficient. "
+                "max_turns is clamped to [1, 50]."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id":   {"type": "string",  "description": "Task ID to read history for."},
+                    "max_turns": {"type": "integer", "description": "Max turns to return. Clamped to [1, 50]. Default 20."},
+                },
+                "required": ["task_id"],
             },
         },
     },
@@ -5593,6 +6020,393 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    # --- Autopilot objective tools (Gap 4) ---
+    {
+        "type": "function",
+        "function": {
+            "name": "get_objective_detail",
+            "description": (
+                "[READ] Return full details of an autopilot objective including its direct children. "
+                "Use to inspect priority, status, last assessment, and child objectives."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "objective_id": {
+                        "type": "integer",
+                        "description": "ID of the autopilot objective to retrieve.",
+                    },
+                },
+                "required": ["objective_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_objective_evidence",
+            "description": (
+                "[READ] Return the full evidence log for an autopilot objective. "
+                "The log is an append-only record of findings, milestones, and dead ends."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "objective_id": {
+                        "type": "integer",
+                        "description": "ID of the objective whose evidence log to retrieve.",
+                    },
+                },
+                "required": ["objective_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "append_objective_evidence",
+            "description": (
+                "[WRITE] Append a timestamped note to an objective's evidence log. "
+                "Use to record findings, progress milestones, or dead ends during investigation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "objective_id": {
+                        "type": "integer",
+                        "description": "ID of the objective to append evidence to.",
+                    },
+                    "entry": {
+                        "type": "string",
+                        "description": "The evidence note to append. Markdown is supported.",
+                    },
+                },
+                "required": ["objective_id", "entry"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_objectives",
+            "description": (
+                "[READ] List autopilot objectives for the current project. "
+                "Returns one-line summaries including id, priority, status, and description."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["active", "paused", "complete", "all"],
+                        "description": "Filter by status. Default 'active'.",
+                        "default": "active",
+                    },
+                },
+            },
+        },
+    },
+    # --- Math tools ---
+    {
+        "type": "function",
+        "function": {
+            "name": "run_sympy",
+            "description": (
+                "[RUN — docker-sandbox] Execute Python/SymPy code for mathematical exploration. "
+                "Runs in an isolated Docker container with no network access. "
+                "Returns stdout and stderr. Use for scratch computation; "
+                "commit final results via write_file + run_test_pytest."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Python source code to execute (may import sympy, numpy, scipy, mpmath).",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Max execution seconds (default 120, clamped to [10, 600]).",
+                    },
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_arxiv",
+            "description": (
+                "[READ] Search arXiv for mathematical papers. "
+                "Returns structured records: id, title, authors, year, abstract, url, pdf."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query string, e.g. 'twin prime conjecture'.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Number of results to return (default 5, max 20).",
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "arXiv category filter, e.g. 'math.NT' for number theory (optional).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_oeis",
+            "description": (
+                "[READ] Search the OEIS (Online Encyclopedia of Integer Sequences). "
+                "Returns structured records: id, name, values, offset, formula, url."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query — a sequence description, keyword, or comma-separated integers.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Number of results to return (default 5, max 20).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    # Gap 12 — Lean4 proof depth
+    {
+        "type": "function",
+        "function": {
+            "name": "search_mathlib",
+            "description": (
+                "[READ] Search Lean4 Mathlib for existing theorems, lemmas, and definitions. "
+                "Always call this before attempting to prove something — it may already exist. "
+                "Returns list of {name, type, module, doc}."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search terms, e.g. 'prime gap sieve' or 'Nat.Prime dvd'.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Max results to return (default 10, max 50).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_lean4_proof_state",
+            "description": (
+                "[RUN — docker-sandbox] Get the Lean4 proof state (goal + hypotheses) at a "
+                "specific line in a .lean source file. Place a `sorry` at the point you want "
+                "to inspect — the infoview shows what sorry is standing in for. "
+                "Use after writing a proof attempt to understand what remains to be proved."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "lean_source": {
+                        "type": "string",
+                        "description": "Full Lean4 source code of the file.",
+                    },
+                    "line": {
+                        "type": "integer",
+                        "description": "1-indexed line number to inspect (place `sorry` there).",
+                    },
+                    "col": {
+                        "type": "integer",
+                        "description": "Column number (default 0).",
+                    },
+                },
+                "required": ["lean_source", "line"],
+            },
+        },
+    },
+    # Gap 5 — self-modification
+    {
+        "type": "function",
+        "function": {
+            "name": "vote_to_revert",
+            "description": (
+                "[RUN] Cast a vote to revert the most recent self-modification merge commit. "
+                "Use when you observe that a recent change caused regressions or broken "
+                "functionality. When votes reach the configured threshold the system "
+                "automatically runs git revert and creates a PIP card. "
+                "Only available in _maestro_self project sessions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Why this merge should be reverted.",
+                    },
+                },
+                "required": ["reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_episodes",
+            "description": (
+                "[READ] Search episodic memory for past attempts, failures, or conclusions "
+                "related to a question or approach. Returns semantically similar past "
+                "episodes with their outcomes. Use before starting an approach that may "
+                "have been tried and failed before."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "What to search for — describe the approach or problem area.",
+                    },
+                    "k": {
+                        "type": "integer",
+                        "description": "Max results to return (1–20). Default 5.",
+                    },
+                    "episode_type": {
+                        "type": "string",
+                        "description": (
+                            "Optional filter: 'failure', 'session_summary', or 'document'. "
+                            "Omit to search all types."
+                        ),
+                    },
+                },
+                "required": ["question"],
+            },
+        },
+    },
+    # ---- Inter-agent messaging (Gap 8) ----
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_agent",
+            "description": (
+                "[RUN] Ask another running agent session a question and receive its answer inline. "
+                "The other agent runs a fresh reasoning session with your question and returns "
+                "a direct answer. This is a blocking call — your session waits for the reply. "
+                "Use list_active_sessions() first to find the right target."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_session_id": {
+                        "type": "string",
+                        "description": "Session ID of the agent to ask. Use list_active_sessions() to find it.",
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "The question or request to send to the other agent.",
+                    },
+                },
+                "required": ["target_session_id", "question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_active_sessions",
+            "description": (
+                "[READ] List all currently running agent sessions across all projects. "
+                "Returns session ID, task ID, task title, agent type, and LLM ID. "
+                "Use to find a target before calling ask_agent()."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Optional — filter to sessions in this project only.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    # ---- Event watch tools (Gap 9) ----
+    {
+        "type": "function",
+        "function": {
+            "name": "register_watch",
+            "description": (
+                "[RUN] Register an event watch that triggers a Maestro autopilot tick when "
+                "an external event occurs. Supported types: webhook (HTTP POST), "
+                "file_watch (filesystem), api_poll (periodic URL fetch)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "event_type": {
+                        "type": "string",
+                        "enum": ["webhook", "file_watch", "api_poll"],
+                        "description": "Type of event source.",
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Human-readable name for this watch.",
+                    },
+                    "source_config": {
+                        "type": "object",
+                        "description": (
+                            "Event-source configuration. "
+                            "webhook: {secret?}. "
+                            "file_watch: {path, recursive?, events?}. "
+                            "api_poll: {url, poll_interval_seconds?, timeout_seconds?, headers?}."
+                        ),
+                    },
+                    "fire_config": {
+                        "type": "object",
+                        "description": (
+                            "Dedup/expiry configuration (all optional): "
+                            "{cooldown_seconds, use_content_hash, max_fires, expires_at}."
+                        ),
+                    },
+                },
+                "required": ["event_type", "label", "source_config"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_watches_for_project",
+            "description": "[READ] List event watches for the current project.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["active", "paused", "expired"],
+                        "description": "Filter by watch status (default: active).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 
@@ -5609,7 +6423,8 @@ TOOL_CATEGORIES: dict[str, str] = {
     "restart_server":         "Infrastructure",
     "get_system_health":      "Infrastructure",
     "read_log_window":        "Infrastructure",
-    "get_budget_history":     "Infrastructure",
+    "get_budget_history":         "Infrastructure",
+    "get_task_history_recent":    "Infrastructure",
     # Pipelines — pipeline template management
     "list_pipelines":          "Pipelines",
     "get_pipeline":            "Pipelines",
@@ -5698,11 +6513,23 @@ TOOL_CATEGORIES: dict[str, str] = {
     "get_document":           "Documents",
     "search_documents":       "Documents",
     "list_documents":         "Documents",
+    # Objectives — autopilot objective tools (Gap 4)
+    "get_objective_detail":       "Objectives",
+    "get_objective_evidence":     "Objectives",
+    "append_objective_evidence":  "Objectives",
+    "list_objectives":            "Objectives",
     # Summaries — hierarchical scope summaries
     "get_project_summary":    "Summaries",
     "get_directory_summary":  "Summaries",
     "get_module_summary":     "Summaries",
     "list_scope_summaries":   "Summaries",
+    # Self-modification (Gap 5)
+    "vote_to_revert":         "Infrastructure",
+    # Episodic memory (Gap 7)
+    "query_episodes":         "Infrastructure",
+    # Inter-agent messaging (Gap 8)
+    "ask_agent":              "Infrastructure",
+    "list_active_sessions":   "Infrastructure",
 }
 
 
@@ -5974,6 +6801,107 @@ async def async_dispatch_tool(
             return await agent.run()
         except Exception as exc:
             return f"ERROR: agentic web_search failed: {exc}"
+
+    if name == "consult_maestro":
+        from app.agent.config import CONSULT_MAX_CALLS_PER_SESSION
+        question = arguments.get("question", "").strip()
+        if not question:
+            return "ERROR: consult_maestro requires a non-empty 'question'."
+
+        effective_task_id = task_id or "_unknown"
+        call_count = _increment_consult_count(effective_task_id)
+
+        if call_count > CONSULT_MAX_CALLS_PER_SESSION:
+            return (
+                f"You have reached the consult_maestro limit for this session "
+                f"({CONSULT_MAX_CALLS_PER_SESSION} calls).  Make your best judgment "
+                "with the information available and proceed."
+            )
+
+        # Resolve project context for ConsultAgent
+        project_name: str | None = None
+        project_maestro_llm_id: int | None = None
+        if task_id:
+            try:
+                from app.database import get_task as _get_task_rec, get_project as _get_proj
+                task_rec = _get_task_rec(task_id)
+                if task_rec:
+                    project_name = getattr(task_rec, "project", None)
+                    if project_name:
+                        proj = _get_proj(project_name)
+                        if proj:
+                            project_maestro_llm_id = getattr(proj, "maestro_llm_id", None)
+            except Exception as _exc:
+                logger.debug("consult_maestro: project lookup failed: %s", _exc)
+
+        try:
+            from app.agent.consult_agent import run_consult_agent
+            answer = await run_consult_agent(
+                question=question,
+                task_id=effective_task_id,
+                caller_llm_id=llm_id,
+                budget_id=budget_id,
+                project_name=project_name,
+                project_maestro_llm_id=project_maestro_llm_id,
+            )
+            return answer
+        except Exception as exc:
+            return f"ERROR: consult_maestro failed: {type(exc).__name__}: {exc}"
+
+    if name == "ask_agent":
+        from app.agent.config import ASK_AGENT_MAX_DEPTH
+        target_session_id = arguments.get("target_session_id", "").strip()
+        question = arguments.get("question", "").strip()
+        if not target_session_id or not question:
+            return "ERROR: ask_agent requires non-empty 'target_session_id' and 'question'."
+
+        ask_depth = _ask_depth_ctx.get()
+        if ask_depth >= ASK_AGENT_MAX_DEPTH:
+            return (
+                f"Max inter-agent ask depth ({ASK_AGENT_MAX_DEPTH}) reached. "
+                "Make your best judgment with the information available."
+            )
+
+        effective_task_id = task_id or "_unknown"
+        if effective_task_id == target_session_id:
+            return "Cannot ask yourself. Use list_active_sessions() to find a different target."
+
+        from app.agent.scheduler import get_active_session_info as _get_session_info
+        session_info = _get_session_info(target_session_id)
+        if session_info is None:
+            return (
+                f"Session '{target_session_id}' is not active. "
+                "Use list_active_sessions() to see current sessions."
+            )
+
+        # TODO KV cache checkpoint: if KV serialization were implemented,
+        # the parent session's context would be written to disk here, allowing
+        # the parent's prompt prefix to be restored from cache after this call.
+
+        try:
+            from app.agent.inter_agent_session import InterAgentSession
+            session = InterAgentSession(
+                question=question,
+                target_task_id=target_session_id,
+                calling_task_id=effective_task_id,
+                calling_session_id=_session_id_ctx.get(),
+                ask_depth=ask_depth + 1,
+                llm_id=session_info.get("llm_id") or llm_id,
+                budget_id=budget_id,
+            )
+            return await session.run()
+        except Exception as exc:
+            return f"ERROR: ask_agent failed: {type(exc).__name__}: {exc}"
+
+    if name == "list_active_sessions":
+        import json as _json
+        from app.agent.scheduler import list_active_sessions as _list_sessions
+        project_filter = arguments.get("project") or None
+        calling_task_id = task_id
+        sessions = _list_sessions(exclude_task_id=calling_task_id, project_filter=project_filter)
+        if not sessions:
+            return "No other active agent sessions found."
+        return _json.dumps(sessions, indent=2)
 
     # All other tools - synchronous
     return dispatch_tool(name, arguments)

@@ -398,7 +398,9 @@ INDEV_AGENT_TOOLS: list[str] = _getlist("indev", "agent_tools",
     "run_build_make, run_build_cargo, run_build_go, run_build_npm, run_build_tsc, "
     "run_build_gradle, run_build_mvn, "
     "run_deps_pip, run_deps_npm, run_deps_cargo, "
-    "report_tool_bug, submit_work"
+    "consult_maestro, report_tool_bug, submit_work, "
+    "query_episodes, "
+    "ask_agent, list_active_sessions"
 )
 
 # ===========================================================================
@@ -413,7 +415,8 @@ CONCEPTUAL_REVIEW_REVIEWER_TOOLS: list[str] = _getlist("conceptual_review", "rev
     "read_file, read_file_metadata, read_last_output, "
     "find_in_files, find_files, list_directory, "
     "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
-    "get_task, list_tasks, report_tool_bug, submit_work"
+    "get_task, list_tasks, report_tool_bug, submit_work, "
+    "query_episodes"
     )
 
 
@@ -479,13 +482,15 @@ FINAL_REVIEW_CODE_QUALITY_TOOLS: list[str] = _getlist("final_review", "code_qual
     "find_in_files, find_files, list_directory, "
     "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
     "get_task, list_tasks, report_tool_bug, submit_work, "
-    "run_test_pytest, run_check_mypy, run_check_ruff, run_check_black, read_test_summary"
+    "run_test_pytest, run_check_mypy, run_check_ruff, run_check_black, read_test_summary, "
+    "query_episodes"
 )
 FINAL_REVIEW_FUNCTIONAL_TOOLS: list[str] = _getlist("final_review", "functional_reviewer_tools",
     "read_file, read_file_metadata, read_last_output, "
     "find_in_files, find_files, list_directory, "
     "read_git_status, read_git_diff, read_git_log, read_git_blame, read_git_show, "
-    "get_task, list_tasks, report_tool_bug, submit_work"
+    "get_task, list_tasks, report_tool_bug, submit_work, "
+    "query_episodes"
     )
 
 
@@ -571,9 +576,12 @@ LOG_BACKUP_COUNT: int = _getint("logging", "backup_count", None, 5)
 
 SCHEDULER_TICK_INTERVAL: float = _getfloat("scheduler", "tick_interval", None, 5.0)
 SCHEDULER_ENABLED: bool = _getbool("scheduler", "enabled", None, True)
+MODEL_BLOCK_TIMEOUT_MINUTES: int = _getint(
+    "scheduler", "model_block_timeout_minutes", "MAESTRO_MODEL_BLOCK_TIMEOUT_MINUTES", 30
+)
 SCHEDULER_DISPATCHABLE_TYPES: list[str] = _getlist(
     "scheduler", "dispatchable_types",
-    "idea, planning, indev, conceptual_review, optimization, security, final_review"
+    "idea, planning, indev, conceptual_review, optimization, security, final_review, reflection_agent"
 )
 FILE_SUMMARY_WAIT_TIMEOUT: float = _getfloat("scheduler", "file_summary_wait_timeout", None, 300.0)
 FILE_SUMMARY_STREAM_IDLE_TIMEOUT: float = _getfloat("scheduler", "file_summary_stream_idle_timeout", None, 30.0)
@@ -609,6 +617,125 @@ MAESTRO_SURVEY_TOOLS: list[str] = _getlist("maestro", "survey_tools", "get_proje
 ARCH_GEN_MAX_TOKENS: int = _getint("arch_gen", "max_tokens", None, 32768)
 
 # ===========================================================================
+# Orchestration / ConsultAgent
+# ===========================================================================
+
+def _getint_optional(section: str, key: str, env_var: str | None) -> "int | None":
+    """Return int from config or None if not set / empty."""
+    if env_var:
+        env_val = os.getenv(env_var)
+        if env_val is not None and env_val.strip():
+            return int(env_val.strip())
+    raw = _cfg.get(section, key, fallback="").strip()
+    return int(raw) if raw else None
+
+
+# ===========================================================================
+# Autopilot objectives
+# ===========================================================================
+
+AUTOPILOT_MAX_OBJECTIVES_PER_TICK: int = _getint("autopilot", "max_objectives_per_tick", None, 2)
+AUTOPILOT_SPIN_DEMOTION_THRESHOLD: int = _getint("autopilot", "spin_demotion_threshold", None, 2)
+AUTOPILOT_SPIN_CARD_THRESHOLD: int     = _getint("autopilot", "spin_card_threshold", None, 2)
+AUTOPILOT_ASSESSMENT_MAX_TURNS: int    = _getint("autopilot", "assessment_max_turns", None, 5)
+
+# ===========================================================================
+# Episodic Memory (Gap 7)
+# ===========================================================================
+
+EPISODIC_MEMORY_ENABLED: bool = _getbool(
+    "episodic_memory", "enabled", "MAESTRO_EPISODIC_MEMORY_ENABLED", False
+)
+EPISODIC_MEMORY_EMBEDDING_LLM_ID: "int | None" = _getint_optional(
+    "episodic_memory", "embedding_llm_id", None
+)
+EPISODIC_MEMORY_EMBEDDING_DIM: int = _getint(
+    "episodic_memory", "embedding_dim", None, 1536
+)
+EPISODIC_MEMORY_DECAY_HALF_LIFE_DAYS: int = _getint(
+    "episodic_memory", "decay_half_life_days", None, 90
+)
+EPISODIC_MEMORY_KEEPALIVE_EXTENSION_DAYS: int = _getint(
+    "episodic_memory", "keepalive_extension_days", None, 14
+)
+EPISODIC_MEMORY_AUTO_INJECT_K: int = _getint(
+    "episodic_memory", "auto_inject_k", None, 3
+)
+
+# ===========================================================================
+# Training data pipeline (Gap 11)
+# ===========================================================================
+
+TRAINING_EXPORT_THRESHOLD: int = _getint("training", "export_threshold", "MAESTRO_TRAINING_EXPORT_THRESHOLD", 100)
+TRAINING_EXPORT_MAX_PER_RUN: int = _getint("training", "export_max_per_run", "MAESTRO_TRAINING_EXPORT_MAX_PER_RUN", 1000)
+TRAINING_EXPORT_DIR: str = _get("training", "export_dir", "MAESTRO_TRAINING_EXPORT_DIR", "data/training_exports")
+TRAINING_DEDUP_MAX: int = _getint("training", "dedup_fingerprint_max", "MAESTRO_TRAINING_DEDUP_MAX", 3)
+
+
+# ===========================================================================
+# Maestro capabilities (Gap 4 — autonomy toggles)
+# ===========================================================================
+
+from dataclasses import dataclass as _dataclass
+
+
+@_dataclass
+class MaestroCapabilities:
+    """Runtime autonomy flags read from [maestro_capabilities] in maestro.ini."""
+    can_create_objectives: bool
+    can_complete_objectives: bool
+    can_create_cards: bool
+    max_objectives_per_tick: int
+    can_self_modify: bool
+    can_auto_merge_human_review: bool
+    can_auto_merge_self_modification: bool
+
+    @classmethod
+    def from_config(cls) -> "MaestroCapabilities":
+        return cls(
+            can_create_objectives          = _getbool("maestro_capabilities", "can_create_objectives",          None, False),
+            can_complete_objectives        = _getbool("maestro_capabilities", "can_complete_objectives",        None, True),
+            can_create_cards               = _getbool("maestro_capabilities", "can_create_cards",               None, True),
+            max_objectives_per_tick        = _getint( "maestro_capabilities", "max_objectives_per_tick",        None, 2),
+            can_self_modify                = _getbool("maestro_capabilities", "can_self_modify",                None, False),
+            can_auto_merge_human_review    = _getbool("maestro_capabilities", "can_auto_merge_human_review",    None, False),
+            can_auto_merge_self_modification = _getbool("maestro_capabilities", "can_auto_merge_self_modification", None, False),
+        )
+
+
+MAESTRO_CAPABILITIES: MaestroCapabilities = MaestroCapabilities.from_config()
+
+# Gap 5 — self-modification constants
+SELF_MODIFICATION_PROJECT: str = "_maestro_self"
+SELF_MOD_INTEGRATION_BRANCH: str = "maestro/self-improvement"
+SELF_MOD_REVERT_VOTE_THRESHOLD: int = _getint("maestro_capabilities", "revert_vote_threshold", None, 3)
+
+# ===========================================================================
+# Orchestration / ConsultAgent
+# ===========================================================================
+
+ORCHESTRATION_LLM_ID: "int | None" = _getint_optional(
+    "orchestration", "maestro_llm_id", "MAESTRO_ORCHESTRATOR_LLM_ID"
+)
+CONSULT_MAX_CALLS_PER_SESSION: int = _getint("orchestration", "consult_max_calls_per_session", None, 3)
+CONSULT_AGENT_MAX_TURNS: int = _getint("orchestration", "consult_agent_max_turns", None, 5)
+ASK_AGENT_MAX_DEPTH: int = _getint("orchestration", "ask_max_depth", "MAESTRO_ASK_MAX_DEPTH", 3)
+
+# ===========================================================================
+# Reflection agent
+# ===========================================================================
+
+REFLECTION_MAX_TURNS: int = _getint(
+    "reflection", "max_turns", "MAESTRO_REFLECTION_MAX_TURNS", 150
+)
+REFLECTION_MAX_HISTORY_TURNS: int = _getint(
+    "reflection", "max_history_turns", "MAESTRO_REFLECTION_MAX_HISTORY_TURNS", 20
+)
+REFLECTION_CONFIDENCE_THRESHOLD: float = _getfloat(
+    "reflection", "confidence_threshold", "MAESTRO_REFLECTION_CONFIDENCE_THRESHOLD", 0.7
+)
+
+# ===========================================================================
 # Server admin
 # ===========================================================================
 
@@ -618,3 +745,34 @@ ARCH_GEN_MAX_TOKENS: int = _getint("arch_gen", "max_tokens", None, 32768)
 SERVER_ALLOW_REMOTE_RESTART: bool = _getbool(
     "server", "allow_remote_restart", "MAESTRO_ALLOW_REMOTE_RESTART", False
 )
+
+
+# ===========================================================================
+# LLM routing resolver (GAP 10)
+# ===========================================================================
+
+DEFAULT_LLM_ID: "int | None" = _getint_optional("scheduler", "default_llm_id", "MAESTRO_DEFAULT_LLM_ID")
+
+
+def resolve_llm_for_task(task, stage_key: str) -> "int | None":
+    """Return the llm_id to use for dispatching *task* at *stage_key*.
+
+    Resolution order:
+      1. task.llm_id if human-pinned (task.llm_pinned = True)
+      2. project_llm_routing entry for stage_key
+      3. project.llm_id
+      4. DEFAULT_LLM_ID from ini (None if not set)
+    """
+    if getattr(task, 'llm_pinned', False) and task.llm_id:
+        return task.llm_id
+
+    from app.database.crud_projects import get_routing_table, get_project_by_id
+    if task.project_id:
+        routing = get_routing_table(task.project_id)
+        if stage_key in routing:
+            return routing[stage_key]
+        project = get_project_by_id(task.project_id)
+        if project and project.llm_id:
+            return project.llm_id
+
+    return DEFAULT_LLM_ID

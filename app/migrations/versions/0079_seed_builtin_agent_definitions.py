@@ -1,3 +1,5 @@
+description = "Seed 14 built-in agent definitions into custom_agent_definitions with behavior_type and behavior_config"
+
 """
 Seed the 14 built-in agent definitions into custom_agent_definitions.
 

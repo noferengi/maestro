@@ -343,16 +343,19 @@ def get_all_migrations() -> list:
 # Commands
 # ---------------------------------------------------------------------------
 
-def migrate(conn_wrapper) -> None:
-    """Apply all pending migrations in order."""
+def migrate(conn_wrapper, target_id: str = None) -> None:
+    """Apply pending migrations in order, optionally up to target_id."""
     ensure_migrations_table(conn_wrapper)
     applied = set(get_applied(conn_wrapper))
     all_migrations = get_all_migrations()
 
     pending = [(mid, mod) for mid, mod in all_migrations if mid not in applied]
+    if target_id:
+        pending = [(mid, mod) for mid, mod in pending if mid <= target_id]
 
     if not pending:
-        print("No pending migrations — database is up to date.")
+        msg = f"No pending migrations {'up to ' + target_id if target_id else ''}"
+        print(f"{msg} — database is up to date.")
         return
 
     for migration_id, mod in pending:
@@ -403,6 +406,46 @@ def rollback(conn_wrapper) -> None:
         {"mid": last_id}
     )
     print("done")
+
+
+def rehash(conn_wrapper, migration_ids: "list[str]") -> None:
+    """
+    *** REWRITE HISTORY *** — update stored checksums to match current file content.
+
+    NEVER USE THIS to cover up behavioural changes to up() or down().
+    Only appropriate for cosmetic-only edits (adding a description variable,
+    fixing a comment) where the schema change is identical to what was applied.
+
+    Prints a diff-style summary of what was re-stamped.
+    """
+    ensure_migrations_table(conn_wrapper)
+    all_migrations = dict(get_all_migrations())
+    applied = set(get_applied(conn_wrapper))
+
+    for mid in migration_ids:
+        if mid not in applied:
+            print(f"  {mid}: not in applied set — skipping")
+            continue
+        path = _find_migration_file(mid)
+        if path is None:
+            print(f"  {mid}: migration file not found — skipping")
+            continue
+        new_chk = _file_checksum(path)
+        conn_wrapper.execute(
+            "SELECT checksum FROM schema_migrations WHERE migration_id = :mid",
+            {"mid": mid},
+        )
+        row = conn_wrapper.fetchone()
+        old_chk = row["checksum"] if row else None
+        if old_chk == new_chk:
+            print(f"  {mid}: checksum unchanged — nothing to do")
+            continue
+        conn_wrapper.execute(
+            "UPDATE schema_migrations SET checksum = :chk WHERE migration_id = :mid",
+            {"chk": new_chk, "mid": mid},
+        )
+        desc = getattr(all_migrations.get(mid), "description", mid)
+        print(f"  {mid}: rehashed  [{(old_chk or 'none')[:12]}... -> {new_chk[:12]}...]  {desc}")
 
 
 def status(conn_wrapper) -> None:
@@ -542,7 +585,7 @@ def _inline_seed(conn_wrapper) -> None:
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def _run_on(target: str, cmd: str) -> None:
+def _run_on(target: str, cmd: str, target_id: str = None, rehash_ids: "list[str] | None" = None) -> None:
     """Run a single migration command against one target database."""
     eng, is_pg = get_connection(target)
     if cmd == "reset":
@@ -551,44 +594,91 @@ def _run_on(target: str, cmd: str) -> None:
     with eng.begin() as conn:
         wrap = ConnectionWrapper(conn, is_pg)
         if cmd == "migrate":
-            migrate(wrap)
+            migrate(wrap, target_id)
         elif cmd == "status":
             status(wrap)
         elif cmd == "rollback":
             rollback(wrap)
+        elif cmd == "rehash":
+            rehash(wrap, rehash_ids or [])
 
 
 def main():
-    commands = ("migrate", "status", "rollback", "reset", "test", "prod")
+    commands = ("migrate", "status", "rollback", "reset", "test", "prod", "rehash")
     if len(sys.argv) < 2 or sys.argv[1] not in commands:
         print("TheMaestro Database Migration Runner")
         print("-" * 36)
-        print("Usage: python app/migrations/runner.py <command>")
+        print("Usage: python app/migrations/runner.py <command> [args]")
         print("\nCommands:")
-        print("  status    - Show applied vs pending migrations for BOTH databases")
-        print("  migrate   - Apply pending migrations: test DB first, then prod DB")
-        print("  rollback  - Revert the last migration on BOTH databases")
-        print("  reset     - DESTROY all data on BOTH databases and re-migrate (Dev only)")
-        print("  test      - Run 'migrate' on the test database only")
-        print("  prod      - Run 'migrate' on the production database only")
+        print("  status               - Show applied vs pending migrations for BOTH databases")
+        print("  migrate [NNNN]       - Apply pending migrations: test DB first, then prod DB")
+        print("  rollback             - Revert the last migration on BOTH databases")
+        print("  reset                - DESTROY all data on BOTH databases and re-migrate (Dev only)")
+        print("  test [NNNN]          - Run 'migrate' on the test database only")
+        print("  prod [NNNN]          - Run 'migrate' on the production database only")
+        print("  rehash NNNN [NNNN...]  - *** REWRITE HISTORY: re-stamp stored checksums to match")
+        print("                         current file content for the listed migration IDs.")
+        print("                         ONLY for cosmetic edits (description, comments).")
+        print("                         NEVER use after changing up() or down().")
         sys.exit(1)
 
     cmd = sys.argv[1]
+    target_id = sys.argv[2] if len(sys.argv) > 2 else None
+    rehash_ids = sys.argv[2:] if cmd == "rehash" else None
 
     if cmd == "test":
         print("=== Test DB ===")
-        _run_on("test", "migrate")
+        _run_on("test", "migrate", target_id)
     elif cmd == "prod":
         print("=== Production DB ===")
-        _run_on("prod", "migrate")
-    else:
-        # Default: apply to test first, then prod (test, status, rollback, reset all touch both)
+        _run_on("prod", "migrate", target_id)
+    elif cmd == "rehash":
+        if not rehash_ids:
+            print("ERROR: rehash requires at least one migration ID (e.g. 0079 0080)")
+            sys.exit(1)
+        print("*** REHASH — rewriting stored checksums (cosmetic edits only) ***")
+        print()
         if TEST_ADMIN_DATABASE_URL:
             print("=== Test DB ===")
-            _run_on("test", cmd)
+            _run_on("test", "rehash", rehash_ids=rehash_ids)
             print()
         print("=== Production DB ===")
-        _run_on("prod", cmd)
+        _run_on("prod", "rehash", rehash_ids=rehash_ids)
+    else:
+        # Default behavior for both databases
+        if cmd == "rollback":
+            # Global-aware rollback: only revert the highest ID found across both
+            t_last_id, p_last_id = None, None
+            if TEST_ADMIN_DATABASE_URL:
+                eng, is_pg = get_connection("test")
+                with eng.connect() as conn:
+                    applied = get_applied(ConnectionWrapper(conn, is_pg))
+                    t_last_id = applied[-1] if applied else None
+            
+            eng, is_pg = get_connection("prod")
+            with eng.connect() as conn:
+                applied = get_applied(ConnectionWrapper(conn, is_pg))
+                p_last_id = applied[-1] if applied else None
+            
+            highest_id = max([i for i in (t_last_id, p_last_id) if i], default=None)
+            if not highest_id:
+                print("Nothing to roll back.")
+                return
+
+            if t_last_id == highest_id:
+                print("=== Test DB ===")
+                _run_on("test", "rollback")
+                if p_last_id == highest_id: print()
+            if p_last_id == highest_id:
+                print("=== Production DB ===")
+                _run_on("prod", "rollback")
+        else:
+            if TEST_ADMIN_DATABASE_URL:
+                print("=== Test DB ===")
+                _run_on("test", cmd, target_id)
+                print()
+            print("=== Production DB ===")
+            _run_on("prod", cmd, target_id)
 
 if __name__ == "__main__":
     main()

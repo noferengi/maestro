@@ -14,7 +14,7 @@ upsert_project() uses Ellipsis (...) as a sentinel for llm_id / budget_id:
 import logging
 
 from .session import SessionLocal
-from .models import Project, ProjectSettings
+from .models import Project, ProjectSettings, ProjectLlmRouting
 from app.utils import normalize_path
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,18 @@ def get_project(name: str):
         db.close()
 
 
+def get_project_by_id(project_id: int):
+    """Return a single project by integer PK, or None if not found."""
+    db = SessionLocal()
+    try:
+        return db.query(Project).filter(Project.id == project_id).first()
+    except Exception as e:
+        logger.error("Error getting project by id %d: %s", project_id, e)
+        return None
+    finally:
+        db.close()
+
+
 def get_project_path(project_name: str) -> "str | None":
     """
     Return the filesystem path for a project, or None if unknown.
@@ -59,18 +71,23 @@ def upsert_project(
     name: str,
     path: "str | None" = None,
     description: "str | None" = None,
-    llm_id: "int | None" = ...,     # type: ignore[assignment]
-    budget_id: "int | None" = ...,  # type: ignore[assignment]
-    pipeline_template_id: "int | None" = ...,  # type: ignore[assignment]
+    llm_id: "int | None" = ...,                    # type: ignore[assignment]
+    budget_id: "int | None" = ...,                 # type: ignore[assignment]
+    maestro_llm_id: "int | None" = ...,            # type: ignore[assignment]
+    pipeline_template_id: "int | None" = ...,      # type: ignore[assignment]
+    autopilot_budget_id: "int | None" = ...,       # type: ignore[assignment]
+    autopilot_max_in_flight: "int | None" = ...,   # type: ignore[assignment]
+    exclude_from_training: "bool | object" = ...,  # type: ignore[assignment]
 ) -> "Project | None":
     """
     Create or update a project.  ``path`` is the absolute filesystem root of
     the project's git repository.  Passing path=None leaves an existing path
     unchanged (use empty string to explicitly clear it).
 
-    ``llm_id``, ``budget_id``, and ``pipeline_template_id`` follow the same sentinel
-    pattern: the default value of ``...`` (Ellipsis) means "don't change the
-    existing value". Pass an int or None explicitly to set/clear any field.
+    ``llm_id``, ``budget_id``, ``maestro_llm_id``, and ``pipeline_template_id``
+    follow the same sentinel pattern: the default value of ``...`` (Ellipsis)
+    means "don't change the existing value". Pass an int or None explicitly to
+    set/clear any field.
     """
     db = SessionLocal()
     try:
@@ -86,8 +103,16 @@ def upsert_project(
                 existing.llm_id = llm_id
             if budget_id is not ...:
                 existing.budget_id = budget_id
+            if maestro_llm_id is not ...:
+                existing.maestro_llm_id = maestro_llm_id
             if pipeline_template_id is not ...:
                 existing.pipeline_template_id = pipeline_template_id
+            if autopilot_budget_id is not ...:
+                existing.autopilot_budget_id = autopilot_budget_id
+            if autopilot_max_in_flight is not ...:
+                existing.autopilot_max_in_flight = autopilot_max_in_flight
+            if exclude_from_training is not ...:
+                existing.exclude_from_training = bool(exclude_from_training)
             db.commit()
             db.refresh(existing)
             return existing
@@ -98,7 +123,11 @@ def upsert_project(
                 description=description,
                 llm_id=llm_id if llm_id is not ... else None,
                 budget_id=budget_id if budget_id is not ... else None,
+                maestro_llm_id=maestro_llm_id if maestro_llm_id is not ... else None,
                 pipeline_template_id=pipeline_template_id if pipeline_template_id is not ... else None,
+                autopilot_budget_id=autopilot_budget_id if autopilot_budget_id is not ... else None,
+                autopilot_max_in_flight=autopilot_max_in_flight if autopilot_max_in_flight is not ... else 10,
+                exclude_from_training=bool(exclude_from_training) if exclude_from_training is not ... else False,
             )
             db.add(project)
             db.commit()
@@ -226,6 +255,59 @@ def get_all_project_settings(project_id: int) -> dict:
         db.close()
 
 
+def get_routing_table(project_id: int) -> "dict[str, int]":
+    """Return {stage_key: llm_id} for all routing entries in a project."""
+    db = SessionLocal()
+    try:
+        rows = db.query(ProjectLlmRouting).filter_by(project_id=project_id).all()
+        return {r.stage_key: r.llm_id for r in rows}
+    except Exception as e:
+        logger.error("Error getting routing table for project %d: %s", project_id, e)
+        return {}
+    finally:
+        db.close()
+
+
+def upsert_routing_entry(project_id: int, stage_key: str, llm_id: int) -> None:
+    """Insert or replace a routing entry for (project_id, stage_key)."""
+    db = SessionLocal()
+    try:
+        row = db.query(ProjectLlmRouting).filter_by(
+            project_id=project_id, stage_key=stage_key
+        ).first()
+        if row:
+            row.llm_id = llm_id
+        else:
+            db.add(ProjectLlmRouting(project_id=project_id, stage_key=stage_key, llm_id=llm_id))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error("Error upserting routing entry project=%d stage=%r: %s", project_id, stage_key, e)
+        raise
+    finally:
+        db.close()
+
+
+def delete_routing_entry(project_id: int, stage_key: str) -> bool:
+    """Remove a routing entry. Returns True if deleted, False if not found."""
+    db = SessionLocal()
+    try:
+        row = db.query(ProjectLlmRouting).filter_by(
+            project_id=project_id, stage_key=stage_key
+        ).first()
+        if not row:
+            return False
+        db.delete(row)
+        db.commit()
+        return True
+    except Exception as e:
+        db.rollback()
+        logger.error("Error deleting routing entry project=%d stage=%r: %s", project_id, stage_key, e)
+        return False
+    finally:
+        db.close()
+
+
 def project_to_dict(project: Project) -> dict:
     """Convert Project SQLAlchemy model to dictionary."""
     if not project:
@@ -237,6 +319,10 @@ def project_to_dict(project: Project) -> dict:
         "description": project.description,
         "llm_id": project.llm_id,
         "budget_id": project.budget_id,
+        "maestro_llm_id": getattr(project, "maestro_llm_id", None),
         "pipeline_template_id": getattr(project, "pipeline_template_id", None),
+        "autopilot_budget_id": getattr(project, "autopilot_budget_id", None),
+        "autopilot_max_in_flight": getattr(project, "autopilot_max_in_flight", 10),
+        "exclude_from_training": getattr(project, "exclude_from_training", False),
         "created_at": (project.created_at.isoformat() if hasattr(project.created_at, 'isoformat') else str(project.created_at)) if project.created_at else None,
     }

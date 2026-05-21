@@ -11,7 +11,7 @@ from sqlalchemy import (
     ForeignKey, UniqueConstraint, Boolean, Float,
 )
 from sqlalchemy.schema import FetchedValue
-from sqlalchemy.orm import relationship, object_session
+from sqlalchemy.orm import relationship, backref, object_session
 from datetime import datetime, timezone
 
 from .session import Base
@@ -140,6 +140,9 @@ class LLM(Base):
     cost_per_million_prompt_tokens = Column(Float, nullable=False, default=0.0)
     cost_per_million_completion_tokens = Column(Float, nullable=False, default=0.0)
     compute_node_id = Column(Integer, ForeignKey("compute_nodes.id"), nullable=True)
+    capabilities = Column(JSON, nullable=False, server_default='[]')
+    supports_tools = Column(Boolean, nullable=False, default=True)
+    supports_vision = Column(Boolean, nullable=False, default=False)
 
     __table_args__ = (
         UniqueConstraint('address', 'port', 'model', name='uq_llm_endpoint'),
@@ -180,13 +183,34 @@ class Project(Base):
     name = Column(String, nullable=False, unique=True)
     path = Column(String, nullable=True)       # Absolute path to the project root
     description = Column(Text, nullable=True)
-    llm_id = Column(Integer, ForeignKey("llms.id"), nullable=True)     # Default LLM for maintenance jobs
-    budget_id = Column(Integer, ForeignKey("budgets.id"), nullable=True)  # Default budget for maintenance jobs
+    llm_id = Column(Integer, ForeignKey("llms.id"), nullable=True)             # Default LLM for maintenance jobs
+    budget_id = Column(Integer, ForeignKey("budgets.id"), nullable=True)        # Default budget for maintenance jobs
+    maestro_llm_id = Column(Integer, ForeignKey("llms.id"), nullable=True)      # LLM for ConsultAgent / Maestro-mode ops
     pipeline_template_id = Column(Integer, ForeignKey("pipeline_templates.id"), nullable=True)
+    autopilot_budget_id = Column(Integer, ForeignKey("budgets.id"), nullable=True)  # budget charged by autopilot ticks
+    autopilot_max_in_flight = Column(Integer, nullable=False, default=10)            # board saturation cap
+    exclude_from_training = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     def __repr__(self):
         return f"<Project(id={self.id}, name='{self.name}', path='{self.path}')>"
+
+
+class ProjectLlmRouting(Base):
+    """Per-project routing table: maps pipeline stage keys to specific LLM IDs."""
+    __tablename__ = "project_llm_routing"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    stage_key = Column(Text, nullable=False)
+    llm_id = Column(Integer, ForeignKey("llms.id"), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('project_id', 'stage_key', name='uq_project_stage_routing'),
+    )
+
+    def __repr__(self):
+        return f"<ProjectLlmRouting(project={self.project_id}, stage={self.stage_key!r}, llm={self.llm_id})>"
 
 
 class ProjectSettings(Base):
@@ -285,7 +309,7 @@ class Task(Base):
     content = Column(JSON, nullable=True)  # For architecture tasks: frontend, backend, etc.
     llm_id = Column(Integer, ForeignKey('llms.id'), nullable=True)
     budget_id = Column(Integer, ForeignKey('budgets.id'), nullable=True)
-    llm_ref = relationship('LLM', lazy='joined')
+    llm_ref = relationship('LLM', foreign_keys='Task.llm_id', lazy='joined')
     budget_ref = relationship('Budget', lazy='joined')
     history = Column(JSON, nullable=True, default=list)  # Array of {status, timestamp}
     prerequisites = Column(JSON, nullable=True, default=list)  # List of prerequisite task IDs
@@ -314,6 +338,10 @@ class Task(Base):
     is_starred = Column(Boolean, nullable=False, default=False)
     stage_key = Column(String, nullable=True)  # Phase 1: mirrors type; Phase 2+: follows pipeline_stages.stage_key
     goal_id = Column(Integer, ForeignKey("maestro_goals.id"), nullable=True, index=True)  # primary goal this card serves
+    autopilot_objective_id = Column(Integer, ForeignKey("autopilot_objectives.id"), nullable=True)  # set when spawned by autopilot
+    llm_pinned = Column(Boolean, nullable=False, default=False)
+    dispatch_waiting_since = Column(DateTime(timezone=True), nullable=True)
+    blocked_on_model_id = Column(Integer, ForeignKey('llms.id'), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -941,6 +969,36 @@ class ProjectDecision(Base):
         return f"<ProjectDecision(id={self.id}, topic={self.topic!r})>"
 
 
+class AutopilotObjective(Base):
+    """Persistent mission objective that drives autonomous card creation across ticks."""
+    __tablename__ = "autopilot_objectives"
+
+    id                     = Column(Integer, primary_key=True, autoincrement=True)
+    project_id             = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    description            = Column(Text, nullable=False)
+    priority               = Column(Integer, nullable=False, default=5)
+    status                 = Column(String, nullable=False, default="active")  # active|paused|complete
+    time_box_hours         = Column(Integer, nullable=True)
+    created_at             = Column(DateTime(timezone=True), server_default=FetchedValue())
+    expires_at             = Column(DateTime(timezone=True), nullable=True)
+    completed_at           = Column(DateTime(timezone=True), nullable=True)
+    last_assessment        = Column(Text, nullable=True)
+    assessment_tick        = Column(Integer, nullable=True)
+    appears_complete_since = Column(DateTime(timezone=True), nullable=True)
+    parent_id              = Column(Integer, ForeignKey("autopilot_objectives.id"), nullable=True)
+    created_by             = Column(String, nullable=False, default="human")  # 'human' | 'maestro'
+
+    children = relationship(
+        "AutopilotObjective",
+        backref=backref("parent", remote_side="AutopilotObjective.id"),
+        foreign_keys="[AutopilotObjective.parent_id]",
+        lazy="select",
+    )
+
+    def __repr__(self):
+        return f"<AutopilotObjective(id={self.id}, project={self.project_id}, status={self.status!r})>"
+
+
 class MaestroGoal(Base):
     """Persistent goal — a direction the system is moving toward.
 
@@ -1150,3 +1208,139 @@ class SystemSettings(Base):
 
     def __repr__(self):
         return f"<SystemSettings(key={self.key!r}, value={self.value!r})>"
+
+
+class RevertVote(Base):
+    """Agent votes to revert a self-modification merge commit."""
+    __tablename__ = "revert_votes"
+
+    id           = Column(Integer, primary_key=True)
+    task_id      = Column(String, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
+    merge_commit = Column(Text, nullable=False)
+    reason       = Column(Text, nullable=False)
+    created_at   = Column(DateTime(timezone=True), nullable=False, server_default="now()")
+
+    def __repr__(self):
+        return f"<RevertVote(id={self.id}, merge_commit={self.merge_commit!r:.12})>"
+
+
+class SelfModMergeLog(Base):
+    """Audit log of merges made by the _maestro_self self-modification project."""
+    __tablename__ = "self_mod_merge_log"
+
+    id           = Column(Integer, primary_key=True)
+    merge_commit = Column(Text, nullable=False, unique=True)
+    task_id      = Column(String, ForeignKey("tasks.id"), nullable=False)
+    reverted     = Column(Boolean, nullable=False, default=False)
+    reverted_at  = Column(DateTime(timezone=True), nullable=True)
+    created_at   = Column(DateTime(timezone=True), nullable=False, server_default="now()")
+
+    def __repr__(self):
+        return f"<SelfModMergeLog(id={self.id}, merge_commit={self.merge_commit!r:.12}, reverted={self.reverted})>"
+
+
+class EpisodicMemory(Base):
+    """Semantic episodic memory — past agent attempts, failures, and session summaries."""
+    __tablename__ = "episodic_memory"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    project_id   = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    task_id      = Column(String, ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True)
+    episode_type = Column(String, nullable=False)   # failure | session_summary | document
+    content      = Column(Text, nullable=False)
+    # embedding is pgvector type — mapped as Text for ORM schema tracking only; never set via ORM
+    embedding    = Column(Text, nullable=True)
+    metadata_    = Column("metadata", JSON, nullable=False, default=dict)
+    created_at   = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+    expires_at   = Column(DateTime(timezone=True), nullable=False)
+    last_accessed = Column(DateTime(timezone=True), nullable=True)
+
+    def __repr__(self):
+        return f"<EpisodicMemory(id={self.id}, type={self.episode_type!r}, project={self.project_id})>"
+
+
+class EpisodicSummaryJob(Base):
+    """Background job that generates a 2-4 sentence LLM summary of a finished session
+    and stores it as a 'session_summary' episode in episodic_memory."""
+    __tablename__ = "episodic_summary_jobs"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    task_id      = Column(String, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
+    final_status = Column(String, nullable=False)   # ACCEPTED | REJECTED | REVERT_TO_DESIGN | …
+    status       = Column(String, nullable=False, default="pending")  # pending|running|completed|failed
+    priority     = Column(Float, nullable=False, default=0.5)
+    tier         = Column(Integer, nullable=False, default=2)
+    llm_id       = Column(Integer, ForeignKey("llms.id", ondelete="SET NULL"), nullable=True)
+    budget_id    = Column(Integer, ForeignKey("budgets.id", ondelete="SET NULL"), nullable=True)
+    created_at   = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+    def __repr__(self):
+        return f"<EpisodicSummaryJob(id={self.id}, task_id={self.task_id!r}, status={self.status!r})>"
+
+
+# ---------------------------------------------------------------------------
+# Event-driven trigger tables (GAP 9)
+# ---------------------------------------------------------------------------
+
+class WatchedEvent(Base):
+    """Registry of event watches that trigger a Maestro autopilot tick on fire."""
+    __tablename__ = "watched_events"
+
+    id                = Column(Integer, primary_key=True, autoincrement=True)
+    project_id        = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    event_type        = Column(String, nullable=False)   # webhook | file_watch | api_poll
+    label             = Column(String, nullable=False)
+    source_config     = Column(JSON, nullable=False, default=dict)
+    fire_config       = Column(JSON, nullable=False, default=dict)
+    status            = Column(String, nullable=False, default="active")  # active | paused | expired
+    last_fired_at     = Column(DateTime(timezone=True), nullable=True)
+    last_payload_hash = Column(String, nullable=True)
+    fire_count        = Column(Integer, nullable=False, default=0)
+    created_at        = Column(DateTime(timezone=True), nullable=False, server_default="now()")
+    created_by_session = Column(String, nullable=True)
+
+    def __repr__(self):
+        return f"<WatchedEvent(id={self.id}, type={self.event_type!r}, label={self.label!r}, status={self.status!r})>"
+
+
+class WatchErrorLog(Base):
+    """Error log for failed api_poll or dispatcher attempts per watch."""
+    __tablename__ = "watch_error_log"
+
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    watch_id   = Column(Integer, ForeignKey("watched_events.id", ondelete="CASCADE"), nullable=False)
+    error      = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default="now()")
+
+    def __repr__(self):
+        return f"<WatchErrorLog(id={self.id}, watch_id={self.watch_id}, error={self.error[:60]!r})>"
+
+
+class TrainingSessionScore(Base):
+    """Quality score record for a single agent session, used to select export candidates."""
+    __tablename__ = "training_session_scores"
+
+    session_id  = Column(String, primary_key=True)
+    task_id     = Column(String, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
+    score       = Column(Float, nullable=False)
+    tags        = Column(JSON, nullable=False, default=list)
+    qualified   = Column(Boolean, nullable=False)
+    scored_at   = Column(DateTime(timezone=True), nullable=False, server_default="now()")
+    exported_at = Column(DateTime(timezone=True), nullable=True)
+
+    def __repr__(self):
+        return f"<TrainingSessionScore(session_id={self.session_id!r}, score={self.score}, tags={self.tags})>"
+
+
+class TrainingCheckpoint(Base):
+    """Records a model deployment event so metrics can be segmented before/after each version."""
+    __tablename__ = "training_checkpoints"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    checkpoint_name = Column(String, nullable=False)
+    model_notes     = Column(Text, nullable=True)
+    recorded_at     = Column(DateTime(timezone=True), nullable=False, server_default="now()")
+
+    def __repr__(self):
+        return f"<TrainingCheckpoint(id={self.id}, name={self.checkpoint_name!r})>"

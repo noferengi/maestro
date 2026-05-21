@@ -21,7 +21,7 @@ configure_logging(
 logger = logging.getLogger(__name__)
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
@@ -104,6 +104,24 @@ async def lifespan(app: FastAPI):
         logger.warning("check_builtin_templates failed: %s", exc)
     from app.agent.scheduler import start_scheduler
     start_scheduler()
+    # Start file-system watcher for file_watch event triggers (Gap 9).
+    try:
+        from app.agent.file_watcher import MaestroFileWatcher, _set_file_watcher
+        _fw = MaestroFileWatcher()
+        _fw.start()
+        _set_file_watcher(_fw)
+    except Exception as exc:
+        logger.warning("FileWatcher failed to start (non-fatal): %s", exc)
+    # Non-fatal Docker availability check — math tooling needs Docker Desktop running.
+    try:
+        import subprocess as _sp
+        _sp.run(["docker", "info"], capture_output=True, timeout=5, check=True)
+        logger.info("Docker available — math sandbox ready.")
+    except Exception:
+        logger.warning(
+            "Docker is not available. Math pipeline tooling (run_sympy, Lean4, Coq) "
+            "will return errors until Docker Desktop is started."
+        )
     try:
         yield
     finally:
@@ -115,6 +133,10 @@ async def lifespan(app: FastAPI):
             signal_shutdown()
             from app.agent.scheduler import stop_scheduler
             stop_scheduler(timeout=60.0)
+            from app.agent.file_watcher import get_file_watcher
+            fw = get_file_watcher()
+            if fw:
+                fw.stop()
         except KeyboardInterrupt:
             logger.info("Shutdown sequence interrupted by user. Exiting immediately.")
 
@@ -163,7 +185,7 @@ def _check_builtin_templates() -> None:
         "Novel Writing":                8,
         "Research Report":              9,
         "Data Analysis":                7,
-        "Mathematics / Proof Exploration": 8,
+        "Mathematics / Proof Exploration": 11,
         "Bug Triage":                   7,
         "Overnight Generation":         7,
     }
@@ -261,6 +283,10 @@ def update_existing_task(task_id: str, task_data: dict):
     # Only allow updating specific fields
     allowed_fields = ['title', 'description', 'owner', 'tags', 'content', 'llm_id', 'budget_id', 'type', 'prerequisites', 'map_x', 'map_y', 'review_notes', 'stage_key', 'pipeline_template_id', 'goal_id']
     update_data = {key: value for key, value in task_data.items() if key in allowed_fields}
+
+    # When a human explicitly sets llm_id via the UI, pin it so routing doesn't override it
+    if 'llm_id' in update_data and update_data['llm_id'] is not None:
+        update_data['llm_pinned'] = True
 
     # Gate: advancing a task requires description, llm_id, and budget_id
     new_type = update_data.get('type')
@@ -814,6 +840,7 @@ def _pipeline_session(func):
         "_run_final_review_pipeline_bg": "final_review",
         "_run_loop_bg": "maestro_loop",
         "_run_intake_bg": "intake",
+        "_run_reflection_bg": "reflection_agent",
     }
 
     @functools.wraps(func)
@@ -1765,16 +1792,65 @@ def _run_final_review_pipeline_bg(task_id: str) -> None:
         _teardown_worktree(task_id, project_path, worktree_path)
 
 
+def _merge_to_integration_branch(task_id: str) -> "str | None":
+    """Merge maestro/task-{task_id} into maestro/self-improvement. Returns new HEAD SHA or None."""
+    import subprocess as _sp
+    from app.agent.config import (
+        GIT_SAFETY_BRANCH_PREFIX, SELF_MOD_INTEGRATION_BRANCH, MAESTRO_GIT_ROOT, PROJECT_ROOT
+    )
+
+    repo = MAESTRO_GIT_ROOT or PROJECT_ROOT
+    task_branch = f"{GIT_SAFETY_BRANCH_PREFIX}{task_id}"
+
+    def _git(*args):
+        return _sp.run(["git"] + list(args), capture_output=True, text=True, timeout=30, cwd=repo)
+
+    # Ensure integration branch exists
+    r = _git("checkout", SELF_MOD_INTEGRATION_BRANCH)
+    if r.returncode != 0:
+        # Create integration branch from main if it doesn't exist
+        r = _git("checkout", "-b", SELF_MOD_INTEGRATION_BRANCH, "main")
+        if r.returncode != 0:
+            logger.error("[self-mod] Could not create integration branch: %s", r.stderr)
+            return None
+
+    r = _git("merge", "--no-ff", task_branch, "-m",
+             f"self-mod: merge {task_branch} into {SELF_MOD_INTEGRATION_BRANCH}")
+    if r.returncode != 0:
+        logger.error("[self-mod] Merge failed: %s", r.stderr)
+        _git("merge", "--abort")
+        return None
+
+    r = _git("rev-parse", "HEAD")
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
 def _execute_merge_bg(task_id: str) -> None:
     """Background runner for merge to main."""
     try:
         from app.agent.merge import execute_merge
         from app.database import get_project_path
+        from app.agent.config import MAESTRO_CAPABILITIES, SELF_MODIFICATION_PROJECT
 
         task = get_task(task_id)
         project_path = None
         if task and task.project:
             project_path = get_project_path(task.project)
+
+        # Self-modification project: redirect to integration branch if auto-merge enabled
+        if (task and task.project == SELF_MODIFICATION_PROJECT
+                and MAESTRO_CAPABILITIES.can_auto_merge_human_review
+                and MAESTRO_CAPABILITIES.can_auto_merge_self_modification):
+            sha = _merge_to_integration_branch(task_id)
+            if sha:
+                from app.database import record_self_mod_merge
+                record_self_mod_merge(task_id, sha)
+                update_task(task_id, type="completed")
+                logger.info("[self-mod] Task '%s' auto-merged to integration branch (%s).", task_id, sha)
+            else:
+                update_task(task_id, type="human_review")
+                logger.error("[self-mod] Task '%s' integration branch merge failed. Moved to human_review.", task_id)
+            return
 
         result = execute_merge(task_id, project_path=project_path)
 
@@ -1842,6 +1918,29 @@ def _record_demotion(task_id: str, from_stage: str, to_stage: str, reason: str) 
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
     update_task(task_id, demotion_count=(task.demotion_count or 0) + 1, demotion_history=history)
+
+    # Record failure episode in episodic memory (best-effort, never blocks demotion)
+    try:
+        import app.agent.config as _cfg
+        if _cfg.EPISODIC_MEMORY_ENABLED and task.project_id is not None:
+            from app.agent.episodic_memory import insert_episode
+            insert_episode(
+                project_id=task.project_id,
+                task_id=task_id,
+                episode_type="failure",
+                content=(
+                    f"Task '{task.title}' demoted from {from_stage} to {to_stage}. "
+                    f"Reason: {reason[:400]}"
+                ),
+                metadata={
+                    "stage_key": from_stage,
+                    "task_title": task.title,
+                    "outcome": "demotion",
+                },
+                settings=_cfg,
+            )
+    except Exception:
+        pass  # episodic write is never allowed to break demotion logic
 
     # Trigger PIP generation if demoted from a review stage
     review_stages = {"conceptual_review", "optimization", "security", "final_review", "human_review"}
@@ -3681,6 +3780,9 @@ def create_project(data: dict):
     budget_id = data.get("budget_id") or None
     if budget_id is not None:
         budget_id = int(budget_id)
+    maestro_llm_id = data.get("maestro_llm_id") or None
+    if maestro_llm_id is not None:
+        maestro_llm_id = int(maestro_llm_id)
     pipeline_template_id = data.get("pipeline_template_id") or None
     if pipeline_template_id is not None:
         pipeline_template_id = int(pipeline_template_id)
@@ -3691,6 +3793,7 @@ def create_project(data: dict):
         description=description,
         llm_id=llm_id if llm_id is not None else ...,
         budget_id=budget_id if budget_id is not None else ...,
+        maestro_llm_id=maestro_llm_id if maestro_llm_id is not None else ...,
         pipeline_template_id=pipeline_template_id if pipeline_template_id is not None else ...,
     )
     if not project:
@@ -3726,9 +3829,19 @@ def update_project(project_name: str, data: dict):
     budget_id = data.get("budget_id", ...)  # Ellipsis = don't change; None = clear
     if budget_id is not ... and budget_id is not None:
         budget_id = int(budget_id)
+    maestro_llm_id = data.get("maestro_llm_id", ...)  # Ellipsis = don't change; None = clear
+    if maestro_llm_id is not ... and maestro_llm_id is not None:
+        maestro_llm_id = int(maestro_llm_id)
     pipeline_template_id = data.get("pipeline_template_id", ...)
     if pipeline_template_id is not ... and pipeline_template_id is not None:
         pipeline_template_id = int(pipeline_template_id)
+    autopilot_budget_id = data.get("autopilot_budget_id", ...)
+    if autopilot_budget_id is not ... and autopilot_budget_id is not None:
+        autopilot_budget_id = int(autopilot_budget_id)
+    autopilot_max_in_flight = data.get("autopilot_max_in_flight", ...)
+    if autopilot_max_in_flight is not ... and autopilot_max_in_flight is not None:
+        autopilot_max_in_flight = int(autopilot_max_in_flight)
+    exclude_from_training = data.get("exclude_from_training", ...)
 
     project = upsert_project(
         effective_name,
@@ -3736,13 +3849,131 @@ def update_project(project_name: str, data: dict):
         description=description,
         llm_id=llm_id,
         budget_id=budget_id,
-        pipeline_template_id=pipeline_template_id
+        maestro_llm_id=maestro_llm_id,
+        pipeline_template_id=pipeline_template_id,
+        autopilot_budget_id=autopilot_budget_id,
+        autopilot_max_in_flight=autopilot_max_in_flight,
+        exclude_from_training=exclude_from_training,
     )
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or update failed.")
     if project.path:
         _trigger_project_prewarm(project.name, project.path, project_llm_id=project.llm_id, project_budget_id=project.budget_id)
     return _project_to_dict(project)
+
+
+# ============================================
+# Autopilot Objectives Endpoints
+# ============================================
+
+@app.get("/api/projects/{project_name}/objectives/tree")
+def get_project_objectives_tree(project_name: str):
+    """Return all objectives as a nested tree (children embedded under parents)."""
+    from database import get_objective_tree
+    project = get_project(project_name)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return get_objective_tree(project.id)
+
+
+@app.get("/api/projects/{project_name}/objectives")
+def list_project_objectives(project_name: str, status: str = "active"):
+    """List autopilot objectives for a project (filter by status: active|paused|complete|all)."""
+    from database import list_objectives, objective_to_dict
+    project = get_project(project_name)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    status_filter = None if status == "all" else status
+    objs = list_objectives(project.id, status=status_filter)
+    return [objective_to_dict(o) for o in objs]
+
+
+@app.post("/api/projects/{project_name}/objectives")
+def create_project_objective(project_name: str, data: dict):
+    """Create a new autopilot objective for a project."""
+    from database import create_objective, objective_to_dict
+    project = get_project(project_name)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    description = (data.get("description") or "").strip()
+    if not description:
+        raise HTTPException(status_code=422, detail="description is required")
+    priority = int(data.get("priority", 5))
+    time_box_hours = data.get("time_box_hours")
+    if time_box_hours is not None:
+        time_box_hours = int(time_box_hours)
+    parent_id = data.get("parent_id")
+    if parent_id is not None:
+        parent_id = int(parent_id)
+    created_by = data.get("created_by", "human")
+    if created_by not in ("human", "maestro"):
+        created_by = "human"
+    obj = create_objective(
+        project.id,
+        description,
+        priority=priority,
+        time_box_hours=time_box_hours,
+        parent_id=parent_id,
+        created_by=created_by,
+    )
+    if not obj:
+        raise HTTPException(status_code=500, detail="Failed to create objective")
+    return objective_to_dict(obj)
+
+
+@app.put("/api/projects/{project_name}/objectives/{obj_id}")
+def update_project_objective(project_name: str, obj_id: int, data: dict):
+    """Edit an objective's description, priority, time_box_hours, or status."""
+    from database import get_objective, update_objective, objective_to_dict
+    project = get_project(project_name)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    obj = get_objective(obj_id)
+    if not obj or obj.project_id != project.id:
+        raise HTTPException(status_code=404, detail="Objective not found")
+    kwargs = {}
+    if "description" in data and data["description"] is not None:
+        kwargs["description"] = data["description"].strip()
+    if "priority" in data and data["priority"] is not None:
+        kwargs["priority"] = int(data["priority"])
+    if "time_box_hours" in data:
+        kwargs["time_box_hours"] = int(data["time_box_hours"]) if data["time_box_hours"] is not None else None
+    if "status" in data and data["status"] in ("active", "paused", "complete"):
+        kwargs["status"] = data["status"]
+    if "appears_complete_since" in data and data["appears_complete_since"] is None:
+        kwargs["appears_complete_since"] = None
+    updated = update_objective(obj_id, **kwargs)
+    if not updated:
+        raise HTTPException(status_code=500, detail="Update failed")
+    return objective_to_dict(updated)
+
+
+@app.delete("/api/projects/{project_name}/objectives/{obj_id}")
+def delete_project_objective(project_name: str, obj_id: int):
+    """Delete an autopilot objective."""
+    from database import get_objective, delete_objective
+    project = get_project(project_name)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    obj = get_objective(obj_id)
+    if not obj or obj.project_id != project.id:
+        raise HTTPException(status_code=404, detail="Objective not found")
+    ok = delete_objective(obj_id)
+    return {"deleted": ok}
+
+
+@app.get("/api/projects/{project_name}/objectives/{obj_id}/evidence")
+def get_project_objective_evidence(project_name: str, obj_id: int):
+    """Return the plain-text evidence log for an objective."""
+    from database import get_objective, get_objective_evidence
+    project = get_project(project_name)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    obj = get_objective(obj_id)
+    if not obj or obj.project_id != project.id:
+        raise HTTPException(status_code=404, detail="Objective not found")
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(get_objective_evidence(obj_id))
 
 
 # ============================================
@@ -4170,6 +4401,9 @@ def create_new_llm(data: dict):
     mc = data.get('max_context', 4096)
     if not isinstance(mc, int) or mc < MIN_CONTEXT_SIZE or mc > MAX_CONTEXT_SIZE:
         raise HTTPException(status_code=400, detail=f"max_context must be {MIN_CONTEXT_SIZE}-{MAX_CONTEXT_SIZE}")
+    _VALID_CAPABILITY_TAGS = {"reasoning", "code", "math", "fast", "long_context", "cheap"}
+    raw_caps = data.get('capabilities', [])
+    caps = [c for c in (raw_caps if isinstance(raw_caps, list) else []) if c in _VALID_CAPABILITY_TAGS]
     llm = create_llm(
         address=data['address'],
         port=data.get('port', 8008),
@@ -4183,11 +4417,14 @@ def create_new_llm(data: dict):
     )
     if not llm:
         raise HTTPException(status_code=409, detail="LLM with this address/port/model already exists")
-    # Optionally assign a compute node
+    cap_updates: dict = {}
     if 'compute_node_id' in data:
-        node_id = data['compute_node_id'] or None
-        update_llm(llm.id, compute_node_id=node_id)
-        llm = get_llm(llm.id)
+        cap_updates['compute_node_id'] = data['compute_node_id'] or None
+    cap_updates['capabilities'] = caps
+    cap_updates['supports_tools'] = bool(data.get('supports_tools', True))
+    cap_updates['supports_vision'] = bool(data.get('supports_vision', False))
+    update_llm(llm.id, **cap_updates)
+    llm = get_llm(llm.id)
     return llm_to_dict(llm)
 
 
@@ -4227,14 +4464,19 @@ def sync_delete_llm_with_cache(llm_id: int):
 
 @app.put("/api/llms/{llm_id}", response_model=dict)
 def update_existing_llm(llm_id: int, data: dict):
+    _VALID_CAPABILITY_TAGS = {"reasoning", "code", "math", "fast", "long_context", "cheap"}
     allowed = ['address', 'port', 'model', 'settings', 'parallel_sessions', 'max_context', 'notes',
                'cost_per_million_prompt_tokens', 'cost_per_million_completion_tokens',
-               'compute_node_id']
+               'compute_node_id', 'capabilities', 'supports_tools', 'supports_vision']
     updates = {k: v for k, v in data.items() if k in allowed}
-    # Normalize compute_node_id: empty string or 0 → None
     if 'compute_node_id' in updates:
         raw = updates['compute_node_id']
         updates['compute_node_id'] = int(raw) if raw else None
+    if 'capabilities' in updates:
+        caps = updates['capabilities']
+        if not isinstance(caps, list):
+            caps = []
+        updates['capabilities'] = [c for c in caps if c in _VALID_CAPABILITY_TAGS]
     llm = sync_update_llm_with_cache(llm_id, **updates)
 
     if not llm:
@@ -6233,6 +6475,62 @@ def run_final_review_on_demand(task_id: str):
     return {"task_id": task_id, "status": "STARTED", "pipeline": "final_review"}
 
 
+@_pipeline_session
+def _run_reflection_bg(task_id: str) -> None:
+    """On-demand: run the reflection agent for a task's current (or synthetic) stage."""
+    try:
+        import asyncio
+        from app.agent.pipeline_router import StageConfig, get_stage_config
+        from app.agent.stage_executors import _run_reflection_agent
+
+        task = get_task(task_id)
+        if not task:
+            return
+
+        project_path = _setup_thread_context(task)
+        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
+
+        # Use the task's current stage if it is a reflection stage; else synthesise one.
+        stage_config = get_stage_config(task_id)
+        if stage_config is None or stage_config.agent_type != "reflection_agent":
+            stage_config = StageConfig(
+                stage_key="reflection",
+                label="Reflection",
+                agent_type="reflection_agent",
+                position=0,
+                config={},
+                template_id=0,
+                stage_id=0,
+            )
+
+        _run_reflection_agent(
+            task_id=task_id,
+            stage_config=stage_config,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            max_context=max_context,
+            llm_id=task.llm_id,
+            budget_id=task.budget_id,
+            project_path=project_path,
+        )
+    except ShutdownError:
+        logger.info("[reflection] Task '%s' aborted due to server shutdown.", task_id)
+    except Exception:
+        logger.exception("[reflection] Task '%s' failed.", task_id)
+
+
+@app.post("/api/tasks/{task_id}/trigger-reflection", response_model=dict)
+def run_reflection_on_demand(task_id: str):
+    """Manually trigger the reflection agent for a task."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not task.llm_id or not task.budget_id:
+        raise HTTPException(status_code=400, detail="Task needs an LLM endpoint and budget assigned.")
+    _start_bg(_run_reflection_bg, task_id)
+    return {"task_id": task_id, "status": "STARTED", "pipeline": "reflection"}
+
+
 # ===========================================================================
 # PIP (Performance Improvement Plan) endpoints
 # ===========================================================================
@@ -6414,6 +6712,74 @@ def unmerge_task(task_id: str):
     updated = update_task(task_id, type="human_review")
     append_task_history(task_id, "unmerged", message=f"Merge commit {sha[:8]} reverted. Moved back to Human Review.")
     return {**task_to_dict(updated), "git": f"reverted {sha[:8]}"}
+
+
+# ---------------------------------------------------------------------------
+# Gap 5 — Self-modification routes
+# ---------------------------------------------------------------------------
+
+@app.post("/api/tasks/{task_id}/self-mod-merge", response_model=dict)
+def self_mod_merge(task_id: str):
+    """Manually merge a _maestro_self task to maestro/self-improvement after tests pass."""
+    import subprocess as _sp
+    from app.agent.config import MAESTRO_CAPABILITIES, SELF_MODIFICATION_PROJECT, PROJECT_ROOT
+
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.project != SELF_MODIFICATION_PROJECT:
+        raise HTTPException(status_code=400, detail="Not a self-modification project task")
+    if not MAESTRO_CAPABILITIES.can_self_modify:
+        raise HTTPException(status_code=403, detail="can_self_modify is disabled in maestro.ini")
+
+    result = _sp.run(
+        ["venv/Scripts/python.exe", "-m", "pytest", "app/tests/", "-q", "--tb=short"],
+        capture_output=True, text=True, timeout=120, cwd=PROJECT_ROOT,
+    )
+    if result.returncode != 0:
+        return {"error": "Tests failed", "output": result.stdout + result.stderr}
+
+    sha = _merge_to_integration_branch(task_id)
+    if not sha:
+        raise HTTPException(status_code=500, detail="Integration branch merge failed")
+
+    from app.database import record_self_mod_merge
+    record_self_mod_merge(task_id, sha)
+    update_task(task_id, type="completed")
+    return {"merge_commit": sha, "branch": "maestro/self-improvement"}
+
+
+@app.get("/api/tasks/{task_id}/revert-votes", response_model=list)
+def get_task_revert_votes(task_id: str):
+    """Return all revert votes for the most recent self-mod merge commit associated with this task."""
+    from app.database import get_revert_votes, get_latest_self_mod_merge
+    merge_commit = get_latest_self_mod_merge()
+    if not merge_commit:
+        return []
+    return get_revert_votes(merge_commit)
+
+
+@app.get("/api/projects/_maestro_self/integration-branch-status", response_model=dict)
+def integration_branch_status():
+    """Return the current status of the maestro/self-improvement integration branch."""
+    import subprocess as _sp
+    from app.agent.config import SELF_MOD_INTEGRATION_BRANCH, MAESTRO_GIT_ROOT, PROJECT_ROOT
+
+    repo = MAESTRO_GIT_ROOT or PROJECT_ROOT
+
+    def _git(*args):
+        r = _sp.run(["git"] + list(args), capture_output=True, text=True, timeout=15, cwd=repo)
+        return r.stdout.strip() if r.returncode == 0 else None
+
+    head_sha = _git("rev-parse", SELF_MOD_INTEGRATION_BRANCH) or "branch not found"
+    ahead_raw = _git("rev-list", "--count", f"main..{SELF_MOD_INTEGRATION_BRANCH}")
+    ahead = int(ahead_raw) if ahead_raw and ahead_raw.isdigit() else 0
+
+    return {
+        "branch": SELF_MOD_INTEGRATION_BRANCH,
+        "head_sha": head_sha,
+        "commits_ahead_of_main": ahead,
+    }
 
 
 @app.get("/api/agent/tasks/ready", response_model=List[dict])
@@ -7101,6 +7467,125 @@ def set_project_settings_api(name: str, data: dict = Body(...)):
 
 
 # ---------------------------------------------------------------------------
+# Model routing API (GAP 10)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/projects/{name}/routing", response_model=dict)
+def get_project_routing(name: str):
+    """Return the per-project stage→LLM routing table as {stage_key: llm_id}."""
+    from database import get_project, get_routing_table
+    project = get_project(name)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
+    return get_routing_table(project.id)
+
+
+@app.put("/api/projects/{name}/routing/{stage}", response_model=dict)
+def put_project_routing(name: str, stage: str, data: dict = Body(...)):
+    """Upsert a routing entry.  Body: {\"llm_id\": N}"""
+    from database import get_project, upsert_routing_entry
+    project = get_project(name)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
+    llm_id = data.get("llm_id")
+    if not llm_id:
+        raise HTTPException(status_code=400, detail="llm_id is required")
+    upsert_routing_entry(project.id, stage, int(llm_id))
+    return {"ok": True}
+
+
+@app.delete("/api/projects/{name}/routing/{stage}", response_model=dict)
+def delete_project_routing(name: str, stage: str):
+    """Remove a stage routing override, reverting to project default."""
+    from database import get_project, delete_routing_entry
+    project = get_project(name)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
+    delete_routing_entry(project.id, stage)
+    return {"ok": True}
+
+
+@app.get("/api/projects/{name}/cost-by-model", response_model=dict)
+def get_cost_by_model(name: str):
+    """Return token/cost breakdown grouped by model and by stage for a project."""
+    from database import get_project, SessionLocal
+    from database import LLM, BudgetEntry, Task
+    project = get_project(name)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
+
+    db = SessionLocal()
+    try:
+        # by_model: aggregate tokens/cost per llm_id
+        from sqlalchemy import func
+        by_model_rows = (
+            db.query(
+                BudgetEntry.llm_id,
+                func.sum(BudgetEntry.prompt_cost).label("total_prompt"),
+                func.sum(BudgetEntry.generation_cost).label("total_completion"),
+            )
+            .join(Task, Task.id == BudgetEntry.task_id)
+            .filter(Task.project_id == project.id)
+            .group_by(BudgetEntry.llm_id)
+            .all()
+        )
+
+        by_model = []
+        for row in by_model_rows:
+            llm = db.query(LLM).filter_by(id=row.llm_id).first() if row.llm_id else None
+            prompt_tokens = row.total_prompt or 0
+            completion_tokens = row.total_completion or 0
+            total_tokens = prompt_tokens + completion_tokens
+            cost_usd = 0.0
+            if llm:
+                cost_usd = (
+                    prompt_tokens / 1_000_000 * (llm.cost_per_million_prompt_tokens or 0)
+                    + completion_tokens / 1_000_000 * (llm.cost_per_million_completion_tokens or 0)
+                )
+            by_model.append({
+                "llm_id": row.llm_id,
+                "model_name": llm.model if llm else None,
+                "total_tokens": total_tokens,
+                "total_cost_usd": round(cost_usd, 6),
+            })
+
+        # by_stage: aggregate cost per (stage_key, llm_id)
+        by_stage_rows = (
+            db.query(
+                Task.stage_key,
+                BudgetEntry.llm_id,
+                func.sum(BudgetEntry.prompt_cost).label("total_prompt"),
+                func.sum(BudgetEntry.generation_cost).label("total_completion"),
+            )
+            .join(Task, Task.id == BudgetEntry.task_id)
+            .filter(Task.project_id == project.id)
+            .group_by(Task.stage_key, BudgetEntry.llm_id)
+            .all()
+        )
+
+        by_stage = []
+        for row in by_stage_rows:
+            llm = db.query(LLM).filter_by(id=row.llm_id).first() if row.llm_id else None
+            prompt_tokens = row.total_prompt or 0
+            completion_tokens = row.total_completion or 0
+            cost_usd = 0.0
+            if llm:
+                cost_usd = (
+                    prompt_tokens / 1_000_000 * (llm.cost_per_million_prompt_tokens or 0)
+                    + completion_tokens / 1_000_000 * (llm.cost_per_million_completion_tokens or 0)
+                )
+            by_stage.append({
+                "stage_key": row.stage_key,
+                "llm_id": row.llm_id,
+                "total_cost_usd": round(cost_usd, 6),
+            })
+    finally:
+        db.close()
+
+    return {"by_model": by_model, "by_stage": by_stage}
+
+
+# ---------------------------------------------------------------------------
 # Document store API
 # ---------------------------------------------------------------------------
 
@@ -7174,3 +7659,100 @@ def list_task_documents(task_id: str):
     """List all documents written by a specific task (metadata only)."""
     from database import list_documents_written_by_task
     return list_documents_written_by_task(task_id)
+
+
+# ===========================================================================
+# Event-driven trigger API  (Gap 9)
+# ===========================================================================
+
+@app.post("/api/events/inbound/{watch_id}")
+async def inbound_webhook(watch_id: int, request: Request):
+    """Receive an inbound webhook and fire the corresponding event watch."""
+    import hmac as _hmac
+    import hashlib as _hashlib
+    from app.database.crud_events import get_watch
+    from app.agent.event_dispatcher import EventDispatcher
+
+    body = await request.body()
+
+    watch = get_watch(watch_id)
+    if not watch or watch.status != "active":
+        raise HTTPException(status_code=404, detail="Watch not found or inactive")
+
+    secret = (watch.source_config or {}).get("secret")
+    if secret:
+        sig = request.headers.get("X-Hub-Signature-256", "")
+        expected = "sha256=" + _hmac.new(
+            secret.encode(), body, _hashlib.sha256
+        ).hexdigest()
+        if not _hmac.compare_digest(sig, expected):
+            raise HTTPException(status_code=403, detail="Invalid signature")
+
+    payload = body.decode("utf-8", errors="replace")[:16384]
+
+    import asyncio as _asyncio
+    import concurrent.futures as _cf
+    with _cf.ThreadPoolExecutor(max_workers=1) as _pool:
+        result = await _asyncio.get_event_loop().run_in_executor(
+            _pool, lambda: EventDispatcher().dispatch(watch_id, payload)
+        )
+    return result
+
+
+# ===========================================================================
+# Training data pipeline API  (Gap 11)
+# ===========================================================================
+
+@app.get("/api/training/status", response_model=dict)
+def get_training_status_route():
+    """Return training export status: qualified count, last export time, file list."""
+    from app.database.crud_training import get_training_status
+    from app.agent.config import TRAINING_EXPORT_THRESHOLD, TRAINING_EXPORT_DIR
+    status = get_training_status(export_dir=TRAINING_EXPORT_DIR)
+    status["threshold"] = TRAINING_EXPORT_THRESHOLD
+    return status
+
+
+@app.post("/api/training/export", response_model=dict)
+def trigger_training_export():
+    """Manually trigger a training export regardless of the threshold."""
+    from app.agent.training_exporter import run_export
+    from app.agent.config import (
+        TRAINING_EXPORT_DIR, TRAINING_EXPORT_MAX_PER_RUN, TRAINING_DEDUP_MAX
+    )
+    result = run_export(
+        export_dir=TRAINING_EXPORT_DIR,
+        export_max=TRAINING_EXPORT_MAX_PER_RUN,
+        dedup_max=TRAINING_DEDUP_MAX,
+    )
+    if result is None:
+        return {"count": 0, "path": None}
+    path, count = result
+    return {"count": count, "path": path}
+
+
+@app.get("/api/training/metrics", response_model=dict)
+def get_training_metrics_route(after: int | None = None):
+    """Return performance metrics, optionally filtered to after a checkpoint."""
+    from app.database.crud_training import get_training_metrics
+    return get_training_metrics(after_checkpoint_id=after)
+
+
+@app.post("/api/training/checkpoints", response_model=dict)
+def create_training_checkpoint_route(data: dict = Body(...)):
+    """Record a model deployment event checkpoint."""
+    from app.database.crud_training import create_training_checkpoint, checkpoint_to_dict
+    name = data.get("name", "").strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="name is required")
+    cp = create_training_checkpoint(name, notes=data.get("notes"))
+    if not cp:
+        raise HTTPException(status_code=500, detail="Failed to create checkpoint")
+    return checkpoint_to_dict(cp)
+
+
+@app.get("/api/training/checkpoints", response_model=list)
+def list_training_checkpoints_route():
+    """List all model deployment checkpoints, newest first."""
+    from app.database.crud_training import list_training_checkpoints, checkpoint_to_dict
+    return [checkpoint_to_dict(cp) for cp in list_training_checkpoints()]

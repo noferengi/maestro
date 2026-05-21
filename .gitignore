@@ -59,6 +59,7 @@ logs/
 /.maestro-worktrees/
 maestro.db
 tempbackup/
+backups/
 
 # Secrets — never commit
 .env

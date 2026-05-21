@@ -155,6 +155,10 @@ class MaestroLoop:
             set_task_git_cwd(self.project_path)
             logger.info("Task '%s': git cwd set to '%s'.", self.task_id, self.project_path)
 
+        from app.agent.tools import reset_consult_count, _ask_depth_ctx
+        reset_consult_count(self.task_id)
+        _ask_depth_ctx.set(0)  # root session always starts at depth 0
+
         try:
             return await self._loop()
         except asyncio.CancelledError:
@@ -421,6 +425,37 @@ class MaestroLoop:
                 except Exception:
                     pass  # goal injection is best-effort, never block the agent
 
+                # Gap 4 — inject autopilot objective context for tasks spawned by an objective
+                try:
+                    if _task_rec and _task_rec.autopilot_objective_id:
+                        from app.database import get_objective, list_objectives
+                        obj = get_objective(_task_rec.autopilot_objective_id)
+                        if obj and obj.status != "complete":
+                            created_str = obj.created_at.strftime("%Y-%m-%d") if obj.created_at else "unknown"
+                            pip_block += "\n\n### AUTOPILOT OBJECTIVE\n"
+                            pip_block += (
+                                f"[P{obj.priority}] {sanitize_user_content(obj.description)}\n"
+                                f"Status: {obj.status} | Created by: {obj.created_by} | "
+                                f"Started: {created_str}\n"
+                            )
+                            if obj.last_assessment:
+                                pip_block += f"Latest assessment: {sanitize_user_content(obj.last_assessment)}\n"
+                            pip_block += (
+                                f"Evidence log: call get_objective_evidence(objective_id={obj.id})"
+                                " to read the full history.\n"
+                            )
+                            others = [
+                                o for o in list_objectives(obj.project_id, status="active")
+                                if o.id != obj.id
+                            ]
+                            if others:
+                                pip_block += "\n**Other active objectives (summaries):**\n"
+                                for o in others:
+                                    pip_block += f"- [P{o.priority}] id={o.id}: {sanitize_user_content(o.description)}\n"
+                                pip_block += "Use get_objective_detail(id) to read any of the above in full.\n"
+                except Exception:
+                    pass  # objective injection is best-effort, never block the agent
+
                 # Inject demotion history so re-entering dev sessions know why they were sent back
                 if _task_rec and _task_rec.demotion_history:
                     recent = _task_rec.demotion_history[-3:]
@@ -434,13 +469,41 @@ class MaestroLoop:
         except Exception:
             pass
 
+        # Auto-inject relevant past episodes (Gap 7 — episodic memory)
+        episode_block = ""
+        try:
+            import app.agent.config as _cfg
+            if (
+                _cfg.EPISODIC_MEMORY_ENABLED
+                and _cfg.EPISODIC_MEMORY_AUTO_INJECT_K > 0
+                and _task_rec
+                and _task_rec.project_id is not None
+            ):
+                from app.agent.episodic_memory import query_episodes
+                episodes = query_episodes(
+                    project_id=_task_rec.project_id,
+                    question=(_task_rec.description or _task_rec.title or self.task_id),
+                    k=_cfg.EPISODIC_MEMORY_AUTO_INJECT_K,
+                    settings=_cfg,
+                )
+                if episodes:
+                    lines = ["\n\n### Relevant past experience"]
+                    for ep in episodes:
+                        ts = ep["created_at"].strftime("%Y-%m-%d") if ep.get("created_at") else "?"
+                        lines.append(
+                            f"- [{ep['episode_type']} | {ts}] {ep['content']}"
+                        )
+                    episode_block = "\n".join(lines) + "\n"
+        except Exception:
+            pass  # episodic injection is always best-effort
+
         return [
             {"role": "system", "content": MAESTRO_SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": (
                     f"Your assigned task ID is: **{self.task_id}**"
-                    f"{snapshot_block}{arch_block}{pip_block}\n\n"
+                    f"{snapshot_block}{arch_block}{pip_block}{episode_block}\n\n"
                     f"Begin by calling get_task('{self.task_id}') to load the full "
                     f"task definition, including the approved PLANNING result "
                     f"(file_manifest, implementation_steps, interface_contracts). "
@@ -657,6 +720,22 @@ class MaestroLoop:
             )
 
         _LOOP_STATUS[self.task_id] = self._status_dict(result)
+
+        # Enqueue async session-end summary job (Gap 7 — episodic memory)
+        if sig != SIGNAL_CONSULT:  # don't summarise paused sessions
+            try:
+                import app.agent.config as _cfg
+                if _cfg.EPISODIC_MEMORY_ENABLED:
+                    from app.database import create_episodic_summary_job
+                    create_episodic_summary_job(
+                        task_id=self.task_id,
+                        final_status=sig or "UNKNOWN",
+                        llm_id=self.llm_id,
+                        budget_id=self.budget_id,
+                    )
+            except Exception:
+                pass  # job enqueue must never break session teardown
+
         return result
 
     def _revert_result(self, reason: str) -> LoopResult:

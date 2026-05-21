@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-import tempfile
 
 logger = logging.getLogger(__name__)
 
@@ -83,40 +82,64 @@ def _run_sympy(task_id: str, config: dict) -> bool:
     if not proof_code:
         logger.warning("[verifiers] python_sympy: no sympy_proof_code in task content (task=%s)", task_id)
         return False
-    try:
-        result = subprocess.run(
-            ["python", "-c", proof_code],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode != 0:
-            logger.info(
-                "[verifiers] python_sympy: proof failed (task=%s)\nstderr: %s",
-                task_id, result.stderr[:500],
-            )
-        return result.returncode == 0
-    except subprocess.TimeoutExpired:
+    from app.agent.sandbox import run_in_sandbox
+    result = run_in_sandbox(proof_code, lang="python", timeout=30)
+    if result.get("error"):
+        logger.error("[verifiers] python_sympy: Docker unavailable (task=%s): %s", task_id, result["error"])
+        return False
+    if result.get("timed_out"):
         logger.warning("[verifiers] python_sympy: timeout after 30s (task=%s)", task_id)
         return False
-    except Exception as exc:
-        logger.error("[verifiers] python_sympy: subprocess error (task=%s): %s", task_id, exc)
-        return False
+    if not result.get("ok"):
+        logger.info(
+            "[verifiers] python_sympy: proof failed (task=%s)\nstderr: %s",
+            task_id, result.get("stderr", "")[:500],
+        )
+    return bool(result.get("ok"))
 
 
 def _run_lean4(task_id: str, config: dict) -> bool:
-    # Lean 4 integration is deferred — the slot exists but is not yet wired.
-    logger.warning(
-        "[verifiers] lean4 verifier is a stub — Lean 4 not yet integrated (task=%s)", task_id
-    )
-    return False
+    content = _get_task_content(task_id)
+    lean_source = content.get("lean4_proof", "")
+    if not lean_source:
+        logger.warning("[verifiers] lean4: no lean4_proof in task content (task=%s)", task_id)
+        return False
+    from app.agent.sandbox import run_in_sandbox
+    result = run_in_sandbox(lean_source, lang="lean4", timeout=120)
+    if result.get("error"):
+        logger.error("[verifiers] lean4: Docker unavailable (task=%s): %s", task_id, result["error"])
+        return False
+    if result.get("timed_out"):
+        logger.warning("[verifiers] lean4: timed out (task=%s)", task_id)
+        return False
+    if not result.get("ok"):
+        logger.info(
+            "[verifiers] lean4: verification failed (task=%s)\n%s",
+            task_id, result.get("stderr", ""),
+        )
+    return bool(result.get("ok"))
 
 
 def _run_coq(task_id: str, config: dict) -> bool:
-    logger.warning(
-        "[verifiers] coq verifier is a stub — Coq not yet integrated (task=%s)", task_id
-    )
-    return False
+    content = _get_task_content(task_id)
+    coq_proof = content.get("coq_proof", "")
+    if not coq_proof:
+        logger.warning("[verifiers] coq: no coq_proof in task content (task=%s)", task_id)
+        return False
+    from app.agent.sandbox import run_in_sandbox
+    result = run_in_sandbox(coq_proof, lang="coq", timeout=120)
+    if result.get("error"):
+        logger.error("[verifiers] coq: Docker unavailable (task=%s): %s", task_id, result["error"])
+        return False
+    if result.get("timed_out"):
+        logger.warning("[verifiers] coq: timed out (task=%s)", task_id)
+        return False
+    if not result.get("ok"):
+        logger.info(
+            "[verifiers] coq: verification failed (task=%s)\n%s",
+            task_id, result.get("stderr", ""),
+        )
+    return bool(result.get("ok"))
 
 
 def _run_custom(task_id: str, config: dict) -> bool:

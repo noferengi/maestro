@@ -94,7 +94,7 @@ def store_document(
             existing.deleted_at = None  # un-delete if previously soft-deleted
             db.commit()
             db.refresh(existing)
-            return _doc_to_dict(existing)
+            result = _doc_to_dict(existing)
         else:
             doc = ProjectDocument(
                 project_id=project_id,
@@ -108,7 +108,26 @@ def store_document(
             db.add(doc)
             db.commit()
             db.refresh(doc)
-            return _doc_to_dict(doc)
+            result = _doc_to_dict(doc)
+
+    # Record document episode in episodic memory (best-effort, outside the with-block)
+    if len(content) > 100:
+        try:
+            import app.agent.config as _cfg
+            if _cfg.EPISODIC_MEMORY_ENABLED:
+                from app.agent.episodic_memory import insert_episode
+                insert_episode(
+                    project_id=project_id,
+                    task_id=written_by_task_id,
+                    episode_type="document",
+                    content=f"[{key}] {content[:2000]}",
+                    metadata={"source_key": key, "project_id": project_id},
+                    settings=_cfg,
+                )
+        except Exception:
+            pass  # episodic write must never break document storage
+
+    return result
 
 
 # ---------------------------------------------------------------------------

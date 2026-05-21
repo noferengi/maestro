@@ -1,110 +1,11 @@
 import configparser
 import json
 from pathlib import Path
-from datetime import datetime, timezone
 
 description = "malleable pipelines baseline - phase 1 (PostgreSQL)"
 
 
 def up(conn):
-    if not conn.is_postgres:
-        print("[0070] SQLite detected — adding compatible columns and tables for existing tests.")
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS pipeline_templates (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                name        TEXT    NOT NULL UNIQUE,
-                description TEXT,
-                is_default  INTEGER NOT NULL DEFAULT 0,
-                is_builtin  INTEGER NOT NULL DEFAULT 0,
-                version     INTEGER NOT NULL DEFAULT 1,
-                created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS pipeline_stage_groups (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                template_id INTEGER NOT NULL REFERENCES pipeline_templates(id),
-                name        TEXT    NOT NULL,
-                color       TEXT,
-                position    INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS pipeline_stages (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                template_id INTEGER NOT NULL REFERENCES pipeline_templates(id),
-                stage_key   TEXT    NOT NULL,
-                label       TEXT    NOT NULL,
-                agent_type  TEXT    NOT NULL,
-                position    INTEGER NOT NULL,
-                group_id    INTEGER REFERENCES pipeline_stage_groups(id),
-                config      TEXT,
-                color       TEXT,
-                UNIQUE(template_id, stage_key)
-            );
-            CREATE TABLE IF NOT EXISTS pipeline_transitions (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                template_id   INTEGER NOT NULL REFERENCES pipeline_templates(id),
-                from_stage_id INTEGER NOT NULL REFERENCES pipeline_stages(id),
-                to_stage_id   INTEGER NOT NULL REFERENCES pipeline_stages(id),
-                condition     TEXT    NOT NULL CHECK(condition IN ('pass','fail','reject','always','skip')),
-                priority      INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS pipeline_arch_categories (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                template_id INTEGER NOT NULL REFERENCES pipeline_templates(id),
-                key         TEXT    NOT NULL,
-                label       TEXT    NOT NULL,
-                color       TEXT,
-                position    INTEGER NOT NULL,
-                UNIQUE(template_id, key)
-            );
-            CREATE TABLE IF NOT EXISTS project_documents (
-                id                 INTEGER  PRIMARY KEY AUTOINCREMENT,
-                project_id         INTEGER  NOT NULL REFERENCES projects(id),
-                key                TEXT     NOT NULL,
-                content            TEXT     NOT NULL,
-                tags               TEXT,
-                written_by_task_id TEXT     REFERENCES tasks(id),
-                created_at         DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at         DATETIME DEFAULT CURRENT_TIMESTAMP,
-                deleted_at         DATETIME,
-                UNIQUE(project_id, key)
-            );
-            CREATE TABLE IF NOT EXISTS archived_files (
-                id             INTEGER  PRIMARY KEY AUTOINCREMENT,
-                task_id        TEXT     NOT NULL REFERENCES tasks(id),
-                original_path  TEXT     NOT NULL,
-                archive_path   TEXT     NOT NULL UNIQUE,
-                deleted_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
-                restored_at    DATETIME
-            );
-            CREATE TABLE IF NOT EXISTS project_settings (
-                project_id INTEGER NOT NULL REFERENCES projects(id),
-                key        TEXT    NOT NULL,
-                value      TEXT    NOT NULL,
-                PRIMARY KEY (project_id, key)
-            );
-            CREATE TABLE IF NOT EXISTS custom_agent_definitions (
-                id            INTEGER  PRIMARY KEY AUTOINCREMENT,
-                name          TEXT     NOT NULL UNIQUE,
-                display_name  TEXT     NOT NULL,
-                description   TEXT,
-                intent        TEXT,
-                system_prompt TEXT     NOT NULL DEFAULT '',
-                allowed_tools TEXT     NOT NULL DEFAULT '[]',
-                gate_type     TEXT     NOT NULL DEFAULT 'llm_judge',
-                verifier      TEXT     NOT NULL DEFAULT 'none',
-                verifier_cmd  TEXT,
-                created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        try:
-            conn.execute("ALTER TABLE tasks ADD COLUMN stage_key TEXT")
-        except Exception: pass
-        try:
-            conn.execute("ALTER TABLE projects ADD COLUMN pipeline_template_id INTEGER")
-        except Exception: pass
-        conn.execute("UPDATE tasks SET stage_key = type WHERE stage_key IS NULL")
-        return
-
     print("[0070] Starting malleable pipelines migration (Phase 1)...")
 
     # 1. Create New Tables
@@ -235,7 +136,7 @@ def up(conn):
         VALUES ('Software Development', 'Standard design-implement-verify pipeline', TRUE, TRUE)
         ON CONFLICT (name) DO NOTHING
     """)
-    
+
     res = conn.execute("SELECT id FROM pipeline_templates WHERE name = 'Software Development'")
     template_id = res.fetchone()['id']
 
@@ -283,7 +184,7 @@ def up(conn):
         VALUES (:tid, 'Optimization + Security', '#ff9800', 4)
         ON CONFLICT DO NOTHING
     """, {"tid": template_id})
-    
+
     res = conn.execute("SELECT id FROM pipeline_stage_groups WHERE template_id = :tid AND name = 'Optimization + Security'", {"tid": template_id})
     group_id = res.fetchone()['id']
 
@@ -332,7 +233,7 @@ def up(conn):
     # 8. Insert default arch categories
     print("[0070] Seeding arch categories...")
     arch_categories = [
-        "Platform", "Design", "Testing", "Performance", "API", "Data", "Tooling", 
+        "Platform", "Design", "Testing", "Performance", "API", "Data", "Tooling",
         "Security", "DevOps", "Documentation", "Quality", "Cost", "Scalability", "General"
     ]
     for pos, label in enumerate(arch_categories):
@@ -357,14 +258,11 @@ def up(conn):
     print("[0070] Backfilling existing data...")
     conn.execute("UPDATE tasks SET stage_key = type WHERE stage_key IS NULL")
     conn.execute("UPDATE projects SET pipeline_template_id = :tid WHERE pipeline_template_id IS NULL", {"tid": template_id})
-    
+
     print("[0070] Malleable pipelines Phase 1 migration complete.")
 
 
 def down(conn):
-    if not conn.is_postgres:
-        return
-
     conn.execute("ALTER TABLE projects DROP COLUMN IF EXISTS pipeline_template_id")
     conn.execute("ALTER TABLE tasks DROP COLUMN IF EXISTS stage_key")
     conn.executescript("""

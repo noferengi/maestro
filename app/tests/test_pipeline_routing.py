@@ -317,6 +317,7 @@ class TestSchedulerDispatch:
         patches = [
             patch(self._DB_GET_ALL, return_value=[]),
             patch("app.agent.scheduler._cleanup_finished"),
+            patch("app.agent.scheduler._check_model_block_timeout"),
             patch(self._DAG_RESOLVER, return_value=self._resolver_returning(ready_tasks)),
             patch("threading.Thread", mock_thread),
         ]

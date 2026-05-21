@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from sqlalchemy import or_, and_
 
 from .session import SessionLocal
-from .models import ResearchJob, FileSummaryJob, OptimizationBenchmark, ArchGenJob, Project
+from .models import ResearchJob, FileSummaryJob, OptimizationBenchmark, ArchGenJob, Project, EpisodicSummaryJob
 
 logger = logging.getLogger(__name__)
 
@@ -540,5 +540,95 @@ def get_retriable_arch_gen_jobs(
     except Exception as exc:
         logger.error("Error getting retriable arch_gen_jobs: %s", exc)
         return []
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# EpisodicSummaryJob — async session-end LLM summarisation (Gap 7)
+# ---------------------------------------------------------------------------
+
+def create_episodic_summary_job(
+    task_id: str,
+    final_status: str,
+    *,
+    llm_id: "int | None" = None,
+    budget_id: "int | None" = None,
+    priority: float = 0.5,
+    tier: int = 2,
+) -> "EpisodicSummaryJob | None":
+    """Insert a new pending episodic summary job."""
+    db = SessionLocal()
+    try:
+        job = EpisodicSummaryJob(
+            task_id=task_id,
+            final_status=final_status,
+            llm_id=llm_id,
+            budget_id=budget_id,
+            priority=priority,
+            tier=tier,
+            status="pending",
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        return job
+    except Exception as exc:
+        db.rollback()
+        logger.error("Error creating episodic_summary_job for task %s: %s", task_id, exc)
+        return None
+    finally:
+        db.close()
+
+
+def get_pending_episodic_summary_jobs(limit: int = 10) -> "list[EpisodicSummaryJob]":
+    """Return pending episodic summary jobs ordered by tier ASC, priority ASC, created_at ASC."""
+    db = SessionLocal()
+    try:
+        return (
+            db.query(EpisodicSummaryJob)
+            .filter(EpisodicSummaryJob.status == "pending")
+            .order_by(
+                EpisodicSummaryJob.tier,
+                EpisodicSummaryJob.priority,
+                EpisodicSummaryJob.created_at,
+            )
+            .limit(limit)
+            .all()
+        )
+    except Exception as exc:
+        logger.error("Error fetching pending episodic_summary_jobs: %s", exc)
+        return []
+    finally:
+        db.close()
+
+
+def update_episodic_summary_job(job_id: int, **kwargs) -> None:
+    """Update fields on an episodic summary job; auto-sets completed_at on terminal status."""
+    db = SessionLocal()
+    try:
+        job = db.query(EpisodicSummaryJob).filter(EpisodicSummaryJob.id == job_id).first()
+        if not job:
+            return
+        for key, value in kwargs.items():
+            setattr(job, key, value)
+        if kwargs.get("status") in ("completed", "failed") and job.completed_at is None:
+            job.completed_at = datetime.utcnow()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.error("Error updating episodic_summary_job %d: %s", job_id, exc)
+    finally:
+        db.close()
+
+
+def get_episodic_summary_job(job_id: int) -> "EpisodicSummaryJob | None":
+    """Fetch a single episodic summary job by id."""
+    db = SessionLocal()
+    try:
+        return db.query(EpisodicSummaryJob).filter(EpisodicSummaryJob.id == job_id).first()
+    except Exception as exc:
+        logger.error("Error fetching episodic_summary_job %d: %s", job_id, exc)
+        return None
     finally:
         db.close()

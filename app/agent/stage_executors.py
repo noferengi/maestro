@@ -3,10 +3,11 @@ app/agent/stage_executors.py
 ------------------------------
 Generic pipeline node executors registered via register_agent_type_executor().
 
-Three executor types:
+Four executor types:
   circuit_breaker  — configurable attempt counter; parks or fails when exhausted
   voting_panel     — N-voter LLM panel with tally strategy
   fan_out_judge    — best-of-N parallel agents + LLM judge picks the winner
+  reflection_agent — skeptical post-stage reviewer; stores confidence report
 
 Each executor has a public runner function (_run_*) that is registered in
 scheduler.py at import time.  The function signature matches the agent-type
@@ -546,6 +547,75 @@ def _run_fan_out_judge(
 
     except Exception:
         logger.exception("[fan_out_judge] task '%s' stage '%s' raised.", task_id, stage_config.stage_key)
+    finally:
+        close_agent_session(session_id, exit_reason, "")
+        try:
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=5.0))
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Reflection Agent
+# ---------------------------------------------------------------------------
+
+def _run_reflection_agent(
+    task_id: str,
+    stage_config: StageConfig,
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """
+    Run ReflectionAgent for a pipeline stage of agent_type 'reflection_agent'.
+
+    Stores a structured JSON confidence report at
+    reflection:{task_id}:{stage_key} in the project document store, then
+    advances the stage unconditionally (condition='pass').  Maestro reads
+    the report on its next tick and decides consequence.
+
+    Stage config keys (all optional):
+        system_prompt                — override default skeptical-reviewer prompt
+        reflection_llm_id            — specific LLM for this reflection stage
+        reflection_max_history_turns — cap on get_task_history_recent (default 20)
+        max_turns                    — agent turn limit (default 150)
+    """
+    from app.database import create_agent_session, close_agent_session
+    from app.agent.reflection_agent import ReflectionAgent
+
+    session_id = create_agent_session(
+        task_id=task_id,
+        agent_type=f"reflection_agent:{stage_config.stage_key}",
+        llm_id=llm_id,
+        budget_id=budget_id,
+        scheduler_reason="scheduler",
+    )
+    exit_reason = "error"
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        agent = ReflectionAgent(
+            task_id=task_id,
+            stage_config=stage_config,
+            llm_id=llm_id,
+            budget_id=budget_id,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            max_context=max_context,
+        )
+        result = loop.run_until_complete(agent.run())
+        exit_reason = (result or {}).get("condition", "pass") if isinstance(result, dict) else "pass"
+
+    except Exception:
+        logger.exception("[reflection_agent] task '%s' stage '%s' raised.", task_id, stage_config.stage_key)
     finally:
         close_agent_session(session_id, exit_reason, "")
         try:

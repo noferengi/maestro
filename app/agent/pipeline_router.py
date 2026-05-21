@@ -266,6 +266,16 @@ def advance_stage(task_id: str, condition: str, *, from_stage: "str | None" = No
         except Exception:
             logger.debug("[pipeline_router] goal auto-trigger skipped", exc_info=True)
 
+        # When a card with an autopilot objective completes, trigger an autopilot tick.
+        try:
+            task = get_task(task_id)
+            if task and task.autopilot_objective_id and task.project_id:
+                proj_name = task.project or f"project-{task.project_id}"
+                from app.agent.scheduler import _trigger_autopilot_tick
+                _trigger_autopilot_tick(task.project_id, proj_name)
+        except Exception:
+            logger.debug("[pipeline_router] autopilot tick trigger skipped", exc_info=True)
+
     return True
 
 

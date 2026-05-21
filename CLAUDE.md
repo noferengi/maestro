@@ -43,15 +43,26 @@ The test suite uses a real PostgreSQL database (configured via `MAESTRO_TEST_DB`
 
 ## Environment & configuration
 
-**Database:** Configured via `.env` (loaded by `python-dotenv` in `app/agent/config.py`).
-Copy `.env.example` to `.env` and fill in credentials. Key variables:
+**Remote server — `arcbox`:** A single remote machine called `arcbox` hosts both the
+PostgreSQL database cluster and the Docker daemon. All database URLs point to `arcbox:5432`
+and all Docker operations route through `DOCKER_HOST=ssh://freazer@arcbox`. The math
+pipeline sandbox image (`sympy-lean4-sandbox:latest`, ~2 GB, Lean 4.29.1 + SymPy 1.14)
+is pre-built and resident on arcbox — container startup is instant with no network download.
+
+**Credentials:** All secrets and connection overrides are fully configured in `.env` and
+must not be re-entered or re-prompted. The `.env` file sets:
 
 ```
-MAESTRO_DATABASE_URL=postgresql://...    # application connection
-MAESTRO_ADMIN_DATABASE_URL=postgresql:// # migration runner (needs schema perms)
-TAVILY_API_KEY=                          # optional; for Tavily web search
-BRAVE_API_KEY=                           # optional; for Brave web search
+MAESTRO_DATABASE_URL          # app user → arcbox PostgreSQL
+MAESTRO_ADMIN_DATABASE_URL    # admin user → arcbox PostgreSQL (DDL / migrations)
+MAESTRO_TEST_DATABASE_URL     # test DB → arcbox PostgreSQL
+MAESTRO_TEST_ADMIN_DATABASE_URL
+DOCKER_HOST=ssh://freazer@arcbox   # remote Docker daemon
+TAVILY_API_KEY / BRAVE_API_KEY     # search provider keys
 ```
+
+Copy `.env.example` to `.env` and fill in credentials for a fresh setup; on this machine
+the file is already populated and all services are reachable.
 
 Config load order (highest priority wins): env vars → `maestro.ini` → built-in defaults.
 

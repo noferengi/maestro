@@ -248,6 +248,12 @@ _llm_counts_lock = threading.Lock()
 _last_global_heartbeat = 0.0
 _HEARTBEAT_INTERVAL_SECONDS = 300.0  # 5 minutes
 
+_last_training_score = time.time()          # Don't fire on first tick; wait 1 hour
+_TRAINING_SCORE_INTERVAL_SECONDS = 3600.0   # 1 hour
+
+_last_training_export_check = time.time()   # Don't fire on first tick; wait 24 hours
+_TRAINING_EXPORT_INTERVAL_SECONDS = 86400.0  # 24 hours
+
 # Rate-limiting for Maestro logs to prevent log flooding
 _project_last_maestro_log = {}  # project_name -> {log_type: timestamp}
 _MAESTRO_LOG_INTERVAL = 300.0   # 5 minutes
@@ -265,6 +271,63 @@ def _log_project_maestro(project_name: str, log_type: str, message: str, level: 
     else:
         # Always log at DEBUG level even if rate-limited for INFO
         logger.debug(message)
+
+# ---------------------------------------------------------------------------
+# Inter-agent session query helpers (Gap 8)
+# ---------------------------------------------------------------------------
+
+def get_active_session_info(task_id: str) -> "dict | None":
+    """Return metadata for a running session keyed by task_id, or None if not alive."""
+    with _active_sessions_lock:
+        thread = _active_sessions.get(task_id)
+        if thread is None or not thread.is_alive():
+            return None
+        return {
+            "task_id": task_id,
+            "title": _session_titles.get(task_id),
+            "type": _session_types.get(task_id),
+            "llm_id": _session_llm_ids.get(task_id),
+        }
+
+
+def list_active_sessions(
+    exclude_task_id: "str | None" = None,
+    project_filter: "str | None" = None,
+) -> "list[dict]":
+    """Return all alive sessions, optionally excluding the caller and filtering by project."""
+    with _active_sessions_lock:
+        snapshot = [
+            (tid, thread)
+            for tid, thread in _active_sessions.items()
+            if thread.is_alive() and tid != exclude_task_id
+        ]
+        entries = [
+            {
+                "session_id": tid,
+                "task_id": tid,
+                "task_title": _session_titles.get(tid, tid),
+                "agent_type": _session_types.get(tid, "unknown"),
+                "llm_id": _session_llm_ids.get(tid),
+            }
+            for tid, _ in snapshot
+        ]
+
+    if not project_filter:
+        return entries
+
+    # Filter by project — requires a DB lookup outside the lock
+    filtered = []
+    for entry in entries:
+        try:
+            from app.database import get_task as _db_get_task
+            task = _db_get_task(entry["task_id"])
+            if task is not None and task.project == project_filter:
+                entry["project"] = task.project
+                filtered.append(entry)
+        except Exception:
+            pass
+    return filtered
+
 
 # ---------------------------------------------------------------------------
 # Session management
@@ -1186,6 +1249,26 @@ def _check_and_reserve_slot(
     return True
 
 
+def _check_model_block_timeout(task_id: str, required_llm_id: int) -> None:
+    """If a task has been waiting for its required model beyond the timeout, mark it blocked."""
+    from app.database import get_task
+    from app.database.crud_tasks import mark_dispatch_waiting, set_task_blocked_on_model
+    from app.agent.config import MODEL_BLOCK_TIMEOUT_MINUTES
+    db_task = get_task(task_id)
+    if db_task is None:
+        return
+    if db_task.dispatch_waiting_since is None:
+        mark_dispatch_waiting(task_id)
+        return
+    wait_minutes = (datetime.utcnow() - db_task.dispatch_waiting_since.replace(tzinfo=None)).total_seconds() / 60
+    if wait_minutes >= MODEL_BLOCK_TIMEOUT_MINUTES:
+        logger.warning(
+            "Task '%s' has been waiting %.1f min for LLM %d — marking blocked_on_model.",
+            task_id, wait_minutes, required_llm_id,
+        )
+        set_task_blocked_on_model(task_id, required_llm_id)
+
+
 def _dispatch_pipeline_tasks_tiered(
     tier: int,
     ready_tasks: list,
@@ -1251,7 +1334,7 @@ def _dispatch_pipeline_tasks_tiered(
                 continue
 
         db_task = get_task(task_id)
-        if not db_task or not db_task.llm_id:
+        if not db_task:
             continue
 
         _content_blob = db_task.content or {}
@@ -1267,17 +1350,23 @@ def _dispatch_pipeline_tasks_tiered(
             except Exception:
                 pass
 
-        llm = get_llm(db_task.llm_id)
+        from app.agent.config import resolve_llm_for_task
+        required_llm_id = resolve_llm_for_task(db_task, db_task.stage_key or task_type)
+        if not required_llm_id:
+            continue
+
+        llm = get_llm(required_llm_id)
         if not llm:
             continue
 
         if allowed_llm_id is not None and llm.id != allowed_llm_id:
+            _check_model_block_timeout(task_id, required_llm_id)
             continue
         if allowed_llm_id is None:
             allowed_llm_id = llm.id
             logger.info("[%s] One-LLM policy: pinning to LLM %d (%s).", AGENT_NAME, llm.id, llm.model)
 
-        worst = _estimate_worst_case_microcents(db_task.llm_id, db_task.budget_id)
+        worst = _estimate_worst_case_microcents(required_llm_id, db_task.budget_id)
         if worst > 0 and not budget_has_capacity(db_task.budget_id, worst):
             logger.info(
                 "[%s] Skipping task '%s' - budget %s insufficient (%d µ¢ worst-case).",
@@ -1303,7 +1392,14 @@ def _dispatch_pipeline_tasks_tiered(
             llm, node_active_counts, node_session_counts, node_obj_cache, llm_node_cache,
             label=f"task '{task_id}'",
         ):
+            _check_model_block_timeout(task_id, required_llm_id)
             continue
+
+        # Auto-assign llm_id on the task record (not pinned — routing table drove this)
+        if db_task.llm_id != required_llm_id or db_task.dispatch_waiting_since is not None:
+            from app.database import update_task
+            update_task(task_id, llm_id=required_llm_id, llm_pinned=False,
+                        dispatch_waiting_since=None, blocked_on_model_id=None)
 
         logger.info(
             "Dispatching task '%s' (type=%s, tier=%d) to LLM %d (%s:%d %s) [slot %d/%d].",
@@ -1448,6 +1544,7 @@ def _tick() -> None:
 
     # ── TIER 1: Maestro-originated ───────────────────────────────────────────
     # MaestroAgent (stall recovery, heartbeat) and Maestro-created pipeline tasks.
+    _expire_autopilot_objectives()  # cheap DB check; no LLM slot needed
     if _free_slots(allowed_llm_id) > 0:
         allowed_llm_id = _dispatch_maestro(allowed_llm_id, *_cap_args)
     if _free_slots(allowed_llm_id) > 0:
@@ -1470,14 +1567,60 @@ def _tick() -> None:
         allowed_llm_id = _dispatch_goal_verification_jobs(allowed_llm_id, *_cap_args)
     if _free_slots(allowed_llm_id) > 0:
         allowed_llm_id = _dispatch_research_jobs(allowed_llm_id, *_cap_args)
+    if _free_slots(allowed_llm_id) > 0:
+        allowed_llm_id = _dispatch_episodic_summary_jobs(allowed_llm_id, *_cap_args)
     _dispatch_stranded_subdivisions(allowed_llm_id, *_cap_args)
     _dispatch_factory_triggers(allowed_llm_id)
+    _run_episodic_cleanup()
 
     # ── TIER 3: Background pipeline cards ────────────────────────────────────
     # Subdivision children, factory-created cards, system-owned tasks.
     # Only run when all higher-tier work is satisfied.
     if _free_slots(allowed_llm_id) > 0:
         _dispatch_pipeline_tasks_tiered(3, ready_tasks, allowed_llm_id, *_cap_args)
+
+    # ── API poll watches (Gap 9) ──────────────────────────────────────────────
+    # No LLM slot needed to check; dispatch happens inside poll_due_watches.
+    try:
+        from app.agent.api_poller import poll_due_watches
+        poll_due_watches()
+    except Exception as _poll_exc:
+        logger.debug("[Scheduler] api_poller error: %s", _poll_exc)
+
+    # ── Training pipeline (Gap 11) ────────────────────────────────────────────
+    # No LLM slot needed — pure DB reads/writes.
+    global _last_training_score, _last_training_export_check
+    _now = time.time()
+    if (_now - _last_training_score) >= _TRAINING_SCORE_INTERVAL_SECONDS:
+        _last_training_score = _now
+        try:
+            from app.database.crud_training import score_new_sessions
+            import threading as _threading
+            _threading.Thread(target=score_new_sessions, daemon=True,
+                              name="training-scorer").start()
+        except Exception as _train_exc:
+            logger.debug("[Scheduler] training scorer error: %s", _train_exc)
+    if (_now - _last_training_export_check) >= _TRAINING_EXPORT_INTERVAL_SECONDS:
+        _last_training_export_check = _now
+        try:
+            from app.database.crud_training import count_qualified_unexported
+            from app.agent.config import (
+                TRAINING_EXPORT_THRESHOLD, TRAINING_EXPORT_MAX_PER_RUN,
+                TRAINING_EXPORT_DIR, TRAINING_DEDUP_MAX,
+            )
+            if count_qualified_unexported() >= TRAINING_EXPORT_THRESHOLD:
+                from app.agent.training_exporter import run_export
+                import threading as _threading
+                _threading.Thread(
+                    target=run_export,
+                    kwargs={"export_dir": TRAINING_EXPORT_DIR,
+                            "export_max": TRAINING_EXPORT_MAX_PER_RUN,
+                            "dedup_max": TRAINING_DEDUP_MAX},
+                    daemon=True,
+                    name="training-exporter",
+                ).start()
+        except Exception as _export_exc:
+            logger.debug("[Scheduler] training export error: %s", _export_exc)
 
 
 def _dispatch_heartbeat_maestro(
@@ -1883,6 +2026,9 @@ def _dispatch_maestro(
             llm_model=llm_model,
         )
 
+        # Autopilot objectives tick — runs alongside Maestro stall response
+        _trigger_autopilot_tick(project.id, project_name)
+
     return allowed_llm_id
 
 
@@ -1948,6 +2094,328 @@ def _start_maestro_thread(
         _session_llm_ids[session_key] = llm_id
         _session_titles[session_key] = f"Maestro: {project_name}"
     t.start()
+
+
+def _run_autopilot_tick_for_project(project_id: int, project_name: str) -> None:
+    """Run one autopilot tick for a project: spin detection + LLM assessment + card creation.
+
+    Called from a background thread (non-blocking from the scheduler's perspective).
+    """
+    from app.database import (
+        list_objectives, get_in_flight_count, update_objective_status,
+        record_assessment, create_task, get_budget_spent_microcents,
+        get_budget,
+    )
+    from app.database.session import SessionLocal
+    from app.database.models import AutopilotObjective, Task, Project
+    from app.agent.config import (
+        AUTOPILOT_MAX_OBJECTIVES_PER_TICK,
+        AUTOPILOT_SPIN_DEMOTION_THRESHOLD,
+        AUTOPILOT_SPIN_CARD_THRESHOLD,
+        AUTOPILOT_ASSESSMENT_MAX_TURNS,
+    )
+
+    db = SessionLocal()
+    try:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return
+
+        active_objs = list_objectives(project_id, status="active")
+        if not active_objs:
+            return
+
+        in_flight = get_in_flight_count(project_id)
+        if in_flight >= project.autopilot_max_in_flight:
+            logger.info(
+                "[autopilot] project '%s' suppressed — board saturated (%d/%d in-flight)",
+                project_name, in_flight, project.autopilot_max_in_flight,
+            )
+            return
+
+        if project.autopilot_budget_id:
+            budget = get_budget(project.autopilot_budget_id)
+            if budget and budget.dollar_amount >= 0:
+                spent = get_budget_spent_microcents(project.autopilot_budget_id)
+                limit = int(budget.dollar_amount * 100_000_000)
+                if spent >= limit:
+                    logger.info(
+                        "[autopilot] project '%s' suppressed — autopilot budget exhausted",
+                        project_name,
+                    )
+                    return
+    finally:
+        db.close()
+
+    # Process top-priority objectives (up to cap)
+    for obj in active_objs[:AUTOPILOT_MAX_OBJECTIVES_PER_TICK]:
+        try:
+            _run_objective_assessment(obj, project_id, project_name)
+        except Exception:
+            logger.warning(
+                "[autopilot] assessment failed for objective %d", obj.id, exc_info=True
+            )
+
+
+def _detect_spin(objective_id: int) -> bool:
+    """Return True if this objective's spawned cards have cycled past the demotion threshold."""
+    from app.database.session import SessionLocal
+    from app.database.models import Task
+    from app.agent.config import AUTOPILOT_SPIN_DEMOTION_THRESHOLD, AUTOPILOT_SPIN_CARD_THRESHOLD
+
+    db = SessionLocal()
+    try:
+        count = (
+            db.query(Task)
+            .filter(
+                Task.autopilot_objective_id == objective_id,
+                Task.demotion_count >= AUTOPILOT_SPIN_DEMOTION_THRESHOLD,
+                Task.is_active == True,
+            )
+            .count()
+        )
+        return count >= AUTOPILOT_SPIN_CARD_THRESHOLD
+    finally:
+        db.close()
+
+
+def _run_objective_assessment(obj, project_id: int, project_name: str) -> None:
+    """Run LLM self-assessment for one objective; create cards and update DB state."""
+    import asyncio as _asyncio
+    import json as _json
+    from datetime import datetime, timezone
+    from app.database import (
+        record_assessment, update_objective_status,
+        create_task, get_task, get_tasks_by_project,
+        get_system_setting,
+    )
+    from app.database.session import SessionLocal
+    from app.database.models import Task, AutopilotObjective, Project
+    from app.agent.config import (
+        AUTOPILOT_ASSESSMENT_MAX_TURNS,
+        ORCHESTRATION_LLM_ID,
+    )
+
+    # --- spin detection (cheap, DB-only) ---
+    if _detect_spin(obj.id):
+        note = (
+            "Auto-paused: spin detected. Multiple spawned cards have been demoted "
+            "repeatedly without making progress. Human review needed."
+        )
+        update_objective_status(obj.id, "paused")
+        record_assessment(obj.id, note, tick=0, appears_complete=False)
+        logger.info("[autopilot] objective %d paused — spin detected", obj.id)
+        return
+
+    # --- resolve LLM to use for assessment ---
+    db = SessionLocal()
+    try:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return
+        maestro_llm_id = project.maestro_llm_id or ORCHESTRATION_LLM_ID
+        if maestro_llm_id is None:
+            raw = get_system_setting("maestro_llm_id")
+            maestro_llm_id = int(raw) if raw else None
+        if maestro_llm_id is None:
+            logger.info(
+                "[autopilot] objective %d skipped — no maestro_llm_id configured", obj.id
+            )
+            return
+        budget_id = project.autopilot_budget_id or project.budget_id
+
+        # Build tagged-card list for prompt
+        tagged_tasks = (
+            db.query(Task)
+            .filter(Task.autopilot_objective_id == obj.id, Task.is_active == True)
+            .all()
+        )
+        card_lines = "\n".join(
+            f"  - [{t.stage_key or t.type}] {t.title} (demotions: {t.demotion_count})"
+            for t in tagged_tasks
+        ) or "  (none yet)"
+    finally:
+        db.close()
+
+    time_box_str = f"{obj.time_box_hours}h" if obj.time_box_hours else "none"
+    created_str = obj.created_at.isoformat() if obj.created_at else "unknown"
+    prior_notes = obj.last_assessment or "(no prior assessment)"
+
+    assessment_prompt = f"""You are The Maestro. Evaluate progress toward an autopilot objective and decide the next action.
+
+Objective: {obj.description}
+Time box: {time_box_str}
+Created: {created_str}
+
+Cards spawned by this objective:
+{card_lines}
+
+Prior assessment notes:
+{prior_notes}
+
+Evaluate and respond with a JSON object ONLY (no markdown, no explanation):
+{{
+  "appears_complete": <true|false>,
+  "stuck": <true|false>,
+  "assessment_notes": "<narrative summary of progress>",
+  "new_cards": [
+    {{"title": "<card title>", "description": "<brief description>"}}
+  ]
+}}
+
+Rules:
+1. appears_complete = true ONLY if you are confident the objective is fully achieved.
+2. stuck = true if the objective is making no meaningful progress and a human should decide.
+3. new_cards: 0-3 IDEA card proposals. Empty list if no new work is needed.
+4. Dead ends are progress — "we know X doesn't work" is forward motion.
+"""
+
+    # --- call LLM via ConsultAgent-style single-turn call ---
+    try:
+        from app.agent.llm_client import call_llm
+        from app.database import get_llm
+
+        llm = get_llm(maestro_llm_id)
+        if not llm:
+            return
+        llm_base_url = f"http://{llm.address}:{llm.port}/v1"
+
+        loop = _asyncio.new_event_loop()
+        try:
+            raw_response = loop.run_until_complete(
+                call_llm(
+                    messages=[{"role": "user", "content": assessment_prompt}],
+                    llm_id=maestro_llm_id,
+                    budget_id=budget_id,
+                    model=llm.model,
+                    base_url=llm_base_url,
+                    max_tokens=2048,
+                    session_id=None,
+                )
+            )
+        finally:
+            loop.close()
+    except Exception as exc:
+        logger.warning("[autopilot] LLM call failed for objective %d: %s", obj.id, exc)
+        return
+
+    # --- parse response ---
+    content = ""
+    if raw_response and raw_response.get("choices"):
+        content = raw_response["choices"][0].get("message", {}).get("content", "")
+
+    try:
+        # Strip markdown fences if present
+        text = content.strip()
+        if text.startswith("```"):
+            text = text.split("```", 2)[-1].lstrip("json").strip().rstrip("`")
+        result = _json.loads(text)
+    except Exception:
+        logger.warning(
+            "[autopilot] Failed to parse JSON from assessment for objective %d: %r",
+            obj.id, content[:200],
+        )
+        return
+
+    appears_complete = bool(result.get("appears_complete", False))
+    stuck = bool(result.get("stuck", False))
+    notes = str(result.get("assessment_notes", ""))
+    new_cards = result.get("new_cards", [])
+
+    # --- record assessment in DB ---
+    record_assessment(obj.id, notes, tick=0, appears_complete=appears_complete)
+
+    # --- handle stuck ---
+    if stuck:
+        update_objective_status(obj.id, "paused")
+        logger.info("[autopilot] objective %d paused — LLM assessed as stuck", obj.id)
+        return
+
+    # --- multi-tick completion confirmation ---
+    db = SessionLocal()
+    try:
+        obj_fresh = db.query(AutopilotObjective).filter(AutopilotObjective.id == obj.id).first()
+        if appears_complete and obj_fresh and obj_fresh.appears_complete_since is not None:
+            from app.database import complete_objective
+            complete_objective(obj.id)
+            logger.info(
+                "[autopilot] objective %d marked complete (confirmed on second tick)", obj.id
+            )
+            return
+    finally:
+        db.close()
+
+    # --- create new IDEA cards ---
+    from app.agent.config import MAESTRO_CAPABILITIES
+    if isinstance(new_cards, list) and MAESTRO_CAPABILITIES.can_create_cards:
+        for card_spec in new_cards[:3]:
+            if not isinstance(card_spec, dict):
+                continue
+            title = str(card_spec.get("title", "")).strip()
+            description = str(card_spec.get("description", "")).strip()
+            if not title:
+                continue
+            try:
+                create_task(
+                    title=title,
+                    description=description,
+                    task_type="idea",
+                    project_id=project_id,
+                    stage_key="idea",
+                    autopilot_objective_id=obj.id,
+                )
+                logger.info(
+                    "[autopilot] created IDEA card '%s' for objective %d", title, obj.id
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[autopilot] failed to create card '%s': %s", title, exc
+                )
+
+
+def _trigger_autopilot_tick(project_id: int, project_name: str) -> None:
+    """Spawn a short-lived daemon thread to run an autopilot tick without blocking the scheduler."""
+    t = threading.Thread(
+        target=_run_autopilot_tick_for_project,
+        args=(project_id, project_name),
+        daemon=True,
+        name=f"autopilot-tick-{project_id}",
+    )
+    t.start()
+
+
+def _expire_autopilot_objectives() -> None:
+    """Flip any time-boxed objectives that have passed their expires_at to complete."""
+    from app.database.session import SessionLocal
+    from app.database.models import AutopilotObjective
+    from app.database import complete_objective
+    from datetime import datetime, timezone
+
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        expired = (
+            db.query(AutopilotObjective)
+            .filter(
+                AutopilotObjective.status == "active",
+                AutopilotObjective.expires_at != None,
+                AutopilotObjective.expires_at <= now,
+            )
+            .all()
+        )
+        for obj in expired:
+            db.close()
+            db = None
+            complete_objective(obj.id)
+            logger.info(
+                "[autopilot] objective %d expired — marked complete (time_box reached)", obj.id
+            )
+            db = SessionLocal()
+    except Exception as exc:
+        logger.warning("[autopilot] expire check failed: %s", exc)
+    finally:
+        if db:
+            db.close()
 
 
 def _dispatch_clarification_jobs(
@@ -5143,12 +5611,14 @@ from app.agent.stage_executors import (  # noqa: E402
     _run_circuit_breaker,
     _run_voting_panel,
     _run_fan_out_judge,
+    _run_reflection_agent,
 )
 from app.agent.pipeline_router import register_agent_type_executor as _reg_executor  # noqa: E402
 
-_reg_executor("circuit_breaker", _run_circuit_breaker)
-_reg_executor("voting_panel",    _run_voting_panel)
-_reg_executor("fan_out_judge",   _run_fan_out_judge)
+_reg_executor("circuit_breaker",   _run_circuit_breaker)
+_reg_executor("voting_panel",      _run_voting_panel)
+_reg_executor("fan_out_judge",     _run_fan_out_judge)
+_reg_executor("reflection_agent",  _run_reflection_agent)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -5395,6 +5865,8 @@ def _rescue_stale_jobs() -> None:
         update_file_summary_job,
         update_research_job,
         update_arch_gen_job,
+        get_pending_episodic_summary_jobs,
+        update_episodic_summary_job,
     )
 
     with _active_sessions_lock:
@@ -5519,6 +5991,242 @@ def _rescue_stale_jobs() -> None:
                     completed_at=None,
                     retry_count=retry_count + 1,
                 )
+
+    # --- Episodic summary jobs — reset orphaned 'running' rows ---
+    try:
+        from app.database.session import SessionLocal
+        from app.database.models import EpisodicSummaryJob as _ESJ
+        with SessionLocal() as db:
+            orphaned = db.query(_ESJ).filter(_ESJ.status == "running").all()  # ORM query — no text() needed
+        for job in orphaned:
+            session_key = f"episodic-summary-{job.id}"
+            with _active_sessions_lock:
+                is_alive = (
+                    session_key in _active_sessions
+                    and _active_sessions[session_key].is_alive()
+                )
+            if not is_alive:
+                logger.warning(
+                    "[rescue] episodic_summary job %d stuck in 'running' — resetting to pending.",
+                    job.id,
+                )
+                update_episodic_summary_job(job.id, status="pending", completed_at=None)
+    except Exception as exc:
+        logger.debug("[rescue] episodic_summary rescue check: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Episodic summary job dispatcher + runner (Gap 7)
+# ---------------------------------------------------------------------------
+
+_EPISODIC_SUMMARY_RETRY_COOLDOWN: float = 300.0   # 5 min cooldown for failed jobs
+_EPISODIC_SUMMARY_MAX_TURNS: int = 3              # not really turns; just for LLM calls
+_SUMMARY_PROMPT = (
+    "Summarise what this agent session attempted, what worked, and what failed. "
+    "Be specific about approaches and outcomes. Write 2-4 sentences only. "
+    "Focus on information that would help a future agent avoid the same mistakes "
+    "or recognise promising directions."
+)
+
+
+def _dispatch_episodic_summary_jobs(
+    allowed_llm_id: "int | None",
+    node_active_counts: "dict[int, int]",
+    node_session_counts: "dict[int, int]",
+    node_obj_cache: "dict[int, Any]",
+    llm_node_cache: "dict[int, int | None]",
+) -> "int | None":
+    """Dispatch pending episodic summary jobs (tier 2 — maintenance).
+    Returns the (possibly updated) allowed_llm_id.
+    """
+    from app.agent.config import EPISODIC_MEMORY_ENABLED
+    if not EPISODIC_MEMORY_ENABLED:
+        return allowed_llm_id
+
+    from app.database import get_pending_episodic_summary_jobs, update_episodic_summary_job, get_llm
+
+    pending = get_pending_episodic_summary_jobs(limit=5)
+    for job in pending:
+        if not job.llm_id:
+            continue
+
+        job_key = f"episodic-summary-{job.id}"
+        with _active_sessions_lock:
+            if job_key in _active_sessions and _active_sessions[job_key].is_alive():
+                continue
+
+        llm = get_llm(job.llm_id)
+        if not llm:
+            continue
+
+        if allowed_llm_id is not None and llm.id != allowed_llm_id:
+            continue
+        if allowed_llm_id is None:
+            allowed_llm_id = llm.id
+
+        if not _check_and_reserve_slot(
+            llm, node_active_counts, node_session_counts, node_obj_cache, llm_node_cache,
+            label=job_key,
+        ):
+            continue
+
+        update_episodic_summary_job(job.id, status="running")
+
+        thread = threading.Thread(
+            target=_run_episodic_summary_job,
+            args=(job, llm),
+            daemon=True,
+            name=f"maestro-episodic-summary-{job.id}",
+        )
+        with _active_sessions_lock:
+            _active_sessions[job_key] = thread
+            _session_llm_ids[job_key] = llm.id
+            _session_titles[job_key] = f"Episodic Summary: task {job.task_id}"
+        thread.start()
+
+    return allowed_llm_id
+
+
+def _run_episodic_summary_job(job: Any, llm: Any) -> None:
+    """Worker: generate a 2-4 sentence session summary and store it as an episode."""
+    import asyncio as _asyncio
+    import json as _json
+    from app.database import update_episodic_summary_job, get_task as _get_task, get_budget_entries
+    from app.agent.llm_client import call_llm
+    from app.agent.episodic_memory import insert_episode
+    import app.agent.config as _cfg
+
+    job_key = f"episodic-summary-{job.id}"
+    try:
+        task = _get_task(job.task_id)
+        if not task:
+            update_episodic_summary_job(job.id, status="failed")
+            return
+
+        # Fetch recent budget entries (up to 30 LLM turns)
+        entries = get_budget_entries(task_id=str(job.task_id), limit=30)
+
+        if not entries:
+            update_episodic_summary_job(job.id, status="completed")
+            return
+
+        # Build a condensed history text for the summarisation prompt
+        lines = []
+        for i, e in enumerate(entries):
+            preview = ""
+            try:
+                resp = _json.loads(e.response_data or "{}")
+                choices = resp.get("choices") or []
+                if choices:
+                    preview = (
+                        (choices[0].get("message") or {}).get("content") or ""
+                    )[:300]
+            except Exception:
+                pass
+            agent = e.agent_name or "?"
+            lines.append(f"[turn {i+1}] agent={agent}: {preview}")
+
+        history_text = "\n".join(lines)
+
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a concise technical analyst. Summarise agent sessions in 2-4 sentences.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Task: {task.title}\n"
+                    f"Final status: {job.final_status}\n\n"
+                    f"Recent session history (last {len(entries)} turns):\n{history_text}\n\n"
+                    f"{_SUMMARY_PROMPT}"
+                ),
+            },
+        ]
+
+        loop = _asyncio.new_event_loop()
+        try:
+            response = loop.run_until_complete(
+                call_llm(
+                    messages,
+                    base_url=llm.base_url,
+                    model=llm.model,
+                    tools=None,
+                    task_id=job.task_id,
+                    llm_id=job.llm_id,
+                    budget_id=job.budget_id,
+                    agent_name="episodic_summary",
+                )
+            )
+        finally:
+            loop.close()
+
+        summary_text = ""
+        if response and response.get("choices"):
+            summary_text = (
+                response["choices"][0].get("message", {}).get("content", "") or ""
+            ).strip()
+
+        if summary_text and task.project_id is not None:
+            insert_episode(
+                project_id=task.project_id,
+                task_id=job.task_id,
+                episode_type="session_summary",
+                content=f"Task '{task.title}' ({job.final_status}): {summary_text}",
+                metadata={
+                    "task_title": task.title,
+                    "final_status": job.final_status,
+                    "job_id": job.id,
+                },
+                settings=_cfg,
+            )
+
+        update_episodic_summary_job(job.id, status="completed")
+
+    except Exception as exc:
+        logger.error("[episodic_summary] job %d failed: %s", job.id, exc)
+        update_episodic_summary_job(job.id, status="failed")
+    finally:
+        job_key = f"episodic-summary-{job.id}"
+        with _active_sessions_lock:
+            _active_sessions.pop(job_key, None)
+            lid = _session_llm_ids.pop(job_key, None)
+        if lid is not None:
+            with _llm_counts_lock:
+                _llm_session_counts[lid] = max(0, _llm_session_counts.get(lid, 0) - 1)
+
+
+# ---------------------------------------------------------------------------
+# Nightly episodic memory cleanup
+# ---------------------------------------------------------------------------
+
+_last_episodic_cleanup: float = 0.0
+_EPISODIC_CLEANUP_INTERVAL: float = 86400.0  # 24 hours
+
+
+def _run_episodic_cleanup() -> None:
+    """Delete expired episodic_memory rows (expires_at < now). Runs once per day."""
+    global _last_episodic_cleanup
+    from app.agent.config import EPISODIC_MEMORY_ENABLED
+    if not EPISODIC_MEMORY_ENABLED:
+        return
+
+    now = time.time()
+    if now - _last_episodic_cleanup < _EPISODIC_CLEANUP_INTERVAL:
+        return
+    _last_episodic_cleanup = now
+
+    try:
+        from app.database.session import SessionLocal
+        from sqlalchemy import text as _sa_text
+        with SessionLocal() as db:
+            result = db.execute(_sa_text("DELETE FROM episodic_memory WHERE expires_at < now()"))
+            db.commit()
+            deleted = result.rowcount if hasattr(result, "rowcount") else "?"
+            if deleted and deleted != "?" and int(deleted) > 0:
+                logger.info("[episodic_cleanup] Deleted %s expired episode(s).", deleted)
+    except Exception as exc:
+        logger.warning("[episodic_cleanup] cleanup failed: %s", exc)
 
 
 def _task_to_mini_dict(task: Any) -> dict:

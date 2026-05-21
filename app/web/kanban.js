@@ -932,6 +932,10 @@ function renderTasksFromDatabase() {
 
     // Apply column ordering and group brackets from the active pipeline template
     applyPipelineTemplateLayout();
+
+    // Self-modification banner (Gap 5)
+    _renderSelfModBanner();
+    _loadSelfModBadges();
 }
 
 function updateTaskCounts() {
@@ -2546,7 +2550,7 @@ async function loadProjects() {
         container.innerHTML = '';
 
         projects.forEach(p => {
-            container.appendChild(_buildProjectTab(p.name, p.path, p.description, p.llm_id, p.budget_id));
+            container.appendChild(_buildProjectTab(p.name, p.path, p.description, p.llm_id, p.budget_id, p.autopilot_budget_id, p.autopilot_max_in_flight, p.exclude_from_training));
         });
 
         // If no project is selected yet, pick the first one
@@ -2562,7 +2566,7 @@ async function loadProjects() {
     }
 }
 
-function _buildProjectTab(name, path, description, llmId, budgetId) {
+function _buildProjectTab(name, path, description, llmId, budgetId, autopilotBudgetId, autopilotMaxInFlight, excludeFromTraining) {
     const tab = document.createElement('div');
     tab.className = 'project-tab';
     tab.setAttribute('data-project', name);
@@ -2579,7 +2583,7 @@ function _buildProjectTab(name, path, description, llmId, budgetId) {
     gear.title = 'Edit project settings';
     gear.addEventListener('click', (e) => {
         e.stopPropagation();
-        openEditProjectModal(name, path || '', description || '', llmId || null, budgetId || null);
+        openEditProjectModal(name, path || '', description || '', llmId || null, budgetId || null, autopilotBudgetId || null, autopilotMaxInFlight != null ? autopilotMaxInFlight : 10, excludeFromTraining || false);
     });
 
     tab.appendChild(label);
@@ -2651,6 +2655,10 @@ function initializeModals() {
 
     document.getElementById('inbox-detail-modal').addEventListener('click', function(e) {
         if (e.target === this && _modalMousedownTarget === this) closeInboxDetailModal();
+    });
+
+    document.getElementById('training-status-modal').addEventListener('click', function(e) {
+        if (e.target === this && _modalMousedownTarget === this) closeTrainingStatusModal();
     });
 }
 
@@ -2812,7 +2820,7 @@ async function saveNewProject() {
     }
 }
 
-function openEditProjectModal(name, path, description, llmId, budgetId) {
+function openEditProjectModal(name, path, description, llmId, budgetId, autopilotBudgetId, autopilotMaxInFlight, excludeFromTraining) {
     document.getElementById('edit-project-original-name').value = name;
     document.getElementById('edit-project-modal-title').textContent = `Edit: ${name}`;
     document.getElementById('edit-project-name-input').value = name;
@@ -2823,6 +2831,13 @@ function openEditProjectModal(name, path, description, llmId, budgetId) {
     document.getElementById('edit-project-create-path').checked = false;
     populateProjectLlmSelect('edit-project-llm-select', llmId || null);
     populateProjectBudgetSelect('edit-project-budget-select', budgetId || null);
+    populateProjectBudgetSelect('edit-project-autopilot-budget-select', autopilotBudgetId || null);
+    document.getElementById('edit-project-max-in-flight').value = autopilotMaxInFlight != null ? autopilotMaxInFlight : 10;
+    document.getElementById('edit-project-exclude-training').checked = excludeFromTraining === true;
+    epCancelObjectiveForm();
+    epLoadObjectives(name);
+    loadProjectRouting(name);
+    loadCostByModel(name);
     document.getElementById('edit-project-modal').classList.add('active');
     document.getElementById('edit-project-path').focus();
 }
@@ -2840,6 +2855,11 @@ async function saveEditProject() {
     const llm_id = llmVal ? parseInt(llmVal, 10) : null;
     const budgetVal = document.getElementById('edit-project-budget-select').value;
     const budget_id = budgetVal ? parseInt(budgetVal, 10) : null;
+    const apBudgetVal = document.getElementById('edit-project-autopilot-budget-select').value;
+    const autopilot_budget_id = apBudgetVal ? parseInt(apBudgetVal, 10) : null;
+    const maxInFlightVal = document.getElementById('edit-project-max-in-flight').value;
+    const autopilot_max_in_flight = maxInFlightVal ? parseInt(maxInFlightVal, 10) : 10;
+    const exclude_from_training = document.getElementById('edit-project-exclude-training').checked;
     const create_if_missing = document.getElementById('edit-project-create-path').checked;
     const errEl = document.getElementById('edit-project-error');
     const warnEl = document.getElementById('edit-project-path-warn');
@@ -2854,7 +2874,7 @@ async function saveEditProject() {
         const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(originalName)}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: newName, path, description, llm_id, budget_id, create_if_missing }),
+            body: JSON.stringify({ name: newName, path, description, llm_id, budget_id, autopilot_budget_id, autopilot_max_in_flight, exclude_from_training, create_if_missing }),
         });
         if (!resp.ok) {
             const err = await resp.json().catch(() => ({}));
@@ -2905,6 +2925,355 @@ async function deleteProjectFromModal() {
         errEl.style.display = 'block';
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Objectives panel (inside edit-project-modal)
+// ──────────────────────────────────────────────────────────────────────────────
+
+async function epLoadObjectives(projectName) {
+    const container = document.getElementById('edit-project-objectives-list');
+    if (!container) return;
+    container.innerHTML = '<div style="color:#6c757d;font-size:0.85rem;padding:0.5rem 0">Loading…</div>';
+    try {
+        const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectName)}/objectives/tree`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const tree = await resp.json();
+        epRenderObjectivesTree(tree, projectName, container);
+    } catch (e) {
+        container.innerHTML = `<div style="color:#dc3545;font-size:0.85rem">Failed to load objectives: ${e.message}</div>`;
+    }
+}
+
+function epRenderObjectivesTree(tree, projectName, container, depth) {
+    depth = depth || 0;
+    if (depth === 0) {
+        if (!tree.length) {
+            container.innerHTML = '<div style="color:#6c757d;font-size:0.85rem;padding:0.25rem 0">No objectives yet.</div>';
+            return;
+        }
+        container.innerHTML = '';
+    }
+    tree.forEach(obj => {
+        const item = _epBuildObjectiveItem(obj, projectName, depth);
+        container.appendChild(item);
+        if (obj.children && obj.children.length) {
+            epRenderObjectivesTree(obj.children, projectName, container, depth + 1);
+        }
+    });
+}
+
+function _epBuildObjectiveItem(obj, projectName, depth) {
+    depth = depth || 0;
+    const item = document.createElement('div');
+    item.className = 'objective-item' + (depth > 0 ? ' obj-child' : '');
+    item.dataset.objId = obj.id;
+    if (depth > 0) item.style.marginLeft = (depth * 1.2) + 'rem';
+
+    const isStuck = obj.status === 'paused' && obj.last_assessment && obj.last_assessment.includes('spin');
+    const isAppComplete = obj.appears_complete_since && obj.status === 'active';
+
+    let statusBadge = '';
+    if (obj.status === 'active') statusBadge = '<span class="obj-status-badge obj-status-active">active</span>';
+    else if (obj.status === 'paused') statusBadge = '<span class="obj-status-badge obj-status-paused">paused</span>';
+    else if (obj.status === 'complete') statusBadge = '<span class="obj-status-badge obj-status-complete">complete</span>';
+
+    const maestroBadge = obj.created_by === 'maestro'
+        ? '<span class="obj-maestro-badge">maestro</span>'
+        : '';
+    const stuckBadge = isStuck ? '<span class="obj-stuck-badge">&#128308; Stuck — review needed</span>' : '';
+
+    const assessmentPreview = obj.last_assessment
+        ? `<div class="obj-assessment-preview">${obj.last_assessment.slice(0, 120)}${obj.last_assessment.length > 120 ? '…' : ''}</div>`
+        : '';
+
+    const completeBanner = isAppComplete
+        ? `<div class="obj-complete-banner">&#9888; Appears complete &mdash; <button class="btn-link" onclick="epConfirmComplete('${projectName}', ${obj.id})">Confirm &#10003;</button> &nbsp; <button class="btn-link obj-dismiss" onclick="epDismissComplete('${projectName}', ${obj.id})">Dismiss</button></div>`
+        : '';
+
+    const addSubBtn = obj.status !== 'complete' && depth === 0
+        ? `<button class="obj-action-btn" title="Add sub-objective" onclick="epShowAddSubObjectiveForm(${obj.id}, ${JSON.stringify(obj.description)})">&#8627;</button>`
+        : '';
+
+    const actionBtns = obj.status !== 'complete'
+        ? `<button class="obj-action-btn" title="Edit" onclick="epShowEditObjectiveForm(${obj.id}, ${JSON.stringify(obj.description)}, ${obj.priority}, ${obj.time_box_hours || ''})">✏</button>
+           ${addSubBtn}
+           ${obj.status === 'active'
+               ? `<button class="obj-action-btn" title="Pause" onclick="epSetStatus('${projectName}', ${obj.id}, 'paused')">⏸</button>`
+               : `<button class="obj-action-btn" title="Resume" onclick="epSetStatus('${projectName}', ${obj.id}, 'active')">▶</button>`}
+           <button class="obj-action-btn obj-action-del" title="Delete" onclick="epDeleteObjective('${projectName}', ${obj.id})">&#10005;</button>`
+        : `<button class="obj-action-btn obj-action-del" title="Delete" onclick="epDeleteObjective('${projectName}', ${obj.id})">&#10005;</button>`;
+
+    const evidenceToggle = `<button class="obj-action-btn" title="Evidence log" onclick="epToggleEvidence('${projectName}', ${obj.id}, this)">&#128196;</button>`;
+
+    item.innerHTML = `
+        <div class="obj-header">
+            <span class="obj-badge">&#9889;</span>
+            <span class="obj-description">${obj.description}</span>${maestroBadge}
+            <div class="obj-actions">${actionBtns}${evidenceToggle}</div>
+        </div>
+        <div class="obj-meta">${statusBadge} ${obj.priority !== 5 ? `<span class="obj-priority">priority ${obj.priority}</span>` : ''} ${obj.time_box_hours ? `<span class="obj-timebox">&#128339; ${obj.time_box_hours}h</span>` : ''} ${stuckBadge}</div>
+        ${completeBanner}
+        ${assessmentPreview}
+        <div class="obj-evidence-panel" id="obj-evidence-${obj.id}" style="display:none"></div>
+    `;
+    return item;
+}
+
+function epShowAddObjectiveForm() {
+    document.getElementById('ep-obj-edit-id').value = '';
+    document.getElementById('ep-obj-parent-id').value = '';
+    document.getElementById('ep-obj-description').value = '';
+    document.getElementById('ep-obj-priority').value = 5;
+    document.getElementById('ep-obj-timebox').value = '';
+    const lbl = document.getElementById('ep-obj-parent-label');
+    if (lbl) lbl.style.display = 'none';
+    document.getElementById('edit-project-objective-form').style.display = 'block';
+    document.getElementById('ep-add-obj-btn').style.display = 'none';
+    document.getElementById('ep-obj-description').focus();
+}
+
+function epShowAddSubObjectiveForm(parentId, parentDesc) {
+    document.getElementById('ep-obj-edit-id').value = '';
+    document.getElementById('ep-obj-parent-id').value = parentId;
+    document.getElementById('ep-obj-description').value = '';
+    document.getElementById('ep-obj-priority').value = 5;
+    document.getElementById('ep-obj-timebox').value = '';
+    const lbl = document.getElementById('ep-obj-parent-label');
+    if (lbl) {
+        document.getElementById('ep-obj-parent-desc').textContent = parentDesc.slice(0, 60) + (parentDesc.length > 60 ? '…' : '');
+        lbl.style.display = 'block';
+    }
+    document.getElementById('edit-project-objective-form').style.display = 'block';
+    document.getElementById('ep-add-obj-btn').style.display = 'none';
+    document.getElementById('ep-obj-description').focus();
+}
+
+function epShowEditObjectiveForm(objId, description, priority, timeboxHours) {
+    document.getElementById('ep-obj-edit-id').value = objId;
+    document.getElementById('ep-obj-description').value = description;
+    document.getElementById('ep-obj-priority').value = priority;
+    document.getElementById('ep-obj-timebox').value = timeboxHours || '';
+    document.getElementById('edit-project-objective-form').style.display = 'block';
+    document.getElementById('ep-add-obj-btn').style.display = 'none';
+    document.getElementById('ep-obj-description').focus();
+}
+
+function epCancelObjectiveForm() {
+    const form = document.getElementById('edit-project-objective-form');
+    if (form) form.style.display = 'none';
+    const btn = document.getElementById('ep-add-obj-btn');
+    if (btn) btn.style.display = '';
+    const lbl = document.getElementById('ep-obj-parent-label');
+    if (lbl) lbl.style.display = 'none';
+    const pid = document.getElementById('ep-obj-parent-id');
+    if (pid) pid.value = '';
+}
+
+async function epSaveObjective() {
+    const projectName = document.getElementById('edit-project-original-name').value;
+    const editId = document.getElementById('ep-obj-edit-id').value;
+    const description = document.getElementById('ep-obj-description').value.trim();
+    const priority = parseInt(document.getElementById('ep-obj-priority').value, 10) || 5;
+    const timeboxVal = document.getElementById('ep-obj-timebox').value;
+    const time_box_hours = timeboxVal ? parseInt(timeboxVal, 10) : null;
+    const parentIdVal = document.getElementById('ep-obj-parent-id').value;
+    const parent_id = parentIdVal ? parseInt(parentIdVal, 10) : null;
+
+    if (!description) {
+        document.getElementById('ep-obj-description').focus();
+        return;
+    }
+
+    const url = editId
+        ? `${API_BASE}/projects/${encodeURIComponent(projectName)}/objectives/${editId}`
+        : `${API_BASE}/projects/${encodeURIComponent(projectName)}/objectives`;
+    const method = editId ? 'PUT' : 'POST';
+    const body = { description, priority, time_box_hours };
+    if (!editId && parent_id) body.parent_id = parent_id;
+
+    try {
+        const resp = await fetch(url, {
+            method,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        epCancelObjectiveForm();
+        epLoadObjectives(projectName);
+    } catch (e) {
+        alert(`Failed to save objective: ${e.message}`);
+    }
+}
+
+async function epToggleEvidence(projectName, objId, btn) {
+    const panel = document.getElementById(`obj-evidence-${objId}`);
+    if (!panel) return;
+    if (panel.style.display !== 'none') {
+        panel.style.display = 'none';
+        return;
+    }
+    panel.textContent = 'Loading evidence…';
+    panel.style.display = 'block';
+    try {
+        const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectName)}/objectives/${objId}/evidence`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const text = await resp.text();
+        panel.textContent = text || '(no evidence recorded yet)';
+    } catch (e) {
+        panel.textContent = `Error loading evidence: ${e.message}`;
+    }
+}
+
+async function epDeleteObjective(projectName, objId) {
+    if (!await showConfirm('Delete Objective', 'Delete this objective? Spawned cards will remain but lose the objective tag.', 'Delete')) return;
+    try {
+        const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectName)}/objectives/${objId}`, { method: 'DELETE' });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        epLoadObjectives(projectName);
+    } catch (e) {
+        alert(`Failed to delete objective: ${e.message}`);
+    }
+}
+
+async function epSetStatus(projectName, objId, status) {
+    try {
+        const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectName)}/objectives/${objId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status }),
+        });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        epLoadObjectives(projectName);
+    } catch (e) {
+        alert(`Failed to update objective: ${e.message}`);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GAP 10 — Model routing table + cost breakdown in project settings
+// ---------------------------------------------------------------------------
+
+async function loadProjectRouting(projectName) {
+    const tbody = document.getElementById('project-routing-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = '<tr><td colspan="3" style="color:#6c757d;font-size:0.82rem;padding:0.5rem">Loading…</td></tr>';
+
+    try {
+        // Load current routing table and pipeline stages in parallel
+        const [routingResp, stages] = await Promise.all([
+            fetch(`${API_BASE}/projects/${encodeURIComponent(projectName)}/routing`).then(r => r.ok ? r.json() : {}),
+            (async () => {
+                const proj = allProjects.find(p => p.name === projectName);
+                if (!proj || !proj.pipeline_template_id) return [];
+                const r = await fetch(`${API_BASE}/pipelines/${proj.pipeline_template_id}`);
+                if (!r.ok) return [];
+                const tmpl = await r.json();
+                return (tmpl.stages || []).sort((a, b) => a.position - b.position);
+            })(),
+        ]);
+
+        if (!stages.length) {
+            tbody.innerHTML = '<tr><td colspan="3" style="color:#6c757d;font-size:0.82rem;padding:0.5rem">No pipeline stages found for this project.</td></tr>';
+            return;
+        }
+
+        const nonModelTypes = new Set(['human_review', 'verifier', 'factory']);
+        let html = '';
+        stages.forEach(stage => {
+            const isNoModel = nonModelTypes.has(stage.agent_type);
+            const currentLlmId = routingResp[stage.stage_key] || '';
+            if (isNoModel) {
+                html += `<tr>
+                    <td style="padding:0.3rem 0.5rem">${stage.label || stage.stage_key}</td>
+                    <td style="padding:0.3rem 0.5rem;color:#adb5bd;font-style:italic">(no model needed)</td>
+                    <td></td>
+                </tr>`;
+            } else {
+                let optionsHtml = '<option value="">(project default)</option>';
+                allLlms.forEach(l => {
+                    const sel = l.id == currentLlmId ? ' selected' : '';
+                    optionsHtml += `<option value="${l.id}"${sel}>${l.model} (id ${l.id})</option>`;
+                });
+                html += `<tr>
+                    <td style="padding:0.3rem 0.5rem">${stage.label || stage.stage_key}</td>
+                    <td style="padding:0.3rem 0.5rem">
+                        <select onchange="setProjectRouting('${projectName}', '${stage.stage_key}', this.value)">${optionsHtml}</select>
+                    </td>
+                    <td style="padding:0.3rem 0.5rem">
+                        ${currentLlmId ? `<button class="action-btn action-btn-danger" style="padding:2px 6px;font-size:0.75rem" onclick="clearProjectRouting('${projectName}', '${stage.stage_key}', this)">Clear</button>` : ''}
+                    </td>
+                </tr>`;
+            }
+        });
+        tbody.innerHTML = html;
+    } catch (e) {
+        tbody.innerHTML = `<tr><td colspan="3" style="color:#dc3545;font-size:0.82rem;padding:0.5rem">Error: ${e.message}</td></tr>`;
+    }
+}
+
+async function setProjectRouting(projectName, stageKey, llmIdStr) {
+    if (!llmIdStr) {
+        await clearProjectRouting(projectName, stageKey, null);
+        return;
+    }
+    await fetch(`${API_BASE}/projects/${encodeURIComponent(projectName)}/routing/${encodeURIComponent(stageKey)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ llm_id: parseInt(llmIdStr, 10) }),
+    });
+    loadProjectRouting(projectName);
+}
+
+async function clearProjectRouting(projectName, stageKey, btn) {
+    await fetch(`${API_BASE}/projects/${encodeURIComponent(projectName)}/routing/${encodeURIComponent(stageKey)}`, {
+        method: 'DELETE',
+    });
+    loadProjectRouting(projectName);
+}
+
+async function loadCostByModel(projectName) {
+    const el = document.getElementById('project-cost-by-model');
+    if (!el) return;
+    try {
+        const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectName)}/cost-by-model`);
+        if (!resp.ok) { el.textContent = 'No cost data yet.'; return; }
+        const data = await resp.json();
+        if (!data.by_model || !data.by_model.length) { el.textContent = 'No LLM usage recorded for this project yet.'; return; }
+        let html = '<table style="width:100%;border-collapse:collapse;font-size:0.82rem;margin-bottom:0.5rem"><thead><tr style="color:#6c757d"><th style="text-align:left;padding:0.2rem 0.4rem">Model</th><th style="text-align:right;padding:0.2rem 0.4rem">Tokens</th><th style="text-align:right;padding:0.2rem 0.4rem">Cost USD</th></tr></thead><tbody>';
+        data.by_model.forEach(r => {
+            html += `<tr><td style="padding:0.2rem 0.4rem">${r.model_name || `LLM ${r.llm_id}`}</td><td style="text-align:right;padding:0.2rem 0.4rem">${(r.total_tokens||0).toLocaleString()}</td><td style="text-align:right;padding:0.2rem 0.4rem">$${r.total_cost_usd.toFixed(4)}</td></tr>`;
+        });
+        html += '</tbody></table>';
+        el.innerHTML = html;
+    } catch (e) {
+        el.textContent = 'Could not load cost data.';
+    }
+}
+
+async function epConfirmComplete(projectName, objId) {
+    await epSetStatus(projectName, objId, 'complete');
+}
+
+async function epDismissComplete(projectName, objId) {
+    // Reset appears_complete_since by sending appears_complete=false via a synthetic assessment call.
+    // The easiest API path is to PATCH the objective to clear the field — use the PUT endpoint
+    // with a flag the backend can recognise, or simply PUT status=active which implicitly keeps
+    // it active but we also need to clear appears_complete_since. We do that by sending a custom
+    // field that the backend PUT handler already accepts via update_objective(**kwargs).
+    try {
+        const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectName)}/objectives/${objId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ appears_complete_since: null }),
+        });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        epLoadObjectives(projectName);
+    } catch (e) {
+        alert(`Failed to dismiss: ${e.message}`);
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 
 async function saveTask() {
     const title = document.getElementById('task-title').value.trim();
@@ -3683,6 +4052,11 @@ function createTaskCard(id, title, tags, owner, status) {
         contractIndicator = '<span class="contract-indicator" title="Has interface contracts">&#128196;</span>';
     }
 
+    // Autopilot badge — shown on cards spawned by an autopilot objective
+    const autopilotBadge = taskObj.autopilot_objective_id
+        ? `<span class="autopilot-badge" title="Spawned by autopilot objective #${taskObj.autopilot_objective_id}">&#9889;</span>`
+        : '';
+
     let parentLink = '';
     if (parentId && taskData[parentId]) {
         const parentTitle = taskData[parentId].title || parentId;
@@ -3735,7 +4109,7 @@ function createTaskCard(id, title, tags, owner, status) {
         ${stripeHtml}
         <button class="card-highlight-btn" title="${_isStarred ? 'Unstar (remove priority boost)' : 'Star (boost scheduler priority)'}" onclick="event.stopPropagation();toggleHighlight('${id}')">${_isStarred ? '\u2605' : '\u2606'}</button>
         ${parentLink}
-        <div class="task-title"${isBigIdea ? ` onclick="zoomIntoBigIdea('${id}')" style="cursor:pointer"` : ''}>${title}${rejBadge}${processingSpinner}${subdivBadge}${bigIdeaBadge}${contractIndicator}${pipBadge}</div>
+        <div class="task-title"${isBigIdea ? ` onclick="zoomIntoBigIdea('${id}')" style="cursor:pointer"` : ''}>${title}${rejBadge}${processingSpinner}${subdivBadge}${bigIdeaBadge}${contractIndicator}${pipBadge}${autopilotBadge}</div>
         <div class="task-meta">
             ${tagsHtml}
             ${ownerHtml}
@@ -6176,6 +6550,15 @@ function editLlmEntry(id) {
     document.getElementById('llm-edit-cost-prompt').value = llm.cost_per_million_prompt_tokens || 0;
     document.getElementById('llm-edit-cost-completion').value = llm.cost_per_million_completion_tokens || 0;
     populateComputeNodeSelect('llm-edit-compute-node', llm.compute_node_id || null);
+    // Populate capability checkboxes
+    const caps = llm.capabilities || [];
+    document.querySelectorAll('#llm-edit-capabilities-checkboxes input[type=checkbox]').forEach(cb => {
+        cb.checked = caps.includes(cb.value);
+    });
+    const toolsCb = document.getElementById('llm-edit-supports-tools');
+    const visionCb = document.getElementById('llm-edit-supports-vision');
+    if (toolsCb) toolsCb.checked = llm.supports_tools !== false;
+    if (visionCb) visionCb.checked = !!llm.supports_vision;
     document.getElementById('llm-edit-placeholder').style.display = 'none';
     document.getElementById('llm-edit-form').style.display = 'block';
     document.getElementById('llm-edit-error').style.display = 'none';
@@ -6192,10 +6575,11 @@ function renderLlmList() {
     html += '<tr style="border-bottom:1px solid #dee2e6"><th style="text-align:left;padding:0.4rem">ID</th><th style="text-align:left;padding:0.4rem">Endpoint</th><th style="text-align:left;padding:0.4rem">Model</th><th style="text-align:left;padding:0.4rem">Sessions</th><th style="text-align:left;padding:0.4rem">Context</th><th></th></tr>';
     allLlms.forEach(l => {
         const ctx = l.max_context >= 1024 ? `${Math.round(l.max_context / 1024)}k` : l.max_context;
+        const caps = (l.capabilities || []).map(c => `<span class="llm-cap-badge">${c}</span>`).join('');
         html += `<tr style="border-bottom:1px solid #f0f0f0">
             <td style="padding:0.4rem">${l.id}</td>
             <td style="padding:0.4rem">${l.address}:${l.port}</td>
-            <td style="padding:0.4rem"><a href="#" onclick="editLlmEntry(${l.id}); return false;" style="color:#0d6efd;text-decoration:none;cursor:pointer">${l.model}</a></td>
+            <td style="padding:0.4rem"><a href="#" onclick="editLlmEntry(${l.id}); return false;" style="color:#0d6efd;text-decoration:none;cursor:pointer">${l.model}</a>${caps}</td>
             <td style="padding:0.4rem">${l.parallel_sessions}</td>
             <td style="padding:0.4rem">${ctx}</td>
             <td style="padding:0.4rem"><button class="action-btn action-btn-danger" onclick="deleteLlmEntry(${l.id})">Delete</button></td>
@@ -6227,10 +6611,19 @@ function _validateLlmFields(prefix) {
     const costCompletion = parseFloat(document.getElementById(`${prefix}-cost-completion`)?.value) || 0;
     const cnRaw = document.getElementById(`${prefix}-compute-node`)?.value;
     const compute_node_id = cnRaw ? parseInt(cnRaw) : null;
+    // Capability tags
+    const capCheckboxesId = prefix === 'llm' ? 'llm-capabilities-checkboxes' : 'llm-edit-capabilities-checkboxes';
+    const capabilities = Array.from(
+        document.querySelectorAll(`#${capCheckboxesId} input[type=checkbox]:checked`)
+    ).map(cb => cb.value);
+    const supToolsId = prefix === 'llm' ? 'llm-supports-tools' : 'llm-edit-supports-tools';
+    const supVisionId = prefix === 'llm' ? 'llm-supports-vision' : 'llm-edit-supports-vision';
+    const supports_tools = document.getElementById(supToolsId)?.checked !== false;
+    const supports_vision = !!document.getElementById(supVisionId)?.checked;
     return { address, port, model, parallel_sessions: parallelRaw, max_context: contextRaw, notes,
              cost_per_million_prompt_tokens: costPrompt,
              cost_per_million_completion_tokens: costCompletion,
-             compute_node_id };
+             compute_node_id, capabilities, supports_tools, supports_vision };
 }
 
 async function addLlm() {
@@ -8627,5 +9020,144 @@ function _relTime(iso) {
     const h = Math.floor(m / 60);
     if (h < 24) return `${h}h ago`;
     return `${Math.floor(h / 24)}d ago`;
+}
+
+// ---------------------------------------------------------------------------
+// Gap 5 — Self-modification UI helpers
+// ---------------------------------------------------------------------------
+
+function _removeSelfModBanner() {
+    const existing = document.getElementById('self-mod-banner');
+    if (existing) existing.remove();
+}
+
+async function _renderSelfModBanner() {
+    _removeSelfModBanner();
+    if (currentProject !== '_maestro_self') return;
+
+    const banner = document.createElement('div');
+    banner.id = 'self-mod-banner';
+    banner.className = 'self-mod-banner';
+    banner.textContent = '⚠ Self-Modification Mode — writes target Maestro source tree';
+
+    // Fetch integration branch status asynchronously and append to banner
+    try {
+        const resp = await fetch(`${API_BASE}/projects/_maestro_self/integration-branch-status`);
+        if (resp.ok) {
+            const data = await resp.json();
+            const info = document.createElement('span');
+            info.className = 'self-mod-branch-info';
+            info.textContent = ` | Branch: ${data.branch} @ ${(data.head_sha || '').slice(0, 8)} (+${data.commits_ahead_of_main} ahead of main)`;
+            banner.appendChild(info);
+        }
+    } catch (_) {}
+
+    // Insert before the kanban board
+    const board = document.querySelector('.kanban-board') || document.body;
+    board.parentNode.insertBefore(banner, board);
+}
+
+async function _loadSelfModBadges() {
+    if (currentProject !== '_maestro_self') return;
+    try {
+        const resp = await fetch(`${API_BASE}/tasks/self-mod-merge/revert-votes`);
+        if (!resp.ok) return;
+        const votes = await resp.json();
+        if (!votes || votes.length === 0) return;
+
+        // Attach badges to any card currently in the DOM
+        document.querySelectorAll('.task-card').forEach(card => {
+            if (!card.querySelector('.revert-vote-badge')) {
+                const badge = document.createElement('span');
+                badge.className = 'revert-vote-badge';
+                badge.textContent = `⚠ ${votes.length} revert vote${votes.length !== 1 ? 's' : ''}`;
+                badge.title = votes.map(v => `${v.task_id}: ${v.reason}`).join('\n');
+                card.appendChild(badge);
+            }
+        });
+    } catch (_) {}
+}
+
+// ---------------------------------------------------------------------------
+// Training Status Modal
+// ---------------------------------------------------------------------------
+
+async function openTrainingStatusModal() {
+    document.getElementById('training-status-modal').classList.add('active');
+    await loadTrainingStatus();
+}
+
+function closeTrainingStatusModal() {
+    document.getElementById('training-status-modal').classList.remove('active');
+}
+
+async function loadTrainingStatus() {
+    const el = document.getElementById('training-status-content');
+    el.innerHTML = '<div style="color:#6c757d;font-size:0.85rem">Loading...</div>';
+    try {
+        const resp = await fetch(`${API_BASE}/training/status`);
+        if (!resp.ok) throw new Error(resp.statusText);
+        const s = await resp.json();
+        const pct = s.threshold > 0 ? Math.min(100, Math.round(s.qualified_unexported / s.threshold * 100)) : 0;
+        const lastExport = s.last_export_at
+            ? new Date(s.last_export_at).toLocaleString()
+            : 'Never';
+        const filesHtml = (s.exports || []).map(f =>
+            `<tr>
+              <td style="font-family:monospace;font-size:0.75rem;word-break:break-all">${f.path}</td>
+              <td style="text-align:right;white-space:nowrap">${f.count.toLocaleString()}</td>
+              <td style="text-align:right;white-space:nowrap">${f.size_mb.toFixed(1)} MB</td>
+            </tr>`
+        ).join('');
+        el.innerHTML = `
+            <div style="margin-bottom:1rem">
+                <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px">
+                    <span style="font-weight:600">Qualified sessions ready to export</span>
+                    <span style="font-size:0.85rem;color:#6c757d">${s.qualified_unexported.toLocaleString()} / ${s.threshold.toLocaleString()} threshold</span>
+                </div>
+                <div style="background:#e9ecef;border-radius:4px;height:10px;overflow:hidden">
+                    <div style="background:#0d6efd;height:100%;width:${pct}%;transition:width 0.3s"></div>
+                </div>
+            </div>
+            <div style="font-size:0.85rem;color:#495057;margin-bottom:1rem">
+                <strong>Last export:</strong> ${lastExport}
+                ${s.last_export_count ? `&nbsp;&mdash;&nbsp;${s.last_export_count.toLocaleString()} sessions` : ''}
+            </div>
+            ${filesHtml ? `
+            <table style="width:100%;border-collapse:collapse;font-size:0.8rem">
+                <thead>
+                    <tr style="border-bottom:1px solid #dee2e6;color:#6c757d">
+                        <th style="text-align:left;padding:4px 6px">File</th>
+                        <th style="text-align:right;padding:4px 6px">Sessions</th>
+                        <th style="text-align:right;padding:4px 6px">Size</th>
+                    </tr>
+                </thead>
+                <tbody>${filesHtml}</tbody>
+            </table>` : '<div style="color:#6c757d;font-size:0.85rem">No export files yet.</div>'}
+        `;
+    } catch (e) {
+        el.innerHTML = `<div style="color:#dc3545">Error loading training status: ${e.message}</div>`;
+    }
+}
+
+async function triggerTrainingExport() {
+    const btn = document.getElementById('training-export-btn');
+    const msg = document.getElementById('training-export-msg');
+    btn.disabled = true;
+    msg.textContent = 'Exporting...';
+    try {
+        const resp = await fetch(`${API_BASE}/training/export`, { method: 'POST' });
+        const data = await resp.json();
+        if (data.count === 0) {
+            msg.textContent = 'No qualifying sessions to export.';
+        } else {
+            msg.textContent = `Exported ${data.count} sessions.`;
+        }
+        await loadTrainingStatus();
+    } catch (e) {
+        msg.textContent = `Export failed: ${e.message}`;
+    } finally {
+        btn.disabled = false;
+    }
 }
 

@@ -1,0 +1,308 @@
+[
+  {
+    "name": "Nat.Prime",
+    "type": "ℕ → Prop",
+    "module": "Mathlib.Data.Nat.Prime.Basic",
+    "doc": "p is prime if p >= 2 and has no divisors other than 1 and p"
+  },
+  {
+    "name": "Nat.prime_def_lt_dvd",
+    "type": "Nat.Prime p ↔ 2 ≤ p ∧ ∀ m, m ∣ p → m = 1 ∨ m = p",
+    "module": "Mathlib.Data.Nat.Prime.Basic",
+    "doc": "Characterization of primality by divisibility"
+  },
+  {
+    "name": "Nat.Prime.eq_one_or_self_of_dvd",
+    "type": "Nat.Prime p → ∀ a, a ∣ p → a = 1 ∨ a = p",
+    "module": "Mathlib.Data.Nat.Prime.Basic",
+    "doc": "A prime has only trivial divisors"
+  },
+  {
+    "name": "Nat.infinite_setOf_prime",
+    "type": "Set.Infinite {p | Nat.Prime p}",
+    "module": "Mathlib.Data.Nat.Prime.Infinite",
+    "doc": "There are infinitely many primes (Euclid's theorem)"
+  },
+  {
+    "name": "Nat.exists_infinite_primes",
+    "type": "∀ n, ∃ p, p ≥ n ∧ Nat.Prime p",
+    "module": "Mathlib.Data.Nat.Prime.Infinite",
+    "doc": "For every n there is a prime >= n"
+  },
+  {
+    "name": "Nat.Prime.dvd_mul",
+    "type": "Nat.Prime p → (p ∣ m * n ↔ p ∣ m ∨ p ∣ n)",
+    "module": "Mathlib.Data.Nat.Prime.Basic",
+    "doc": "A prime divides a product iff it divides one of the factors"
+  },
+  {
+    "name": "Nat.Prime.dvd_of_dvd_pow",
+    "type": "Nat.Prime p → p ∣ m ^ n → p ∣ m",
+    "module": "Mathlib.Data.Nat.Prime.Basic",
+    "doc": "A prime dividing a power divides the base"
+  },
+  {
+    "name": "Nat.Prime.two_le",
+    "type": "Nat.Prime p → 2 ≤ p",
+    "module": "Mathlib.Data.Nat.Prime.Basic",
+    "doc": "Every prime is at least 2"
+  },
+  {
+    "name": "Nat.Prime.ne_one",
+    "type": "Nat.Prime p → p ≠ 1",
+    "module": "Mathlib.Data.Nat.Prime.Basic",
+    "doc": "A prime is not equal to 1"
+  },
+  {
+    "name": "Nat.prime_two",
+    "type": "Nat.Prime 2",
+    "module": "Mathlib.Data.Nat.Prime.Basic",
+    "doc": "2 is prime"
+  },
+  {
+    "name": "Nat.prime_three",
+    "type": "Nat.Prime 3",
+    "module": "Mathlib.Data.Nat.Prime.Basic",
+    "doc": "3 is prime"
+  },
+  {
+    "name": "Nat.minFac",
+    "type": "ℕ → ℕ",
+    "module": "Mathlib.Data.Nat.Prime.MinFac",
+    "doc": "The minimal prime factor of n; minFac 1 = 1, minFac 0 = 2"
+  },
+  {
+    "name": "Nat.minFac_prime",
+    "type": "1 < n → Nat.Prime (Nat.minFac n)",
+    "module": "Mathlib.Data.Nat.Prime.MinFac",
+    "doc": "The minimal factor of n > 1 is prime"
+  },
+  {
+    "name": "Nat.minFac_dvd",
+    "type": "∀ n, Nat.minFac n ∣ n",
+    "module": "Mathlib.Data.Nat.Prime.MinFac",
+    "doc": "The minimal factor divides n"
+  },
+  {
+    "name": "Nat.factors",
+    "type": "ℕ → List ℕ",
+    "module": "Mathlib.Data.Nat.Factors",
+    "doc": "Prime factorization of n as a sorted list (with multiplicity)"
+  },
+  {
+    "name": "Nat.factors_prime_pow",
+    "type": "Nat.Prime p → Nat.factors (p ^ n) = List.replicate n p",
+    "module": "Mathlib.Data.Nat.Factors",
+    "doc": "Factorization of a prime power is a list of copies of p"
+  },
+  {
+    "name": "Nat.mem_factors",
+    "type": "p ∈ Nat.factors n ↔ Nat.Prime p ∧ p ∣ n",
+    "module": "Mathlib.Data.Nat.Factors",
+    "doc": "Membership in factors list iff prime divisor"
+  },
+  {
+    "name": "Nat.factorization",
+    "type": "ℕ →* ℕ →₀ ℕ",
+    "module": "Mathlib.Data.Nat.Factorization.Basic",
+    "doc": "The prime factorization of n as a finitely-supported function (Finsupp)"
+  },
+  {
+    "name": "Nat.factorization_prime_pow",
+    "type": "Nat.Prime p → Nat.factorization (p ^ n) = Finsupp.single p n",
+    "module": "Mathlib.Data.Nat.Factorization.Basic",
+    "doc": "Factorization of p^n is a single-entry finsupp"
+  },
+  {
+    "name": "Nat.Coprime",
+    "type": "ℕ → ℕ → Prop",
+    "module": "Mathlib.Data.Nat.GCD.Basic",
+    "doc": "Nat.Coprime a b ↔ Nat.gcd a b = 1"
+  },
+  {
+    "name": "Nat.Coprime.prime_dvd_of_dvd_mul",
+    "type": "Nat.Coprime k n → Nat.Prime p → p ∣ k * n → p ∣ n",
+    "module": "Mathlib.Data.Nat.GCD.Basic",
+    "doc": "If gcd(k,n)=1 and p|kn and p prime then p|n"
+  },
+  {
+    "name": "Nat.gcd",
+    "type": "ℕ → ℕ → ℕ",
+    "module": "Mathlib.Data.Nat.GCD.Basic",
+    "doc": "Greatest common divisor of two natural numbers"
+  },
+  {
+    "name": "Nat.lcm",
+    "type": "ℕ → ℕ → ℕ",
+    "module": "Mathlib.Data.Nat.GCD.Basic",
+    "doc": "Least common multiple of two natural numbers"
+  },
+  {
+    "name": "Nat.primorial",
+    "type": "ℕ → ℕ",
+    "module": "Mathlib.NumberTheory.Primorial",
+    "doc": "Primorial n = product of all primes <= n"
+  },
+  {
+    "name": "Nat.primorial_pos",
+    "type": "∀ n, 0 < Nat.primorial n",
+    "module": "Mathlib.NumberTheory.Primorial",
+    "doc": "The primorial is always positive"
+  },
+  {
+    "name": "Nat.primeCounting",
+    "type": "ℕ → ℕ",
+    "module": "Mathlib.NumberTheory.PrimeCounting",
+    "doc": "pi(n): number of primes <= n"
+  },
+  {
+    "name": "Nat.primeCounting_add_le",
+    "type": "Nat.primeCounting (a + b) ≤ Nat.primeCounting a + b",
+    "module": "Mathlib.NumberTheory.PrimeCounting",
+    "doc": "Subadditive bound on the prime counting function"
+  },
+  {
+    "name": "ArithmeticFunction",
+    "type": "(ℕ → R) with ring structure",
+    "module": "Mathlib.NumberTheory.ArithmeticFunction",
+    "doc": "Type of arithmetic functions n -> R with Dirichlet convolution"
+  },
+  {
+    "name": "ArithmeticFunction.vonMangoldt",
+    "type": "ArithmeticFunction ℝ",
+    "module": "Mathlib.NumberTheory.ArithmeticFunction",
+    "doc": "The von Mangoldt function Lambda(n) = log p if n = p^k, else 0"
+  },
+  {
+    "name": "ArithmeticFunction.sigma",
+    "type": "ℕ → ArithmeticFunction ℕ",
+    "module": "Mathlib.NumberTheory.ArithmeticFunction",
+    "doc": "sigma k n = sum of k-th powers of divisors of n"
+  },
+  {
+    "name": "ArithmeticFunction.moebius",
+    "type": "ArithmeticFunction ℤ",
+    "module": "Mathlib.NumberTheory.ArithmeticFunction",
+    "doc": "The Moebius function mu(n)"
+  },
+  {
+    "name": "ArithmeticFunction.pdiv",
+    "type": "ArithmeticFunction ℕ → ArithmeticFunction ℕ → ArithmeticFunction ℕ",
+    "module": "Mathlib.NumberTheory.ArithmeticFunction",
+    "doc": "Pointwise division of arithmetic functions"
+  },
+  {
+    "name": "Int.ModEq",
+    "type": "ℤ → ℤ → ℤ → Prop",
+    "module": "Mathlib.Data.Int.ModCast",
+    "doc": "Int.ModEq n a b ↔ n | a - b (a ≡ b [ZMOD n])"
+  },
+  {
+    "name": "ZMod",
+    "type": "ℕ → Type",
+    "module": "Mathlib.Data.ZMod.Basic",
+    "doc": "Integers mod n: ZMod n = ZMod n"
+  },
+  {
+    "name": "ZMod.val_natCast",
+    "type": "∀ {n : ℕ} (a : ℕ), (ZMod.val (a : ZMod n)) = a % n",
+    "module": "Mathlib.Data.ZMod.Basic",
+    "doc": "The canonical representative of a natural number mod n"
+  },
+  {
+    "name": "Finset.sum",
+    "type": "Finset α → (α → β) → β",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset",
+    "doc": "Sum of a function over a finite set"
+  },
+  {
+    "name": "Finset.prod",
+    "type": "Finset α → (α → β) → β",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset",
+    "doc": "Product of a function over a finite set"
+  },
+  {
+    "name": "Finset.filter",
+    "type": "Finset α → (α → Bool) → Finset α",
+    "module": "Mathlib.Data.Finset.Basic",
+    "doc": "Filter elements of a finite set by a decidable predicate"
+  },
+  {
+    "name": "Finset.range",
+    "type": "ℕ → Finset ℕ",
+    "module": "Mathlib.Data.Finset.Basic",
+    "doc": "Finset.range n = {0, 1, ..., n-1}"
+  },
+  {
+    "name": "Nat.setOf_prime_and_lt_eq",
+    "type": "↔ characterization of {p | Nat.Prime p ∧ p < n}",
+    "module": "Mathlib.NumberTheory.PrimeCounting",
+    "doc": "The set of primes less than n as a decidable finset"
+  },
+  {
+    "name": "Nat.Prime.odd_of_ne_two",
+    "type": "Nat.Prime p → p ≠ 2 → p % 2 = 1",
+    "module": "Mathlib.Data.Nat.Prime.Basic",
+    "doc": "All primes except 2 are odd"
+  },
+  {
+    "name": "Nat.Prime.eq_two_or_odd",
+    "type": "Nat.Prime p → p = 2 ∨ p % 2 = 1",
+    "module": "Mathlib.Data.Nat.Prime.Basic",
+    "doc": "A prime is either 2 or odd"
+  },
+  {
+    "name": "Nat.Coprime.pow_dvd_of_pow_dvd",
+    "type": "Nat.Coprime k n → k ^ m ∣ n ^ m → k ∣ n",
+    "module": "Mathlib.Data.Nat.GCD.Basic",
+    "doc": "Coprime base: if k^m | n^m then k | n"
+  },
+  {
+    "name": "Nat.Prime.coprime_iff_not_dvd",
+    "type": "Nat.Prime p → (Nat.Coprime p n ↔ ¬p ∣ n)",
+    "module": "Mathlib.Data.Nat.GCD.Basic",
+    "doc": "A prime p is coprime to n iff it does not divide n"
+  },
+  {
+    "name": "Finset.card_filter_le",
+    "type": "Finset.card (Finset.filter p s) ≤ Finset.card s",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": "Filtering can only decrease the cardinality of a finset"
+  },
+  {
+    "name": "Nat.log",
+    "type": "ℕ → ℕ → ℕ",
+    "module": "Mathlib.Data.Nat.Log",
+    "doc": "Nat.log b n = floor(log_b n), integer logarithm base b"
+  },
+  {
+    "name": "Nat.Prime.factorization_self",
+    "type": "Nat.Prime p → Nat.factorization p = Finsupp.single p 1",
+    "module": "Mathlib.Data.Nat.Factorization.Basic",
+    "doc": "The factorization of a prime p is {p : 1}"
+  },
+  {
+    "name": "Nat.sieve_eratosthenes",
+    "type": "Finset ℕ → ℕ → Finset ℕ",
+    "module": "Mathlib.Data.Nat.Prime.Sieve",
+    "doc": "Sieve of Eratosthenes: filter primes up to n from a candidate set"
+  },
+  {
+    "name": "Nat.Prime.infinite_of_sieve",
+    "type": "related to sieve lower bound arguments for prime gaps",
+    "module": "Mathlib.Data.Nat.Prime.Sieve",
+    "doc": "Sieve lower bound: infinitely many primes via sieve density argument"
+  },
+  {
+    "name": "Nat.card_primes_le",
+    "type": "Finset.card (Finset.filter Nat.Prime (Finset.range (n + 1))) = Nat.primeCounting n",
+    "module": "Mathlib.NumberTheory.PrimeCounting",
+    "doc": "The count of primes <= n equals primeCounting n"
+  },
+  {
+    "name": "Int.emod_emod_of_dvd",
+    "type": "m ∣ n → a % n % m = a % m",
+    "module": "Mathlib.Data.Int.Order",
+    "doc": "Modular reduction: mod n then mod m equals mod m when m | n"
+  }
+]

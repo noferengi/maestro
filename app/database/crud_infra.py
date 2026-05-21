@@ -254,6 +254,9 @@ def llm_to_dict(llm):
         "cost_per_million_prompt_tokens": llm.cost_per_million_prompt_tokens,
         "cost_per_million_completion_tokens": llm.cost_per_million_completion_tokens,
         "compute_node_id": getattr(llm, "compute_node_id", None),
+        "capabilities": getattr(llm, "capabilities", None) or [],
+        "supports_tools": getattr(llm, "supports_tools", True),
+        "supports_vision": getattr(llm, "supports_vision", False),
     }
 
 

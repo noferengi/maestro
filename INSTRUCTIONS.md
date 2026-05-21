@@ -18,6 +18,16 @@
 9. [Workspace Isolation & File Recovery](#9-workspace-isolation--file-recovery)
 10. [Arch Categories](#10-arch-categories)
 11. [Quick Reference — URLs](#11-quick-reference--urls)
+12. [Self-Modification (Advanced)](#12-self-modification-advanced)
+13. [Autopilot Objectives & Goal Hierarchy](#13-autopilot-objectives--goal-hierarchy)
+14. [Model Routing — Stage-to-LLM Assignment](#14-model-routing--stage-to-llm-assignment)
+15. [Episodic Memory](#15-episodic-memory)
+16. [Reflection Stage](#16-reflection-stage)
+17. [Math Tooling & Formal Verification](#17-math-tooling--formal-verification)
+18. [Event Triggers](#18-event-triggers)
+19. [Training Data Pipeline](#19-training-data-pipeline)
+20. [Inter-Agent Communications](#20-inter-agent-communications)
+21. [Orchestrator LLM & Maestro Escalation](#21-orchestrator-llm--maestro-escalation)
 
 ---
 
@@ -248,6 +258,7 @@ Each pipeline stage runs an *agent* — a piece of code that receives the task c
 | `fan_out_judge` | Fan-Out + Judge | N parallel proposals; judge picks the best one |
 | `human_gate` | Human Gate | Blocks until human approves (or autopilot handles it) |
 | `factory_node` | Card Factory | Ingests external data and batch-creates cards |
+| `reflection_agent` | Reflection | Skeptical re-read of prior stage output; produces a structured JSON confidence report |
 | `intake_agent` | Intake | IDEA stage processing |
 | `terminal` | Terminal | Marks the end of the pipeline; no dispatch |
 
@@ -666,6 +677,637 @@ POST               /api/tasks/{id}/undelete
 # Autopilot
 GET/POST           /api/settings/autopilot
 GET/POST           /api/projects/{name}/settings
+
+# Self-modification (Gap 5)
+POST               /api/tasks/{id}/self-mod-merge
+GET                /api/tasks/{id}/revert-votes
+GET                /api/projects/_maestro_self/integration-branch-status
+```
+
+---
+
+## 12. Self-Modification (Advanced)
+
+> **Warning:** This is a high-risk feature. When enabled, Maestro agents can write to
+> the Maestro source tree itself. Mistakes can corrupt the running server. Only enable
+> on development instances with version control and tested backups.
+
+### Overview
+
+GAP 5 adds a guarded self-modification pathway. Agents running under the reserved project
+`_maestro_self` can edit a whitelist of Maestro source files, subject to:
+
+1. The `can_self_modify = true` flag in `maestro.ini`
+2. File-level allowlist at `app/agent/self_modification_allowlist.py`
+3. Permanent hard-block list (safety guard, deletion module, migrations, secrets)
+4. Full test suite must pass before any merge to the integration branch
+5. Human must manually merge `maestro/self-improvement` → `main`
+
+### Setup
+
+**Step 1** — Create the `_maestro_self` project pointing at the Maestro repo itself:
+
+In the UI: New Project → Name: `_maestro_self` → Path: `D:/workspace/TheMaestro`
+
+**Step 2** — Enable the capability in `maestro.ini`:
+
+```ini
+[maestro_capabilities]
+can_self_modify = true
+```
+
+Restart the server after editing `maestro.ini`.
+
+**Step 3** — (Optional) Enable auto-merge to the integration branch:
+
+```ini
+can_auto_merge_human_review = true
+can_auto_merge_self_modification = true
+```
+
+Without these flags, tasks complete at the `human_review` stage and you merge manually
+via `POST /api/tasks/{id}/self-mod-merge`.
+
+### What agents can write to
+
+The allowlist in `app/agent/self_modification_allowlist.py` controls which files are in
+scope. By default this includes agent system files, database CRUD, frontend JS/CSS, and
+test files. Migrations, config files, secrets, and the safety guard (`tools.py`) are
+permanently off-limits.
+
+To extend the allowlist, add the absolute path to `ALLOWED_PATHS` in that file.
+
+### Integration branch
+
+All self-modification work accumulates on `maestro/self-improvement`. This branch is
+**never** automatically merged to `main` — only a human can do that. Check its status at
+any time via:
+
+```
+GET /api/projects/_maestro_self/integration-branch-status
+```
+
+### Revert voting
+
+If an agent identifies a regression from a recent self-modification merge, it can call
+the `vote_to_revert` tool. When the vote count reaches `revert_vote_threshold` (default 3),
+the system automatically runs `git revert` on `maestro/self-improvement` and creates a
+PIP card summarizing all votes. View votes via:
+
+```
+GET /api/tasks/{id}/revert-votes
+```
+
+---
+
+---
+
+## 13. Autopilot Objectives & Goal Hierarchy
+
+Autopilot objectives are long-running goals that Maestro pursues autonomously across many scheduler ticks. The basic autopilot toggle (section 8) starts/stops the engine; objectives are what direct it.
+
+### Creating an Objective
+
+Open **Project Settings** (⚙ gear icon) → scroll to the **Objectives** panel.
+
+```
+Objectives
+─────────────────────────────────────────────────────────────
+[P10] ● Explore twin prime gaps               [pause] [edit] [✕]
+      [P8]  ○ Sieve to 10^9                   [maestro]
+      [P8]  ○ Formalize Zhang bounds           [maestro]
+      [P5]  ✓ Calibrate on Bertrand postulate  completed
+
+                              [+ Add Objective]
+```
+
+- **P** = priority (1–10, higher is more urgent)
+- **●** active · **○** child active · **✓** complete
+- **[maestro]** badge — this sub-objective was created by Maestro autonomously
+- **⚡ badge on kanban cards** — card was spawned by an autopilot objective
+
+**Add Objective form fields:**
+- Description (what Maestro should pursue)
+- Priority (1–10)
+- Time-box hours (optional — objective expires automatically after this many hours)
+
+### Objective Lifecycle
+
+1. **Active** — Maestro assesses progress each stall or completion event, creates IDEA cards, and records findings.
+2. **Appears complete** — Maestro sets this on the first tick it's confident. It only marks complete on the *second* tick of sustained confidence (prevents premature closure).
+3. **Complete** — status flipped; if this was the last active child, the parent auto-completes.
+4. **Paused** — set manually (UI buttons) or automatically by spin detection (same card demoted ≥ N times from this objective).
+5. **Stuck badge** — shown when spin detection fires. Requires human review to resume.
+
+### Sub-Objectives (Hierarchy)
+
+Objectives can be nested. When Maestro creates a sub-objective (requires `can_create_objectives = true` in `maestro.ini`), it appears indented under the parent in the UI. Completing all children propagates up to complete the parent.
+
+```ini
+[maestro_capabilities]
+can_create_objectives = true    # allow Maestro to create its own sub-objectives
+can_complete_objectives = true  # allow Maestro to mark objectives complete
+can_create_cards = true         # allow Maestro to spawn IDEA cards
+max_objectives_per_tick = 2     # max objectives assessed per tick
+```
+
+When `can_create_objectives = false`, Maestro writes suggested sub-objectives to the evidence log instead of inserting them.
+
+### Evidence Log
+
+Maestro maintains an evidence document per objective at key `objective:{id}:evidence` in the project document store. This is an append-only timestamped log of what was found, what failed, and what was ruled out. View it by clicking an objective row in the UI (evidence toggle panel).
+
+Agents working on autopilot-spawned cards receive the spawning objective's description and evidence summary in their system prompt automatically.
+
+### Autopilot Budget
+
+To cap spending per project, set an **Autopilot Budget** in project settings (dropdown picks a budget record). Maestro suppresses itself when that budget is exhausted. Set **Max in-flight cards** to prevent board saturation.
+
+### REST API
+
+```
+GET    /api/projects/{name}/objectives              — list (filterable by status)
+POST   /api/projects/{name}/objectives              — create
+PUT    /api/projects/{name}/objectives/{id}         — edit/pause/resume
+DELETE /api/projects/{name}/objectives/{id}         — delete
+GET    /api/projects/{name}/objectives/tree         — nested tree for UI
+GET    /api/projects/{name}/objectives/{id}/evidence — full evidence log text
+```
+
+---
+
+## 14. Model Routing — Stage-to-LLM Assignment
+
+By default every stage in a project runs on the project's configured LLM. Model routing lets you assign a specific LLM to specific pipeline stages — use a fast cheap model for file-summary stages, a reasoning-heavy model for planning, a math-capable model for proof stages.
+
+### LLM Capability Tags
+
+In the LLM configuration panel (`/api/llms`), each LLM endpoint can be tagged with capability strings:
+
+| Tag | Meaning |
+|---|---|
+| `reasoning` | Multi-step logical reasoning and planning |
+| `code` | Code generation and debugging |
+| `math` | Symbolic and formal mathematics |
+| `fast` | Low latency, optimised for short tasks |
+| `long_context` | Context window > 32K tokens |
+| `cheap` | Low cost per token; prefer for bulk tasks |
+
+Tags are stored in `llms.capabilities` and are visible in the routing UI. They are advisory — the routing resolution does not enforce them automatically, but they help you make correct assignments.
+
+### Routing Table in Project Settings
+
+Open **Project Settings** → **Model Routing** section:
+
+```
+Stage               Assigned Model          (default: Qwen 35B)
+──────────────────────────────────────────────────────────────
+PLANNING            [Claude Sonnet ▾]
+INDEV               [Qwen 35B ▾]
+SECURITY            [Claude Opus ▾]
+FINAL_REVIEW        [Qwen 35B ▾]
+HUMAN_REVIEW        (no model needed)
+```
+
+Each row has an LLM picker and a **Clear** button (reverts to project default). Stages of type `human_review` and `verifier` are greyed out — they don't run an LLM.
+
+### Resolution Order
+
+When dispatching a task, the scheduler resolves the LLM in this order:
+
+1. **Human-pinned** — task was manually assigned a specific LLM in the task edit panel (`task.llm_pinned = true`). This always wins.
+2. **Routing table entry** — `project_llm_routing[stage_key]` for the current project.
+3. **Project default** — `project.llm_id`.
+4. **System default** — `maestro.ini` → `[orchestration] default_llm_id`.
+
+### Hard Routing and Blocked Tasks
+
+Maestro uses **hard routing** — a task waits for its assigned model rather than falling back. If the assigned model is at capacity for more than `model_block_timeout_minutes` (default 30), the task is marked `blocked_on_model` and surfaced in project health for human review.
+
+```ini
+[scheduler]
+model_block_timeout_minutes = 30
+```
+
+### Cost by Model
+
+```
+GET /api/projects/{name}/cost-by-model
+```
+
+Returns token and cost breakdown by model and by stage for the project.
+
+### REST API
+
+```
+GET    /api/projects/{name}/routing
+PUT    /api/projects/{name}/routing/{stage}    body: {"llm_id": N}
+DELETE /api/projects/{name}/routing/{stage}    — revert stage to project default
+```
+
+---
+
+## 15. Episodic Memory
+
+Maestro maintains a vector database of past experiences — failures, session summaries, and document writes — and retrieves semantically similar past episodes at the start of each agent session. This prevents the system from rediscovering the same failure modes repeatedly.
+
+### What Gets Stored
+
+| Episode type | When it's stored |
+|---|---|
+| `failure` | Immediately when a task is demoted |
+| `session_summary` | Asynchronously after a session ends (2–4 sentence LLM summary) |
+| `document` | When a document longer than 100 chars is written to the document store |
+
+### What Agents See
+
+At the start of every session, the top-K most relevant episodes (by cosine similarity × recency decay) are injected under a `### Relevant past experience` block in the system prompt:
+
+```
+### Relevant past experience
+- [failure | 2026-04-12] Task 'Prove twin prime gaps' demoted from PROOF_ATTEMPT.
+  Lean4 syntax error on dependent type application. Standard rewrite tactic failed.
+- [session_summary | 2026-04-15] Agent explored induction on gap modulus. Found
+  counterexample at n=47. Pivoted to sieve approach.
+```
+
+Agents can also query episodic memory on demand with the `query_episodes` tool (when enabled in their stage's tool allowlist):
+
+```
+query_episodes(question="what approaches failed on formal proofs", k=5, episode_type="failure")
+```
+
+### Configuration
+
+```ini
+[episodic_memory]
+embedding_llm_id =            ; LLM record with embedding endpoint (blank = local fallback)
+decay_half_life_days = 90     ; episodes lose half their recency weight every 90 days
+keepalive_extension_days = 14 ; each retrieval extends expiry by 14 days
+auto_inject_k = 3             ; top-K auto-injected at session start (0 = disable)
+```
+
+### Staleness and Cleanup
+
+Episodes that are never retrieved expire after 5 years. Episodes that remain useful (retrieved regularly) are kept alive indefinitely by the `keepalive_extension_days` mechanism. A nightly cleanup job hard-deletes expired rows.
+
+### Requirements
+
+The `pgvector` PostgreSQL extension must be installed. Run `/migrate` after enabling to apply migrations 0096–0097 if not already applied.
+
+---
+
+## 16. Reflection Stage
+
+The **reflection** agent type is a pipeline stage that reads the prior stage's output skeptically and produces a structured JSON confidence report. Use it where logical errors, wrong assumptions, or missed edge cases are a concern — code review, proof checking, fact verification.
+
+### Adding a Reflection Stage
+
+In the Pipeline Editor, add a stage and set its **Agent type** to `Reflection`. Wire it between the stage you want reviewed and the next stage.
+
+When a stage of type `reflection` is selected in the property panel, additional fields appear:
+
+- **Reflection LLM** — which model runs the review (defaults to the orchestrator LLM; see section 21)
+- **Max history turns** — how many prior LLM turns the reflection agent can inspect (default 20, max 50)
+
+The **System prompt** field is pre-filled with a starter template you can customise:
+
+```
+You are a skeptical reviewer. Find real defects, wrong assumptions, and missed edge
+cases — not vague concerns. If uncertain, state that explicitly in uncertain_about.
+A high-confidence clean report is valuable. Output your structured JSON report at the end.
+```
+
+### Report Format
+
+The reflection agent produces a JSON block at the end of its session:
+
+```json
+{
+  "confidence": 0.72,
+  "issues": [
+    {"severity": "blocking", "finding": "Off-by-one in loop bounds..."},
+    {"severity": "warning",  "finding": "Assumes input is sorted..."},
+    {"severity": "note",     "finding": "Variable name x is ambiguous"}
+  ],
+  "uncertain_about": ["Whether the caching strategy is thread-safe..."]
+}
+```
+
+Severity levels: `blocking`, `warning`, `note`. Reports are stored at `reflection:{task_id}:{stage_key}` in the document store.
+
+### What Maestro Does With the Report
+
+After the reflection stage, Maestro reviews the report and decides:
+
+- **No blocking issues, confidence ≥ threshold** → advance to next stage
+- **Blocking issues found** → retry the prior stage with the report injected as `[REFLECTION FEEDBACK]`, or demote, or create a PIP
+- **Warnings only** → advance but surface findings in the human review stage
+
+The decision is Maestro's judgment, not hardcoded logic. A `blocking` issue in a calibration stage may be treated differently from the same issue in final review.
+
+### Configuration
+
+```ini
+[reflection]
+confidence_threshold = 0.7    ; below this, Maestro treats as blocking regardless of issues list
+max_history_turns = 20
+```
+
+### Manual Trigger
+
+```
+POST /api/tasks/{id}/trigger-reflection
+```
+
+---
+
+## 17. Math Tooling & Formal Verification
+
+The Mathematics / Proof Exploration pipeline template ships with nine working stages, real tool integrations, and a Docker-sandboxed execution environment.
+
+### Requirements
+
+**Docker Desktop must be running** before the Maestro server starts for any math tooling to work. Maestro checks on startup and logs a warning (not a crash) if Docker is unavailable. Start Docker Desktop, then restart the server.
+
+Build the sandbox image once:
+
+```bash
+docker build -t sympy-lean4-sandbox:latest docker/sympy-lean4-sandbox/
+```
+
+The image contains Python 3.12 + SymPy/NumPy/SciPy, Lean 4 (via elan), and Coq.
+
+### Agent Tools
+
+| Tool | Available in stages | Purpose |
+|---|---|---|
+| `run_sympy` | Math stages | Execute Python/SymPy code in the Docker sandbox. Returns stdout + stderr (capped at 8 KiB each). Timeout configurable (default 120 s, max 600 s). |
+| `search_arxiv` | Literature, Hypothesis, Proof Strategy | Search arXiv by query + category (e.g. `math.NT`). Returns title, authors, year, abstract (500 chars), and PDF URL. |
+| `search_oeis` | Literature, Hypothesis | Search the OEIS integer sequences database. Returns sequence ID, name, first 20 values, formulas. |
+
+**Docker isolation:** `run_sympy` runs with `--network none --memory 512m --cpus 1`. Agents cannot affect the host environment, make network requests, or consume unbounded memory.
+
+### Stage-Gate Verifiers
+
+Formal verification gates run automatically when a card advances past a `verifier` stage:
+
+| Verifier key | What it runs |
+|---|---|
+| `python_sympy` | Runs `task.content.sympy_proof_code` in the Docker sandbox (30 s timeout). Exit 0 = pass. |
+| `lean4` | Runs `task.content.lean_proof` through Lean 4 in the Docker sandbox. Full compiler stderr returned to the agent on failure — it reads the type-checker error and corrects. |
+| `coq` | Runs `task.content.coq_proof` through Coq in the Docker sandbox. Degrades gracefully if Coq is absent from the image. |
+
+Both `run_sympy` (mid-session) and the `python_sympy` verifier (gate) route through the same Docker sandbox — the host process never executes arbitrary agent code directly.
+
+### Configuration
+
+```ini
+[math]
+sandbox_memory_mb = 512
+sandbox_timeout_default = 120
+```
+
+---
+
+## 18. Event Triggers
+
+Maestro can react to external events — a GitHub webhook, a file appearing in a watched directory, a URL whose content changes. Each event fires a Maestro autopilot tick with the event payload as context.
+
+### Registering a Watch
+
+Agents running in Maestro sessions can call `register_watch` to set up a watch:
+
+```python
+# Webhook watch — returns an inbound URL to configure in the external system
+register_watch(
+    event_type="webhook",
+    label="GitHub push to main",
+    source_config={"secret": "optional-hmac-secret"},
+    fire_config={"cooldown_seconds": 60}
+)
+# Returns: {"inbound_url": "/api/events/inbound/42", "watch_id": 42}
+
+# File system watch — fires when files appear or change
+register_watch(
+    event_type="file_watch",
+    label="Inbox folder",
+    source_config={"path": "C:/Users/mdm16/Documents/Inbox", "recursive": false},
+    fire_config={"cooldown_seconds": 5}
+)
+
+# Scheduled URL poll — fires when the response content changes
+register_watch(
+    event_type="api_poll",
+    label="arXiv twin primes",
+    source_config={
+        "url": "https://export.arxiv.org/api/query?search_query=ti:twin+primes&max_results=5",
+        "poll_interval_seconds": 3600
+    },
+    fire_config={"use_content_hash": true}
+)
+```
+
+### Deduplication
+
+Each watch has independent dedup controls (set in `fire_config`):
+
+| Key | Effect |
+|---|---|
+| `cooldown_seconds` | Suppress re-fire for N seconds after firing (default: 60 for webhooks, 5 for file watches) |
+| `use_content_hash` | Only fire if payload differs from last firing (default on for API polls) |
+| `max_fires` | Auto-expire the watch after N firings |
+| `expires_at` | Hard expiry timestamp |
+
+### Webhook Endpoint
+
+```
+POST /api/events/inbound/{watch_id}
+```
+
+Payloads are capped at 16 KiB. If the watch has a `secret` in its `source_config`, the endpoint validates the `X-Hub-Signature-256` header (GitHub webhook format).
+
+### Managing Watches
+
+```python
+list_watches_for_project(project="Garden")  # tool available to agents
+```
+
+After 3 consecutive API poll failures, the watch is paused automatically and the errors are available via `get_watch_errors(watch_id)` (MCP tool).
+
+---
+
+## 19. Training Data Pipeline
+
+Maestro accumulates training data from every agent session and exports it as Hugging Face-format JSONL for local fine-tuning.
+
+### Opting a Project Out
+
+In **Project Settings**, enable **Exclude from training data**. All sessions from that project are excluded from all future and retroactive export runs.
+
+### Quality Signals
+
+Sessions are automatically scored by a background job (hourly). A session qualifies for export if all of:
+- Its task reached `completed` stage
+- It has no turns truncated by context limit (`finish_reason != length`)
+- It is not a mechanical session (file summaries, etc.)
+
+Qualified sessions receive additional score bonuses:
+- `+0.5` — session ended with `ACCEPTED` submit
+- `+1.0` — **failure-recovery** session: ran after a task demotion and the task ultimately completed (most valuable signal — demonstrates self-correction)
+- `+0.5` — contains a formally verified proof
+
+### Export Format
+
+Exports are Hugging Face conversational JSONL (`{"messages": [...]}`). System prompts are **stripped entirely** — only user/assistant/tool turns are exported. Tool calls are serialised as structured text blocks:
+
+```json
+{"role": "assistant", "content": "I'll check the file first.\n<tool_call>\n{\"name\": \"read_file\", ...}\n</tool_call>"}
+{"role": "tool",      "content": "<tool_response>\n{file contents...}\n</tool_response>"}
+```
+
+Near-duplicate sessions (same task description fingerprint) are capped at `dedup_fingerprint_max` per export file to avoid over-representing repeated test tasks.
+
+### Auto-Export Threshold
+
+When the number of newly qualified unexported sessions reaches `export_threshold` (default 100), the export job runs automatically and writes a JSONL file to `export_dir`.
+
+```ini
+[training]
+export_threshold = 100
+export_max_per_run = 1000
+export_dir = data/training_exports
+dedup_fingerprint_max = 3
+```
+
+### Status and Manual Trigger
+
+```
+GET  /api/training/status    — qualified count, last export time, file list
+POST /api/training/export    — manual export trigger; returns path to JSONL file
+GET  /api/training/metrics   — demotion rate, completion rate, tokens-to-completion (segmented by checkpoint)
+```
+
+### Training Checkpoints
+
+When you deploy a new fine-tuned model version, record a checkpoint so metrics can be segmented before and after:
+
+```
+POST /api/training/checkpoints    body: {"checkpoint_name": "qwen-35b-lora-2026-05-20", "model_notes": "..."}
+```
+
+`GET /api/training/metrics?after=checkpoint_id` then returns performance metrics for sessions since that checkpoint.
+
+---
+
+## 20. Inter-Agent Communications
+
+Agents can ask peer agents questions at runtime and receive answers inline. The asking session blocks while the peer runs a short focused sub-session, then continues with the answer as a tool result.
+
+### Calling `ask_agent`
+
+```python
+# First, find available sessions
+sessions = list_active_sessions(project="Garden")
+# [{"session_id": "abc123", "task_id": 42, "task_title": "Implement auth module", ...}]
+
+# Ask a peer
+answer = ask_agent(
+    target_session_id="abc123",
+    question="What authentication library did you decide to use and why?"
+)
+```
+
+The peer session runs a focused LLM session (max 5 turns, read-only tools) and returns its answer. Budget for the sub-session is charged to the *calling* task.
+
+### Depth Cap
+
+To prevent runaway chains, each call increments an `ask_depth` counter. When `ask_depth >= ask_max_depth` (default 3), `ask_agent` returns:
+
+```
+Max inter-agent ask depth (3) reached. Make your best judgment with available information.
+```
+
+```ini
+[orchestration]
+ask_max_depth = 3
+```
+
+### Availability
+
+`ask_agent` and `list_active_sessions` are available to `custom_llm`, `implementation`, `writing`, `research`, and similar worker agents. They are **not** available to Maestro (which uses `consult_maestro` instead), reflection agents (read-only review context), or mechanical agents.
+
+### Budget Tracing
+
+Sub-session entries appear in the calling task's budget trace tagged `agent_name="InterAgentSession"` with `ask_depth` in metadata. The full conversation is auditable via `/api/budget-entries`.
+
+---
+
+## 21. Orchestrator LLM & Maestro Escalation
+
+### Orchestrator LLM (`maestro_llm_id`)
+
+Several advanced features — autopilot objective assessment (section 13), ConsultAgent (below), reflection LLM resolution (section 16), episodic summary generation (section 15) — use a dedicated *orchestrator* LLM rather than the task's worker LLM.
+
+Configure it in `maestro.ini`:
+
+```ini
+[orchestration]
+maestro_llm_id =              ; LLM record ID to use for Maestro-mode operations
+                               ; blank = fall back to project default LLM
+consult_max_calls_per_session = 3
+ask_max_depth = 3
+```
+
+Or set it per-project via **Project Settings → Orchestrator LLM** (the same dropdown as the worker LLM picker). Per-project setting takes priority over the ini.
+
+### `consult_maestro` — Agent Escalation Tool
+
+When a worker agent encounters a question that requires architectural judgment — ambiguous interface contracts, conflicting requirements, repeated tooling failures — it can escalate to Maestro mid-session:
+
+```python
+answer = consult_maestro(
+    question="The task says to use REST but the arch doc specifies GraphQL. Which should I implement?"
+)
+```
+
+A **ConsultAgent** spins up synchronously: it loads all arch cards and document store titles as context, can call read-only project tools (`get_document`, `list_tasks`, `get_task_description`), reasons over the question, and returns an answer. The calling agent receives the answer as a normal tool result and continues.
+
+**Behaviour:**
+- The calling session never pauses visibly — escalation and response happen within a single LLM turn
+- ConsultAgent uses the orchestrator LLM (`maestro_llm_id`), not the worker LLM
+- Per-session call cap: once `consult_max_calls_per_session` is reached, further calls return an error instructing the agent to use its best judgment
+- Maestro cannot call `consult_maestro` itself (excluded from its tool list)
+- Budget for ConsultAgent sessions is charged to the task, tagged `agent_name="ConsultAgent"`
+
+To make `consult_maestro` available in a stage, include it in the stage's tool allowlist in the Pipeline Editor. It does not need to be listed for every stage — only stages where escalation is appropriate.
+
+### Quick Reference — New Endpoints (Sections 13–21)
+
+```
+# Objectives
+GET/POST   /api/projects/{name}/objectives
+PUT/DELETE /api/projects/{name}/objectives/{id}
+GET        /api/projects/{name}/objectives/tree
+GET        /api/projects/{name}/objectives/{id}/evidence
+
+# Model routing
+GET        /api/projects/{name}/routing
+PUT        /api/projects/{name}/routing/{stage}
+DELETE     /api/projects/{name}/routing/{stage}
+GET        /api/projects/{name}/cost-by-model
+
+# Event triggers
+POST       /api/events/inbound/{watch_id}
+
+# Training
+GET        /api/training/status
+POST       /api/training/export
+GET        /api/training/metrics
+POST       /api/training/checkpoints
+
+# Reflection
+POST       /api/tasks/{id}/trigger-reflection
 ```
 
 ---

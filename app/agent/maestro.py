@@ -95,6 +95,7 @@ class MaestroAgent:
         llm_base_url: str,
         llm_model: str,
         is_heartbeat: bool = False,
+        event_context: "str | None" = None,
     ):
         self.project      = project_name
         self.project_path = project_path
@@ -103,6 +104,7 @@ class MaestroAgent:
         self.llm_base_url = llm_base_url
         self.llm_model    = llm_model
         self.is_heartbeat = is_heartbeat
+        self.event_context = event_context
         
         from app.agent.survey_orchestrator import SurveyOrchestrator
         self.orchestrator = SurveyOrchestrator()
@@ -597,7 +599,15 @@ class MaestroAgent:
         elif state.git_error:
             git_block = f"\nWARNING: Git health check failed: {state.git_error}\n"
 
+        event_prefix = (
+            f"[INCOMING EVENT]\n{sanitize_user_content(self.event_context)}\n\n"
+            "React to this event. Decide what to create, investigate, or record. "
+            "Use your full toolkit.\n\n"
+            if self.event_context else ""
+        )
+
         user_msg = (
+            f"{event_prefix}"
             f"Project: {self.project}\n"
             f"Mutation strategy: {strategy_name} — {strategy_desc}\n"
             f"{git_block}\n"
@@ -739,9 +749,19 @@ class MaestroAgent:
             "No prose after calling submit_work."
         )
 
+        event_prefix = (
+            f"[INCOMING EVENT]\n{sanitize_user_content(self.event_context)}\n\n"
+            "React to this event. Decide what to create, investigate, or record.\n\n"
+            if self.event_context else ""
+        )
+
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": f"Project: {sanitize_user_content(self.project)}\n{deleted_block}\nSurvey this project and propose up to 3 new idea cards."}
+            {"role": "user",   "content": (
+                f"{event_prefix}"
+                f"Project: {sanitize_user_content(self.project)}\n{deleted_block}\n"
+                "Survey this project and propose up to 3 new idea cards."
+            )},
         ]
         
         # Include submit_work and infra tools in survey context

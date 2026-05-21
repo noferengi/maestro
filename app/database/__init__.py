@@ -55,6 +55,9 @@ if globals().get('_initialized'):
         'app.database.crud_settings', 'app.database.crud_malleable',
         'app.database.crud_documents',
         'app.database.crud_goals',
+        'app.database.crud_autopilot',
+        'app.database.crud_events',
+        'app.database.crud_training',
     ]:  # NOTE: keep this list in sync with the from-imports below
 
         if _sub in _sys.modules:
@@ -77,6 +80,7 @@ from .models import (
     LLM,
     Budget,
     Project,
+    ProjectLlmRouting,
     Task,
     BudgetEntry,
     Expense,
@@ -118,6 +122,14 @@ from .models import (
     CustomAgentDefinition,
     MaestroGoal,
     GoalVerificationJob,
+    AutopilotObjective,
+    RevertVote,
+    SelfModMergeLog,
+    EpisodicSummaryJob,
+    WatchedEvent,
+    WatchErrorLog,
+    TrainingSessionScore,
+    TrainingCheckpoint,
 )
 
 # Task CRUD + seeding + helpers
@@ -159,12 +171,15 @@ from .crud_tasks import (
     get_pending_pip_resolution_jobs,
     get_active_pip_resolution_jobs_for_task,
     update_pip_resolution_job,
+    mark_dispatch_waiting,
+    set_task_blocked_on_model,
 )
 
 # Project CRUD
 from .crud_projects import (
     get_all_projects,
     get_project,
+    get_project_by_id,
     get_project_path,
     upsert_project,
     rename_project,
@@ -173,6 +188,9 @@ from .crud_projects import (
     get_project_setting,
     set_project_setting,
     get_all_project_settings,
+    get_routing_table,
+    upsert_routing_entry,
+    delete_routing_entry,
 )
 
 # LLM + Budget + ComputeNode CRUD
@@ -268,6 +286,10 @@ from .crud_jobs import (
     get_pending_arch_gen_jobs,
     update_arch_gen_job,
     get_retriable_arch_gen_jobs,
+    create_episodic_summary_job,
+    get_pending_episodic_summary_jobs,
+    update_episodic_summary_job,
+    get_episodic_summary_job,
 )
 
 # File + search caches + archived files
@@ -381,6 +403,42 @@ from .crud_goals import (
     get_verification_jobs_for_goal,
 )
 
+# Autopilot objectives + self-modification CRUD
+from .crud_autopilot import (
+    create_objective,
+    list_objectives,
+    get_objective,
+    complete_objective,
+    get_objective_tree,
+    append_objective_evidence,
+    get_objective_evidence,
+    update_objective,
+    update_objective_status,
+    record_assessment,
+    get_in_flight_count,
+    delete_objective,
+    objective_to_dict,
+    cast_revert_vote,
+    get_revert_votes,
+    record_self_mod_merge,
+    get_latest_self_mod_merge,
+    mark_self_mod_reverted,
+)
+
+# Event watches (Gap 9)
+from .crud_events import (
+    create_watch,
+    get_watch,
+    list_watches,
+    update_watch_status,
+    record_firing,
+    should_fire,
+    log_watch_error,
+    get_watch_errors,
+    get_consecutive_error_count,
+    payload_hash,
+)
+
 # Factory runs audit
 from .crud_factory import (
     create_factory_run,
@@ -439,11 +497,27 @@ from .crud_malleable import (
     transfer_cards,
 )
 
+# Training data pipeline (Gap 11)
+from .crud_training import (
+    score_session,
+    upsert_training_score,
+    get_unscored_sessions,
+    score_new_sessions,
+    count_qualified_unexported,
+    get_qualified_unexported_sessions,
+    mark_sessions_exported,
+    get_training_status,
+    create_training_checkpoint,
+    list_training_checkpoints,
+    checkpoint_to_dict,
+    get_training_metrics,
+)
+
 __all__ = [
     # session
     "DATABASE_PATH", "engine", "SessionLocal", "Base", "get_db", "init_db_tables",
     # models
-    "ComputeNode", "LLM", "Budget", "Project", "Task", "BudgetEntry", "Expense",
+    "ComputeNode", "LLM", "Budget", "Project", "ProjectLlmRouting", "Task", "BudgetEntry", "Expense",
     "TransitionVote", "TransitionResult", "SubdivisionRecord",
     "PlanningResult", "ComponentResult", "OptimizationResult",
     "SecurityReviewResult", "FinalReviewResult", "MergeRecord", "PerformanceImprovementPlan",
@@ -455,7 +529,9 @@ __all__ = [
     "PipelineTemplate", "PipelineStage", "PipelineTransition",
     "PipelineStageGroup", "PipelineArchCategory", "ProjectDocument",
     "ArchivedFile", "ProjectSettings", "CustomAgentDefinition",
-    "MaestroGoal", "GoalVerificationJob",
+    "MaestroGoal", "GoalVerificationJob", "AutopilotObjective",
+    "RevertVote", "SelfModMergeLog",
+    "WatchedEvent", "WatchErrorLog",
     # crud_tasks
     "init_db", "seed_sample_tasks", "seed_task", "seed_sample_tasks_raw",
     "create_task", "get_task", "get_tasks_by_type", "get_tasks_by_project",
@@ -470,8 +546,10 @@ __all__ = [
     "create_pip_resolution_job", "get_pending_pip_resolution_jobs",
     "get_active_pip_resolution_jobs_for_task", "update_pip_resolution_job",
     # crud_projects
-    "get_all_projects", "get_project", "get_project_path", "upsert_project", "rename_project", "delete_project", "project_to_dict",
+    "get_all_projects", "get_project", "get_project_by_id", "get_project_path", "upsert_project", "rename_project", "delete_project", "project_to_dict",
     "get_project_setting", "set_project_setting", "get_all_project_settings",
+    "get_routing_table", "upsert_routing_entry", "delete_routing_entry",
+    "mark_dispatch_waiting", "set_task_blocked_on_model",
     # crud_infra
     "get_all_llms", "get_llm", "create_llm", "update_llm", "delete_llm",
     "get_all_budgets", "get_budget", "create_budget", "update_budget", "delete_budget",
@@ -554,6 +632,17 @@ __all__ = [
     "delete_document", "store_document_by_project", "get_document_by_project",
     "fuzzy_get_document_by_project", "list_documents_by_project",
     "delete_document_by_project", "list_documents_written_by_task",
+    # crud_autopilot
+    "create_objective", "list_objectives", "get_objective", "complete_objective",
+    "get_objective_tree", "append_objective_evidence", "get_objective_evidence",
+    "update_objective", "update_objective_status", "record_assessment",
+    "get_in_flight_count", "delete_objective", "objective_to_dict",
+    "cast_revert_vote", "get_revert_votes",
+    "record_self_mod_merge", "get_latest_self_mod_merge", "mark_self_mod_reverted",
+    # crud_events
+    "create_watch", "get_watch", "list_watches", "update_watch_status",
+    "record_firing", "should_fire", "log_watch_error", "get_watch_errors",
+    "get_consecutive_error_count", "payload_hash",
     # crud_goals
     "create_goal", "get_goal", "get_active_goals_for_project", "get_goals_for_project",
     "update_goal", "append_goal_evidence", "goal_to_dict",

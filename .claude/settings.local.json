@@ -78,7 +78,10 @@
       "mcp__maestro__get_gate_history",
       "mcp__maestro__get_budget_entry_full",
       "mcp__maestro__get_scheduler_api_status",
-      "Bash(venv/Scripts/python.exe -m pytest app/tests/ -x -q)"
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/ -x -q)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_episodic_memory.py::TestEpisodicSummaryJobCRUD::test_update_sets_completed_at -v -s)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/ -v --timeout=120 -q)",
+      "Bash(venv/Scripts/python.exe -m pytest app/tests/test_schema_drift.py app/tests/test_episodic_memory.py -v -q)"
     ]
   },
   "enableAllProjectMcpServers": true,

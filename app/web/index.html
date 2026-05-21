@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kanban Board - TheMaestro</title>
-    <link rel="stylesheet" href="/static/style.css?v=44">
+    <link rel="stylesheet" href="/static/style.css?v=46">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
@@ -16,7 +16,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markup.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-css.min.js"></script>
-    <script src="/static/kanban.js?v=72"></script>
+    <script src="/static/kanban.js?v=75"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -63,6 +63,13 @@
             </div>
             <div class="project-tab" id="maestro-decisions-btn" style="cursor:pointer" onclick="openMaestroDecisionsModal()">
                 Decision Log
+            </div>
+        </div>
+
+        <h2 style="margin-top:1rem">Training Pipeline</h2>
+        <div class="project-tabs">
+            <div class="project-tab" id="training-status-btn" style="cursor:pointer" onclick="openTrainingStatusModal()">
+                Training Status
             </div>
         </div>
 
@@ -328,6 +335,64 @@
                     <label class="form-label" for="edit-project-description">Description</label>
                     <textarea class="form-textarea" id="edit-project-description" rows="2" placeholder="Optional description..."></textarea>
                 </div>
+                <div class="ep-section-divider">Autopilot</div>
+                <div class="form-group">
+                    <label class="form-label" for="edit-project-autopilot-budget-select">Autopilot Budget</label>
+                    <select class="form-input" id="edit-project-autopilot-budget-select"></select>
+                    <div style="font-size:0.78rem;color:#6c757d;margin-top:0.25rem">Budget charged for autopilot-spawned card creation and LLM assessments. When exhausted, autopilot self-suppresses.</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="edit-project-max-in-flight">Max in-flight cards</label>
+                    <input type="number" class="form-input" id="edit-project-max-in-flight" min="1" max="100" value="10" style="width:100px">
+                    <div style="font-size:0.78rem;color:#6c757d;margin-top:0.25rem">Autopilot suppresses itself when active objective-tagged cards reach this count.</div>
+                </div>
+                <div class="ep-section-divider">Training Pipeline</div>
+                <div class="form-group">
+                    <label class="form-label" style="display:flex;align-items:center;gap:0.5rem;cursor:pointer">
+                        <input type="checkbox" id="edit-project-exclude-training">
+                        Exclude from training data
+                    </label>
+                    <div style="font-size:0.78rem;color:#6c757d;margin-top:0.25rem">When checked, sessions from this project are omitted from all training exports.</div>
+                </div>
+                <div class="ep-section-divider">Objectives</div>
+                <div id="edit-project-objectives-list" class="objectives-list">
+                    <div class="objectives-loading" style="color:#6c757d;font-size:0.85rem;padding:0.5rem 0">Loading…</div>
+                </div>
+                <div id="edit-project-objective-form" class="objective-inline-form" style="display:none">
+                    <input type="hidden" id="ep-obj-edit-id">
+                    <input type="hidden" id="ep-obj-parent-id">
+                    <div id="ep-obj-parent-label" style="display:none;font-size:0.78rem;color:#6c757d;margin-bottom:0.3rem">Sub-objective of: <em id="ep-obj-parent-desc"></em></div>
+                    <textarea class="form-textarea" id="ep-obj-description" rows="2" placeholder="Describe the objective…" style="margin-bottom:0.4rem"></textarea>
+                    <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+                        <label style="font-size:0.82rem;color:#495057">Priority (1–10):
+                            <input type="number" class="form-input" id="ep-obj-priority" min="1" max="10" value="5" style="width:60px;display:inline-block;margin-left:0.25rem">
+                        </label>
+                        <label style="font-size:0.82rem;color:#495057">Time-box hours (optional):
+                            <input type="number" class="form-input" id="ep-obj-timebox" min="1" placeholder="none" style="width:70px;display:inline-block;margin-left:0.25rem">
+                        </label>
+                        <button class="btn btn-primary" style="padding:0.3rem 0.75rem;font-size:0.82rem" onclick="epSaveObjective()">Save</button>
+                        <button class="btn btn-secondary" style="padding:0.3rem 0.75rem;font-size:0.82rem" onclick="epCancelObjectiveForm()">Cancel</button>
+                    </div>
+                </div>
+                <button class="btn btn-secondary" id="ep-add-obj-btn" style="margin-top:0.5rem;font-size:0.82rem;padding:0.3rem 0.75rem" onclick="epShowAddObjectiveForm()">+ Add objective</button>
+                <div class="ep-section-divider">Model Routing</div>
+                <div style="font-size:0.78rem;color:#6c757d;margin-bottom:0.5rem">Override the default LLM per pipeline stage. Empty = use project default.</div>
+                <div id="project-routing-section">
+                    <table id="project-routing-table" class="routing-table" style="width:100%;border-collapse:collapse;font-size:0.85rem">
+                        <thead>
+                            <tr style="color:#6c757d;font-size:0.78rem;text-transform:uppercase;letter-spacing:0.04em">
+                                <th style="text-align:left;padding:0.3rem 0.5rem;font-weight:600">Stage</th>
+                                <th style="text-align:left;padding:0.3rem 0.5rem;font-weight:600">LLM Override</th>
+                                <th style="width:50px"></th>
+                            </tr>
+                        </thead>
+                        <tbody id="project-routing-tbody">
+                            <tr><td colspan="3" style="color:#6c757d;font-size:0.82rem;padding:0.5rem">Loading stages…</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="ep-section-divider" style="margin-top:1rem">Cost by Model</div>
+                <div id="project-cost-by-model" style="font-size:0.82rem;color:#6c757d">Loading…</div>
                 <div id="edit-project-error" class="inline-error" style="display:none"></div>
             </div>
             <div class="modal-footer">
@@ -429,6 +494,21 @@
                             <textarea class="form-input" id="llm-notes" rows="2"
                                       placeholder="e.g. Q8_0 quant of Qwen3-Coder-Next-80B finetune v2.1, SWA enabled"></textarea>
                         </div>
+                        <div class="form-group">
+                            <label class="form-label">Capabilities</label>
+                            <div class="cap-checkboxes" id="llm-capabilities-checkboxes">
+                                <label><input type="checkbox" value="reasoning"> reasoning</label>
+                                <label><input type="checkbox" value="code"> code</label>
+                                <label><input type="checkbox" value="math"> math</label>
+                                <label><input type="checkbox" value="fast"> fast</label>
+                                <label><input type="checkbox" value="long_context"> long_context</label>
+                                <label><input type="checkbox" value="cheap"> cheap</label>
+                            </div>
+                        </div>
+                        <div class="form-group" style="display:flex;gap:1.5rem">
+                            <label><input type="checkbox" id="llm-supports-tools" checked> Supports tool calls</label>
+                            <label><input type="checkbox" id="llm-supports-vision"> Supports vision</label>
+                        </div>
                         <div id="llm-error" class="inline-error" style="display:none"></div>
                         <div style="margin-top:1rem">
                             <button class="btn btn-primary" id="llm-submit-btn" onclick="addLlm()">Add LLM Endpoint</button>
@@ -483,9 +563,24 @@
                                 <textarea class="form-input" id="llm-edit-notes" rows="2"
                                           placeholder="e.g. Q8_0 quant of Qwen3-Coder-Next-80B finetune v2.1, SWA enabled"></textarea>
                             </div>
+                            <div class="form-group">
+                                <label class="form-label">Capabilities</label>
+                                <div class="cap-checkboxes" id="llm-edit-capabilities-checkboxes">
+                                    <label><input type="checkbox" value="reasoning"> reasoning</label>
+                                    <label><input type="checkbox" value="code"> code</label>
+                                    <label><input type="checkbox" value="math"> math</label>
+                                    <label><input type="checkbox" value="fast"> fast</label>
+                                    <label><input type="checkbox" value="long_context"> long_context</label>
+                                    <label><input type="checkbox" value="cheap"> cheap</label>
+                                </div>
+                            </div>
+                            <div class="form-group" style="display:flex;gap:1.5rem">
+                                <label><input type="checkbox" id="llm-edit-supports-tools"> Supports tool calls</label>
+                                <label><input type="checkbox" id="llm-edit-supports-vision"> Supports vision</label>
+                            </div>
                             <div id="llm-edit-error" class="inline-error" style="display:none"></div>
                             <div style="margin-top:1rem">
-                                <button class="btn btn-primary" onclick="addLlm()">Save Changes</button>
+                                <button class="btn btn-primary" onclick="saveLlmEdit()">Save Changes</button>
                             </div>
                         </div>
                     </div>
@@ -1187,6 +1282,26 @@
                 <tbody id="doc-list"></tbody>
             </table>
             <div id="doc-viewer" style="display:none;margin-top:12px;padding:10px;background:#161b2e;border-radius:4px;font-size:12px;font-family:monospace;white-space:pre-wrap;max-height:300px;overflow:auto"></div>
+        </div>
+    </div>
+
+    <!-- Training Status Modal -->
+    <div class="modal-overlay" id="training-status-modal">
+        <div class="modal" style="width:580px">
+            <div class="modal-header">
+                <h2 class="modal-title">Training Pipeline</h2>
+                <button class="close-btn" onclick="closeTrainingStatusModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="training-status-content">
+                    <div style="color:#6c757d;font-size:0.85rem">Loading...</div>
+                </div>
+                <div style="margin-top:1.2rem;display:flex;gap:0.5rem;align-items:center">
+                    <button class="btn btn-primary" id="training-export-btn" onclick="triggerTrainingExport()">Export Now</button>
+                    <button class="btn btn-secondary" onclick="loadTrainingStatus()">Refresh</button>
+                    <span id="training-export-msg" style="font-size:0.8rem;color:#6c757d;margin-left:0.5rem"></span>
+                </div>
+            </div>
         </div>
     </div>
 </body>

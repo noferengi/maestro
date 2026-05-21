@@ -1,3 +1,5 @@
+description = "Fix stale allowed_tools names in built-in agent definitions after tool rename pass (search_files, run_pytest, run_mypy, etc.)"
+
 """
 Fix stale allowed_tools names in five built-in agent definitions.
 

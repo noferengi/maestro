@@ -485,7 +485,7 @@ def seed_sample_tasks_raw(conn):
 # Task CRUD
 # ---------------------------------------------------------------------------
 
-def create_task(title, task_type, description="", owner="user", tags=None, content=None, llm_id=None, budget_id=None, prerequisites=None, project='TheMaestro', project_id=None, position=None, stage_key=None, pipeline_template_id=None):
+def create_task(title, task_type, description="", owner="user", tags=None, content=None, llm_id=None, budget_id=None, prerequisites=None, project='TheMaestro', project_id=None, position=None, stage_key=None, pipeline_template_id=None, autopilot_objective_id=None):
     """Create a new task.
 
     Pass either ``project`` (name string) or ``project_id`` (integer).  If both
@@ -519,6 +519,7 @@ def create_task(title, task_type, description="", owner="user", tags=None, conte
             project_id=project_id,
             pipeline_template_id=pipeline_template_id,
             position=position,
+            autopilot_objective_id=autopilot_objective_id,
             history=[{"status": "created", "timestamp": datetime.now().isoformat()}]
         )
         db.add(task)
@@ -1082,6 +1083,7 @@ def task_to_dict(task):
         "clarification_status": getattr(task, "clarification_status", "none") or "none",
         "description_original": getattr(task, "description_original", None),
         "goal_id": getattr(task, "goal_id", None),
+        "autopilot_objective_id": getattr(task, "autopilot_objective_id", None),
         "created_at": task.created_at.isoformat() if task.created_at else None,
         "updated_at": task.updated_at.isoformat() if task.updated_at else None,
         "pips": [
@@ -1089,3 +1091,39 @@ def task_to_dict(task):
             for p in (get_pips_for_task(task.id) if hasattr(task, "id") else [])
         ]
     }
+
+
+# ---------------------------------------------------------------------------
+# Routing dispatch helpers (GAP 10)
+# ---------------------------------------------------------------------------
+
+def mark_dispatch_waiting(task_id: str) -> None:
+    """Record that a task started waiting for its required model."""
+    db = SessionLocal()
+    try:
+        db.query(Task).filter_by(id=task_id).update(
+            {"dispatch_waiting_since": datetime.utcnow()},
+            synchronize_session=False,
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error("Error marking dispatch_waiting for task %s: %s", task_id, e)
+    finally:
+        db.close()
+
+
+def set_task_blocked_on_model(task_id: str, llm_id: int) -> None:
+    """Mark a task as blocked waiting for a specific model that is at capacity."""
+    db = SessionLocal()
+    try:
+        db.query(Task).filter_by(id=task_id).update(
+            {"blocked_on_model_id": llm_id},
+            synchronize_session=False,
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error("Error setting blocked_on_model for task %s: %s", task_id, e)
+    finally:
+        db.close()

@@ -105,6 +105,16 @@ AGENT_REGISTRY: dict[str, AgentSpec] = {
         description="Universal LLM agent driven entirely by stage.config (system_prompt, tools, gate_type)",
         gate_type="llm_judge",
     ),
+    "reflection_agent": AgentSpec(
+        cls=None,  # dispatched via registered executor in scheduler.py
+        display_name="Reflection",
+        description=(
+            "Skeptical post-stage review — produces a structured JSON confidence report "
+            "(confidence, issues, uncertain_about) consumed by Maestro to decide next action."
+        ),
+        default_tools=["get_task_history_recent", "submit_work"],
+        gate_type="single_pass",
+    ),
     "circuit_breaker": AgentSpec(
         cls=None,
         display_name="Circuit Breaker",

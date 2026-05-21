@@ -10,18 +10,22 @@ Session setup  (_test_schema, scope="session"):
   1. Applies any pending migrations to the test DB via the migration runner.
   2. Truncates every data table (CASCADE) so the session starts from a clean
      slate.  schema_migrations is preserved so the runner stays consistent.
+  3. Opens ONE outer transaction on a shared connection held for the entire
+     pytest session (never committed).
 
 Per-test  (_db_rollback, autouse, scope="function"):
-  - Opens one connection and begins an outer transaction that is NEVER committed.
-  - Patches every module's SessionLocal to return sessions bound to that
-    connection with join_transaction_mode="create_savepoint".  A session.commit()
-    inside test code releases a savepoint instead of committing the outer
+  - Creates a SAVEPOINT on the shared connection at the start of each test.
+  - Patches every module's SessionLocal (using a pre-built cache, not a full
+    sys.modules scan) to return Session objects bound to the shared connection
+    with join_transaction_mode="create_savepoint".  A session.commit() inside
+    test code releases an inner savepoint instead of committing the outer
     transaction — writes are visible within the test but never persisted.
-  - On teardown: restores all SessionLocal references, then rolls back and
-    closes the connection.
+  - On teardown: restores all SessionLocal references, then rolls back to the
+    test's savepoint (ROLLBACK TO SAVEPOINT), discarding all writes.
 
-This means every test starts with an empty database (except baseline rows
-inserted during the test itself) and leaves no state behind.
+This means every test starts with an empty database and leaves no state behind,
+while paying only ~1 round-trip per test (SAVEPOINT + ROLLBACK TO) instead of
+2 (connection open + close).
 """
 
 from __future__ import annotations
@@ -48,7 +52,7 @@ import app.database  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
-# Session fixture: migrate then truncate.
+# Session fixture: migrate, truncate, open the shared outer connection.
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="session", autouse=True)
@@ -90,50 +94,82 @@ def _test_schema():
     # Leave the test DB populated for post-mortem inspection if a session fails.
 
 
-# ---------------------------------------------------------------------------
-# Per-test fixture: savepoint-based rollback.
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(autouse=True)
-def _db_rollback():
+@pytest.fixture(scope="session")
+def _shared_conn(_test_schema):
     """
-    Wrap every test in a transaction that is rolled back after the test.
+    One database connection held open for the entire pytest session.
 
-    Mechanism:
-      - Open one connection to the test engine and begin an outer transaction.
-      - Patch SessionLocal in every module that has it (within the app./database
-        namespace) to a factory that returns Session objects bound to that
-        connection with join_transaction_mode="create_savepoint".  With this
-        mode, session.commit() releases a savepoint instead of committing the
-        outer transaction, so CRUD writes are visible within the test but never
-        hit the database permanently.
-      - On teardown: restore all original SessionLocal references, then roll
-        back the outer transaction and close the connection.
+    An outer transaction is started here and never committed.  Per-test
+    isolation is provided by SAVEPOINT / ROLLBACK TO SAVEPOINT in _db_rollback.
     """
     from app.database.session import engine
-
     conn = engine.connect()
     conn.begin()  # outer transaction — never committed
+    yield conn
+    try:
+        conn.rollback()
+    finally:
+        conn.close()
 
-    def make_session():
-        return Session(conn, join_transaction_mode="create_savepoint", autoflush=False)
 
-    originals = []
+# ---------------------------------------------------------------------------
+# Module cache: built once, reused by every test.
+# ---------------------------------------------------------------------------
+
+# Populated by _build_session_local_cache() after all imports are done.
+_SESSION_LOCAL_MODULES: list = []
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _build_session_local_cache(_test_schema):
+    """
+    Walk sys.modules once (after migrations + eager imports) and cache every
+    module that has a SessionLocal attribute.  Avoids a full sys.modules scan
+    on every test (~2 000 modules x 1 000 tests = 2 M iterations saved).
+    """
     for modname, mod in list(sys.modules.items()):
         if (
             modname.startswith("app.")
             or modname.startswith("database")
             or modname == "main"
         ) and hasattr(mod, "SessionLocal"):
-            originals.append((mod, mod.SessionLocal))
-            mod.SessionLocal = make_session
+            _SESSION_LOCAL_MODULES.append(mod)
+
+
+# ---------------------------------------------------------------------------
+# Per-test fixture: savepoint-based rollback on the shared connection.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _db_rollback(_shared_conn, _build_session_local_cache):
+    """
+    Wrap every test in a SAVEPOINT that is rolled back on teardown.
+
+    Uses the session-scoped _shared_conn so no DB connection is opened or
+    closed per test.  The pre-built _SESSION_LOCAL_MODULES cache avoids
+    scanning sys.modules on every test.
+    """
+    sp = _shared_conn.begin_nested()  # SAVEPOINT
+
+    def make_session():
+        return Session(_shared_conn, join_transaction_mode="create_savepoint",
+                       autoflush=False)
+
+    originals = [(mod, mod.SessionLocal) for mod in _SESSION_LOCAL_MODULES]
+    for mod, _ in originals:
+        mod.SessionLocal = make_session
 
     yield
 
     for mod, orig in originals:
         mod.SessionLocal = orig
 
-    try:
-        conn.rollback()
-    finally:
-        conn.close()
+    sp.rollback()  # ROLLBACK TO SAVEPOINT — discards all test writes
+
+
+@pytest.fixture(autouse=True)
+def _reset_shutdown_events():
+    yield
+    from app.agent.llm_client import _shutdown_event, _force_shutdown_event
+    _shutdown_event.clear()
+    _force_shutdown_event.clear()
