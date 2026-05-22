@@ -408,6 +408,7 @@ async def _stream_llm_response(
     url: str,
     payload: dict,
     idle_timeout: float,
+    task_id: str | None = None,
 ) -> dict:
     """POST to a streaming chat/completions endpoint with per-chunk idle timeout.
 
@@ -543,6 +544,17 @@ async def _stream_llm_response(
                         content = delta.get("content")
                         if content:
                             accumulated_content.append(content)
+                            if task_id:
+                                try:
+                                    from app.agent.stream_broker import publish as _sb_publish
+                                    _sb_publish(
+                                        task_id, content,
+                                        agent_name=_ctx_agent_name.get() or "",
+                                        session_id=session_id or "",
+                                        turn_type="content",
+                                    )
+                                except Exception:
+                                    pass
 
                         fr = choice.get("finish_reason")
                         if fr:
@@ -598,6 +610,26 @@ async def _stream_llm_response(
     msg: dict = {"role": "assistant", "content": "".join(accumulated_content)}
     if tool_calls_list:
         msg["tool_calls"] = tool_calls_list
+
+    if task_id:
+        try:
+            from app.agent.stream_broker import publish as _sb_publish
+            import json as _json
+            _agent = _ctx_agent_name.get() or ""
+            _sid = session_id or ""
+            if tool_calls_list:
+                tool_info = [
+                    {
+                        "name": tc.get("function", {}).get("name", ""),
+                        "args": tc.get("function", {}).get("arguments", ""),
+                    }
+                    for tc in tool_calls_list
+                ]
+                _sb_publish(task_id, _json.dumps(tool_info), agent_name=_agent,
+                            session_id=_sid, turn_type="tool_invoked")
+            _sb_publish(task_id, "", agent_name=_agent, session_id=_sid, turn_type="turn_end")
+        except Exception:
+            pass
 
     return {
         "id": response_id,
@@ -772,16 +804,20 @@ def _sanitize_messages(messages: list[dict]) -> list[dict]:
                 content = content.replace(raw, safe)
                 changed = True
 
-        _sbrace_match = _SINGLE_BRACE_RE.search(content)
-        if _sbrace_match:
-            if log_debug:
-                snip = content[max(0, _sbrace_match.start() - 40):_sbrace_match.end() + 40].replace("\n", "↵")
-                logger.debug(
-                    "msg[%d] (%s): Escaping single-brace identifiers ×%d — near: %r",
-                    i, role, len(_SINGLE_BRACE_RE.findall(content)), snip,
-                )
-            content = _SINGLE_BRACE_RE.sub(r"[\1]", content)
-            changed = True
+        # Tool results contain code and data — mangling {n} to [n] corrupts f-strings
+        # and causes agents to copy broken syntax on subsequent writes. Only apply
+        # single-brace escaping to system/user messages (template-sourced content).
+        if role != "tool":
+            _sbrace_match = _SINGLE_BRACE_RE.search(content)
+            if _sbrace_match:
+                if log_debug:
+                    snip = content[max(0, _sbrace_match.start() - 40):_sbrace_match.end() + 40].replace("\n", "↵")
+                    logger.debug(
+                        "msg[%d] (%s): Escaping single-brace identifiers ×%d — near: %r",
+                        i, role, len(_SINGLE_BRACE_RE.findall(content)), snip,
+                    )
+                content = _SINGLE_BRACE_RE.sub(r"[\1]", content)
+                changed = True
 
         _non_ascii = sum(1 for c in content if ord(c) > 127)
         if _non_ascii:
@@ -1215,7 +1251,7 @@ async def call_llm(
 
             if stream:
                 # Streaming: per-chunk idle timeout; clock runs only during generation.
-                result = await _stream_llm_response(url, payload, _idle_timeout)
+                result = await _stream_llm_response(url, payload, _idle_timeout, task_id=task_id)
             else:
                 import json as _json
                 async with httpx.AsyncClient(timeout=_http_timeout) as client:

@@ -827,6 +827,79 @@ def _find_old_str_lax(text: str, old_str: str) -> "tuple[int, int] | None":
     return char_start, char_end
 
 
+def _find_old_str_indent_lax(text: str, old_str: str) -> "tuple[int, int] | None":
+    """Line-by-line match ignoring ALL leading/trailing whitespace per line.
+
+    Last-resort fallback for indentation mismatches (wrong indent level, tabs vs
+    spaces, mixed indent).  Returns (char_start, char_end) in *text*, or None if
+    not found exactly once.  Rejects all-blank old_str to avoid spurious matches.
+    """
+    text_lines = text.splitlines(keepends=True)
+    old_lines = old_str.splitlines(keepends=True) or [old_str]
+    n = len(old_lines)
+    old_stripped = [l.strip() for l in old_lines]
+    if not any(old_stripped):
+        return None
+    matches: list[int] = []
+    for i in range(max(1, len(text_lines) - n + 1)):
+        if i + n > len(text_lines):
+            break
+        if [l.strip() for l in text_lines[i : i + n]] == old_stripped:
+            matches.append(i)
+    if len(matches) != 1:
+        return None
+    i = matches[0]
+    char_start = sum(len(text_lines[j]) for j in range(i))
+    char_end = char_start + sum(len(text_lines[i + j]) for j in range(n))
+    return char_start, char_end
+
+
+def _apply_patch_from_span(
+    safe_path: str, path: str, original: str,
+    char_start: int, char_end: int, new_str: str,
+    repair_note: str = "",
+) -> str:
+    """Archive pre-patch copy, apply replacement at char_start:char_end, stage, return message."""
+    start_line = original[:char_start].count("\n") + 1
+    old_chunk = original[char_start:char_end]
+    end_line = start_line + old_chunk.count("\n")
+    effective_root = _task_git_cwd.get() or PROJECT_ROOT
+    rel_path = os.path.relpath(os.path.realpath(safe_path), os.path.realpath(effective_root))
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+    archive_dest = os.path.join(_effective_archive_dir(), timestamp, rel_path)
+    try:
+        os.makedirs(os.path.dirname(archive_dest), exist_ok=True)
+        shutil.copy2(safe_path, archive_dest)
+    except OSError as exc:
+        return f"ERROR: could not archive pre-patch copy of '{path}': {exc}"
+    patched = original[:char_start] + new_str + original[char_end:]
+    try:
+        with open(safe_path, "w", encoding="utf-8") as fh:
+            fh.write(patched)
+    except OSError as exc:
+        return f"ERROR writing '{path}': {exc}"
+    _invalidate_prepped_cache(safe_path)
+    _git_run(["git", "add", safe_path])
+    lines_changed = new_str.count("\n") - old_chunk.count("\n")
+    new_end_line = start_line + new_str.count("\n")
+    note = f" [{repair_note}]" if repair_note else ""
+    msg = (
+        f"OK: patched '{path}' (lines {start_line}-{end_line} -> {start_line}-{new_end_line}, "
+        f"net {lines_changed:+d} lines){note}. Staged for git."
+    )
+    patched_lines = patched.splitlines()
+    ctx_start = max(0, start_line - 2)
+    ctx_end = min(len(patched_lines), new_end_line + 2)
+    if ctx_end - ctx_start <= 250:
+        section = '\n'.join(
+            f"{ctx_start + i + 1}: {patched_lines[ctx_start + i]}" for i in range(ctx_end - ctx_start)
+        )
+        msg += f"\n\n== PATCHED SECTION (lines {ctx_start+1}-{ctx_end}) ==\n{section}\n== END =="
+    else:
+        msg += f"\n(section spans {ctx_end - ctx_start} lines — too large to show inline)"
+    return msg
+
+
 def _vis_ws(s: str) -> str:
     """Render non-obvious whitespace visibly (ASCII-safe) for diagnostics."""
     return s.replace('\r', '[CR]').replace('\t', '[TAB]')
@@ -836,6 +909,8 @@ def patch_file(path: str, old_str: str, new_str: str) -> str:
     """[WRITE — files] Replace an exact string in a file. old_str must appear exactly once.
     Auto-stages for git. Path must be inside project root.
     Use this instead of write_file when making targeted edits — avoids full-file rewrites.
+    Auto-repairs trailing whitespace differences, extra blank lines around old_str, and
+    indentation mismatches when an exact string match is not found.
     """
     try:
         safe_path = _assert_safe_write_path(path)
@@ -857,57 +932,44 @@ def patch_file(path: str, old_str: str, new_str: str) -> str:
 
     count = original.count(old_str)
     if count == 0:
-        msg = [f"ERROR: old_str not found in '{path}'."]
+        # --- Lax matching cascade (most to least specific) ---
 
-        # Auto-repair path: trailing whitespace on lines doesn't match but text does.
+        # Level 1: trailing whitespace — handles lines with extra trailing spaces/tabs.
         lax = _find_old_str_lax(original, old_str)
         if lax is not None:
-            char_start, char_end = lax
-            start_line = original[:char_start].count("\n") + 1
-            end_line = start_line + old_str.count("\n")
-            norm = os.path.normpath(os.path.realpath(safe_path))
-            unserved = _next_unserved_range(norm, start_line, end_line)
-            if unserved is not None:
-                return (
-                    f"ERROR: lines {start_line}-{end_line} of '{path}' have not been read yet. "
-                    f"Call read_file('{path}', start={start_line}, end={end_line}) first."
-                )
-            effective_root = _task_git_cwd.get() or PROJECT_ROOT
-            rel_path = os.path.relpath(os.path.realpath(safe_path), os.path.realpath(effective_root))
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
-            archive_dest = os.path.join(_effective_archive_dir(), timestamp, rel_path)
-            try:
-                os.makedirs(os.path.dirname(archive_dest), exist_ok=True)
-                shutil.copy2(safe_path, archive_dest)
-            except OSError as exc:
-                return f"ERROR: could not archive pre-patch copy of '{path}': {exc}"
-            patched = original[:char_start] + new_str + original[char_end:]
-            try:
-                with open(safe_path, "w", encoding="utf-8") as fh:
-                    fh.write(patched)
-            except OSError as exc:
-                return f"ERROR writing '{path}': {exc}"
-            _invalidate_prepped_cache(safe_path)
-            _git_run(["git", "add", safe_path])
-            lines_changed = new_str.count("\n") - old_str.count("\n")
-            new_end_line = start_line + new_str.count("\n")
-            lax_msg = (
-                f"OK: patched '{path}' (lines {start_line}-{end_line} -> {start_line}-{new_end_line}, "
-                f"net {lines_changed:+d} lines) [auto-repaired trailing whitespace]. Staged for git."
-            )
-            patched_lines = patched.splitlines()
-            ctx_start = max(0, start_line - 2)
-            ctx_end = min(len(patched_lines), new_end_line + 2)
-            if ctx_end - ctx_start <= 250:
-                section = '\n'.join(
-                    f"{ctx_start + i + 1}: {patched_lines[ctx_start + i]}" for i in range(ctx_end - ctx_start)
-                )
-                lax_msg += f"\n\n== PATCHED SECTION (lines {ctx_start+1}-{ctx_end}) ==\n{section}\n== END =="
-            else:
-                lax_msg += f"\n(section spans {ctx_end - ctx_start} lines — too large to show inline)"
-            return lax_msg
+            return _apply_patch_from_span(safe_path, path, original, lax[0], lax[1], new_str,
+                                          "auto-repaired trailing whitespace")
 
-        # Diagnostic path: show visible whitespace so the model can spot the mismatch.
+        # Level 2: blank-line trimming — handles extra leading/trailing newlines in old_str.
+        old_str_trimmed = old_str.strip('\n')
+        if old_str_trimmed and old_str_trimmed != old_str:
+            count_t = original.count(old_str_trimmed)
+            if count_t == 1:
+                off = original.index(old_str_trimmed)
+                return _apply_patch_from_span(safe_path, path, original, off,
+                                              off + len(old_str_trimmed), new_str,
+                                              "auto-trimmed blank lines from old_str")
+            if count_t == 0:
+                lax2 = _find_old_str_lax(original, old_str_trimmed)
+                if lax2 is not None:
+                    return _apply_patch_from_span(safe_path, path, original, lax2[0], lax2[1], new_str,
+                                                  "auto-trimmed blank lines + repaired trailing whitespace")
+        else:
+            old_str_trimmed = old_str  # keep reference for level 3
+
+        # Level 3: indentation-lax — strips all leading/trailing whitespace per line.
+        indent_lax = _find_old_str_indent_lax(original, old_str)
+        if indent_lax is not None:
+            return _apply_patch_from_span(safe_path, path, original, indent_lax[0], indent_lax[1], new_str,
+                                          "auto-repaired indentation")
+        if old_str_trimmed != old_str:
+            indent_lax2 = _find_old_str_indent_lax(original, old_str_trimmed)
+            if indent_lax2 is not None:
+                return _apply_patch_from_span(safe_path, path, original, indent_lax2[0], indent_lax2[1], new_str,
+                                              "auto-trimmed blank lines + repaired indentation")
+
+        # Nothing matched — build diagnostic for the agent.
+        msg = [f"ERROR: old_str not found in '{path}'."]
         import re
         def _canonical(s: str) -> str: return re.sub(r"\s+", "", s)
         if _canonical(old_str) in _canonical(original):
@@ -952,58 +1014,10 @@ def patch_file(path: str, old_str: str, new_str: str) -> str:
             f"ERROR: old_str appears {count} times in '{path}' — patch is ambiguous. "
             "Extend old_str to include more surrounding context so it matches exactly once."
         )
-    # Locate the line range of old_str and verify those lines have been served.
+    # Exact match — apply directly.
     char_offset = original.index(old_str)
-    start_line = original[:char_offset].count("\n") + 1
-    end_line = start_line + old_str.count("\n")
-    norm = os.path.normpath(os.path.realpath(safe_path))
-    unserved = _next_unserved_range(norm, start_line, end_line)
-    if unserved is not None:
-        return (
-            f"ERROR: lines {start_line}-{end_line} of '{path}' have not been read yet. "
-            f"Call read_file('{path}', start={start_line}, end={end_line}) first "
-            "so the exact text is in your context before patching."
-        )
-    # Archive a copy of the pre-patch file before making any changes.
-    effective_root = _task_git_cwd.get() or PROJECT_ROOT
-    rel_path = os.path.relpath(os.path.realpath(safe_path), os.path.realpath(effective_root))
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
-    archive_dest = os.path.join(_effective_archive_dir(), timestamp, rel_path)
-    try:
-        os.makedirs(os.path.dirname(archive_dest), exist_ok=True)
-        shutil.copy2(safe_path, archive_dest)
-    except OSError as exc:
-        return f"ERROR: could not archive pre-patch copy of '{path}': {exc}"
-
-    patched = original.replace(old_str, new_str, 1)
-    try:
-        with open(safe_path, "w", encoding="utf-8") as fh:
-            fh.write(patched)
-    except OSError as exc:
-        return f"ERROR writing '{path}': {exc}"
-    _invalidate_prepped_cache(safe_path)
-    rc, out, err = _git_run(["git", "add", safe_path])
-    git_msg = " Staged for git."
-    if rc != 0:
-        git_msg = f" but STAGING FAILED: {err or out}"
-        
-    lines_changed = new_str.count("\n") - old_str.count("\n")
-    new_end_line = start_line + new_str.count("\n")
-    msg = (
-        f"OK: patched '{path}' (lines {start_line}-{end_line} -> {start_line}-{new_end_line}, "
-        f"net {lines_changed:+d} lines).{git_msg}"
-    )
-    patched_lines = patched.splitlines()
-    ctx_start = max(0, start_line - 2)
-    ctx_end = min(len(patched_lines), new_end_line + 2)
-    if ctx_end - ctx_start <= 250:
-        section = '\n'.join(
-            f"{ctx_start + i + 1}: {patched_lines[ctx_start + i]}" for i in range(ctx_end - ctx_start)
-        )
-        msg += f"\n\n== PATCHED SECTION (lines {ctx_start+1}-{ctx_end}) ==\n{section}\n== END =="
-    else:
-        msg += f"\n(section spans {ctx_end - ctx_start} lines — too large to show inline)"
-    return msg
+    return _apply_patch_from_span(safe_path, path, original, char_offset,
+                                  char_offset + len(old_str), new_str)
 
 
 def _get_cached_summary_for_listing(abs_path: str) -> "str | None":
@@ -2098,10 +2112,6 @@ def web_fetch(url: str) -> str:
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         clean_text = "\n".join(lines)
 
-        # Truncate to reasonable length for context
-        if len(clean_text) > 8000:
-            clean_text = clean_text[:8000] + "\n... (content truncated)"
-
         return f"== CONTENT FROM: {url} ==\n\n{clean_text}"
     except Exception as exc:
         return f"ERROR fetching URL '{url}': {exc}"
@@ -3087,7 +3097,8 @@ def _run_tool_subprocess(
             return 1, timeout_msg
         output = stdout or ""
         rc = proc.returncode
-        return rc, output if output else f"EXIT_CODE: {rc}"
+        body = output if output else ""
+        return rc, f"[EXIT:{rc}]\n{body}"
     except FileNotFoundError as exc:
         return 1, f"Command not found: {exc}"
     except Exception as exc:
@@ -3248,33 +3259,21 @@ def read_test_summary() -> str:
     output = _last_test_output.get("")
     if not output:
         return "No pytest output recorded. Run run_test_pytest first."
+    import re as _re
     passed = failed = errors = 0
     failing_names: list[str] = []
     for line in output.splitlines():
-        if " passed" in line:
-            for part in line.split(","):
-                part = part.strip()
-                if "passed" in part:
-                    try:
-                        passed = int(part.split()[0])
-                    except (ValueError, IndexError):
-                        pass
-        if " failed" in line:
-            for part in line.split(","):
-                part = part.strip()
-                if "failed" in part:
-                    try:
-                        failed = int(part.split()[0])
-                    except (ValueError, IndexError):
-                        pass
-        if " error" in line.lower():
-            for part in line.split(","):
-                part = part.strip()
-                if "error" in part.lower():
-                    try:
-                        errors = int(part.split()[0])
-                    except (ValueError, IndexError):
-                        pass
+        # Use regex to extract counts — pytest decorates the summary line with
+        # "=== N passed in Xs ===" so int(line.split()[0]) always gives "===".
+        m = _re.search(r'(\d+) passed', line)
+        if m:
+            passed = int(m.group(1))
+        m = _re.search(r'(\d+) failed', line)
+        if m:
+            failed = int(m.group(1))
+        m = _re.search(r'(\d+) error', line, _re.IGNORECASE)
+        if m:
+            errors = int(m.group(1))
         if line.startswith("FAILED "):
             failing_names.append(line[7:].strip())
     import json as _json
@@ -3385,6 +3384,16 @@ def get_system_health(head: int | None = None, tail: int | None = None, grep: st
 def _doc_project_id() -> int | None:
     """Resolve the current agent's project_id from context."""
     project_name = _task_project_name.get()
+    if not project_name:
+        # Fallback: derive project from task_id context (handles rapid-retry sessions
+        # where _task_project_name was not yet set by the dispatcher).
+        task_id = _task_id_ctx.get()
+        if task_id:
+            from app.database import get_task as _gt
+            task = _gt(task_id)
+            if task and task.project:
+                _task_project_name.set(task.project)
+                project_name = task.project
     if not project_name:
         return None
     from app.database.session import SessionLocal
@@ -3987,6 +3996,29 @@ def run_sympy(code: str, timeout: int = 120) -> str:
     return "\n".join(parts) or "[no output]"
 
 
+def run_lean4(source: str, timeout: int = 120) -> str:
+    """[RUN — docker-sandbox] Compile Lean4 source against Mathlib in an isolated Docker container. Returns stdout/stderr. Exit code 0 means the file compiles with no errors and no sorry placeholders."""
+    timeout = max(30, min(600, int(timeout)))
+    from app.agent.sandbox import run_in_sandbox
+    result = run_in_sandbox(source, lang="lean4", timeout=timeout)
+    if "error" in result and "stdout" not in result:
+        return f"[run_lean4] Error: {result['error']}"
+    parts = []
+    out = result.get("stdout", "")[:8192]
+    err = result.get("stderr", "")[:8192]
+    if out:
+        parts.append(f"stdout:\n{out}")
+    if err:
+        parts.append(f"stderr:\n{err}")
+    if result.get("timed_out"):
+        parts.append("[timed out — lean4 compilation exceeded time limit]")
+    elif result.get("ok"):
+        parts.append("[compiled successfully — no errors]")
+    else:
+        parts.append("[compilation failed — non-zero exit code]")
+    return "\n".join(parts) or "[no output]"
+
+
 from app.agent.tools_math import search_arxiv as _search_arxiv_impl, search_oeis as _search_oeis_impl, search_mathlib as _search_mathlib_impl  # noqa: E402
 
 
@@ -4271,6 +4303,7 @@ TOOL_REGISTRY: dict[str, Any] = {
     "list_objectives":            tool_list_objectives,
     # Math tools
     "run_sympy": run_sympy,
+    "run_lean4": run_lean4,
     "search_arxiv": _search_arxiv_impl,
     "search_oeis": _search_oeis_impl,
     "search_mathlib": _search_mathlib_impl,
@@ -4643,11 +4676,11 @@ TOOL_SCHEMAS: list[dict] = [
             "name": "patch_file",
             "description": (
                 "[WRITE — files] Replace an exact string in a file. "
-                "REQUIRES the specific lines being edited to have been served by read_file() — enforced. "
                 "old_str must match exactly once — extend it with more surrounding lines if ambiguous. "
                 "Fails with a clear error if old_str appears 0 or 2+ times. "
                 "CRLF (\\r\\n) in old_str is auto-normalized — you never need to worry about \\r. "
-                "Trailing whitespace differences per line are auto-repaired when the text otherwise matches. "
+                "Auto-repairs trailing whitespace differences, extra blank lines around old_str, and "
+                "indentation mismatches when an exact match is not found — repair applied is noted in the OK message. "
                 "read_file marks trailing whitespace as <trailing:Nsp> or <trailing:Ntab>; "
                 "you do NOT need to include these markers in old_str — they are informational only. "
                 "Prefer this over write_file for any targeted edit: avoids full-file rewrites and the "
@@ -6136,6 +6169,32 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "run_lean4",
+            "description": (
+                "[RUN — docker-sandbox] Compile Lean4 source against Mathlib in an isolated Docker container. "
+                "Pipe source to `lean /tmp/main.lean`; returns stdout and stderr. "
+                "Exit code 0 (message: 'compiled successfully') means no errors and no sorry. "
+                "The sandbox image (sympy-lean4-sandbox:latest) has Lean 4.29.1 + Mathlib pre-built."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "Complete Lean4 source file contents to compile.",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Max compilation seconds (default 120, clamped to [30, 600]).",
+                    },
+                },
+                "required": ["source"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_arxiv",
             "description": (
                 "[READ] Search arXiv for mathematical papers. "
@@ -6558,7 +6617,7 @@ def build_tool_schemas(allowed_names: list[str]) -> list[dict]:
 # Dispatcher
 # ---------------------------------------------------------------------------
 
-def dispatch_tool(name: str, arguments: dict) -> str:
+def dispatch_tool(name: str, arguments: dict, *, task_id: str | None = None) -> str:
     """
     Route a tool call to its implementation.
     Returns a string result suitable for feeding back to the LLM as a
@@ -6574,6 +6633,13 @@ def dispatch_tool(name: str, arguments: dict) -> str:
         if not isinstance(result, str):
             import json
             result = json.dumps(result, default=str)
+
+        # Record to success store before truncation so [EXIT:N] prefix is always present
+        if task_id:
+            from app.agent.tool_success_store import TRACKED_TOOLS, record, infer_success
+            if name in TRACKED_TOOLS:
+                record(task_id, name, infer_success(name, result))
+
         return _cap_tool_result(name, result)
     except TypeError as exc:
         logger.warning("Tool error [%s]: %s", name, exc)
@@ -6904,4 +6970,4 @@ async def async_dispatch_tool(
         return _json.dumps(sessions, indent=2)
 
     # All other tools - synchronous
-    return dispatch_tool(name, arguments)
+    return dispatch_tool(name, arguments, task_id=task_id)

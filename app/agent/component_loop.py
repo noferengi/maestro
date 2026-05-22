@@ -541,7 +541,7 @@ class ComponentLoop:
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
-                        "content": str(result)[:4000],
+                        "content": str(result),
                     })
 
         return ComponentLoopResult(
@@ -586,7 +586,7 @@ class ComponentLoop:
             "an error — do NOT call the function with the guarded value and wait for it.\n"
             "- Mock expensive external calls (network, disk, subprocesses). "
             "Do not make real network requests in tests.\n\n"
-            f"Planning Context:\n{sanitize_user_content(self.planning_context[:4000])}\n"
+            f"Planning Context:\n{sanitize_user_content(self.planning_context)}\n"
         )
         if self.review_feedback:
             prompt += (

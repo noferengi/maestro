@@ -61,7 +61,8 @@ def diagnose_task(task_id: str, since_entry_id: int = None) -> dict:
 
     Returns current type, active/recent agent sessions (each with a
     current_phase field inferred from the last LLM call), last 15 budget
-    entries with finish_reason pre-extracted, planning gate history,
+    entries with finish_reason pre-extracted (prompt_cost_delta and
+    prompt_message_count reflect the per-turn delta model), planning gate history,
     correction agent history, cycle_counts rollup, and an activity_status
     summary. Replaces 4+ separate DB queries.
 
@@ -106,13 +107,13 @@ def diagnose_task(task_id: str, since_entry_id: int = None) -> dict:
         # Budget trace — delta or full
         if since_entry_id is not None:
             budget_rows = conn.execute(
-                "SELECT id, agent_name, prompt_cost, generation_cost, response_data, created_at "
+                "SELECT id, agent_name, prompt_cost, prompt_message_count, generation_cost, response_data, created_at "
                 "FROM budget_entries WHERE task_id=? AND id > ? ORDER BY id DESC",
                 (task_id, since_entry_id),
             ).fetchall()
         else:
             budget_rows = conn.execute(
-                "SELECT id, agent_name, prompt_cost, generation_cost, response_data, created_at "
+                "SELECT id, agent_name, prompt_cost, prompt_message_count, generation_cost, response_data, created_at "
                 "FROM budget_entries WHERE task_id=? ORDER BY id DESC LIMIT 15",
                 (task_id,),
             ).fetchall()
@@ -122,7 +123,8 @@ def diagnose_task(task_id: str, since_entry_id: int = None) -> dict:
             budget_trace.append({
                 "id": b["id"],
                 "agent_name": b["agent_name"],
-                "prompt_cost": b["prompt_cost"],
+                "prompt_cost_delta": b["prompt_cost"],
+                "prompt_message_count": b["prompt_message_count"],
                 "generation_cost": b["generation_cost"],
                 "created_at": b["created_at"],
                 **fields,
@@ -181,12 +183,13 @@ def diagnose_task(task_id: str, since_entry_id: int = None) -> dict:
             })
 
         tr_rows = conn.execute(
-            "SELECT transition, outcome, substr(vote_summary, 1, 300), created_at "
+            "SELECT transition, outcome, substr(vote_summary::text, 1, 300) AS summary_preview, created_at "
             "FROM transition_results WHERE task_id=? ORDER BY id DESC LIMIT 8",
             (task_id,),
         ).fetchall()
         transitions = [
-            {"transition": r[0], "outcome": r[1], "summary_preview": r[2], "created_at": r[3]}
+            {"transition": r["transition"], "outcome": r["outcome"],
+             "summary_preview": r["summary_preview"], "created_at": r["created_at"]}
             for r in tr_rows
         ]
 
@@ -324,13 +327,20 @@ def get_budget_trace(task_id: str, n: int = 20) -> list:
     Last N budget entries for a task, with finish_reason and content preview
     pre-extracted from the response_data blob.
 
+    Since migration 0076 budget entries store per-turn deltas, not cumulative
+    totals. Fields reflect this:
+      prompt_cost_delta     — tokens added to the prompt in THIS turn only
+      prompt_message_count  — total messages in context at this turn (absolute)
+      generation_cost       — tokens generated in this turn (unchanged)
+
     Key signal: finish_reason='length' + empty content_preview + non-empty
     reasoning_preview means the LLM hit max_tokens during chain-of-thought.
+    Watch prompt_message_count climbing toward the model's context limit.
     """
     conn = get_conn()
     try:
         rows = conn.execute(
-            "SELECT id, agent_name, prompt_cost, generation_cost, response_data, created_at "
+            "SELECT id, agent_name, prompt_cost, prompt_message_count, generation_cost, response_data, created_at "
             "FROM budget_entries WHERE task_id=? ORDER BY id DESC LIMIT ?",
             (task_id, n),
         ).fetchall()
@@ -340,7 +350,8 @@ def get_budget_trace(task_id: str, n: int = 20) -> list:
             result.append({
                 "id": b["id"],
                 "agent_name": b["agent_name"],
-                "prompt_cost": b["prompt_cost"],
+                "prompt_cost_delta": b["prompt_cost"],
+                "prompt_message_count": b["prompt_message_count"],
                 "generation_cost": b["generation_cost"],
                 "created_at": b["created_at"],
                 **fields,
@@ -964,7 +975,6 @@ def preview_dispatch(project: str = None) -> dict:
         sys.path.insert(0, _project_root)
 
     from app.agent.dag import DAGResolver
-    from app.agent.config import SCHEDULER_DISPATCHABLE_TYPES
     from app.database import get_all_tasks, get_task, get_llm, get_project
 
     conn = get_conn()
@@ -1067,13 +1077,14 @@ def preview_dispatch(project: str = None) -> dict:
             llm_id = task["_llm_id"]
             budget_id = task["_budget_id"]
 
-            # Check 1: dispatchable types
-            if task_type not in SCHEDULER_DISPATCHABLE_TYPES:
+            # Check 1: skip types that the real scheduler never auto-dispatches
+            # (matches _SCHEDULER_SKIP_STAGE_TYPES in scheduler.py — human_review only)
+            if task_type in ("human_review",):
                 skipped.append({
                     "task_id": task_id,
                     "title": task["title"],
                     "type": task_type,
-                    "reason": f"type '{task_type}' not in SCHEDULER_DISPATCHABLE_TYPES",
+                    "reason": "human_gate — requires manual action",
                 })
                 continue
 

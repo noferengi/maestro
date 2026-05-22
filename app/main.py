@@ -6966,6 +6966,65 @@ async def scheduler_tail():
     )
 
 
+@app.get("/api/tasks/{task_id}/live")
+async def task_live_stream(task_id: str, since: int = 0):
+    """SSE endpoint that streams live LLM token output for a specific task.
+
+    Tokens are published by the LLM client as each chunk arrives from the
+    upstream model server.  A ring buffer of the last 400 chunks is kept so
+    reconnecting clients can catch up via the ?since=N query param.
+
+    Events:
+      token    — {seq, text, agent_name, session_id, turn_type, ts}
+      status   — {active: bool} heartbeat / state change
+      done     — stream is idle and no active session found
+    """
+    from app.agent import stream_broker  # noqa: PLC0415
+    from app.agent.scheduler import _active_sessions, _active_sessions_lock  # noqa: PLC0415
+
+    async def event_gen():
+        seq = since
+        idle_ticks = 0
+        MAX_IDLE = 120  # 12 seconds of no tokens → emit status; 120 = 60s
+
+        while True:
+            chunks = stream_broker.get_tokens_since(task_id, seq)
+            if chunks:
+                idle_ticks = 0
+                for c in chunks:
+                    seq = c["seq"]
+                    yield f"event: token\ndata: {json.dumps(c, ensure_ascii=False)}\n\n"
+            else:
+                idle_ticks += 1
+                # Every 2s, send status heartbeat
+                if idle_ticks % 20 == 0:
+                    age = stream_broker.last_activity_age(task_id)
+                    with _active_sessions_lock:
+                        is_running = any(
+                            tid == task_id and t.is_alive()
+                            for tid, t in _active_sessions.items()
+                        )
+                    age_val = round(age, 1) if age != float("inf") else 9999
+                    payload = json.dumps({"active": is_running, "idle_seconds": age_val})
+                    yield f"event: status\ndata: {payload}\n\n"
+                    # If nothing has happened for 90s and no active session, close
+                    if age > 90 and not is_running:
+                        yield f"event: done\ndata: {{}}\n\n"
+                        return
+
+            await asyncio.sleep(0.1)
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Admin routes
 # ---------------------------------------------------------------------------
@@ -7708,6 +7767,82 @@ def list_task_documents(task_id: str):
         full = get_document(project_id, meta["key"]) if project_id else None
         results.append(full if full else meta)
     return results
+
+
+@app.get("/api/tasks/{task_id}/math-status")
+def get_task_math_status(task_id: str):
+    """Math pipeline stage history and Lean4 artifacts for the Stage Journal."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    MATH_STAGE_KEYS = {
+        "LITERATURE_SURVEY", "PROBLEM_FORMALIZATION", "CALIBRATION",
+        "COMPUTATIONAL_EXPLORATION", "HYPOTHESIS_GENERATION", "PROOF_STRATEGY",
+        "PROOF_ATTEMPT", "REFLECTION", "FORMAL_VERIFICATION", "WRITEUP",
+    }
+
+    from sqlalchemy import text as _text
+    db = SessionLocal()
+    try:
+        agg_rows = db.execute(_text("""
+            SELECT
+                agent_type,
+                COUNT(*) AS total_cycles,
+                SUM(CASE WHEN exit_reason='pass' THEN 1 ELSE 0 END) AS pass_count,
+                SUM(CASE WHEN exit_reason='error' THEN 1 ELSE 0 END) AS error_count,
+                SUM(CASE WHEN exit_reason='shutdown' THEN 1 ELSE 0 END) AS shutdown_count,
+                MIN(started_at) AS first_started_at,
+                MAX(ended_at) AS last_ended_at
+            FROM agent_sessions
+            WHERE task_id = :tid
+              AND (agent_type LIKE 'generic:%' OR agent_type LIKE 'reflection_agent:%')
+            GROUP BY agent_type
+            ORDER BY MIN(started_at)
+        """), {"tid": task_id}).fetchall()
+
+        last_rows = db.execute(_text("""
+            SELECT DISTINCT ON (agent_type)
+                agent_type, exit_reason, exit_summary
+            FROM agent_sessions
+            WHERE task_id = :tid
+              AND (agent_type LIKE 'generic:%' OR agent_type LIKE 'reflection_agent:%')
+            ORDER BY agent_type, started_at DESC
+        """), {"tid": task_id}).fetchall()
+    finally:
+        db.close()
+
+    last_exit_map = {r[0]: (r[1], r[2]) for r in last_rows}
+
+    stage_history = []
+    is_math = False
+    for row in agg_rows:
+        agent_type, total, passes, errors, shutdowns, first_at, last_at = row
+        stage_key = agent_type.split(":", 1)[-1] if ":" in agent_type else agent_type
+        if stage_key.upper() in MATH_STAGE_KEYS:
+            is_math = True
+        last_exit, last_summary = last_exit_map.get(agent_type, (None, None))
+        stage_history.append({
+            "agent_type": agent_type,
+            "stage_key": stage_key,
+            "total_cycles": int(total),
+            "pass_count": int(passes or 0),
+            "error_count": int(errors or 0),
+            "shutdown_count": int(shutdowns or 0),
+            "last_exit_reason": last_exit,
+            "last_exit_summary": last_summary or "",
+            "first_started_at": str(first_at) if first_at else None,
+            "last_ended_at": str(last_at) if last_at else None,
+        })
+
+    content = task.content or {}
+
+    return {
+        "is_math_pipeline": is_math,
+        "stage_history": stage_history,
+        "lean4_output": content.get("lean4_output"),
+        "lean4_source": content.get("lean4_source"),
+    }
 
 
 # ===========================================================================

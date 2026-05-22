@@ -314,7 +314,7 @@ class OptimizationPipeline:
             f"You are an optimization proposer with lens: {lens_name}.\n"
             f"Focus: {focus}\n\n"
             f"Task: {sanitize_user_content(self.task_description)}\n"
-            f"Baseline: {sanitize_user_content(json.dumps(baseline, indent=1)[:2000])}\n\n"
+            f"Baseline: {sanitize_user_content(json.dumps(baseline, indent=1))}\n\n"
             "You may use tools to inspect code files.\n\n"
             "To submit your proposals, call the submit_work tool with:\n"
             "payload={\"lens\": \"...\", \"proposals\": [{\"description\": \"...\", "

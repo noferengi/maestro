@@ -141,6 +141,10 @@ class CustomLLMAgent(AgentLoop):
         self._defn_verifier_cmd: str | None = defn.verifier_cmd
         self._user_prompt_template: str = defn.user_prompt_template or ""
 
+        # Reset per-session tool-success state so re-dispatched tasks start clean
+        from app.agent.tool_success_store import reset as _tss_reset
+        _tss_reset(task_id)
+
     # ------------------------------------------------------------------
     # AgentLoop abstract interface
     # ------------------------------------------------------------------
@@ -230,6 +234,43 @@ class CustomLLMAgent(AgentLoop):
                     logger.warning(
                         "[custom_llm_agent] task '%s': verifier '%s' failed — condition -> fail",
                         self.task_id, verifier,
+                    )
+                    condition = "fail"
+
+        # Check required_tool_successes declared in stage config.
+        # e.g. {"required_tool_successes": ["run_lean4", "run_test_pytest"]}
+        if condition == "pass":
+            cfg = (self._stage_config.config or {}) if self._stage_config else {}
+            required = cfg.get("required_tool_successes") or []
+            if required:
+                from app.agent.tool_success_store import query as _tss_query
+                blocked_by: list[str] = []
+                for tool_name in required:
+                    state = _tss_query(self.task_id, tool_name)
+                    if state is not True:
+                        label = "never called" if state is None else "called but failed"
+                        blocked_by.append(f"{tool_name} ({label})")
+                if blocked_by:
+                    logger.warning(
+                        "[custom_llm_agent] task '%s': required_tool_successes not met: %s — condition -> fail",
+                        self.task_id, blocked_by,
+                    )
+                    condition = "fail"
+
+        # Check required_tool_groups: each inner list is an OR-group; all groups must be satisfied.
+        if condition == "pass":
+            cfg = (self._stage_config.config or {}) if self._stage_config else {}
+            required_groups = cfg.get("required_tool_groups") or []
+            if required_groups:
+                from app.agent.tool_success_store import query_group as _tss_query_group
+                blocked_groups: list[str] = []
+                for group in required_groups:
+                    if not _tss_query_group(self.task_id, group):
+                        blocked_groups.append(f"none of [{', '.join(group)}] succeeded")
+                if blocked_groups:
+                    logger.warning(
+                        "[custom_llm_agent] task '%s': required_tool_groups not met: %s — condition -> fail",
+                        self.task_id, blocked_groups,
                     )
                     condition = "fail"
 

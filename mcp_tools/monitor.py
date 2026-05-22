@@ -98,7 +98,7 @@ def monitor(
         q = (
             "SELECT t.id, t.title, t.type FROM tasks t "
             "LEFT JOIN projects p ON t.project_id=p.id "
-            "WHERE t.is_active=1 AND t.type NOT IN ('idea','architecture')"
+            "WHERE t.is_active AND t.type NOT IN ('idea','architecture')"
         )
         params: list = []
         if project:

@@ -356,7 +356,7 @@ class ConceptualReviewPipeline:
             },
         ]
 
-        plan_summary = json.dumps(self.plan, indent=1)[:6000]
+        plan_summary = json.dumps(self.plan, indent=1)
 
         tasks = []
         for reviewer in reviewers:
@@ -570,7 +570,7 @@ class ConceptualReviewPipeline:
         if not needs_research_stages:
             return all_votes  # Only deterministic voters; can't re-run with context
 
-        plan_summary = json.dumps(self.plan, indent=1)[:6000]
+        plan_summary = json.dumps(self.plan, indent=1)
         det_summary = self._summarize_votes([v for v in all_votes if v.stage.startswith("d")])
         extra_context = f"\n## Research Findings\n{findings}\n\n"
 

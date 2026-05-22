@@ -99,7 +99,7 @@ class DevOrchestrator:
         total_prompt = 0
         total_completion = 0
 
-        planning_context = json.dumps(self.plan, indent=1)[:8000]
+        planning_context = json.dumps(self.plan, indent=1)
 
         for batch_idx, batch in enumerate(batches):
             logger.info(
@@ -397,7 +397,7 @@ class DevOrchestrator:
             output = raw.decode("utf-8", errors="replace")
             parsed = parse_pytest_output(output)
             passed = parsed["all_passed"]
-            return passed, output[:6000], parsed
+            return passed, output, parsed
         except Exception as e:
             msg = f"Test runner error: {e}"
             logger.warning("[dev_orch] %s", msg)
@@ -509,7 +509,7 @@ class DevOrchestrator:
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tc["id"],
-                            "content": result_str[:4000],
+                            "content": result_str,
                         })
                     
                     if terminal_found:

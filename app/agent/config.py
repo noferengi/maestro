@@ -79,7 +79,7 @@ def _getlist(section: str, key: str, fallback: str) -> list[str]:
 
 LLM_BASE_URL: str = _get("llm", "base_url", "MAESTRO_LLM_BASE_URL", "http://localhost:8008/v1")
 LLM_MODEL: str = _get("llm", "model", "MAESTRO_LLM_MODEL", "omnicoder-9b")
-MAX_TOKENS_PER_TURN: int = _getint("llm", "max_tokens_per_turn", "MAESTRO_MAX_TOKENS", 32768)
+MAX_TOKENS_PER_TURN: int = _getint("llm", "max_tokens_per_turn", "MAESTRO_MAX_TOKENS", 65536)
 LLM_TIMEOUT_SECONDS: int = _getint("llm", "timeout_seconds", "MAESTRO_LLM_TIMEOUT", 120)
 
 # ===========================================================================
@@ -363,7 +363,7 @@ VERDICT_RANGES: dict[str, tuple[int, int]] = _build_verdict_ranges()
 PLANNING_BEST_OF_N: int = _getint("planning", "best_of_n", None, 5)
 PLANNING_MAX_FILES: int = _getint("planning", "max_files", None, 8)
 PLANNING_MAX_STEPS: int = _getint("planning", "max_steps", None, 6)
-PLANNING_JUDGE_MAX_TOKENS: int = _getint("planning", "judge_max_tokens", None, 32768)
+PLANNING_JUDGE_MAX_TOKENS: int = _getint("planning", "judge_max_tokens", None, 65536)
 PLANNING_MAX_DESIGN_RETRIES: int = _getint("planning", "max_design_retries", None, 3)
 PLANNING_MAX_REJECTIONS: int = _getint("planning", "max_rejections", None, 5)
 PLANNING_SURVEY_MAX_TURNS: int = _getint("planning", "survey_max_turns", None, 100)
@@ -535,7 +535,7 @@ TOOL_MAX_GIT_LOG_ENTRIES: int = _getint("tools", "max_git_log_entries", None, 10
 GIT_TIMEOUT_SECONDS: int = _getint("tools", "git_timeout_seconds", None, 30)
 
 SNAPSHOT_MAX_DEPTH: int = _getint("snapshot", "max_depth", None, 4)
-SNAPSHOT_MAX_TOKENS: int = _getint("snapshot", "max_tokens", None, 32768)
+SNAPSHOT_MAX_TOKENS: int = _getint("snapshot", "max_tokens", None, 65536)
 SNAPSHOT_CACHE_TTL: int = _getint("snapshot", "cache_ttl_seconds", None, 300)
 SNAPSHOT_CONTEXT_RATIO: float = _getfloat("snapshot", "context_ratio", None, 0.12)
 
@@ -545,8 +545,8 @@ SNAPSHOT_CONTEXT_RATIO: float = _getfloat("snapshot", "context_ratio", None, 0.1
 
 SUMMARY_CONTEXT_RATIO: float = _getfloat("survey", "summary_context_ratio", None, 0.10)
 SUMMARY_MAX_FILE_SIZE: int = _getint("survey", "max_file_size_bytes", None, 1024 * 1024)
-SURVEY_VERDICT_MAX_TOKENS: int = _getint("survey", "verdict_max_tokens", None, 32768)
-SURVEY_SUMMARY_MAX_TOKENS: int = _getint("survey", "summary_max_tokens", None, 32768)
+SURVEY_VERDICT_MAX_TOKENS: int = _getint("survey", "verdict_max_tokens", None, 65536)
+SURVEY_SUMMARY_MAX_TOKENS: int = _getint("survey", "summary_max_tokens", None, 65536)
 SURVEY_STALENESS_ENABLED: bool = _getbool("survey", "staleness_enabled", None, True)
 SURVEY_STALENESS_CHECK_RATIO: float = _getfloat("survey", "staleness_check_ratio", None, 0.05)
 SURVEY_MAX_CONCURRENT_JOBS: int = _getint("survey", "max_concurrent_scope_jobs", None, 3)
@@ -581,7 +581,15 @@ MODEL_BLOCK_TIMEOUT_MINUTES: int = _getint(
 )
 SCHEDULER_DISPATCHABLE_TYPES: list[str] = _getlist(
     "scheduler", "dispatchable_types",
-    "idea, planning, indev, conceptual_review, optimization, security, final_review, reflection_agent"
+    "idea, planning, indev, conceptual_review, optimization, security, final_review, "
+    "reflection, reflection_agent, pip_resolution, "
+    "LITERATURE_SURVEY, PROBLEM_FORMALIZATION, CALIBRATION, COMPUTATIONAL_EXPLORATION, "
+    "HYPOTHESIS_GENERATION, PROOF_STRATEGY, PROOF_ATTEMPT, FORMAL_VERIFICATION, REFLECTION, WRITEUP, "
+    "outline, chapter_factory, chapter_draft, continuity_check, line_edit, "
+    "story_bible, chapter_outline, seed_prompt, "
+    "topic_refinement, research, draft, fact_check, formatting, "
+    "question_refinement, data_collection, schema_design, analysis, visualization, write_up, "
+    "bug_report, reproduce, root_cause, fix, regression_test"
 )
 FILE_SUMMARY_WAIT_TIMEOUT: float = _getfloat("scheduler", "file_summary_wait_timeout", None, 300.0)
 FILE_SUMMARY_STREAM_IDLE_TIMEOUT: float = _getfloat("scheduler", "file_summary_stream_idle_timeout", None, 30.0)
@@ -607,14 +615,14 @@ MAESTRO_ENABLED: bool        = _getbool("maestro", "enabled",              "MAES
 MAESTRO_STALL_TICKS: int     = _getint ("maestro", "stall_ticks",          None,                      60)
 MAESTRO_MAX_RESURRECTIONS: int = _getint("maestro", "max_cards_to_resurrect", None,                   3)
 MAESTRO_MAX_NEW_CARDS: int   = _getint ("maestro", "max_new_cards",        None,                      2)
-MAESTRO_DECIDE_MAX_TOKENS: int = _getint("maestro", "decide_max_tokens",   None,                      32768)
+MAESTRO_DECIDE_MAX_TOKENS: int = _getint("maestro", "decide_max_tokens",   None,                      65536)
 MAESTRO_SURVEY_TOOLS: list[str] = _getlist("maestro", "survey_tools", "get_project_summary, get_directory_summary, get_module_summary, list_scope_summaries")
 
 # ===========================================================================
 # Arch Gen — architecture card population agent
 # ===========================================================================
 
-ARCH_GEN_MAX_TOKENS: int = _getint("arch_gen", "max_tokens", None, 32768)
+ARCH_GEN_MAX_TOKENS: int = _getint("arch_gen", "max_tokens", None, 65536)
 
 # ===========================================================================
 # Orchestration / ConsultAgent

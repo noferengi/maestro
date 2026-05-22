@@ -13,7 +13,6 @@ import json
 import logging
 import os
 import subprocess
-import tempfile
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -22,11 +21,13 @@ SANDBOX_IMAGE = "sympy-lean4-sandbox:latest"
 DEFAULT_TIMEOUT = 120
 DEFAULT_MEMORY = "512m"
 
-# (filename, entrypoint command inside the container)
-_LANG_ENTRY: dict[str, tuple[str, list[str]]] = {
-    "python": ("main.py",   ["python", "/code/main.py"]),
-    "lean4":  ("main.lean", ["lean",   "/code/main.lean"]),
-    "coq":    ("main.v",    ["coqc",   "/code/main.v"]),
+# Stdin-based entry commands (no volume mount required).
+# Code is piped to the container's stdin so Windows temp paths never appear
+# in the docker run command — required when DOCKER_HOST points to a remote daemon.
+_LANG_STDIN_CMD: dict[str, list[str]] = {
+    "python": ["python", "-"],
+    "lean4":  ["sh", "-c", "cat > /mathlib-project/Verify.lean && cd /mathlib-project && lake env lean /mathlib-project/Verify.lean"],
+    "coq":    ["sh", "-c", "cat > /tmp/main.v && coqc /tmp/main.v"],
 }
 
 
@@ -63,7 +64,7 @@ def run_in_sandbox(
     Returns {ok, stdout, stderr, timed_out} on normal exit.
     Returns {ok: False, error: str} when Docker is unavailable or misconfigured.
     """
-    if lang not in _LANG_ENTRY:
+    if lang not in _LANG_STDIN_CMD:
         return {
             "ok": False,
             "error": f"Unknown language {lang!r}. Supported: python, lean4, coq",
@@ -75,51 +76,48 @@ def run_in_sandbox(
             "error": "Docker is not available. Start Docker Desktop.",
         }
 
-    filename, cmd = _LANG_ENTRY[lang]
+    cmd = _LANG_STDIN_CMD[lang]
     memory = _get_memory_limit()
     container_name = f"maestro-sandbox-{uuid.uuid4().hex[:12]}"
 
     try:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            code_file = os.path.join(tmp_dir, filename)
-            with open(code_file, "w", encoding="utf-8") as f:
-                f.write(code)
+        docker_cmd = [
+            "docker", "run", "--rm", "-i",
+            "--name", container_name,
+            "--network", "none",
+            "--memory", memory,
+            "--cpus", "1",
+            SANDBOX_IMAGE,
+        ] + cmd
 
-            docker_cmd = [
-                "docker", "run", "--rm",
-                "--name", container_name,
-                "--network", "none",
-                "--memory", memory,
-                "--cpus", "1",
-                "-v", f"{tmp_dir}:/code:ro",
-                SANDBOX_IMAGE,
-            ] + cmd
-
-            proc = subprocess.Popen(
-                docker_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+        proc = subprocess.Popen(
+            docker_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            stdout_b, stderr_b = proc.communicate(
+                input=code.encode("utf-8"), timeout=timeout
             )
+        except subprocess.TimeoutExpired:
+            proc.kill()
             try:
-                stdout_b, stderr_b = proc.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                try:
-                    subprocess.run(
-                        ["docker", "kill", container_name],
-                        capture_output=True,
-                        timeout=5,
-                    )
-                except Exception:
-                    pass
-                return {"ok": False, "stdout": "", "stderr": "", "timed_out": True}
+                subprocess.run(
+                    ["docker", "kill", container_name],
+                    capture_output=True,
+                    timeout=5,
+                )
+            except Exception:
+                pass
+            return {"ok": False, "stdout": "", "stderr": "", "timed_out": True}
 
-            return {
-                "ok": proc.returncode == 0,
-                "stdout": stdout_b.decode("utf-8", errors="replace"),
-                "stderr": stderr_b.decode("utf-8", errors="replace"),
-                "timed_out": False,
-            }
+        return {
+            "ok": proc.returncode == 0,
+            "stdout": stdout_b.decode("utf-8", errors="replace"),
+            "stderr": stderr_b.decode("utf-8", errors="replace"),
+            "timed_out": False,
+        }
 
     except Exception as exc:
         logger.error("[sandbox] Error running sandbox (lang=%s): %s", lang, exc)
@@ -157,7 +155,8 @@ LINE = {line}
 COL = {col}
 
 proc = subprocess.Popen(
-    ["lean", "--server"],
+    ["lake", "env", "lean", "--server"],
+    cwd="/mathlib-project",
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
@@ -195,7 +194,7 @@ try:
 
     _send({{"jsonrpc": "2.0", "method": "textDocument/didOpen",
             "params": {{"textDocument": {{
-                "uri": "file:///code/main.lean",
+                "uri": "file:///mathlib-project/Verify.lean",
                 "languageId": "lean4",
                 "version": 1,
                 "text": LEAN_SOURCE,
@@ -206,7 +205,7 @@ try:
 
     _send({{"jsonrpc": "2.0", "id": 2, "method": "$/lean/plainGoal",
             "params": {{
-                "textDocument": {{"uri": "file:///code/main.lean"}},
+                "textDocument": {{"uri": "file:///mathlib-project/Verify.lean"}},
                 "position": {{"line": LINE, "character": COL}},
             }}}})
 

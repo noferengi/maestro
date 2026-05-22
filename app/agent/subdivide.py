@@ -584,11 +584,11 @@ class SubdivisionAgent:
                 if _scope_reason:
                     planning_ctx += f"**Scope verdict:** {sanitize_user_content(_scope_reason)}\n\n"
                 if _rationale:
-                    planning_ctx += f"**Design rationale attempted:** {sanitize_user_content(_rationale[:500])}\n\n"
+                    planning_ctx += f"**Design rationale attempted:** {sanitize_user_content(_rationale)}\n\n"
                 if _manifest_str and _manifest_str != "[]":
-                    planning_ctx += f"**File manifest from attempted design:**\n```json\n{sanitize_user_content(_manifest_str[:2000])}\n```\n\n"
+                    planning_ctx += f"**File manifest from attempted design:**\n```json\n{sanitize_user_content(_manifest_str)}\n```\n\n"
                 if _survey:
-                    planning_ctx += f"**Codebase survey summary:**\n{sanitize_user_content(_survey[:1500])}\n\n"
+                    planning_ctx += f"**Codebase survey summary:**\n{sanitize_user_content(_survey)}\n\n"
                 planning_ctx += (
                     "Use this information to decompose the task into smaller, focused sub-ideas "
                     "that each touch fewer files and have a single clear responsibility."

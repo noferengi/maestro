@@ -424,3 +424,48 @@ def cleanup_ghost_worktrees(project_path: str | None = None) -> dict:
         _run(["git", "worktree", "prune"], proj)
 
     return report
+
+
+def set_project_enabled(enabled: bool, project: str | None = None) -> str:
+    """
+    Enable or disable one project, or all projects at once.
+
+    Args:
+        enabled: True to enable the project(s); False to disable (pause all scheduling).
+        project: Name of the project to toggle. Omit (or pass None) to apply to ALL projects.
+
+    When a project is disabled the scheduler skips every task in it — no new agent
+    work starts until the project is re-enabled. Currently-running sessions are not
+    interrupted; they will complete normally. The change takes effect within ~30 s
+    (the scheduler's project-enabled cache TTL).
+
+    Examples:
+        set_project_enabled(False)                  # pause ALL projects
+        set_project_enabled(True)                   # resume ALL projects
+        set_project_enabled(True, "EasyProject")    # resume just EasyProject
+        set_project_enabled(False, "MyApp")         # pause just MyApp
+    """
+    from app.database import get_all_projects, get_project, set_project_setting
+
+    value = "true" if enabled else "false"
+    action = "enabled" if enabled else "disabled"
+
+    if project:
+        p = get_project(project)
+        if not p:
+            all_names = [x.name for x in get_all_projects()]
+            return (
+                f"ERROR: Project '{project}' not found. "
+                f"Known projects: {all_names or '(none)'}"
+            )
+        set_project_setting(p.id, "enabled", value)
+        return f"OK: project '{project}' {action}."
+
+    # All projects
+    projects = get_all_projects()
+    if not projects:
+        return "ERROR: No projects found in the database."
+    for p in projects:
+        set_project_setting(p.id, "enabled", value)
+    names = [p.name for p in projects]
+    return f"OK: {len(projects)} project(s) {action}: {names}"

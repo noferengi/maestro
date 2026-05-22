@@ -62,6 +62,27 @@ _UNIT_TEST_REVIEWER_SUBSET = frozenset({
 _UNIT_TEST_TITLE_PATTERNS = ("test_", "test ", "tests for", "testcare", "testplant", "testcreate", "testupdate", "testdelete")
 _UNIT_TEST_DESC_PATTERNS = ("@pytest", "def test_", "pytest.fixture", "assert ", "dataclass", " enum ", "unit test")
 
+# Formal-proof tasks only need reviewers that can reason about proof structure and
+# verification strategy.  Security and performance reviewers have nothing to say about
+# theorem proving and will emit false NOT_SUITABLE / REJECTED signals.
+_PROOF_REVIEWER_SUBSET = frozenset({
+    "coupling_reviewer",      # repurposed: lemma dependency graph, no circular proofs
+    "testability_reviewer",   # repurposed: verification strategy, lake build, no sorry
+})
+
+_PROOF_KEYWORDS = (
+    "lean4", "lean 4", "coq", "isabelle", "agda", "idris",
+    "theorem", "lemma", "proof", "mathlib", "lake build",
+    " sorry", "formal verification", "tactic", "tactic proof",
+    "fermat", "prime", "zmod", "nat.prime",
+)
+
+
+def _is_proof_task(title: str, description: str) -> bool:
+    """Return True when heuristics indicate a formal-proof / theorem-proving task."""
+    combined = (title + " " + (description or "")).lower()
+    return any(kw in combined for kw in _PROOF_KEYWORDS)
+
 
 def _is_unit_test_task(title: str, description: str) -> bool:
     """Return True when heuristics indicate a pure unit-test writing task."""
@@ -194,6 +215,46 @@ def _scan_existing_files(project_root: str, survey_text: str) -> list[str]:
     return found
 
 
+# Design personas for formal-proof / theorem-proving tasks.  Replaces the SW-dev
+# personas when _is_proof_task() returns True.
+_PROOF_DESIGN_PERSONAS: list[tuple[str, str]] = [
+    (
+        "Mathematical Rigor & Completeness",
+        "Your primary concern is mathematical correctness and completeness. "
+        "Every case must be covered, no sorry placeholders are acceptable in the final proof, "
+        "and the argument must be logically watertight. Identify which Mathlib lemmas are "
+        "available and sufficient; do not assume lemmas exist without evidence. "
+        "In your design_rationale, explain the mathematical strategy and why it is complete.",
+    ),
+    (
+        "Lean4 Tactics & Mathlib Integration",
+        "Your primary concern is idiomatic use of Lean4 and Mathlib. "
+        "Choose tactic blocks that are concise and well-supported by existing Mathlib infrastructure. "
+        "Prefer `decide`, `norm_num`, `ring`, `simp`, `omega`, `exact?`, `apply?` where applicable. "
+        "Identify the precise Mathlib import paths needed. "
+        "In your design_rationale, name the specific lemmas or tactics you plan to use and why.",
+    ),
+    (
+        "Proof Structure & Readability",
+        "Your primary concern is proof structure and long-term readability. "
+        "Break the proof into named helper lemmas with clear statements. "
+        "Use meaningful names and add doc-comments explaining the mathematical intent. "
+        "The proof should be maintainable: a future contributor should be able to see "
+        "immediately what each lemma asserts and why the overall structure works. "
+        "In your design_rationale, describe the decomposition into sub-lemmas and the "
+        "narrative flow of the proof.",
+    ),
+    (
+        "Build & Verification Strategy",
+        "Your primary concern is ensuring the deliverable compiles and passes all checks. "
+        "Plan for a zero-error `lake build`: resolve all imports, handle universe levels, "
+        "and anticipate type-class resolution issues. Define the verification steps the "
+        "implementation agent must run (lake build, lean --check, etc.). "
+        "In your design_rationale, list the exact build commands, expected output, and "
+        "how you will confirm zero sorry and zero errors.",
+    ),
+]
+
 _DESIGN_PERSONAS: list[tuple[str, str]] = [
     (
         "Correctness & Testability",
@@ -316,13 +377,22 @@ SURVEY_TOOLS = [
     "search_files", "find_files", "list_directory",
     "git_log", "git_blame",
     "get_task", "list_tasks",
+    "submit_work",
+]
+
+# Extra tools unlocked for formal-proof / theorem-proving survey phases.
+_PROOF_SURVEY_EXTRA_TOOLS = [
+    "search_mathlib", "search_arxiv", "search_oeis",
 ]
 
 
-def _get_survey_tool_schemas() -> list[dict]:
+def _get_survey_tool_schemas(*, is_proof: bool = False) -> list[dict]:
     """Return OpenAI-format tool schemas for the survey agent."""
     from app.agent.tools import TOOL_SCHEMAS
-    return [s for s in TOOL_SCHEMAS if s["function"]["name"] in SURVEY_TOOLS]
+    allowed = set(SURVEY_TOOLS)
+    if is_proof:
+        allowed.update(_PROOF_SURVEY_EXTRA_TOOLS)
+    return [s for s in TOOL_SCHEMAS if s["function"]["name"] in allowed]
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +436,7 @@ class PlanningPipeline:
         self._total_completion = 0
         # Set in run() after the survey, used by _stage_design_review
         self._is_simple: bool = False
+        self._is_proof: bool = False
         self._effective_best_of_n: int = PLANNING_BEST_OF_N
         # Lazily computed architecture context (cached on first access)
         self.__arch_ctx: str | None = None
@@ -391,14 +462,23 @@ class PlanningPipeline:
         set_llm_session_context(AGENT_NAME)
         logger.info(f"[{AGENT_NAME}] Starting pipeline for task '%s'", self.task_id)
 
+        # Classify task domain before the survey so the survey gets the right tools/prompt.
+        self._is_proof = _is_proof_task(self.task_title, self.task_description)
+        if self._is_proof:
+            logger.info(
+                "[%s] Formal-proof task detected — using proof personas, reviewer subset, and math survey tools.",
+                AGENT_NAME,
+            )
+
         # Stage 1: Codebase survey
         survey_summary = await self._stage_codebase_survey()
 
-        # Classify complexity after the survey so we can factor in the survey result.
         # Unit-test tasks are already handled by their own reviewer subset; simple tasks
         # get a reduced design pool (2 proposals) and a lighter reviewer panel.
+        # Proof tasks bypass _is_simple (they have their own persona pool).
         self._is_simple = (
-            not _is_unit_test_task(self.task_title, self.task_description)
+            not self._is_proof
+            and not _is_unit_test_task(self.task_title, self.task_description)
             and _is_simple_task(self.task_title, self.task_description, survey_summary)
         )
         self._effective_best_of_n = 2 if self._is_simple else PLANNING_BEST_OF_N
@@ -633,34 +713,65 @@ class PlanningPipeline:
         from app.agent.tools import dispatch_tool, _restrict_reads_to_root as _survey_root_flag
 
         _arch = self._arch_ctx
-        system_prompt = (
-            "You are a codebase surveyor. Your job is to understand the existing code "
-            "structure relevant to the following task.\n\n"
-            "WORKFLOW:\n"
-            "1. Use tools to read 3-8 key files most relevant to the task.\n"
-            "2. Once you have a clear picture of the existing structure, STOP reading "
-            "and synthesize your findings.\n"
-            "3. Output a single message starting with 'SURVEY_COMPLETE:' followed by "
-            "your summary. Do NOT keep reading once you understand the key structure.\n\n"
-            "SYNTHESIS TRIGGERS — emit SURVEY_COMPLETE when ANY of these are true:\n"
-            "- You have read 5+ files and understand the relevant interfaces.\n"
-            "- You have confirmed the relevant modules and their responsibilities.\n"
-            "- You have identified what needs to change and what can be reused.\n\n"
-            f"Task: {self.task_title}\n"
-            f"Description: {self.task_description}"
-            + (f"\n\n{_arch}" if _arch else "")
-        )
+
+        if self._is_proof:
+            system_prompt = (
+                "You are a formal-proof surveyor. Your job is to gather the information "
+                "a proof designer needs: what Mathlib already provides, what the mathematical "
+                "strategy should be, and what project structure (if any) already exists.\n\n"
+                "WORKFLOW:\n"
+                "1. Check whether any Lean/proof files already exist with list_directory / find_files.\n"
+                "2. If the project is EMPTY (no .lean files), that is EXPECTED — skip immediately to step 3.\n"
+                "3. Search Mathlib for relevant theorems using search_mathlib. For Fermat's Little Theorem "
+                "or modular arithmetic tasks, search for terms like 'ZMod', 'Finset.card', "
+                "'ZMod.pow_card_sub_one_eq_one', 'Nat.Prime', 'Finset.prod_pow_eq_pow_sum'. "
+                "Run 2-4 targeted searches covering the key lemmas you expect to need.\n"
+                "4. Optionally use search_arxiv if a literature reference would sharpen the proof strategy.\n"
+                "5. Once you have identified the relevant Mathlib lemmas and understand the proof strategy, "
+                "call submit_work(signal='ACCEPTED', summary='<your findings>') to finish the survey.\n\n"
+                "GREENFIELD SHORTCUT — if list_directory shows no .lean files, do NOT keep searching "
+                "the filesystem. Go directly to search_mathlib.\n\n"
+                f"Task: {self.task_title}\n"
+                f"Description: {self.task_description}"
+                + (f"\n\n{_arch}" if _arch else "")
+            )
+            user_content = (
+                "Survey the proof environment. Check for existing .lean files, then search Mathlib "
+                "for the key lemmas this proof will need. When done, call submit_work to finish."
+            )
+        else:
+            system_prompt = (
+                "You are a codebase surveyor. Your job is to understand the existing code "
+                "structure relevant to the following task.\n\n"
+                "WORKFLOW:\n"
+                "1. Use tools to read 3-8 key files most relevant to the task.\n"
+                "2. Once you have a clear picture of the existing structure, STOP reading "
+                "and synthesize your findings.\n"
+                "3. Call submit_work(signal='ACCEPTED', summary='<your findings>') to finish. "
+                "Alternatively, output a message starting with 'SURVEY_COMPLETE:' followed by "
+                "your summary.\n\n"
+                "GREENFIELD SHORTCUT — if list_directory shows the project is empty, call "
+                "submit_work immediately with summary='Greenfield project — no existing files.'\n\n"
+                "SYNTHESIS TRIGGERS — finish when ANY of these are true:\n"
+                "- You have read 5+ files and understand the relevant interfaces.\n"
+                "- You have confirmed the relevant modules and their responsibilities.\n"
+                "- You have identified what needs to change and what can be reused.\n\n"
+                f"Task: {self.task_title}\n"
+                f"Description: {self.task_description}"
+                + (f"\n\n{_arch}" if _arch else "")
+            )
+            user_content = (
+                "Survey the codebase. Focus only on files most relevant to this task. "
+                "Read 3-8 key files, then call submit_work to finish. "
+                "Do not exhaustively read every file — stop once you understand the key structure."
+            )
 
         messages: list[dict] = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": (
-                "Survey the codebase. Focus only on files most relevant to this task. "
-                "Read 3-8 key files, then immediately emit SURVEY_COMPLETE: with your summary. "
-                "Do not exhaustively read every file — stop once you understand the key structure."
-            )},
+            {"role": "user", "content": user_content},
         ]
 
-        tool_schemas = _get_survey_tool_schemas()
+        tool_schemas = _get_survey_tool_schemas(is_proof=self._is_proof)
         survey_result = ""
         content = ""
         _ctx_warned: set[float] = set()
@@ -765,7 +876,29 @@ class PlanningPipeline:
                             result = dispatch_tool(fn_name, fn_args)
                         except Exception as e:
                             result = f"Error: {e}"
-                        result_str = str(result)[:4000]
+                        result_str = str(result)
+
+                        # submit_work terminal signal — extract summary and end survey.
+                        # Parse from untruncated `result` so a long summary doesn't
+                        # silently truncate the JSON and cause the loop to continue.
+                        if fn_name == "submit_work":
+                            try:
+                                _terminal = json.loads(str(result))
+                                if _terminal.get("__maestro_terminal__"):
+                                    survey_result = _terminal.get("summary", result_str)
+                                    logger.info(
+                                        "[%s] Survey ended via submit_work at turn %d",
+                                        AGENT_NAME, turn + 1,
+                                    )
+                                    messages.append({
+                                        "role": "tool",
+                                        "tool_call_id": tc["id"],
+                                        "content": result_str,
+                                    })
+                                    break
+                            except (json.JSONDecodeError, AttributeError):
+                                pass
+
                         logger.debug(f"[{AGENT_NAME}] Survey turn %d: %s(%s) → %d chars",
                                      turn + 1, fn_name,
                                      ", ".join(f"{k}={v!r}" for k, v in fn_args.items()),
@@ -775,8 +908,8 @@ class PlanningPipeline:
                             "tool_call_id": tc["id"],
                             "content": result_str,
                         })
-                    
-                    if survey_result: # Loop broken by guard
+
+                    if survey_result:  # Loop broken by submit_work or repetition guard
                         break
                 elif not content:
                     break
@@ -833,12 +966,48 @@ class PlanningPipeline:
             "6. Name test subjects by component/class name (e.g. 'UserService'), not by filename.\n"
             "7. implementation_steps is MANDATORY and MUST be a non-empty list — an empty array "
             "is a HARD GATE FAILURE that will reject your entire plan. Fill this BEFORE file_manifest. "
-            "Each step: {\"order\": 1, \"component\": \"MyClass\", \"files\": [\"src/my_class.py\"], "
-            "\"description\": \"Create MyClass with X and Y methods\", "
+            "Each step: {\"order\": 1, \"component\": \"ComponentName\", \"files\": [\"src/example.ext\"], "
+            "\"description\": \"Implement ComponentName doing X\", "
             "\"depends_on\": [], \"estimated_context_tokens\": 2000}\n"
             "8. DO NOT output free-form prose after calling submit_work."
             + (f"\n\n{_arch}" if _arch else "")
         )
+
+        _proof_format = (
+            "Based on the survey and task description, produce a detailed proof design "
+            "for this formal-verification task.\n\n"
+            "To complete your design, call the submit_work tool with:\n"
+            "- signal: 'ACCEPTED'\n"
+            "- summary: A brief summary of your proof strategy.\n"
+            "- payload: {\n"
+            "    \"implementation_steps\": [REQUIRED — non-empty ordered list of proof steps],\n"
+            "    \"design_rationale\": \"string explaining the mathematical strategy\",\n"
+            "    \"file_manifest\": \"list of {path, action, purpose, estimated_lines, depends_on} "
+            "— list the .lean files to create or modify\",\n"
+            "    \"dependency_graph\": \"dict mapping lemma/theorem -> [lemmas it depends on]\",\n"
+            "    \"interface_contracts\": \"list of {component, provides, consumes, invariants} "
+            "— each component is a lemma or theorem; 'provides' is its statement; "
+            "'invariants' are proof obligations\",\n"
+            "    \"test_strategy\": \"list of {component, test_file, test_cases, fixtures} "
+            "— here 'test_file' is the lake build command or lean check command; "
+            "'test_cases' are the specific propositions verified; 'fixtures' are Mathlib imports\"\n"
+            "}\n\n"
+            "CRITICAL rules:\n"
+            "1. No sorry placeholders in the final proof — the plan must describe how each "
+            "proof obligation will be discharged.\n"
+            "2. Name each lemma concisely and clearly. List its exact Lean4 type signature in 'provides'.\n"
+            "3. List only Mathlib lemmas you have evidence for in 'consumes' — do not assume "
+            "lemmas exist without citing them.\n"
+            "4. implementation_steps is MANDATORY and MUST be a non-empty list. "
+            "Each step: {\"order\": 1, \"component\": \"TheoremName\", "
+            "\"files\": [\"Mathlib/TheoremName.lean\"], "
+            "\"description\": \"Prove TheoremName using tactic X\", "
+            "\"depends_on\": [], \"estimated_context_tokens\": 2000}\n"
+            "5. DO NOT output free-form prose after calling submit_work."
+            + (f"\n\n{_arch}" if _arch else "")
+        )
+
+        _active_format = _proof_format if self._is_proof else _format
 
         # Warn the design LLM when existing files are present on disk — prevents
         # it from proposing CREATE actions that collide with prior INDEV work.
@@ -863,7 +1032,7 @@ class PlanningPipeline:
         user_msg = (
             f"Task: {sanitize_user_content(self.task_title)}\n"
             f"Description: {sanitize_user_content(self.task_description)}\n\n"
-            f"Codebase Survey:\n{sanitize_user_content(survey[:8000])}"
+            f"Codebase Survey:\n{sanitize_user_content(survey)}"
             + _greenfield_warning
         )
 
@@ -878,18 +1047,20 @@ class PlanningPipeline:
             if is_shutting_down():
                 raise ShutdownError("Server is shutting down")
 
-            persona_label, persona_concern = _DESIGN_PERSONAS[i % len(_DESIGN_PERSONAS)]
+            _personas = _PROOF_DESIGN_PERSONAS if self._is_proof else _DESIGN_PERSONAS
+            persona_label, persona_concern = _personas[i % len(_personas)]
+            _role = "formal proof specialist" if self._is_proof else "software architect"
             _spec_suffix = (
                 "\n\n*** SPEC COMPLIANCE — BINDING CONSTRAINTS ***\n"
                 + sanitize_user_content(_spec_block)
                 + "\n*** END SPEC COMPLIANCE ***"
             ) if _spec_block else ""
             system_prompt = (
-                f"You are a software architect. Primary concern: {persona_label}.\n"
+                f"You are a {_role}. Primary concern: {persona_label}.\n"
                 f"{persona_concern}"
                 + _spec_suffix
                 + "\n\n"
-                + _format
+                + _active_format
             )
             messages: list[dict] = [
                 {"role": "system", "content": system_prompt},
@@ -971,7 +1142,7 @@ class PlanningPipeline:
                         tool_result_msgs.append({
                             "role": "tool",
                             "tool_call_id": tc.get("id", f"call_{turn}_{tc_name}"),
-                            "content": str(tc_result)[:8000],
+                            "content": str(tc_result),
                         })
 
                     if terminal:
@@ -1188,9 +1359,15 @@ class PlanningPipeline:
             },
         ]
 
-        # RC3: Skip off-topic reviewers for unit-test or simple tasks to avoid false
-        # REJECTED/NOT_SUITABLE signals from perspectives that have no signal to give.
-        if _is_unit_test_task(self.task_title, self.task_description):
+        # RC3: Skip off-topic reviewers for unit-test, proof, or simple tasks to avoid
+        # false REJECTED/NOT_SUITABLE signals from perspectives that have no signal to give.
+        if self._is_proof:
+            reviewers = [r for r in reviewers if r["name"] in _PROOF_REVIEWER_SUBSET]
+            logger.info(
+                "[%s] Proof task — running %d reviewer(s): %s",
+                AGENT_NAME, len(reviewers), [r["name"] for r in reviewers],
+            )
+        elif _is_unit_test_task(self.task_title, self.task_description):
             reviewers = [r for r in reviewers if r["name"] in _UNIT_TEST_REVIEWER_SUBSET]
             logger.info(
                 "[%s] Unit-test task detected — running %d reviewer(s): %s",
@@ -1203,7 +1380,7 @@ class PlanningPipeline:
                 AGENT_NAME, len(reviewers), [r["name"] for r in reviewers],
             )
 
-        design_summary = json.dumps(design, indent=1, ensure_ascii=True)[:6000]
+        design_summary = json.dumps(design, indent=1, ensure_ascii=True)
         _arch = self._arch_ctx
         _arch_prefix = (
             f"Task: {self.task_title}\n"
@@ -1219,11 +1396,12 @@ class PlanningPipeline:
             "author is informed but not blocked."
         )
 
+        _domain_label = "proof plan" if self._is_proof else "software design"
         reviewer_prompts = []
         for reviewer in reviewers:
             prompt = (
                 f"{_arch_prefix}"
-                f"You are reviewing a software design from the perspective of: {reviewer['focus']}"
+                f"You are reviewing a {_domain_label} from the perspective of: {reviewer['focus']}"
                 f"{_intent_rule}\n\n"
                 f"Design:\n{design_summary}\n\n"
                 "Use WARN (not REJECTED) when your concern is an opinionated tradeoff that the "
@@ -1363,7 +1541,7 @@ class PlanningPipeline:
         prompt = (
             (f"{_arch}\n\n" if _arch else "")
             + "Analyze this design for potential pitfalls:\n"
-            f"{json.dumps(design, indent=1, ensure_ascii=True)[:4000]}\n\n"
+            f"{json.dumps(design, indent=1, ensure_ascii=True)}\n\n"
             "Look for: edge cases, implicit dependencies, race conditions, "
             "state management issues, migration risks.\n"
             "To output pitfalls, call the submit_work tool with:\n"
@@ -1432,8 +1610,8 @@ class PlanningPipeline:
             + "You have a winning design and identified pitfalls. "
             "Produce a consolidated final design that incorporates mitigations "
             "for the identified pitfalls. Use the submit_work tool to output the result.\n\n"
-            f"Original design:\n{json.dumps(design, indent=1, ensure_ascii=True)[:4000]}\n\n"
-            f"Pitfalls:\n{json.dumps(pitfalls, indent=1, ensure_ascii=True)[:2000]}"
+            f"Original design:\n{json.dumps(design, indent=1, ensure_ascii=True)}\n\n"
+            f"Pitfalls:\n{json.dumps(pitfalls, indent=1, ensure_ascii=True)}"
         )
 
         from app.agent.tools import build_tool_schemas, dispatch_tool

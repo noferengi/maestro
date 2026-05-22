@@ -578,6 +578,11 @@ _HUNG_SESSION_IDLE_SECONDS    = 300   # 5 min — kill if no LLM call in this wi
 _failed_cooldowns: dict[str, float] = {}
 _FAIL_COOLDOWN_SECONDS = 60.0  # Wait 60s before retrying a failed task
 
+# LLM IDs dispatched during the current tick — used by _check_and_reserve_slot to
+# correctly determine llm_already_loaded when a fast-completing thread has decremented
+# _llm_session_counts back to 0 before the next dispatch check within the same tick.
+_tick_dispatched_llm_ids: set[int] = set()
+
 # task_id -> timestamp of last rejected intake run (longer inter-retry backoff)
 # Rejection means "not ready yet", not "permanently blocked" — always retry unless exhausted.
 _rejection_cooldowns: dict[str, float] = {}
@@ -627,6 +632,59 @@ def _is_project_in_failure_cooldown(project_name: str | None) -> bool:
         return False
     last_failure = _project_failure_cooldowns.get(project_name, 0)
     return (time.time() - last_failure) < _PROJECT_FAILURE_COOLDOWN_SECONDS
+
+
+# Project enabled/disabled cache — rebuilt at most once per 30 s to avoid per-tick DB queries.
+# project_id -> bool (True = enabled, default)
+_project_enabled_cache: dict[int, bool] = {}
+# project_name -> project_id (for dispatchers that only have a name)
+_project_name_id_cache: dict[str, int] = {}
+_project_enabled_cache_time: float = 0.0
+_PROJECT_ENABLED_CACHE_TTL = 30.0
+
+
+def _refresh_project_enabled_cache() -> None:
+    """Reload the project-enabled cache from project_settings."""
+    global _project_enabled_cache, _project_name_id_cache, _project_enabled_cache_time
+    try:
+        from app.database.session import SessionLocal
+        from app.database.models import Project, ProjectSettings
+        db = SessionLocal()
+        try:
+            projects = db.query(Project).all()
+            disabled_ids: set[int] = {
+                row.project_id
+                for row in db.query(ProjectSettings).filter_by(key="enabled")
+                if row.value == "false"
+            }
+            _project_enabled_cache = {p.id: p.id not in disabled_ids for p in projects}
+            _project_name_id_cache = {p.name: p.id for p in projects}
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning("[scheduler] Failed to refresh project enabled cache: %s", exc)
+    _project_enabled_cache_time = time.time()
+
+
+def _is_project_enabled_by_id(project_id: int | None) -> bool:
+    """Return True if the project is enabled (default when unknown)."""
+    if project_id is None:
+        return True
+    if time.time() - _project_enabled_cache_time > _PROJECT_ENABLED_CACHE_TTL:
+        _refresh_project_enabled_cache()
+    return _project_enabled_cache.get(project_id, True)
+
+
+def _is_project_enabled_by_name(project_name: str | None) -> bool:
+    """Return True if the project is enabled (default when unknown)."""
+    if not project_name:
+        return True
+    if time.time() - _project_enabled_cache_time > _PROJECT_ENABLED_CACHE_TTL:
+        _refresh_project_enabled_cache()
+    pid = _project_name_id_cache.get(project_name)
+    if pid is None:
+        return True
+    return _project_enabled_cache.get(pid, True)
 
 
 # Background thread that drives the scheduler tick
@@ -850,10 +908,19 @@ def get_scheduler_status() -> dict:
         if tid not in session_map or s.started_at > session_map[tid].started_at:
             session_map[tid] = s
 
+    task_by_id = {t.id: t for t in all_tasks}
     task_dicts = [_task_to_mini_dict(t) for t in all_tasks]
     resolver = DAGResolver(task_dicts)
     ready_tasks = resolver.get_ready_tasks()
     ready_ids: set[str] = {t["id"] for t in ready_tasks}
+
+    # Refresh project-enabled cache once per tick, then filter disabled-project tasks out
+    # of ready_tasks so _dispatch_pipeline_tasks_tiered never sees them.
+    _refresh_project_enabled_cache()
+    ready_tasks = [
+        t for t in ready_tasks
+        if _is_project_enabled_by_id(getattr(task_by_id.get(t["id"]), "project_id", None))
+    ]
 
     # Big-idea parents (have children - skipped by DAG as non-dispatchable)
     children_by_parent: set[str] = {
@@ -862,7 +929,7 @@ def get_scheduler_status() -> dict:
         if t.get("parent_task_id")
     }
 
-    dispatchable_set = set(SCHEDULER_DISPATCHABLE_TYPES)
+    dispatchable_set = {s.lower() for s in SCHEDULER_DISPATCHABLE_TYPES}
     done_set = {s.lower() for s in PIPELINE_DONE_STATUSES}
     never_dispatch = {"completed", "cancelled", "subdividing", "accepted"}
 
@@ -870,8 +937,6 @@ def get_scheduler_status() -> dict:
     queued_list: list[dict] = []
     blocked_list: list[dict] = []
     stopped_list: list[dict] = []
-
-    task_by_id = {t.id: t for t in all_tasks}
 
     # 1. Add scheduler-managed active tasks
     for tid in active_session_ids:
@@ -941,6 +1006,10 @@ def get_scheduler_status() -> dict:
 
         # Already in active_list?
         if tid in active_session_ids:
+            continue
+
+        # Skip tasks belonging to disabled projects
+        if not _is_project_enabled_by_id(getattr(task, "project_id", None)):
             continue
 
         # Only care about dispatchable types that aren't terminal
@@ -1209,6 +1278,10 @@ def _check_and_reserve_slot(
         if node_obj is not None:
             with _llm_counts_lock:
                 llm_already_loaded = _llm_session_counts[llm_id] > 0
+            # Also treat as loaded if this LLM was dispatched earlier in this tick:
+            # a fast-completing thread may have decremented _llm_session_counts back
+            # to 0 before we reach the next candidate, inflating the loaded-model cap.
+            llm_already_loaded = llm_already_loaded or (llm_id in _tick_dispatched_llm_ids)
             mlm = getattr(node_obj, "max_loaded_models", 1)
             if not llm_already_loaded and node_active_counts[node_id] >= mlm:
                 logger.debug(
@@ -1245,6 +1318,11 @@ def _check_and_reserve_slot(
         if not was_already_active:
             node_active_counts[node_id] += 1
         node_session_counts[node_id] += 1
+
+    # Record this LLM as dispatched this tick so llm_already_loaded stays True even
+    # if the thread completes (and decrements _llm_session_counts) before the next
+    # candidate in the same tick is evaluated.
+    _tick_dispatched_llm_ids.add(llm_id)
 
     return True
 
@@ -1335,6 +1413,9 @@ def _dispatch_pipeline_tasks_tiered(
 
         db_task = get_task(task_id)
         if not db_task:
+            continue
+
+        if not _is_project_enabled_by_id(getattr(db_task, 'project_id', None)):
             continue
 
         _content_blob = db_task.content or {}
@@ -1461,7 +1542,9 @@ def _tick() -> None:
     from app.agent.dag import DAGResolver
     from app.database import get_all_tasks, get_task, get_llm, get_compute_node
 
-    # 0. Cleanup finished sessions (also removes from _session_llm_ids)
+    # 0. Reset tick-local LLM dispatch tracking and cleanup finished sessions.
+    global _tick_dispatched_llm_ids
+    _tick_dispatched_llm_ids = set()
     _cleanup_finished()
 
     # 0a-pre. Kill sessions alive but LLM-idle for too long (hung tool calls, stalled HTTP).
@@ -2491,15 +2574,18 @@ def _dispatch_file_summary_jobs(
         if not job.llm_id:
             continue
 
-        # Throttling: Skip projects with recent failures/rescues
+        # Throttling: Skip projects with recent failures/rescues or disabled projects
         if job.task_id:
             task = _get_task(job.task_id)
-            if task and task.project and _is_project_in_failure_cooldown(task.project):
-                logger.debug(
-                    "Skipping file_summary job %d - project '%s' is in failure cooldown.",
-                    job.id, task.project,
-                )
-                continue
+            if task:
+                if not _is_project_enabled_by_id(getattr(task, "project_id", None)):
+                    continue
+                if task.project and _is_project_in_failure_cooldown(task.project):
+                    logger.debug(
+                        "Skipping file_summary job %d - project '%s' is in failure cooldown.",
+                        job.id, task.project,
+                    )
+                    continue
 
         job_key = f"file-summary-{job.id}"
         with _active_sessions_lock:
@@ -2902,7 +2988,9 @@ def _dispatch_arch_gen_jobs(
         if only_tier is not None and getattr(job, "tier", 2) != only_tier:
             continue
 
-        # Throttling: Skip projects with recent failures/rescues
+        # Skip disabled projects and throttle projects with recent failures
+        if not _is_project_enabled_by_name(getattr(job, "project", None)):
+            continue
         if _is_project_in_failure_cooldown(job.project):
             logger.debug(
                 "Skipping arch_gen job %d - project '%s' is in failure cooldown.",
@@ -2964,6 +3052,9 @@ def _dispatch_scope_survey_jobs(
     pending = get_pending_scope_survey_jobs(limit=SURVEY_MAX_CONCURRENT_JOBS)
     for job in pending:
         if not job.llm_id:
+            continue
+
+        if not _is_project_enabled_by_name(getattr(job, "project_name", None)):
             continue
 
         job_key = f"scope-survey-{job.id}"
@@ -3110,7 +3201,7 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
             prompt = (
                 f"You are updating the summary for the '{job.scope_key}' {job.scope_type} in project '{job.project_name}'.\n"
                 f"Old Summary:\n{existing.summary}\n\n"
-                f"Git Diff of changes:\n{diff_text[:4000]}\n\n"
+                f"Git Diff of changes:\n{diff_text}\n\n"
                 "Please provide an updated summary that incorporates these changes. Maintain the same style. "
                 "Provide a detailed summary and a 2-sentence 'short_summary' at the very end of your response, "
                 "prefixed with 'SHORT_SUMMARY: '."
@@ -3554,6 +3645,9 @@ def _dispatch_pip_resolution_jobs(
     for job in jobs:
         task = get_task(job.task_id)
         if not task or not task.llm_id:
+            continue
+
+        if not _is_project_enabled_by_id(getattr(task, "project_id", None)):
             continue
 
         llm = get_llm(task.llm_id)
@@ -4881,6 +4975,7 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
         logger.warning("No planning result for task '%s', demoting to planning.", task_id)
         advance_stage(task_id, "fail", from_stage="indev")
         _record_demotion_inline(task_id, "indev", "planning", "Missing planning results")
+        _failed_cooldowns[task_id] = time.time()
         return
 
     try:

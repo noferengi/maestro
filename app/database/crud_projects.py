@@ -13,6 +13,8 @@ upsert_project() uses Ellipsis (...) as a sentinel for llm_id / budget_id:
 
 import logging
 
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
 from .session import SessionLocal
 from .models import Project, ProjectSettings, ProjectLlmRouting
 from app.utils import normalize_path
@@ -223,17 +225,18 @@ def get_project_setting(project_id: int, key: str, default=None):
 
 
 def set_project_setting(project_id: int, key: str, value: str) -> None:
-    """Upsert a per-project setting."""
+    """Upsert a per-project setting (atomic, race-safe)."""
     db = SessionLocal()
     try:
-        row = (db.query(ProjectSettings)
-               .filter(ProjectSettings.project_id == project_id,
-                       ProjectSettings.key == key)
-               .first())
-        if row:
-            row.value = value
-        else:
-            db.add(ProjectSettings(project_id=project_id, key=key, value=value))
+        stmt = (
+            pg_insert(ProjectSettings)
+            .values(project_id=project_id, key=key, value=value)
+            .on_conflict_do_update(
+                index_elements=["project_id", "key"],
+                set_={"value": value},
+            )
+        )
+        db.execute(stmt)
         db.commit()
     except Exception as e:
         db.rollback()
@@ -312,6 +315,7 @@ def project_to_dict(project: Project) -> dict:
     """Convert Project SQLAlchemy model to dictionary."""
     if not project:
         return {}
+    enabled = get_project_setting(project.id, "enabled", "true") != "false"
     return {
         "id": project.id,
         "name": project.name,
@@ -324,5 +328,6 @@ def project_to_dict(project: Project) -> dict:
         "autopilot_budget_id": getattr(project, "autopilot_budget_id", None),
         "autopilot_max_in_flight": getattr(project, "autopilot_max_in_flight", 10),
         "exclude_from_training": getattr(project, "exclude_from_training", False),
+        "enabled": enabled,
         "created_at": (project.created_at.isoformat() if hasattr(project.created_at, 'isoformat') else str(project.created_at)) if project.created_at else None,
     }

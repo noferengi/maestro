@@ -80,7 +80,7 @@ def run_shell_review(tool: str, path: str = ".", *, project_path: str | None = N
     effective_timeout = timeout if timeout is not None else SHELL_TIMEOUT_SECONDS
     args = builder(safe_path)
     rc, out = _run_tool_subprocess(args, cwd, effective_timeout, f"ERROR: {tool} timed out after {effective_timeout}s")
-    return out[:8000] if out else "(no output)"
+    return out if out else "(no output)"
 
 
 # ---------------------------------------------------------------------------

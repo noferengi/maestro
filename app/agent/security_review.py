@@ -79,7 +79,7 @@ def run_shell_security(tool: str, path: str = ".", *, project_path: str | None =
 
     args = builder(safe_path)
     rc, out = _run_tool_subprocess(args, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: {tool} timed out after {SHELL_TIMEOUT_SECONDS}s")
-    return out[:8000] if out else "(no output)"
+    return out if out else "(no output)"
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +233,7 @@ class SecurityPipeline:
             try:
                 result = await loop.run_in_executor(None, shell_fn, tool_key)
                 if result and not result.startswith("ERROR:"):
-                    scan_outputs.append(f"[{scanner_name}]\n{result[:2000]}")
+                    scan_outputs.append(f"[{scanner_name}]\n{result}")
                 else:
                     logger.debug(f"[{AGENT_NAME}] Pre-scan '%s': %s", tool_key, result[:200])
             except Exception as e:

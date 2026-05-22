@@ -70,13 +70,13 @@ _VALID_VERDICTS = {v.value for v in Verdict} - {Verdict.CONDITIONAL_PASS.value}
 # ---------------------------------------------------------------------------
 
 _SCOPE_SYSTEM_PROMPT = """\
-You are a senior software architect performing scope analysis on a proposed task.
+You are a senior analyst performing scope analysis on a proposed task.
 
 Analyze the task and determine:
 - Overall scope (small / medium / large / epic)
 - Complexity rating (1-10)
 - Whether the task should be decomposed into subtasks
-- Key areas of the codebase likely affected
+- Key areas of the project or system likely affected by this task
 - Estimated effort category (trivial, minor, moderate, significant, major)
 
 To complete your analysis, call the submit_work tool with:
@@ -98,7 +98,7 @@ Verdict guidelines:
 - LIKELY: Task is well-defined, reasonable scope, clearly feasible.
 - POSSIBLE: Task is feasible but has some ambiguity or moderate complexity.
 - NEEDS_RESEARCH: Task is too vague to assess - needs clarification before proceeding.
-- NOT_SUITABLE: Task is poorly scoped, too large without decomposition, or architecturally questionable.
+- NOT_SUITABLE: Task is poorly scoped, too large without decomposition, or fundamentally questionable.
 - REJECTED: Task is fundamentally unfeasible, contradictory, or harmful to the project.
 - SUBDIVIDE_IDEA: Task is fundamentally sound but too large to implement in a single context window. Should be decomposed into smaller pieces. Only use when the task is good but genuinely too big - not vague (NEEDS_RESEARCH) or bad (REJECTED).
 
@@ -106,18 +106,18 @@ No prose after calling submit_work.\
 """
 
 _FEASIBILITY_SYSTEM_PROMPT = """\
-You are a senior software engineer performing feasibility analysis on a proposed task.
+You are an expert analyst performing feasibility analysis on a proposed task.
 
 You will receive:
 1. The task description and title.
-2. A structural analysis of the current codebase (file counts, languages, module structure).
+2. A structural analysis of the current project (file counts, languages or formats, component structure).
 
 Your job is to assess:
-- Whether the task is technically feasible given the current codebase structure.
-- What ambiguities or unknowns exist that could block implementation.
-- Whether external dependencies or APIs are needed.
+- Whether the task is feasible given the current project structure and environment.
+- What ambiguities or unknowns exist that could block completion.
+- Whether external dependencies, tools, or APIs are needed.
 - What risks or edge cases should be considered.
-- Whether the codebase is in a state that can accommodate this change.
+- Whether the project is in a state that can accommodate this task.
 
 To complete your analysis, call the submit_work tool with:
 payload={
@@ -125,7 +125,7 @@ payload={
   "ambiguities": [<string>, ...],
   "external_dependencies": [<string>, ...],
   "risks": [<string>, ...],
-  "codebase_readiness": "ready" | "needs_refactoring" | "incompatible",
+  "project_readiness": "ready" | "needs_preparation" | "incompatible",
   "vote": {
     "verdict": "POSSIBLE" | "LIKELY" | "NOT_SUITABLE" | "REJECTED" | "NEEDS_RESEARCH" | "SUBDIVIDE_IDEA",
     "confidence": <float 0.0-1.0>,
@@ -134,11 +134,11 @@ payload={
 }
 
 Verdict guidelines:
-- LIKELY: Codebase is ready, no major blockers, dependencies are available.
-- POSSIBLE: Feasible but some refactoring or dependency resolution needed.
-- NEEDS_RESEARCH: Cannot determine feasibility - too many unknowns.
-- NOT_SUITABLE: Significant architectural incompatibilities or missing foundations.
-- REJECTED: Fundamentally impossible given the current system.
+- LIKELY: Project/environment is ready, no major blockers, required dependencies are available.
+- POSSIBLE: Feasible but some preparation or dependency resolution needed.
+- NEEDS_RESEARCH: Cannot determine feasibility — too many unknowns.
+- NOT_SUITABLE: Significant structural incompatibilities or missing foundations.
+- REJECTED: Fundamentally impossible given the current state of the project.
 - SUBDIVIDE_IDEA: Task is fundamentally sound but too large to implement in a single context window. Should be decomposed into smaller pieces. Only use when the task is good but genuinely too big - not vague (NEEDS_RESEARCH) or bad (REJECTED).
 
 No prose after calling submit_work.\
@@ -152,7 +152,7 @@ You will receive:
 2. A list of all current non-completed tasks in the project.
 
 Your job is to detect:
-- File-level conflicts: tasks that are likely to modify the same files.
+- Artifact conflicts: tasks that are likely to modify the same files, documents, or outputs.
 - Semantic conflicts: tasks with overlapping or contradictory goals.
 - Priority conflicts: tasks that should be done first as prerequisites.
 - Resource conflicts: tasks that compete for the same limited resources.
@@ -811,8 +811,8 @@ class IntakePipeline:
             f"Task Title: {self.task_title}\n\n"
             f"Task Description:\n{self.task_description}\n\n"
             f"--- Scope Analysis (from Stage 1) ---\n{scope_summary}\n\n"
-            f"--- Codebase Structure (from Static Analysis) ---\n{static_summary}\n\n"
-            f"Please assess the technical feasibility of this task."
+            f"--- Project Structure (from Static Analysis) ---\n{static_summary}\n\n"
+            f"Please assess the feasibility of this task."
         )
 
         try:

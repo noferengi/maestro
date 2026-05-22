@@ -431,7 +431,7 @@ class ResearchAgent:
             accumulated = "\n\n".join(finding_parts)
         else:
             accumulated = "No findings were recorded."
-        context_snippet = json.dumps(self.context, indent=1)[:2000]
+        context_snippet = json.dumps(self.context, indent=1)
 
         user_msg = (
             f"Original question: {sanitize_user_content(self.question)}\n\n"
@@ -452,7 +452,7 @@ class ResearchAgent:
                 kwargs: dict = dict(
                     base_url=self.llm_base_url,
                     model=self.llm_model,
-                    max_tokens=32768,
+                    max_tokens=65536,
                     task_id=self.task_id,
                     llm_id=self.llm_id,
                     budget_id=self.budget_id,
@@ -760,7 +760,7 @@ class ResearchAgent:
                 post_mortem_messages,
                 base_url=self.llm_base_url,
                 model=self.llm_model,
-                max_tokens=32768,
+                max_tokens=65536,
                 task_id=self.task_id,
                 llm_id=self.llm_id,
                 agent_name=AGENT_NAME,
@@ -1060,7 +1060,7 @@ class InvestigationAgent:
             accumulated = "\n\n".join(self._accumulated_findings) or "No findings recorded."
             final_report = {
                 "answer": "Investigation exhausted without producing a structured report.",
-                "key_findings": [accumulated[:2000]],
+                "key_findings": [accumulated],
                 "evidence": [],
                 "gaps": ["Investigation budget was insufficient to reach a conclusion."],
                 "recommendation": "Retry with a more specific question or a higher turn budget.",

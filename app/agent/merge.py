@@ -121,7 +121,7 @@ def _run_tests(project_path: str, test_cwd: str) -> tuple[bool, str]:
             timeout=MERGE_TEST_TIMEOUT,
             cwd=test_cwd,
         )
-        output = (test_result.stdout + test_result.stderr)[:4000]
+        output = test_result.stdout + test_result.stderr
         # Exit code 5 = no tests collected — project has no tests, treat as pass
         passed = test_result.returncode in (0, 5)
         return passed, output

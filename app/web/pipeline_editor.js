@@ -18,6 +18,7 @@ let _canvas = null;       // LGraphCanvas instance
 let _templateId = null;   // integer or null
 let _templateData = null; // full API response
 let _agentTypes = [];     // [{type_key, display_name, …}]
+let _trackableTools = { categories: {}, all: [] }; // tool-success-store tracked tools by category
 
 // Maps litegraph node.id → DB stage.position (used for back-edge detection)
 let _stagePosMap = {};
@@ -441,6 +442,9 @@ function buildGraphFromTemplate(data) {
                 output_keys:          Array.isArray(cfg.output_keys)
                                         ? cfg.output_keys.join(", ")
                                         : (cfg.output_keys || ""),
+                required_tool_groups: Array.isArray(cfg.required_tool_groups)
+                                        ? cfg.required_tool_groups
+                                        : [],
             };
         }
 
@@ -676,8 +680,9 @@ async function saveGraph() {
                         system_prompt:       p.system_prompt,
                         gate_type:           p.gate_type,
                         max_retries:         parseInt(p.max_retries) || 3,
-                        required_input_keys: p.required_input_keys.split(",").map(s=>s.trim()).filter(Boolean),
-                        output_keys:         p.output_keys.split(",").map(s=>s.trim()).filter(Boolean),
+                        required_input_keys:  p.required_input_keys.split(",").map(s=>s.trim()).filter(Boolean),
+                        output_keys:          p.output_keys.split(",").map(s=>s.trim()).filter(Boolean),
+                        required_tool_groups: Array.isArray(p.required_tool_groups) ? p.required_tool_groups : [],
                         _canvas_x: Math.round(node.pos[0]),
                         _canvas_y: Math.round(node.pos[1]),
                     },
@@ -802,6 +807,7 @@ function openPanel(node) {
         _populateAgentTypeSelect(body, node.properties.agent_type);
         _renderConditionsList(body, node);
         _setupConditionAdd(body, node);
+        _setupToolGroupsPanel(body, node);
     }
 
     // Factory-specific panel wiring
@@ -997,6 +1003,137 @@ function _setupConditionAdd(body, node) {
         node.addOutput(cond, "task");
         _canvas.setDirty(true, true);
         _renderConditionsList(body, node);
+    });
+}
+
+// ============================================================
+// Required tool groups panel
+// ============================================================
+
+function _renderToolGroupsList(body, node) {
+    const list = body.querySelector("#pf-tool-groups-list");
+    if (!list) return;
+    list.innerHTML = "";
+
+    const groups = Array.isArray(node.properties.required_tool_groups)
+        ? node.properties.required_tool_groups
+        : [];
+
+    groups.forEach((group, gIdx) => {
+        const row = document.createElement("div");
+        row.className = "pe-tool-group-row";
+
+        // Header: "Group N" label + delete-group button
+        const header = document.createElement("div");
+        header.className = "pe-tool-group-header";
+        const title = document.createElement("span");
+        title.textContent = `Group ${gIdx + 1} — any one must succeed`;
+        const delGroup = document.createElement("button");
+        delGroup.className = "pe-condition-del";
+        delGroup.textContent = "✕ group";
+        delGroup.title = "Remove this group";
+        delGroup.addEventListener("click", () => {
+            node.properties.required_tool_groups.splice(gIdx, 1);
+            _renderToolGroupsList(body, node);
+            _canvas.setDirty(true, true);
+            setSaveStatus("Unsaved changes");
+        });
+        header.appendChild(title);
+        header.appendChild(delGroup);
+        row.appendChild(header);
+
+        // Tool chips
+        const chips = document.createElement("div");
+        chips.className = "pe-tool-chips";
+        if (group.length === 0) {
+            const empty = document.createElement("span");
+            empty.className = "pe-field-hint";
+            empty.style.padding = "2px 0";
+            empty.textContent = "No tools yet — add one below";
+            chips.appendChild(empty);
+        } else {
+            group.forEach((toolName, tIdx) => {
+                const chip = document.createElement("span");
+                chip.className = "pe-tool-chip";
+                chip.textContent = toolName;
+
+                const chipDel = document.createElement("button");
+                chipDel.className = "pe-tool-chip-del";
+                chipDel.textContent = "×";
+                chipDel.title = `Remove ${toolName}`;
+                chipDel.addEventListener("click", () => {
+                    node.properties.required_tool_groups[gIdx].splice(tIdx, 1);
+                    _renderToolGroupsList(body, node);
+                    _canvas.setDirty(true, true);
+                    setSaveStatus("Unsaved changes");
+                });
+                chip.appendChild(chipDel);
+                chips.appendChild(chip);
+            });
+        }
+        row.appendChild(chips);
+
+        // Add-tool row: dropdown + button
+        const addRow = document.createElement("div");
+        addRow.className = "pe-tool-group-add-row";
+
+        const sel = document.createElement("select");
+        sel.className = "pe-input pe-select";
+        sel.style.flex = "1";
+        sel.style.fontSize = "11px";
+
+        const blankOpt = document.createElement("option");
+        blankOpt.value = "";
+        blankOpt.textContent = "— add tool —";
+        sel.appendChild(blankOpt);
+
+        Object.entries(_trackableTools.categories || {}).forEach(([catName, tools]) => {
+            const og = document.createElement("optgroup");
+            og.label = catName;
+            tools.forEach(t => {
+                const opt = document.createElement("option");
+                opt.value = t;
+                opt.textContent = t;
+                if (group.includes(t)) opt.disabled = true;
+                og.appendChild(opt);
+            });
+            sel.appendChild(og);
+        });
+
+        const addBtn = document.createElement("button");
+        addBtn.className = "pe-btn pe-btn-xs pe-btn-secondary";
+        addBtn.textContent = "+ Add";
+        addBtn.addEventListener("click", () => {
+            const tool = sel.value;
+            if (!tool) return;
+            if (!node.properties.required_tool_groups[gIdx].includes(tool)) {
+                node.properties.required_tool_groups[gIdx].push(tool);
+                _renderToolGroupsList(body, node);
+                _canvas.setDirty(true, true);
+                setSaveStatus("Unsaved changes");
+            }
+        });
+
+        addRow.appendChild(sel);
+        addRow.appendChild(addBtn);
+        row.appendChild(addRow);
+        list.appendChild(row);
+    });
+}
+
+function _setupToolGroupsPanel(body, node) {
+    if (!Array.isArray(node.properties.required_tool_groups)) {
+        node.properties.required_tool_groups = [];
+    }
+    _renderToolGroupsList(body, node);
+
+    const addGroupBtn = body.querySelector("#pf-add-tool-group");
+    if (!addGroupBtn) return;
+    addGroupBtn.addEventListener("click", () => {
+        node.properties.required_tool_groups.push([]);
+        _renderToolGroupsList(body, node);
+        _canvas.setDirty(true, true);
+        setSaveStatus("Unsaved changes");
     });
 }
 
@@ -1483,11 +1620,16 @@ document.addEventListener("DOMContentLoaded", async function () {
     // Wire up events
     setupEvents();
 
-    // Load agent types
+    // Load agent types and trackable tools
     try {
         _agentTypes = await apiGet("/pipelines/agent-types");
     } catch (_) {
         _agentTypes = [];
+    }
+    try {
+        _trackableTools = await apiGet("/pipelines/trackable-tools");
+    } catch (_) {
+        _trackableTools = { categories: {}, all: [] };
     }
 
     // Load template or start empty

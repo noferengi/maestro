@@ -1597,7 +1597,7 @@ async function _buildStageJournal(taskId) {
     const task = taskData[taskId];
     const body = document.getElementById('sj-body');
     try {
-        const [summaryResp, planResp, compResp, optResp, secResp, frResp, mrResp, diffResp, rjResp, txnResp, docsResp] = await Promise.all([
+        const [summaryResp, planResp, compResp, optResp, secResp, frResp, mrResp, diffResp, rjResp, txnResp, docsResp, mathResp] = await Promise.all([
             fetch(`/api/tasks/${taskId}/stage-summary`),
             fetch(`/api/tasks/${taskId}/planning-result`),
             fetch(`/api/tasks/${taskId}/component-status`),
@@ -1609,6 +1609,7 @@ async function _buildStageJournal(taskId) {
             fetch(`/api/tasks/${taskId}/research-jobs`),
             fetch(`/api/tasks/${taskId}/transition-status`),
             fetch(`/api/tasks/${taskId}/documents`),
+            fetch(`/api/tasks/${taskId}/math-status`),
         ]);
 
         const summary  = summaryResp.ok  ? await summaryResp.json()  : null;
@@ -1622,6 +1623,7 @@ async function _buildStageJournal(taskId) {
         const rjList   = rjResp.ok       ? await rjResp.json()       : [];
         const txn      = txnResp.ok      ? await txnResp.json()      : null;
         const docsList = docsResp.ok     ? await docsResp.json()     : [];
+        const mathData = mathResp && mathResp.ok ? await mathResp.json() : null;
 
         let html = '';
 
@@ -1667,6 +1669,141 @@ async function _buildStageJournal(taskId) {
                 html += `</div>`;
             }
             html += '</div>';
+        }
+
+        // ---- Math Pipeline section ----
+        if (mathData && mathData.is_math_pipeline && mathData.stage_history && mathData.stage_history.length > 0) {
+            const MATH_LABELS = {
+                LITERATURE_SURVEY: 'Literature Survey',
+                PROBLEM_FORMALIZATION: 'Problem Formalization',
+                CALIBRATION: 'Calibration',
+                COMPUTATIONAL_EXPLORATION: 'Computational Exploration',
+                HYPOTHESIS_GENERATION: 'Hypothesis Generation',
+                PROOF_STRATEGY: 'Proof Strategy',
+                PROOF_ATTEMPT: 'Proof Attempt',
+                REFLECTION: 'Reflection',
+                FORMAL_VERIFICATION: 'Formal Verification',
+                WRITEUP: 'Writeup',
+            };
+
+            // Determine overall pipeline outcome from last stage
+            const lastStage = mathData.stage_history[mathData.stage_history.length - 1];
+            const allPassed = mathData.stage_history.every(s => s.last_exit_reason === 'pass');
+            const overallBadge = allPassed
+                ? '<span class="sj-badge ok">all stages passed</span>'
+                : '<span class="sj-badge info">in progress</span>';
+
+            html += `<div class="sj-section">
+                <div class="sj-section-title">&#129518; Math Pipeline ${overallBadge}</div>
+                <table class="sj-table sj-math-table">
+                    <thead><tr><th>Stage</th><th>Result</th><th>Cycles</th><th>Started</th><th>Duration</th></tr></thead>
+                    <tbody>`;
+
+            for (const s of mathData.stage_history) {
+                const label = MATH_LABELS[s.stage_key] || s.stage_key;
+                const passed = s.last_exit_reason === 'pass';
+                const running = !s.last_exit_reason || s.last_exit_reason === null;
+                const resultCls = passed ? 'status-done' : running ? '' : 'status-failed';
+                const resultTxt = s.last_exit_reason || '…';
+                const retryNote = s.error_count > 0
+                    ? `<span style="color:#6c757d;font-size:0.7rem;margin-left:0.4rem">(${s.error_count} error${s.error_count > 1 ? 's' : ''} before pass)</span>`
+                    : '';
+                const cyclesTxt = s.total_cycles === 1 ? '1' : `${s.total_cycles}`;
+
+                let durTxt = '—';
+                if (s.first_started_at && s.last_ended_at) {
+                    const ms = new Date(s.last_ended_at) - new Date(s.first_started_at);
+                    if (ms >= 3600000) durTxt = `${(ms/3600000).toFixed(1)}h`;
+                    else if (ms >= 60000) durTxt = `${Math.round(ms/60000)}m`;
+                    else durTxt = `${Math.round(ms/1000)}s`;
+                }
+
+                const startedTxt = s.first_started_at
+                    ? new Date(s.first_started_at).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})
+                    : '—';
+
+                html += `<tr>
+                    <td><strong>${escHtml(label)}</strong></td>
+                    <td class="${resultCls}">${escHtml(resultTxt)}${retryNote}</td>
+                    <td>${escHtml(cyclesTxt)}</td>
+                    <td style="color:#6c757d;font-size:0.78rem">${escHtml(startedTxt)}</td>
+                    <td style="color:#6c757d;font-size:0.78rem">${escHtml(durTxt)}</td>
+                </tr>`;
+            }
+
+            html += '</tbody></table>';
+
+            // ---- Lean4 Source & Output (if stored from FORMAL_VERIFICATION) ----
+            if (mathData.lean4_source || mathData.lean4_output) {
+                const fvStage = mathData.stage_history.find(s => s.stage_key === 'FORMAL_VERIFICATION');
+                const fvPassed = fvStage && fvStage.last_exit_reason === 'pass';
+                const fvBadge = fvPassed
+                    ? '<span class="sj-badge ok">&#10003; compiled</span>'
+                    : '<span class="sj-badge warn">&#10007; failed</span>';
+
+                html += `<div style="margin-top:0.8rem">
+                    <div style="font-size:0.75rem;font-weight:700;color:#6c757d;margin-bottom:0.4rem">
+                        &#9671; Lean4 Formal Verification ${fvBadge}
+                    </div>`;
+
+                if (mathData.lean4_source) {
+                    html += `<details class="sj-doc-item" open>
+                        <summary class="sj-doc-key">&#128196; Lean4 source (.lean)</summary>
+                        <pre class="sj-doc-content sj-lean4-source">${escHtml(mathData.lean4_source)}</pre>
+                    </details>`;
+                }
+                if (mathData.lean4_output) {
+                    const hasError = mathData.lean4_output.toLowerCase().includes('error');
+                    html += `<details class="sj-doc-item">
+                        <summary class="sj-doc-key" style="${hasError?'color:#dc3545':''}">
+                            &#128196; Compiler output${hasError ? ' — errors found' : ' — clean'}
+                        </summary>
+                        <pre class="sj-doc-content sj-lean4-output">${escHtml(mathData.lean4_output)}</pre>
+                    </details>`;
+                }
+                html += '</div>';
+            }
+
+            html += '</div>';
+
+            // ---- Reflection Report (extracted from doc store for prominence) ----
+            const reflDoc = docsList.find(d => d.key && d.key.startsWith('reflection:'));
+            if (reflDoc && reflDoc.content) {
+                let reflData = null;
+                try { reflData = JSON.parse(reflDoc.content); } catch(e) {}
+                if (reflData) {
+                    const conf = reflData.confidence != null ? Math.round(reflData.confidence * 100) : null;
+                    const confStr = conf != null ? `${conf}%` : '';
+                    const confCls = conf != null ? (conf >= 80 ? 'ok' : conf >= 50 ? 'info' : 'warn') : 'muted';
+                    const issues = reflData.issues || [];
+                    const blocking = issues.filter(i => i.severity === 'blocking');
+                    const warnings = issues.filter(i => i.severity === 'warning');
+                    const notes = issues.filter(i => i.severity === 'note');
+
+                    html += `<div class="sj-section">
+                        <div class="sj-section-title">&#129504; Reflection Report
+                            ${confStr ? `<span class="sj-badge ${confCls}">confidence ${escHtml(confStr)}</span>` : ''}
+                            ${blocking.length ? `<span class="sj-badge warn">${blocking.length} blocking</span>` : ''}
+                        </div>`;
+
+                    if (blocking.length || warnings.length || notes.length) {
+                        for (const issue of issues) {
+                            const sevCls = issue.severity === 'blocking' ? '#dc3545' : issue.severity === 'warning' ? '#fd7e14' : '#6c757d';
+                            html += `<div class="sj-check-row">
+                                <span class="sj-check-icon" style="color:${sevCls};font-size:0.75rem;min-width:5rem;font-weight:700;text-transform:uppercase">${escHtml(issue.severity)}</span>
+                                <div class="sj-check-detail">${escHtml(issue.finding || '')}</div>
+                            </div>`;
+                        }
+                    } else {
+                        html += `<div style="color:#198754;font-size:0.85rem">No issues found.</div>`;
+                    }
+
+                    if (reflData.uncertain_about && reflData.uncertain_about.length) {
+                        html += `<div style="font-size:0.75rem;color:#6c757d;margin-top:0.5rem"><em>Uncertain about:</em> ${escHtml(reflData.uncertain_about.join('; '))}</div>`;
+                    }
+                    html += '</div>';
+                }
+            }
         }
 
         // ---- Planning section ----
@@ -1922,9 +2059,13 @@ async function _buildStageJournal(taskId) {
         }
 
         // ---- Stage Outputs section (task.content output_keys) ----
+        // For math pipelines, lean4_source and lean4_output are shown in the Math
+        // Pipeline section above — exclude them here to avoid duplication.
+        const _mathShownKeys = (mathData && mathData.is_math_pipeline)
+            ? new Set(['lean4_source', 'lean4_output']) : new Set();
         const content = task && task.content;
         if (content && typeof content === 'object' && !Array.isArray(content)) {
-            const keys = Object.keys(content).filter(k => !k.startsWith('_'));
+            const keys = Object.keys(content).filter(k => !k.startsWith('_') && !_mathShownKeys.has(k));
             if (keys.length > 0) {
                 html += `<details class="sj-section sj-outputs-details">
                     <summary class="sj-section-title">&#128216; Stage Outputs (${keys.length})</summary>`;
@@ -1941,10 +2082,16 @@ async function _buildStageJournal(taskId) {
         }
 
         // ---- Documents section (project doc store) ----
-        if (docsList && docsList.length > 0) {
+        // For math pipelines, reflection documents are shown in the Math Pipeline
+        // section above — exclude them here to avoid duplication.
+        const _mathShownDocs = (mathData && mathData.is_math_pipeline)
+            ? new Set(docsList.filter(d => d.key && d.key.startsWith('reflection:')).map(d => d.key))
+            : new Set();
+        const _visibleDocs = docsList.filter(d => !_mathShownDocs.has(d.key));
+        if (_visibleDocs.length > 0) {
             html += `<details class="sj-section sj-outputs-details">
-                <summary class="sj-section-title">&#128196; Documents (${docsList.length})</summary>`;
-            for (const doc of docsList) {
+                <summary class="sj-section-title">&#128196; Documents (${_visibleDocs.length})</summary>`;
+            for (const doc of _visibleDocs) {
                 const tags = (doc.tags || []).map(t =>
                     `<span class="sj-badge muted" style="margin-left:0.3rem;font-size:0.65rem">${escHtml(t)}</span>`
                 ).join('');
@@ -4182,6 +4329,7 @@ function createTaskCard(id, title, tags, owner, status) {
             <span class="toolbar-sep"></span>
             <button class="toolbar-btn" title="Run Agent — start MaestroLoop" onclick="event.stopPropagation();runAgentFromToolbar('${id}')">▶</button>
             <button class="toolbar-btn" title="Stop Agent — request graceful halt" onclick="event.stopPropagation();toolbarStopAgent('${id}')">⏹</button>
+            <button class="toolbar-btn toolbar-btn-peek" title="Peek — watch live LLM output" onclick="event.stopPropagation();openLivePeek('${id}')">&#128065;</button>
             <!-- Stage management demoted to overflow menu -->
             <span class="toolbar-sep"></span>
             <button class="toolbar-btn" title="Open in Diagnostics" onclick="event.stopPropagation();toolbarOpenDiagnostics('${id}')">📊</button>
@@ -9205,5 +9353,263 @@ async function triggerTrainingExport() {
     } finally {
         btn.disabled = false;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Live Stream Peek Drawer
+// ---------------------------------------------------------------------------
+// A slide-in panel that subscribes to /api/tasks/{id}/live and renders tokens
+// as they arrive from the LLM.  Only one drawer is open at a time.
+
+let _peekTaskId = null;       // task id currently peeked
+let _peekSource = null;       // active EventSource
+let _peekSeq = 0;             // last seq received (for reconnect)
+let _peekAgentName = '';
+let _peekAutoScroll = true;
+
+function openLivePeek(taskId) {
+    const task = taskData[taskId];
+    const title = task ? escapeHtml(task.title || taskId) : escapeHtml(taskId);
+
+    // Create drawer if it doesn't exist
+    let drawer = document.getElementById('live-peek-drawer');
+    if (!drawer) {
+        drawer = document.createElement('div');
+        drawer.id = 'live-peek-drawer';
+        drawer.className = 'live-peek-drawer';
+        drawer.innerHTML = `
+            <div class="lp-header">
+                <span class="lp-pulse" id="lp-pulse"></span>
+                <span class="lp-title" id="lp-title">Live Stream</span>
+                <span class="lp-agent" id="lp-agent"></span>
+                <div class="lp-header-btns">
+                    <button class="lp-btn" title="Clear output" onclick="_peekClear()">&#10005; Clear</button>
+                    <button class="lp-btn" title="Close" onclick="closeLivePeek()">&#10005;</button>
+                </div>
+            </div>
+            <div class="lp-output" id="lp-output">
+                <div class="lp-waiting" id="lp-waiting">Connecting to live stream…</div>
+            </div>
+            <div class="lp-footer">
+                <label class="lp-autoscroll-label">
+                    <input type="checkbox" id="lp-autoscroll" checked onchange="_peekAutoScrollToggle(this)">
+                    Auto-scroll
+                </label>
+                <span class="lp-seq" id="lp-seq"></span>
+            </div>
+        `;
+        document.body.appendChild(drawer);
+
+        // Pause auto-scroll on manual scroll up
+        document.getElementById('lp-output').addEventListener('scroll', _peekCheckScroll);
+    }
+
+    // Switch task if already open
+    if (_peekTaskId !== taskId) {
+        _peekCloseSse();
+        _peekTaskId = taskId;
+        _peekSeq = 0;
+        _peekAutoScroll = true;
+        document.getElementById('lp-autoscroll').checked = true;
+        document.getElementById('lp-output').innerHTML =
+            `<div class="lp-waiting" id="lp-waiting">Connecting to live stream…</div>`;
+    }
+
+    document.getElementById('lp-title').textContent = title;
+    drawer.classList.add('open');
+    _peekConnect();
+}
+
+function closeLivePeek() {
+    _peekCloseSse();
+    const drawer = document.getElementById('live-peek-drawer');
+    if (drawer) drawer.classList.remove('open');
+    _peekTaskId = null;
+}
+
+function _peekClear() {
+    const out = document.getElementById('lp-output');
+    if (out) out.innerHTML = `<div class="lp-waiting">Stream cleared.</div>`;
+}
+
+function _peekAutoScrollToggle(cb) {
+    _peekAutoScroll = cb.checked;
+}
+
+function _peekCheckScroll() {
+    const out = document.getElementById('lp-output');
+    if (!out) return;
+    const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
+    _peekAutoScroll = atBottom;
+    const cb = document.getElementById('lp-autoscroll');
+    if (cb) cb.checked = atBottom;
+}
+
+function _peekCloseSse() {
+    if (_peekSource) {
+        _peekSource.close();
+        _peekSource = null;
+    }
+}
+
+function _peekConnect() {
+    if (!_peekTaskId) return;
+    _peekCloseSse();
+
+    const url = `${API_BASE}/tasks/${_peekTaskId}/live?since=${_peekSeq}`;
+    const es = new EventSource(url);
+    _peekSource = es;
+
+    const pulse = document.getElementById('lp-pulse');
+
+    es.addEventListener('token', e => {
+        const data = JSON.parse(e.data);
+        _peekSeq = data.seq;
+
+        // Update agent label if changed
+        if (data.agent_name && data.agent_name !== _peekAgentName) {
+            _peekAgentName = data.agent_name;
+            const agentEl = document.getElementById('lp-agent');
+            if (agentEl) agentEl.textContent = data.agent_name;
+        }
+        if (pulse) pulse.classList.add('active');
+
+        _peekAppendToken(data);
+        _peekScrollDown();
+        _peekUpdateSeq();
+    });
+
+    es.addEventListener('status', e => {
+        let data;
+        try { data = JSON.parse(e.data); } catch { return; }
+        if (pulse) pulse.classList.toggle('active', data.active);
+        if (!data.active) {
+            const agentEl = document.getElementById('lp-agent');
+            if (agentEl && _peekAgentName) agentEl.textContent = _peekAgentName + ' (idle)';
+        }
+    });
+
+    es.addEventListener('done', () => {
+        if (pulse) pulse.classList.remove('active');
+        _peekAppendSeparator('Stream complete');
+        _peekScrollDown();
+        _peekCloseSse();
+    });
+
+    es.onerror = () => {
+        // Browser will auto-reconnect on EventSource error; just update indicator
+        if (pulse) pulse.classList.remove('active');
+    };
+}
+
+function _peekAppendToken(data) {
+    const out = document.getElementById('lp-output');
+    if (!out) return;
+
+    // Remove placeholder
+    const waiting = document.getElementById('lp-waiting');
+    if (waiting) waiting.remove();
+
+    if (data.turn_type === 'tool_invoked') {
+        let tools;
+        try { tools = JSON.parse(data.text); } catch { tools = [{name: String(data.text), args: ''}]; }
+        // Normalise old format (array of strings) to new format (array of {name, args})
+        if (tools.length > 0 && typeof tools[0] === 'string') {
+            tools = tools.map(n => ({name: n, args: ''}));
+        }
+        const sep = document.createElement('div');
+        sep.className = 'lp-tool-sep';
+        tools.forEach(tool => {
+            const item = document.createElement('div');
+            item.className = 'lp-tool-item';
+            let argsObj = null;
+            try { if (tool.args) argsObj = JSON.parse(tool.args); } catch {}
+            const hasArgs = argsObj && Object.keys(argsObj).length > 0;
+            // One-line preview: first 2 key=val pairs
+            let previewStr = '';
+            if (hasArgs) {
+                const entries = Object.entries(argsObj);
+                const parts = entries.slice(0, 2).map(([k, v]) => {
+                    const vs = typeof v === 'string'
+                        ? '"' + (v.length > 42 ? v.slice(0, 42) + '…' : v) + '"'
+                        : String(v).slice(0, 42);
+                    return k + '=' + vs;
+                });
+                previewStr = '(' + parts.join(', ') + (entries.length > 2 ? ', …' : '') + ')';
+            }
+            const toggleEl = document.createElement('span');
+            toggleEl.className = 'lp-tool-toggle' + (hasArgs ? '' : ' lp-tool-toggle-empty');
+            toggleEl.textContent = '▶';
+            if (hasArgs) toggleEl.onclick = () => _lpToggleTool(toggleEl);
+            const nameEl = document.createElement('span');
+            nameEl.textContent = '➤ ' + tool.name;
+            const previewEl = document.createElement('span');
+            previewEl.className = 'lp-tool-preview';
+            previewEl.textContent = previewStr;
+            item.appendChild(toggleEl);
+            item.appendChild(nameEl);
+            item.appendChild(previewEl);
+            if (hasArgs) {
+                const argsEl = document.createElement('div');
+                argsEl.className = 'lp-tool-args';
+                const pre = document.createElement('pre');
+                pre.textContent = JSON.stringify(argsObj, null, 2);
+                argsEl.appendChild(pre);
+                item.appendChild(argsEl);
+            }
+            sep.appendChild(item);
+        });
+        out.appendChild(sep);
+        return;
+    }
+
+    if (data.turn_type === 'turn_end') {
+        const sep = document.createElement('div');
+        sep.className = 'lp-turn-sep';
+        out.appendChild(sep);
+        return;
+    }
+
+    // content token — append to last text node or create new
+    let last = out.lastElementChild;
+    if (!last || !last.classList.contains('lp-text-block')) {
+        last = document.createElement('div');
+        last.className = 'lp-text-block';
+        out.appendChild(last);
+    }
+    // Preserve newlines; escape HTML in the raw token
+    const escaped = data.text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    last.innerHTML += escaped.replace(/\n/g, '<br>');
+}
+
+function _lpToggleTool(toggleEl) {
+    const item = toggleEl.closest('.lp-tool-item');
+    const argsEl = item && item.querySelector('.lp-tool-args');
+    if (!argsEl) return;
+    const open = argsEl.classList.toggle('open');
+    toggleEl.textContent = open ? '▼' : '▶';
+}
+
+function _peekAppendSeparator(label) {
+    const out = document.getElementById('lp-output');
+    if (!out) return;
+    const sep = document.createElement('div');
+    sep.className = 'lp-done-sep';
+    sep.textContent = label;
+    out.appendChild(sep);
+}
+
+function _peekScrollDown() {
+    if (!_peekAutoScroll) return;
+    const out = document.getElementById('lp-output');
+    if (out) out.scrollTop = out.scrollHeight;
+}
+
+function _peekUpdateSeq() {
+    const el = document.getElementById('lp-seq');
+    if (el) el.textContent = `seq ${_peekSeq}`;
 }
 

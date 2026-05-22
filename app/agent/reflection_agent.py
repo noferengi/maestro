@@ -94,7 +94,7 @@ def _build_context_message(
         content = task.content if isinstance(task.content, dict) else {}
         for key in ("final_output", "output", "result", "code"):
             if key in content:
-                val = str(content[key])[:4000]
+                val = str(content[key])
                 lines.append(f"\n== Prior Stage Output ({key}) ==\n{val}")
                 break
 
@@ -110,7 +110,7 @@ def _build_context_message(
             if prior:
                 lines.append(f"\n== Prior Reflection Reports ({len(prior)}) ==")
                 for d in prior:
-                    lines.append(f"[{d['key']}]\n{d.get('content', '')[:2000]}")
+                    lines.append(f"[{d['key']}]\n{d.get('content', '')}")
     except Exception as exc:
         logger.debug("ReflectionAgent: could not load prior reflections: %s", exc)
 

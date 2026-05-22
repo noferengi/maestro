@@ -468,6 +468,19 @@ def _run_generic_stage(
         budget_id=budget_id,
         scheduler_reason="scheduler",
     )
+    if project_path:
+        from app.agent.tools import set_task_git_cwd
+        set_task_git_cwd(project_path, task_id=task_id)
+
+    # Set _task_project_name so document store tools (list_documents, get_document,
+    # store_document) can resolve the project_id from context.  Without this every
+    # generic:* agent gets "No project context" from all doc-store tool calls.
+    from app.database import get_task as _get_task_for_ctx
+    from app.agent.tools import _task_project_name
+    _ctx_task = _get_task_for_ctx(task_id)
+    if _ctx_task and _ctx_task.project:
+        _task_project_name.set(_ctx_task.project)
+
     exit_reason = "error"
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
