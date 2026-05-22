@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kanban Board - TheMaestro</title>
-    <link rel="stylesheet" href="/static/style.css?v=46">
+    <link rel="stylesheet" href="/static/style.css?v=48">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
@@ -16,7 +16,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markup.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-css.min.js"></script>
-    <script src="/static/kanban.js?v=75"></script>
+    <script src="/static/kanban.js?v=77"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -334,6 +334,13 @@
                 <div class="form-group">
                     <label class="form-label" for="edit-project-description">Description</label>
                     <textarea class="form-textarea" id="edit-project-description" rows="2" placeholder="Optional description..."></textarea>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" style="display:flex;align-items:center;gap:0.5rem;cursor:pointer">
+                        <input type="checkbox" id="edit-project-enabled" checked>
+                        Project Enabled
+                    </label>
+                    <div style="font-size:0.78rem;color:#6c757d;margin-top:0.25rem">When unchecked, the scheduler skips all tasks in this project — no new agent work will start until re-enabled.</div>
                 </div>
                 <div class="ep-section-divider">Autopilot</div>
                 <div class="form-group">

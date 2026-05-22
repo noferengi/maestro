@@ -1597,7 +1597,7 @@ async function _buildStageJournal(taskId) {
     const task = taskData[taskId];
     const body = document.getElementById('sj-body');
     try {
-        const [summaryResp, planResp, compResp, optResp, secResp, frResp, mrResp, diffResp, rjResp, txnResp] = await Promise.all([
+        const [summaryResp, planResp, compResp, optResp, secResp, frResp, mrResp, diffResp, rjResp, txnResp, docsResp] = await Promise.all([
             fetch(`/api/tasks/${taskId}/stage-summary`),
             fetch(`/api/tasks/${taskId}/planning-result`),
             fetch(`/api/tasks/${taskId}/component-status`),
@@ -1608,6 +1608,7 @@ async function _buildStageJournal(taskId) {
             fetch(`/api/tasks/${taskId}/diff`),
             fetch(`/api/tasks/${taskId}/research-jobs`),
             fetch(`/api/tasks/${taskId}/transition-status`),
+            fetch(`/api/tasks/${taskId}/documents`),
         ]);
 
         const summary  = summaryResp.ok  ? await summaryResp.json()  : null;
@@ -1620,6 +1621,7 @@ async function _buildStageJournal(taskId) {
         const diffData = diffResp.ok     ? await diffResp.json()     : null;
         const rjList   = rjResp.ok       ? await rjResp.json()       : [];
         const txn      = txnResp.ok      ? await txnResp.json()      : null;
+        const docsList = docsResp.ok     ? await docsResp.json()     : [];
 
         let html = '';
 
@@ -1915,6 +1917,45 @@ async function _buildStageJournal(taskId) {
                 html += `<div class="sj-rj-empty">No research jobs recorded for this task.</div>`;
             } else {
                 for (const j of rjList) { html += _renderResearchJobCard(j); }
+            }
+            html += '</details>';
+        }
+
+        // ---- Stage Outputs section (task.content output_keys) ----
+        const content = task && task.content;
+        if (content && typeof content === 'object' && !Array.isArray(content)) {
+            const keys = Object.keys(content).filter(k => !k.startsWith('_'));
+            if (keys.length > 0) {
+                html += `<details class="sj-section sj-outputs-details">
+                    <summary class="sj-section-title">&#128216; Stage Outputs (${keys.length})</summary>`;
+                for (const k of keys) {
+                    const val = content[k];
+                    const valStr = typeof val === 'string' ? val : JSON.stringify(val, null, 2);
+                    html += `<details class="sj-doc-item">
+                        <summary class="sj-doc-key">${escHtml(k)}</summary>
+                        <pre class="sj-doc-content">${escHtml(valStr)}</pre>
+                    </details>`;
+                }
+                html += '</details>';
+            }
+        }
+
+        // ---- Documents section (project doc store) ----
+        if (docsList && docsList.length > 0) {
+            html += `<details class="sj-section sj-outputs-details">
+                <summary class="sj-section-title">&#128196; Documents (${docsList.length})</summary>`;
+            for (const doc of docsList) {
+                const tags = (doc.tags || []).map(t =>
+                    `<span class="sj-badge muted" style="margin-left:0.3rem;font-size:0.65rem">${escHtml(t)}</span>`
+                ).join('');
+                let display = doc.content || '';
+                if (display.trimStart().startsWith('{') || display.trimStart().startsWith('[')) {
+                    try { display = JSON.stringify(JSON.parse(display), null, 2); } catch(e) {}
+                }
+                html += `<details class="sj-doc-item">
+                    <summary class="sj-doc-key">${escHtml(doc.key || '')}${tags}</summary>
+                    <pre class="sj-doc-content">${escHtml(display)}</pre>
+                </details>`;
             }
             html += '</details>';
         }
@@ -2550,7 +2591,7 @@ async function loadProjects() {
         container.innerHTML = '';
 
         projects.forEach(p => {
-            container.appendChild(_buildProjectTab(p.name, p.path, p.description, p.llm_id, p.budget_id, p.autopilot_budget_id, p.autopilot_max_in_flight, p.exclude_from_training));
+            container.appendChild(_buildProjectTab(p.name, p.path, p.description, p.llm_id, p.budget_id, p.autopilot_budget_id, p.autopilot_max_in_flight, p.exclude_from_training, p.enabled !== false));
         });
 
         // If no project is selected yet, pick the first one
@@ -2566,15 +2607,18 @@ async function loadProjects() {
     }
 }
 
-function _buildProjectTab(name, path, description, llmId, budgetId, autopilotBudgetId, autopilotMaxInFlight, excludeFromTraining) {
+function _buildProjectTab(name, path, description, llmId, budgetId, autopilotBudgetId, autopilotMaxInFlight, excludeFromTraining, enabled = true) {
     const tab = document.createElement('div');
     tab.className = 'project-tab';
+    if (!enabled) tab.classList.add('project-tab--disabled');
     tab.setAttribute('data-project', name);
 
     const label = document.createElement('span');
     label.className = 'project-tab-label';
     label.textContent = `📁 ${name}`;
-    label.title = path ? `Path: ${path}` : 'No path configured';
+    const titleParts = [path ? `Path: ${path}` : 'No path configured'];
+    if (!enabled) titleParts.push('(disabled — scheduler paused)');
+    label.title = titleParts.join(' · ');
     label.addEventListener('click', () => switchProject(name));
 
     const gear = document.createElement('button');
@@ -2583,7 +2627,7 @@ function _buildProjectTab(name, path, description, llmId, budgetId, autopilotBud
     gear.title = 'Edit project settings';
     gear.addEventListener('click', (e) => {
         e.stopPropagation();
-        openEditProjectModal(name, path || '', description || '', llmId || null, budgetId || null, autopilotBudgetId || null, autopilotMaxInFlight != null ? autopilotMaxInFlight : 10, excludeFromTraining || false);
+        openEditProjectModal(name, path || '', description || '', llmId || null, budgetId || null, autopilotBudgetId || null, autopilotMaxInFlight != null ? autopilotMaxInFlight : 10, excludeFromTraining || false, enabled !== false);
     });
 
     tab.appendChild(label);
@@ -2820,7 +2864,7 @@ async function saveNewProject() {
     }
 }
 
-function openEditProjectModal(name, path, description, llmId, budgetId, autopilotBudgetId, autopilotMaxInFlight, excludeFromTraining) {
+function openEditProjectModal(name, path, description, llmId, budgetId, autopilotBudgetId, autopilotMaxInFlight, excludeFromTraining, enabled = true) {
     document.getElementById('edit-project-original-name').value = name;
     document.getElementById('edit-project-modal-title').textContent = `Edit: ${name}`;
     document.getElementById('edit-project-name-input').value = name;
@@ -2834,6 +2878,7 @@ function openEditProjectModal(name, path, description, llmId, budgetId, autopilo
     populateProjectBudgetSelect('edit-project-autopilot-budget-select', autopilotBudgetId || null);
     document.getElementById('edit-project-max-in-flight').value = autopilotMaxInFlight != null ? autopilotMaxInFlight : 10;
     document.getElementById('edit-project-exclude-training').checked = excludeFromTraining === true;
+    document.getElementById('edit-project-enabled').checked = enabled !== false;
     epCancelObjectiveForm();
     epLoadObjectives(name);
     loadProjectRouting(name);
@@ -2860,6 +2905,7 @@ async function saveEditProject() {
     const maxInFlightVal = document.getElementById('edit-project-max-in-flight').value;
     const autopilot_max_in_flight = maxInFlightVal ? parseInt(maxInFlightVal, 10) : 10;
     const exclude_from_training = document.getElementById('edit-project-exclude-training').checked;
+    const enabled = document.getElementById('edit-project-enabled').checked;
     const create_if_missing = document.getElementById('edit-project-create-path').checked;
     const errEl = document.getElementById('edit-project-error');
     const warnEl = document.getElementById('edit-project-path-warn');
@@ -2874,7 +2920,7 @@ async function saveEditProject() {
         const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(originalName)}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: newName, path, description, llm_id, budget_id, autopilot_budget_id, autopilot_max_in_flight, exclude_from_training, create_if_missing }),
+            body: JSON.stringify({ name: newName, path, description, llm_id, budget_id, autopilot_budget_id, autopilot_max_in_flight, exclude_from_training, enabled, create_if_missing }),
         });
         if (!resp.ok) {
             const err = await resp.json().catch(() => ({}));

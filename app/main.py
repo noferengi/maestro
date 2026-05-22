@@ -2580,6 +2580,9 @@ def get_task_diff(task_id: str, max_bytes: int = 65536):
     base_ref = None
     head_ref = None
 
+    TERMINAL_STAGE_KEYS = frozenset({"accepted", "resolved", "wontfix", "published", "completed"})
+    task_stage_key = getattr(task, "stage_key", None) or task.type
+
     if branch_exists:
         # Branch still exists — diff it against base
         method = "branch"
@@ -2597,7 +2600,23 @@ def get_task_diff(task_id: str, max_bytes: int = 65536):
         head_ref = merge_sha
         rc, diff_text, err = _run("git", "diff", f"{merge_sha}^1", merge_sha)
         rc2, stat_text, _ = _run("git", "diff", "--stat", f"{merge_sha}^1", merge_sha)
-    else:
+
+    # Terminal-stage fallback: search all branches for commits mentioning this task ID.
+    # --fixed-strings prevents the dot in task IDs like "task-123.456" being treated as
+    # a regex wildcard.
+    if not diff_text.strip() and task_stage_key in TERMINAL_STAGE_KEYS and not merge_sha:
+        rc_log, log_out, _ = _run(
+            "git", "log", "--all", "--fixed-strings", "--grep", task_id, "--format=%H"
+        )
+        if rc_log == 0 and log_out.strip():
+            candidate_sha = log_out.strip().splitlines()[0].strip()
+            rc_c, candidate_diff, _ = _run("git", "diff", f"{candidate_sha}^", candidate_sha)
+            if rc_c == 0 and candidate_diff.strip():
+                method = "task_commit"
+                diff_text = candidate_diff
+                _, stat_text, _ = _run("git", "diff", "--stat", f"{candidate_sha}^", candidate_sha)
+
+    if not diff_text.strip() and method is None:
         return {
             "task_id": task_id,
             "branch": branch,
@@ -3842,6 +3861,7 @@ def update_project(project_name: str, data: dict):
     if autopilot_max_in_flight is not ... and autopilot_max_in_flight is not None:
         autopilot_max_in_flight = int(autopilot_max_in_flight)
     exclude_from_training = data.get("exclude_from_training", ...)
+    enabled = data.get("enabled", ...)  # True/False or Ellipsis (don't change)
 
     project = upsert_project(
         effective_name,
@@ -3857,6 +3877,9 @@ def update_project(project_name: str, data: dict):
     )
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or update failed.")
+    if enabled is not ...:
+        from database import set_project_setting as _sps
+        _sps(project.id, "enabled", "true" if bool(enabled) else "false")
     if project.path:
         _trigger_project_prewarm(project.name, project.path, project_llm_id=project.llm_id, project_budget_id=project.budget_id)
     return _project_to_dict(project)
@@ -4985,6 +5008,21 @@ def _template_meta_to_dict(t) -> dict:
 
 # NOTE: fixed-path routes (/agent-types, /import) must appear before /{id} to avoid
 # FastAPI trying to cast the literal string as an integer.
+
+@app.get("/api/pipelines/trackable-tools")
+def get_trackable_tools():
+    """Return all tool-success-store tracked tools, organized by category."""
+    from app.agent.tool_success_store import TRACKED_TOOLS
+    categories = {
+        "Math / Formal": ["run_lean4", "run_sympy", "run_coq"],
+        "Test runners": ["run_test_pytest", "run_test_unittest", "run_test_cargo", "run_test_go", "run_test_npm"],
+        "Linters / type checkers": ["run_check_mypy", "run_check_ruff", "run_check_black"],
+        "Build": ["run_build_tsc", "run_build_cargo", "run_build_go", "run_build_npm",
+                  "run_build_make", "run_build_gradle", "run_build_mvn"],
+        "Security audit": ["run_audit_bandit", "run_audit_pip", "run_audit_semgrep", "run_audit_npm"],
+    }
+    return {"categories": categories, "all": sorted(TRACKED_TOOLS)}
+
 
 @app.get("/api/pipelines/agent-types", response_model=List[dict])
 def list_agent_types():
@@ -7656,9 +7694,20 @@ def search_project_documents(name: str, q: str, threshold: float = 0.3):
 
 @app.get("/api/tasks/{task_id}/documents", response_model=List[dict])
 def list_task_documents(task_id: str):
-    """List all documents written by a specific task (metadata only)."""
-    from database import list_documents_written_by_task
-    return list_documents_written_by_task(task_id)
+    """List all documents written by a specific task, with full content."""
+    from database import list_documents_written_by_task, get_document
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    meta_list = list_documents_written_by_task(task_id)
+    if not meta_list:
+        return []
+    project_id = task.project_id or (meta_list[0].get("project_id") if meta_list else None)
+    results = []
+    for meta in meta_list:
+        full = get_document(project_id, meta["key"]) if project_id else None
+        results.append(full if full else meta)
+    return results
 
 
 # ===========================================================================

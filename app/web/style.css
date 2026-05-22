@@ -88,6 +88,17 @@ body {
     opacity: 1 !important;
 }
 
+.project-tab--disabled {
+    opacity: 0.45;
+    filter: grayscale(0.6);
+}
+
+.project-tab--disabled .project-tab-label::after {
+    content: ' ⏸';
+    font-size: 0.75em;
+    opacity: 0.7;
+}
+
 .add-project-btn {
     margin-top: 0.5rem;
     padding: 0.5rem 0.75rem;
@@ -3077,6 +3088,40 @@ body {
     color: #6c757d;
     font-size: 0.82rem;
     padding: 0.35rem 0;
+}
+
+/* =========================================================
+   Stage Outputs / Documents sections (inside Stage Journal)
+   ========================================================= */
+
+.sj-outputs-details > summary { cursor: pointer; list-style: none; }
+.sj-outputs-details > summary::-webkit-details-marker { display: none; }
+.sj-outputs-details > summary::before { content: '▶ '; font-size: 0.7rem; color: #6c757d; }
+.sj-outputs-details[open] > summary::before { content: '▼ '; }
+
+.sj-doc-item {
+    border: 1px solid #dee2e6;
+    border-left: 3px solid #6c757d;
+    border-radius: 4px;
+    margin-bottom: 0.4rem;
+}
+.sj-doc-item > summary {
+    cursor: pointer; list-style: none; padding: 0.4rem 0.6rem;
+}
+.sj-doc-item > summary::-webkit-details-marker { display: none; }
+.sj-doc-item > summary::before { content: '▶ '; font-size: 0.65rem; color: #6c757d; }
+.sj-doc-item[open] > summary::before { content: '▼ '; }
+.sj-doc-key {
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 0.78rem; font-weight: 600;
+}
+.sj-doc-content {
+    max-height: 300px; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-word;
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 0.78rem; line-height: 1.45;
+    background: #f8f9fa; border-top: 1px solid #dee2e6;
+    padding: 0.5rem 0.7rem; margin: 0;
 }
 
 /* =========================================================
