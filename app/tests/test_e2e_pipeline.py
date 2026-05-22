@@ -20,6 +20,26 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
 # ---------------------------------------------------------------------------
+# Fixture: reset llm_client dispatch-stagger state between tests
+# ---------------------------------------------------------------------------
+# _endpoint_states is a module-level global that tracks per-endpoint stagger
+# windows (_MIN_DISPATCH_GAP = 0.5 s).  asyncio.gather fans out concurrent
+# reviewer coroutines that each claim a slot immediately; without a reset the
+# Nth reviewer sleeps (N-1) * 0.5 s for real, turning each E2E test into a
+# 1.5+ s sleep-fest even though httpx is fully mocked.
+
+@pytest.fixture(autouse=True)
+def _reset_llm_endpoint_state():
+    from app.agent import llm_client
+    llm_client._endpoint_states.clear()
+    orig_gap = llm_client._MIN_DISPATCH_GAP
+    llm_client._MIN_DISPATCH_GAP = 0.0  # no stagger in mocked tests
+    yield
+    llm_client._endpoint_states.clear()
+    llm_client._MIN_DISPATCH_GAP = orig_gap
+
+
+# ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
 
