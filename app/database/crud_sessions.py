@@ -10,16 +10,26 @@ agent exits with its exit_reason and optional summary text.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
+
+import sqlalchemy as _sa
 
 from .session import SessionLocal
 from .models import AgentSession, Task, ToolBugReport
 
 logger = logging.getLogger(__name__)
 
+_CLOSE_RETRIES = 3
+_CLOSE_RETRY_BASE_SECS = 1.0
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _ago_iso(seconds: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
 
 
 def create_agent_session(
@@ -74,33 +84,51 @@ def close_agent_session(
     """Fill ended_at and outcome fields on an existing agent session row.
 
     Safe to call with session_id=None (no-op) so callers don't need to
-    guard against create_agent_session failures.
+    guard against create_agent_session failures.  Idempotent: a second call
+    on an already-closed session returns immediately without overwriting the
+    original exit_reason.  Retries up to _CLOSE_RETRIES times on transient DB
+    errors with exponential backoff so a single hiccup doesn't silently leave
+    ended_at NULL forever.
     """
     if session_id is None:
         return
-    db = SessionLocal()
-    try:
-        row = db.query(AgentSession).filter(AgentSession.id == session_id).first()
-        if not row:
+    for attempt in range(1, _CLOSE_RETRIES + 1):
+        db = SessionLocal()
+        try:
+            row = db.query(AgentSession).filter(AgentSession.id == session_id).first()
+            if not row:
+                return
+            if row.ended_at:
+                return
+            row.ended_at = _now_iso()
+            row.exit_reason = exit_reason
+            row.exit_summary = (exit_summary or "")[:4000]
+            if turn_count is not None:
+                row.turn_count = turn_count
+            row.prompt_tokens = prompt_tokens or 0
+            row.completion_tokens = completion_tokens or 0
+            if row.task_id:
+                db.query(Task).filter(Task.id == row.task_id).update(
+                    {"last_progress_at": datetime.now(timezone.utc).replace(tzinfo=None)},
+                    synchronize_session=False,
+                )
+            db.commit()
             return
-        row.ended_at = _now_iso()
-        row.exit_reason = exit_reason
-        row.exit_summary = (exit_summary or "")[:4000]   # cap to avoid huge blobs
-        if turn_count is not None:
-            row.turn_count = turn_count
-        row.prompt_tokens = prompt_tokens or 0
-        row.completion_tokens = completion_tokens or 0
-        if row.task_id:
-            db.query(Task).filter(Task.id == row.task_id).update(
-                {"last_progress_at": datetime.now(timezone.utc).replace(tzinfo=None)},
-                synchronize_session=False,
-            )
-        db.commit()
-    except Exception as exc:
-        db.rollback()
-        logger.error("Error closing agent_session %s: %s", session_id, exc)
-    finally:
-        db.close()
+        except Exception as exc:
+            db.rollback()
+            if attempt < _CLOSE_RETRIES:
+                logger.warning(
+                    "close_agent_session %s attempt %d/%d failed: %s",
+                    session_id, attempt, _CLOSE_RETRIES, exc,
+                )
+                time.sleep(_CLOSE_RETRY_BASE_SECS * (2 ** (attempt - 1)))
+            else:
+                logger.error(
+                    "close_agent_session %s permanently failed after %d attempts: %s",
+                    session_id, _CLOSE_RETRIES, exc,
+                )
+        finally:
+            db.close()
 
 
 def close_zombie_sessions() -> int:
@@ -234,6 +262,82 @@ def close_zombie_sessions_by_session_id(exclude_ids: set[int]) -> list[str]:
     except Exception as exc:
         db.rollback()
         logger.error("Error in close_zombie_sessions_by_session_id: %s", exc)
+        return []
+    finally:
+        db.close()
+
+
+def heartbeat_sessions(session_ids: set[int]) -> None:
+    """Batch-update last_activity_at for a set of open sessions.
+
+    Called every 30 s by the scheduler heartbeat thread.  Safe to call with any
+    IDs; sessions that are already closed (ended_at IS NOT NULL) are ignored.
+    """
+    if not session_ids:
+        return
+    safe_ids = {int(i) for i in session_ids if i is not None}
+    if not safe_ids:
+        return
+    placeholders = ",".join(str(i) for i in safe_ids)
+    db = SessionLocal()
+    try:
+        db.execute(
+            _sa.text(
+                f"UPDATE agent_sessions SET last_activity_at = :now "
+                f"WHERE id IN ({placeholders}) AND ended_at IS NULL"
+            ),
+            {"now": _now_iso()},
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.debug("[sessions] heartbeat_sessions failed: %s", exc)
+    finally:
+        db.close()
+
+
+def close_stale_sessions(timeout_seconds: int = 120) -> list[str]:
+    """Close sessions whose last_activity_at is older than timeout_seconds.
+
+    These belong to crashed processes whose heartbeats stopped.
+    Returns the distinct task_ids that were closed.
+    """
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            _sa.text(
+                "SELECT id, task_id FROM agent_sessions "
+                "WHERE ended_at IS NULL "
+                "  AND last_activity_at IS NOT NULL "
+                "  AND last_activity_at < :cutoff"
+            ),
+            {"cutoff": _ago_iso(timeout_seconds)},
+        ).fetchall()
+
+        if not rows:
+            return []
+
+        close_ids = [r[0] for r in rows]
+        task_ids = list({r[1] for r in rows if r[1] is not None})
+        logger.info(
+            "[sessions] Closing %d stale session(s) (timeout=%ds): tasks=%s",
+            len(close_ids), timeout_seconds, task_ids,
+        )
+
+        placeholders = ",".join(str(i) for i in close_ids)
+        db.execute(
+            _sa.text(
+                f"UPDATE agent_sessions SET ended_at=:now, exit_reason='heartbeat_timeout', "
+                f"exit_summary='Closed: no heartbeat for {timeout_seconds}s (crashed process)' "
+                f"WHERE id IN ({placeholders})"
+            ),
+            {"now": _now_iso()},
+        )
+        db.commit()
+        return task_ids
+    except Exception as exc:
+        db.rollback()
+        logger.error("[sessions] close_stale_sessions failed: %s", exc)
         return []
     finally:
         db.close()

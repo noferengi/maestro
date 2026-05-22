@@ -709,6 +709,42 @@ def _is_project_enabled_by_name(project_name: str | None) -> bool:
 _scheduler_thread: threading.Thread | None = None
 _scheduler_stop = threading.Event()
 
+# Background thread that keeps last_activity_at fresh and sweeps stale sessions
+_session_heartbeat_thread: "threading.Thread | None" = None
+_session_heartbeat_stop = threading.Event()
+_HEARTBEAT_SESSION_INTERVAL = 30    # seconds between heartbeat writes
+_HEARTBEAT_STALE_INTERVAL   = 60    # seconds between stale-session sweeps
+_HEARTBEAT_STALE_TIMEOUT    = 120   # sessions older than this are considered crashed
+
+
+def _session_heartbeat_worker() -> None:
+    """Daemon: keep last_activity_at fresh and detect/close stale sessions."""
+    _last_stale_check = 0.0
+    while not _session_heartbeat_stop.wait(_HEARTBEAT_SESSION_INTERVAL):
+        # 1. Update last_activity_at for all currently registered sessions.
+        with _active_sessions_lock:
+            session_ids = set(_active_db_session_ids.values())
+        if session_ids:
+            try:
+                from app.database import heartbeat_sessions
+                heartbeat_sessions(session_ids)
+            except Exception:
+                logger.debug("[heartbeat] Batch heartbeat update failed.")
+
+        # 2. Periodically sweep for stale sessions (crashed-process victims).
+        now = time.time()
+        if now - _last_stale_check >= _HEARTBEAT_STALE_INTERVAL:
+            _last_stale_check = now
+            try:
+                from app.database import close_stale_sessions
+                stale = close_stale_sessions(timeout_seconds=_HEARTBEAT_STALE_TIMEOUT)
+                if stale:
+                    logger.info(
+                        "[heartbeat] Closed stale session(s) for tasks: %s", stale
+                    )
+            except Exception:
+                logger.debug("[heartbeat] Stale session sweep failed.")
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -716,7 +752,7 @@ _scheduler_stop = threading.Event()
 
 def start_scheduler() -> None:
     """Start the background scheduler thread (if enabled in config)."""
-    global _scheduler_thread
+    global _scheduler_thread, _session_heartbeat_thread
     if not SCHEDULER_ENABLED:
         logger.info("Scheduler disabled in config.")
         return
@@ -764,6 +800,15 @@ def start_scheduler() -> None:
     _scheduler_thread.start()
     logger.info("Scheduler started (tick every %.1fs).", SCHEDULER_TICK_INTERVAL)
 
+    _session_heartbeat_stop.clear()
+    _session_heartbeat_thread = threading.Thread(
+        target=_session_heartbeat_worker,
+        daemon=True,
+        name="maestro-session-heartbeat",
+    )
+    _session_heartbeat_thread.start()
+    logger.info("Session heartbeat thread started (interval %ds).", _HEARTBEAT_SESSION_INTERVAL)
+
 
 def stop_scheduler(wait_for_sessions: bool = True, timeout: float = 60.0) -> None:
     """Signal the scheduler to stop and wait for it.
@@ -780,9 +825,16 @@ def stop_scheduler(wait_for_sessions: bool = True, timeout: float = 60.0) -> Non
         immediately.  Threads blocked in non-LLM work (DB writes, git, etc.) are
         not interruptible and are logged as survivors.
     """
-    global _scheduler_thread
+    global _scheduler_thread, _session_heartbeat_thread
     if _scheduler_thread is None:
         return
+
+    # Stop the heartbeat thread first so it doesn't race with the drain below.
+    _session_heartbeat_stop.set()
+    if _session_heartbeat_thread and _session_heartbeat_thread.is_alive():
+        _session_heartbeat_thread.join(timeout=5.0)
+    _session_heartbeat_thread = None
+
     _scheduler_stop.set()
     _scheduler_thread.join(timeout=SCHEDULER_TICK_INTERVAL + 2)
     _scheduler_thread = None
@@ -839,10 +891,12 @@ def stop_scheduler(wait_for_sessions: bool = True, timeout: float = 60.0) -> Non
     # Close any DB agent_session rows that threads left open (force-killed threads
     # never reach their own finally blocks, so their ended_at stays NULL).
     try:
-        from app.database import close_zombie_sessions_for_tasks
-        closed = close_zombie_sessions_for_tasks(exclude_task_ids=set())
-        if closed:
-            logger.info("Scheduler shutdown: closed %d orphaned DB session(s).", closed)
+        from app.database import close_zombie_sessions_by_session_id
+        closed_tasks = close_zombie_sessions_by_session_id(exclude_ids=set())
+        if closed_tasks:
+            logger.info(
+                "Scheduler shutdown: closed orphaned DB sessions for tasks: %s", closed_tasks
+            )
     except Exception:
         logger.exception("Scheduler shutdown: failed to close orphaned DB sessions.")
 
@@ -5888,15 +5942,29 @@ def _recover_hung_sessions() -> None:
 
 def _cleanup_finished() -> None:
     """Remove sessions whose threads have completed and re-sync capacity counts."""
+    dead_db_session_ids: list[int] = []
     with _active_sessions_lock:
         finished = [tid for tid, t in _active_sessions.items() if not t.is_alive()]
         for tid in finished:
+            db_sid = _active_db_session_ids.pop(tid, None)
+            if db_sid is not None:
+                dead_db_session_ids.append(db_sid)
             del _active_sessions[tid]
             _session_llm_ids.pop(tid, None)
             _session_titles.pop(tid, None)
             _session_types.pop(tid, None)
             _session_started_at.pop(tid, None)
-            _active_db_session_ids.pop(tid, None)
+
+    # Immediately close DB sessions for threads that exited without their finally block.
+    # close_agent_session is idempotent — already-closed sessions are a no-op.
+    if dead_db_session_ids:
+        try:
+            from app.database import close_agent_session
+            for db_sid in dead_db_session_ids:
+                close_agent_session(db_sid, "thread_exited",
+                                    "Thread exited without closing session")
+        except Exception:
+            logger.exception("[scheduler] Failed to close dead-thread DB sessions.")
 
     # Re-sync _llm_session_counts from the ground truth (live threads + external registry)
     new_counts: dict[int, int] = defaultdict(int)
