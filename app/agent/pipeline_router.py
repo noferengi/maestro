@@ -468,6 +468,15 @@ def _run_generic_stage(
         budget_id=budget_id,
         scheduler_reason="scheduler",
     )
+    # Register with the scheduler so zombie cleanup doesn't close this session
+    # while the thread is still running.  Local import avoids a module-level
+    # circular import (scheduler → pipeline_router → scheduler).
+    if session_id is not None:
+        try:
+            from app.agent.scheduler import register_db_session
+            register_db_session(task_id, session_id)
+        except Exception:
+            pass  # non-fatal; zombie cleanup is still a safety net
     if project_path:
         from app.agent.tools import set_task_git_cwd
         set_task_git_cwd(project_path, task_id=task_id)
