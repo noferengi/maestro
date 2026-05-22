@@ -1085,6 +1085,14 @@ def _run_planning_pipeline_bg(task_id: str) -> None:
             return
         project_path = _setup_thread_context(task)
 
+        # Derive planning domain from the project's pipeline template.
+        _pipeline_template_id = getattr(task, 'pipeline_template_id', None)
+        try:
+            from app.agent.planning import _get_domain as _gd
+            _domain = _gd(_pipeline_template_id, task.title, task.description or "")
+        except Exception:
+            _domain = "software"
+
         # --- Planning cache gate (DB-only, runs before worktree setup) ---
         _content_hash = None
         try:
@@ -1222,6 +1230,7 @@ def _run_planning_pipeline_bg(task_id: str) -> None:
                         llm_id=task.llm_id,
                         budget_id=task.budget_id,
                         project_path=worktree_path,
+                        domain=_domain,
                     )
                 )
                 # Persist gate check details so the UI can surface why a gate failed

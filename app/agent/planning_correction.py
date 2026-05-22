@@ -59,6 +59,7 @@ class PlanningCorrectionAgent:
         max_context: int | None = None,
         task_title: str = "",
         task_description: str = "",
+        domain: str = "software",
     ) -> None:
         self.task_id = task_id
         self.planning_result_id = planning_result_id
@@ -73,6 +74,7 @@ class PlanningCorrectionAgent:
         self.max_context = max_context
         self.task_title = task_title
         self.task_description = task_description
+        self.domain = domain
 
         self._messages: list[dict] = []
         self._turn: int = 0
@@ -205,6 +207,7 @@ class PlanningCorrectionAgent:
                         budget_id=self.budget_id,
                         project_path=self.project_root,
                         task_description=self.task_description,
+                        domain=getattr(self, "domain", "software"),
                     )
                     
                     if gate_result.get("passed"):

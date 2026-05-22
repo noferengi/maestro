@@ -326,6 +326,7 @@ from .crud_sessions import (
     close_agent_session,
     close_zombie_sessions,
     close_zombie_sessions_for_tasks,
+    close_zombie_sessions_by_session_id,
     get_agent_sessions_for_task,
     get_open_sessions,
     create_tool_bug_report,
@@ -595,6 +596,7 @@ __all__ = [
     "mark_inbox_read", "mark_all_inbox_read", "delete_inbox_message", "count_unread_inbox",
     # crud_sessions
     "create_agent_session", "close_agent_session", "close_zombie_sessions", "close_zombie_sessions_for_tasks",
+    "close_zombie_sessions_by_session_id",
     "get_agent_sessions_for_task",
     "create_tool_bug_report", "get_tool_bug_reports", "mark_tool_bug_reports_viewed",
     # crud_maestro

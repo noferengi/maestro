@@ -240,6 +240,24 @@ _session_types: dict[str, str] = {}
 # Protected by _active_sessions_lock.
 _session_started_at: dict[str, float] = {}
 
+# session key -> AgentSession.id (DB PK) for the *current* open session.
+# Protected by _active_sessions_lock.  Cleared alongside _active_sessions in
+# _cleanup_finished().  Used by close_zombie_sessions_by_session_id() so that
+# stale predecessor sessions (e.g. 50 previous planning runs on the same task)
+# are closed even while the task thread is still alive.
+_active_db_session_ids: dict[str, int] = {}
+
+
+def register_db_session(session_key: str, db_session_id: int) -> None:
+    """Record the current DB AgentSession PK for this session key.
+
+    Call immediately after create_agent_session() returns a non-None id.
+    Overwrites any previous entry for the same key — the latest session is
+    always the one that should survive cleanup.
+    """
+    with _active_sessions_lock:
+        _active_db_session_ids[session_key] = db_session_id
+
 
 # Per-LLM active session count: llm_id -> count
 _llm_session_counts: dict[int, int] = defaultdict(int)
@@ -3118,7 +3136,9 @@ def _run_scope_survey_job(job: Any, llm: Any) -> None:
         budget_id=job.budget_id,
         scheduler_reason="scheduler",
     )
-    
+    if _session_id is not None:
+        register_db_session(session_key, _session_id)
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -3577,6 +3597,8 @@ def _run_pip_preflight_and_gate(
         budget_id=budget_id,
         scheduler_reason="scheduler",
     )
+    if _session_id is not None:
+        register_db_session(task_id, _session_id)
 
     preflight = loop.run_until_complete(
         run_pip_preflight(task_id, stage, llm_id, budget_id, project_path)
@@ -3759,6 +3781,8 @@ def _run_pip_resolution_research(job: Any, task: Any, llm: Any) -> None:
         budget_id=getattr(task, "budget_id", None),
         scheduler_reason="scheduler",
     )
+    if _session_id is not None:
+        register_db_session(job_key, _session_id)
     _exit_reason = "error"
     _exit_summary = ""
 
@@ -3857,6 +3881,8 @@ def _run_pip_resolution_agent(job: Any, task: Any, llm: Any) -> None:
         scheduler_reason="scheduler",
         max_turns=_PIP_MAX_TURNS,
     )
+    if _session_id is not None:
+        register_db_session(resolve_key, _session_id)
     _exit_reason = "error"
     _exit_summary = ""
     _turn_count = None
@@ -4204,6 +4230,8 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
         budget_id=task.budget_id,
         scheduler_reason="scheduler",
     )
+    if _session_id is not None:
+        register_db_session(task_id, _session_id)
     _exit_reason = "error"
     _exit_summary = ""
     _prompt_tokens = 0
@@ -4357,6 +4385,7 @@ def _run_planning_correction(
     project_path: str | None,
     task_title: str = "",
     task_description: str = "",
+    domain: str = "software",
 ) -> dict:
     """Run PlanningCorrectionAgent inline and increment correction_attempts."""
     from app.agent.planning_correction import PlanningCorrectionAgent
@@ -4370,6 +4399,8 @@ def _run_planning_correction(
         budget_id=budget_id,
         scheduler_reason="gate_repair",
     )
+    if _session_id is not None:
+        register_db_session(task_id, _session_id)
     _exit_reason = "error"
     _exit_summary = ""
 
@@ -4386,6 +4417,7 @@ def _run_planning_correction(
         max_context=max_context,
         task_title=task_title,
         task_description=task_description,
+        domain=domain,
     )
     try:
         correction_result = loop.run_until_complete(agent.run())
@@ -4441,6 +4473,15 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
     task = get_task(task_id)
     if not task:
         return
+
+    # Derive planning domain from the project's pipeline template.
+    _pipeline_template_id = getattr(task, 'pipeline_template_id', None)
+    try:
+        from app.agent.planning import _get_domain as _gd
+        _domain = _gd(_pipeline_template_id, task.title, task.description or "")
+    except Exception:
+        _domain = "software"
+    logger.debug("[planning] Task '%s' domain=%r (pipeline_template_id=%s)", task_id, _domain, _pipeline_template_id)
 
     # --- Planning cache gate ---
     # Compute content hash for this task spec. Used both to check for a reusable
@@ -4502,6 +4543,8 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
         budget_id=budget_id,
         scheduler_reason="scheduler",
     )
+    if _session_id is not None:
+        register_db_session(task_id, _session_id)
     _exit_reason = "error"
     _exit_summary = ""
     _prompt_tokens = 0
@@ -4593,6 +4636,7 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
                     budget_id=budget_id,
                     project_path=project_path,
                     task_description=task.description or "",
+                    domain=_domain,
                 )
             )
             if gate_result.get("passed"):
@@ -4676,6 +4720,7 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
                             project_path=project_path,
                             task_title=task.title or "",
                             task_description=task.description or "",
+                            domain=_domain,
                         )
                         if correction_result.get("outcome") == "corrected":
                             # Re-run gate on the patched plan
@@ -4701,6 +4746,7 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
                                         budget_id=budget_id,
                                         project_path=project_path,
                                         task_description=task.description or "",
+                                        domain=_domain,
                                     )
                                 )
                                 if gate_result2.get("passed"):
@@ -4821,6 +4867,8 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
             scheduler_reason="scheduler",
             max_turns=_MAX_TURNS,
         )
+        if _session_id is not None:
+            register_db_session(task_id, _session_id)
 
         maestro = MaestroLoop(
             task_id=task_id,
@@ -5028,6 +5076,8 @@ def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
         budget_id=budget_id,
         scheduler_reason="scheduler",
     )
+    if _session_id is not None:
+        register_db_session(task_id, _session_id)
     _exit_reason = "error"
     _exit_summary = ""
     _prompt_tokens = 0
@@ -5135,6 +5185,8 @@ def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
         budget_id=budget_id,
         scheduler_reason="scheduler",
     )
+    if _session_id is not None:
+        register_db_session(task_id, _session_id)
     _exit_reason = "error"
     _exit_summary = ""
     _prompt_tokens = 0
@@ -5240,6 +5292,8 @@ def _run_optimization_task(task_id: str, llm_base_url: str, llm_model: str,
         task_id=task_id, agent_type="optimization",
         llm_id=llm_id, budget_id=budget_id, scheduler_reason="scheduler",
     )
+    if _session_id is not None:
+        register_db_session(task_id, _session_id)
     _exit_reason = "error"
     _exit_summary = ""
     _prompt = _compl = 0
@@ -5322,6 +5376,8 @@ def _run_security_task(task_id: str, llm_base_url: str, llm_model: str,
         task_id=task_id, agent_type="security",
         llm_id=llm_id, budget_id=budget_id, scheduler_reason="scheduler",
     )
+    if _session_id is not None:
+        register_db_session(task_id, _session_id)
     _exit_reason = "error"
     _exit_summary = ""
     _prompt_tokens = _completion_tokens = 0
@@ -5419,6 +5475,8 @@ def _run_final_review_task(task_id: str, llm_base_url: str, llm_model: str,
         task_id=task_id, agent_type="final_review",
         llm_id=llm_id, budget_id=budget_id, scheduler_reason="scheduler",
     )
+    if _session_id is not None:
+        register_db_session(task_id, _session_id)
     _exit_reason = "error"
     _exit_summary = ""
     _prompt_tokens = _completion_tokens = 0
@@ -5838,6 +5896,7 @@ def _cleanup_finished() -> None:
             _session_titles.pop(tid, None)
             _session_types.pop(tid, None)
             _session_started_at.pop(tid, None)
+            _active_db_session_ids.pop(tid, None)
 
     # Re-sync _llm_session_counts from the ground truth (live threads + external registry)
     new_counts: dict[int, int] = defaultdict(int)
@@ -5857,16 +5916,15 @@ def _cleanup_finished() -> None:
         _llm_session_counts.clear()
         _llm_session_counts.update(new_counts)
 
-    # Reconcile DB state — close any open agent_sessions whose task_id is no
-    # longer in the alive set (crash-recovery for zombie rows).
-    # This runs every tick to ensure first-tick recovery after a restart.
+    # Reconcile DB state — close any open agent_sessions whose session PK is not
+    # in the currently-alive set.  Using session ID (not task ID) means stale
+    # predecessor sessions (e.g. 50 prior planning retries for the same task)
+    # are cleaned up even while the task thread is still running.
     with _active_sessions_lock:
-        _alive_ids = set(_active_sessions.keys())
-    with _external_sessions_lock:
-        _alive_ids.update(_external_sessions.keys())
+        _alive_db_session_ids = set(_active_db_session_ids.values())
     try:
-        from app.database import close_zombie_sessions_for_tasks, create_inbox_message, get_task
-        closed_ids = close_zombie_sessions_for_tasks(exclude_task_ids=_alive_ids)
+        from app.database import close_zombie_sessions_by_session_id, create_inbox_message, get_task
+        closed_ids = close_zombie_sessions_by_session_id(exclude_ids=_alive_db_session_ids)
         if closed_ids:
             logger.info("[scheduler] Closed zombie DB session(s) for tasks: %s", closed_ids)
             for tid in closed_ids:

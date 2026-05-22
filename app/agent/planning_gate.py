@@ -163,6 +163,7 @@ class PlanningGate:
         budget_id: int | None = None,
         project_path: str | None = None,
         task_description: str = "",
+        domain: str = "software",
     ):
         self.task_id = task_id
         self.plan = planning_result
@@ -174,6 +175,7 @@ class PlanningGate:
         self.budget_id = budget_id
         self.project_path = project_path
         self.task_description = task_description
+        self.domain = domain
 
     async def run(self) -> GateResult:
         """Execute all 7 checks and return the gate result."""
@@ -182,7 +184,16 @@ class PlanningGate:
         checks: list[GateCheck] = []
 
         # Check 0a: Python namespace conflicts (module vs package collision)
-        checks.append(self._check_namespace_conflicts())
+        # Only meaningful for software/code domains; skip for proof, writing, etc.
+        if self.domain != "software":
+            checks.append(GateCheck(
+                name="namespace_conflicts",
+                passed=True,
+                hard_fail=True,
+                detail=f"Skipped (domain={self.domain!r} — Python namespace check not applicable).",
+            ))
+        else:
+            checks.append(self._check_namespace_conflicts())
 
         # Check 0b: CREATE targets that already exist on disk
         checks.append(self._check_proposed_creates_exist())
@@ -731,25 +742,79 @@ class PlanningGate:
                 for s in self.plan.get("implementation_steps", [])
             ],
         }
+        domain = getattr(self, "domain", "software")
+
+        if domain == "proof":
+            review_body = (
+                "Review the plan above on four dimensions:\n\n"
+                "1. MATHEMATICAL SOUNDNESS — is the proof strategy logically valid? "
+                "Does the plan use a correct proof approach (induction, contradiction, etc.)?\n\n"
+                "2. MATHLIB LEMMA VERIFICATION — are cited Mathlib lemmas real and correctly typed? "
+                "Flag any lemma names that look invented or incorrectly stated.\n\n"
+                "3. ZERO-SORRY COMMITMENT — does the plan explicitly commit to discharging every "
+                "proof obligation? Flag any 'sorry' placeholders left intentionally.\n\n"
+                "4. BUILD VERIFICATION — does the plan specify `lake build` or an equivalent "
+                "step to confirm the Lean4 file compiles without errors?\n"
+            )
+            critical_rules = ""
+        elif domain == "writing":
+            review_body = (
+                "Review the plan above on three dimensions:\n\n"
+                "1. NARRATIVE COHERENCE — does the outline/structure match the task spec?\n\n"
+                "2. SCOPE COMPLIANCE — do word count, genre, POV, and other constraints from "
+                "the task description match what the plan commits to delivering?\n\n"
+                "3. DELIVERABLE COVERAGE — are all chapters, scenes, or sections specified "
+                "in the task description addressed in the plan?\n"
+            )
+            critical_rules = ""
+        elif domain == "research":
+            review_body = (
+                "Review the plan above on three dimensions:\n\n"
+                "1. METHODOLOGY SOUNDNESS — is the research approach valid for the stated goal?\n\n"
+                "2. CITATION SCOPE — does the plan cover the required topics, sources, or "
+                "literature areas specified in the task?\n\n"
+                "3. DELIVERABLE COVERAGE — are all sections from the task spec addressed?\n"
+            )
+            critical_rules = ""
+        elif domain == "data_analysis":
+            review_body = (
+                "Review the plan above on three dimensions:\n\n"
+                "1. STATISTICAL VALIDITY — are the proposed analyses appropriate for the data "
+                "and research question?\n\n"
+                "2. PIPELINE CORRECTNESS — does the plan cover data loading, transformation, "
+                "and output in the correct format?\n\n"
+                "3. SPEC COMPLIANCE — are all required metrics, visualizations, and output "
+                "formats from the task description addressed?\n"
+            )
+            critical_rules = ""
+        else:
+            # software / bug_triage / default
+            review_body = (
+                "Review the plan above on three dimensions:\n\n"
+                "1. FEASIBILITY — is the plan technically sound and achievable?\n\n"
+                "2. SPEC COMPLIANCE — does the plan's actual implementation use an approach "
+                "the task explicitly forbids?\n\n"
+                "3. ACCEPTANCE CRITERIA COVERAGE — does the plan's implementation_steps "
+                "address every item in the ACCEPTANCE CRITERIA section above?\n"
+                "   List any criteria that are NOT addressed by the plan.\n"
+            )
+            critical_rules = (
+                "\n   CRITICAL RULES:\n"
+                "   - Read ONLY the file_manifest actions and implementation_steps descriptions "
+                "to judge what the code will DO. Ignore any mentions of approaches being "
+                "avoided, replaced, warned about, or listed as risks — those are advisory notes.\n"
+                "   - 'action: verify' means checking existing code — it is NOT implementing anything.\n"
+                "   - A plan that says 'replace X with Y' implements Y, not X. Only flag if Y "
+                "is the forbidden approach.\n"
+                "   - If the implementation_steps say 'naive recursion' or 'fib(n-1) + fib(n-2)', "
+                "that IS compliant with a naive-recursion requirement — do NOT flag it.\n"
+            )
+
         prompt = (
             f"{task_desc_block}{ac_block}"
             f"PLAN (implementation fields only):\n{json.dumps(spec_plan, indent=1)[:3000]}\n\n"
-            "Review the plan above on three dimensions:\n\n"
-            "1. FEASIBILITY — is the plan technically sound and achievable?\n\n"
-            "2. SPEC COMPLIANCE — does the plan's actual implementation use an approach "
-            "the task explicitly forbids?\n\n"
-            "3. ACCEPTANCE CRITERIA COVERAGE — does the plan's implementation_steps "
-            "address every item in the ACCEPTANCE CRITERIA section above?\n"
-            "   List any criteria that are NOT addressed by the plan.\n\n"
-            "   CRITICAL RULES:\n"
-            "   - Read ONLY the file_manifest actions and implementation_steps descriptions "
-            "to judge what the code will DO. Ignore any mentions of approaches being "
-            "avoided, replaced, warned about, or listed as risks — those are advisory notes.\n"
-            "   - 'action: verify' means checking existing code — it is NOT implementing anything.\n"
-            "   - A plan that says 'replace X with Y' implements Y, not X. Only flag if Y "
-            "is the forbidden approach.\n"
-            "   - If the implementation_steps say 'naive recursion' or 'fib(n-1) + fib(n-2)', "
-            "that IS compliant with a naive-recursion requirement — do NOT flag it.\n\n"
+            f"{review_body}"
+            f"{critical_rules}\n"
             "To complete your review, call the submit_work tool with:\n"
             "{\n"
             '  "signal": "ACCEPTED",\n'
@@ -903,6 +968,7 @@ async def run_planning_gate(
     budget_id: int | None = None,
     project_path: str | None = None,
     task_description: str = "",
+    domain: str = "software",
 ) -> dict:
     """Run the planning gate and return a result dict."""
     if project_path is not None:
@@ -919,6 +985,7 @@ async def run_planning_gate(
         budget_id=budget_id,
         project_path=project_path,
         task_description=task_description,
+        domain=domain,
     )
     result = await gate.run()
     return {

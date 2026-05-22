@@ -181,6 +181,64 @@ def close_zombie_sessions_for_tasks(exclude_task_ids: set[str]) -> list[str]:
         db.close()
 
 
+def close_zombie_sessions_by_session_id(exclude_ids: set[int]) -> list[str]:
+    """Close all open sessions whose PK is not in exclude_ids.
+
+    Unlike close_zombie_sessions_for_tasks() (which excludes entire tasks),
+    this function excludes individual session rows by PK. A task that retried
+    planning 50 times will have 50 stale open sessions and 1 current one; only
+    the current session's ID is in exclude_ids, so all 50 stale ones get closed.
+
+    Returns the distinct task_ids that had sessions closed.
+    """
+    import sqlalchemy as _sa
+    # Normalise to ints; filter out any None values from failed creates.
+    safe_exclude = {int(i) for i in exclude_ids if i is not None}
+
+    db = SessionLocal()
+    try:
+        open_rows = db.execute(
+            _sa.text(
+                "SELECT id, task_id FROM agent_sessions WHERE ended_at IS NULL"
+            )
+        ).fetchall()
+
+        to_close = [r for r in open_rows if r[0] not in safe_exclude]
+        if not to_close:
+            return []
+
+        close_ids = [r[0] for r in to_close]
+        task_ids = list({r[1] for r in to_close if r[1] is not None})
+
+        logger.info(
+            "[sessions] Found %d zombie session(s) to close by session ID (tasks: %s)",
+            len(close_ids), task_ids,
+        )
+
+        placeholders = ",".join(str(i) for i in close_ids)
+        db.execute(
+            _sa.text(
+                f"UPDATE agent_sessions SET ended_at=:now, exit_reason='shutdown', "
+                f"exit_summary='Closed by scheduler cleanup: session no longer active' "
+                f"WHERE id IN ({placeholders})"
+            ),
+            {"now": _now_iso()},
+        )
+        db.commit()
+        logger.info(
+            "[sessions] Successfully closed %d zombie session(s) for %d task(s).",
+            len(close_ids), len(task_ids),
+        )
+        return task_ids
+
+    except Exception as exc:
+        db.rollback()
+        logger.error("Error in close_zombie_sessions_by_session_id: %s", exc)
+        return []
+    finally:
+        db.close()
+
+
 def get_agent_sessions_for_task(task_id: str) -> list[AgentSession]:
     """Return all sessions for a task, oldest first."""
     db = SessionLocal()

@@ -85,6 +85,58 @@ def _is_proof_task(title: str, description: str) -> bool:
     return any(kw in combined for kw in _PROOF_KEYWORDS)
 
 
+_TEMPLATE_DOMAIN_MAP: dict[str, str] = {
+    "mathematics / proof exploration": "proof",
+    "mathematics/proof exploration": "proof",
+    "novel writing": "writing",
+    "research report": "research",
+    "data analysis": "data_analysis",
+    "bug triage": "bug_triage",
+    "software development": "software",
+    "overnight generation": "writing",
+    "overnight story factory": "writing",
+}
+
+
+def _get_domain(
+    pipeline_template_id: int | None,
+    title: str,
+    description: str,
+) -> str:
+    """Return the planning domain string for this task.
+
+    Priority:
+    1. Map pipeline_template_id → template name → domain
+    2. Proof keyword heuristics
+    3. Default: "software"
+    """
+    if pipeline_template_id is not None:
+        try:
+            from app.database.session import SessionLocal as _SL
+            import sqlalchemy as _sa
+            db = _SL()
+            try:
+                row = db.execute(
+                    _sa.text("SELECT name FROM pipeline_templates WHERE id = :id"),
+                    {"id": pipeline_template_id},
+                ).fetchone()
+                if row:
+                    name_lower = (row[0] or "").lower().strip()
+                    if name_lower in _TEMPLATE_DOMAIN_MAP:
+                        return _TEMPLATE_DOMAIN_MAP[name_lower]
+                    # Partial match fallback
+                    for key, domain in _TEMPLATE_DOMAIN_MAP.items():
+                        if key in name_lower or name_lower in key:
+                            return domain
+            finally:
+                db.close()
+        except Exception:
+            pass
+    if _is_proof_task(title, description):
+        return "proof"
+    return "software"
+
+
 def _is_unit_test_task(title: str, description: str) -> bool:
     """Return True when heuristics indicate a pure unit-test writing task."""
     title_l = title.lower()

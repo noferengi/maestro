@@ -432,6 +432,7 @@ async def _stream_llm_response(
     http_timeout = httpx.Timeout(connect=3.0, read=None, write=30.0, pool=5.0)
 
     accumulated_content: list[str] = []
+    accumulated_reasoning: list[str] = []
             # tool_calls_acc: index -> {id, type, function: {name, arguments}}
     # Built incrementally from delta.tool_calls chunks (OpenAI streaming format).
     tool_calls_acc: dict[int, dict] = {}
@@ -556,6 +557,10 @@ async def _stream_llm_response(
                                 except Exception:
                                     pass
 
+                        reasoning = delta.get("reasoning_content")
+                        if reasoning:
+                            accumulated_reasoning.append(reasoning)
+
                         fr = choice.get("finish_reason")
                         if fr:
                             finish_reason = fr
@@ -608,6 +613,8 @@ async def _stream_llm_response(
 
     tool_calls_list = [tool_calls_acc[k] for k in sorted(tool_calls_acc)] if tool_calls_acc else None
     msg: dict = {"role": "assistant", "content": "".join(accumulated_content)}
+    if accumulated_reasoning:
+        msg["reasoning_content"] = "".join(accumulated_reasoning)
     if tool_calls_list:
         msg["tool_calls"] = tool_calls_list
 
@@ -1263,16 +1270,39 @@ async def call_llm(
                     response.raise_for_status()
                     result = response.json()
 
-            # Success - reset backoff state for this endpoint
-            with _ep_lock:
-                if resolved_url in _endpoint_states:
-                    prev = _endpoint_states.pop(resolved_url)
-                    if prev.fail_count > 0:
-                        logger.info(
-                            "LLM endpoint %s is back online (was down for %d attempt(s)).",
-                            resolved_url, prev.fail_count,
-                        )
-            # _retry_wait stays None -> break after finally
+            # All-thinking overflow detection: reasoning model consumed all tokens
+            # on internal chain-of-thought and returned no visible content.
+            # Treat as a retryable failure; on the second retry disable thinking.
+            _ovfl_choice = (result.get("choices") or [{}])[0]
+            _ovfl_msg = _ovfl_choice.get("message") or {}
+            _ovfl_content = (_ovfl_msg.get("content") or "").strip()
+            _ovfl_tokens = result.get("usage", {}).get("completion_tokens", 0)
+            if _ovfl_choice.get("finish_reason") == "length" and not _ovfl_content and _ovfl_tokens > 500:
+                _total_retry_count += 1
+                logger.error(
+                    "%s LLM thinking overflow: %d tokens consumed with no output content. "
+                    "Treating as retryable failure (attempt %d).",
+                    _agent_label, _ovfl_tokens, _total_retry_count,
+                )
+                if max_retries is not None and _total_retry_count >= max_retries:
+                    raise RuntimeError(
+                        f"LLM thinking overflow: {_ovfl_tokens} completion tokens with no output "
+                        f"after {_total_retry_count} attempt(s)."
+                    )
+                if _total_retry_count >= 2:
+                    payload["thinking"] = {"type": "disabled"}
+                _retry_wait = 5.0
+            else:
+                # Success - reset backoff state for this endpoint
+                with _ep_lock:
+                    if resolved_url in _endpoint_states:
+                        prev = _endpoint_states.pop(resolved_url)
+                        if prev.fail_count > 0:
+                            logger.info(
+                                "LLM endpoint %s is back online (was down for %d attempt(s)).",
+                                resolved_url, prev.fail_count,
+                            )
+                # _retry_wait stays None -> break after finally
 
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             # Infrastructure problem: server not running.  Log at WARNING, not ERROR.
