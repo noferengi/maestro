@@ -1,0 +1,383 @@
+[
+  {
+    "category": "Number Theory",
+    "topic": "Prime numbers",
+    "key_lemmas": [
+      "Nat.Prime",
+      "Nat.Prime.dvd_mul",
+      "Nat.infinite_setOf_prime",
+      "Nat.exists_infinite_primes",
+      "Nat.Prime.dvd_of_dvd_pow"
+    ],
+    "modules": ["Mathlib.Data.Nat.Prime.Basic", "Mathlib.Data.Nat.Prime.Infinite"],
+    "description": "Primality, divisibility by primes, Euclid infinitude"
+  },
+  {
+    "category": "Number Theory",
+    "topic": "Modular arithmetic (ZMod)",
+    "key_lemmas": [
+      "ZMod",
+      "ZMod.val_natCast",
+      "ZMod.pow_card_sub_one_eq_one",
+      "ZMod.units_pow_card_sub_one",
+      "Int.ModEq"
+    ],
+    "modules": ["Mathlib.Data.ZMod.Basic", "Mathlib.Data.ZMod.Units"],
+    "description": "Integers mod n, Fermat's little theorem, unit group"
+  },
+  {
+    "category": "Number Theory",
+    "topic": "GCD and coprimality",
+    "key_lemmas": [
+      "Nat.gcd_comm",
+      "Nat.gcd_dvd_left",
+      "Nat.Coprime",
+      "IsCoprime",
+      "Nat.gcd_eq_gcd_ab"
+    ],
+    "modules": ["Mathlib.Data.Nat.GCD.Basic"],
+    "description": "GCD, Bezout, coprimality, LCM"
+  },
+  {
+    "category": "Number Theory",
+    "topic": "Factorization",
+    "key_lemmas": [
+      "Nat.factorization",
+      "Nat.factorization_mul",
+      "Nat.factorization_prime",
+      "Nat.minFac",
+      "Nat.minFac_prime"
+    ],
+    "modules": ["Mathlib.Data.Nat.Factorization.Basic", "Mathlib.Data.Nat.Prime.MinFac"],
+    "description": "Prime factorization, multiplicity, smallest prime factor"
+  },
+  {
+    "category": "Number Theory",
+    "topic": "Euler totient function",
+    "key_lemmas": [
+      "Nat.totient",
+      "Nat.totient_prime",
+      "Nat.totient_prime_pow",
+      "Nat.totient_eq_card_coprimes"
+    ],
+    "modules": ["Mathlib.Data.Nat.Totient"],
+    "description": "Euler phi function, totient of prime powers"
+  },
+  {
+    "category": "Algebra",
+    "topic": "Group theory",
+    "key_lemmas": [
+      "orderOf_dvd_card",
+      "pow_orderOf_eq_one",
+      "orderOf_eq_card_of_forall_mem_zpowers",
+      "Subgroup.card_dvd_of_le"
+    ],
+    "modules": [
+      "Mathlib.GroupTheory.OrderOfElement",
+      "Mathlib.GroupTheory.Subgroup.Basic"
+    ],
+    "description": "Order of elements, Lagrange's theorem, subgroup structure"
+  },
+  {
+    "category": "Algebra",
+    "topic": "Ring and field basics",
+    "key_lemmas": ["Ring", "CommRing", "Field", "mul_comm", "add_comm", "ring"],
+    "modules": ["Mathlib.Algebra.Ring.Basic", "Mathlib.Algebra.Field.Basic"],
+    "description": "Ring/field axioms, ring_nf and ring tactics"
+  },
+  {
+    "category": "Algebra",
+    "topic": "Polynomial rings",
+    "key_lemmas": [
+      "Polynomial.eval",
+      "Polynomial.roots",
+      "Polynomial.degree_mul",
+      "Polynomial.Monic",
+      "Polynomial.roots_X_sub_C"
+    ],
+    "modules": ["Mathlib.RingTheory.Polynomial.Basic", "Mathlib.Data.Polynomial.Basic"],
+    "description": "Polynomial evaluation, roots, degree"
+  },
+  {
+    "category": "Algebra",
+    "topic": "Linear algebra",
+    "key_lemmas": [
+      "Matrix.det",
+      "LinearMap.ker",
+      "Finsupp.total",
+      "Module.rank"
+    ],
+    "modules": [
+      "Mathlib.LinearAlgebra.Matrix.Determinant",
+      "Mathlib.LinearAlgebra.Basic"
+    ],
+    "description": "Determinants, kernel/image, module rank"
+  },
+  {
+    "category": "Combinatorics",
+    "topic": "Finset operations",
+    "key_lemmas": [
+      "Finset.card_union_add_card_inter",
+      "Finset.card_filter",
+      "Finset.card_image_of_injOn",
+      "Finset.sum_add_distrib",
+      "Finset.prod_pow_eq_pow_sum"
+    ],
+    "modules": ["Mathlib.Data.Finset.Basic", "Mathlib.Algebra.BigOperators.Basic"],
+    "description": "Finite sets: cardinality, sums, products, filter, image"
+  },
+  {
+    "category": "Combinatorics",
+    "topic": "Binomial coefficients",
+    "key_lemmas": [
+      "Nat.choose_symm",
+      "Nat.choose_succ_succ",
+      "Nat.add_choose_eq",
+      "Nat.choose_pos"
+    ],
+    "modules": ["Mathlib.Data.Nat.Choose.Basic"],
+    "description": "Binomial coefficients, Pascal's rule"
+  },
+  {
+    "category": "Combinatorics",
+    "topic": "Counting / Fintype",
+    "key_lemmas": [
+      "Fintype.card",
+      "Fintype.card_prod",
+      "Fintype.card_sum",
+      "Nat.card",
+      "Fintype.card_fin"
+    ],
+    "modules": ["Mathlib.Data.Fintype.Basic", "Mathlib.Data.Fintype.Card"],
+    "description": "Counting finite types, product types, equivalences"
+  },
+  {
+    "category": "Logic",
+    "topic": "Decidability",
+    "key_lemmas": [
+      "decide",
+      "Decidable",
+      "DecidableEq",
+      "Finset.decidableMem"
+    ],
+    "modules": ["Mathlib.Logic.Decidable"],
+    "description": "decide tactic for decidable propositions, DecidableEq"
+  },
+  {
+    "category": "Logic",
+    "topic": "Classical reasoning",
+    "key_lemmas": [
+      "Classical.em",
+      "Classical.byContradiction",
+      "not_not",
+      "Classical.choice"
+    ],
+    "modules": ["Mathlib.Logic.Classical"],
+    "description": "Classical excluded middle, proof by contradiction"
+  },
+  {
+    "category": "Logic",
+    "topic": "Exists and forall",
+    "key_lemmas": [
+      "exists_prop",
+      "forall_and",
+      "not_exists",
+      "not_forall",
+      "exists_unique"
+    ],
+    "modules": ["Mathlib.Logic.Basic"],
+    "description": "Quantifier manipulation, unique existence"
+  },
+  {
+    "category": "Order Theory",
+    "topic": "Partial orders and lattices",
+    "key_lemmas": [
+      "le_antisymm",
+      "lt_of_le_of_lt",
+      "Finset.sup",
+      "Finset.inf",
+      "OrderIso"
+    ],
+    "modules": ["Mathlib.Order.Basic", "Mathlib.Order.Lattice"],
+    "description": "Partial orders, lattice operations, order isomorphisms"
+  },
+  {
+    "category": "Order Theory",
+    "topic": "Well-founded induction",
+    "key_lemmas": [
+      "Nat.strong_induction_on",
+      "WellFounded.induction",
+      "Nat.strongRecOn"
+    ],
+    "modules": ["Mathlib.Order.WellFounded"],
+    "description": "Strong induction, well-founded recursion"
+  },
+  {
+    "category": "Analysis",
+    "topic": "Real numbers",
+    "key_lemmas": [
+      "Real.sqrt",
+      "Real.sqrt_sq",
+      "Irrational",
+      "Real.irrational_sqrt_two",
+      "abs_le"
+    ],
+    "modules": ["Mathlib.Analysis.SpecialFunctions.Pow.Real", "Mathlib.Data.Real.Irrational"],
+    "description": "Square roots, irrationality, absolute value"
+  },
+  {
+    "category": "Analysis",
+    "topic": "Inequalities",
+    "key_lemmas": [
+      "sq_nonneg",
+      "mul_self_nonneg",
+      "abs_nonneg",
+      "pow_pos",
+      "Nat.div_le_self"
+    ],
+    "modules": ["Mathlib.Algebra.Order.Ring.Lemmas"],
+    "description": "Non-negativity, monotonicity, power inequalities"
+  },
+  {
+    "category": "Lean4 Tactics",
+    "topic": "Automation tactics",
+    "key_lemmas": [
+      "omega",
+      "ring",
+      "ring_nf",
+      "norm_num",
+      "decide",
+      "simp",
+      "linarith",
+      "nlinarith"
+    ],
+    "modules": [],
+    "description": "omega (linear arithmetic over Nat/Int), ring (polynomial identities), norm_num (numeric computations), decide (decidable propositions)"
+  },
+  {
+    "category": "Lean4 Tactics",
+    "topic": "Proof search tactics",
+    "key_lemmas": [
+      "apply?",
+      "exact?",
+      "rw?",
+      "simp?",
+      "aesop"
+    ],
+    "modules": [],
+    "description": "Suggestion tactics: apply? searches for matching lemmas, exact? finds direct matches, simp? shows which simp lemmas fired"
+  },
+  {
+    "category": "Lean4 Tactics",
+    "topic": "Induction and cases",
+    "key_lemmas": [
+      "induction",
+      "cases",
+      "rcases",
+      "obtain",
+      "Nat.rec",
+      "Fin.cases"
+    ],
+    "modules": [],
+    "description": "Structural induction, case analysis, destructuring patterns"
+  },
+  {
+    "category": "Number Theory",
+    "topic": "Divisibility",
+    "key_lemmas": [
+      "dvd_refl",
+      "dvd_trans",
+      "dvd_add",
+      "dvd_mul_right",
+      "Nat.dvd_antisymm"
+    ],
+    "modules": ["Mathlib.Algebra.Order.Ring.Lemmas", "Mathlib.Data.Nat.Defs"],
+    "description": "Divisibility relation, basic lemmas"
+  },
+  {
+    "category": "Number Theory",
+    "topic": "Chinese remainder theorem",
+    "key_lemmas": [
+      "ZMod.chineseRemainder",
+      "IsCoprime.comm",
+      "Int.emod_emod_of_dvd"
+    ],
+    "modules": ["Mathlib.Data.ZMod.Basic", "Mathlib.RingTheory.Coprime.Basic"],
+    "description": "CRT for coprime moduli, simultaneous congruences"
+  },
+  {
+    "category": "Algebra",
+    "topic": "Monoids and semigroups",
+    "key_lemmas": [
+      "mul_one",
+      "one_mul",
+      "mul_assoc",
+      "pow_succ",
+      "pow_zero",
+      "pow_add"
+    ],
+    "modules": ["Mathlib.Algebra.Group.Basic"],
+    "description": "Monoid axioms, power lemmas, commutativity"
+  },
+  {
+    "category": "Combinatorics",
+    "topic": "Pigeonhole principle",
+    "key_lemmas": [
+      "Finset.exists_ne_map_eq_of_card_lt_of_maps_to",
+      "Fintype.exists_ne_map_eq_of_card_lt"
+    ],
+    "modules": ["Mathlib.Data.Fintype.Basic"],
+    "description": "Pigeonhole: if |domain| > |codomain| then some two elements collide"
+  },
+  {
+    "category": "Analysis",
+    "topic": "Sequences and limits",
+    "key_lemmas": [
+      "tendsto_atTop",
+      "Filter.Tendsto",
+      "summable_of_summable_norm",
+      "tsum_eq_zero_iff"
+    ],
+    "modules": ["Mathlib.Topology.Algebra.InfiniteSum.Basic"],
+    "description": "Convergence, summability, topological limits"
+  },
+  {
+    "category": "Logic",
+    "topic": "Propositional connectives",
+    "key_lemmas": [
+      "And.comm",
+      "Or.comm",
+      "iff_of_true",
+      "not_and",
+      "or_iff_not_imp_left"
+    ],
+    "modules": ["Mathlib.Logic.Basic"],
+    "description": "And/Or/Not/Iff lemmas and propositional reasoning"
+  },
+  {
+    "category": "Algebra",
+    "topic": "Norm and absolute value",
+    "key_lemmas": [
+      "norm_nonneg",
+      "norm_mul",
+      "norm_add_le",
+      "abs_add",
+      "Int.natAbs"
+    ],
+    "modules": ["Mathlib.Analysis.Normed.Group.Basic"],
+    "description": "Norms, triangle inequality, integer absolute value"
+  },
+  {
+    "category": "Number Theory",
+    "topic": "Integer properties",
+    "key_lemmas": [
+      "Int.natCast_dvd_natCast",
+      "Int.coe_nat_dvd",
+      "Int.emod_add_ediv",
+      "Int.ediv_add_emod",
+      "Int.natAbs_dvd"
+    ],
+    "modules": ["Mathlib.Data.Int.Order", "Mathlib.Data.Int.Defs"],
+    "description": "Integer casting, division, mod properties"
+  }
+]

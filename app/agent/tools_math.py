@@ -153,6 +153,8 @@ def search_oeis(query: str, max_results: int = 5) -> str:
 _MATHLIB_INDEX_PATH = pathlib.Path(__file__).parent / "mathlib_index.json"
 _mathlib_index: list[dict] | None = None
 
+_LOOGLE_API = "https://loogle.lean-lang.org/json"
+
 
 def _load_mathlib_index() -> list[dict]:
     global _mathlib_index
@@ -202,21 +204,43 @@ def _search_mathlib_live(query: str, max_results: int) -> list[dict] | None:
         return None
 
 
-def search_mathlib(query: str, max_results: int = 10) -> list[dict]:
+def _search_mathlib_loogle(query: str, max_results: int) -> list[dict] | None:
     """
-    Search Lean4 Mathlib for theorems, lemmas, and definitions matching query.
+    Query the Loogle API (loogle.lean-lang.org).
 
-    Primary path: lake env lean --stdin (requires lake + Mathlib in PATH).
-    Fallback: bundled static index (app/agent/mathlib_index.json).
-
-    Returns list of {name, type, module, doc}.
+    Supports name fragments, type signatures, and keyword queries.
+    Returns None on any network/parse failure so the caller can fall back.
+    Returns an empty list when the query succeeds but matches nothing.
     """
-    max_results = max(1, min(50, int(max_results)))
+    params = urllib.parse.urlencode({"q": query})
+    url = f"{_LOOGLE_API}?{params}"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "maestro-agent/1.0"})
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        logger.debug("[search_mathlib] Loogle request failed: %s", exc)
+        return None
 
-    live = _search_mathlib_live(query, max_results)
-    if live is not None:
-        return live
+    if data.get("error"):
+        logger.debug("[search_mathlib] Loogle returned error: %s", data["error"])
+        return None
 
+    hits = data.get("hits") or []
+    results: list[dict] = []
+    for hit in hits[:max_results]:
+        results.append({
+            "name": hit.get("name", ""),
+            "type": hit.get("type", ""),
+            "module": hit.get("module", ""),
+            # Loogle uses "docstring" or "doc" depending on version
+            "doc": hit.get("docstring") or hit.get("doc") or "",
+        })
+    return results
+
+
+def _search_mathlib_static(query: str, max_results: int) -> list[dict]:
+    """Keyword search over the bundled static index (offline fallback)."""
     index = _load_mathlib_index()
     terms = query.lower().split()
     scored: list[tuple[int, dict]] = []
@@ -232,3 +256,60 @@ def search_mathlib(query: str, max_results: int = 10) -> list[dict]:
             scored.append((score, entry))
     scored.sort(key=lambda x: -x[0])
     return [e for _, e in scored[:max_results]]
+
+
+_MATHLIB_TOPICS_PATH = pathlib.Path(__file__).parent / "mathlib_topics.json"
+_mathlib_topics: list[dict] | None = None
+
+
+def _load_mathlib_topics() -> list[dict]:
+    global _mathlib_topics
+    if _mathlib_topics is None:
+        try:
+            _mathlib_topics = json.loads(_MATHLIB_TOPICS_PATH.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("[list_mathlib_topics] Failed to load topics: %s", exc)
+            _mathlib_topics = []
+    return _mathlib_topics
+
+
+def list_mathlib_topics(category: str = "") -> list[dict]:
+    """
+    List curated Mathlib topic areas with key lemma names.
+
+    Call with no argument to see all topics. Pass a category name
+    (case-insensitive, partial match) to filter:
+    "number theory", "algebra", "combinatorics", "logic", etc.
+
+    Returns list of {category, topic, key_lemmas, modules, description}.
+    Use search_mathlib(query) to look up specific lemmas after identifying the topic.
+    """
+    topics = _load_mathlib_topics()
+    if not category:
+        return topics
+    cat_lower = category.lower()
+    return [t for t in topics if cat_lower in t.get("category", "").lower()]
+
+
+def search_mathlib(query: str, max_results: int = 10) -> list[dict]:
+    """
+    Search Lean4 Mathlib for theorems, lemmas, and definitions matching query.
+
+    Search order (first success wins):
+      1. lake env lean --stdin  — exact #check lookup (requires lake in PATH)
+      2. Loogle API             — full-text / name / type search over all of Mathlib
+      3. Bundled static index   — offline keyword fallback (51 hand-curated entries)
+
+    Returns list of {name, type, module, doc}.
+    """
+    max_results = max(1, min(50, int(max_results)))
+
+    live = _search_mathlib_live(query, max_results)
+    if live is not None:
+        return live
+
+    loogle = _search_mathlib_loogle(query, max_results)
+    if loogle is not None:
+        return loogle
+
+    return _search_mathlib_static(query, max_results)

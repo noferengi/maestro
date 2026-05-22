@@ -4019,7 +4019,7 @@ def run_lean4(source: str, timeout: int = 120) -> str:
     return "\n".join(parts) or "[no output]"
 
 
-from app.agent.tools_math import search_arxiv as _search_arxiv_impl, search_oeis as _search_oeis_impl, search_mathlib as _search_mathlib_impl  # noqa: E402
+from app.agent.tools_math import search_arxiv as _search_arxiv_impl, search_oeis as _search_oeis_impl, search_mathlib as _search_mathlib_impl, list_mathlib_topics as _list_mathlib_topics_impl  # noqa: E402
 
 
 def _get_lean4_proof_state_tool(lean_source: str, line: int, col: int = 0) -> str:
@@ -4307,6 +4307,7 @@ TOOL_REGISTRY: dict[str, Any] = {
     "search_arxiv": _search_arxiv_impl,
     "search_oeis": _search_oeis_impl,
     "search_mathlib": _search_mathlib_impl,
+    "list_mathlib_topics": _list_mathlib_topics_impl,
     "get_lean4_proof_state": _get_lean4_proof_state_tool,
     # Self-modification tools (Gap 5)
     "vote_to_revert": handle_vote_to_revert,
@@ -6273,6 +6274,31 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "list_mathlib_topics",
+            "description": (
+                "[READ] Browse curated Mathlib topic areas with key lemma names. "
+                "Call with no argument to see all topics; pass a category to filter. "
+                "Use this to orient yourself before calling search_mathlib. "
+                "Categories: Number Theory, Algebra, Combinatorics, Logic, Order Theory, Analysis, Lean4 Tactics."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "description": (
+                            "Category filter (case-insensitive, partial match). "
+                            "Omit to return all topics."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_lean4_proof_state",
             "description": (
                 "[RUN — docker-sandbox] Get the Lean4 proof state (goal + hypotheses) at a "
@@ -6582,6 +6608,14 @@ TOOL_CATEGORIES: dict[str, str] = {
     "get_directory_summary":  "Summaries",
     "get_module_summary":     "Summaries",
     "list_scope_summaries":   "Summaries",
+    # Math — formal proof and Mathlib tools
+    "run_sympy":              "Math",
+    "run_lean4":              "Math",
+    "search_arxiv":           "Math",
+    "search_oeis":            "Math",
+    "search_mathlib":         "Math",
+    "list_mathlib_topics":    "Math",
+    "get_lean4_proof_state":  "Math",
     # Self-modification (Gap 5)
     "vote_to_revert":         "Infrastructure",
     # Episodic memory (Gap 7)

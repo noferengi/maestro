@@ -1,9 +1,9 @@
 [
   {
     "name": "Nat.Prime",
-    "type": "ℕ → Prop",
-    "module": "Mathlib.Data.Nat.Prime.Basic",
-    "doc": "p is prime if p >= 2 and has no divisors other than 1 and p"
+    "type": " (p : ℕ) : Prop",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": "`Nat.Prime p` means that `p` is a prime number, that is, a natural number\nat least 2 whose only divisors are `p` and `1`.\nThe theorem `Nat.prime_def` witnesses this description of a prime number. "
   },
   {
     "name": "Nat.prime_def_lt_dvd",
@@ -55,32 +55,32 @@
   },
   {
     "name": "Nat.prime_two",
-    "type": "Nat.Prime 2",
-    "module": "Mathlib.Data.Nat.Prime.Basic",
+    "type": " : Nat.Prime 2",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
     "doc": "2 is prime"
   },
   {
     "name": "Nat.prime_three",
-    "type": "Nat.Prime 3",
-    "module": "Mathlib.Data.Nat.Prime.Basic",
+    "type": " : Nat.Prime 3",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
     "doc": "3 is prime"
   },
   {
     "name": "Nat.minFac",
-    "type": "ℕ → ℕ",
-    "module": "Mathlib.Data.Nat.Prime.MinFac",
-    "doc": "The minimal prime factor of n; minFac 1 = 1, minFac 0 = 2"
+    "type": " (n : ℕ) : ℕ",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": "Returns the smallest prime factor of `n ≠ 1`. "
   },
   {
     "name": "Nat.minFac_prime",
-    "type": "1 < n → Nat.Prime (Nat.minFac n)",
-    "module": "Mathlib.Data.Nat.Prime.MinFac",
+    "type": " {n : ℕ} (n1 : n ≠ 1) : Nat.Prime n.minFac",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
     "doc": "The minimal factor of n > 1 is prime"
   },
   {
     "name": "Nat.minFac_dvd",
-    "type": "∀ n, Nat.minFac n ∣ n",
-    "module": "Mathlib.Data.Nat.Prime.MinFac",
+    "type": " (n : ℕ) : n.minFac ∣ n",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
     "doc": "The minimal factor divides n"
   },
   {
@@ -115,9 +115,9 @@
   },
   {
     "name": "Nat.Coprime",
-    "type": "ℕ → ℕ → Prop",
-    "module": "Mathlib.Data.Nat.GCD.Basic",
-    "doc": "Nat.Coprime a b ↔ Nat.gcd a b = 1"
+    "type": " (m n : ℕ) : Prop",
+    "module": "Init.Data.Nat.Coprime",
+    "doc": "`m` and `n` are coprime, or relatively prime, if their `gcd` is 1. "
   },
   {
     "name": "Nat.Coprime.prime_dvd_of_dvd_mul",
@@ -127,9 +127,9 @@
   },
   {
     "name": "Nat.gcd",
-    "type": "ℕ → ℕ → ℕ",
-    "module": "Mathlib.Data.Nat.GCD.Basic",
-    "doc": "Greatest common divisor of two natural numbers"
+    "type": " (m n : ℕ) : ℕ",
+    "module": "Init.Data.Nat.Gcd",
+    "doc": "Computes the greatest common divisor of two natural numbers. The GCD of two natural numbers is the\nlargest natural number that evenly divides both.\n\nIn particular, the GCD of a number and `0` is the number itself.\n\nThis reference implementation via the Euclidean algorithm is overridden in both the kernel and the\ncompiler to efficiently evaluate using arbitrary-precision arithmetic. The definition provided here\nis the logical model.\n\nExamples:\n* `Nat.gcd 10 15 = 5`\n* `Nat.gcd 0 5 = 5`\n* `Nat.gcd 7 0 = 7`\n"
   },
   {
     "name": "Nat.lcm",
@@ -193,15 +193,15 @@
   },
   {
     "name": "Int.ModEq",
-    "type": "ℤ → ℤ → ℤ → Prop",
-    "module": "Mathlib.Data.Int.ModCast",
-    "doc": "Int.ModEq n a b ↔ n | a - b (a ≡ b [ZMOD n])"
+    "type": " (n a b : ℤ) : Prop",
+    "module": "Mathlib.Data.Int.ModEq",
+    "doc": "`a ≡ b [ZMOD n]` when `a % n = b % n`. "
   },
   {
     "name": "ZMod",
-    "type": "ℕ → Type",
-    "module": "Mathlib.Data.ZMod.Basic",
-    "doc": "Integers mod n: ZMod n = ZMod n"
+    "type": " : ℕ → Type",
+    "module": "Mathlib.Data.ZMod.Defs",
+    "doc": "The integers modulo `n : ℕ`. "
   },
   {
     "name": "ZMod.val_natCast",
@@ -211,21 +211,21 @@
   },
   {
     "name": "Finset.sum",
-    "type": "Finset α → (α → β) → β",
-    "module": "Mathlib.Algebra.BigOperators.Group.Finset",
-    "doc": "Sum of a function over a finite set"
+    "type": " {ι : Type u_1} {M : Type u_3} [AddCommMonoid M] (s : Finset ι) (f : ι → M) : M",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": "`∑ x ∈ s, f x` is the sum of `f x` as `x` ranges over the elements\nof the finite set `s`.\n\nWhen the index type is a `Fintype`, the notation `∑ x, f x`, is a shorthand for\n`∑ x ∈ Finset.univ, f x`. "
   },
   {
     "name": "Finset.prod",
-    "type": "Finset α → (α → β) → β",
-    "module": "Mathlib.Algebra.BigOperators.Group.Finset",
-    "doc": "Product of a function over a finite set"
+    "type": " {ι : Type u_1} {M : Type u_3} [CommMonoid M] (s : Finset ι) (f : ι → M) : M",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": "`∏ x ∈ s, f x` is the product of `f x` as `x` ranges over the elements of the finite set `s`.\n\nWhen the index type is a `Fintype`, the notation `∏ x, f x`, is a shorthand for\n`∏ x ∈ Finset.univ, f x`. "
   },
   {
     "name": "Finset.filter",
-    "type": "Finset α → (α → Bool) → Finset α",
-    "module": "Mathlib.Data.Finset.Basic",
-    "doc": "Filter elements of a finite set by a decidable predicate"
+    "type": " {α : Type u_1} (p : α → Prop) [DecidablePred p] (s : Finset α) : Finset α",
+    "module": "Mathlib.Data.Finset.Filter",
+    "doc": "`Finset.filter p s` is the set of elements of `s` that satisfy `p`.\n\nFor example, one can use `s.filter (· ∈ t)` to get the intersection of `s` with `t : Set α`\nas a `Finset α` (when a `DecidablePred (· ∈ t)` instance is available). "
   },
   {
     "name": "Finset.range",
@@ -304,5 +304,3671 @@
     "type": "m ∣ n → a % n % m = a % m",
     "module": "Mathlib.Data.Int.Order",
     "doc": "Modular reduction: mod n then mod m equals mod m when m | n"
+  },
+  {
+    "name": "ZMod.commRing",
+    "type": " (n : ℕ) : CommRing (ZMod n)",
+    "module": "Mathlib.Data.ZMod.Defs",
+    "doc": ""
+  },
+  {
+    "name": "ZMod.decidableEq",
+    "type": " (n : ℕ) : DecidableEq (ZMod n)",
+    "module": "Mathlib.Data.ZMod.Defs",
+    "doc": ""
+  },
+  {
+    "name": "ZMod.inhabited",
+    "type": " (n : ℕ) : Inhabited (ZMod n)",
+    "module": "Mathlib.Data.ZMod.Defs",
+    "doc": ""
+  },
+  {
+    "name": "ZMod.repr",
+    "type": " (n : ℕ) : Repr (ZMod n)",
+    "module": "Mathlib.Data.ZMod.Defs",
+    "doc": ""
+  },
+  {
+    "name": "ZMod.infinite",
+    "type": " : Infinite (ZMod 0)",
+    "module": "Mathlib.Data.ZMod.Defs",
+    "doc": ""
+  },
+  {
+    "name": "ZMod.instUnique",
+    "type": " : Unique (ZMod 1)",
+    "module": "Mathlib.Data.ZMod.Defs",
+    "doc": ""
+  },
+  {
+    "name": "ZMod.fintype",
+    "type": " (n : ℕ) [NeZero n] : Fintype (ZMod n)",
+    "module": "Mathlib.Data.ZMod.Defs",
+    "doc": ""
+  },
+  {
+    "name": "ZMod.card",
+    "type": " (n : ℕ) [Fintype (ZMod n)] : Fintype.card (ZMod n) = n",
+    "module": "Mathlib.Data.ZMod.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.card_zmod",
+    "type": " (n : ℕ) : Nat.card (ZMod n) = n",
+    "module": "Mathlib.SetTheory.Cardinal.Finite",
+    "doc": ""
+  },
+  {
+    "name": "ZMod.instInv",
+    "type": " (n : ℕ) : Inv (ZMod n)",
+    "module": "Mathlib.Data.ZMod.Basic",
+    "doc": ""
+  },
+  {
+    "name": "ZMod.val",
+    "type": " {n : ℕ} : ZMod n → ℕ",
+    "module": "Mathlib.Data.ZMod.Basic",
+    "doc": "`val a` is a natural number defined as:\n- for `a : ZMod 0` it is the absolute value of `a`\n- for `a : ZMod n` with `0 < n` it is the least natural number in the equivalence class\n\nSee `ZMod.valMinAbs` for a variant that takes values in the integers.\n"
+  },
+  {
+    "name": "ZMod.inv",
+    "type": " (n : ℕ) : ZMod n → ZMod n",
+    "module": "Mathlib.Data.ZMod.Basic",
+    "doc": "The inversion on `ZMod n`.\nIt is setup in such a way that `a * a⁻¹` is equal to `gcd a.val n`.\nIn particular, if `a` is coprime to `n`, and hence a unit, `a * a⁻¹ = 1`. "
+  },
+  {
+    "name": "ZMod.cast",
+    "type": " {R : Type u_1} [AddGroupWithOne R] {n : ℕ} : ZMod n → R",
+    "module": "Mathlib.Data.ZMod.Basic",
+    "doc": "Cast an integer modulo `n` to another semiring.\nThis function is a morphism if the characteristic of `R` divides `n`.\nSee `ZMod.castHom` for a bundled version. "
+  },
+  {
+    "name": "ZMod.nontrivial'",
+    "type": " : Nontrivial (ZMod 0)",
+    "module": "Mathlib.Data.ZMod.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.residueClassesEquiv",
+    "type": " (N : ℕ) [NeZero N] : ℕ ≃ ZMod N × ℕ",
+    "module": "Mathlib.Data.ZMod.Basic",
+    "doc": "Equivalence between `ℕ` and `ZMod N × ℕ`, sending `n` to `(n mod N, n / N)`. "
+  },
+  {
+    "name": "ZMod.nontrivial_iff",
+    "type": " {n : ℕ} : Nontrivial (ZMod n) ↔ n ≠ 1",
+    "module": "Mathlib.Data.ZMod.Basic",
+    "doc": ""
+  },
+  {
+    "name": "ZMod.subsingleton_iff",
+    "type": " {n : ℕ} : Subsingleton (ZMod n) ↔ n = 1",
+    "module": "Mathlib.Data.ZMod.Basic",
+    "doc": ""
+  },
+  {
+    "name": "ZMod.val_injective",
+    "type": " (n : ℕ) [NeZero n] : Function.Injective ZMod.val",
+    "module": "Mathlib.Data.ZMod.Basic",
+    "doc": ""
+  },
+  {
+    "name": "ZMod.nontrivial",
+    "type": " (n : ℕ) [Fact (1 < n)] : Nontrivial (ZMod n)",
+    "module": "Mathlib.Data.ZMod.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.decidablePrime",
+    "type": " (p : ℕ) : Decidable (Nat.Prime p)",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": "This instance is set up to work in the kernel (`by decide`) for small values.\n\nBelow (`decidablePrime'`) we will define a faster variant to be used by the compiler\n(e.g. in `#eval` or `by native_decide`).\n\nIf you need to prove that a particular number is prime, in any case\nyou should not use `by decide`, but rather `by norm_num`, which is\nmuch faster.\n"
+  },
+  {
+    "name": "Nat.decidablePrime'",
+    "type": " (p : ℕ) : Decidable (Nat.Prime p)",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": "This definition is faster in the virtual machine than `decidablePrime`,\nbut slower in the kernel.\n"
+  },
+  {
+    "name": "Nat.prime_eleven",
+    "type": " : Nat.Prime 11",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.prime_five",
+    "type": " : Nat.Prime 5",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.prime_seven",
+    "type": " : Nat.Prime 7",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.decidablePrime_csimp",
+    "type": " : Nat.decidablePrime = Nat.decidablePrime'",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.fact_prime_three",
+    "type": " : Fact (Nat.Prime 3)",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.fact_prime_two",
+    "type": " : Fact (Nat.Prime 2)",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.not_prime_one",
+    "type": " : ¬Nat.Prime 1",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.not_prime_zero",
+    "type": " : ¬Nat.Prime 0",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.prime_one_false",
+    "type": " : Nat.Prime 1 → False",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": "A copy of `not_prime_one` stated in a way that works for `aesop`.\n\nSee https://github.com/leanprover-community/aesop/issues/197 for an explanation. "
+  },
+  {
+    "name": "Nat.prime_zero_false",
+    "type": " : Nat.Prime 0 → False",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": "A copy of `not_prime_zero` stated in a way that works for `aesop`.\n\nSee https://github.com/leanprover-community/aesop/issues/197 for an explanation. "
+  },
+  {
+    "name": "Prime.nat_prime",
+    "type": " {p : ℕ} : Prime p → Nat.Prime p",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": "**Alias** of the reverse direction of `Nat.prime_iff`."
+  },
+  {
+    "name": "Nat.Prime.prime",
+    "type": " {p : ℕ} : Nat.Prime p → Prime p",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": "**Alias** of the forward direction of `Nat.prime_iff`."
+  },
+  {
+    "name": "Nat.irreducible_iff_nat_prime",
+    "type": " (a : ℕ) : Irreducible a ↔ Nat.Prime a",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.prime_iff",
+    "type": " {p : ℕ} : Nat.Prime p ↔ Prime p",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.Prime.minFac_eq",
+    "type": " {p : ℕ} (hp : Nat.Prime p) : p.minFac = p",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.minFac_pos",
+    "type": " (n : ℕ) : 0 < n.minFac",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.minFac_has_prop",
+    "type": " {n : ℕ} (n1 : n ≠ 1) : Nat.minFacProp✝ n n.minFac",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.minFac_one",
+    "type": " : Nat.minFac 1 = 1",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.minFac_prime_iff",
+    "type": " {n : ℕ} : Nat.Prime n.minFac ↔ n ≠ 1",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.minFac_two",
+    "type": " : Nat.minFac 2 = 2",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.minFac_zero",
+    "type": " : Nat.minFac 0 = 2",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.minFac_le",
+    "type": " {n : ℕ} (H : 0 < n) : n.minFac ≤ n",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.minFac_eq_one_iff",
+    "type": " {n : ℕ} : n.minFac = 1 ↔ n = 1",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.prime_def_minFac",
+    "type": " {p : ℕ} : Nat.Prime p ↔ 2 ≤ p ∧ p.minFac = p",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.minFac_eq_two_iff",
+    "type": " (n : ℕ) : n.minFac = 2 ↔ 2 ∣ n",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.not_prime_iff_minFac_lt",
+    "type": " {n : ℕ} (n2 : 2 ≤ n) : ¬Nat.Prime n ↔ n.minFac < n",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.minFac_le_of_dvd",
+    "type": " {n m : ℕ} : 2 ≤ m → m ∣ n → n.minFac ≤ m",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.minFac_le_div",
+    "type": " {n : ℕ} (pos : 0 < n) (np : ¬Nat.Prime n) : n.minFac ≤ n / n.minFac",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.le_minFac",
+    "type": " {m n : ℕ} : n = 1 ∨ m ≤ n.minFac ↔ ∀ (p : ℕ), Nat.Prime p → p ∣ n → m ≤ p",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Nat.minFac_sq_le_self",
+    "type": " {n : ℕ} (w : 0 < n) (h : ¬Nat.Prime n) : n.minFac ^ 2 ≤ n",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": "The square of the smallest prime factor of a composite number `n` is at most `n`.\n"
+  },
+  {
+    "name": "Nat.minFac_eq",
+    "type": " (n : ℕ) : n.minFac = if 2 ∣ n then 2 else n.minFacAux 3",
+    "module": "Mathlib.Data.Nat.Prime.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.card",
+    "type": " {α : Type u_1} (s : Finset α) : ℕ",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": "`s.card` is the number of elements of `s`, aka its cardinality.\n\nThe notation `#s` can be accessed in the `Finset` locale. "
+  },
+  {
+    "name": "Finset.card_range",
+    "type": " (n : ℕ) : (Finset.range n).card = n",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": ""
+  },
+  {
+    "name": "Finset.card_def",
+    "type": " {α : Type u_1} (s : Finset α) : s.card = s.val.card",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": ""
+  },
+  {
+    "name": "Finset.card_mono",
+    "type": " {α : Type u_1} : Monotone Finset.card",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": ""
+  },
+  {
+    "name": "Finset.card_strictMono",
+    "type": " {α : Type u_1} : StrictMono Finset.card",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": ""
+  },
+  {
+    "name": "Finset.card_val",
+    "type": " {α : Type u_1} (s : Finset α) : s.val.card = s.card",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": ""
+  },
+  {
+    "name": "Finset.length_toList",
+    "type": " {α : Type u_1} (s : Finset α) : s.toList.length = s.card",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": ""
+  },
+  {
+    "name": "Finset.card_empty",
+    "type": " {α : Type u_1} : ∅.card = 0",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": ""
+  },
+  {
+    "name": "Finset.card_le_one_of_subsingleton",
+    "type": " {α : Type u_1} [Subsingleton α] (s : Finset α) : s.card ≤ 1",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": "A `Finset` of a subsingleton type has cardinality at most one. "
+  },
+  {
+    "name": "Finset.Nonempty.card_ne_zero",
+    "type": " {α : Type u_1} {s : Finset α} : s.Nonempty → s.card ≠ 0",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": "**Alias** of the reverse direction of `Finset.card_ne_zero`."
+  },
+  {
+    "name": "Finset.card_mk",
+    "type": " {α : Type u_1} {m : Multiset α} {nodup : m.Nodup} : { val := m, nodup := nodup }.card = m.card",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": ""
+  },
+  {
+    "name": "Finset.card_ne_zero",
+    "type": " {α : Type u_1} {s : Finset α} : s.card ≠ 0 ↔ s.Nonempty",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": ""
+  },
+  {
+    "name": "List.toFinset_card_le",
+    "type": " {α : Type u_1} [DecidableEq α] (l : List α) : l.toFinset.card ≤ l.length",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": ""
+  },
+  {
+    "name": "Multiset.toFinset_card_le",
+    "type": " {α : Type u_1} [DecidableEq α] (m : Multiset α) : m.toFinset.card ≤ m.card",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": ""
+  },
+  {
+    "name": "Finset.Nonempty.card_pos",
+    "type": " {α : Type u_1} {s : Finset α} : s.Nonempty → 0 < s.card",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": "**Alias** of the reverse direction of `Finset.card_pos`."
+  },
+  {
+    "name": "Finset.card_pos",
+    "type": " {α : Type u_1} {s : Finset α} : 0 < s.card ↔ s.Nonempty",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": ""
+  },
+  {
+    "name": "Finset.card_singleton",
+    "type": " {α : Type u_1} (a : α) : {a}.card = 1",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": ""
+  },
+  {
+    "name": "Finset.one_le_card",
+    "type": " {α : Type u_1} {s : Finset α} : 1 ≤ s.card ↔ s.Nonempty",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": ""
+  },
+  {
+    "name": "Finset.one_lt_card_iff_nontrivial",
+    "type": " {α : Type u_1} {s : Finset α} : 1 < s.card ↔ s.Nontrivial",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": ""
+  },
+  {
+    "name": "Finset.card_erase_le",
+    "type": " {α : Type u_1} {s : Finset α} {a : α} [DecidableEq α] : (s.erase a).card ≤ s.card",
+    "module": "Mathlib.Data.Finset.Card",
+    "doc": ""
+  },
+  {
+    "name": "Finset.sum_val",
+    "type": " {M : Type u_3} [AddCommMonoid M] (s : Finset M) : s.val.sum = s.sum id",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.sum_multiset_singleton",
+    "type": " {ι : Type u_1} (s : Finset ι) : ∑ a ∈ s, {a} = s.val",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.sum_eq_multiset_sum",
+    "type": " {ι : Type u_1} {M : Type u_3} [AddCommMonoid M] (s : Finset ι) (f : ι → M) : ∑ x ∈ s, f x = (Multiset.map f s.val).sum",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.sum_map_val",
+    "type": " {ι : Type u_1} {M : Type u_3} [AddCommMonoid M] (s : Finset ι) (f : ι → M) : (Multiset.map f s.val).sum = ∑ a ∈ s, f a",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.sum_mk",
+    "type": " {ι : Type u_1} {M : Type u_3} [AddCommMonoid M] (s : Multiset ι) (hs : s.Nodup) (f : ι → M) : { val := s, nodup := hs }.sum f = (Multiset.map f s).sum",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.sum_empty'",
+    "type": " {ι : Type u_1} {M : Type u_3} [AddCommMonoid M] : ∅.sum = fun x => 0",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.op_sum",
+    "type": " {ι : Type u_1} {M : Type u_3} [AddCommMonoid M] (s : Finset ι) (f : ι → M) : MulOpposite.op (∑ x ∈ s, f x) = ∑ x ∈ s, MulOpposite.op (f x)",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": "Moving to the opposite additive commutative monoid commutes with summing. "
+  },
+  {
+    "name": "Finset.sum_empty",
+    "type": " {ι : Type u_1} {M : Type u_3} {f : ι → M} [AddCommMonoid M] : ∑ x ∈ ∅, f x = 0",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.sum_of_isEmpty",
+    "type": " {ι : Type u_1} {M : Type u_3} {f : ι → M} [AddCommMonoid M] [IsEmpty ι] (s : Finset ι) : ∑ i ∈ s, f i = 0",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.sum_range_zero",
+    "type": " {M : Type u_3} [AddCommMonoid M] (f : ℕ → M) : ∑ k ∈ Finset.range 0, f k = 0",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.unop_sum",
+    "type": " {ι : Type u_1} {M : Type u_3} [AddCommMonoid M] (s : Finset ι) (f : ι → Mᵐᵒᵖ) : MulOpposite.unop (∑ x ∈ s, f x) = ∑ x ∈ s, MulOpposite.unop (f x)",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Multiset.card_sum",
+    "type": " {ι : Type u_1} {α : Type u_6} (s : Finset ι) (f : ι → Multiset α) : (∑ i ∈ s, f i).card = ∑ i ∈ s, (f i).card",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.nonempty_of_sum_ne_zero",
+    "type": " {ι : Type u_1} {M : Type u_3} {s : Finset ι} {f : ι → M} [AddCommMonoid M] (h : ∑ x ∈ s, f x ≠ 0) : s.Nonempty",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Fintype.sum_empty",
+    "type": " {ι : Type u_1} {M : Type u_3} [Fintype ι] [AddCommMonoid M] [IsEmpty ι] (f : ι → M) : ∑ x, f x = 0",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.sum_toList",
+    "type": " {M : Type u_7} [AddCommMonoid M] (s : Finset M) : s.toList.sum = ∑ x ∈ s, x",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Function.Bijective.sum_comp",
+    "type": " {ι : Type u_1} {κ : Type u_2} {M : Type u_3} [Fintype ι] [Fintype κ] [AddCommMonoid M] {e : ι → κ} (he : Function.Bijective e) (g : κ → M) : ∑ i, g (e i) = ∑ i, g i",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Multiset.count_sum'",
+    "type": " {ι : Type u_1} {α : Type u_6} [DecidableEq α] {s : Finset ι} {a : α} {f : ι → Multiset α} : Multiset.count a (∑ x ∈ s, f x) = ∑ x ∈ s, Multiset.count a (f x)",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.sum_const_zero",
+    "type": " {ι : Type u_1} {M : Type u_3} {s : Finset ι} [AddCommMonoid M] : ∑ _x ∈ s, 0 = 0",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.sum_filter_count_eq_countP",
+    "type": " {ι : Type u_1} [DecidableEq ι] (p : ι → Prop) [DecidablePred p] (l : List ι) : ∑ x ∈ l.toFinset with p x, List.count x l = List.countP (fun b => decide (p b)) l",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.prod_val",
+    "type": " {M : Type u_3} [CommMonoid M] (s : Finset M) : s.val.prod = s.prod id",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.prod_eq_multiset_prod",
+    "type": " {ι : Type u_1} {M : Type u_3} [CommMonoid M] (s : Finset ι) (f : ι → M) : ∏ x ∈ s, f x = (Multiset.map f s.val).prod",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.prod_map_val",
+    "type": " {ι : Type u_1} {M : Type u_3} [CommMonoid M] (s : Finset ι) (f : ι → M) : (Multiset.map f s.val).prod = ∏ a ∈ s, f a",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.prod_mk",
+    "type": " {ι : Type u_1} {M : Type u_3} [CommMonoid M] (s : Multiset ι) (hs : s.Nodup) (f : ι → M) : { val := s, nodup := hs }.prod f = (Multiset.map f s).prod",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Multiset.toFinset_prod_dvd_prod",
+    "type": " {M : Type u_3} [DecidableEq M] [CommMonoid M] (S : Multiset M) : S.toFinset.prod id ∣ S.prod",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.prod_empty'",
+    "type": " {ι : Type u_1} {M : Type u_3} [CommMonoid M] : ∅.prod = fun x => 1",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": "Variant of `prod_empty` not applied to a function. "
+  },
+  {
+    "name": "Finset.op_prod",
+    "type": " {ι : Type u_1} {M : Type u_3} [CommMonoid M] (s : Finset ι) (f : ι → M) : AddOpposite.op (∏ i ∈ s, f i) = ∏ i ∈ s, AddOpposite.op (f i)",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.prod_empty",
+    "type": " {ι : Type u_1} {M : Type u_3} {f : ι → M} [CommMonoid M] : ∏ x ∈ ∅, f x = 1",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.prod_of_isEmpty",
+    "type": " {ι : Type u_1} {M : Type u_3} {f : ι → M} [CommMonoid M] [IsEmpty ι] (s : Finset ι) : ∏ i ∈ s, f i = 1",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.prod_range_zero",
+    "type": " {M : Type u_3} [CommMonoid M] (f : ℕ → M) : ∏ k ∈ Finset.range 0, f k = 1",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.unop_prod",
+    "type": " {ι : Type u_1} {M : Type u_3} [CommMonoid M] (s : Finset ι) (f : ι → Mᵐᵒᵖ) : AddOpposite.unop (∏ i ∈ s, f i) = ∏ i ∈ s, AddOpposite.unop (f i)",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.nonempty_of_prod_ne_one",
+    "type": " {ι : Type u_1} {M : Type u_3} {s : Finset ι} {f : ι → M} [CommMonoid M] (h : ∏ x ∈ s, f x ≠ 1) : s.Nonempty",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Fintype.prod_empty",
+    "type": " {ι : Type u_1} {M : Type u_3} [Fintype ι] [CommMonoid M] [IsEmpty ι] (f : ι → M) : ∏ x, f x = 1",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.prod_toList",
+    "type": " {M : Type u_7} [CommMonoid M] (s : Finset M) : s.toList.prod = ∏ x ∈ s, x",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Function.Bijective.prod_comp",
+    "type": " {ι : Type u_1} {κ : Type u_2} {M : Type u_3} [Fintype ι] [Fintype κ] [CommMonoid M] {e : ι → κ} (he : Function.Bijective e) (g : κ → M) : ∏ i, g (e i) = ∏ i, g i",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.prod_const_one",
+    "type": " {ι : Type u_1} {M : Type u_3} {s : Finset ι} [CommMonoid M] : ∏ _x ∈ s, 1 = 1",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.prod_dvd_prod_of_subset",
+    "type": " {ι : Type u_7} {M : Type u_8} [CommMonoid M] (s t : Finset ι) (f : ι → M) (h : s ⊆ t) : ∏ i ∈ s, f i ∣ ∏ i ∈ t, f i",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.prod_map_toList",
+    "type": " {ι : Type u_1} {M : Type u_3} [CommMonoid M] (s : Finset ι) (f : ι → M) : (List.map f s.toList).prod = s.prod f",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Finset.prod_map'",
+    "type": " {ι : Type u_1} {κ : Type u_2} {M : Type u_3} [CommMonoid M] (s : Finset ι) (e : ι ↪ κ) : (Finset.map e s).prod = fun f => ∏ x ∈ s, f (e x)",
+    "module": "Mathlib.Algebra.BigOperators.Group.Finset.Defs",
+    "doc": "Variant of `prod_map` not applied to a function. "
+  },
+  {
+    "name": "Finset.filter_true",
+    "type": " {α : Type u_1} {h : DecidablePred fun x => True} (s : Finset α) : {x ∈ s | True} = s",
+    "module": "Mathlib.Data.Finset.Filter",
+    "doc": ""
+  },
+  {
+    "name": "Finset.filter_subset",
+    "type": " {α : Type u_1} (p : α → Prop) [DecidablePred p] (s : Finset α) : Finset.filter p s ⊆ s",
+    "module": "Mathlib.Data.Finset.Filter",
+    "doc": ""
+  },
+  {
+    "name": "Finset.filter_false",
+    "type": " {α : Type u_1} {h : DecidablePred fun x => False} (s : Finset α) : {x ∈ s | False} = ∅",
+    "module": "Mathlib.Data.Finset.Filter",
+    "doc": ""
+  },
+  {
+    "name": "Finset.filter_empty",
+    "type": " {α : Type u_1} (p : α → Prop) [DecidablePred p] : Finset.filter p ∅ = ∅",
+    "module": "Mathlib.Data.Finset.Filter",
+    "doc": ""
+  },
+  {
+    "name": "Finset.filter_congr_decidable",
+    "type": " {α : Type u_1} (s : Finset α) (p : α → Prop) (h : DecidablePred p) [DecidablePred p] : Finset.filter p s = Finset.filter p s",
+    "module": "Mathlib.Data.Finset.Filter",
+    "doc": ""
+  },
+  {
+    "name": "Finset.filter_val",
+    "type": " {α : Type u_1} (p : α → Prop) [DecidablePred p] (s : Finset α) : (Finset.filter p s).val = Multiset.filter p s.val",
+    "module": "Mathlib.Data.Finset.Filter",
+    "doc": ""
+  },
+  {
+    "name": "Finset.monotone_filter_left",
+    "type": " {α : Type u_1} (p : α → Prop) [DecidablePred p] : Monotone (Finset.filter p)",
+    "module": "Mathlib.Data.Finset.Filter",
+    "doc": ""
+  },
+  {
+    "name": "Finset.filter_const",
+    "type": " {α : Type u_1} (p : Prop) [Decidable p] (s : Finset α) : {_a ∈ s | p} = if p then s else ∅",
+    "module": "Mathlib.Data.Finset.Filter",
+    "doc": ""
+  },
+  {
+    "name": "Finset.filter_subset_filter",
+    "type": " {α : Type u_1} (p : α → Prop) [DecidablePred p] {s t : Finset α} (h : s ⊆ t) : Finset.filter p s ⊆ Finset.filter p t",
+    "module": "Mathlib.Data.Finset.Filter",
+    "doc": ""
+  },
+  {
+    "name": "Finset.filter_true_of_mem",
+    "type": " {α : Type u_1} {p : α → Prop} [DecidablePred p] {s : Finset α} (h : ∀ x ∈ s, p x) : Finset.filter p s = s",
+    "module": "Mathlib.Data.Finset.Filter",
+    "doc": "If all elements of a `Finset` satisfy the predicate `p`, `s.filter p` is `s`. "
+  },
+  {
+    "name": "Finset.filter_eq_self",
+    "type": " {α : Type u_1} {p : α → Prop} [DecidablePred p] {s : Finset α} : Finset.filter p s = s ↔ ∀ x ∈ s, p x",
+    "module": "Mathlib.Data.Finset.Filter",
+    "doc": ""
+  },
+  {
+    "name": "Finset.filter_comm",
+    "type": " {α : Type u_1} (p q : α → Prop) [DecidablePred p] [DecidablePred q] (s : Finset α) : Finset.filter q (Finset.filter p s) = Finset.filter p (Finset.filter q s)",
+    "module": "Mathlib.Data.Finset.Filter",
+    "doc": ""
+  },
+  {
+    "name": "Finset.filter_nonempty_iff",
+    "type": " {α : Type u_1} {p : α → Prop} [DecidablePred p] {s : Finset α} : (Finset.filter p s).Nonempty ↔ ∃ a ∈ s, p a",
+    "module": "Mathlib.Data.Finset.Filter",
+    "doc": ""
+  },
+  {
+    "name": "Set.pairwiseDisjoint_filter",
+    "type": " {α : Type u_1} {β : Type u_2} [DecidableEq β] (f : α → β) (s : Set β) (t : Finset α) : s.PairwiseDisjoint fun x => {x_1 ∈ t | f x_1 = x}",
+    "module": "Mathlib.Data.Finset.Filter",
+    "doc": ""
+  },
+  {
+    "name": "Finset.filter_false_of_mem",
+    "type": " {α : Type u_1} {p : α → Prop} [DecidablePred p] {s : Finset α} (h : ∀ x ∈ s, ¬p x) : Finset.filter p s = ∅",
+    "module": "Mathlib.Data.Finset.Filter",
+    "doc": "If all elements of a `Finset` fail to satisfy the predicate `p`, `s.filter p` is `∅`. "
+  },
+  {
+    "name": "Finset.mem_of_mem_filter",
+    "type": " {α : Type u_1} {p : α → Prop} [DecidablePred p] {s : Finset α} (x : α) (h : x ∈ Finset.filter p s) : x ∈ s",
+    "module": "Mathlib.Data.Finset.Filter",
+    "doc": ""
+  },
+  {
+    "name": "Finset.filter_eq_empty_iff",
+    "type": " {α : Type u_1} {p : α → Prop} [DecidablePred p] {s : Finset α} : Finset.filter p s = ∅ ↔ ∀ ⦃x : α⦄, x ∈ s → ¬p x",
+    "module": "Mathlib.Data.Finset.Filter",
+    "doc": ""
+  },
+  {
+    "name": "Finset.filter_ssubset",
+    "type": " {α : Type u_1} {p : α → Prop} [DecidablePred p] {s : Finset α} : Finset.filter p s ⊂ s ↔ ∃ x ∈ s, ¬p x",
+    "module": "Mathlib.Data.Finset.Filter",
+    "doc": ""
+  },
+  {
+    "name": "Finset.coe_filter",
+    "type": " {α : Type u_1} (p : α → Prop) [DecidablePred p] (s : Finset α) : ↑(Finset.filter p s) = {x | x ∈ s ∧ p x}",
+    "module": "Mathlib.Data.Finset.Filter",
+    "doc": ""
+  },
+  {
+    "name": "orderOf",
+    "type": " {G : Type u_1} [Monoid G] (x : G) : ℕ",
+    "module": "Mathlib.GroupTheory.OrderOfElement",
+    "doc": "`orderOf x` is the order of the element `x`, i.e. the `n ≥ 1`, s.t. `x ^ n = 1` if it exists.\nOtherwise, i.e. if `x` is of infinite order, then `orderOf x` is `0` by convention. "
+  },
+  {
+    "name": "orderOf_le_card",
+    "type": " {G : Type u_1} [Monoid G] {x : G} [Finite G] : orderOf x ≤ Nat.card G",
+    "module": "Mathlib.GroupTheory.OrderOfElement",
+    "doc": ""
+  },
+  {
+    "name": "orderOf_le_card_univ",
+    "type": " {G : Type u_1} [Monoid G] {x : G} [Fintype G] : orderOf x ≤ Fintype.card G",
+    "module": "Mathlib.GroupTheory.OrderOfElement",
+    "doc": ""
+  },
+  {
+    "name": "orderOf_dvd_natCard",
+    "type": " {G : Type u_6} [Group G] (x : G) : orderOf x ∣ Nat.card G",
+    "module": "Mathlib.GroupTheory.OrderOfElement",
+    "doc": ""
+  },
+  {
+    "name": "Subsingleton.orderOf_eq",
+    "type": " {G : Type u_1} [Monoid G] [Subsingleton G] (x : G) : orderOf x = 1",
+    "module": "Mathlib.GroupTheory.OrderOfElement",
+    "doc": ""
+  },
+  {
+    "name": "orderOf_dvd_card",
+    "type": " {G : Type u_1} [Group G] [Fintype G] {x : G} : orderOf x ∣ Fintype.card G",
+    "module": "Mathlib.GroupTheory.OrderOfElement",
+    "doc": ""
+  },
+  {
+    "name": "orderOf_eq_zero",
+    "type": " {G : Type u_1} [Monoid G] {x : G} (h : ¬IsOfFinOrder x) : orderOf x = 0",
+    "module": "Mathlib.GroupTheory.OrderOfElement",
+    "doc": ""
+  },
+  {
+    "name": "orderOf_ne_zero_iff",
+    "type": " {G : Type u_1} [Monoid G] {x : G} : orderOf x ≠ 0 ↔ IsOfFinOrder x",
+    "module": "Mathlib.GroupTheory.OrderOfElement",
+    "doc": ""
+  },
+  {
+    "name": "orderOf_pos",
+    "type": " {G : Type u_1} [LeftCancelMonoid G] [Finite G] (x : G) : 0 < orderOf x",
+    "module": "Mathlib.GroupTheory.OrderOfElement",
+    "doc": "This is the same as `IsOfFinOrder.orderOf_pos` but with one fewer explicit assumption since this\nis automatic in case of a finite cancellative monoid. "
+  },
+  {
+    "name": "IsOfFinOrder.orderOf_pos",
+    "type": " {G : Type u_1} [Monoid G] {x : G} (h : IsOfFinOrder x) : 0 < orderOf x",
+    "module": "Mathlib.GroupTheory.OrderOfElement",
+    "doc": ""
+  },
+  {
+    "name": "orderOf_eq_zero_iff",
+    "type": " {G : Type u_1} [Monoid G] {x : G} : orderOf x = 0 ↔ ¬IsOfFinOrder x",
+    "module": "Mathlib.GroupTheory.OrderOfElement",
+    "doc": ""
+  },
+  {
+    "name": "orderOf_pos_iff",
+    "type": " {G : Type u_1} [Monoid G] {x : G} : 0 < orderOf x ↔ IsOfFinOrder x",
+    "module": "Mathlib.GroupTheory.OrderOfElement",
+    "doc": "A group element has finite order iff its order is positive. "
+  },
+  {
+    "name": "orderOf_units",
+    "type": " {G : Type u_1} [Monoid G] {y : Gˣ} : orderOf ↑y = orderOf y",
+    "module": "Mathlib.GroupTheory.OrderOfElement",
+    "doc": ""
+  },
+  {
+    "name": "IsUnit.orderOf_eq_one",
+    "type": " {G : Type u_1} [Monoid G] [Subsingleton Gˣ] {x : G} (h : IsUnit x) : orderOf x = 1",
+    "module": "Mathlib.GroupTheory.OrderOfElement",
+    "doc": ""
+  },
+  {
+    "name": "orderOf_one",
+    "type": " {G : Type u_1} [Monoid G] : orderOf 1 = 1",
+    "module": "Mathlib.GroupTheory.OrderOfElement",
+    "doc": ""
+  },
+  {
+    "name": "orderOf_pow_dvd",
+    "type": " {G : Type u_1} [Monoid G] {x : G} (n : ℕ) : orderOf (x ^ n) ∣ orderOf x",
+    "module": "Mathlib.GroupTheory.OrderOfElement",
+    "doc": ""
+  },
+  {
+    "name": "pow_injOn_Iio_orderOf",
+    "type": " {G : Type u_1} [Monoid G] {x : G} : Set.InjOn (fun x_1 => x ^ x_1) (Set.Iio (orderOf x))",
+    "module": "Mathlib.GroupTheory.OrderOfElement",
+    "doc": ""
+  },
+  {
+    "name": "IsOfFinOrder.mono",
+    "type": " {G : Type u_1} {β : Type u_5} [Monoid G] {x : G} [Monoid β] {y : β} (hx : IsOfFinOrder x) (h : orderOf y ∣ orderOf x) : IsOfFinOrder y",
+    "module": "Mathlib.GroupTheory.OrderOfElement",
+    "doc": ""
+  },
+  {
+    "name": "orderOf_fst_dvd_orderOf",
+    "type": " {α : Type u_4} {β : Type u_5} [Monoid α] [Monoid β] {x : α × β} : orderOf x.1 ∣ orderOf x",
+    "module": "Mathlib.GroupTheory.OrderOfElement",
+    "doc": ""
+  },
+  {
+    "name": "orderOf_snd_dvd_orderOf",
+    "type": " {α : Type u_4} {β : Type u_5} [Monoid α] [Monoid β] {x : α × β} : orderOf x.2 ∣ orderOf x",
+    "module": "Mathlib.GroupTheory.OrderOfElement",
+    "doc": ""
+  },
+  {
+    "name": "Nat.instAssociativeGcd",
+    "type": " : Std.Associative Nat.gcd",
+    "module": "Init.Data.Nat.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Nat.instCommutativeGcd",
+    "type": " : Std.Commutative Nat.gcd",
+    "module": "Init.Data.Nat.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Nat.instIdempotentOpGcd",
+    "type": " : Std.IdempotentOp Nat.gcd",
+    "module": "Init.Data.Nat.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Nat.gcd_self",
+    "type": " (n : ℕ) : n.gcd n = n",
+    "module": "Init.Data.Nat.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Nat.gcd_dvd_left",
+    "type": " (m n : ℕ) : m.gcd n ∣ m",
+    "module": "Init.Data.Nat.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Nat.gcd_dvd_right",
+    "type": " (m n : ℕ) : m.gcd n ∣ n",
+    "module": "Init.Data.Nat.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Nat.instLawfulIdentityGcdOfNat",
+    "type": " : Std.LawfulIdentity Nat.gcd 0",
+    "module": "Init.Data.Nat.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Nat.gcd_comm",
+    "type": " (m n : ℕ) : m.gcd n = n.gcd m",
+    "module": "Init.Data.Nat.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Nat.gcd_zero_left",
+    "type": " (y : ℕ) : Nat.gcd 0 y = y",
+    "module": "Init.Data.Nat.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Nat.gcd_zero_right",
+    "type": " (n : ℕ) : n.gcd 0 = n",
+    "module": "Init.Data.Nat.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Nat.gcd_gcd_self_left_left",
+    "type": " (m n : ℕ) : (m.gcd n).gcd m = m.gcd n",
+    "module": "Init.Data.Nat.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Nat.gcd_gcd_self_left_right",
+    "type": " (m n : ℕ) : (n.gcd m).gcd m = n.gcd m",
+    "module": "Init.Data.Nat.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Nat.gcd_gcd_self_right_left",
+    "type": " (m n : ℕ) : m.gcd (m.gcd n) = m.gcd n",
+    "module": "Init.Data.Nat.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Nat.gcd_gcd_self_right_right",
+    "type": " (m n : ℕ) : m.gcd (n.gcd m) = n.gcd m",
+    "module": "Init.Data.Nat.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Nat.gcd_eq_left",
+    "type": " {m n : ℕ} (H : m ∣ n) : m.gcd n = m",
+    "module": "Init.Data.Nat.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Nat.gcd_eq_right",
+    "type": " {m n : ℕ} (H : n ∣ m) : m.gcd n = n",
+    "module": "Init.Data.Nat.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Nat.gcd_assoc",
+    "type": " (m n k : ℕ) : (m.gcd n).gcd k = m.gcd (n.gcd k)",
+    "module": "Init.Data.Nat.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Nat.gcd_left_comm",
+    "type": " (m n k : ℕ) : m.gcd (n.gcd k) = n.gcd (m.gcd k)",
+    "module": "Init.Data.Nat.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Nat.gcd_eq_left_iff_dvd",
+    "type": " {m n : ℕ} : m.gcd n = m ↔ m ∣ n",
+    "module": "Init.Data.Nat.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Int.gcd",
+    "type": " (m n : ℤ) : ℕ",
+    "module": "Init.Data.Int.Gcd",
+    "doc": "Computes the greatest common divisor of two integers as a natural number. The GCD of two integers is\nthe largest natural number that evenly divides both. However, the GCD of a number and `0` is the\nnumber's absolute value.\n\nThis implementation uses `Nat.gcd`, which is overridden in both the kernel and the compiler to\nefficiently evaluate using arbitrary-precision arithmetic.\n\nExamples:\n* `Int.gcd 10 15 = 5`\n* `Int.gcd 10 (-15) = 5`\n* `Int.gcd (-6) (-9) = 3`\n* `Int.gcd 0 5 = 5`\n* `Int.gcd (-7) 0 = 7`\n"
+  },
+  {
+    "name": "Int.gcd_self",
+    "type": " {a : ℤ} : a.gcd a = a.natAbs",
+    "module": "Init.Data.Int.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Int.gcd_comm",
+    "type": " (a b : ℤ) : a.gcd b = b.gcd a",
+    "module": "Init.Data.Int.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Int.gcd_dvd_natAbs_left",
+    "type": " (a b : ℤ) : a.gcd b ∣ a.natAbs",
+    "module": "Init.Data.Int.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Int.gcd_dvd_natAbs_right",
+    "type": " (a b : ℤ) : a.gcd b ∣ b.natAbs",
+    "module": "Init.Data.Int.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Int.gcd_dvd_left",
+    "type": " (a b : ℤ) : ↑(a.gcd b) ∣ a",
+    "module": "Init.Data.Int.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Int.gcd_dvd_right",
+    "type": " (a b : ℤ) : ↑(a.gcd b) ∣ b",
+    "module": "Init.Data.Int.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Int.gcd_eq_natAbs_gcd_natAbs",
+    "type": " (m n : ℤ) : m.gcd n = m.natAbs.gcd n.natAbs",
+    "module": "Init.Data.Int.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Int.gcd_zero",
+    "type": " {a : ℤ} : a.gcd 0 = a.natAbs",
+    "module": "Init.Data.Int.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Int.gcd_zero_left",
+    "type": " (a : ℤ) : Int.gcd 0 a = a.natAbs",
+    "module": "Init.Data.Int.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Int.gcd_zero_right",
+    "type": " (a : ℤ) : a.gcd 0 = a.natAbs",
+    "module": "Init.Data.Int.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Int.zero_gcd",
+    "type": " {a : ℤ} : Int.gcd 0 a = a.natAbs",
+    "module": "Init.Data.Int.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Int.gcd_neg",
+    "type": " {a b : ℤ} : a.gcd (-b) = a.gcd b",
+    "module": "Init.Data.Int.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Int.neg_gcd",
+    "type": " {a b : ℤ} : (-a).gcd b = a.gcd b",
+    "module": "Init.Data.Int.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Int.gcd_eq_natAbs_left",
+    "type": " {a b : ℤ} (h : a ∣ b) : a.gcd b = a.natAbs",
+    "module": "Init.Data.Int.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Int.gcd_eq_natAbs_right",
+    "type": " {b a : ℤ} (h : b ∣ a) : a.gcd b = b.natAbs",
+    "module": "Init.Data.Int.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Int.gcd_eq_natAbs_left_iff_dvd",
+    "type": " {a b : ℤ} : a.gcd b = a.natAbs ↔ a ∣ b",
+    "module": "Init.Data.Int.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Int.gcd_eq_natAbs_right_iff_dvd",
+    "type": " {a b : ℤ} : a.gcd b = b.natAbs ↔ b ∣ a",
+    "module": "Init.Data.Int.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Int.gcd_gcd_self_left_left",
+    "type": " (m n : ℤ) : (↑(m.gcd n)).gcd m = m.gcd n",
+    "module": "Init.Data.Int.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "Int.gcd_gcd_self_left_right",
+    "type": " (m n : ℤ) : (↑(n.gcd m)).gcd m = n.gcd m",
+    "module": "Init.Data.Int.Gcd",
+    "doc": ""
+  },
+  {
+    "name": "IsCoprime",
+    "type": " {R : Type u} [CommSemiring R] (x y : R) : Prop",
+    "module": "Mathlib.RingTheory.Coprime.Basic",
+    "doc": "The proposition that `x` and `y` are coprime, defined to be the existence of `a` and `b` such\nthat `a * x + b * y = 1`. Note that elements with no common divisors are not necessarily coprime,\ne.g., the multivariate polynomials `x₁` and `x₂` are not coprime. "
+  },
+  {
+    "name": "IsCoprime.symm",
+    "type": " {R : Type u} [CommSemiring R] {x y : R} (H : IsCoprime x y) : IsCoprime y x",
+    "module": "Mathlib.RingTheory.Coprime.Basic",
+    "doc": ""
+  },
+  {
+    "name": "isCoprime_comm",
+    "type": " {R : Type u} [CommSemiring R] {x y : R} : IsCoprime x y ↔ IsCoprime y x",
+    "module": "Mathlib.RingTheory.Coprime.Basic",
+    "doc": ""
+  },
+  {
+    "name": "isCoprime_self",
+    "type": " {R : Type u} [CommSemiring R] {x : R} : IsCoprime x x ↔ IsUnit x",
+    "module": "Mathlib.RingTheory.Coprime.Basic",
+    "doc": ""
+  },
+  {
+    "name": "IsCoprime.isRelPrime",
+    "type": " {R : Type u} [CommSemiring R] {a b : R} (h : IsCoprime a b) : IsRelPrime a b",
+    "module": "Mathlib.RingTheory.Coprime.Basic",
+    "doc": ""
+  },
+  {
+    "name": "isCoprime_one_left",
+    "type": " {R : Type u} [CommSemiring R] {x : R} : IsCoprime 1 x",
+    "module": "Mathlib.RingTheory.Coprime.Basic",
+    "doc": ""
+  },
+  {
+    "name": "isCoprime_one_right",
+    "type": " {R : Type u} [CommSemiring R] {x : R} : IsCoprime x 1",
+    "module": "Mathlib.RingTheory.Coprime.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.isCoprime_iff",
+    "type": " {m n : ℕ} : IsCoprime m n ↔ m = 1 ∨ n = 1",
+    "module": "Mathlib.RingTheory.Coprime.Basic",
+    "doc": "`IsCoprime` is not a useful definition for `Nat`; consider using `Nat.Coprime` instead. "
+  },
+  {
+    "name": "IsCoprime.of_isCoprime_of_dvd_left",
+    "type": " {R : Type u} [CommSemiring R] {x y z : R} (h : IsCoprime y z) (hdvd : x ∣ y) : IsCoprime x z",
+    "module": "Mathlib.RingTheory.Coprime.Basic",
+    "doc": ""
+  },
+  {
+    "name": "IsCoprime.of_isCoprime_of_dvd_right",
+    "type": " {R : Type u} [CommSemiring R] {x y z : R} (h : IsCoprime z y) (hdvd : x ∣ y) : IsCoprime z x",
+    "module": "Mathlib.RingTheory.Coprime.Basic",
+    "doc": ""
+  },
+  {
+    "name": "IsCoprime.of_mul_left_left",
+    "type": " {R : Type u} [CommSemiring R] {x y z : R} (H : IsCoprime (x * y) z) : IsCoprime x z",
+    "module": "Mathlib.RingTheory.Coprime.Basic",
+    "doc": ""
+  },
+  {
+    "name": "IsCoprime.of_mul_left_right",
+    "type": " {R : Type u} [CommSemiring R] {x y z : R} (H : IsCoprime (x * y) z) : IsCoprime y z",
+    "module": "Mathlib.RingTheory.Coprime.Basic",
+    "doc": ""
+  },
+  {
+    "name": "IsCoprime.of_mul_right_left",
+    "type": " {R : Type u} [CommSemiring R] {x y z : R} (H : IsCoprime x (y * z)) : IsCoprime x y",
+    "module": "Mathlib.RingTheory.Coprime.Basic",
+    "doc": ""
+  },
+  {
+    "name": "IsCoprime.of_mul_right_right",
+    "type": " {R : Type u} [CommSemiring R] {x y z : R} (H : IsCoprime x (y * z)) : IsCoprime x z",
+    "module": "Mathlib.RingTheory.Coprime.Basic",
+    "doc": ""
+  },
+  {
+    "name": "isCoprime_zero_left",
+    "type": " {R : Type u} [CommSemiring R] {x : R} : IsCoprime 0 x ↔ IsUnit x",
+    "module": "Mathlib.RingTheory.Coprime.Basic",
+    "doc": ""
+  },
+  {
+    "name": "isCoprime_zero_right",
+    "type": " {R : Type u} [CommSemiring R] {x : R} : IsCoprime x 0 ↔ IsUnit x",
+    "module": "Mathlib.RingTheory.Coprime.Basic",
+    "doc": ""
+  },
+  {
+    "name": "IsCoprime.intCast",
+    "type": " {R : Type u_1} [CommRing R] {a b : ℤ} (h : IsCoprime a b) : IsCoprime ↑a ↑b",
+    "module": "Mathlib.RingTheory.Coprime.Basic",
+    "doc": ""
+  },
+  {
+    "name": "IsCoprime.isUnit_of_dvd",
+    "type": " {R : Type u} [CommSemiring R] {x y : R} (H : IsCoprime x y) (d : x ∣ y) : IsUnit x",
+    "module": "Mathlib.RingTheory.Coprime.Basic",
+    "doc": ""
+  },
+  {
+    "name": "IsCoprime.neg_left",
+    "type": " {R : Type u} [CommRing R] {x y : R} (h : IsCoprime x y) : IsCoprime (-x) y",
+    "module": "Mathlib.RingTheory.Coprime.Basic",
+    "doc": ""
+  },
+  {
+    "name": "IsCoprime.neg_right",
+    "type": " {R : Type u} [CommRing R] {x y : R} (h : IsCoprime x y) : IsCoprime x (-y)",
+    "module": "Mathlib.RingTheory.Coprime.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.instDecidableCoprime",
+    "type": " (m n : ℕ) : Decidable (m.Coprime n)",
+    "module": "Init.Data.Nat.Coprime",
+    "doc": ""
+  },
+  {
+    "name": "Nat.coprime_one_left",
+    "type": " (n : ℕ) : Nat.Coprime 1 n",
+    "module": "Init.Data.Nat.Coprime",
+    "doc": ""
+  },
+  {
+    "name": "Nat.coprime_one_right",
+    "type": " (n : ℕ) : n.Coprime 1",
+    "module": "Init.Data.Nat.Coprime",
+    "doc": ""
+  },
+  {
+    "name": "Nat.Coprime.symm",
+    "type": " {n m : ℕ} : n.Coprime m → m.Coprime n",
+    "module": "Init.Data.Nat.Coprime",
+    "doc": ""
+  },
+  {
+    "name": "Nat.coprime_comm",
+    "type": " {n m : ℕ} : n.Coprime m ↔ m.Coprime n",
+    "module": "Init.Data.Nat.Coprime",
+    "doc": ""
+  },
+  {
+    "name": "Nat.coprime_one_left_eq_true",
+    "type": " (n : ℕ) : Nat.Coprime 1 n = True",
+    "module": "Init.Data.Nat.Coprime",
+    "doc": ""
+  },
+  {
+    "name": "Nat.coprime_one_right_eq_true",
+    "type": " (n : ℕ) : n.Coprime 1 = True",
+    "module": "Init.Data.Nat.Coprime",
+    "doc": ""
+  },
+  {
+    "name": "Nat.Coprime.gcd_left",
+    "type": " {m n : ℕ} (k : ℕ) (hmn : m.Coprime n) : (k.gcd m).Coprime n",
+    "module": "Init.Data.Nat.Coprime",
+    "doc": ""
+  },
+  {
+    "name": "Nat.Coprime.gcd_right",
+    "type": " {m n : ℕ} (k : ℕ) (hmn : m.Coprime n) : m.Coprime (k.gcd n)",
+    "module": "Init.Data.Nat.Coprime",
+    "doc": ""
+  },
+  {
+    "name": "Nat.coprime_self",
+    "type": " (n : ℕ) : n.Coprime n ↔ n = 1",
+    "module": "Init.Data.Nat.Coprime",
+    "doc": ""
+  },
+  {
+    "name": "Nat.Coprime.coprime_dvd_left",
+    "type": " {m k n : ℕ} (H1 : m ∣ k) (H2 : k.Coprime n) : m.Coprime n",
+    "module": "Init.Data.Nat.Coprime",
+    "doc": ""
+  },
+  {
+    "name": "Nat.Coprime.coprime_dvd_right",
+    "type": " {n m k : ℕ} (H1 : n ∣ m) (H2 : k.Coprime m) : k.Coprime n",
+    "module": "Init.Data.Nat.Coprime",
+    "doc": ""
+  },
+  {
+    "name": "Nat.Coprime.gcd_both",
+    "type": " {m n : ℕ} (k l : ℕ) (hmn : m.Coprime n) : (k.gcd m).Coprime (l.gcd n)",
+    "module": "Init.Data.Nat.Coprime",
+    "doc": ""
+  },
+  {
+    "name": "Nat.Coprime.gcd_eq_one",
+    "type": " {m n : ℕ} : m.Coprime n → m.gcd n = 1",
+    "module": "Init.Data.Nat.Coprime",
+    "doc": ""
+  },
+  {
+    "name": "Nat.coprime_iff_gcd_eq_one",
+    "type": " {m n : ℕ} : m.Coprime n ↔ m.gcd n = 1",
+    "module": "Init.Data.Nat.Coprime",
+    "doc": ""
+  },
+  {
+    "name": "Nat.coprime_zero_left",
+    "type": " (n : ℕ) : Nat.Coprime 0 n ↔ n = 1",
+    "module": "Init.Data.Nat.Coprime",
+    "doc": ""
+  },
+  {
+    "name": "Nat.coprime_zero_right",
+    "type": " (n : ℕ) : n.Coprime 0 ↔ n = 1",
+    "module": "Init.Data.Nat.Coprime",
+    "doc": ""
+  },
+  {
+    "name": "Nat.Coprime.coprime_mul_left",
+    "type": " {k m n : ℕ} (H : (k * m).Coprime n) : m.Coprime n",
+    "module": "Init.Data.Nat.Coprime",
+    "doc": ""
+  },
+  {
+    "name": "Nat.Coprime.coprime_mul_left_right",
+    "type": " {m k n : ℕ} (H : m.Coprime (k * n)) : m.Coprime n",
+    "module": "Init.Data.Nat.Coprime",
+    "doc": ""
+  },
+  {
+    "name": "Nat.choose",
+    "type": " : ℕ → ℕ → ℕ",
+    "module": "Mathlib.Data.Nat.Choose.Basic",
+    "doc": "`choose n k` is the number of `k`-element subsets in an `n`-element set. Also known as binomial\ncoefficients. For the fact that this is the number of `k`-element-subsets of an `n`-element\nset, see `Finset.card_powersetCard`. "
+  },
+  {
+    "name": "Nat.choose_eq_fast_choose",
+    "type": " : Nat.choose = Nat.fast_choose",
+    "module": "Mathlib.Data.Nat.Choose.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.choose_mono",
+    "type": " (b : ℕ) : Monotone fun a => a.choose b",
+    "module": "Mathlib.Data.Nat.Choose.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.choose_one_right",
+    "type": " (n : ℕ) : n.choose 1 = n",
+    "module": "Mathlib.Data.Nat.Choose.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.choose_self",
+    "type": " (n : ℕ) : n.choose n = 1",
+    "module": "Mathlib.Data.Nat.Choose.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.choose_le_succ",
+    "type": " (a c : ℕ) : a.choose c ≤ a.succ.choose c",
+    "module": "Mathlib.Data.Nat.Choose.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.choose_succ_self",
+    "type": " (n : ℕ) : n.choose n.succ = 0",
+    "module": "Mathlib.Data.Nat.Choose.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.choose_zero_right",
+    "type": " (n : ℕ) : n.choose 0 = 1",
+    "module": "Mathlib.Data.Nat.Choose.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.choose_zero_succ",
+    "type": " (k : ℕ) : Nat.choose 0 k.succ = 0",
+    "module": "Mathlib.Data.Nat.Choose.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.choose_eq_zero_of_lt",
+    "type": " {n k : ℕ} : n < k → n.choose k = 0",
+    "module": "Mathlib.Data.Nat.Choose.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.choose_le_choose",
+    "type": " {a b : ℕ} (c : ℕ) (h : a ≤ b) : a.choose c ≤ b.choose c",
+    "module": "Mathlib.Data.Nat.Choose.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.choose_ne_zero",
+    "type": " {n k : ℕ} (h : k ≤ n) : n.choose k ≠ 0",
+    "module": "Mathlib.Data.Nat.Choose.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.choose_eq_zero_iff",
+    "type": " {n k : ℕ} : n.choose k = 0 ↔ n < k",
+    "module": "Mathlib.Data.Nat.Choose.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.choose_ne_zero_iff",
+    "type": " {n k : ℕ} : n.choose k ≠ 0 ↔ k ≤ n",
+    "module": "Mathlib.Data.Nat.Choose.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.choose_pos",
+    "type": " {n k : ℕ} : k ≤ n → 0 < n.choose k",
+    "module": "Mathlib.Data.Nat.Choose.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.choose_eq_descFactorial_div_factorial",
+    "type": " (n k : ℕ) : n.choose k = n.descFactorial k / k.factorial",
+    "module": "Mathlib.Data.Nat.Choose.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.descFactorial_eq_factorial_mul_choose",
+    "type": " (n k : ℕ) : n.descFactorial k = k.factorial * n.choose k",
+    "module": "Mathlib.Data.Nat.Choose.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.choose_le_add",
+    "type": " (a b c : ℕ) : a.choose c ≤ (a + b).choose c",
+    "module": "Mathlib.Data.Nat.Choose.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.choose_le_middle",
+    "type": " (r n : ℕ) : n.choose r ≤ n.choose (n / 2)",
+    "module": "Mathlib.Data.Nat.Choose.Basic",
+    "doc": "`choose n r` is maximised when `r` is `n/2`. "
+  },
+  {
+    "name": "Nat.choose_succ_succ",
+    "type": " (n k : ℕ) : n.succ.choose k.succ = n.choose k + n.choose k.succ",
+    "module": "Mathlib.Data.Nat.Choose.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.factorial",
+    "type": " : ℕ → ℕ",
+    "module": "Mathlib.Data.Nat.Factorial.Basic",
+    "doc": "`Nat.factorial n` is the factorial of `n`. "
+  },
+  {
+    "name": "Nat.factorial_eq_factorialBinarySplitting",
+    "type": " : Nat.factorial = Nat.factorialBinarySplitting",
+    "module": "Mathlib.Data.Nat.Factorial.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.self_le_factorial",
+    "type": " (n : ℕ) : n ≤ n.factorial",
+    "module": "Mathlib.Data.Nat.Factorial.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.descFactorial_self",
+    "type": " (n : ℕ) : n.descFactorial n = n.factorial",
+    "module": "Mathlib.Data.Nat.Factorial.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.factorial_ne_zero",
+    "type": " (n : ℕ) : n.factorial ≠ 0",
+    "module": "Mathlib.Data.Nat.Factorial.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.factorial_pos",
+    "type": " (n : ℕ) : 0 < n.factorial",
+    "module": "Mathlib.Data.Nat.Factorial.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.one_ascFactorial",
+    "type": " (k : ℕ) : Nat.ascFactorial 1 k = k.factorial",
+    "module": "Mathlib.Data.Nat.Factorial.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.factorial_one",
+    "type": " : Nat.factorial 1 = 1",
+    "module": "Mathlib.Data.Nat.Factorial.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.factorial_two",
+    "type": " : Nat.factorial 2 = 2",
+    "module": "Mathlib.Data.Nat.Factorial.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.factorial_zero",
+    "type": " : Nat.factorial 0 = 1",
+    "module": "Mathlib.Data.Nat.Factorial.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.factorial_dvd_factorial",
+    "type": " {m n : ℕ} (h : m ≤ n) : m.factorial ∣ n.factorial",
+    "module": "Mathlib.Data.Nat.Factorial.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.factorial_le",
+    "type": " {m n : ℕ} (h : m ≤ n) : m.factorial ≤ n.factorial",
+    "module": "Mathlib.Data.Nat.Factorial.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.lt_factorial_self",
+    "type": " {n : ℕ} (hi : 3 ≤ n) : n < n.factorial",
+    "module": "Mathlib.Data.Nat.Factorial.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.factorial_le_pow",
+    "type": " (n : ℕ) : n.factorial ≤ n ^ n",
+    "module": "Mathlib.Data.Nat.Factorial.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.factorial_eq_one",
+    "type": " {n : ℕ} : n.factorial = 1 ↔ n ≤ 1",
+    "module": "Mathlib.Data.Nat.Factorial.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.one_lt_factorial",
+    "type": " {n : ℕ} : 1 < n.factorial ↔ 1 < n",
+    "module": "Mathlib.Data.Nat.Factorial.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.dvd_factorial",
+    "type": " {m n : ℕ} : 0 < m → m ≤ n → m ∣ n.factorial",
+    "module": "Mathlib.Data.Nat.Factorial.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.factorial_inj",
+    "type": " {m n : ℕ} (hn : 1 < n) : n.factorial = m.factorial ↔ n = m",
+    "module": "Mathlib.Data.Nat.Factorial.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.factorial_lt_of_lt",
+    "type": " {m n : ℕ} (hn : 0 < n) (h : n < m) : n.factorial < m.factorial",
+    "module": "Mathlib.Data.Nat.Factorial.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.factorial_lt",
+    "type": " {m n : ℕ} (hn : 0 < n) : n.factorial < m.factorial ↔ n < m",
+    "module": "Mathlib.Data.Nat.Factorial.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Int.ModEq.instIsTrans",
+    "type": " {n : ℤ} : IsTrans ℤ n.ModEq",
+    "module": "Mathlib.Data.Int.ModEq",
+    "doc": ""
+  },
+  {
+    "name": "Int.ModEq.instRefl",
+    "type": " {n : ℤ} : Std.Refl n.ModEq",
+    "module": "Mathlib.Data.Int.ModEq",
+    "doc": ""
+  },
+  {
+    "name": "Int.ModEq.refl",
+    "type": " {n : ℤ} (a : ℤ) : a ≡ a [ZMOD n]",
+    "module": "Mathlib.Data.Int.ModEq",
+    "doc": ""
+  },
+  {
+    "name": "Int.ModEq.rfl",
+    "type": " {n a : ℤ} : a ≡ a [ZMOD n]",
+    "module": "Mathlib.Data.Int.ModEq",
+    "doc": ""
+  },
+  {
+    "name": "Int.instDecidableModEq",
+    "type": " {n a b : ℤ} : Decidable (a ≡ b [ZMOD n])",
+    "module": "Mathlib.Data.Int.ModEq",
+    "doc": ""
+  },
+  {
+    "name": "Int.modulus_modEq_zero",
+    "type": " {n : ℤ} : n ≡ 0 [ZMOD n]",
+    "module": "Mathlib.Data.Int.ModEq",
+    "doc": ""
+  },
+  {
+    "name": "Int.modEq_one",
+    "type": " {a b : ℤ} : a ≡ b [ZMOD 1]",
+    "module": "Mathlib.Data.Int.ModEq",
+    "doc": ""
+  },
+  {
+    "name": "Int.ModEq.symm",
+    "type": " {n a b : ℤ} : a ≡ b [ZMOD n] → b ≡ a [ZMOD n]",
+    "module": "Mathlib.Data.Int.ModEq",
+    "doc": ""
+  },
+  {
+    "name": "Int.modEq_comm",
+    "type": " {n a b : ℤ} : a ≡ b [ZMOD n] ↔ b ≡ a [ZMOD n]",
+    "module": "Mathlib.Data.Int.ModEq",
+    "doc": ""
+  },
+  {
+    "name": "AddCommGroup.modEq_iff_intModEq",
+    "type": " {a b z : ℤ} : a ≡ b [PMOD z] ↔ a ≡ b [ZMOD z]",
+    "module": "Mathlib.Data.Int.ModEq",
+    "doc": ""
+  },
+  {
+    "name": "AddCommGroup.modEq_iff_int_modEq",
+    "type": " {a b z : ℤ} : a ≡ b [PMOD z] ↔ a ≡ b [ZMOD z]",
+    "module": "Mathlib.Data.Int.ModEq",
+    "doc": "**Alias** of `AddCommGroup.modEq_iff_intModEq`."
+  },
+  {
+    "name": "Int.add_modEq_left",
+    "type": " {n a : ℤ} : n + a ≡ a [ZMOD n]",
+    "module": "Mathlib.Data.Int.ModEq",
+    "doc": ""
+  },
+  {
+    "name": "Int.add_modEq_right",
+    "type": " {n a : ℤ} : a + n ≡ a [ZMOD n]",
+    "module": "Mathlib.Data.Int.ModEq",
+    "doc": ""
+  },
+  {
+    "name": "Int.modEq_sub",
+    "type": " (a b : ℤ) : a ≡ b [ZMOD a - b]",
+    "module": "Mathlib.Data.Int.ModEq",
+    "doc": ""
+  },
+  {
+    "name": "Int.mod_modEq",
+    "type": " (a n : ℤ) : a % n ≡ a [ZMOD n]",
+    "module": "Mathlib.Data.Int.ModEq",
+    "doc": ""
+  },
+  {
+    "name": "Int.modEq_neg",
+    "type": " {n a b : ℤ} : a ≡ b [ZMOD -n] ↔ a ≡ b [ZMOD n]",
+    "module": "Mathlib.Data.Int.ModEq",
+    "doc": ""
+  },
+  {
+    "name": "Int.modEq_zero_iff",
+    "type": " {a b : ℤ} : a ≡ b [ZMOD 0] ↔ a = b",
+    "module": "Mathlib.Data.Int.ModEq",
+    "doc": ""
+  },
+  {
+    "name": "Dvd.dvd.modEq_zero_int",
+    "type": " {n a : ℤ} (h : n ∣ a) : a ≡ 0 [ZMOD n]",
+    "module": "Mathlib.Data.Int.ModEq",
+    "doc": ""
+  },
+  {
+    "name": "Dvd.dvd.zero_modEq_int",
+    "type": " {n a : ℤ} (h : n ∣ a) : 0 ≡ a [ZMOD n]",
+    "module": "Mathlib.Data.Int.ModEq",
+    "doc": ""
+  },
+  {
+    "name": "Nat.sqrt",
+    "type": " (n : ℕ) : ℕ",
+    "module": "Batteries.Data.Nat.Basic",
+    "doc": "Integer square root function. Implemented via Newton's method.\n"
+  },
+  {
+    "name": "Nat.sqrt_le_self",
+    "type": " (n : ℕ) : n.sqrt ≤ n",
+    "module": "Mathlib.Data.Nat.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Nat.sqrt_succ_le_succ_sqrt",
+    "type": " (n : ℕ) : n.succ.sqrt ≤ n.sqrt.succ",
+    "module": "Mathlib.Data.Nat.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Nat.sqrt_one",
+    "type": " : Nat.sqrt 1 = 1",
+    "module": "Mathlib.Data.Nat.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Nat.sqrt_two",
+    "type": " : Nat.sqrt 2 = 1",
+    "module": "Mathlib.Data.Nat.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Nat.sqrt_zero",
+    "type": " : Nat.sqrt 0 = 0",
+    "module": "Mathlib.Data.Nat.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Nat.sqrt_eq",
+    "type": " (n : ℕ) : (n * n).sqrt = n",
+    "module": "Mathlib.Data.Nat.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Nat.sqrt_le_sqrt",
+    "type": " {m n : ℕ} (h : m ≤ n) : m.sqrt ≤ n.sqrt",
+    "module": "Mathlib.Data.Nat.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Nat.sqrt_le",
+    "type": " (n : ℕ) : n.sqrt * n.sqrt ≤ n",
+    "module": "Mathlib.Data.Nat.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Nat.sqrt_lt_self",
+    "type": " {n : ℕ} (h : 1 < n) : n.sqrt < n",
+    "module": "Mathlib.Data.Nat.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Nat.lt_succ_sqrt",
+    "type": " (n : ℕ) : n < n.sqrt.succ * n.sqrt.succ",
+    "module": "Mathlib.Data.Nat.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Nat.le_three_of_sqrt_eq_one",
+    "type": " {n : ℕ} (h : n.sqrt = 1) : n ≤ 3",
+    "module": "Mathlib.Data.Nat.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Nat.sqrt_eq_zero",
+    "type": " {n : ℕ} : n.sqrt = 0 ↔ n = 0",
+    "module": "Mathlib.Data.Nat.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Nat.sqrt_eq'",
+    "type": " (n : ℕ) : (n ^ 2).sqrt = n",
+    "module": "Mathlib.Data.Nat.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Nat.sqrt_pos",
+    "type": " {n : ℕ} : 0 < n.sqrt ↔ 0 < n",
+    "module": "Mathlib.Data.Nat.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Nat.le_sqrt",
+    "type": " {m n : ℕ} : m ≤ n.sqrt ↔ m * m ≤ n",
+    "module": "Mathlib.Data.Nat.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Nat.sqrt_le'",
+    "type": " (n : ℕ) : n.sqrt ^ 2 ≤ n",
+    "module": "Mathlib.Data.Nat.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Nat.sqrt_lt",
+    "type": " {m n : ℕ} : m.sqrt < n ↔ m < n * n",
+    "module": "Mathlib.Data.Nat.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Nat.lt_succ_sqrt'",
+    "type": " (n : ℕ) : n < n.sqrt.succ ^ 2",
+    "module": "Mathlib.Data.Nat.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Nat.add_one_sqrt_le_of_ne_zero",
+    "type": " {n : ℕ} (hn : n ≠ 0) : (n + 1).sqrt ≤ n",
+    "module": "Mathlib.Data.Nat.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Int.sqrt",
+    "type": " (z : ℤ) : ℤ",
+    "module": "Mathlib.Data.Int.Sqrt",
+    "doc": "`sqrt z` is the square root of an integer `z`. If `z` is positive, it returns the largest\ninteger `r` such that `r * r ≤ n`. If it is negative, it returns `0`. For example, `sqrt (-1) = 0`,\n`sqrt 1 = 1`, `sqrt 2 = 1` "
+  },
+  {
+    "name": "Int.sqrt_nonneg",
+    "type": " (n : ℤ) : 0 ≤ Int.sqrt n",
+    "module": "Mathlib.Data.Int.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Int.sqrt_natCast",
+    "type": " (n : ℕ) : Int.sqrt ↑n = ↑n.sqrt",
+    "module": "Mathlib.Data.Int.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Int.sqrt_eq",
+    "type": " (n : ℤ) : Int.sqrt (n * n) = ↑n.natAbs",
+    "module": "Mathlib.Data.Int.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Int.sqrt_ofNat",
+    "type": " (n : ℕ) : Int.sqrt (OfNat.ofNat n) = ↑(OfNat.ofNat n).sqrt",
+    "module": "Mathlib.Data.Int.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Int.exists_mul_self",
+    "type": " (x : ℤ) : (∃ n, n * n = x) ↔ Int.sqrt x * Int.sqrt x = x",
+    "module": "Mathlib.Data.Int.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Rat.sqrt_intCast",
+    "type": " (z : ℤ) : Rat.sqrt ↑z = ↑(Int.sqrt z)",
+    "module": "Mathlib.Data.Rat.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Int.abs_le_sqrt",
+    "type": " {a b : ℤ} (hn : 0 ≤ b) : |a| ≤ Int.sqrt b ↔ a * a ≤ b",
+    "module": "Mathlib.Data.Int.Order.Lemmas",
+    "doc": ""
+  },
+  {
+    "name": "Int.abs_le_sqrt_iff_sq_le",
+    "type": " {a b : ℤ} (hn : 0 ≤ b) : |a| ≤ Int.sqrt b ↔ a ^ 2 ≤ b",
+    "module": "Mathlib.Data.Int.Order.Lemmas",
+    "doc": ""
+  },
+  {
+    "name": "Ring",
+    "type": " (R : Type u) : Type u",
+    "module": "Mathlib.Algebra.Ring.Defs",
+    "doc": "A `Ring` is a `Semiring` with negation making it an additive group. "
+  },
+  {
+    "name": "CommRing.toRing",
+    "type": " {α : Type u} [self : CommRing α] : Ring α",
+    "module": "Mathlib.Algebra.Ring.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Ring.toAddCommGroup",
+    "type": " {R : Type u} [self : Ring R] : AddCommGroup R",
+    "module": "Mathlib.Algebra.Ring.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Ring.toAddGroupWithOne",
+    "type": " {R : Type u} [self : Ring R] : AddGroupWithOne R",
+    "module": "Mathlib.Algebra.Ring.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Ring.toIntCast",
+    "type": " {R : Type u} [self : Ring R] : IntCast R",
+    "module": "Mathlib.Algebra.Ring.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Ring.toNeg",
+    "type": " {R : Type u} [self : Ring R] : Neg R",
+    "module": "Mathlib.Algebra.Ring.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Ring.toNonAssocRing",
+    "type": " {α : Type u} [Ring α] : NonAssocRing α",
+    "module": "Mathlib.Algebra.Ring.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Ring.toNonUnitalRing",
+    "type": " {α : Type u} [Ring α] : NonUnitalRing α",
+    "module": "Mathlib.Algebra.Ring.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Ring.toSemiring",
+    "type": " {R : Type u} [self : Ring R] : Semiring R",
+    "module": "Mathlib.Algebra.Ring.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Ring.toSub",
+    "type": " {R : Type u} [self : Ring R] : Sub R",
+    "module": "Mathlib.Algebra.Ring.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Ring.zsmul",
+    "type": " {R : Type u} [self : Ring R] : ℤ → R → R",
+    "module": "Mathlib.Algebra.Ring.Defs",
+    "doc": "Multiplication by an integer.\nSet this to `zsmulRec` unless `Module` diamonds are possible. "
+  },
+  {
+    "name": "IsMulCommutative.instCommRing",
+    "type": " {R : Type v} [Ring R] [IsMulCommutative R] : CommRing R",
+    "module": "Mathlib.Algebra.Ring.Defs",
+    "doc": "A `Ring` which `IsMulCommutative` is a `CommRing`.\n\nThis is primarily used to deduce the bundled version from the unbundled one for commutative\nsubobjects in a noncommutative ambient type. As such this is only available inside the\n`IsMulCommutative` scope so as to avoid deleterious effects to type class synthesis for bundled\ncommutativity.\n\nSee note [commutative subobjects]. "
+  },
+  {
+    "name": "Ring.intCast_ofNat",
+    "type": " {R : Type u} [self : Ring R] (n : ℕ) : IntCast.intCast ↑n = ↑n",
+    "module": "Mathlib.Algebra.Ring.Defs",
+    "doc": "The canonical homomorphism `ℤ → R` agrees with the one from `ℕ → R` on `ℕ`. "
+  },
+  {
+    "name": "Ring.zsmul_neg'",
+    "type": " {R : Type u} [self : Ring R] (n : ℕ) (a : R) : Ring.zsmul (Int.negSucc n) a = -Ring.zsmul (↑n.succ) a",
+    "module": "Mathlib.Algebra.Ring.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Ring.zsmul_zero'",
+    "type": " {R : Type u} [self : Ring R] (a : R) : Ring.zsmul 0 a = 0",
+    "module": "Mathlib.Algebra.Ring.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Ring.intCast_negSucc",
+    "type": " {R : Type u} [self : Ring R] (n : ℕ) : IntCast.intCast (Int.negSucc n) = -↑(n + 1)",
+    "module": "Mathlib.Algebra.Ring.Defs",
+    "doc": "The canonical homomorphism `ℤ → R` for negative values is just the negation of the values\nof the canonical homomorphism `ℕ → R`. "
+  },
+  {
+    "name": "Ring.sub_eq_add_neg",
+    "type": " {R : Type u} [self : Ring R] (a b : R) : a - b = a + -b",
+    "module": "Mathlib.Algebra.Ring.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Ring.zsmul_succ'",
+    "type": " {R : Type u} [self : Ring R] (n : ℕ) (a : R) : Ring.zsmul (↑n.succ) a = Ring.zsmul (↑n) a + a",
+    "module": "Mathlib.Algebra.Ring.Defs",
+    "doc": ""
+  },
+  {
+    "name": "CommRing.mk",
+    "type": " {α : Type u} [toRing : Ring α] (mul_comm : ∀ (a b : α), a * b = b * a) : CommRing α",
+    "module": "Mathlib.Algebra.Ring.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Ring.neg_add_cancel",
+    "type": " {R : Type u} [self : Ring R] (a : R) : -a + a = 0",
+    "module": "Mathlib.Algebra.Ring.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Field",
+    "type": " (K : Type u) : Type u",
+    "module": "Mathlib.Algebra.Field.Defs",
+    "doc": "A `Field` is a `CommRing` with multiplicative inverses for nonzero elements.\n\nAn instance of `Field K` includes maps `ratCast : ℚ → K` and `qsmul : ℚ → K → K`.\nThose two fields are needed to implement the `DivisionRing K → Algebra ℚ K` instance since we need\nto control the specific definitions for some special cases of `K` (in particular `K = ℚ` itself).\nSee also note [forgetful inheritance].\n\nIf the field has positive characteristic `p`, our division by zero convention forces\n`ratCast (1 / p) = 1 / 0 = 0`. "
+  },
+  {
+    "name": "Field.toCommRing",
+    "type": " {K : Type u} [self : Field K] : CommRing K",
+    "module": "Mathlib.Algebra.Field.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Field.toDiv",
+    "type": " {K : Type u} [self : Field K] : Div K",
+    "module": "Mathlib.Algebra.Field.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Field.toDivisionRing",
+    "type": " {K : Type u} [self : Field K] : DivisionRing K",
+    "module": "Mathlib.Algebra.Field.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Field.toInv",
+    "type": " {K : Type u} [self : Field K] : Inv K",
+    "module": "Mathlib.Algebra.Field.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Field.toNNRatCast",
+    "type": " {K : Type u} [self : Field K] : NNRatCast K",
+    "module": "Mathlib.Algebra.Field.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Field.toNontrivial",
+    "type": " {K : Type u} [self : Field K] : Nontrivial K",
+    "module": "Mathlib.Algebra.Field.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Field.toRatCast",
+    "type": " {K : Type u} [self : Field K] : RatCast K",
+    "module": "Mathlib.Algebra.Field.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Field.toSemifield",
+    "type": " {K : Type u_1} [Field K] : Semifield K",
+    "module": "Mathlib.Algebra.Field.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Field.nnqsmul",
+    "type": " {K : Type u} [self : Field K] : ℚ≥0 → K → K",
+    "module": "Mathlib.Algebra.Field.Defs",
+    "doc": "Scalar multiplication by a nonnegative rational number.\n\nUnless there is a risk of a `Module ℚ≥0 _` instance diamond, write `nnqsmul := _`. This will set\n`nnqsmul` to `(NNRat.cast · * ·)` thanks to unification in the default proof of `nnqsmul_def`.\n\nDo not use directly. Instead use the `•` notation. "
+  },
+  {
+    "name": "Field.qsmul",
+    "type": " {K : Type u} [self : Field K] : ℚ → K → K",
+    "module": "Mathlib.Algebra.Field.Defs",
+    "doc": "Scalar multiplication by a rational number.\n\nUnless there is a risk of a `Module ℚ _` instance diamond, write `qsmul := _`. This will set\n`qsmul` to `(Rat.cast · * ·)` thanks to unification in the default proof of `qsmul_def`.\n\nDo not use directly. Instead use the `•` notation. "
+  },
+  {
+    "name": "Field.zpow",
+    "type": " {K : Type u} [self : Field K] : ℤ → K → K",
+    "module": "Mathlib.Algebra.Field.Defs",
+    "doc": "The power operation: `a ^ n = a * ··· * a`; `a ^ (-n) = a⁻¹ * ··· a⁻¹` (`n` times) "
+  },
+  {
+    "name": "Field.zpow_neg'",
+    "type": " {K : Type u} [self : Field K] (n : ℕ) (a : K) : Field.zpow (Int.negSucc n) a = (Field.zpow (↑n.succ) a)⁻¹",
+    "module": "Mathlib.Algebra.Field.Defs",
+    "doc": "`a ^ -(n + 1) = (a ^ (n + 1))⁻¹` "
+  },
+  {
+    "name": "Field.zpow_zero'",
+    "type": " {K : Type u} [self : Field K] (a : K) : Field.zpow 0 a = 1",
+    "module": "Mathlib.Algebra.Field.Defs",
+    "doc": "`a ^ 0 = 1` "
+  },
+  {
+    "name": "Field.nnqsmul_def",
+    "type": " {K : Type u} [self : Field K] (q : ℚ≥0) (a : K) : Field.nnqsmul q a = ↑q * a",
+    "module": "Mathlib.Algebra.Field.Defs",
+    "doc": "However `qsmul` is defined, it must be propositionally equal to multiplication by `Rat.cast`.\n\nDo not use this lemma directly. Use `NNRat.smul_def` instead. "
+  },
+  {
+    "name": "Field.qsmul_def",
+    "type": " {K : Type u} [self : Field K] (a : ℚ) (x : K) : Field.qsmul a x = ↑a * x",
+    "module": "Mathlib.Algebra.Field.Defs",
+    "doc": "However `qsmul` is defined, it must be propositionally equal to multiplication by `Rat.cast`.\n\nDo not use this lemma directly. Use `Rat.cast_def` instead. "
+  },
+  {
+    "name": "Field.div_eq_mul_inv",
+    "type": " {K : Type u} [self : Field K] (a b : K) : a / b = a * b⁻¹",
+    "module": "Mathlib.Algebra.Field.Defs",
+    "doc": "`a / b := a * b⁻¹` "
+  },
+  {
+    "name": "Field.zpow_succ'",
+    "type": " {K : Type u} [self : Field K] (n : ℕ) (a : K) : Field.zpow (↑n.succ) a = Field.zpow (↑n) a * a",
+    "module": "Mathlib.Algebra.Field.Defs",
+    "doc": "`a ^ (n + 1) = a ^ n * a` "
+  },
+  {
+    "name": "Field.ratCast_def",
+    "type": " {K : Type u} [self : Field K] (q : ℚ) : ↑q = ↑q.num / ↑q.den",
+    "module": "Mathlib.Algebra.Field.Defs",
+    "doc": "However `Rat.cast q` is defined, it must be propositionally equal to `q.num / q.den`.\n\nDo not use this lemma directly. Use `Rat.cast_def` instead. "
+  },
+  {
+    "name": "Field.inv_zero",
+    "type": " {K : Type u} [self : Field K] : 0⁻¹ = 0",
+    "module": "Mathlib.Algebra.Field.Defs",
+    "doc": "The inverse of `0` is `0` by convention. "
+  },
+  {
+    "name": "Group",
+    "type": " (G : Type u) : Type u",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": "A `Group` is a `Monoid` with an operation `⁻¹` satisfying `a⁻¹ * a = 1`.\n\nThere is also a division operation `/` such that `a / b = a * b⁻¹`,\nwith a default so that `a / b = a * b⁻¹` holds by definition.\n\nUse `Group.ofLeftAxioms` or `Group.ofRightAxioms` to define a group structure\non a type with the minimum proof obligations.\n"
+  },
+  {
+    "name": "CommGroup.toGroup",
+    "type": " {G : Type u} [self : CommGroup G] : Group G",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Group.toCancelMonoid",
+    "type": " {G : Type u_1} [Group G] : CancelMonoid G",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Group.toDivInvMonoid",
+    "type": " {G : Type u} [self : Group G] : DivInvMonoid G",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Group.toDivisionMonoid",
+    "type": " {G : Type u_1} [Group G] : DivisionMonoid G",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "IsMulCommutative.instCommGroup",
+    "type": " {G : Type u_2} [Group G] [IsMulCommutative G] : CommGroup G",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": "A `Group` which `IsMulCommutative` is a `CommGroup`.\n\nThis is primarily used to deduce the bundled version from the unbundled one for commutative\nsubobjects in a noncommutative ambient type. As such this is only available inside the\n`IsMulCommutative` scope so as to avoid deleterious effects to type class synthesis for bundled\ncommutativity.\n\nSee note [commutative subobjects]. "
+  },
+  {
+    "name": "div_self'",
+    "type": " {G : Type u_1} [Group G] (a : G) : a / a = 1",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Group.mk",
+    "type": " {G : Type u} [toDivInvMonoid : DivInvMonoid G] (inv_mul_cancel : ∀ (a : G), a⁻¹ * a = 1) : Group G",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "div_mul_cancel",
+    "type": " {G : Type u_1} [Group G] (a b : G) : a / b * b = a",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "mul_div_cancel_right",
+    "type": " {G : Type u_1} [Group G] (a b : G) : a * b / b = a",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Group.inv_mul_cancel",
+    "type": " {G : Type u} [self : Group G] (a : G) : a⁻¹ * a = 1",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "CommGroup.mk",
+    "type": " {G : Type u} [toGroup : Group G] (mul_comm : ∀ (a b : G), a * b = b * a) : CommGroup G",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "inv_mul_cancel",
+    "type": " {G : Type u_1} [Group G] (a : G) : a⁻¹ * a = 1",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "mul_inv_cancel",
+    "type": " {G : Type u_1} [Group G] (a : G) : a * a⁻¹ = 1",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "inv_mul_cancel_left",
+    "type": " {G : Type u_1} [Group G] (a b : G) : a⁻¹ * (a * b) = b",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "inv_mul_cancel_right",
+    "type": " {G : Type u_1} [Group G] (a b : G) : a * b⁻¹ * b = a",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "mul_inv_cancel_left",
+    "type": " {G : Type u_1} [Group G] (a b : G) : a * (a⁻¹ * b) = b",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "mul_inv_cancel_right",
+    "type": " {G : Type u_1} [Group G] (a b : G) : a * b * b⁻¹ = a",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "SemiconjBy.conj_mk",
+    "type": " {G : Type u_3} [Group G] (a x : G) : SemiconjBy a x (a * x * a⁻¹)",
+    "module": "Mathlib.Algebra.Group.Semiconj.Defs",
+    "doc": "`a` semiconjugates `x` to `a * x * a⁻¹`. "
+  },
+  {
+    "name": "SemiconjBy.conj_iff",
+    "type": " {G : Type u_3} [Group G] {a x y b : G} : SemiconjBy (b * a * b⁻¹) (b * x * b⁻¹) (b * y * b⁻¹) ↔ SemiconjBy a x y",
+    "module": "Mathlib.Algebra.Group.Semiconj.Defs",
+    "doc": ""
+  },
+  {
+    "name": "CommGroup",
+    "type": " (G : Type u) : Type u",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": "A commutative group is a group with commutative `(*)`. "
+  },
+  {
+    "name": "CommGroup.toCancelCommMonoid",
+    "type": " {G : Type u_1} [CommGroup G] : CancelCommMonoid G",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "CommGroup.toCommMonoid",
+    "type": " {G : Type u} [self : CommGroup G] : CommMonoid G",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "CommGroup.toDivisionCommMonoid",
+    "type": " {G : Type u_1} [CommGroup G] : DivisionCommMonoid G",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "CommGroup.mul_comm",
+    "type": " {G : Type u} [self : CommGroup G] (a b : G) : a * b = b * a",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": "Multiplication is commutative in a commutative multiplicative magma. "
+  },
+  {
+    "name": "inv_mul_cancel_comm",
+    "type": " {G : Type u_1} [CommGroup G] (a b : G) : a⁻¹ * b * a = b",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "inv_mul_cancel_comm_assoc",
+    "type": " {G : Type u_1} [CommGroup G] (a b : G) : a⁻¹ * (b * a) = b",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "mul_inv_cancel_comm",
+    "type": " {G : Type u_1} [CommGroup G] (a b : G) : a * b * a⁻¹ = b",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "mul_inv_cancel_comm_assoc",
+    "type": " {G : Type u_1} [CommGroup G] (a b : G) : a * (b * a⁻¹) = b",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Pi.commGroup",
+    "type": " {I : Type u} {f : I → Type v₁} [(i : I) → CommGroup (f i)] : CommGroup ((i : I) → f i)",
+    "module": "Mathlib.Algebra.Group.Pi.Basic",
+    "doc": ""
+  },
+  {
+    "name": "const_div_involutive",
+    "type": " {G : Type u_3} [CommGroup G] (a : G) : Function.Involutive fun x => a / x",
+    "module": "Mathlib.Algebra.Group.Basic",
+    "doc": ""
+  },
+  {
+    "name": "div_div_cancel",
+    "type": " {G : Type u_3} [CommGroup G] (a b : G) : a / (a / b) = b",
+    "module": "Mathlib.Algebra.Group.Basic",
+    "doc": ""
+  },
+  {
+    "name": "div_div_self'",
+    "type": " {G : Type u_3} [CommGroup G] (a b : G) : a / (a / b) = b",
+    "module": "Mathlib.Algebra.Group.Basic",
+    "doc": ""
+  },
+  {
+    "name": "div_eq_iff_comm",
+    "type": " {G : Type u_3} [CommGroup G] {a b c : G} : a / b = c ↔ a / c = b",
+    "module": "Mathlib.Algebra.Group.Basic",
+    "doc": ""
+  },
+  {
+    "name": "mul_div_cancel",
+    "type": " {G : Type u_3} [CommGroup G] (a b : G) : a * (b / a) = b",
+    "module": "Mathlib.Algebra.Group.Basic",
+    "doc": ""
+  },
+  {
+    "name": "mul_div_cancel_left",
+    "type": " {G : Type u_3} [CommGroup G] (a b : G) : a * b / a = b",
+    "module": "Mathlib.Algebra.Group.Basic",
+    "doc": ""
+  },
+  {
+    "name": "div_eq_of_eq_mul'",
+    "type": " {G : Type u_3} [CommGroup G] {a b c : G} (h : a = b * c) : a / b = c",
+    "module": "Mathlib.Algebra.Group.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Monoid",
+    "type": " (M : Type u) : Type u",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": "A `Monoid` is a `Semigroup` with an element `1` such that `1 * a = a * 1 = a`. "
+  },
+  {
+    "name": "IsMulTorsionFree",
+    "type": " (M : Type u_2) [Monoid M] : Prop",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": "A monoid is torsion-free if power by every non-zero element `n : ℕ` is injective. "
+  },
+  {
+    "name": "CommMonoid.toMonoid",
+    "type": " {M : Type u} [self : CommMonoid M] : Monoid M",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "DivInvMonoid.toMonoid",
+    "type": " {G : Type u} [self : DivInvMonoid G] : Monoid G",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "LeftCancelMonoid.toMonoid",
+    "type": " {M : Type u} [self : LeftCancelMonoid M] : Monoid M",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Monoid.toMulOneClass",
+    "type": " {M : Type u} [self : Monoid M] : MulOneClass M",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Monoid.toOne",
+    "type": " {M : Type u} [self : Monoid M] : One M",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Monoid.toSemigroup",
+    "type": " {M : Type u} [self : Monoid M] : Semigroup M",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "RightCancelMonoid.toMonoid",
+    "type": " {M : Type u} [self : RightCancelMonoid M] : Monoid M",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Monoid.npow",
+    "type": " {M : Type u} [self : Monoid M] : ℕ → M → M",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": "Raising to the power of a natural number. "
+  },
+  {
+    "name": "Monoid.toPow",
+    "type": " {M : Type u_2} [Monoid M] : Pow M ℕ",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "DivInvMonoid.div'",
+    "type": " {G : Type u} [Monoid G] [Inv G] (a b : G) : G",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": "In a class equipped with instances of both `Monoid` and `Inv`, this definition records what the\ndefault definition for `Div` would be: `a * b⁻¹`.  This is later provided as the default value for\nthe `Div` instance in `DivInvMonoid`.\n\nWe keep it as a separate definition rather than inlining it in `DivInvMonoid` so that the `Div`\nfield of individual `DivInvMonoid`s constructed using that default value will not be unfolded at\n`.instance` transparency. "
+  },
+  {
+    "name": "LeftCancelMonoid.mk",
+    "type": " {M : Type u} [toMonoid : Monoid M] [toIsLeftCancelMul : IsLeftCancelMul M] : LeftCancelMonoid M",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "RightCancelMonoid.mk",
+    "type": " {M : Type u} [toMonoid : Monoid M] [toIsRightCancelMul : IsRightCancelMul M] : RightCancelMonoid M",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "IsMulCommutative.instCommMonoid",
+    "type": " {M : Type u_2} [Monoid M] [IsMulCommutative M] : CommMonoid M",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": "A `Monoid` which `IsMulCommutative` is a `CommMonoid`.\n\nThis is primarily used to deduce the bundled version from the unbundled one for commutative\nsubobjects in a noncommutative ambient type. As such this is only available inside the\n`IsMulCommutative` scope so as to avoid deleterious effects to type class synthesis for bundled\ncommutativity.\n\nSee note [commutative subobjects]. "
+  },
+  {
+    "name": "instIsDedekindFiniteMonoidOfIsLeftCancelMul",
+    "type": " (M : Type u_2) [Monoid M] [IsLeftCancelMul M] : IsDedekindFiniteMonoid M",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "instIsDedekindFiniteMonoidOfIsRightCancelMul",
+    "type": " (M : Type u_2) [Monoid M] [IsRightCancelMul M] : IsDedekindFiniteMonoid M",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "pow_one",
+    "type": " {M : Type u_2} [Monoid M] (a : M) : a ^ 1 = a",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Monoid.npow_zero",
+    "type": " {M : Type u} [self : Monoid M] (x : M) : Monoid.npow 0 x = 1",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": "Raising to the power `(0 : ℕ)` gives `1`. "
+  },
+  {
+    "name": "npow_eq_pow",
+    "type": " {M : Type u_2} [Monoid M] (n : ℕ) (x : M) : Monoid.npow n x = x ^ n",
+    "module": "Mathlib.Algebra.Group.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Function.Injective",
+    "type": " {α : Sort u_1} {β : Sort u_2} (f : α → β) : Prop",
+    "module": "Init.Data.Function",
+    "doc": "A function `f : α → β` is called injective if `f x = f y` implies `x = y`. "
+  },
+  {
+    "name": "Function.injective_id",
+    "type": " {α : Sort u_1} : Function.Injective id",
+    "module": "Init.Data.Function",
+    "doc": ""
+  },
+  {
+    "name": "Function.HasLeftInverse.injective",
+    "type": " {α : Sort u_1} {β : Sort u_2} {f : α → β} : Function.HasLeftInverse f → Function.Injective f",
+    "module": "Init.Data.Function",
+    "doc": ""
+  },
+  {
+    "name": "Function.LeftInverse.injective",
+    "type": " {α : Sort u_1} {β : Sort u_2} {g : β → α} {f : α → β} : Function.LeftInverse g f → Function.Injective f",
+    "module": "Init.Data.Function",
+    "doc": ""
+  },
+  {
+    "name": "Function.rightInverse_of_injective_of_leftInverse",
+    "type": " {α : Sort u_1} {β : Sort u_2} {f : α → β} {g : β → α} (injf : Function.Injective f) (lfg : Function.LeftInverse f g) : Function.RightInverse f g",
+    "module": "Init.Data.Function",
+    "doc": ""
+  },
+  {
+    "name": "Function.Injective.ne",
+    "type": " {α : Sort u_1} {β : Sort u_2} {f : α → β} (hf : Function.Injective f) {a₁ a₂ : α} : a₁ ≠ a₂ → f a₁ ≠ f a₂",
+    "module": "Init.Data.Function",
+    "doc": ""
+  },
+  {
+    "name": "Function.Injective.eq_iff",
+    "type": " {α : Sort u_1} {β : Sort u_2} {f : α → β} (I : Function.Injective f) {a b : α} : f a = f b ↔ a = b",
+    "module": "Init.Data.Function",
+    "doc": ""
+  },
+  {
+    "name": "Function.Injective.ne_iff",
+    "type": " {α : Sort u_1} {β : Sort u_2} {f : α → β} (hf : Function.Injective f) {x y : α} : f x ≠ f y ↔ x ≠ y",
+    "module": "Init.Data.Function",
+    "doc": ""
+  },
+  {
+    "name": "Function.Injective.comp",
+    "type": " {α : Sort u_1} {β : Sort u_2} {γ : Sort u_3} {g : β → γ} {f : α → β} (hg : Function.Injective g) (hf : Function.Injective f) : Function.Injective (g ∘ f)",
+    "module": "Init.Data.Function",
+    "doc": ""
+  },
+  {
+    "name": "Function.Injective.eq_iff'",
+    "type": " {α : Sort u_1} {β : Sort u_2} {f : α → β} (I : Function.Injective f) {a b : α} {c : β} (h : f b = c) : f a = c ↔ a = b",
+    "module": "Init.Data.Function",
+    "doc": ""
+  },
+  {
+    "name": "Function.Injective.ne_iff'",
+    "type": " {α : Sort u_1} {β : Sort u_2} {f : α → β} (hf : Function.Injective f) {x y : α} {z : β} (h : f y = z) : f x ≠ z ↔ x ≠ y",
+    "module": "Init.Data.Function",
+    "doc": ""
+  },
+  {
+    "name": "Lean.Grind.leftInv",
+    "type": " {α : Sort u} {β : Sort v} (f : α → β) (hf : Function.Injective f) [Nonempty α] : β → α",
+    "module": "Init.Grind.Injective",
+    "doc": ""
+  },
+  {
+    "name": "Function.Injective.leftInverse",
+    "type": " {α : Sort u_1} {β : Sort u_2} (f : α → β) (hf : Function.Injective f) [hα : Nonempty α] : ∃ g, Function.LeftInverse g f",
+    "module": "Init.Grind.Injective",
+    "doc": ""
+  },
+  {
+    "name": "Lean.Grind.leftInv_eq",
+    "type": " {α : Sort u} {β : Sort v} (f : α → β) (hf : Function.Injective f) [Nonempty α] (a : α) : f⁻¹ (f a) = a",
+    "module": "Init.Grind.Injective",
+    "doc": ""
+  },
+  {
+    "name": "Char.ofOrdinal_injective",
+    "type": " : Function.Injective Char.ofOrdinal",
+    "module": "Init.Data.Char.Ordinal",
+    "doc": ""
+  },
+  {
+    "name": "Char.ordinal_injective",
+    "type": " : Function.Injective Char.ordinal",
+    "module": "Init.Data.Char.Ordinal",
+    "doc": ""
+  },
+  {
+    "name": "List.prefix_map_iff_of_injective",
+    "type": " {α : Type u_1} {β : Type u_2} {l₁ l₂ : List α} {f : α → β} (hf : Function.Injective f) : List.map f l₁ <+: List.map f l₂ ↔ l₁ <+: l₂",
+    "module": "Init.Data.List.Nat.Sublist",
+    "doc": ""
+  },
+  {
+    "name": "List.suffix_map_iff_of_injective",
+    "type": " {α : Type u_1} {β : Type u_2} {l₁ l₂ : List α} {f : α → β} (hf : Function.Injective f) : List.map f l₁ <:+ List.map f l₂ ↔ l₁ <:+ l₂",
+    "module": "Init.Data.List.Nat.Sublist",
+    "doc": ""
+  },
+  {
+    "name": "Option.map_injective",
+    "type": " {α : Type u_1} {β : Type u_2} {f : α → β} (hf : Function.Injective f) : Function.Injective (Option.map f)",
+    "module": "Init.Data.Option.Function",
+    "doc": ""
+  },
+  {
+    "name": "Std.PRange.UpwardEnumerable.Map.injective",
+    "type": " {α : Type u} {β : Type v} [Std.PRange.UpwardEnumerable α] [Std.PRange.UpwardEnumerable β] (self : Std.PRange.UpwardEnumerable.Map α β) : Function.Injective self.toFun",
+    "module": "Init.Data.Range.Polymorphic.Map",
+    "doc": ""
+  },
+  {
+    "name": "Function.Bijective",
+    "type": " {α : Sort u₁} {β : Sort u₂} (f : α → β) : Prop",
+    "module": "Mathlib.Logic.Function.Defs",
+    "doc": "A function is called bijective if it is both injective and surjective. "
+  },
+  {
+    "name": "Function.bijective_id",
+    "type": " {α : Sort u₁} : Function.Bijective id",
+    "module": "Mathlib.Logic.Function.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Function.Bijective.comp",
+    "type": " {α : Sort u₁} {β : Sort u₂} {φ : Sort u₃} {g : β → φ} {f : α → β} : Function.Bijective g → Function.Bijective f → Function.Bijective (g ∘ f)",
+    "module": "Mathlib.Logic.Function.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Function.not_bijective",
+    "type": " : Function.Bijective Not",
+    "module": "Mathlib.Logic.Function.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Function.bijective_of_subsingleton",
+    "type": " {α : Sort u_1} [Subsingleton α] (f : α → α) : Function.Bijective f",
+    "module": "Mathlib.Logic.Function.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Function.Involutive.bijective",
+    "type": " {α : Sort u} {f : α → α} (h : Function.Involutive f) : Function.Bijective f",
+    "module": "Mathlib.Logic.Function.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Function.Bijective.injective",
+    "type": " {α : Sort u_1} {β : Sort u_2} {f : α → β} (hf : Function.Bijective f) : Function.Injective f",
+    "module": "Mathlib.Logic.Function.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Function.Bijective.surjective",
+    "type": " {α : Sort u_1} {β : Sort u_2} {f : α → β} (hf : Function.Bijective f) : Function.Surjective f",
+    "module": "Mathlib.Logic.Function.Basic",
+    "doc": ""
+  },
+  {
+    "name": "cast_bijective",
+    "type": " {α β : Sort u_3} (h : α = β) : Function.Bijective (cast h)",
+    "module": "Mathlib.Logic.Function.Basic",
+    "doc": ""
+  },
+  {
+    "name": "eq_mp_bijective",
+    "type": " {α β : Sort u_3} (h : α = β) : Function.Bijective h.mp",
+    "module": "Mathlib.Logic.Function.Basic",
+    "doc": ""
+  },
+  {
+    "name": "eq_mpr_bijective",
+    "type": " {α β : Sort u_3} (h : α = β) : Function.Bijective h.mpr",
+    "module": "Mathlib.Logic.Function.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Function.Bijective.existsUnique",
+    "type": " {α : Sort u_1} {β : Sort u_2} {f : α → β} (hf : Function.Bijective f) (b : β) : ∃! a, f a = b",
+    "module": "Mathlib.Logic.Function.Basic",
+    "doc": "Shorthand for using projection notation with `Function.bijective_iff_existsUnique`. "
+  },
+  {
+    "name": "Function.bijective_iff_existsUnique",
+    "type": " {α : Sort u_1} {β : Sort u_2} (f : α → β) : Function.Bijective f ↔ ∀ (b : β), ∃! a, f a = b",
+    "module": "Mathlib.Logic.Function.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Function.Bijective.comp_left",
+    "type": " {α : Sort u} {β : Sort v} {γ : Sort w} {g : β → γ} (hg : Function.Bijective g) : Function.Bijective fun x => g ∘ x",
+    "module": "Mathlib.Logic.Function.Basic",
+    "doc": "Composition by a bijective function on the left is itself bijective. "
+  },
+  {
+    "name": "Function.Bijective.comp_right",
+    "type": " {α : Sort u_1} {β : Sort u_2} {γ : Sort u_3} {f : α → β} (hf : Function.Bijective f) : Function.Bijective fun g => g ∘ f",
+    "module": "Mathlib.Logic.Function.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Function.Bijective.existsUnique_iff",
+    "type": " {α : Sort u_1} {β : Sort u_2} {f : α → β} (hf : Function.Bijective f) {p : β → Prop} : (∃! y, p y) ↔ ∃! x, p (f x)",
+    "module": "Mathlib.Logic.Function.Basic",
+    "doc": ""
+  },
+  {
+    "name": "eq_rec_on_bijective",
+    "type": " {α : Sort u_1} {C : α → Sort u_3} {a a' : α} (h : a = a') : Function.Bijective fun x => h ▸ x",
+    "module": "Mathlib.Logic.Function.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Function.bijective_iff_has_inverse",
+    "type": " {α : Sort u} {β : Sort v} {f : α → β} : Function.Bijective f ↔ ∃ g, Function.LeftInverse g f ∧ Function.RightInverse g f",
+    "module": "Mathlib.Logic.Function.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Function.Bijective.of_comp_iff",
+    "type": " {α : Sort u_1} {β : Sort u_2} {γ : Sort u_3} (f : α → β) {g : γ → α} (hg : Function.Bijective g) : Function.Bijective (f ∘ g) ↔ Function.Bijective f",
+    "module": "Mathlib.Logic.Function.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Function.Bijective.of_comp_iff'",
+    "type": " {α : Sort u_1} {β : Sort u_2} {γ : Sort u_3} {f : α → β} (hf : Function.Bijective f) (g : γ → α) : Function.Bijective (f ∘ g) ↔ Function.Bijective g",
+    "module": "Mathlib.Logic.Function.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Equiv",
+    "type": " (α : Sort u_1) (β : Sort u_2) : Sort (max (max 1 u_1) u_2)",
+    "module": "Mathlib.Logic.Equiv.Defs",
+    "doc": "`α ≃ β` is the type of functions from `α → β` with a two-sided inverse. "
+  },
+  {
+    "name": "Equiv.propEquivBool",
+    "type": " : Prop ≃ Bool",
+    "module": "Mathlib.Logic.Equiv.Defs",
+    "doc": "`Prop` is noncomputably equivalent to `Bool`. "
+  },
+  {
+    "name": "Equiv.punitEquivPUnit",
+    "type": " : PUnit.{v} ≃ PUnit.{w}",
+    "module": "Mathlib.Logic.Equiv.Defs",
+    "doc": "`PUnit` sorts in any two universes are equivalent. "
+  },
+  {
+    "name": "Equiv.refl",
+    "type": " (α : Sort u_1) : α ≃ α",
+    "module": "Mathlib.Logic.Equiv.Defs",
+    "doc": "Any type is equivalent to itself. "
+  },
+  {
+    "name": "Equiv.arrowPUnitEquivPUnit",
+    "type": " (α : Sort u_1) : (α → PUnit.{v}) ≃ PUnit.{w}",
+    "module": "Mathlib.Logic.Equiv.Defs",
+    "doc": "The sort of maps to `PUnit.{v}` is equivalent to `PUnit.{w}`. "
+  },
+  {
+    "name": "Equiv.emptyArrowEquivPUnit",
+    "type": " (α : Sort u_1) : (Empty → α) ≃ PUnit.{u}",
+    "module": "Mathlib.Logic.Equiv.Defs",
+    "doc": "The sort of maps from `Empty` is equivalent to `PUnit`. "
+  },
+  {
+    "name": "Equiv.falseArrowEquivPUnit",
+    "type": " (α : Sort u_1) : (False → α) ≃ PUnit.{u}",
+    "module": "Mathlib.Logic.Equiv.Defs",
+    "doc": "The sort of maps from `False` is equivalent to `PUnit`. "
+  },
+  {
+    "name": "Equiv.inhabited'",
+    "type": " {α : Sort u} : Inhabited (α ≃ α)",
+    "module": "Mathlib.Logic.Equiv.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Equiv.pemptyArrowEquivPUnit",
+    "type": " (α : Sort u_1) : (PEmpty.{u_2} → α) ≃ PUnit.{u}",
+    "module": "Mathlib.Logic.Equiv.Defs",
+    "doc": "The sort of maps from `PEmpty` is equivalent to `PUnit`. "
+  },
+  {
+    "name": "Equiv.plift",
+    "type": " {α : Sort u} : PLift α ≃ α",
+    "module": "Mathlib.Logic.Equiv.Defs",
+    "doc": "`PLift α` is equivalent to `α`. "
+  },
+  {
+    "name": "Equiv.propEquivPUnit",
+    "type": " {p : Prop} (h : p) : p ≃ PUnit.{0}",
+    "module": "Mathlib.Logic.Equiv.Defs",
+    "doc": "The `Sort` of proofs of a true proposition is equivalent to `PUnit`. "
+  },
+  {
+    "name": "Equiv.punitArrowEquiv",
+    "type": " (α : Sort u_1) : (PUnit.{u} → α) ≃ α",
+    "module": "Mathlib.Logic.Equiv.Defs",
+    "doc": "The sort of maps from `PUnit` is equivalent to the codomain. "
+  },
+  {
+    "name": "Equiv.trueArrowEquiv",
+    "type": " (α : Sort u_1) : (True → α) ≃ α",
+    "module": "Mathlib.Logic.Equiv.Defs",
+    "doc": "The sort of maps from `True` is equivalent to the codomain. "
+  },
+  {
+    "name": "Equiv.ulift",
+    "type": " {α : Type v} : ULift.{u, v} α ≃ α",
+    "module": "Mathlib.Logic.Equiv.Defs",
+    "doc": "`ULift α` is equivalent to `α`. "
+  },
+  {
+    "name": "Equiv.equivEmpty",
+    "type": " (α : Sort u) [IsEmpty α] : α ≃ Empty",
+    "module": "Mathlib.Logic.Equiv.Defs",
+    "doc": "If `α` is an empty type, then it is equivalent to the `Empty` type. "
+  },
+  {
+    "name": "Equiv.equivPEmpty",
+    "type": " (α : Sort v) [IsEmpty α] : α ≃ PEmpty.{u}",
+    "module": "Mathlib.Logic.Equiv.Defs",
+    "doc": "If `α` is an empty type, then it is equivalent to the `PEmpty` type in any universe. "
+  },
+  {
+    "name": "Equiv.equivPUnit",
+    "type": " (α : Sort u) [Unique α] : α ≃ PUnit.{v}",
+    "module": "Mathlib.Logic.Equiv.Defs",
+    "doc": "If `α` has a unique element, then it is equivalent to any `PUnit`. "
+  },
+  {
+    "name": "Equiv.propEquivPEmpty",
+    "type": " {p : Prop} (h : ¬p) : p ≃ PEmpty.{u_1}",
+    "module": "Mathlib.Logic.Equiv.Defs",
+    "doc": "The `Sort` of proofs of a false proposition is equivalent to `PEmpty`. "
+  },
+  {
+    "name": "Equiv.equivEmptyEquiv",
+    "type": " (α : Sort u) : α ≃ Empty ≃ IsEmpty α",
+    "module": "Mathlib.Logic.Equiv.Defs",
+    "doc": "`α` is equivalent to an empty type iff `α` is empty. "
+  },
+  {
+    "name": "Equiv.instTrans",
+    "type": " : Trans Equiv Equiv Equiv",
+    "module": "Mathlib.Logic.Equiv.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Fintype.card",
+    "type": " (α : Type u_4) [Fintype α] : ℕ",
+    "module": "Mathlib.Data.Fintype.Card",
+    "doc": "`card α` is the number of elements in `α`, defined when `α` is a fintype. "
+  },
+  {
+    "name": "Fintype.card_fin",
+    "type": " (n : ℕ) : Fintype.card (Fin n) = n",
+    "module": "Mathlib.Data.Fintype.Card",
+    "doc": ""
+  },
+  {
+    "name": "Fintype.card_bool",
+    "type": " : Fintype.card Bool = 2",
+    "module": "Mathlib.Data.Fintype.Card",
+    "doc": ""
+  },
+  {
+    "name": "Fintype.card_empty",
+    "type": " : Fintype.card Empty = 0",
+    "module": "Mathlib.Data.Fintype.Card",
+    "doc": ""
+  },
+  {
+    "name": "Fintype.card_pempty",
+    "type": " : Fintype.card PEmpty.{u_4 + 1} = 0",
+    "module": "Mathlib.Data.Fintype.Card",
+    "doc": ""
+  },
+  {
+    "name": "Fintype.card_prop",
+    "type": " : Fintype.card Prop = 2",
+    "module": "Mathlib.Data.Fintype.Card",
+    "doc": ""
+  },
+  {
+    "name": "Fintype.card_punit",
+    "type": " : Fintype.card PUnit.{u_4 + 1} = 1",
+    "module": "Mathlib.Data.Fintype.Card",
+    "doc": ""
+  },
+  {
+    "name": "Fintype.card_unit",
+    "type": " : Fintype.card Unit = 1",
+    "module": "Mathlib.Data.Fintype.Card",
+    "doc": ""
+  },
+  {
+    "name": "Finset.card_univ",
+    "type": " {α : Type u_1} [Fintype α] : Finset.univ.card = Fintype.card α",
+    "module": "Mathlib.Data.Fintype.Card",
+    "doc": ""
+  },
+  {
+    "name": "Finset.card_le_univ",
+    "type": " {α : Type u_1} [Fintype α] (s : Finset α) : s.card ≤ Fintype.card α",
+    "module": "Mathlib.Data.Fintype.Card",
+    "doc": ""
+  },
+  {
+    "name": "Fintype.card_lex",
+    "type": " (α : Type u_4) [Fintype α] : Fintype.card (Lex α) = Fintype.card α",
+    "module": "Mathlib.Data.Fintype.Card",
+    "doc": ""
+  },
+  {
+    "name": "Fintype.card_orderDual",
+    "type": " (α : Type u_4) [Fintype α] : Fintype.card αᵒᵈ = Fintype.card α",
+    "module": "Mathlib.Data.Fintype.Card",
+    "doc": ""
+  },
+  {
+    "name": "Fintype.card_plift",
+    "type": " (α : Type u_4) [Fintype α] : Fintype.card (PLift α) = Fintype.card α",
+    "module": "Mathlib.Data.Fintype.Card",
+    "doc": ""
+  },
+  {
+    "name": "Fintype.card_ulift",
+    "type": " (α : Type u_4) [Fintype α] : Fintype.card (ULift.{u_5, u_4} α) = Fintype.card α",
+    "module": "Mathlib.Data.Fintype.Card",
+    "doc": ""
+  },
+  {
+    "name": "Fintype.instNeZeroNatCardOfNonempty",
+    "type": " {α : Type u_1} [Fintype α] [Nonempty α] : NeZero (Fintype.card α)",
+    "module": "Mathlib.Data.Fintype.Card",
+    "doc": ""
+  },
+  {
+    "name": "Fintype.card_eq_zero",
+    "type": " {α : Type u_1} [Fintype α] [IsEmpty α] : Fintype.card α = 0",
+    "module": "Mathlib.Data.Fintype.Card",
+    "doc": ""
+  },
+  {
+    "name": "Fintype.card_ne_zero",
+    "type": " {α : Type u_1} [Fintype α] [Nonempty α] : Fintype.card α ≠ 0",
+    "module": "Mathlib.Data.Fintype.Card",
+    "doc": ""
+  },
+  {
+    "name": "Fintype.card_ofIsEmpty",
+    "type": " {α : Type u_1} [IsEmpty α] : Fintype.card α = 0",
+    "module": "Mathlib.Data.Fintype.Card",
+    "doc": "Note: this lemma is specifically about `Fintype.ofIsEmpty`. For a statement about\narbitrary `Fintype` instances, use `Fintype.card_eq_zero`. "
+  },
+  {
+    "name": "Fintype.card_of_isEmpty",
+    "type": " {α : Type u_1} [Fintype α] [IsEmpty α] : Fintype.card α = 0",
+    "module": "Mathlib.Data.Fintype.Card",
+    "doc": "**Alias** of `Fintype.card_eq_zero`."
+  },
+  {
+    "name": "Fintype.card_unique",
+    "type": " {α : Type u_1} [Unique α] [h : Fintype α] : Fintype.card α = 1",
+    "module": "Mathlib.Data.Fintype.Card",
+    "doc": ""
+  },
+  {
+    "name": "Nat.card",
+    "type": " (α : Type u_3) : ℕ",
+    "module": "Mathlib.SetTheory.Cardinal.Finite",
+    "doc": "`Nat.card α` is the cardinality of `α` as a natural number.\nIf `α` is infinite, `Nat.card α = 0`. "
+  },
+  {
+    "name": "Nat.card_fin",
+    "type": " (n : ℕ) : Nat.card (Fin n) = n",
+    "module": "Mathlib.SetTheory.Cardinal.Finite",
+    "doc": ""
+  },
+  {
+    "name": "Nat.card_plift",
+    "type": " (α : Type u_3) : Nat.card (PLift α) = Nat.card α",
+    "module": "Mathlib.SetTheory.Cardinal.Finite",
+    "doc": ""
+  },
+  {
+    "name": "Nat.card_ulift",
+    "type": " (α : Type u_3) : Nat.card (ULift.{u_4, u_3} α) = Nat.card α",
+    "module": "Mathlib.SetTheory.Cardinal.Finite",
+    "doc": ""
+  },
+  {
+    "name": "Fintype.card_eq_nat_card",
+    "type": " {α : Type u_1} {x✝ : Fintype α} : Fintype.card α = Nat.card α",
+    "module": "Mathlib.SetTheory.Cardinal.Finite",
+    "doc": "Because this theorem takes `Fintype α` as a non-instance argument, it can be used in particular\nwhen `Fintype.card` ends up with different instance than the one found by inference "
+  },
+  {
+    "name": "Nat.card_eq_fintype_card",
+    "type": " {α : Type u_1} [Fintype α] : Nat.card α = Fintype.card α",
+    "module": "Mathlib.SetTheory.Cardinal.Finite",
+    "doc": ""
+  },
+  {
+    "name": "Nat.card_subtype_true",
+    "type": " {α : Type u_1} : Nat.card { _a // True } = Nat.card α",
+    "module": "Mathlib.SetTheory.Cardinal.Finite",
+    "doc": ""
+  },
+  {
+    "name": "Nat.card_univ",
+    "type": " {α : Type u_1} : Nat.card ↑Set.univ = Nat.card α",
+    "module": "Mathlib.SetTheory.Cardinal.Finite",
+    "doc": ""
+  },
+  {
+    "name": "Nat.card_congr",
+    "type": " {α : Type u_1} {β : Type u_2} (f : α ≃ β) : Nat.card α = Nat.card β",
+    "module": "Mathlib.SetTheory.Cardinal.Finite",
+    "doc": ""
+  },
+  {
+    "name": "Nat.card_eq_of_equiv_fin",
+    "type": " {α : Type u_3} {n : ℕ} (f : α ≃ Fin n) : Nat.card α = n",
+    "module": "Mathlib.SetTheory.Cardinal.Finite",
+    "doc": ""
+  },
+  {
+    "name": "Nat.card_eq_zero_of_infinite",
+    "type": " {α : Type u_1} [Infinite α] : Nat.card α = 0",
+    "module": "Mathlib.SetTheory.Cardinal.Finite",
+    "doc": ""
+  },
+  {
+    "name": "Nat.card_of_isEmpty",
+    "type": " {α : Type u_1} [IsEmpty α] : Nat.card α = 0",
+    "module": "Mathlib.SetTheory.Cardinal.Finite",
+    "doc": ""
+  },
+  {
+    "name": "Nat.cast_card",
+    "type": " {α : Type u_1} [Finite α] : ↑(Nat.card α) = Cardinal.mk α",
+    "module": "Mathlib.SetTheory.Cardinal.Finite",
+    "doc": ""
+  },
+  {
+    "name": "Nat.finite_of_card_ne_zero",
+    "type": " {α : Type u_1} (h : Nat.card α ≠ 0) : Finite α",
+    "module": "Mathlib.SetTheory.Cardinal.Finite",
+    "doc": ""
+  },
+  {
+    "name": "Nat.card_of_subsingleton",
+    "type": " {α : Type u_1} (a : α) [Subsingleton α] : Nat.card α = 1",
+    "module": "Mathlib.SetTheory.Cardinal.Finite",
+    "doc": ""
+  },
+  {
+    "name": "Nat.card_eq_of_bijective",
+    "type": " {α : Type u_1} {β : Type u_2} (f : α → β) (hf : Function.Bijective f) : Nat.card α = Nat.card β",
+    "module": "Mathlib.SetTheory.Cardinal.Finite",
+    "doc": ""
+  },
+  {
+    "name": "Nat.card_unique",
+    "type": " {α : Type u_1} [Nonempty α] [Subsingleton α] : Nat.card α = 1",
+    "module": "Mathlib.SetTheory.Cardinal.Finite",
+    "doc": ""
+  },
+  {
+    "name": "Nat.card_pos",
+    "type": " {α : Type u_1} [Nonempty α] [Finite α] : 0 < Nat.card α",
+    "module": "Mathlib.SetTheory.Cardinal.Finite",
+    "doc": ""
+  },
+  {
+    "name": "Nat.equivFinOfCardPos",
+    "type": " {α : Type u_3} (h : Nat.card α ≠ 0) : α ≃ Fin (Nat.card α)",
+    "module": "Mathlib.SetTheory.Cardinal.Finite",
+    "doc": "If the cardinality is positive, that means it is a finite type, so there is\nan equivalence between `α` and `Fin (Nat.card α)`. See also `Finite.equivFin`. "
+  },
+  {
+    "name": "Set.Infinite",
+    "type": " {α : Type u} (s : Set α) : Prop",
+    "module": "Mathlib.Data.Finite.Defs",
+    "doc": "A set is infinite if it is not finite.\n\nThis is protected so that it does not conflict with global `Infinite`. "
+  },
+  {
+    "name": "Set.finite_or_infinite",
+    "type": " {α : Type u} (s : Set α) : s.Finite ∨ s.Infinite",
+    "module": "Mathlib.Data.Finite.Defs",
+    "doc": "See also `finite_or_infinite`, `fintypeOrInfinite`. "
+  },
+  {
+    "name": "Set.infinite_or_finite",
+    "type": " {α : Type u} (s : Set α) : s.Infinite ∨ s.Finite",
+    "module": "Mathlib.Data.Finite.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Set.Finite.not_infinite",
+    "type": " {α : Type u} {s : Set α} : s.Finite → ¬s.Infinite",
+    "module": "Mathlib.Data.Finite.Defs",
+    "doc": "**Alias** of the reverse direction of `Set.not_infinite`."
+  },
+  {
+    "name": "Set.Infinite.not_finite",
+    "type": " {α : Type u} {s : Set α} (hs : s.Infinite) : ¬s.Finite",
+    "module": "Mathlib.Data.Finite.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Set.Infinite.to_subtype",
+    "type": " {α : Type u} {s : Set α} : s.Infinite → Infinite ↑s",
+    "module": "Mathlib.Data.Finite.Defs",
+    "doc": "**Alias** of the reverse direction of `Set.infinite_coe_iff`."
+  },
+  {
+    "name": "Set.infinite_coe_iff",
+    "type": " {α : Type u} {s : Set α} : Infinite ↑s ↔ s.Infinite",
+    "module": "Mathlib.Data.Finite.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Set.not_finite",
+    "type": " {α : Type u} {s : Set α} : ¬s.Finite ↔ s.Infinite",
+    "module": "Mathlib.Data.Finite.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Set.not_infinite",
+    "type": " {α : Type u} {s : Set α} : ¬s.Infinite ↔ s.Finite",
+    "module": "Mathlib.Data.Finite.Defs",
+    "doc": ""
+  },
+  {
+    "name": "Set.infinite_univ",
+    "type": " {α : Type u} [h : Infinite α] : Set.univ.Infinite",
+    "module": "Mathlib.Data.Set.Finite.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Set.infinite_univ_iff",
+    "type": " {α : Type u} : Set.univ.Infinite ↔ Infinite α",
+    "module": "Mathlib.Data.Set.Finite.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Set.Infinite.nonempty",
+    "type": " {α : Type u} {s : Set α} (h : s.Infinite) : s.Nonempty",
+    "module": "Mathlib.Data.Set.Finite.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Set.Infinite.nontrivial",
+    "type": " {α : Type u} {s : Set α} (hs : s.Infinite) : s.Nontrivial",
+    "module": "Mathlib.Data.Set.Finite.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Set.Infinite.natEmbedding",
+    "type": " {α : Type u} (s : Set α) (h : s.Infinite) : ℕ ↪ ↑s",
+    "module": "Mathlib.Data.Set.Finite.Basic",
+    "doc": "Embedding of `ℕ` into an infinite set. "
+  },
+  {
+    "name": "Set.infinite_of_finite_compl",
+    "type": " {α : Type u} [Infinite α] {s : Set α} (hs : sᶜ.Finite) : s.Infinite",
+    "module": "Mathlib.Data.Set.Finite.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Set.infinite_range_of_injective",
+    "type": " {α : Type u} {β : Type v} [Infinite α] {f : α → β} (hi : Function.Injective f) : (Set.range f).Infinite",
+    "module": "Mathlib.Data.Set.Finite.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Set.Finite.infinite_compl",
+    "type": " {α : Type u} [Infinite α] {s : Set α} (hs : s.Finite) : sᶜ.Infinite",
+    "module": "Mathlib.Data.Set.Finite.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Set.Infinite.of_image",
+    "type": " {α : Type u} {β : Type v} (f : α → β) {s : Set α} (hs : (f '' s).Infinite) : s.Infinite",
+    "module": "Mathlib.Data.Set.Finite.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Set.infinite_range_iff",
+    "type": " {α : Type u} {β : Type v} {f : α → β} (hf : Function.Injective f) : (Set.range f).Infinite ↔ Infinite α",
+    "module": "Mathlib.Data.Set.Finite.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Set.Infinite.mono",
+    "type": " {α : Type u} {s t : Set α} (h : s ⊆ t) : s.Infinite → t.Infinite",
+    "module": "Mathlib.Data.Set.Finite.Basic",
+    "doc": ""
+  },
+  {
+    "name": "Nat.totient",
+    "type": " (n : ℕ) : ℕ",
+    "module": "Mathlib.Data.Nat.Totient",
+    "doc": "Euler's totient function. This counts the number of naturals strictly less than `n` which are\ncoprime with `n`. "
+  },
+  {
+    "name": "Nat.totient_le",
+    "type": " (n : ℕ) : n.totient ≤ n",
+    "module": "Mathlib.Data.Nat.Totient",
+    "doc": ""
+  },
+  {
+    "name": "Nat.sum_totient",
+    "type": " (n : ℕ) : n.divisors.sum Nat.totient = n",
+    "module": "Mathlib.Data.Nat.Totient",
+    "doc": ""
+  },
+  {
+    "name": "Nat.totient_one",
+    "type": " : Nat.totient 1 = 1",
+    "module": "Mathlib.Data.Nat.Totient",
+    "doc": ""
+  },
+  {
+    "name": "Nat.totient_two",
+    "type": " : Nat.totient 2 = 1",
+    "module": "Mathlib.Data.Nat.Totient",
+    "doc": ""
+  },
+  {
+    "name": "Nat.totient_zero",
+    "type": " : Nat.totient 0 = 0",
+    "module": "Mathlib.Data.Nat.Totient",
+    "doc": ""
+  },
+  {
+    "name": "Nat.neZero_totient",
+    "type": " {n : ℕ} [NeZero n] : NeZero n.totient",
+    "module": "Mathlib.Data.Nat.Totient",
+    "doc": ""
+  },
+  {
+    "name": "Nat.totient_dvd_of_dvd",
+    "type": " {a b : ℕ} (h : a ∣ b) : a.totient ∣ b.totient",
+    "module": "Mathlib.Data.Nat.Totient",
+    "doc": ""
+  },
+  {
+    "name": "Nat.totient_even",
+    "type": " {n : ℕ} (hn : 2 < n) : Even n.totient",
+    "module": "Mathlib.Data.Nat.Totient",
+    "doc": ""
+  },
+  {
+    "name": "Nat.odd_totient_iff_eq_one",
+    "type": " {n : ℕ} : Odd n.totient ↔ n.totient = 1",
+    "module": "Mathlib.Data.Nat.Totient",
+    "doc": ""
+  },
+  {
+    "name": "Nat.totient_lt",
+    "type": " (n : ℕ) (hn : 1 < n) : n.totient < n",
+    "module": "Mathlib.Data.Nat.Totient",
+    "doc": ""
+  },
+  {
+    "name": "Nat.totient_eq_card_coprime",
+    "type": " (n : ℕ) : n.totient = {a ∈ Finset.range n | n.Coprime a}.card",
+    "module": "Mathlib.Data.Nat.Totient",
+    "doc": ""
+  },
+  {
+    "name": "Nat.totient_eq_zero",
+    "type": " {n : ℕ} : n.totient = 0 ↔ n = 0",
+    "module": "Mathlib.Data.Nat.Totient",
+    "doc": ""
+  },
+  {
+    "name": "Nat.totient_eq_card_lt_and_coprime",
+    "type": " (n : ℕ) : n.totient = Nat.card ↑{m | m < n ∧ n.Coprime m}",
+    "module": "Mathlib.Data.Nat.Totient",
+    "doc": "A characterisation of `Nat.totient` that avoids `Finset`. "
+  },
+  {
+    "name": "Nat.totient_prime",
+    "type": " {p : ℕ} (hp : Nat.Prime p) : p.totient = p - 1",
+    "module": "Mathlib.Data.Nat.Totient",
+    "doc": ""
+  },
+  {
+    "name": "Even.eq_of_totient_eq_totient",
+    "type": " {a b : ℕ} (h : a ∣ b) (ha : Even a) (h' : a.totient = b.totient) : a = b",
+    "module": "Mathlib.Data.Nat.Totient",
+    "doc": ""
+  },
+  {
+    "name": "Nat.totient_pos",
+    "type": " {n : ℕ} : 0 < n.totient ↔ 0 < n",
+    "module": "Mathlib.Data.Nat.Totient",
+    "doc": ""
+  },
+  {
+    "name": "Nat.totient_two_mul_of_odd",
+    "type": " {n : ℕ} (hn : Odd n) : (2 * n).totient = n.totient",
+    "module": "Mathlib.Data.Nat.Totient",
+    "doc": ""
+  },
+  {
+    "name": "Nat.odd_totient_iff",
+    "type": " {n : ℕ} : Odd n.totient ↔ n = 1 ∨ n = 2",
+    "module": "Mathlib.Data.Nat.Totient",
+    "doc": "Euler's totient function is only odd at `1` or `2`. "
+  },
+  {
+    "name": "Nat.sum_totient'",
+    "type": " (n : ℕ) : ∑ m ∈ Finset.range n.succ with m ∣ n, m.totient = n",
+    "module": "Mathlib.Data.Nat.Totient",
+    "doc": ""
+  },
+  {
+    "name": "Real.sqrt",
+    "type": " (x : ℝ) : ℝ",
+    "module": "Mathlib.Data.Real.Sqrt",
+    "doc": "The square root of a real number. This returns 0 for negative inputs.\n\nThis has notation `√x`. Note that `√x⁻¹` is parsed as `√(x⁻¹)`. "
+  },
+  {
+    "name": "Real.sqrt_monotone",
+    "type": " : Monotone Real.sqrt",
+    "module": "Mathlib.Data.Real.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Real.sqrt_nonneg",
+    "type": " (x : ℝ) : 0 ≤ √x",
+    "module": "Mathlib.Data.Real.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Real.tendsto_sqrt_atTop",
+    "type": " : Filter.Tendsto (fun x => √x) Filter.atTop Filter.atTop",
+    "module": "Mathlib.Data.Real.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Real.sqrt_inv",
+    "type": " (x : ℝ) : √x⁻¹ = (√x)⁻¹",
+    "module": "Mathlib.Data.Real.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Real.nat_sqrt_le_real_sqrt",
+    "type": " {a : ℕ} : ↑a.sqrt ≤ √↑a",
+    "module": "Mathlib.Data.Real.Sqrt",
+    "doc": "The natural square root is at most the real square root "
+  },
+  {
+    "name": "Real.sqrt_le_sqrt",
+    "type": " {x y : ℝ} (h : x ≤ y) : √x ≤ √y",
+    "module": "Mathlib.Data.Real.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Real.comap_sqrt_atTop",
+    "type": " : Filter.comap (fun x => √x) Filter.atTop = Filter.atTop",
+    "module": "Mathlib.Data.Real.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Real.map_sqrt_atTop",
+    "type": " : Filter.map (fun x => √x) Filter.atTop = Filter.atTop",
+    "module": "Mathlib.Data.Real.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Real.sqrt_one",
+    "type": " : √1 = 1",
+    "module": "Mathlib.Data.Real.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Real.sqrt_zero",
+    "type": " : √0 = 0",
+    "module": "Mathlib.Data.Real.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Real.strictMonoOn_sqrt",
+    "type": " : StrictMonoOn Real.sqrt (Set.Ici 0)",
+    "module": "Mathlib.Data.Real.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Real.continuous_sqrt",
+    "type": " : Continuous fun x => √x",
+    "module": "Mathlib.Data.Real.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Real.div_sqrt",
+    "type": " {x : ℝ} : x / √x = √x",
+    "module": "Mathlib.Data.Real.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Real.floor_real_sqrt_eq_nat_sqrt",
+    "type": " {a : ℕ} : ⌊√↑a⌋ = ↑a.sqrt",
+    "module": "Mathlib.Data.Real.Sqrt",
+    "doc": "The floor of the real square root is the same as the natural square root. "
+  },
+  {
+    "name": "Real.sqrt_mul_self_eq_abs",
+    "type": " (x : ℝ) : √(x * x) = |x|",
+    "module": "Mathlib.Data.Real.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Real.nat_floor_real_sqrt_eq_nat_sqrt",
+    "type": " {a : ℕ} : ⌊√↑a⌋₊ = a.sqrt",
+    "module": "Mathlib.Data.Real.Sqrt",
+    "doc": "The natural floor of the real square root is the same as the natural square root. "
+  },
+  {
+    "name": "Real.sqrt_div_self",
+    "type": " {x : ℝ} : √x / x = (√x)⁻¹",
+    "module": "Mathlib.Data.Real.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Real.sqrt_eq_one",
+    "type": " {x : ℝ} : √x = 1 ↔ x = 1",
+    "module": "Mathlib.Data.Real.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Real.sqrt_eq_zero_of_nonpos",
+    "type": " {x : ℝ} (h : x ≤ 0) : √x = 0",
+    "module": "Mathlib.Data.Real.Sqrt",
+    "doc": ""
+  },
+  {
+    "name": "Irrational",
+    "type": " (x : ℝ) : Prop",
+    "module": "Mathlib.NumberTheory.Real.Irrational",
+    "doc": "A real number is irrational if it is not equal to any rational number. "
+  },
+  {
+    "name": "Int.not_irrational",
+    "type": " (m : ℤ) : ¬Irrational ↑m",
+    "module": "Mathlib.NumberTheory.Real.Irrational",
+    "doc": ""
+  },
+  {
+    "name": "Nat.not_irrational",
+    "type": " (m : ℕ) : ¬Irrational ↑m",
+    "module": "Mathlib.NumberTheory.Real.Irrational",
+    "doc": ""
+  },
+  {
+    "name": "Rat.not_irrational",
+    "type": " (q : ℚ) : ¬Irrational ↑q",
+    "module": "Mathlib.NumberTheory.Real.Irrational",
+    "doc": ""
+  },
+  {
+    "name": "instDecidableIrrationalSqrtCastReal",
+    "type": " (n : ℕ) : Decidable (Irrational √↑n)",
+    "module": "Mathlib.NumberTheory.Real.Irrational",
+    "doc": ""
+  },
+  {
+    "name": "instDecidableIrrationalSqrtCastReal_1",
+    "type": " (z : ℤ) : Decidable (Irrational √↑z)",
+    "module": "Mathlib.NumberTheory.Real.Irrational",
+    "doc": ""
+  },
+  {
+    "name": "instDecidableIrrationalSqrtCastReal_2",
+    "type": " (q : ℚ) : Decidable (Irrational √↑q)",
+    "module": "Mathlib.NumberTheory.Real.Irrational",
+    "doc": ""
+  },
+  {
+    "name": "not_irrational_one",
+    "type": " : ¬Irrational 1",
+    "module": "Mathlib.NumberTheory.Real.Irrational",
+    "doc": ""
+  },
+  {
+    "name": "not_irrational_zero",
+    "type": " : ¬Irrational 0",
+    "module": "Mathlib.NumberTheory.Real.Irrational",
+    "doc": ""
+  },
+  {
+    "name": "Irrational.inv",
+    "type": " {x : ℝ} (h : Irrational x) : Irrational x⁻¹",
+    "module": "Mathlib.NumberTheory.Real.Irrational",
+    "doc": ""
+  },
+  {
+    "name": "Irrational.neg",
+    "type": " {x : ℝ} (h : Irrational x) : Irrational (-x)",
+    "module": "Mathlib.NumberTheory.Real.Irrational",
+    "doc": ""
+  },
+  {
+    "name": "Irrational.of_inv",
+    "type": " {x : ℝ} (h : Irrational x⁻¹) : Irrational x",
+    "module": "Mathlib.NumberTheory.Real.Irrational",
+    "doc": ""
+  },
+  {
+    "name": "Irrational.of_neg",
+    "type": " {x : ℝ} (h : Irrational (-x)) : Irrational x",
+    "module": "Mathlib.NumberTheory.Real.Irrational",
+    "doc": ""
+  },
+  {
+    "name": "irrational_inv_iff",
+    "type": " {x : ℝ} : Irrational x⁻¹ ↔ Irrational x",
+    "module": "Mathlib.NumberTheory.Real.Irrational",
+    "doc": ""
+  },
+  {
+    "name": "irrational_neg_iff",
+    "type": " {x : ℝ} : Irrational (-x) ↔ Irrational x",
+    "module": "Mathlib.NumberTheory.Real.Irrational",
+    "doc": ""
+  },
+  {
+    "name": "Nat.Prime.irrational_sqrt",
+    "type": " {p : ℕ} (hp : Nat.Prime p) : Irrational √↑p",
+    "module": "Mathlib.NumberTheory.Real.Irrational",
+    "doc": ""
+  },
+  {
+    "name": "Irrational.ne_int",
+    "type": " {x : ℝ} (h : Irrational x) (m : ℤ) : x ≠ ↑m",
+    "module": "Mathlib.NumberTheory.Real.Irrational",
+    "doc": ""
+  },
+  {
+    "name": "Irrational.ne_nat",
+    "type": " {x : ℝ} (h : Irrational x) (m : ℕ) : x ≠ ↑m",
+    "module": "Mathlib.NumberTheory.Real.Irrational",
+    "doc": ""
+  },
+  {
+    "name": "Irrational.ne_rat",
+    "type": " {x : ℝ} (h : Irrational x) (q : ℚ) : x ≠ ↑q",
+    "module": "Mathlib.NumberTheory.Real.Irrational",
+    "doc": ""
+  },
+  {
+    "name": "Irrational.ne_one",
+    "type": " {x : ℝ} (h : Irrational x) : x ≠ 1",
+    "module": "Mathlib.NumberTheory.Real.Irrational",
+    "doc": ""
+  },
+  {
+    "name": "Polynomial.roots",
+    "type": " {R : Type u} [CommRing R] [IsDomain R] (p : Polynomial R) : Multiset R",
+    "module": "Mathlib.Algebra.Polynomial.Roots",
+    "doc": "`roots p` noncomputably gives a multiset containing all the roots of `p`,\nincluding their multiplicities. "
+  },
+  {
+    "name": "Polynomial.card_roots'",
+    "type": " {R : Type u} [CommRing R] [IsDomain R] (p : Polynomial R) : p.roots.card ≤ p.natDegree",
+    "module": "Mathlib.Algebra.Polynomial.Roots",
+    "doc": ""
+  },
+  {
+    "name": "Polynomial.count_roots",
+    "type": " {R : Type u} {a : R} [CommRing R] [IsDomain R] [DecidableEq R] (p : Polynomial R) : Multiset.count a p.roots = Polynomial.rootMultiplicity a p",
+    "module": "Mathlib.Algebra.Polynomial.Roots",
+    "doc": ""
+  },
+  {
+    "name": "Polynomial.isRoot_of_mem_roots",
+    "type": " {R : Type u} {a : R} [CommRing R] [IsDomain R] {p : Polynomial R} (h : a ∈ p.roots) : p.IsRoot a",
+    "module": "Mathlib.Algebra.Polynomial.Roots",
+    "doc": ""
+  },
+  {
+    "name": "Polynomial.roots_neg",
+    "type": " {R : Type u} [CommRing R] [IsDomain R] (p : Polynomial R) : (-p).roots = p.roots",
+    "module": "Mathlib.Algebra.Polynomial.Roots",
+    "doc": ""
+  },
+  {
+    "name": "Polynomial.card_le_degree_of_subset_roots",
+    "type": " {R : Type u} [CommRing R] [IsDomain R] {p : Polynomial R} {Z : Finset R} (h : Z.val ⊆ p.roots) : Z.card ≤ p.natDegree",
+    "module": "Mathlib.Algebra.Polynomial.Roots",
+    "doc": ""
+  },
+  {
+    "name": "Polynomial.roots_one",
+    "type": " {R : Type u} [CommRing R] [IsDomain R] : Polynomial.roots 1 = ∅",
+    "module": "Mathlib.Algebra.Polynomial.Roots",
+    "doc": ""
+  },
+  {
+    "name": "Polynomial.roots_X",
+    "type": " {R : Type u} [CommRing R] [IsDomain R] : Polynomial.X.roots = {0}",
+    "module": "Mathlib.Algebra.Polynomial.Roots",
+    "doc": ""
+  },
+  {
+    "name": "Polynomial.roots_zero",
+    "type": " {R : Type u} [CommRing R] [IsDomain R] : Polynomial.roots 0 = 0",
+    "module": "Mathlib.Algebra.Polynomial.Roots",
+    "doc": ""
+  },
+  {
+    "name": "Polynomial.card_roots_map_le_natDegree",
+    "type": " {A : Type u_3} {B : Type u_4} [Semiring A] [CommRing B] [IsDomain B] {f : A →+* B} (p : Polynomial A) : (Polynomial.map f p).roots.card ≤ p.natDegree",
+    "module": "Mathlib.Algebra.Polynomial.Roots",
+    "doc": ""
+  },
+  {
+    "name": "Polynomial.ne_zero_of_mem_roots",
+    "type": " {R : Type u} {a : R} [CommRing R] [IsDomain R] {p : Polynomial R} (h : a ∈ p.roots) : p ≠ 0",
+    "module": "Mathlib.Algebra.Polynomial.Roots",
+    "doc": ""
+  },
+  {
+    "name": "Polynomial.card_roots_le_one_of_irreducible",
+    "type": " {R : Type u} [CommRing R] [IsDomain R] {p : Polynomial R} (hirr : Irreducible p) : p.roots.card ≤ 1",
+    "module": "Mathlib.Algebra.Polynomial.Roots",
+    "doc": ""
+  },
+  {
+    "name": "Associated.roots_eq",
+    "type": " {R : Type u} [CommRing R] [IsDomain R] {p q : Polynomial R} (h : Associated p q) : p.roots = q.roots",
+    "module": "Mathlib.Algebra.Polynomial.Roots",
+    "doc": ""
+  },
+  {
+    "name": "Polynomial.aroots_def",
+    "type": " {T : Type w} [CommRing T] (p : Polynomial T) (S : Type u_1) [CommRing S] [IsDomain S] [Algebra T S] : p.aroots S = (Polynomial.map (algebraMap T S) p).roots",
+    "module": "Mathlib.Algebra.Polynomial.Roots",
+    "doc": ""
+  },
+  {
+    "name": "Polynomial.mem_roots",
+    "type": " {R : Type u} {a : R} [CommRing R] [IsDomain R] {p : Polynomial R} (hp : p ≠ 0) : a ∈ p.roots ↔ p.IsRoot a",
+    "module": "Mathlib.Algebra.Polynomial.Roots",
+    "doc": ""
+  },
+  {
+    "name": "Polynomial.mem_roots'",
+    "type": " {R : Type u} {a : R} [CommRing R] [IsDomain R] {p : Polynomial R} : a ∈ p.roots ↔ p ≠ 0 ∧ p.IsRoot a",
+    "module": "Mathlib.Algebra.Polynomial.Roots",
+    "doc": ""
+  },
+  {
+    "name": "Polynomial.card_roots",
+    "type": " {R : Type u} [CommRing R] [IsDomain R] {p : Polynomial R} (hp0 : p ≠ 0) : ↑p.roots.card ≤ p.degree",
+    "module": "Mathlib.Algebra.Polynomial.Roots",
+    "doc": ""
+  },
+  {
+    "name": "Polynomial.roots_eq_zero_of_irreducible_of_natDegree_ne_one",
+    "type": " {R : Type u} [CommRing R] [IsDomain R] {p : Polynomial R} (hirr : Irreducible p) (hdeg : p.natDegree ≠ 1) : p.roots = 0",
+    "module": "Mathlib.Algebra.Polynomial.Roots",
+    "doc": ""
+  },
+  {
+    "name": "Polynomial.card_roots_map_le_degree",
+    "type": " {A : Type u_3} {B : Type u_4} [Semiring A] [CommRing B] [IsDomain B] {f : A →+* B} (p : Polynomial A) (hp0 : p ≠ 0) : ↑(Polynomial.map f p).roots.card ≤ p.degree",
+    "module": "Mathlib.Algebra.Polynomial.Roots",
+    "doc": ""
+  },
+  {
+    "name": "Polynomial.roots_eq_zero_iff_isRoot_eq_bot",
+    "type": " {R : Type u} [CommRing R] [IsDomain R] {p : Polynomial R} (hp0 : p ≠ 0) : p.roots = 0 ↔ p.IsRoot = ⊥",
+    "module": "Mathlib.Algebra.Polynomial.Roots",
+    "doc": ""
   }
 ]

@@ -33,6 +33,7 @@ from app.agent.config import (
     check_context_saturation,
 )
 from app.agent.llm_client import call_llm, is_shutting_down, sanitize_user_content, ShutdownError
+from app.agent.mathlib_cheatsheet import format_for_prompt as _cheatsheet
 from app.agent.verdicts import Vote, Verdict, tally_votes
 
 logger = logging.getLogger(__name__)
@@ -253,6 +254,16 @@ _PROOF_DESIGN_PERSONAS: list[tuple[str, str]] = [
         "In your design_rationale, list the exact build commands, expected output, and "
         "how you will confirm zero sorry and zero errors.",
     ),
+    (
+        "Lean4 Build & Import Strategy",
+        "Your primary concern is import ordering, namespace hygiene, and build-system correctness. "
+        "Identify the exact `import Mathlib.*` paths required, check for name collisions with "
+        "existing Mathlib declarations, and flag universe-level constraints that could cause "
+        "unexpected errors. Ensure the `lakefile.lean` dependencies are correct and that "
+        "`lake build` will succeed without any `sorry`. "
+        "In your design_rationale, list each import path with justification, identify any "
+        "Mathlib namespace conflicts, and describe how universe polymorphism is handled.",
+    ),
 ]
 
 _DESIGN_PERSONAS: list[tuple[str, str]] = [
@@ -382,7 +393,7 @@ SURVEY_TOOLS = [
 
 # Extra tools unlocked for formal-proof / theorem-proving survey phases.
 _PROOF_SURVEY_EXTRA_TOOLS = [
-    "search_mathlib", "search_arxiv", "search_oeis",
+    "search_mathlib", "search_arxiv", "search_oeis", "list_mathlib_topics",
 ]
 
 
@@ -556,8 +567,9 @@ class PlanningPipeline:
             # the plan might be weaker than expected.
             valid_count = sum(1 for d in designs if "error" not in d and "parse_error" not in d)
             if 0 < valid_count < self._effective_best_of_n:
+                _active_personas = _PROOF_DESIGN_PERSONAS if self._is_proof else _DESIGN_PERSONAS
                 failed_labels = [
-                    _DESIGN_PERSONAS[i % len(_DESIGN_PERSONAS)][0]
+                    _active_personas[i % len(_active_personas)][0]
                     for i, d in enumerate(designs)
                     if "error" in d or "parse_error" in d
                 ]
@@ -722,16 +734,18 @@ class PlanningPipeline:
                 "WORKFLOW:\n"
                 "1. Check whether any Lean/proof files already exist with list_directory / find_files.\n"
                 "2. If the project is EMPTY (no .lean files), that is EXPECTED — skip immediately to step 3.\n"
-                "3. Search Mathlib for relevant theorems using search_mathlib. For Fermat's Little Theorem "
-                "or modular arithmetic tasks, search for terms like 'ZMod', 'Finset.card', "
-                "'ZMod.pow_card_sub_one_eq_one', 'Nat.Prime', 'Finset.prod_pow_eq_pow_sum'. "
+                "3. Call list_mathlib_topics() to see available topic areas, then use search_mathlib for the "
+                "specific lemmas you need. For Fermat's Little Theorem or modular arithmetic tasks, "
+                "search for terms like 'ZMod', 'Finset.card', 'ZMod.pow_card_sub_one_eq_one', "
+                "'Nat.Prime', 'Finset.prod_pow_eq_pow_sum'. "
                 "Run 2-4 targeted searches covering the key lemmas you expect to need.\n"
                 "4. Optionally use search_arxiv if a literature reference would sharpen the proof strategy.\n"
                 "5. Once you have identified the relevant Mathlib lemmas and understand the proof strategy, "
                 "call submit_work(signal='ACCEPTED', summary='<your findings>') to finish the survey.\n\n"
                 "GREENFIELD SHORTCUT — if list_directory shows no .lean files, do NOT keep searching "
-                "the filesystem. Go directly to search_mathlib.\n\n"
-                f"Task: {self.task_title}\n"
+                "the filesystem. Go directly to list_mathlib_topics(), then search_mathlib.\n\n"
+                + _cheatsheet() + "\n\n"
+                + f"Task: {self.task_title}\n"
                 f"Description: {self.task_description}"
                 + (f"\n\n{_arch}" if _arch else "")
             )
@@ -1036,10 +1050,13 @@ class PlanningPipeline:
             + _greenfield_warning
         )
 
-        # Build tool schema: read-only survey tools + submit_work so agents can
-        # read the codebase before committing to a design. Agents run sequentially
-        # (not in parallel) to avoid saturating the single LLM endpoint.
-        _design_tools = build_tool_schemas(["submit_work"] + SURVEY_TOOLS)
+        # Proof-task design agents get only submit_work — no survey tools.
+        # Survey findings are already in their user message; giving them filesystem
+        # tools causes them to spend all turns re-exploring instead of planning.
+        # Software-task design agents keep survey tools so they can read existing code.
+        _design_tools = build_tool_schemas(
+            ["submit_work"] if self._is_proof else ["submit_work"] + SURVEY_TOOLS
+        )
         _DESIGN_AGENT_MAX_TURNS = 12
 
         designs = []
@@ -1367,6 +1384,24 @@ class PlanningPipeline:
                 "[%s] Proof task — running %d reviewer(s): %s",
                 AGENT_NAME, len(reviewers), [r["name"] for r in reviewers],
             )
+            _PROOF_FOCUS_OVERRIDES = {
+                "coupling_reviewer": (
+                    "Review the lemma dependency graph for soundness: circular proofs, "
+                    "missing helper lemmas, over-ambitious main theorems that require sub-lemmas "
+                    "not listed in the plan. Check that every 'consumes' entry names a real "
+                    "Mathlib lemma with evidence it exists."
+                ),
+                "testability_reviewer": (
+                    "Review the verification strategy: is `lake build` with zero sorry achievable "
+                    "given the listed Mathlib imports? Are the listed tactic sequences well-supported? "
+                    "Are there missing propositions that need to be proved first? "
+                    "Look for proof obligations that are hand-waved away without a clear tactic."
+                ),
+            }
+            reviewers = [
+                {**r, "focus": _PROOF_FOCUS_OVERRIDES.get(r["name"], r["focus"])}
+                for r in reviewers
+            ]
         elif _is_unit_test_task(self.task_title, self.task_description):
             reviewers = [r for r in reviewers if r["name"] in _UNIT_TEST_REVIEWER_SUBSET]
             logger.info(
@@ -1480,8 +1515,17 @@ class PlanningPipeline:
                     data = {"verdict": "POSSIBLE", "confidence": 80, "justification": content[:500]}
 
             verdict_str = data.get("verdict", "POSSIBLE").upper()
-            verdict = Verdict(verdict_str)
-            confidence = int(data.get("confidence", 80))
+            try:
+                verdict = Verdict(verdict_str)
+            except ValueError:
+                logger.warning(
+                    "[%s] Reviewer '%s' returned unrecognized verdict %r — defaulting to POSSIBLE.",
+                    AGENT_NAME, reviewer_name, verdict_str,
+                )
+                verdict = Verdict.POSSIBLE
+                confidence = 80  # midpoint of POSSIBLE range [76,91]
+            else:
+                confidence = int(data.get("confidence", 80))
             # Clamp confidence to verdict range
             lo, hi = verdict.confidence_range
             confidence = max(lo, min(hi, confidence))
@@ -1538,12 +1582,25 @@ class PlanningPipeline:
 
         # LLM: edge case detection
         _arch = self._arch_ctx
+        if self._is_proof:
+            _pitfall_system = "You are a formal-proof quality reviewer. Use submit_work to output pitfalls."
+            _pitfall_focus = (
+                "Look for: missing helper lemmas, proof obligations without a clear tactic, "
+                "`sorry` placeholders in the plan, import paths that don't exist in Mathlib, "
+                "name clashes with existing Mathlib theorems, universe level mismatches, "
+                "overly complex tactic chains that are likely to fail."
+            )
+        else:
+            _pitfall_system = "You are a software quality analyst. Use submit_work to output pitfalls when ready."
+            _pitfall_focus = (
+                "Look for: edge cases, implicit dependencies, race conditions, "
+                "state management issues, migration risks."
+            )
         prompt = (
             (f"{_arch}\n\n" if _arch else "")
             + "Analyze this design for potential pitfalls:\n"
             f"{json.dumps(design, indent=1, ensure_ascii=True)}\n\n"
-            "Look for: edge cases, implicit dependencies, race conditions, "
-            "state management issues, migration risks.\n"
+            f"{_pitfall_focus}\n"
             "To output pitfalls, call the submit_work tool with:\n"
             "payload={\"pitfalls\": [{\"type\": \"...\", \"severity\": \"low|medium|high|critical\", \"detail\": \"...\"}]}"
         )
@@ -1554,7 +1611,7 @@ class PlanningPipeline:
         try:
             response = await call_llm(
                 [
-                    {"role": "system", "content": "You are a software quality analyst. Use submit_work to output pitfalls when ready."},
+                    {"role": "system", "content": _pitfall_system},
                     {"role": "user", "content": prompt},
                 ],
                 base_url=self.llm_base_url,
@@ -1617,10 +1674,16 @@ class PlanningPipeline:
         from app.agent.tools import build_tool_schemas, dispatch_tool
         consol_tools = build_tool_schemas(["submit_work"])
 
+        _consol_system = (
+            "You are a formal proof specialist. Use submit_work to output the final proof design."
+            if self._is_proof
+            else "You are a software architect. Use submit_work to output the final design."
+        )
+
         try:
             response = await call_llm(
                 [
-                    {"role": "system", "content": "You are a software architect. Use submit_work to output the final design."},
+                    {"role": "system", "content": _consol_system},
                     {"role": "user", "content": prompt},
                 ],
                 base_url=self.llm_base_url,

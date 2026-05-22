@@ -316,13 +316,39 @@ class TestSearchOeis:
 # search_mathlib — Gap 12 unit tests
 # ---------------------------------------------------------------------------
 
+_LOOGLE_RESPONSE = json.dumps({
+    "hits": [
+        {
+            "name": "ZMod.pow_card_sub_one_eq_one",
+            "type": "∀ {p : ℕ} [inst : Fact (Nat.Prime p)] (x : (ZMod p)ˣ), x ^ (p - 1) = 1",
+            "module": "Mathlib.Data.ZMod.Units",
+            "docstring": "Fermat's little theorem in ZMod.",
+        }
+    ],
+    "count": 1,
+}).encode()
+
+
+def _make_loogle_mock(response_bytes=_LOOGLE_RESPONSE):
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = response_bytes
+    mock_resp.__enter__ = lambda s: s
+    mock_resp.__exit__ = MagicMock(return_value=False)
+    return mock_resp
+
+
+def _loogle_fails():
+    """Context manager: makes Loogle raise so tests can reach the static index."""
+    import urllib.error
+    return patch("urllib.request.urlopen", side_effect=urllib.error.URLError("offline"))
+
+
 class TestSearchMathlib:
     def test_static_index_returns_results_without_lake(self):
-        # lake not available -> falls back to static index
-        with patch("app.agent.tools_math.shutil.which", return_value=None):
-            import importlib
+        # lake not available, loogle offline -> falls back to static index
+        with patch("app.agent.tools_math.shutil.which", return_value=None), \
+             _loogle_fails():
             import app.agent.tools_math as tm
-            # Reset cached index so it re-reads on next call
             tm._mathlib_index = None
             from app.agent.tools_math import search_mathlib
             results = search_mathlib("prime gap sieve")
@@ -334,7 +360,8 @@ class TestSearchMathlib:
             assert "doc" in r
 
     def test_max_results_respected(self):
-        with patch("app.agent.tools_math.shutil.which", return_value=None):
+        with patch("app.agent.tools_math.shutil.which", return_value=None), \
+             _loogle_fails():
             import app.agent.tools_math as tm
             tm._mathlib_index = None
             from app.agent.tools_math import search_mathlib
@@ -342,7 +369,8 @@ class TestSearchMathlib:
         assert len(results) <= 2
 
     def test_keyword_scoring_returns_prime_first(self):
-        with patch("app.agent.tools_math.shutil.which", return_value=None):
+        with patch("app.agent.tools_math.shutil.which", return_value=None), \
+             _loogle_fails():
             import app.agent.tools_math as tm
             tm._mathlib_index = None
             from app.agent.tools_math import search_mathlib
@@ -351,7 +379,10 @@ class TestSearchMathlib:
         assert "Prime" in results[0]["name"]
 
     def test_nonexistent_query_returns_empty(self):
-        with patch("app.agent.tools_math.shutil.which", return_value=None):
+        # loogle returns empty hits list; static index also misses
+        empty_loogle = json.dumps({"hits": [], "count": 0}).encode()
+        with patch("app.agent.tools_math.shutil.which", return_value=None), \
+             patch("urllib.request.urlopen", return_value=_make_loogle_mock(empty_loogle)):
             import app.agent.tools_math as tm
             tm._mathlib_index = None
             from app.agent.tools_math import search_mathlib
@@ -359,7 +390,8 @@ class TestSearchMathlib:
         assert results == []
 
     def test_max_results_clamped_to_50(self):
-        with patch("app.agent.tools_math.shutil.which", return_value=None):
+        with patch("app.agent.tools_math.shutil.which", return_value=None), \
+             _loogle_fails():
             import app.agent.tools_math as tm
             tm._mathlib_index = None
             from app.agent.tools_math import search_mathlib
@@ -382,6 +414,60 @@ class TestSearchMathlib:
         assert len(results) == 1
         assert results[0]["name"] == "Nat.Prime"
         assert "ℕ → Prop" in results[0]["type"]
+
+    def test_loogle_used_when_lake_unavailable(self):
+        with patch("app.agent.tools_math.shutil.which", return_value=None), \
+             patch("urllib.request.urlopen", return_value=_make_loogle_mock()):
+            import app.agent.tools_math as tm
+            tm._mathlib_index = None
+            from app.agent.tools_math import search_mathlib
+            results = search_mathlib("ZMod.pow_card_sub_one_eq_one")
+        assert len(results) == 1
+        r = results[0]
+        assert r["name"] == "ZMod.pow_card_sub_one_eq_one"
+        assert "ZMod" in r["type"]
+        assert r["module"] == "Mathlib.Data.ZMod.Units"
+        assert r["doc"] != ""  # docstring mapped to doc
+
+    def test_loogle_error_falls_back_to_static_index(self):
+        with patch("app.agent.tools_math.shutil.which", return_value=None), \
+             _loogle_fails():
+            import app.agent.tools_math as tm
+            tm._mathlib_index = None
+            from app.agent.tools_math import search_mathlib
+            results = search_mathlib("Nat.Prime")
+        # static index has Nat.Prime entries; top result should be prime-related
+        assert len(results) >= 1
+        assert "Prime" in results[0]["name"]
+
+    def test_loogle_api_error_field_falls_back_to_static(self):
+        # Loogle returns {"error": "...", "hits": null} -> treated as failure
+        error_resp = json.dumps({"hits": None, "error": "parse error"}).encode()
+        with patch("app.agent.tools_math.shutil.which", return_value=None), \
+             patch("urllib.request.urlopen", return_value=_make_loogle_mock(error_resp)):
+            import app.agent.tools_math as tm
+            tm._mathlib_index = None
+            from app.agent.tools_math import search_mathlib
+            results = search_mathlib("Nat.Prime")
+        assert len(results) >= 1
+
+    def test_loogle_max_results_respected(self):
+        # Loogle response with 3 hits but max_results=2
+        multi_response = json.dumps({
+            "hits": [
+                {"name": "A", "type": "T1", "module": "M1", "docstring": ""},
+                {"name": "B", "type": "T2", "module": "M2", "docstring": ""},
+                {"name": "C", "type": "T3", "module": "M3", "docstring": ""},
+            ],
+            "count": 3,
+        }).encode()
+        with patch("app.agent.tools_math.shutil.which", return_value=None), \
+             patch("urllib.request.urlopen", return_value=_make_loogle_mock(multi_response)):
+            import app.agent.tools_math as tm
+            tm._mathlib_index = None
+            from app.agent.tools_math import search_mathlib
+            results = search_mathlib("anything", max_results=2)
+        assert len(results) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -575,3 +661,121 @@ class TestMigration0105Logic:
         proof_tools = updated[103]
         assert proof_tools.count("search_mathlib") == 1
         assert proof_tools.count("get_lean4_proof_state") == 1
+
+
+# ---------------------------------------------------------------------------
+# list_mathlib_topics — unit tests
+# ---------------------------------------------------------------------------
+
+class TestListMathlibTopics:
+    def _reset_cache(self):
+        import app.agent.tools_math as tm
+        tm._mathlib_topics = None
+
+    def test_returns_all_topics_with_no_filter(self):
+        self._reset_cache()
+        from app.agent.tools_math import list_mathlib_topics
+        topics = list_mathlib_topics()
+        assert isinstance(topics, list)
+        assert len(topics) >= 10
+
+    def test_category_filter_case_insensitive(self):
+        self._reset_cache()
+        from app.agent.tools_math import list_mathlib_topics
+        lower = list_mathlib_topics(category="number theory")
+        upper = list_mathlib_topics(category="Number Theory")
+        mixed = list_mathlib_topics(category="NUMBER THEORY")
+        assert len(lower) > 0
+        assert len(lower) == len(upper) == len(mixed)
+
+    def test_unknown_category_returns_empty(self):
+        self._reset_cache()
+        from app.agent.tools_math import list_mathlib_topics
+        result = list_mathlib_topics(category="xyzzy_nonexistent_category_99999")
+        assert result == []
+
+    def test_each_topic_has_required_fields(self):
+        self._reset_cache()
+        from app.agent.tools_math import list_mathlib_topics
+        topics = list_mathlib_topics()
+        for t in topics:
+            assert "category" in t, f"Missing 'category' in {t}"
+            assert "topic" in t, f"Missing 'topic' in {t}"
+            assert "key_lemmas" in t, f"Missing 'key_lemmas' in {t}"
+            assert "modules" in t, f"Missing 'modules' in {t}"
+            assert "description" in t, f"Missing 'description' in {t}"
+
+    def test_partial_category_match_works(self):
+        self._reset_cache()
+        from app.agent.tools_math import list_mathlib_topics
+        # "number" should match "Number Theory"
+        result = list_mathlib_topics(category="number")
+        assert len(result) > 0
+        for t in result:
+            assert "number" in t["category"].lower()
+
+    def test_tool_registry_dispatch_returns_json(self):
+        self._reset_cache()
+        from app.agent.tools import dispatch_tool
+        raw = dispatch_tool("list_mathlib_topics", {})
+        parsed = json.loads(raw)
+        assert isinstance(parsed, list)
+        assert len(parsed) > 0
+
+    def test_dispatch_with_category_filter(self):
+        self._reset_cache()
+        from app.agent.tools import dispatch_tool
+        raw = dispatch_tool("list_mathlib_topics", {"category": "algebra"})
+        parsed = json.loads(raw)
+        assert isinstance(parsed, list)
+        for t in parsed:
+            assert "algebra" in t["category"].lower()
+
+    def test_topics_file_missing_returns_empty_list(self, tmp_path, monkeypatch):
+        import app.agent.tools_math as tm
+        tm._mathlib_topics = None
+        monkeypatch.setattr(tm, "_MATHLIB_TOPICS_PATH", tmp_path / "nonexistent.json")
+        result = tm.list_mathlib_topics()
+        assert result == []
+        # Reset for subsequent tests
+        tm._mathlib_topics = None
+        import app.agent.tools_math as tm2
+        monkeypatch.setattr(tm2, "_MATHLIB_TOPICS_PATH", tm2._MATHLIB_TOPICS_PATH.__class__(
+            str(tm2.__file__).replace("tools_math.py", "mathlib_topics.json")
+        ))
+
+
+# ---------------------------------------------------------------------------
+# mathlib_cheatsheet — unit tests
+# ---------------------------------------------------------------------------
+
+class TestMathlibCheatsheet:
+    def test_format_for_prompt_is_non_empty_string(self):
+        from app.agent.mathlib_cheatsheet import format_for_prompt
+        result = format_for_prompt()
+        assert isinstance(result, str)
+        assert len(result) > 50
+
+    def test_format_for_prompt_contains_reference_header(self):
+        from app.agent.mathlib_cheatsheet import format_for_prompt
+        result = format_for_prompt()
+        assert "MATHLIB QUICK REFERENCE" in result
+
+    def test_all_cheatsheet_goals_have_lemmas(self):
+        from app.agent.mathlib_cheatsheet import CHEATSHEET
+        for goal, info in CHEATSHEET.items():
+            assert len(info["lemmas"]) > 0, f"Goal '{goal}' has no lemmas"
+            assert len(info["modules"]) > 0, f"Goal '{goal}' has no modules"
+            assert "tactics" in info, f"Goal '{goal}' missing 'tactics'"
+
+    def test_format_for_prompt_lists_all_goals(self):
+        from app.agent.mathlib_cheatsheet import CHEATSHEET, format_for_prompt
+        result = format_for_prompt()
+        for goal in CHEATSHEET:
+            # Each goal should appear in the formatted output
+            assert goal in result, f"Goal '{goal}' not in format_for_prompt() output"
+
+    def test_cheatsheet_fermat_has_zmod_lemma(self):
+        from app.agent.mathlib_cheatsheet import CHEATSHEET
+        fermat = CHEATSHEET["Fermat's little theorem"]
+        assert any("ZMod" in lemma for lemma in fermat["lemmas"])
