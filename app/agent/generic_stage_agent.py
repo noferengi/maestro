@@ -65,6 +65,7 @@ class GenericStageAgent(AgentLoop):
 
     def _build_messages(self) -> list[dict]:
         from app.database import get_task
+        from app.agent.session_summarizer import get_session_learning
         task = get_task(self.task_id)
         cfg = self._stage_config.config or {}
 
@@ -83,6 +84,15 @@ class GenericStageAgent(AgentLoop):
             for key in required_keys:
                 if key in content_blob:
                     user_lines.append(f"{key}: {content_blob[key]}")
+
+        if task:
+            learning = get_session_learning(task.project, self.task_id)
+            if learning:
+                user_lines.append(
+                    "\n== PRIOR SESSION LEARNING (read carefully before acting) ==\n"
+                    f"{learning}\n"
+                    "== END PRIOR LEARNING =="
+                )
 
         return [
             {"role": "system", "content": self._system_prompt},
@@ -122,9 +132,29 @@ class GenericStageAgent(AgentLoop):
 
     async def _on_max_turns(self) -> dict:
         logger.warning(
-            "[generic_stage] task '%s' stage '%s': max turns — advancing fail.",
+            "[generic_stage] task '%s' stage '%s': max turns — summarizing session.",
             self.task_id, self._stage_config.stage_key,
         )
+        from app.database import get_task
+        from app.agent.session_summarizer import summarize_session
+        task = get_task(self.task_id)
+        if task and self.max_context:
+            try:
+                await summarize_session(
+                    task_id=self.task_id,
+                    messages=list(self._messages),
+                    llm_id=self.llm_id,
+                    budget_id=self.budget_id,
+                    project_name=task.project,
+                    max_context=self.max_context,
+                    base_url=self.llm_base_url,
+                    model=self.llm_model,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[generic_stage] task '%s': summarize_session failed: %s",
+                    self.task_id, exc,
+                )
         advance_stage(self.task_id, "fail")
         return {"signal": "MAX_TURNS", "condition": "fail"}
 
