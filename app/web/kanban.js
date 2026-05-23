@@ -9592,11 +9592,10 @@ function _peekAppendToken(data) {
         resultEl.appendChild(label);
         resultEl.appendChild(pre);
         item.appendChild(resultEl);
-        // If item is already expanded, show result immediately
-        const argsEl = item.querySelector('.lp-tool-args');
-        if (argsEl && argsEl.classList.contains('open')) {
-            resultEl.classList.add('open');
-        }
+        // Always show the result immediately; flip the toggle to ▼
+        resultEl.classList.add('open');
+        const toggle = item.querySelector('.lp-tool-toggle');
+        if (toggle) { toggle.textContent = '▼'; toggle.classList.add('lp-tool-toggle-has-result'); }
         _peekScrollDown();
         return;
     }
@@ -9628,9 +9627,9 @@ function _lpToggleTool(toggleEl) {
     const argsEl = item && item.querySelector('.lp-tool-args');
     const resultEl = item && item.querySelector('.lp-tool-result');
     if (!argsEl && !resultEl) return;
-    const wasOpen = (argsEl && argsEl.classList.contains('open'))
-                 || (resultEl && resultEl.classList.contains('open'));
-    const nowOpen = !wasOpen;
+    const isOpen = (argsEl && argsEl.classList.contains('open'))
+                || (resultEl && resultEl.classList.contains('open'));
+    const nowOpen = !isOpen;
     if (argsEl) argsEl.classList.toggle('open', nowOpen);
     if (resultEl) resultEl.classList.toggle('open', nowOpen);
     toggleEl.textContent = nowOpen ? '▼' : '▶';

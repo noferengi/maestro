@@ -4019,11 +4019,13 @@ body {
     padding: 0.35rem 0.6rem;
     border-radius: 3px;
     white-space: pre-wrap;
-    word-break: break-all;
+    word-break: break-word;
     border: 1px solid #21262d;
     border-left: 2px solid #30363d;
-    max-height: none;
+    max-height: 220px;
+    overflow-y: auto;
 }
+.lp-tool-toggle-has-result { color: #58a6ff !important; }
 
 .lp-turn-sep {
     margin: 0.5rem 0;
