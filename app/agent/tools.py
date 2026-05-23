@@ -1727,7 +1727,7 @@ tool_name: str, trying_to: str, expected: str, actual: str) -> str:
     )
 
 
-def submit_work(signal: str, summary: str, payload: dict | None = None) -> str:
+def submit_work(signal: str, summary: str, payload: dict | None = None, previous: bool = False) -> str:
     """[FINISH] The ONLY way to complete a task. Signals that your work is done.
 
     signal: 'ACCEPTED' (task complete), 'REVERT_TO_DESIGN' (task impossible/needs re-plan),
@@ -5916,6 +5916,8 @@ TOOL_SCHEMAS: list[dict] = [
             "description": (
                 "[FINISH] Terminate your session and report outcome. "
                 "Call this ONCE at the very end — it immediately stops the agent loop. "
+                "If a gate rejects your submission, satisfy the required tools then call "
+                "submit_work(signal='ACCEPTED', previous=True) to re-submit without retyping your summary. "
                 "Implementors: ACCEPTED (work done, tests pass), "
                 "REVERT_TO_DESIGN (design is broken, cannot proceed), "
                 "SUBDIVIDE (task too large for one agent), "
@@ -5948,6 +5950,15 @@ TOOL_SCHEMAS: list[dict] = [
                         "description": (
                             "Optional dictionary for agent-specific data (e.g., test results, "
                             "sub-task lists, verdict details). Pass null or omit if no payload needed."
+                        ),
+                    },
+                    "previous": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, reuse signal/summary/payload from the most recent prior "
+                            "submit_work call in this session. Chains back through previous=True "
+                            "calls to find concrete arguments. Use after a gate rejection to "
+                            "re-submit without regenerating your summary."
                         ),
                     },
                 },
@@ -6146,10 +6157,13 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "run_sympy",
             "description": (
-                "[RUN — docker-sandbox] Execute Python/SymPy code for mathematical exploration. "
-                "Runs in an isolated Docker container with no network access. "
-                "Returns stdout and stderr. Use for scratch computation; "
-                "commit final results via write_file + run_test_pytest."
+                "[RUN — docker-sandbox] Execute Python/SymPy code for mathematical computation. "
+                "STATELESS: each call starts a FRESH container — files, variables, and imports from "
+                "previous calls are completely gone. Do NOT use for lake, lean, or any Lean4 operations; "
+                "use run_lean4 for those. No network access. "
+                "Returns stdout and stderr. "
+                "To persist results between calls, extract the value from stdout and store it with "
+                "store_document() or write_file() before the call ends."
             ),
             "parameters": {
                 "type": "object",
@@ -6172,10 +6186,15 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "run_lean4",
             "description": (
-                "[RUN — docker-sandbox] Compile Lean4 source against Mathlib in an isolated Docker container. "
-                "Pipe source to `lean /tmp/main.lean`; returns stdout and stderr. "
+                "[RUN — docker-sandbox] Compile a Lean4 source file against the pre-built Mathlib. "
+                "Writes your source string to /mathlib-project/Verify.lean inside the container, "
+                "then runs `lake env lean /mathlib-project/Verify.lean` — Mathlib imports work "
+                "immediately with no lake init, no cache fetch, and no project setup of any kind. "
+                "STATELESS: each call is a fresh container; use write_file() in the workspace to "
+                "persist the .lean source between calls. "
+                "Returns stdout and stderr. "
                 "Exit code 0 (message: 'compiled successfully') means no errors and no sorry. "
-                "The sandbox image (sympy-lean4-sandbox:latest) has Lean 4.29.1 + Mathlib pre-built."
+                "DO NOT use run_sympy to run lake or lean commands — use this tool instead."
             ),
             "parameters": {
                 "type": "object",

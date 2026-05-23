@@ -200,6 +200,83 @@ class CustomLLMAgent(AgentLoop):
     def _get_tool_schemas(self) -> list[dict]:
         return self._tool_schemas_list
 
+    def _check_gate_for_submit(self, terminal_data: dict) -> str | None:
+        """
+        Pre-terminal gate check. Called from the loop BEFORE the terminal signal
+        is accepted. Returns None if the gate passes (loop exits normally), or a
+        rejection message string that is injected into the agent context so the
+        loop can continue and give the agent a chance to satisfy the gate.
+
+        Only fires for ACCEPTED signals — REJECTED passes through immediately so
+        reviewer agents can still reject without needing to call any tools.
+        """
+        signal = terminal_data.get("signal", "")
+        if signal != "ACCEPTED":
+            return None
+        if self._gate_type in ("none", "single_pass"):
+            return None
+
+        cfg = (self._stage_config.config or {}) if self._stage_config else {}
+        blocked_lines: list[str] = []
+
+        # Verifier gate
+        verifier = cfg.get("verifier") or self._defn_verifier
+        verifier_cmd = cfg.get("verifier_cmd") or self._defn_verifier_cmd
+        if verifier and verifier != "none":
+            from app.agent.verifiers import run_verifier
+            patched = StageConfig(
+                stage_key=self._stage_config.stage_key if self._stage_config else "",
+                agent_type=self._stage_config.agent_type if self._stage_config else "",
+                config={**cfg, "verifier": verifier, "verifier_cmd": verifier_cmd},
+                template_id=self._stage_config.template_id if self._stage_config else None,
+            )
+            if not run_verifier(self.task_id, patched):
+                blocked_lines.append(f"  • verifier '{verifier}' failed")
+
+        # required_tool_successes gate
+        required = cfg.get("required_tool_successes") or []
+        if required:
+            from app.agent.tool_success_store import query as _tss_query
+            for tool_name in required:
+                state = _tss_query(self.task_id, tool_name)
+                if state is not True:
+                    label = "never called" if state is None else "called but failed"
+                    blocked_lines.append(f"  • {tool_name} ({label}) — required_tool_successes")
+
+        # required_tool_groups gate
+        required_groups = cfg.get("required_tool_groups") or []
+        if required_groups:
+            from app.agent.tool_success_store import query_group as _tss_query_group
+            for group in required_groups:
+                if not _tss_query_group(self.task_id, group):
+                    blocked_lines.append(
+                        f"  • none of [{', '.join(group)}] succeeded — required_tool_groups"
+                    )
+
+        if not blocked_lines:
+            return None
+
+        logger.warning(
+            "[custom_llm_agent] task '%s': gate blocked submit_work(ACCEPTED): %s",
+            self.task_id, blocked_lines,
+        )
+
+        requirements_text = "\n".join(blocked_lines)
+        stage_key = self._stage_config.stage_key if self._stage_config else "this stage"
+        msg = (
+            f"[GATE BLOCKED] submit_work(ACCEPTED) was REJECTED by the stage gate for {stage_key}.\n"
+            f"\n"
+            f"Unmet requirements:\n{requirements_text}\n"
+            f"\n"
+            f"You MUST satisfy ALL of the above before submit_work(ACCEPTED) will be accepted.\n"
+            f"Your summary text has been preserved — after satisfying the gate, call:\n"
+            f"  submit_work(signal='ACCEPTED', summary='...', previous=True)\n"
+            f"\n"
+            f"DO NOT call submit_work again until you have run the required tools successfully.\n"
+            f"Call the required tool(s) NOW and check their output before re-submitting."
+        )
+        return msg
+
     async def _on_terminal(self) -> dict:
         signal = self._terminal_signal.get("signal", "")
         if self._gate_type == "none" or self._gate_type == "single_pass":
@@ -211,69 +288,10 @@ class CustomLLMAgent(AgentLoop):
         else:
             condition = "pass"
 
-        # Run formal verification gate if LLM passed and a verifier is configured.
-        # Stage-level verifier overrides the definition-level verifier.
-        if condition == "pass":
-            cfg = (self._stage_config.config or {}) if self._stage_config else {}
-            verifier = cfg.get("verifier") or self._defn_verifier
-            verifier_cmd = cfg.get("verifier_cmd") or self._defn_verifier_cmd
-            if verifier and verifier != "none":
-                from app.agent.verifiers import run_verifier
-                # Build a patched StageConfig with the resolved verifier fields
-                patched = StageConfig(
-                    stage_key=self._stage_config.stage_key if self._stage_config else "",
-                    agent_type=self._stage_config.agent_type if self._stage_config else "",
-                    config={**(cfg), "verifier": verifier, "verifier_cmd": verifier_cmd},
-                    template_id=self._stage_config.template_id if self._stage_config else None,
-                )
-                logger.info(
-                    "[custom_llm_agent] task '%s': running verifier '%s'",
-                    self.task_id, verifier,
-                )
-                if not run_verifier(self.task_id, patched):
-                    logger.warning(
-                        "[custom_llm_agent] task '%s': verifier '%s' failed — condition -> fail",
-                        self.task_id, verifier,
-                    )
-                    condition = "fail"
-
-        # Check required_tool_successes declared in stage config.
-        # e.g. {"required_tool_successes": ["run_lean4", "run_test_pytest"]}
-        if condition == "pass":
-            cfg = (self._stage_config.config or {}) if self._stage_config else {}
-            required = cfg.get("required_tool_successes") or []
-            if required:
-                from app.agent.tool_success_store import query as _tss_query
-                blocked_by: list[str] = []
-                for tool_name in required:
-                    state = _tss_query(self.task_id, tool_name)
-                    if state is not True:
-                        label = "never called" if state is None else "called but failed"
-                        blocked_by.append(f"{tool_name} ({label})")
-                if blocked_by:
-                    logger.warning(
-                        "[custom_llm_agent] task '%s': required_tool_successes not met: %s — condition -> fail",
-                        self.task_id, blocked_by,
-                    )
-                    condition = "fail"
-
-        # Check required_tool_groups: each inner list is an OR-group; all groups must be satisfied.
-        if condition == "pass":
-            cfg = (self._stage_config.config or {}) if self._stage_config else {}
-            required_groups = cfg.get("required_tool_groups") or []
-            if required_groups:
-                from app.agent.tool_success_store import query_group as _tss_query_group
-                blocked_groups: list[str] = []
-                for group in required_groups:
-                    if not _tss_query_group(self.task_id, group):
-                        blocked_groups.append(f"none of [{', '.join(group)}] succeeded")
-                if blocked_groups:
-                    logger.warning(
-                        "[custom_llm_agent] task '%s': required_tool_groups not met: %s — condition -> fail",
-                        self.task_id, blocked_groups,
-                    )
-                    condition = "fail"
-
+        # Gate checks run in _check_gate_for_submit before the loop exits.
+        # By the time _on_terminal is called the gate has already passed,
+        # so we only need to handle the verifier for non-ACCEPTED signals
+        # (e.g. a reviewer REJECTED that still needs advance_stage).
         advance_stage(self.task_id, condition)
         return {"signal": signal, "condition": condition}
 

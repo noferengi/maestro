@@ -86,7 +86,8 @@ def main():
     poll = float(sys.argv[2]) if len(sys.argv) > 2 else 3.0
 
     since_id = 0
-    consecutive_idle = 0
+    last_heartbeat = time.time()
+    heartbeat_interval = 300.0
 
     print(f"[tail_task] watching {task_id} (poll={poll}s) — Ctrl-C to stop", flush=True)
 
@@ -98,7 +99,7 @@ def main():
                 rows = _query_new_entries(raw_conn, task_id, since_id)
 
             if rows:
-                consecutive_idle = 0
+                last_heartbeat = time.time()
                 for r in rows:
                     since_id = r["id"]
                     x = _extract(r)
@@ -114,13 +115,13 @@ def main():
                         line = f"{ts} [{x['finish']}] ctx={ctx} gen={gen}  {snippet[:100]}"
                     print(line, flush=True)
             else:
-                consecutive_idle += 1
-                # Print a heartbeat every ~30s of silence so the monitor knows we're alive
-                if consecutive_idle % 10 == 0:
+                now = time.time()
+                if now - last_heartbeat >= heartbeat_interval:
                     status = "ACTIVE" if active else "IDLE"
                     print(f"[tail_task] {status} stage={stage} since_id={since_id} — waiting...", flush=True)
+                    last_heartbeat = now
 
-            if not active and consecutive_idle > 5:
+            if not active and (time.time() - last_heartbeat) > heartbeat_interval:
                 print(f"[tail_task] session ended (stage={stage}), exiting.", flush=True)
                 break
 

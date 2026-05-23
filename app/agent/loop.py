@@ -603,6 +603,12 @@ class MaestroLoop:
                 if path and path not in self._files_changed:
                     self._files_changed.append(path)
 
+            # Resolve submit_work(previous=True) before dispatching.
+            if name == "submit_work" and arguments.get("previous"):
+                resolved = self._resolve_previous_submit(arguments)
+                if resolved:
+                    arguments = resolved
+
             # Dispatch (async - handles spawn_research_agent correctly)
             result_content = await async_dispatch_tool(
                 name, arguments,
@@ -618,8 +624,12 @@ class MaestroLoop:
                 try:
                     terminal_data = json.loads(result_content)
                     if terminal_data.get("__maestro_terminal__"):
-                        # We store the terminal signal to be picked up by the main loop
-                        self._terminal_signal = terminal_data
+                        gate_error = self._check_gate_for_submit(terminal_data)
+                        if gate_error:
+                            # Gate blocked: inject rejection into context and continue loop.
+                            result_content = gate_error
+                        else:
+                            self._terminal_signal = terminal_data
                 except Exception:
                     pass
 
@@ -631,6 +641,56 @@ class MaestroLoop:
             })
 
         return result_messages
+
+    # ------------------------------------------------------------------
+    # Gate pre-check hook (overridden by CustomLLMAgent)
+    # ------------------------------------------------------------------
+
+    def _check_gate_for_submit(self, terminal_data: dict) -> str | None:
+        """
+        Called before a terminal submit_work signal is accepted.
+        Returns None if the gate passes, or a rejection message string that
+        will be injected into the agent context so the loop can continue.
+        Base implementation always passes; CustomLLMAgent overrides this.
+        """
+        return None
+
+    def _resolve_previous_submit(self, current_args: dict) -> dict | None:
+        """
+        Walk message history backwards to resolve submit_work(previous=True).
+        Chains through any intermediate previous=True calls until it finds
+        a submit_work call with concrete (non-previous) arguments.
+        Returns the resolved arguments dict, or None if not found.
+        """
+        visited: set[int] = set()
+        for msg in reversed(self._messages):
+            if msg.get("role") != "assistant":
+                continue
+            for tc in (msg.get("tool_calls") or []):
+                tc_id = id(tc)
+                if tc_id in visited:
+                    continue
+                visited.add(tc_id)
+                fn = tc.get("function", {})
+                if fn.get("name") != "submit_work":
+                    continue
+                raw = fn.get("arguments", "{}")
+                try:
+                    args = json.loads(raw) if isinstance(raw, str) else raw
+                except Exception:
+                    continue
+                if args.get("previous"):
+                    continue  # skip, keep walking back
+                # Found concrete args — strip previous flag if present and return
+                args.pop("previous", None)
+                logger.info(
+                    "[loop] submit_work(previous=True) resolved to args from earlier call "
+                    "(signal=%s, summary=%s...)",
+                    args.get("signal"), str(args.get("summary", ""))[:60],
+                )
+                return args
+        logger.warning("[loop] submit_work(previous=True): no prior concrete submit_work found in history")
+        return None
 
     # ------------------------------------------------------------------
     # Failure counting
