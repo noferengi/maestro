@@ -577,14 +577,17 @@ class TestIntakePipelineMockLLM:
         stages = {v["stage"] for v in result["votes"]}
         assert "scope_analysis" in stages
 
-    def test_rejected_scope_short_circuits(self):
-        """REJECTED scope vote → pipeline returns 'rejected' without running other stages."""
+    def test_single_rejected_scope_does_not_veto(self):
+        """A single REJECTED scope vote no longer vetoes — all stages still run.
+
+        1 REJECTED out of 4 votes is below the majority threshold of 3,
+        so the outcome must be 'passed'.
+        """
         result = self._run_pipeline(scope="REJECTED")
-        assert result["outcome"] == "rejected", \
-            f"Expected 'rejected', got {result['outcome']!r}"
-        # Only scope_analysis should be in votes (early exit)
-        assert len(result["votes"]) == 1
-        assert result["votes"][0]["stage"] == "scope_analysis"
+        assert result["outcome"] == "passed", \
+            f"Expected 'passed' (single REJECTED is not a veto), got {result['outcome']!r}"
+        # All 4 stages must have run — no early exit
+        assert len(result["votes"]) == 4
 
     def test_needs_research_triggers_research_then_passes(self):
         """NEEDS_RESEARCH scope → run_research called (mocked LIKELY) → outcome 'passed'."""
@@ -601,10 +604,16 @@ class TestIntakePipelineMockLLM:
         assert result["outcome"] == "passed", \
             f"Expected 'passed' after tiebreak, got {result['outcome']!r}"
 
-    def test_rejected_result_contains_justification(self):
-        """Rejected result carries a justification string in at least one vote."""
-        result = self._run_pipeline(scope="REJECTED")
-        assert result["outcome"] == "rejected"
+    def test_majority_negative_votes_rejected_with_justification(self):
+        """3 negative votes out of 4 → 'rejected' with justification strings."""
+        result = self._run_pipeline(
+            scope="REJECTED", static="NOT_SUITABLE",
+            conflict="REJECTED", feasibility="REJECTED",
+        )
+        assert result["outcome"] == "rejected", \
+            f"Expected 'rejected' with 3/4 negative votes, got {result['outcome']!r}"
+        assert len(result.get("rejection_reasons", [])) > 0, \
+            "rejection_reasons must be populated"
         votes = result.get("votes", [])
         assert any(v.get("justification") for v in votes), \
             "At least one vote must carry a justification string"

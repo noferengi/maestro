@@ -203,14 +203,21 @@ class TestFullReject:
         )
         assert len(result["rejection_reasons"]) > 0
 
-    def test_rejected_early_exits_before_other_stages(self):
-        """A REJECTED scope vote should not run conflict/feasibility stages."""
+    def test_rejected_scope_runs_all_stages(self):
+        """A REJECTED scope vote no longer short-circuits — all stages run.
+
+        Since _run_pipeline_direct repeats the last response, all three LLM
+        stages (scope, conflict, feasibility) get REJECTED. That is 3 negative
+        votes out of 4 total (static = LIKELY), which meets the majority
+        threshold of 3 — so the outcome is still 'rejected', but via consensus
+        rather than early exit.
+        """
         result, pipeline = asyncio.run(
             _run_pipeline_direct([_llm_response(_SCOPE_REJECTED)])
         )
         assert result["outcome"] == "rejected"
-        # Scope vote only - pipeline exits early after REJECTED
-        assert len(result["votes"]) == 1
+        # All 4 stages run: scope, static_analysis, conflict_detection, feasibility_analysis
+        assert len(result["votes"]) == 4
 
 
 # ---------------------------------------------------------------------------

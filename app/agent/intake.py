@@ -97,27 +97,67 @@ payload={
 Verdict guidelines:
 - LIKELY: Task is well-defined, reasonable scope, clearly feasible.
 - POSSIBLE: Task is feasible but has some ambiguity or moderate complexity.
-- NEEDS_RESEARCH: Task is too vague to assess - needs clarification before proceeding.
-- NOT_SUITABLE: Task is poorly scoped, too large without decomposition, or fundamentally questionable.
-- REJECTED: Task is fundamentally unfeasible, contradictory, or harmful to the project.
+- NEEDS_RESEARCH: Task is too vague to assess — needs clarification before proceeding.
+- NOT_SUITABLE: Task is poorly scoped, too large without decomposition, or fundamentally
+  malformed (not just ambitious or greenfield).
+- REJECTED: Reserve for tasks that are LOGICALLY IMPOSSIBLE, HARMFUL, or illegal.
+  An empty project, missing infrastructure, or ambitious scope are NOT grounds for REJECTED.
+  This verdict should be extremely rare — default to POSSIBLE or NEEDS_RESEARCH when uncertain.
 - SUBDIVIDE_IDEA: Task is fundamentally sound but too large to implement in a single context window. Should be decomposed into smaller pieces. Only use when the task is good but genuinely too big - not vague (NEEDS_RESEARCH) or bad (REJECTED).
 
 No prose after calling submit_work.\
 """
 
+_PLATFORM_CAPABILITIES = """\
+## Maestro Platform Capabilities
+
+You are evaluating a task that will be executed by Maestro, an agentic workflow platform.
+Before assessing feasibility, understand what Maestro CAN do — the absence of existing code
+in the project directory is NEVER a reason to reject a task.
+
+### Available tools (accessible to implementation agents):
+- **Formal proof / mathematics**: `run_lean4` (Lean4 + Mathlib4 sandbox on a remote Docker host,
+  pre-built image with Lean 4.29.1 + SymPy 1.14), `run_sympy` (Python SymPy), `search_mathlib`,
+  `search_oeis`, `search_arxiv`, `list_mathlib_topics`
+- **Code execution & testing**: `run_pytest`, `run_mypy`, `run_ruff`, `run_black_check`,
+  `run_tsc`, `run_cargo_build`, `run_go_build`, `run_npm_build`
+- **Research & search**: `web_search` (Brave/Tavily), `web_fetch`
+- **File operations**: `read_file`, `write_file`, `search_files`, `find_files`, `list_directory`,
+  `git_log`, `git_blame`, `git_add`, `git_restore`
+- **Agent coordination**: `get_task`, `list_tasks`, `create_subtasks`, `consult_maestro`
+- **Security**: `run_bandit`, `run_pip_audit`, `run_semgrep`
+
+### Pipeline templates (the platform routes tasks through these automatically):
+- **Mathematics / Proof Exploration** — 11 stages: exploration → Lean4 formalization → verification
+- **Software Development** — INDEV → conceptual review → optimization → security → final review
+- **Research Report** — research → synthesis → review
+- **Data Analysis**, **Novel Writing**, **Bug Triage**, **Overnight Story Factory**
+
+### Subdivision: oversized tasks are automatically decomposed into subtasks that run in parallel.
+
+### Key principle: GREENFIELD IS THE NORMAL STARTING STATE.
+Maestro is designed to BUILD things from scratch. An empty project directory means the
+implementation agent will create all necessary files, structure, and infrastructure.
+"No existing code" is never a reason to reject — it is the default starting condition.
+The feasibility question is: "Can Maestro's tools and pipeline execute this work?" — not
+"Does this infrastructure already exist?"
+"""
+
 _FEASIBILITY_SYSTEM_PROMPT = """\
-You are an expert analyst performing feasibility analysis on a proposed task.
+You are an expert analyst performing feasibility analysis on a proposed task that will be
+executed by the Maestro agentic platform.
+
+""" + _PLATFORM_CAPABILITIES + """
 
 You will receive:
 1. The task description and title.
 2. A structural analysis of the current project (file counts, languages or formats, component structure).
 
 Your job is to assess:
-- Whether the task is feasible given the current project structure and environment.
+- Whether Maestro's tools and pipeline can execute this task (NOT whether the code already exists).
 - What ambiguities or unknowns exist that could block completion.
-- Whether external dependencies, tools, or APIs are needed.
+- Whether any external dependencies, APIs, or resources are unavailable to the platform.
 - What risks or edge cases should be considered.
-- Whether the project is in a state that can accommodate this task.
 
 To complete your analysis, call the submit_work tool with:
 payload={
@@ -134,12 +174,17 @@ payload={
 }
 
 Verdict guidelines:
-- LIKELY: Project/environment is ready, no major blockers, required dependencies are available.
-- POSSIBLE: Feasible but some preparation or dependency resolution needed.
-- NEEDS_RESEARCH: Cannot determine feasibility — too many unknowns.
-- NOT_SUITABLE: Significant structural incompatibilities or missing foundations.
-- REJECTED: Fundamentally impossible given the current state of the project.
-- SUBDIVIDE_IDEA: Task is fundamentally sound but too large to implement in a single context window. Should be decomposed into smaller pieces. Only use when the task is good but genuinely too big - not vague (NEEDS_RESEARCH) or bad (REJECTED).
+- LIKELY: The platform has the tools to execute this; no fundamental blockers.
+- POSSIBLE: Feasible but some preparation or unknowns to resolve during execution.
+- NEEDS_RESEARCH: Cannot assess feasibility — key facts about the domain or environment are unknown.
+- NOT_SUITABLE: The task is logically malformed, self-contradictory, or asks for something
+  Maestro cannot meaningfully do (e.g. "deploy to production", "send a real email").
+  Do NOT use this because existing code is absent — that is expected.
+- REJECTED: Reserve for tasks that are LOGICALLY IMPOSSIBLE (mathematical contradiction),
+  HARMFUL (destructive, illegal), or completely outside any agent's capability regardless
+  of project state. This verdict should be extremely rare. Missing infrastructure, absent
+  files, or an empty project directory never justify REJECTED.
+- SUBDIVIDE_IDEA: Task is fundamentally sound but too large for a single context window.
 
 No prose after calling submit_work.\
 """
@@ -244,10 +289,6 @@ class IntakePipeline:
         # Stage 1: Scope Analysis
         scope_vote = await self._stage_scope_analysis()
         self.votes.append(scope_vote)
-
-        # Check for immediate rejection
-        if scope_vote["verdict"] == VERDICT_REJECTED:
-            return self._build_tally()
 
         # Stage 2a and Stage 3 in parallel
         static_vote, conflict_vote = await asyncio.gather(
@@ -912,28 +953,21 @@ class IntakePipeline:
             )
             return result
 
-        # Check for REJECTED - immediate rejection
-        for v in self.votes:
-            if v["verdict"] == VERDICT_REJECTED:
-                result["outcome"] = "rejected"
+        # Rejection requires a MAJORITY of votes to be negative (REJECTED or NOT_SUITABLE
+        # combined). A single REJECTED vote no longer short-circuits — it is treated as a
+        # strong negative signal but not a veto. This prevents one over-cautious stage from
+        # blocking a task that three other stages consider feasible.
+        negative_votes = [
+            v for v in self.votes
+            if v["verdict"] in (VERDICT_REJECTED, VERDICT_NOT_SUITABLE)
+        ]
+        majority_threshold = (len(self.votes) // 2) + 1
+        if len(negative_votes) >= majority_threshold:
+            result["outcome"] = "rejected"
+            for v in negative_votes:
                 result["rejection_reasons"].append(
                     f"Stage '{v['stage']}': {v['justification']}"
                 )
-                return result
-
-        # Check for majority NOT_SUITABLE
-        # Use the same majority threshold as verdicts.py: (n // 2) + 1
-        not_suitable_count = sum(
-            1 for v in self.votes if v["verdict"] == VERDICT_NOT_SUITABLE
-        )
-        majority_threshold = (len(self.votes) // 2) + 1
-        if not_suitable_count >= majority_threshold:
-            result["outcome"] = "rejected"
-            for v in self.votes:
-                if v["verdict"] == VERDICT_NOT_SUITABLE:
-                    result["rejection_reasons"].append(
-                        f"Stage '{v['stage']}': {v['justification']}"
-                    )
             return result
 
         # Check for NEEDS_RESEARCH
