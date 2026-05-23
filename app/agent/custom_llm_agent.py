@@ -192,6 +192,16 @@ class CustomLLMAgent(AgentLoop):
         else:
             user_content = _default_user_content(task, self.task_id)
 
+        if task:
+            from app.agent.session_summarizer import get_session_learning
+            learning = get_session_learning(task.project, self.task_id)
+            if learning:
+                user_content += (
+                    "\n\n== PRIOR SESSION LEARNING (read carefully before acting) ==\n"
+                    f"{learning}\n"
+                    "== END PRIOR LEARNING =="
+                )
+
         return [
             {"role": "system", "content": self._system_prompt},
             {"role": "user",   "content": user_content},
@@ -297,9 +307,29 @@ class CustomLLMAgent(AgentLoop):
 
     async def _on_max_turns(self) -> dict:
         logger.warning(
-            "[custom_llm_agent] task '%s': max turns reached — advancing with 'fail'",
+            "[custom_llm_agent] task '%s': max turns reached — summarizing session.",
             self.task_id,
         )
+        from app.database import get_task
+        from app.agent.session_summarizer import summarize_session
+        task = get_task(self.task_id)
+        if task and self.max_context:
+            try:
+                await summarize_session(
+                    task_id=self.task_id,
+                    messages=list(self._messages),
+                    llm_id=self.llm_id,
+                    budget_id=self.budget_id,
+                    project_name=task.project,
+                    max_context=self.max_context,
+                    base_url=self.llm_base_url,
+                    model=self.llm_model,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[custom_llm_agent] task '%s': summarize_session failed: %s",
+                    self.task_id, exc,
+                )
         advance_stage(self.task_id, "fail")
         return {"signal": "MAX_TURNS", "condition": "fail"}
 
