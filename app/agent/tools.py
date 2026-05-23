@@ -6686,8 +6686,8 @@ def dispatch_tool(name: str, arguments: dict, *, task_id: str | None = None) -> 
         result = func(**arguments)
         # Ensure the result is always a string
         if not isinstance(result, str):
-            import json
-            result = json.dumps(result, default=str)
+            import json as _json_inner
+            result = _json_inner.dumps(result, default=str)
 
         # Record to success store before truncation so [EXIT:N] prefix is always present
         if task_id:
@@ -6695,16 +6695,31 @@ def dispatch_tool(name: str, arguments: dict, *, task_id: str | None = None) -> 
             if name in TRACKED_TOOLS:
                 record(task_id, name, infer_success(name, result))
 
-        return _cap_tool_result(name, result)
+        result_str = _cap_tool_result(name, result)
     except TypeError as exc:
         logger.warning("Tool error [%s]: %s", name, exc)
-        return f"ERROR: Bad arguments for tool '{name}': {exc}"
+        result_str = f"ERROR: Bad arguments for tool '{name}': {exc}"
     except ValueError as exc:
         logger.warning("Tool error [%s]: %s", name, exc)
-        return f"ERROR: {exc}"
+        result_str = f"ERROR: {exc}"
     except Exception as exc:
         logger.warning("Tool error [%s]: %s", name, exc)
-        return f"ERROR: Unexpected error in tool '{name}': {type(exc).__name__}: {exc}"
+        result_str = f"ERROR: Unexpected error in tool '{name}': {type(exc).__name__}: {exc}"
+
+    # Publish result to the live-peek stream for any active browser subscriber.
+    # Fall back to the context-var task_id set by the scheduler so callers that
+    # don't pass task_id explicitly (e.g. planning.py) still get coverage.
+    _tid = task_id or _task_id_ctx.get()
+    if _tid:
+        try:
+            import json as _json_sb
+            from app.agent.stream_broker import publish as _sb_publish
+            _sb_publish(_tid, _json_sb.dumps({"name": name, "result": result_str}),
+                        turn_type="tool_result")
+        except Exception:
+            pass
+
+    return result_str
 
 
 async def async_dispatch_tool(

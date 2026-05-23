@@ -276,17 +276,6 @@ class AgentLoop(ABC):
             result = await self._execute_tool(name, arguments)
             result_str = str(result)
 
-            try:
-                from app.agent.stream_broker import publish as _sb_publish
-                _sb_publish(
-                    self.task_id,
-                    json.dumps({"name": name, "result": result_str}),
-                    agent_name=self._agent_name or "",
-                    turn_type="tool_result",
-                )
-            except Exception:
-                pass
-
             result_messages.append({
                 "role": "tool",
                 "tool_call_id": tool_id,
