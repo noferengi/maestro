@@ -1497,50 +1497,58 @@ class PlanningPipeline:
             reviewer_prompts.append(prompt)
 
         # Run reviewers sequentially to avoid LLM-slot starvation under concurrent sessions.
-        # Each reviewer gets up to 5 minutes; if it times out or errors, it contributes a
-        # POSSIBLE abstention (not NEEDS_RESEARCH, which would block tally Rule 3) so the
-        # remaining reviewers' real verdicts still count.
-        responses = []
+        # LLM errors are infrastructure failures, not decisions — retry with backoff rather
+        # than casting a POSSIBLE vote.  If all retries are exhausted the exception propagates
+        # so the task stays in PLANNING and is rescheduled on the next scheduler tick.
+        _REVIEWER_MAX_RETRIES = 3
+        _REVIEWER_RETRY_WAIT_SECS = 60
+
         from app.agent.tools import build_tool_schemas, dispatch_tool
         reviewer_tools = build_tool_schemas(["submit_work"])
 
-        for reviewer, prompt in zip(reviewers, reviewer_prompts):
-            try:
-                resp = await call_llm(
-                    [
-                        {"role": "system", "content": "You are a design reviewer. Use submit_work to output your verdict when ready."},
-                        {"role": "user", "content": prompt + "\n\nTo complete your review, call the submit_work tool with:\nsignal='ACCEPTED' or 'REJECTED'\npayload={'verdict': 'LIKELY|POSSIBLE|WARN|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED', 'confidence': <0-100>, 'justification': '...'}"},
-                    ],
-                    base_url=self.llm_base_url,
-                    model=self.llm_model,
-                    tools=reviewer_tools,
-                    tool_choice="auto",
-                    total_timeout_secs=300,
-                    task_id=self.task_id,
-                    llm_id=self.llm_id,
-                    budget_id=self.budget_id,
-                    agent_name=AGENT_NAME,
-                )
-                responses.append(resp)
-            except ShutdownError:
-                raise
-            except Exception as exc:
-                responses.append(exc)
-
         votes: list[Vote] = []
-        for i, resp in enumerate(responses):
-            reviewer_name = reviewers[i]["name"]
-            if isinstance(resp, Exception):
-                logger.warning(f"[{AGENT_NAME}] Reviewer '%s' unavailable: %s", reviewer_name, resp)
-                # Use POSSIBLE (abstain) rather than NEEDS_RESEARCH so tally Rule 3 doesn't
-                # block advancement when the failure is infrastructure (LLM busy), not content.
-                votes.append(Vote(
-                    stage=reviewer_name,
-                    verdict=Verdict.POSSIBLE,
-                    confidence=80,
-                    justification=f"Reviewer unavailable (LLM timeout or error): {resp}",
-                ))
-                continue
+        for reviewer, prompt in zip(reviewers, reviewer_prompts):
+            reviewer_name = reviewer["name"]
+
+            _last_exc: Exception | None = None
+            resp = None
+            for _attempt in range(_REVIEWER_MAX_RETRIES + 1):
+                try:
+                    resp = await call_llm(
+                        [
+                            {"role": "system", "content": "You are a design reviewer. Use submit_work to output your verdict when ready."},
+                            {"role": "user", "content": prompt + "\n\nTo complete your review, call the submit_work tool with:\nsignal='ACCEPTED' or 'REJECTED'\npayload={'verdict': 'LIKELY|POSSIBLE|WARN|NEEDS_RESEARCH|NOT_SUITABLE|REJECTED', 'confidence': <0-100>, 'justification': '...'}"},
+                        ],
+                        base_url=self.llm_base_url,
+                        model=self.llm_model,
+                        tools=reviewer_tools,
+                        tool_choice="auto",
+                        total_timeout_secs=300,
+                        task_id=self.task_id,
+                        llm_id=self.llm_id,
+                        budget_id=self.budget_id,
+                        agent_name=AGENT_NAME,
+                    )
+                    _last_exc = None
+                    break
+                except ShutdownError:
+                    raise
+                except Exception as exc:
+                    _last_exc = exc
+                    if _attempt < _REVIEWER_MAX_RETRIES:
+                        logger.warning(
+                            "[%s] Reviewer '%s' LLM error (attempt %d/%d), retrying in %ds: %s",
+                            AGENT_NAME, reviewer_name,
+                            _attempt + 1, _REVIEWER_MAX_RETRIES + 1,
+                            _REVIEWER_RETRY_WAIT_SECS, exc,
+                        )
+                        await asyncio.sleep(_REVIEWER_RETRY_WAIT_SECS)
+
+            if _last_exc is not None:
+                raise RuntimeError(
+                    f"Reviewer '{reviewer_name}' failed after {_REVIEWER_MAX_RETRIES + 1} "
+                    f"attempts — last error: {_last_exc}"
+                ) from _last_exc
 
             self._track_tokens(resp)
             
