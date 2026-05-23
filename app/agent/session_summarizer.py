@@ -326,7 +326,7 @@ async def _merge_summaries(
             ],
             base_url=base_url,
             model=model,
-            max_tokens=2500,
+            max_tokens=4000,
             llm_id=llm_id,
             budget_id=budget_id,
             task_id=task_id,

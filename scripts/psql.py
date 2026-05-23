@@ -76,7 +76,8 @@ def _print_table(rows: list[tuple], columns: list[str]) -> None:
     print(header)
     print(sep)
     for row in str_rows:
-        print("|" + "|".join(f" {cell:<{w}} " for cell, w in zip(row, col_widths)) + "|")
+        safe = [c.encode(sys.stdout.encoding or "utf-8", errors="backslashreplace").decode(sys.stdout.encoding or "utf-8") for c in row]
+        print("|" + "|".join(f" {cell:<{w}} " for cell, w in zip(safe, col_widths)) + "|")
     print(sep)
     print(f"({len(rows)} row{'s' if len(rows) != 1 else ''})")
 
