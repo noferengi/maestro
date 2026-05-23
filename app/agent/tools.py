@@ -5958,7 +5958,9 @@ TOOL_SCHEMAS: list[dict] = [
                             "If true, reuse signal/summary/payload from the most recent prior "
                             "submit_work call in this session. Chains back through previous=True "
                             "calls to find concrete arguments. Use after a gate rejection to "
-                            "re-submit without regenerating your summary."
+                            "re-submit without regenerating your summary. "
+                            "ERROR if no prior submit_work exists in this session — you must "
+                            "call submit_work with explicit arguments at least once first."
                         ),
                     },
                 },

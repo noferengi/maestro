@@ -606,8 +606,21 @@ class MaestroLoop:
             # Resolve submit_work(previous=True) before dispatching.
             if name == "submit_work" and arguments.get("previous"):
                 resolved = self._resolve_previous_submit(arguments)
-                if resolved:
-                    arguments = resolved
+                if resolved is None:
+                    result_content = (
+                        "[ERROR] submit_work(previous=True) failed: no prior submit_work call "
+                        "exists in this session to reference. You must call submit_work with "
+                        "explicit signal and summary arguments at least once before previous=True "
+                        "can be used."
+                    )
+                    result_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_id,
+                        "name": name,
+                        "content": result_content,
+                    })
+                    continue
+                arguments = resolved
 
             # Dispatch (async - handles spawn_research_agent correctly)
             result_content = await async_dispatch_tool(
