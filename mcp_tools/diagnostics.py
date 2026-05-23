@@ -1551,3 +1551,84 @@ def mark_tool_bug_reports_viewed(report_ids: list = None) -> dict:
         return {"marked": result.rowcount}
     finally:
         conn.close()
+
+
+def tail_task(task_id: str, since_entry_id: int = 0, n: int = 20) -> dict:
+    """
+    Lightweight live-tail for a running task session.
+
+    Returns only budget entries with id > since_entry_id (max n), each
+    enriched with extracted tool call names so you can see exactly what the
+    agent called. Designed for rapid polling — call every 5-10 seconds,
+    passing last_entry_id from the previous response as since_entry_id.
+
+    Returns:
+      last_entry_id   — pass as since_entry_id on next call (0 if no entries yet)
+      active          — True if an open agent session exists
+      stage           — current task.type
+      new_entries     — list of LLM calls since since_entry_id, oldest first:
+          id, created_at, agent_name, finish_reason,
+          tool_names (list[str]), reasoning_snippet (100 chars), content_snippet (200 chars),
+          gen_tokens, ctx_messages
+    """
+    conn = get_conn()
+    try:
+        task_row = conn.execute(
+            "SELECT t.type FROM tasks t WHERE t.id = ?",
+            (task_id,),
+        ).fetchone()
+        if not task_row:
+            return {"error": f"Task '{task_id}' not found."}
+
+        active_row = conn.execute(
+            "SELECT id FROM agent_sessions WHERE task_id = ? AND ended_at IS NULL LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        active = active_row is not None
+
+        rows = conn.execute(
+            "SELECT id, agent_name, generation_cost, prompt_message_count, response_data, created_at "
+            "FROM budget_entries "
+            "WHERE task_id = ? AND id > ? "
+            "ORDER BY id ASC LIMIT ?",
+            (task_id, since_entry_id, n),
+        ).fetchall()
+
+        entries = []
+        for r in rows:
+            try:
+                data = json.loads(r["response_data"] or "{}")
+            except Exception:
+                data = {}
+            choice = (data.get("choices") or [{}])[0]
+            msg = choice.get("message") or {}
+            finish_reason = choice.get("finish_reason") or ""
+            content = (msg.get("content") or "").strip()
+            reasoning = (msg.get("reasoning_content") or "").strip()
+            raw_tool_calls = msg.get("tool_calls") or []
+            tool_names = [
+                tc.get("function", {}).get("name", "?")
+                for tc in raw_tool_calls
+                if isinstance(tc, dict)
+            ]
+            entries.append({
+                "id": r["id"],
+                "created_at": str(r["created_at"]),
+                "agent_name": r["agent_name"] or "",
+                "finish_reason": finish_reason,
+                "tool_names": tool_names,
+                "reasoning_snippet": reasoning[:100] if reasoning else "",
+                "content_snippet": content[:200] if content else "",
+                "gen_tokens": r["generation_cost"],
+                "ctx_messages": r["prompt_message_count"],
+            })
+
+        last_entry_id = entries[-1]["id"] if entries else since_entry_id
+        return {
+            "last_entry_id": last_entry_id,
+            "active": active,
+            "stage": task_row["type"],
+            "new_entries": entries,
+        }
+    finally:
+        conn.close()

@@ -40,6 +40,7 @@ Tools:
 
   Monitor:
     maestro__monitor                  — block N seconds, return activity diff + pattern flags
+    maestro__tail_task                — poll-friendly delta: new LLM calls since last entry id
 """
 
 import sys
@@ -72,6 +73,7 @@ from mcp_tools.diagnostics import (
     get_git_branch_state,
     get_tool_bug_reports,
     mark_tool_bug_reports_viewed,
+    tail_task,
 )
 from mcp_tools.actions import (
     append_task_description,
@@ -113,6 +115,7 @@ mcp.tool()(get_merge_records)
 mcp.tool()(get_git_branch_state)
 mcp.tool()(get_tool_bug_reports)
 mcp.tool()(mark_tool_bug_reports_viewed)
+mcp.tool()(tail_task)
 
 # --- Live API tool ---
 mcp.tool()(get_scheduler_api_status)
