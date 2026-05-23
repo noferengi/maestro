@@ -3998,6 +3998,33 @@ body {
     border: 1px solid #21262d;
 }
 
+.lp-tool-result {
+    display: none;
+    width: 100%;
+    margin-top: 0.25rem;
+    padding-left: 1.1rem;
+}
+.lp-tool-result.open { display: block; }
+.lp-tool-result-label {
+    font-size: 0.65rem;
+    color: #6e7681;
+    margin-bottom: 0.15rem;
+    font-style: italic;
+}
+.lp-tool-result pre {
+    margin: 0;
+    font-size: 0.71rem;
+    color: #8b949e;
+    background: #0d1117;
+    padding: 0.35rem 0.6rem;
+    border-radius: 3px;
+    white-space: pre-wrap;
+    word-break: break-all;
+    border: 1px solid #21262d;
+    border-left: 2px solid #30363d;
+    max-height: none;
+}
+
 .lp-turn-sep {
     margin: 0.5rem 0;
     border-top: 1px dashed #21262d;

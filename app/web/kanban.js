@@ -9366,6 +9366,8 @@ let _peekSource = null;       // active EventSource
 let _peekSeq = 0;             // last seq received (for reconnect)
 let _peekAgentName = '';
 let _peekAutoScroll = true;
+let _peekLastToolSep = null;  // lp-tool-sep waiting for tool_result events
+let _peekToolResultIdx = 0;   // which item in _peekLastToolSep gets the next result
 
 function openLivePeek(taskId) {
     const task = taskData[taskId];
@@ -9404,6 +9406,10 @@ function openLivePeek(taskId) {
         document.getElementById('lp-output').addEventListener('scroll', _peekCheckScroll);
     }
 
+    // Reset tool result tracking
+    _peekLastToolSep = null;
+    _peekToolResultIdx = 0;
+
     // Switch task if already open
     if (_peekTaskId !== taskId) {
         _peekCloseSse();
@@ -9430,6 +9436,8 @@ function closeLivePeek() {
 function _peekClear() {
     const out = document.getElementById('lp-output');
     if (out) out.innerHTML = `<div class="lp-waiting">Stream cleared.</div>`;
+    _peekLastToolSep = null;
+    _peekToolResultIdx = 0;
 }
 
 function _peekAutoScrollToggle(cb) {
@@ -9538,9 +9546,9 @@ function _peekAppendToken(data) {
                 previewStr = '(' + parts.join(', ') + (entries.length > 2 ? ', …' : '') + ')';
             }
             const toggleEl = document.createElement('span');
-            toggleEl.className = 'lp-tool-toggle' + (hasArgs ? '' : ' lp-tool-toggle-empty');
+            toggleEl.className = 'lp-tool-toggle';
             toggleEl.textContent = '▶';
-            if (hasArgs) toggleEl.onclick = () => _lpToggleTool(toggleEl);
+            toggleEl.onclick = () => _lpToggleTool(toggleEl);
             const nameEl = document.createElement('span');
             nameEl.textContent = '➤ ' + tool.name;
             const previewEl = document.createElement('span');
@@ -9560,6 +9568,36 @@ function _peekAppendToken(data) {
             sep.appendChild(item);
         });
         out.appendChild(sep);
+        _peekLastToolSep = sep;
+        _peekToolResultIdx = 0;
+        return;
+    }
+
+    if (data.turn_type === 'tool_result') {
+        let parsed;
+        try { parsed = JSON.parse(data.text); } catch { return; }
+        const sep = _peekLastToolSep;
+        if (!sep) return;
+        const items = sep.querySelectorAll('.lp-tool-item');
+        const item = items[_peekToolResultIdx];
+        _peekToolResultIdx++;
+        if (!item) return;
+        const resultEl = document.createElement('div');
+        resultEl.className = 'lp-tool-result';
+        const label = document.createElement('div');
+        label.className = 'lp-tool-result-label';
+        label.textContent = '↳ result';
+        const pre = document.createElement('pre');
+        pre.textContent = parsed.result || '';
+        resultEl.appendChild(label);
+        resultEl.appendChild(pre);
+        item.appendChild(resultEl);
+        // If item is already expanded, show result immediately
+        const argsEl = item.querySelector('.lp-tool-args');
+        if (argsEl && argsEl.classList.contains('open')) {
+            resultEl.classList.add('open');
+        }
+        _peekScrollDown();
         return;
     }
 
@@ -9588,9 +9626,14 @@ function _peekAppendToken(data) {
 function _lpToggleTool(toggleEl) {
     const item = toggleEl.closest('.lp-tool-item');
     const argsEl = item && item.querySelector('.lp-tool-args');
-    if (!argsEl) return;
-    const open = argsEl.classList.toggle('open');
-    toggleEl.textContent = open ? '▼' : '▶';
+    const resultEl = item && item.querySelector('.lp-tool-result');
+    if (!argsEl && !resultEl) return;
+    const wasOpen = (argsEl && argsEl.classList.contains('open'))
+                 || (resultEl && resultEl.classList.contains('open'));
+    const nowOpen = !wasOpen;
+    if (argsEl) argsEl.classList.toggle('open', nowOpen);
+    if (resultEl) resultEl.classList.toggle('open', nowOpen);
+    toggleEl.textContent = nowOpen ? '▼' : '▶';
 }
 
 function _peekAppendSeparator(label) {
