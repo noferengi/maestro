@@ -84,6 +84,13 @@ class OptimizationPipeline:
         self.budget_id = budget_id
         self._total_prompt = 0
         self._total_completion = 0
+        self._stage_cfg: dict = {}
+        try:
+            from app.agent.pipeline_router import get_stage_config as _gsc
+            _sc = _gsc(task_id)
+            self._stage_cfg = (_sc.config or {}) if _sc else {}
+        except Exception:
+            pass
 
     async def run(self) -> OptimizationPipelineResult:
         """Execute all 5 phases."""
@@ -322,8 +329,10 @@ class OptimizationPipeline:
             "\"implementation_steps\": [\"...\"]}]}"
         )
 
+        _sys = (self._stage_cfg.get("system_prompt")
+                or "You are an optimization expert. Use submit_work to output your proposals when ready.")
         messages: list[dict] = [
-            {"role": "system", "content": "You are an optimization expert. Use submit_work to output your proposals when ready."},
+            {"role": "system", "content": _sys},
             {"role": "user", "content": prompt},
         ]
 

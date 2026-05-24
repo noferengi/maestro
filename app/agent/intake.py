@@ -274,6 +274,13 @@ class IntakePipeline:
         self.llm_model = llm_model or LLM_MODEL
         self.project = project or "TheMaestro"
         self.votes: list[dict] = []  # Collect votes from each stage
+        self._stage_cfg: dict = {}
+        try:
+            from app.agent.pipeline_router import get_stage_config as _gsc
+            _sc = _gsc(task_id)
+            self._stage_cfg = (_sc.config or {}) if _sc else {}
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -650,7 +657,8 @@ class IntakePipeline:
         )
 
         try:
-            result = await self._call_llm(_SCOPE_SYSTEM_PROMPT, user_prompt)
+            _scope_sys = self._stage_cfg.get("system_prompt") or _SCOPE_SYSTEM_PROMPT
+            result = await self._call_llm(_scope_sys, user_prompt)
             return self._extract_vote("scope_analysis", result)
         except Exception as exc:
             return self._error_vote("scope_analysis", exc)

@@ -129,6 +129,13 @@ class SecurityPipeline:
         self.max_context = max_context
         self._total_prompt = 0
         self._total_completion = 0
+        self._stage_cfg: dict = {}
+        try:
+            from app.agent.pipeline_router import get_stage_config as _gsc
+            _sc = _gsc(task_id)
+            self._stage_cfg = (_sc.config or {}) if _sc else {}
+        except Exception:
+            pass
 
     _REVIEWERS = [
         {
@@ -337,8 +344,10 @@ class SecurityPipeline:
             "\"description\": \"...\", \"demotion_target\": \"development|planning|optimization\"}]}"
         )
 
+        _sys = (self._stage_cfg.get("system_prompt")
+                or "You are a security expert. Use submit_work to output your verdict when ready.")
         messages: list[dict] = [
-            {"role": "system", "content": "You are a security expert. Use submit_work to output your verdict when ready."},
+            {"role": "system", "content": _sys},
             {"role": "user", "content": prompt},
         ]
 

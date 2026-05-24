@@ -137,6 +137,13 @@ class FinalReviewPipeline:
         self.acceptance_criteria = acceptance_criteria or []
         self._total_prompt = 0
         self._total_completion = 0
+        self._stage_cfg: dict = {}
+        try:
+            from app.agent.pipeline_router import get_stage_config as _gsc
+            _sc = _gsc(task_id)
+            self._stage_cfg = (_sc.config or {}) if _sc else {}
+        except Exception:
+            pass
 
     async def run(self) -> FinalReviewPipelineResult:
         """Run all review agents in parallel."""
@@ -272,12 +279,14 @@ class FinalReviewPipeline:
             "Do not re-run tools or re-verify findings you have already confirmed."
         )
 
+        _default_sys = (
+            "You are a code reviewer. Your session ends when you call submit_work. "
+            "Read what you need, reach a verdict, then call submit_work — "
+            "do not loop back to re-check things you have already seen."
+        )
+        _sys = self._stage_cfg.get("system_prompt") or _default_sys
         messages: list[dict] = [
-            {"role": "system", "content": (
-                "You are a code reviewer. Your session ends when you call submit_work. "
-                "Read what you need, reach a verdict, then call submit_work — "
-                "do not loop back to re-check things you have already seen."
-            )},
+            {"role": "system", "content": _sys},
             {"role": "user", "content": prompt},
         ]
 

@@ -497,6 +497,13 @@ class PlanningPipeline:
         self.prior_failure_context = prior_failure_context or []
         self._total_prompt = 0
         self._total_completion = 0
+        self._stage_cfg: dict = {}
+        try:
+            from app.agent.pipeline_router import get_stage_config as _gsc
+            _sc = _gsc(task_id)
+            self._stage_cfg = (_sc.config or {}) if _sc else {}
+        except Exception:
+            pass
         # Set in run() after the survey, used by _stage_design_review
         self._is_simple: bool = False
         self._is_proof: bool = False
@@ -1124,13 +1131,11 @@ class PlanningPipeline:
                 + sanitize_user_content(_spec_block)
                 + "\n*** END SPEC COMPLIANCE ***"
             ) if _spec_block else ""
-            system_prompt = (
+            _role_prefix = self._stage_cfg.get("system_prompt") or (
                 f"You are a {_role}. Primary concern: {persona_label}.\n"
                 f"{persona_concern}"
-                + _spec_suffix
-                + "\n\n"
-                + _active_format
             )
+            system_prompt = _role_prefix + _spec_suffix + "\n\n" + _active_format
             messages: list[dict] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_msg},
