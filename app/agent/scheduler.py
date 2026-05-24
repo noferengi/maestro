@@ -2885,7 +2885,7 @@ def _run_research_job(job: Any, llm: Any) -> None:
     if task and task.project:
         project_path = _get_project_path(task.project)
         if project_path:
-            set_task_git_cwd(project_path)
+            set_task_git_cwd(project_path, task_id=job.task_id)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -4270,7 +4270,7 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
     task = get_task(task_id)
     if not task:
         return
-    set_task_git_cwd(project_path)
+    set_task_git_cwd(project_path or "", task_id=task_id)
 
     # Require description, llm_id, budget_id before advancing
     if not task.description or not task.llm_id or not task.budget_id:
@@ -4523,6 +4523,8 @@ def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
     from app.database import update_task, get_task, get_all_tasks, create_transition_result, task_to_dict
     from app.database import create_agent_session, close_agent_session
     from app.agent.pipeline_router import advance_stage
+    from app.agent.tools import set_task_git_cwd
+    set_task_git_cwd(project_path or "", task_id=task_id)
 
     task = get_task(task_id)
     if not task:
