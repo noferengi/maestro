@@ -8,7 +8,7 @@
 <script src="/static/vendor/litegraph.js?v=0.7.18"></script>
 
 <link rel="stylesheet" href="/static/vendor/litegraph.css?v=1">
-<link rel="stylesheet" href="/static/pipeline_editor.css?v=3">
+<link rel="stylesheet" href="/static/pipeline_editor.css?v=4">
 </head>
 <body>
 
@@ -29,8 +29,12 @@
         <div class="pe-add-item" data-node-type="maestro/judgment_gate">Judgment Gate</div>
         <div class="pe-add-item" data-node-type="maestro/fan_out">Fan-out ×N</div>
         <div class="pe-add-item" data-node-type="maestro/human_gate">Human Gate</div>
+        <div class="pe-add-item" data-node-type="maestro/static_analysis">Static Analysis</div>
+        <div class="pe-add-item" data-node-type="maestro/dangerous_edit">Dangerous Edit</div>
+        <div class="pe-add-item" data-node-type="maestro/parallel_agents">Parallel Agents</div>
       </div>
     </div>
+    <button id="btn-tool-groups" class="pe-btn pe-btn-secondary" title="Manage tool groupings for parallel agents">⚙ Tool Groups</button>
     <button id="btn-tidy" class="pe-btn pe-btn-secondary" title="Topological auto-layout">Tidy Layout</button>
     <button id="btn-simulate" class="pe-btn pe-btn-secondary" title="Step a ghost token through the pipeline">Simulate</button>
     <button id="btn-save" class="pe-btn pe-btn-primary">Save</button>
@@ -489,6 +493,36 @@
       </p>
     </template>
 
+    <template id="tpl-parallel_agents">
+      <div class="pe-field-row pe-field-readonly">
+        <label>Stage key</label>
+        <span class="pe-field-value" data-bind="stage_key"></span>
+      </div>
+      <div class="pe-field-row">
+        <label for="pf-pa-label">Display label</label>
+        <input type="text" id="pf-pa-label" data-bind="label" class="pe-input">
+      </div>
+      <div class="pe-field-row">
+        <label for="pf-pa-n">Number of agents (N)</label>
+        <input type="number" id="pf-pa-n" data-bind="n"
+          class="pe-input pe-input--sm" min="1" max="10" value="3">
+      </div>
+      <div class="pe-field-row">
+        <label for="pf-pa-output-key">Output key</label>
+        <input type="text" id="pf-pa-output-key" data-bind="output_key" class="pe-input"
+          placeholder="parallel_agents_output">
+      </div>
+      <div class="pe-field-row">
+        <label for="pf-pa-max-turns">Max turns per agent</label>
+        <input type="number" id="pf-pa-max-turns" data-bind="max_turns"
+          class="pe-input pe-input--sm" min="1" max="200" value="30">
+      </div>
+      <div class="pe-field-row">
+        <label>Agent cards</label>
+        <div id="pf-pa-cards" class="pe-agent-cards-container"></div>
+      </div>
+    </template>
+
   </div><!-- /#pe-panel-body -->
 
   <div id="pe-panel-footer">
@@ -496,6 +530,20 @@
     <button id="pe-save-node" class="pe-btn pe-btn-primary">Apply</button>
   </div>
 </div><!-- /#pipeline-property-panel -->
+
+<!-- ── Tool Groups modal ─────────────────────────────────────────────────── -->
+<div id="pe-tg-modal" class="pe-modal-overlay pe-hidden">
+  <div class="pe-modal-box">
+    <div class="pe-modal-header">
+      <span>⚙ Tool Groupings</span>
+      <button id="pe-tg-close" class="pe-btn pe-btn-secondary" style="padding:2px 8px;">✕</button>
+    </div>
+    <div id="pe-tg-body" class="pe-tg-body"></div>
+    <div class="pe-modal-footer">
+      <button id="pe-tg-new" class="pe-btn pe-btn-primary">+ New Group</button>
+    </div>
+  </div>
+</div>
 
 <!-- ── Toast ─────────────────────────────────────────────────────────────── -->
 <div id="pe-toast" class="pe-toast pe-hidden"></div>
@@ -509,6 +557,6 @@
   </div>
 </div>
 
-<script src="/static/pipeline_editor.js?v=11"></script>
+<script src="/static/pipeline_editor.js?v=13"></script>
 </body>
 </html>

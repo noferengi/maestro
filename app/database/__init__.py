@@ -498,6 +498,11 @@ from .crud_malleable import (
     load_custom_agents_into_registry,
     compute_stage_map,
     transfer_cards,
+    get_tool_groupings,
+    get_tool_grouping,
+    create_tool_grouping,
+    update_tool_grouping,
+    delete_tool_grouping,
 )
 
 # Training data pipeline (Gap 11)
@@ -631,6 +636,8 @@ __all__ = [
     "clone_custom_agent_definition",
     "custom_agent_definition_to_dict", "load_custom_agents_into_registry",
     "compute_stage_map", "transfer_cards",
+    "get_tool_groupings", "get_tool_grouping",
+    "create_tool_grouping", "update_tool_grouping", "delete_tool_grouping",
     # crud_documents
     "store_document", "get_document", "fuzzy_get_document", "list_documents",
     "delete_document", "store_document_by_project", "get_document_by_project",

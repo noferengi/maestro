@@ -11,7 +11,7 @@ from .session import SessionLocal
 from .models import (
     PipelineTemplate, PipelineStage, PipelineTransition,
     PipelineStageGroup, PipelineArchCategory,
-    CustomAgentDefinition,
+    CustomAgentDefinition, ToolGrouping,
 )
 
 logger = logging.getLogger(__name__)
@@ -1283,3 +1283,103 @@ def load_custom_agents_into_registry() -> int:
             gate_type=defn.gate_type or "llm_judge",
         )
     return len(defns)
+
+
+# ---------------------------------------------------------------------------
+# Tool Groupings CRUD
+# ---------------------------------------------------------------------------
+
+def _tg_to_dict(tg: ToolGrouping) -> dict:
+    return {
+        "id": tg.id,
+        "name": tg.name,
+        "description": tg.description,
+        "tools": list(tg.tools or []),
+        "is_builtin": bool(tg.is_builtin),
+        "created_at": tg.created_at.isoformat() if tg.created_at else None,
+    }
+
+
+def get_tool_groupings() -> list[dict]:
+    db = SessionLocal()
+    try:
+        rows = db.query(ToolGrouping).order_by(ToolGrouping.id).all()
+        return [_tg_to_dict(r) for r in rows]
+    except Exception:
+        logger.exception("get_tool_groupings failed")
+        return []
+    finally:
+        db.close()
+
+
+def get_tool_grouping(grouping_id: int) -> dict | None:
+    db = SessionLocal()
+    try:
+        row = db.query(ToolGrouping).filter(ToolGrouping.id == grouping_id).first()
+        return _tg_to_dict(row) if row else None
+    except Exception:
+        logger.exception("get_tool_grouping(%d) failed", grouping_id)
+        return None
+    finally:
+        db.close()
+
+
+def create_tool_grouping(name: str, tools: list[str], description: str = "",
+                         clone_from_id: int | None = None) -> dict | None:
+    db = SessionLocal()
+    try:
+        if clone_from_id is not None:
+            src = db.query(ToolGrouping).filter(ToolGrouping.id == clone_from_id).first()
+            if src:
+                tools = list(src.tools or [])
+        row = ToolGrouping(name=name, description=description, tools=tools, is_builtin=False)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return _tg_to_dict(row)
+    except Exception:
+        db.rollback()
+        logger.exception("create_tool_grouping failed name=%r", name)
+        return None
+    finally:
+        db.close()
+
+
+def update_tool_grouping(grouping_id: int, **kwargs) -> dict | None:
+    db = SessionLocal()
+    try:
+        row = db.query(ToolGrouping).filter(ToolGrouping.id == grouping_id).first()
+        if not row:
+            return None
+        for key, val in kwargs.items():
+            if hasattr(row, key) and key not in ("id", "is_builtin", "created_at"):
+                setattr(row, key, val)
+        db.commit()
+        db.refresh(row)
+        return _tg_to_dict(row)
+    except Exception:
+        db.rollback()
+        logger.exception("update_tool_grouping(%d) failed", grouping_id)
+        return None
+    finally:
+        db.close()
+
+
+def delete_tool_grouping(grouping_id: int) -> dict:
+    """Returns {'deleted': True} or {'error': reason}. Builtin groupings cannot be deleted."""
+    db = SessionLocal()
+    try:
+        row = db.query(ToolGrouping).filter(ToolGrouping.id == grouping_id).first()
+        if not row:
+            return {"error": "not_found"}
+        if row.is_builtin:
+            return {"error": "builtin_protected"}
+        db.delete(row)
+        db.commit()
+        return {"deleted": True}
+    except Exception:
+        db.rollback()
+        logger.exception("delete_tool_grouping(%d) failed", grouping_id)
+        return {"error": "db_error"}
+    finally:
+        db.close()

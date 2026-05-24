@@ -583,6 +583,8 @@ def get_tasks_by_project(project_name):
                     Task.pipeline_template_id == None,  # arch tasks and legacy NULLs
                 )
             )
+        # Exclude virtual scheduler tasks — they live in the DB but are not kanban cards
+        q = q.filter(~Task.stage_key.in_(["_psubagent", "_psubagent_join"]))
         tasks = q.order_by(Task.position, Task.created_at).all()
         return tasks
     except Exception as e:

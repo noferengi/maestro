@@ -149,4 +149,25 @@ AGENT_REGISTRY: dict[str, AgentSpec] = {
         ),
         gate_type="llm_judge",
     ),
+    "parallel_agents": AgentSpec(
+        cls=None,
+        display_name="Parallel Agents",
+        description=(
+            "Spawns N independent child tasks in parallel. An aggregator merges outputs "
+            "and advances the parent once all children complete."
+        ),
+        gate_type="none",
+    ),
+    "parallel_subagent": AgentSpec(
+        cls=None,
+        display_name="Parallel Subagent",
+        description="Internal virtual sub-task created by parallel_agents. Config from task.content.",
+        gate_type="none",
+    ),
+    "parallel_subagent_aggregator": AgentSpec(
+        cls=None,
+        display_name="Parallel Subagent Aggregator",
+        description="Internal virtual task that merges parallel subagent outputs and advances the parent stage.",
+        gate_type="none",
+    ),
 }

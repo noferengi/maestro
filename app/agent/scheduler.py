@@ -1001,7 +1001,7 @@ def get_scheduler_status() -> dict:
         if t.get("parent_task_id")
     }
 
-    dispatchable_set = {s.lower() for s in SCHEDULER_DISPATCHABLE_TYPES}
+    dispatchable_set = {s.lower() for s in SCHEDULER_DISPATCHABLE_TYPES} | {"_psubagent", "_psubagent_join"}
     done_set = {s.lower() for s in PIPELINE_DONE_STATUSES}
     never_dispatch = {"completed", "cancelled", "subdividing", "accepted"}
 
@@ -4183,7 +4183,8 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
             ensure_project_ready(project_path)
 
         # Worktree isolation: give each task its own git checkout.
-        if project_path:
+        # Virtual tasks (_psubagent, _psubagent_join) are read-only and skip worktrees.
+        if project_path and not task_type.startswith("_p"):
             from app.agent.worktree import setup_task_worktree
             wt = setup_task_worktree(task_id, project_path)
             if wt is None:
@@ -4200,18 +4201,44 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
         llm_id = llm.id
         budget_id = db_task.budget_id if db_task else None
 
-        from app.agent.pipeline_router import dispatch_task as _pipeline_dispatch
-        dispatched = _pipeline_dispatch(
-            task_id,
-            task_type,
-            llm_base_url=llm_base_url,
-            llm_model=llm_model,
-            max_context=max_context,
-            llm_id=llm_id,
-            budget_id=budget_id,
-            project_path=worktree_path,
-        )
-        if not dispatched:
+        # Virtual dispatch: _psubagent and _psubagent_join bypass the pipeline router.
+        if task_type.startswith("_p"):
+            from app.database import get_task as _gvt
+            from app.agent.pipeline_router import StageConfig as _SC
+            _vt = _gvt(task_id)
+            _vcfg = (_vt.content or {}).get("_subagent_cfg", {}) if _vt else {}
+            if task_type == "_psubagent":
+                from app.agent.stage_executors import _run_parallel_subagent
+                _run_parallel_subagent(
+                    task_id,
+                    _SC(stage_key="_psubagent", label="Parallel Subagent",
+                        agent_type="parallel_subagent", position=0,
+                        config=_vcfg, template_id=0, stage_id=0),
+                    llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path,
+                )
+            elif task_type == "_psubagent_join":
+                from app.agent.stage_executors import _run_parallel_subagent_aggregator
+                _run_parallel_subagent_aggregator(
+                    task_id,
+                    _SC(stage_key="_psubagent_join", label="Parallel Subagent Aggregator",
+                        agent_type="parallel_subagent_aggregator", position=0,
+                        config=_vcfg, template_id=0, stage_id=0),
+                    llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path,
+                )
+            # Fall through to finally for LLM slot release — do not dispatch_task
+        else:
+            from app.agent.pipeline_router import dispatch_task as _pipeline_dispatch
+            dispatched = _pipeline_dispatch(
+                task_id,
+                task_type,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                max_context=max_context,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                project_path=worktree_path,
+            )
+        if not task_type.startswith("_p") and not dispatched:
             # dispatch_task() returns False for: (a) no stage config found (legacy
             # tasks without a pipeline template), or (b) human_gate / terminal
             # agent types.  Only fall back to MaestroLoop for case (a).
@@ -5823,15 +5850,21 @@ from app.agent.stage_executors import (  # noqa: E402
     _run_reflection_agent,
     _run_static_analysis_widget,
     _run_dangerous_edit_llm_agent,
+    _run_parallel_agents,
+    _run_parallel_subagent,
+    _run_parallel_subagent_aggregator,
 )
 from app.agent.pipeline_router import register_agent_type_executor as _reg_executor  # noqa: E402
 
-_reg_executor("circuit_breaker",           _run_circuit_breaker)
-_reg_executor("voting_panel",              _run_voting_panel)
-_reg_executor("fan_out_judge",             _run_fan_out_judge)
-_reg_executor("reflection_agent",          _run_reflection_agent)
-_reg_executor("static_analysis_widget",    _run_static_analysis_widget)
-_reg_executor("dangerous_edit_llm_agent",  _run_dangerous_edit_llm_agent)
+_reg_executor("circuit_breaker",               _run_circuit_breaker)
+_reg_executor("voting_panel",                  _run_voting_panel)
+_reg_executor("fan_out_judge",                 _run_fan_out_judge)
+_reg_executor("reflection_agent",              _run_reflection_agent)
+_reg_executor("static_analysis_widget",        _run_static_analysis_widget)
+_reg_executor("dangerous_edit_llm_agent",      _run_dangerous_edit_llm_agent)
+_reg_executor("parallel_agents",               _run_parallel_agents)
+_reg_executor("parallel_subagent",             _run_parallel_subagent)
+_reg_executor("parallel_subagent_aggregator",  _run_parallel_subagent_aggregator)
 
 # ---------------------------------------------------------------------------
 # Helpers

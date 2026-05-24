@@ -998,3 +998,266 @@ def _run_dangerous_edit_llm_agent(
         loop.close()
         if _session_id is not None:
             close_agent_session(_session_id, _exit_reason, _exit_summary)
+
+
+# ---------------------------------------------------------------------------
+# parallel_agents — fan-out creator
+# ---------------------------------------------------------------------------
+
+def _run_parallel_agents(
+    task_id: str,
+    stage_config: "StageConfig",
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """
+    Fan-out creator for the parallel_agents node.
+
+    Creates N child _psubagent tasks plus one _psubagent_join aggregator, then
+    appends the aggregator ID to the parent's prerequisites to block re-dispatch
+    until all children complete.  Does NOT call advance_stage — the aggregator
+    drives the parent forward.
+    """
+    from app.database import get_task, update_task, create_task
+
+    cfg: dict = stage_config.config or {}
+    agents_cfg: list[dict] = cfg.get("agents", [])
+    output_key: str = cfg.get("output_key", "parallel_agents_output")
+    max_turns: int = int(cfg.get("max_turns", 30))
+
+    parent = get_task(task_id)
+    if not parent:
+        return
+
+    # Idempotency guard: skip if children already created
+    if (parent.content or {}).get("_psubagent_child_ids"):
+        return
+
+    content = dict(parent.content or {})
+    content["_psubagent_waiting"] = True
+    update_task(task_id, content=content)
+
+    child_ids: list[str] = []
+    for i, agent in enumerate(agents_cfg):
+        name = agent.get("name", f"agent_{i}")
+        tg_id = agent.get("tool_grouping_id")
+        child = create_task(
+            title=f"[PA] {parent.title[:50]} — {name}",
+            task_type="_psubagent",
+            stage_key="_psubagent",
+            project_id=parent.project_id,
+            pipeline_template_id=None,
+            llm_id=llm_id,
+            budget_id=budget_id,
+            content={"_subagent_cfg": {
+                "name": name,
+                "system_prompt": agent.get("system_prompt", "Complete the task and call submit_work."),
+                "max_turns": max_turns,
+                "output_key": output_key,
+                "parent_task_id": task_id,
+                "parent_stage_key": stage_config.stage_key,
+                "tool_grouping_id": tg_id,
+            }},
+        )
+        if child:
+            child_ids.append(child.id)
+
+    agg = create_task(
+        title=f"[PA-join] {parent.title[:50]}",
+        task_type="_psubagent_join",
+        stage_key="_psubagent_join",
+        project_id=parent.project_id,
+        pipeline_template_id=None,
+        llm_id=llm_id,
+        budget_id=budget_id,
+        prerequisites=child_ids,
+        content={"_subagent_cfg": {
+            "parent_task_id": task_id,
+            "output_key": output_key,
+            "parent_stage_key": stage_config.stage_key,
+            "child_ids": child_ids,
+        }},
+    )
+
+    content["_psubagent_child_ids"] = child_ids
+    content["_psubagent_agg_id"] = agg.id if agg else None
+    existing_prereqs = list(parent.prerequisites or [])
+    update_task(task_id, content=content,
+                prerequisites=existing_prereqs + ([agg.id] if agg else []))
+
+    logger.info(
+        "[parallel_agents] task '%s': created %d children + aggregator '%s'.",
+        task_id, len(child_ids), (agg.id if agg else "None"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# _psubagent — runs one parallel sub-agent child
+# ---------------------------------------------------------------------------
+
+def _run_parallel_subagent(
+    task_id: str,
+    stage_config: "StageConfig",
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """
+    Runs a single parallel sub-agent child.  Config comes from task.content._subagent_cfg
+    (injected by _run_parallel_agents at creation time).
+    """
+    from app.database import get_task, update_task, create_agent_session, close_agent_session
+
+    task = get_task(task_id)
+    if not task:
+        return
+
+    cfg: dict = (task.content or {}).get("_subagent_cfg", {})
+    name: str = cfg.get("name", "subagent")
+    system_prompt: str = cfg.get("system_prompt", "Complete the task and call submit_work.")
+    max_turns: int = int(cfg.get("max_turns", 30))
+    parent_task_id: str | None = cfg.get("parent_task_id")
+    tg_id: int | None = cfg.get("tool_grouping_id")
+
+    # Resolve tool allowlist from tool grouping
+    tool_allowlist: list[str] = ["submit_work"]
+    if tg_id is not None:
+        try:
+            from app.database.crud_malleable import get_tool_grouping
+            tg = get_tool_grouping(tg_id)
+            if tg:
+                tool_allowlist = list(tg.get("tools", ["submit_work"]))
+        except Exception:
+            logger.exception("[parallel_subagent] task '%s': failed to load tool grouping %s.", task_id, tg_id)
+
+    parent = get_task(parent_task_id) if parent_task_id else None
+    user_msg = (
+        f"Task: {(parent.title if parent else task.title)}\n"
+        f"Description:\n{(parent.description or '') if parent else (task.description or '')}\n\n"
+        "Complete your assigned work. Use submit_work with:\n"
+        "  signal='ACCEPTED', payload={'output': '<your full output>'}"
+    )
+
+    session_id = create_agent_session(
+        task_id=task_id,
+        agent_type=f"parallel_subagent:{name}",
+        llm_id=llm_id,
+        budget_id=budget_id,
+        scheduler_reason="scheduler",
+    )
+    exit_reason = "error"
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        agent = _CollectorAgent(
+            task_id=task_id,
+            system_prompt=system_prompt,
+            tool_allowlist=tool_allowlist,
+            max_turns=max_turns,
+            llm_id=llm_id,
+            budget_id=budget_id,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            max_context=max_context,
+            user_message=user_msg,
+            agent_name=f"subagent:{name}",
+        )
+        payload = loop.run_until_complete(agent.run())
+        output = (payload or {}).get("output", str(payload or ""))
+        blob = dict(task.content or {})
+        blob["output"] = output
+        update_task(task_id, content=blob, type="completed", stage_key="completed")
+        exit_reason = "completed"
+    except Exception:
+        logger.exception("[parallel_subagent] task '%s' agent '%s' raised.", task_id, name)
+        fresh = get_task(task_id)
+        blob = dict((fresh.content or {}) if fresh else {})
+        blob["output"] = f"ERROR: subagent '{name}' failed."
+        blob["_subagent_failed"] = True
+        update_task(task_id, content=blob, type="completed", stage_key="completed")
+        # Still complete so the aggregator can fire
+    finally:
+        close_agent_session(session_id, exit_reason, "")
+        try:
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=5.0))
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# _psubagent_join — aggregator: merges outputs and advances parent
+# ---------------------------------------------------------------------------
+
+def _run_parallel_subagent_aggregator(
+    task_id: str,
+    stage_config: "StageConfig",
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """
+    Aggregator for parallel_agents.  Merges child outputs into the parent task's
+    content and calls advance_stage on the parent so it proceeds to the next stage.
+    """
+    from app.database import get_task, update_task, create_agent_session, close_agent_session
+
+    task = get_task(task_id)
+    if not task:
+        return
+
+    cfg: dict = (task.content or {}).get("_subagent_cfg", {})
+    parent_task_id: str | None = cfg.get("parent_task_id")
+    output_key: str = cfg.get("output_key", "parallel_agents_output")
+    parent_stage_key: str = cfg.get("parent_stage_key", "")
+    child_ids: list[str] = cfg.get("child_ids", [])
+
+    session_id = create_agent_session(
+        task_id=task_id,
+        agent_type="parallel_subagent_aggregator",
+        llm_id=llm_id,
+        budget_id=budget_id,
+        scheduler_reason="scheduler",
+    )
+    exit_reason = "error"
+    try:
+        merged: dict[str, str] = {}
+        for cid in child_ids:
+            child = get_task(cid)
+            if not child:
+                continue
+            child_cfg = (child.content or {}).get("_subagent_cfg", {})
+            name = child_cfg.get("name", cid)
+            merged[name] = (child.content or {}).get("output", "")
+
+        parent = get_task(parent_task_id) if parent_task_id else None
+        if parent:
+            parent_blob = dict(parent.content or {})
+            parent_blob[output_key] = merged
+            parent_blob.pop("_psubagent_waiting", None)
+            update_task(parent_task_id, content=parent_blob)
+
+        update_task(task_id, type="completed", stage_key="completed")
+        advance_stage(parent_task_id, "pass", from_stage=parent_stage_key)
+        exit_reason = "completed"
+        logger.info(
+            "[parallel_subagent_aggregator] task '%s': merged %d outputs → parent '%s' stage '%s'.",
+            task_id, len(merged), parent_task_id, parent_stage_key,
+        )
+    except Exception:
+        logger.exception("[parallel_subagent_aggregator] task '%s' raised.", task_id)
+    finally:
+        close_agent_session(session_id, exit_reason, "")

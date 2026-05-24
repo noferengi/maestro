@@ -75,6 +75,16 @@ class StageNode extends LiteGraph.LGraphNode {
     onDrawBackground(ctx) {
         if (!this.properties.label) return;
         ctx.save();
+        const agentType = this.properties.agent_type || "";
+        if (agentType === "voting_panel") {
+            ctx.fillStyle = "rgba(255,255,255,0.3)";
+            ctx.font = "bold 11px sans-serif";
+            ctx.fillText("[vote]", 8, 22);
+        } else if (agentType === "fan_out_judge") {
+            ctx.fillStyle = "rgba(255,255,255,0.3)";
+            ctx.font = "bold 11px sans-serif";
+            ctx.fillText("[fan]", 8, 22);
+        }
         ctx.fillStyle = "rgba(255,255,255,0.55)";
         ctx.font = "11px monospace";
         ctx.fillText(this.properties.stage_key.substring(0, 18), 8, this.size[1] - 8);
@@ -333,6 +343,78 @@ class DangerousEditNode extends LiteGraph.LGraphNode {
 DangerousEditNode.title = "Dangerous Edit Agent";
 DangerousEditNode.desc = "Wraps MaestroLoop — writes to project working tree inside a git worktree. ⚠ Configurable system prompt, tools, and max_turns.";
 
+
+// ============================================================
+// PARALLEL AGENTS NODE
+// ============================================================
+
+function _peEscHtml(s) {
+    return String(s ?? "")
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+class ParallelAgentsNode extends LiteGraph.LGraphNode {
+    constructor() {
+        super();
+        this.title = "Parallel Agents";
+        this.addInput("in", "task");
+        this.addOutput("pass", "task");
+        this.properties = {
+            stage_id:   null,
+            stage_key:  "",
+            label:      "",
+            agent_type: "parallel_agents",
+            n:          3,
+            output_key: "parallel_agents_output",
+            max_turns:  30,
+            agents:     [],
+        };
+        this.color   = "#0c4a6e";
+        this.bgcolor = "#042940";
+        this.size    = [240, 80 + 3 * 36];
+    }
+
+    _syncSize() {
+        const n = Math.max(1, Math.min(10, parseInt(this.properties.n) || 3));
+        this.size[1] = 80 + n * 36;
+        return n;
+    }
+
+    onDrawBackground(ctx) {
+        const n = this._syncSize();
+        const agents = this.properties.agents || [];
+        ctx.save();
+        ctx.fillStyle = "rgba(255,255,255,0.35)";
+        ctx.font = "16px monospace";
+        ctx.fillText("⑂", 8, 24);
+        ctx.fillStyle = "rgba(255,255,255,0.5)";
+        ctx.font = "11px monospace";
+        ctx.fillText((this.properties.stage_key || "parallel_agents").substring(0, 22), 30, 22);
+        for (let i = 0; i < n; i++) {
+            const name = (agents[i] || {}).name || `agent_${i}`;
+            const y = 42 + i * 36;
+            ctx.fillStyle = "rgba(255,255,255,0.1)";
+            ctx.beginPath();
+            if (ctx.roundRect) {
+                ctx.roundRect(6, y, this.size[0] - 12, 28, 3);
+            } else {
+                ctx.rect(6, y, this.size[0] - 12, 28);
+            }
+            ctx.fill();
+            ctx.fillStyle = "rgba(255,255,255,0.7)";
+            ctx.font = "11px sans-serif";
+            ctx.fillText(`● ${name}`, 12, y + 17);
+        }
+        ctx.restore();
+    }
+
+    onDblClick() { openPanel(this); }
+}
+ParallelAgentsNode.title = "Parallel Agents";
+ParallelAgentsNode.desc = "FOR LOOP — runs N agents in parallel as real scheduler tasks, merges outputs";
+
+
 function registerNodeTypes() {
     LiteGraph.registerNodeType("maestro/stage", StageNode);
     LiteGraph.registerNodeType("maestro/factory", FactoryNode);
@@ -342,6 +424,7 @@ function registerNodeTypes() {
     LiteGraph.registerNodeType("maestro/human_gate", HumanGateNode);
     LiteGraph.registerNodeType("maestro/static_analysis", StaticAnalysisNode);
     LiteGraph.registerNodeType("maestro/dangerous_edit",   DangerousEditNode);
+    LiteGraph.registerNodeType("maestro/parallel_agents",  ParallelAgentsNode);
 
     // Port type colors
     LiteGraph.default_connection_color_byType = {
@@ -474,10 +557,14 @@ function buildGraphFromTemplate(data) {
         const isHumanGate       = stage.agent_type === "human_gate";
         const isStaticAnalysis  = stage.agent_type === "static_analysis_widget";
         const isDangerousEdit   = stage.agent_type === "dangerous_edit_llm_agent";
-        const nodeType = isFactory       ? "maestro/factory"
-                       : isHumanGate     ? "maestro/human_gate"
-                       : isStaticAnalysis ? "maestro/static_analysis"
-                       : isDangerousEdit  ? "maestro/dangerous_edit"
+        const isParallelAgents  = stage.agent_type === "parallel_agents";
+        const isVotingPanel     = stage.agent_type === "voting_panel";
+        const isFanOutJudge     = stage.agent_type === "fan_out_judge";
+        const nodeType = isFactory        ? "maestro/factory"
+                       : isHumanGate      ? "maestro/human_gate"
+                       : isStaticAnalysis  ? "maestro/static_analysis"
+                       : isDangerousEdit   ? "maestro/dangerous_edit"
+                       : isParallelAgents  ? "maestro/parallel_agents"
                        : "maestro/stage";
         const node      = LiteGraph.createNode(nodeType);
         const x = 80 + idx * 280;
@@ -532,6 +619,18 @@ function buildGraphFromTemplate(data) {
                                        ? cfg.required_input_keys.join(", ")
                                        : (cfg.required_input_keys || ""),
             };
+        } else if (isParallelAgents) {
+            node.properties = {
+                stage_id:   stage.id,
+                stage_key:  stage.stage_key,
+                label:      stage.label || stage.stage_key,
+                agent_type: "parallel_agents",
+                n:          cfg.n ?? 3,
+                output_key: cfg.output_key || "parallel_agents_output",
+                max_turns:  cfg.max_turns ?? 30,
+                agents:     Array.isArray(cfg.agents) ? cfg.agents : [],
+            };
+            node._syncSize?.();
         } else {
             node.properties = {
                 stage_id:             stage.id,
@@ -555,9 +654,13 @@ function buildGraphFromTemplate(data) {
             };
         }
 
-        const _defaultColor = isFactory ? "#065f46"
-                            : isHumanGate ? "#be185d"
-                            : isStaticAnalysis ? "#b45309"
+        const _defaultColor = isFactory        ? "#065f46"
+                            : isHumanGate      ? "#be185d"
+                            : isStaticAnalysis  ? "#b45309"
+                            : isDangerousEdit   ? "#7f1d1d"
+                            : isParallelAgents  ? "#0c4a6e"
+                            : isVotingPanel     ? "#4c1d95"
+                            : isFanOutJudge     ? "#0e7490"
                             : "#1e40af";
         node.color   = node.properties.color || _defaultColor;
         node.bgcolor = _darken(node.color);
@@ -745,7 +848,7 @@ async function saveGraph() {
     try {
         // 1. Upsert all stage + factory + static_analysis nodes (sorted by canvas x for position order)
         const allPipelineNodes = _graph._nodes
-            .filter(n => n.type === "maestro/stage" || n.type === "maestro/factory" || n.type === "maestro/static_analysis" || n.type === "maestro/human_gate" || n.type === "maestro/dangerous_edit")
+            .filter(n => n.type === "maestro/stage" || n.type === "maestro/factory" || n.type === "maestro/static_analysis" || n.type === "maestro/human_gate" || n.type === "maestro/dangerous_edit" || n.type === "maestro/parallel_agents")
             .sort((a, b) => a.pos[0] - b.pos[0]);
 
         for (let posIdx = 0; posIdx < allPipelineNodes.length; posIdx++) {
@@ -812,6 +915,26 @@ async function saveGraph() {
                         _canvas_y: Math.round(node.pos[1]),
                     },
                 };
+            } else if (node.type === "maestro/parallel_agents") {
+                const n = Math.max(1, Math.min(10, parseInt(p.n) || 3));
+                const agents = (Array.isArray(p.agents) ? p.agents : []).slice(0, n);
+                while (agents.length < n)
+                    agents.push({name: `agent_${agents.length}`, description: "", system_prompt: "", tool_grouping_id: null});
+                stageBody = {
+                    stage_key:  p.stage_key,
+                    label:      p.label || p.stage_key,
+                    agent_type: "parallel_agents",
+                    color:      "#0c4a6e",
+                    position:   posIdx,
+                    config: {
+                        n,
+                        agents,
+                        output_key: p.output_key || "parallel_agents_output",
+                        max_turns:  parseInt(p.max_turns) || 30,
+                        _canvas_x:  Math.round(node.pos[0]),
+                        _canvas_y:  Math.round(node.pos[1]),
+                    },
+                };
             } else {
                 stageBody = {
                     stage_key:  p.stage_key,
@@ -843,7 +966,7 @@ async function saveGraph() {
 
         // Update stage position map after save so back-edge detection uses new positions
         const stageNodes = allPipelineNodes.filter(n =>
-            n.type === "maestro/stage" || n.type === "maestro/static_analysis" || n.type === "maestro/human_gate" || n.type === "maestro/dangerous_edit"
+            n.type === "maestro/stage" || n.type === "maestro/static_analysis" || n.type === "maestro/human_gate" || n.type === "maestro/dangerous_edit" || n.type === "maestro/parallel_agents"
         );
         stageNodes.forEach((n, i) => { _stagePosMap[n.id] = i; });
 
@@ -859,7 +982,7 @@ async function saveGraph() {
             const fromNode = nodeById[link.origin_id];
             const toNode   = nodeById[link.target_id];
             if (!fromNode || !toNode) continue;
-            const validTypes = new Set(["maestro/stage", "maestro/factory", "maestro/human_gate", "maestro/static_analysis", "maestro/dangerous_edit"]);
+            const validTypes = new Set(["maestro/stage", "maestro/factory", "maestro/human_gate", "maestro/static_analysis", "maestro/dangerous_edit", "maestro/parallel_agents"]);
             if (!validTypes.has(fromNode.type) || !validTypes.has(toNode.type)) continue;
 
             const condition = fromNode.outputs?.[link.origin_slot]?.name || "pass";
@@ -928,6 +1051,7 @@ function openPanel(node) {
         "maestro/human_gate":       "tpl-human_gate",
         "maestro/static_analysis":  "tpl-static-analysis",
         "maestro/dangerous_edit":   "tpl-dangerous_edit",
+        "maestro/parallel_agents":  "tpl-parallel_agents",
     };
     const tplId = typeMap[node.type] || "tpl-stage";
     const tpl = document.getElementById(tplId);
@@ -961,6 +1085,11 @@ function openPanel(node) {
     // Factory-specific panel wiring
     if (tplId === "tpl-factory") {
         _setupFactoryPanel(body, node);
+    }
+
+    // Parallel agents panel wiring
+    if (tplId === "tpl-parallel_agents") {
+        _setupParallelAgentsPanel(body, node);
     }
 
     // Wire up lightning buttons
@@ -1010,6 +1139,25 @@ function applyPanel() {
         _panelNode.properties.factory_triggers = triggers;
     }
 
+    // Collect parallel agents config
+    if (_panelNode.type === "maestro/parallel_agents") {
+        const n = Math.max(1, Math.min(10, parseInt(document.getElementById("pf-pa-n")?.value || "3")));
+        _panelNode.properties.n = n;
+        _panelNode.properties.output_key = document.getElementById("pf-pa-output-key")?.value || "parallel_agents_output";
+        _panelNode.properties.max_turns  = parseInt(document.getElementById("pf-pa-max-turns")?.value || "30");
+        const agents = [];
+        for (let i = 0; i < n; i++) {
+            agents.push({
+                name:              document.getElementById(`pf-pa-name-${i}`)?.value     || `agent_${i}`,
+                description:       document.getElementById(`pf-pa-desc-${i}`)?.value     || "",
+                system_prompt:     document.getElementById(`pf-pa-prompt-${i}`)?.value   || "",
+                tool_grouping_id:  parseInt(document.getElementById(`pf-pa-tg-${i}`)?.value || "0") || null,
+            });
+        }
+        _panelNode.properties.agents = agents;
+        _panelNode._syncSize?.();
+    }
+
     // Update node title to match label
     if (_panelNode.properties.label) {
         _panelNode.title = _panelNode.properties.label;
@@ -1051,6 +1199,73 @@ function _setupFactoryPanel(body, node) {
     const runBtn    = body.querySelector("#pf-run-now");
     const runStatus = body.querySelector("#pf-run-status");
     if (runBtn) runBtn.addEventListener("click", () => runFactoryNow(node, runStatus));
+}
+
+// Tool groupings cache for parallel agent panel dropdowns
+let _toolGroupingsCache = null;
+async function _loadToolGroupings() {
+    if (_toolGroupingsCache) return _toolGroupingsCache;
+    try { _toolGroupingsCache = await apiGet("/tool-groupings"); } catch (_) { _toolGroupingsCache = []; }
+    return _toolGroupingsCache;
+}
+
+function _renderParallelAgentCards(container, n, agents, toolGroupings) {
+    container.innerHTML = "";
+    for (let i = 0; i < n; i++) {
+        const ag = agents[i] || {};
+        const tgOptions = toolGroupings.map(tg =>
+            `<option value="${tg.id}" ${ag.tool_grouping_id == tg.id ? "selected" : ""}>${_peEscHtml(tg.name)}</option>`
+        ).join("");
+        const card = document.createElement("div");
+        card.className = "pe-agent-card";
+        card.innerHTML = `
+            <div class="pe-agent-card-header">Agent ${i + 1}</div>
+            <div class="pe-field-row">
+                <label for="pf-pa-name-${i}">Name</label>
+                <input type="text" id="pf-pa-name-${i}" class="pe-input" value="${_peEscHtml(ag.name || `agent_${i}`)}">
+            </div>
+            <div class="pe-field-row">
+                <label for="pf-pa-desc-${i}">Description</label>
+                <input type="text" id="pf-pa-desc-${i}" class="pe-input" value="${_peEscHtml(ag.description || "")}">
+            </div>
+            <div class="pe-field-row">
+                <label for="pf-pa-prompt-${i}">System prompt</label>
+                <textarea id="pf-pa-prompt-${i}" class="pe-input pe-textarea" rows="4">${_peEscHtml(ag.system_prompt || "")}</textarea>
+            </div>
+            <div class="pe-field-row">
+                <label for="pf-pa-tg-${i}">Tool grouping</label>
+                <select id="pf-pa-tg-${i}" class="pe-input">
+                    <option value="">— none (submit_work only) —</option>
+                    ${tgOptions}
+                </select>
+            </div>`;
+        container.appendChild(card);
+    }
+}
+
+function _setupParallelAgentsPanel(body, node) {
+    const p = node.properties;
+    const container = body.querySelector("#pf-pa-cards");
+    if (!container) return;
+
+    const nInput = body.querySelector("#pf-pa-n");
+    if (nInput) nInput.value = p.n ?? 3;
+
+    const renderCards = (n) => {
+        _loadToolGroupings().then(tgs => {
+            _renderParallelAgentCards(container, n, p.agents || [], tgs);
+        });
+    };
+
+    renderCards(parseInt(nInput?.value || "3"));
+
+    if (nInput) {
+        nInput.addEventListener("change", () => {
+            const n = Math.max(1, Math.min(10, parseInt(nInput.value) || 3));
+            nInput.value = n;
+            renderCards(n);
+        });
+    }
 }
 
 async function runFactoryNow(node, statusEl) {
@@ -1567,10 +1782,127 @@ function peToast(msg, type = "ok") {
 // EVENT WIRING
 // ============================================================
 
+// ============================================================
+// TOOL GROUPS MODAL
+// ============================================================
+
+async function openToolGroupsModal() {
+    _toolGroupingsCache = null; // force refresh
+    const modal = document.getElementById("pe-tg-modal");
+    modal.classList.remove("pe-hidden");
+    await _renderToolGroupsList();
+    document.getElementById("pe-tg-close").onclick = () => modal.classList.add("pe-hidden");
+    document.getElementById("pe-tg-new").onclick = () => _showToolGroupForm(null);
+}
+
+async function _renderToolGroupsList() {
+    const tgs = await _loadToolGroupings();
+    const body = document.getElementById("pe-tg-body");
+    if (!tgs.length) {
+        body.innerHTML = `<p style="color:#64748b;font-size:13px;">No tool groupings yet.</p>`;
+        return;
+    }
+    body.innerHTML = tgs.map(tg => `
+        <div class="pe-tg-row" id="pe-tg-row-${tg.id}">
+          <div class="pe-tg-row-info">
+            <div class="pe-tg-row-name">${_peEscHtml(tg.name)}${tg.is_builtin ? '<span class="pe-tg-builtin-badge">builtin</span>' : ""}</div>
+            <div class="pe-tg-row-desc">${_peEscHtml(tg.description || "")}</div>
+            <div class="pe-tg-row-tools">${tg.tools.length} tool${tg.tools.length !== 1 ? "s" : ""}: ${_peEscHtml(tg.tools.slice(0, 5).join(", ") + (tg.tools.length > 5 ? "…" : ""))}</div>
+          </div>
+          <div class="pe-tg-row-actions">
+            <button class="pe-btn pe-btn-secondary" style="font-size:12px;padding:3px 8px;"
+              onclick="_showToolGroupForm(${tg.id})">Edit</button>
+            <button class="pe-btn pe-btn-secondary" style="font-size:12px;padding:3px 8px;"
+              onclick="_cloneToolGroup(${tg.id})">Clone</button>
+            ${!tg.is_builtin ? `<button class="pe-btn pe-btn-secondary" style="font-size:12px;padding:3px 8px;color:#f87171;"
+              onclick="_deleteToolGroup(${tg.id})">Del</button>` : ""}
+          </div>
+        </div>`).join("");
+}
+
+async function _showToolGroupForm(groupingId) {
+    let tg = null;
+    if (groupingId) {
+        const tgs = await _loadToolGroupings();
+        tg = tgs.find(g => g.id === groupingId);
+    }
+    const body = document.getElementById("pe-tg-body");
+    const formHtml = `
+        <div class="pe-tg-edit-form" id="pe-tg-edit-form">
+          <div class="pe-field-row">
+            <label>Name</label>
+            <input type="text" id="pe-tg-f-name" class="pe-input" value="${_peEscHtml(tg?.name || "")}">
+          </div>
+          <div class="pe-field-row">
+            <label>Description</label>
+            <input type="text" id="pe-tg-f-desc" class="pe-input" value="${_peEscHtml(tg?.description || "")}">
+          </div>
+          <div class="pe-field-row">
+            <label>Tools <span style="color:#94a3b8;font-size:11px;">(one per line)</span></label>
+            <textarea id="pe-tg-f-tools" class="pe-input pe-textarea" rows="8">${_peEscHtml((tg?.tools || []).join("\n"))}</textarea>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:4px;">
+            <button class="pe-btn pe-btn-primary" onclick="_saveToolGroupForm(${groupingId || "null"})">Save</button>
+            <button class="pe-btn pe-btn-secondary" onclick="_renderToolGroupsList()">Cancel</button>
+          </div>
+        </div>`;
+    body.innerHTML = formHtml;
+}
+
+async function _saveToolGroupForm(groupingId) {
+    const name  = document.getElementById("pe-tg-f-name")?.value?.trim();
+    const desc  = document.getElementById("pe-tg-f-desc")?.value?.trim() || "";
+    const tools = (document.getElementById("pe-tg-f-tools")?.value || "")
+        .split("\n").map(s => s.trim()).filter(Boolean);
+    if (!name) { peToast("Name is required", "err"); return; }
+    try {
+        if (groupingId) {
+            await apiPut(`/tool-groupings/${groupingId}`, {name, description: desc, tools});
+        } else {
+            await apiPost(`/tool-groupings`, {name, description: desc, tools});
+        }
+        _toolGroupingsCache = null;
+        peToast("Saved", "ok");
+        await _renderToolGroupsList();
+    } catch (e) {
+        peToast(`Save failed: ${e.message}`, "err");
+    }
+}
+
+async function _cloneToolGroup(groupingId) {
+    const tgs = await _loadToolGroupings();
+    const src = tgs.find(g => g.id === groupingId);
+    if (!src) return;
+    const name = prompt("Name for the cloned group:", `${src.name} (copy)`);
+    if (!name?.trim()) return;
+    try {
+        await apiPost(`/tool-groupings`, {name: name.trim(), description: src.description || "", tools: src.tools});
+        _toolGroupingsCache = null;
+        peToast("Cloned", "ok");
+        await _renderToolGroupsList();
+    } catch (e) {
+        peToast(`Clone failed: ${e.message}`, "err");
+    }
+}
+
+async function _deleteToolGroup(groupingId) {
+    if (!confirm("Delete this tool grouping?")) return;
+    try {
+        await apiDel(`/tool-groupings/${groupingId}`);
+        _toolGroupingsCache = null;
+        peToast("Deleted", "ok");
+        await _renderToolGroupsList();
+    } catch (e) {
+        peToast(`Delete failed: ${e.message}`, "err");
+    }
+}
+
+
 function setupEvents() {
     // Top bar buttons
     document.getElementById("btn-save").addEventListener("click", saveGraph);
     document.getElementById("btn-tidy").addEventListener("click", tidyLayout);
+    document.getElementById("btn-tool-groups").addEventListener("click", openToolGroupsModal);
     document.getElementById("btn-simulate").addEventListener("click", () => {
         if (_simActive) stopSimulation();
         else startSimulation();

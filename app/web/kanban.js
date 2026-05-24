@@ -9356,69 +9356,47 @@ async function triggerTrainingExport() {
 }
 
 // ---------------------------------------------------------------------------
-// Live Stream Peek Drawer
+// Live Stream Peek Drawer — Multi-Stream
 // ---------------------------------------------------------------------------
 // A slide-in panel that subscribes to /api/tasks/{id}/live and renders tokens
-// as they arrive from the LLM.  Only one drawer is open at a time.
+// as they arrive. Multiple concurrent sessions (identified by session_id) are
+// shown as side-by-side columns, up to 3. Resolved streams expose a "Close"
+// button once idle for 60 s after their last turn, or when the task is done.
 
 let _peekTaskId = null;       // task id currently peeked
 let _peekSource = null;       // active EventSource
 let _peekSeq = 0;             // last seq received (for reconnect)
-let _peekAgentName = '';
-let _peekAutoScroll = true;
-let _peekLastToolSep = null;  // lp-tool-sep waiting for tool_result events
-let _peekToolResultIdx = 0;   // which item in _peekLastToolSep gets the next result
+let _peekStreams = new Map(); // sessionId → StreamState
 
 function openLivePeek(taskId) {
     const task = taskData[taskId];
     const title = task ? escapeHtml(task.title || taskId) : escapeHtml(taskId);
 
-    // Create drawer if it doesn't exist
     let drawer = document.getElementById('live-peek-drawer');
     if (!drawer) {
         drawer = document.createElement('div');
         drawer.id = 'live-peek-drawer';
         drawer.className = 'live-peek-drawer';
         drawer.innerHTML = `
-            <div class="lp-header">
+            <div class="lp-header lp-global-header">
                 <span class="lp-pulse" id="lp-pulse"></span>
                 <span class="lp-title" id="lp-title">Live Stream</span>
-                <span class="lp-agent" id="lp-agent"></span>
                 <div class="lp-header-btns">
-                    <button class="lp-btn" title="Clear output" onclick="_peekClear()">&#10005; Clear</button>
-                    <button class="lp-btn" title="Close" onclick="closeLivePeek()">&#10005;</button>
+                    <button class="lp-btn" title="Clear all streams" onclick="_peekClear()">&#10005; Clear</button>
+                    <button class="lp-btn" title="Close drawer" onclick="closeLivePeek()">&#10005;</button>
                 </div>
             </div>
-            <div class="lp-output" id="lp-output">
-                <div class="lp-waiting" id="lp-waiting">Connecting to live stream…</div>
-            </div>
-            <div class="lp-footer">
-                <label class="lp-autoscroll-label">
-                    <input type="checkbox" id="lp-autoscroll" checked onchange="_peekAutoScrollToggle(this)">
-                    Auto-scroll
-                </label>
-                <span class="lp-seq" id="lp-seq"></span>
-            </div>
+            <div class="lp-streams-container" id="lp-streams-container"></div>
         `;
         document.body.appendChild(drawer);
-
-        // Pause auto-scroll on manual scroll up
-        document.getElementById('lp-output').addEventListener('scroll', _peekCheckScroll);
     }
 
-    // Reset tool result tracking
-    _peekLastToolSep = null;
-    _peekToolResultIdx = 0;
-
-    // Switch task if already open
     if (_peekTaskId !== taskId) {
         _peekCloseSse();
+        _peekDestroyAllStreams();
         _peekTaskId = taskId;
         _peekSeq = 0;
-        _peekAutoScroll = true;
-        document.getElementById('lp-autoscroll').checked = true;
-        document.getElementById('lp-output').innerHTML =
-            `<div class="lp-waiting" id="lp-waiting">Connecting to live stream…</div>`;
+        document.getElementById('lp-streams-container').innerHTML = '';
     }
 
     document.getElementById('lp-title').textContent = title;
@@ -9433,24 +9411,21 @@ function closeLivePeek() {
     _peekTaskId = null;
 }
 
+function _peekDestroyAllStreams() {
+    for (const s of _peekStreams.values()) {
+        if (s.idleTimer) clearTimeout(s.idleTimer);
+    }
+    _peekStreams.clear();
+    _peekUpdateDrawerWidth();
+}
+
 function _peekClear() {
-    const out = document.getElementById('lp-output');
-    if (out) out.innerHTML = `<div class="lp-waiting">Stream cleared.</div>`;
-    _peekLastToolSep = null;
-    _peekToolResultIdx = 0;
-}
-
-function _peekAutoScrollToggle(cb) {
-    _peekAutoScroll = cb.checked;
-}
-
-function _peekCheckScroll() {
-    const out = document.getElementById('lp-output');
-    if (!out) return;
-    const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
-    _peekAutoScroll = atBottom;
-    const cb = document.getElementById('lp-autoscroll');
-    if (cb) cb.checked = atBottom;
+    for (const s of _peekStreams.values()) {
+        s.outputEl.innerHTML = `<div class="lp-waiting">Stream cleared.</div>`;
+        s.lastToolSep = null;
+        s.toolResultIdx = 0;
+        if (s.idleTimer) { clearTimeout(s.idleTimer); s.idleTimer = null; }
+    }
 }
 
 function _peekCloseSse() {
@@ -9458,6 +9433,133 @@ function _peekCloseSse() {
         _peekSource.close();
         _peekSource = null;
     }
+}
+
+function _peekUpdateDrawerWidth() {
+    const drawer = document.getElementById('live-peek-drawer');
+    if (!drawer) return;
+    const count = Math.max(1, _peekStreams.size);
+    drawer.style.width = Math.min(count * 460, Math.floor(window.innerWidth * 0.92)) + 'px';
+}
+
+function _peekGetOrCreateStream(sessionId, agentName) {
+    if (_peekStreams.has(sessionId)) {
+        const s = _peekStreams.get(sessionId);
+        if (agentName && agentName !== s.agentName) {
+            s.agentName = agentName;
+            s.agentEl.textContent = agentName;
+        }
+        return s;
+    }
+
+    // At capacity: reuse the oldest stream rather than creating a 4th column
+    if (_peekStreams.size >= 3) {
+        return _peekStreams.values().next().value;
+    }
+
+    const container = document.getElementById('lp-streams-container');
+    if (!container) return null;
+
+    const colEl = document.createElement('div');
+    colEl.className = 'lp-stream-col';
+    colEl.dataset.session = sessionId;
+
+    const headerEl = document.createElement('div');
+    headerEl.className = 'lp-stream-header';
+
+    const pulseEl = document.createElement('span');
+    pulseEl.className = 'lp-pulse lp-stream-pulse';
+
+    const agentEl = document.createElement('span');
+    agentEl.className = 'lp-agent';
+    agentEl.textContent = agentName || 'Agent';
+
+    const sidEl = document.createElement('span');
+    sidEl.className = 'lp-stream-sid';
+    sidEl.textContent = sessionId.length > 8 ? sessionId.slice(0, 8) : sessionId;
+
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'lp-btn lp-close-stream-btn';
+    closeBtn.textContent = '✕ Close';
+    closeBtn.style.display = 'none';
+    closeBtn.addEventListener('click', () => _peekRemoveStream(sessionId));
+
+    headerEl.appendChild(pulseEl);
+    headerEl.appendChild(agentEl);
+    headerEl.appendChild(sidEl);
+    headerEl.appendChild(closeBtn);
+
+    const outputEl = document.createElement('div');
+    outputEl.className = 'lp-stream-output lp-output';
+    outputEl.innerHTML = `<div class="lp-waiting">Connecting…</div>`;
+
+    const footerEl = document.createElement('div');
+    footerEl.className = 'lp-footer';
+
+    const autoScrollLabel = document.createElement('label');
+    autoScrollLabel.className = 'lp-autoscroll-label';
+    const autoScrollCb = document.createElement('input');
+    autoScrollCb.type = 'checkbox';
+    autoScrollCb.checked = true;
+    autoScrollLabel.appendChild(autoScrollCb);
+    autoScrollLabel.appendChild(document.createTextNode(' Auto-scroll'));
+
+    const seqEl = document.createElement('span');
+    seqEl.className = 'lp-seq';
+
+    footerEl.appendChild(autoScrollLabel);
+    footerEl.appendChild(seqEl);
+
+    colEl.appendChild(headerEl);
+    colEl.appendChild(outputEl);
+    colEl.appendChild(footerEl);
+    container.appendChild(colEl);
+
+    const state = {
+        sessionId,
+        agentName: agentName || 'Agent',
+        colEl, outputEl, pulseEl, agentEl, seqEl, closeBtn,
+        autoScroll: true,
+        lastToolSep: null,
+        toolResultIdx: 0,
+        idleTimer: null,
+        done: false,
+    };
+
+    outputEl.addEventListener('scroll', () => {
+        const atBottom = outputEl.scrollHeight - outputEl.scrollTop - outputEl.clientHeight < 40;
+        state.autoScroll = atBottom;
+        autoScrollCb.checked = atBottom;
+    });
+    autoScrollCb.addEventListener('change', () => { state.autoScroll = autoScrollCb.checked; });
+
+    _peekStreams.set(sessionId, state);
+    _peekUpdateDrawerWidth();
+    return state;
+}
+
+function _peekRemoveStream(sessionId) {
+    const s = _peekStreams.get(sessionId);
+    if (!s) return;
+    if (s.idleTimer) clearTimeout(s.idleTimer);
+    s.colEl.remove();
+    _peekStreams.delete(sessionId);
+    _peekUpdateDrawerWidth();
+}
+
+function _peekMarkStreamDone(sessionId) {
+    const s = _peekStreams.get(sessionId);
+    if (!s || s.done) return;
+    s.done = true;
+    if (s.idleTimer) { clearTimeout(s.idleTimer); s.idleTimer = null; }
+    s.pulseEl.classList.remove('active');
+    s.closeBtn.style.display = '';
+
+    const sep = document.createElement('div');
+    sep.className = 'lp-done-sep';
+    sep.textContent = 'Stream complete';
+    s.outputEl.appendChild(sep);
+    if (s.autoScroll) s.outputEl.scrollTop = s.outputEl.scrollHeight;
 }
 
 function _peekConnect() {
@@ -9468,60 +9570,53 @@ function _peekConnect() {
     const es = new EventSource(url);
     _peekSource = es;
 
-    const pulse = document.getElementById('lp-pulse');
+    const globalPulse = document.getElementById('lp-pulse');
 
     es.addEventListener('token', e => {
         const data = JSON.parse(e.data);
         _peekSeq = data.seq;
-
-        // Update agent label if changed
-        if (data.agent_name && data.agent_name !== _peekAgentName) {
-            _peekAgentName = data.agent_name;
-            const agentEl = document.getElementById('lp-agent');
-            if (agentEl) agentEl.textContent = data.agent_name;
-        }
-        if (pulse) pulse.classList.add('active');
-
+        if (globalPulse) globalPulse.classList.add('active');
         _peekAppendToken(data);
-        _peekScrollDown();
-        _peekUpdateSeq();
     });
 
     es.addEventListener('status', e => {
         let data;
         try { data = JSON.parse(e.data); } catch { return; }
-        if (pulse) pulse.classList.toggle('active', data.active);
+        if (globalPulse) globalPulse.classList.toggle('active', data.active);
         if (!data.active) {
-            const agentEl = document.getElementById('lp-agent');
-            if (agentEl && _peekAgentName) agentEl.textContent = _peekAgentName + ' (idle)';
+            for (const s of _peekStreams.values()) s.pulseEl.classList.remove('active');
         }
     });
 
     es.addEventListener('done', () => {
-        if (pulse) pulse.classList.remove('active');
-        _peekAppendSeparator('Stream complete');
-        _peekScrollDown();
+        if (globalPulse) globalPulse.classList.remove('active');
+        for (const sid of _peekStreams.keys()) _peekMarkStreamDone(sid);
         _peekCloseSse();
     });
 
     es.onerror = () => {
-        // Browser will auto-reconnect on EventSource error; just update indicator
-        if (pulse) pulse.classList.remove('active');
+        if (globalPulse) globalPulse.classList.remove('active');
     };
 }
 
 function _peekAppendToken(data) {
-    const out = document.getElementById('lp-output');
-    if (!out) return;
+    const sessionId = data.session_id || '__default__';
+    const stream = _peekGetOrCreateStream(sessionId, data.agent_name);
+    if (!stream) return;
 
-    // Remove placeholder
-    const waiting = document.getElementById('lp-waiting');
+    const out = stream.outputEl;
+
+    // Any incoming token resets the idle-done timer for this stream
+    if (stream.idleTimer) { clearTimeout(stream.idleTimer); stream.idleTimer = null; }
+    stream.pulseEl.classList.add('active');
+    stream.seqEl.textContent = `seq ${data.seq}`;
+
+    const waiting = out.querySelector('.lp-waiting');
     if (waiting) waiting.remove();
 
     if (data.turn_type === 'tool_invoked') {
         let tools;
         try { tools = JSON.parse(data.text); } catch { tools = [{name: String(data.text), args: ''}]; }
-        // Normalise old format (array of strings) to new format (array of {name, args})
         if (tools.length > 0 && typeof tools[0] === 'string') {
             tools = tools.map(n => ({name: n, args: ''}));
         }
@@ -9533,7 +9628,6 @@ function _peekAppendToken(data) {
             let argsObj = null;
             try { if (tool.args) argsObj = JSON.parse(tool.args); } catch {}
             const hasArgs = argsObj && Object.keys(argsObj).length > 0;
-            // One-line preview: first 2 key=val pairs
             let previewStr = '';
             if (hasArgs) {
                 const entries = Object.entries(argsObj);
@@ -9568,19 +9662,20 @@ function _peekAppendToken(data) {
             sep.appendChild(item);
         });
         out.appendChild(sep);
-        _peekLastToolSep = sep;
-        _peekToolResultIdx = 0;
+        stream.lastToolSep = sep;
+        stream.toolResultIdx = 0;
+        if (stream.autoScroll) out.scrollTop = out.scrollHeight;
         return;
     }
 
     if (data.turn_type === 'tool_result') {
         let parsed;
         try { parsed = JSON.parse(data.text); } catch { return; }
-        const sep = _peekLastToolSep;
+        const sep = stream.lastToolSep;
         if (!sep) return;
         const items = sep.querySelectorAll('.lp-tool-item');
-        const item = items[_peekToolResultIdx];
-        _peekToolResultIdx++;
+        const item = items[stream.toolResultIdx];
+        stream.toolResultIdx++;
         if (!item) return;
         const resultEl = document.createElement('div');
         resultEl.className = 'lp-tool-result';
@@ -9592,11 +9687,10 @@ function _peekAppendToken(data) {
         resultEl.appendChild(label);
         resultEl.appendChild(pre);
         item.appendChild(resultEl);
-        // Always show the result immediately; flip the toggle to ▼
         resultEl.classList.add('open');
         const toggle = item.querySelector('.lp-tool-toggle');
         if (toggle) { toggle.textContent = '▼'; toggle.classList.add('lp-tool-toggle-has-result'); }
-        _peekScrollDown();
+        if (stream.autoScroll) out.scrollTop = out.scrollHeight;
         return;
     }
 
@@ -9604,22 +9698,24 @@ function _peekAppendToken(data) {
         const sep = document.createElement('div');
         sep.className = 'lp-turn-sep';
         out.appendChild(sep);
+        // If no new tokens arrive for this session within 60 s, treat it as done
+        stream.idleTimer = setTimeout(() => _peekMarkStreamDone(sessionId), 60000);
         return;
     }
 
-    // content token — append to last text node or create new
+    // content token
     let last = out.lastElementChild;
     if (!last || !last.classList.contains('lp-text-block')) {
         last = document.createElement('div');
         last.className = 'lp-text-block';
         out.appendChild(last);
     }
-    // Preserve newlines; escape HTML in the raw token
     const escaped = data.text
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
     last.innerHTML += escaped.replace(/\n/g, '<br>');
+    if (stream.autoScroll) out.scrollTop = out.scrollHeight;
 }
 
 function _lpToggleTool(toggleEl) {
@@ -9633,25 +9729,5 @@ function _lpToggleTool(toggleEl) {
     if (argsEl) argsEl.classList.toggle('open', nowOpen);
     if (resultEl) resultEl.classList.toggle('open', nowOpen);
     toggleEl.textContent = nowOpen ? '▼' : '▶';
-}
-
-function _peekAppendSeparator(label) {
-    const out = document.getElementById('lp-output');
-    if (!out) return;
-    const sep = document.createElement('div');
-    sep.className = 'lp-done-sep';
-    sep.textContent = label;
-    out.appendChild(sep);
-}
-
-function _peekScrollDown() {
-    if (!_peekAutoScroll) return;
-    const out = document.getElementById('lp-output');
-    if (out) out.scrollTop = out.scrollHeight;
-}
-
-function _peekUpdateSeq() {
-    const el = document.getElementById('lp-seq');
-    if (el) el.textContent = `seq ${_peekSeq}`;
 }
 

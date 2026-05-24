@@ -1344,3 +1344,18 @@ class TrainingCheckpoint(Base):
 
     def __repr__(self):
         return f"<TrainingCheckpoint(id={self.id}, name={self.checkpoint_name!r})>"
+
+
+class ToolGrouping(Base):
+    """Named reusable set of tool function names for parallel_agents sub-agents."""
+    __tablename__ = "tool_groupings"
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    name        = Column(String(120), nullable=False, unique=True)
+    description = Column(Text, nullable=True)
+    tools       = Column(JSON, nullable=False, default=list)
+    is_builtin  = Column(Boolean, nullable=False, default=False)
+    created_at  = Column(DateTime(timezone=True), server_default="now()")
+
+    def __repr__(self):
+        return f"<ToolGrouping(id={self.id}, name={self.name!r}, tools={len(self.tools or [])})>"

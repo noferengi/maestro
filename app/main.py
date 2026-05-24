@@ -7949,3 +7949,71 @@ def list_training_checkpoints_route():
     """List all model deployment checkpoints, newest first."""
     from app.database.crud_training import list_training_checkpoints, checkpoint_to_dict
     return [checkpoint_to_dict(cp) for cp in list_training_checkpoints()]
+
+
+# ---------------------------------------------------------------------------
+# Tool Groupings
+# ---------------------------------------------------------------------------
+
+@app.get("/api/tool-groupings", response_model=List[dict])
+def list_tool_groupings():
+    from app.database import get_tool_groupings
+    return get_tool_groupings()
+
+
+@app.post("/api/tool-groupings", response_model=dict, status_code=201)
+def create_tool_grouping_route(body: dict = Body(...)):
+    from app.database import create_tool_grouping
+    name = body.get("name", "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    result = create_tool_grouping(
+        name=name,
+        tools=body.get("tools", []),
+        description=body.get("description", ""),
+        clone_from_id=body.get("clone_from_id"),
+    )
+    if result is None:
+        raise HTTPException(status_code=409, detail="Name already exists or DB error")
+    return result
+
+
+@app.get("/api/tool-groupings/{grouping_id}", response_model=dict)
+def get_tool_grouping_route(grouping_id: int):
+    from app.database import get_tool_grouping
+    tg = get_tool_grouping(grouping_id)
+    if not tg:
+        raise HTTPException(status_code=404, detail="Tool grouping not found")
+    return tg
+
+
+@app.put("/api/tool-groupings/{grouping_id}", response_model=dict)
+def update_tool_grouping_route(grouping_id: int, body: dict = Body(...)):
+    from app.database import get_tool_grouping, update_tool_grouping
+    tg = get_tool_grouping(grouping_id)
+    if not tg:
+        raise HTTPException(status_code=404, detail="Tool grouping not found")
+    kwargs = {}
+    if "name" in body:
+        kwargs["name"] = body["name"]
+    if "description" in body:
+        kwargs["description"] = body["description"]
+    if "tools" in body:
+        kwargs["tools"] = body["tools"]
+    result = update_tool_grouping(grouping_id, **kwargs)
+    if result is None:
+        raise HTTPException(status_code=500, detail="Update failed")
+    return result
+
+
+@app.delete("/api/tool-groupings/{grouping_id}", status_code=200)
+def delete_tool_grouping_route(grouping_id: int):
+    from app.database import delete_tool_grouping
+    result = delete_tool_grouping(grouping_id)
+    if result.get("error") == "not_found":
+        raise HTTPException(status_code=404, detail="Tool grouping not found")
+    if result.get("error") == "builtin_protected":
+        raise HTTPException(status_code=403, detail="Built-in tool groupings cannot be deleted")
+    if result.get("error"):
+        raise HTTPException(status_code=500, detail="Delete failed")
+    return result
