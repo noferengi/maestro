@@ -819,3 +819,182 @@ def _run_static_analysis_widget(
         task_id, result.get("file_count", 0), output_key,
     )
     advance_stage(task_id, "pass")
+
+
+# ---------------------------------------------------------------------------
+# dangerous_edit_llm_agent — wraps MaestroLoop with stage-config overrides
+# ---------------------------------------------------------------------------
+
+def _record_demotion(task_id: str, from_stage: str, to_stage: str, reason: str) -> None:
+    """Local copy of scheduler._record_demotion_inline — avoids circular import."""
+    import asyncio
+    from datetime import datetime, timezone
+    from app.database import get_task, update_task
+    from app.agent.pip_agent import generate_pip
+
+    task = get_task(task_id)
+    if not task:
+        return
+    history = task.demotion_history or []
+    history.append({
+        "from": from_stage,
+        "to": to_stage,
+        "reason": reason[:500],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    update_task(task_id, demotion_count=(task.demotion_count or 0) + 1, demotion_history=history)
+
+    review_stages = {"conceptual_review", "optimization", "security", "human_review"}
+    if from_stage in review_stages:
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(generate_pip(task_id, from_stage, reason))
+        except RuntimeError:
+            asyncio.run(generate_pip(task_id, from_stage, reason))
+
+
+def _run_dangerous_edit_llm_agent(
+    task_id: str,
+    stage_config: "StageConfig",
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """
+    Executor for dangerous_edit_llm_agent — wraps MaestroLoop with worktree-isolated
+    writes and per-stage overrides for system_prompt, agent_tools, max_turns, and
+    required_input_keys.
+
+    Stage config shape:
+        system_prompt        — override MAESTRO_SYSTEM_PROMPT (empty/absent = default)
+        max_turns            — integer cap (default from maestro.ini)
+        agent_tools          — comma-separated string or list of tool names (absent = INDEV_AGENT_TOOLS)
+        required_input_keys  — comma-separated string or list; values injected from task.content
+    """
+    import asyncio
+    import json as _json
+
+    from app.agent.loop import MaestroLoop
+    from app.agent.config import MAX_TURNS as _DEFAULT_MAX_TURNS
+    from app.database import (
+        get_task,
+        update_task,
+        create_agent_session,
+        close_agent_session,
+        create_inbox_message,
+    )
+    from app.agent.pipeline_router import advance_stage
+
+    cfg = stage_config.config or {}
+    system_prompt = cfg.get("system_prompt") or None  # empty string → None (use default)
+    max_turns = int(cfg.get("max_turns", _DEFAULT_MAX_TURNS))
+    stage_key = stage_config.stage_key
+
+    # agent_tools: stored as JSON list or comma-sep string from the pipeline editor
+    _raw_tools = cfg.get("agent_tools")
+    if isinstance(_raw_tools, list):
+        agent_tools: list[str] | None = [t.strip() for t in _raw_tools if t.strip()] or None
+    elif isinstance(_raw_tools, str) and _raw_tools.strip():
+        agent_tools = [t.strip() for t in _raw_tools.split(",") if t.strip()] or None
+    else:
+        agent_tools = None  # falls back to INDEV_AGENT_TOOLS
+
+    # required_input_keys: same dual-format handling
+    _raw_keys = cfg.get("required_input_keys", [])
+    if isinstance(_raw_keys, list):
+        required_keys: list[str] = [k.strip() for k in _raw_keys if k.strip()]
+    elif isinstance(_raw_keys, str) and _raw_keys.strip():
+        required_keys = [k.strip() for k in _raw_keys.split(",") if k.strip()]
+    else:
+        required_keys = []
+
+    _session_id = None
+    _exit_reason = "error"
+    _exit_summary = ""
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        _session_id = create_agent_session(
+            task_id=task_id,
+            agent_type="dangerous_edit_llm_agent",
+            llm_id=llm_id,
+            budget_id=budget_id,
+            scheduler_reason="scheduler",
+            max_turns=max_turns,
+        )
+
+        maestro = MaestroLoop(
+            task_id=task_id,
+            max_turns=max_turns,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            max_context=max_context,
+            llm_id=llm_id,
+            budget_id=budget_id,
+            project_path=project_path,
+            system_prompt=system_prompt,
+            agent_tools=agent_tools,
+            required_input_keys=required_keys,
+        )
+        result = loop.run_until_complete(maestro.run())
+        _exit_summary = result.final_message or ""
+
+        if result.status == "ACCEPTED":
+            _exit_reason = "completed"
+            advance_stage(task_id, "pass", from_stage=stage_key)
+
+        elif result.status == "NEEDS_HUMAN":
+            _exit_reason = "needs_human"
+            advance_stage(task_id, "pass", from_stage=stage_key)
+            task_obj = get_task(task_id)
+            create_inbox_message(
+                subject=f"Human review needed: {(task_obj.title if task_obj else task_id)[:60]}",
+                source_type="needs_human",
+                task_id=task_id,
+                project_id=task_obj.project if task_obj else None,
+                task_title=task_obj.title if task_obj else None,
+                outcome="needs_human",
+                data_json=_json.dumps({"summary": _exit_summary}),
+            )
+
+        elif result.status == "CONSULTING":
+            _exit_reason = "consulting"
+            update_task(task_id, consultation_payload=_json.dumps({
+                "question": result.consultation_question,
+                "hint": None,
+                "source": None,
+            }))
+            task_obj = get_task(task_id)
+            create_inbox_message(
+                subject=f"Consultation needed: {(task_obj.title if task_obj else task_id)[:60]}",
+                source_type="consultation",
+                task_id=task_id,
+                project_id=task_obj.project if task_obj else None,
+                task_title=task_obj.title if task_obj else None,
+                outcome="consultation",
+                data_json=_json.dumps({
+                    "question": result.consultation_question,
+                    "summary": _exit_summary,
+                }),
+            )
+
+        elif result.status in ("REVERT_TO_DESIGN", "REJECTED"):
+            _exit_reason = "rejected"
+            advance_stage(task_id, "fail", from_stage=stage_key)
+            _record_demotion(task_id, stage_key, "planning",
+                             result.final_message or "Agent requested revert")
+
+        elif result.status in ("MAX_TURNS", "ERROR"):
+            _exit_reason = result.status.lower()
+            advance_stage(task_id, "fail", from_stage=stage_key)
+            _record_demotion(task_id, stage_key, "planning",
+                             f"{result.status} in dangerous_edit_llm_agent stage.")
+
+    finally:
+        loop.close()
+        if _session_id is not None:
+            close_agent_session(_session_id, _exit_reason, _exit_summary)

@@ -5822,14 +5822,16 @@ from app.agent.stage_executors import (  # noqa: E402
     _run_fan_out_judge,
     _run_reflection_agent,
     _run_static_analysis_widget,
+    _run_dangerous_edit_llm_agent,
 )
 from app.agent.pipeline_router import register_agent_type_executor as _reg_executor  # noqa: E402
 
-_reg_executor("circuit_breaker",        _run_circuit_breaker)
-_reg_executor("voting_panel",           _run_voting_panel)
-_reg_executor("fan_out_judge",          _run_fan_out_judge)
-_reg_executor("reflection_agent",       _run_reflection_agent)
-_reg_executor("static_analysis_widget", _run_static_analysis_widget)
+_reg_executor("circuit_breaker",           _run_circuit_breaker)
+_reg_executor("voting_panel",              _run_voting_panel)
+_reg_executor("fan_out_judge",             _run_fan_out_judge)
+_reg_executor("reflection_agent",          _run_reflection_agent)
+_reg_executor("static_analysis_widget",    _run_static_analysis_widget)
+_reg_executor("dangerous_edit_llm_agent",  _run_dangerous_edit_llm_agent)
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -139,4 +139,14 @@ AGENT_REGISTRY: dict[str, AgentSpec] = {
         description="Runs tree-sitter static analysis on the project and injects structured JSON into task.content. No LLM call.",
         gate_type="none",
     ),
+    "dangerous_edit_llm_agent": AgentSpec(
+        cls=None,
+        display_name="Dangerous Edit Agent",
+        description=(
+            "Wraps MaestroLoop with worktree-isolated writes and per-stage config overrides "
+            "(system_prompt, agent_tools, max_turns, required_input_keys). "
+            "⚠ This node has write access to the project working tree."
+        ),
+        gate_type="llm_judge",
+    ),
 }

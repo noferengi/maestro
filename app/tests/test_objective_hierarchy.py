@@ -238,6 +238,9 @@ class TestPromptInjection:
         loop.llm_id = 1
         loop.budget_id = 1
         loop.project_path = project_path
+        loop._system_prompt_override = None
+        loop._tool_schemas = []
+        loop._required_input_keys = []
         loop._messages = []
         loop._turn = 0
         loop._consecutive_errors = 0

@@ -295,6 +295,44 @@ class StaticAnalysisNode extends LiteGraph.LGraphNode {
 StaticAnalysisNode.title = "Static Analysis";
 StaticAnalysisNode.desc = "Deterministic tree-sitter analysis — no LLM, injects JSON into task.content";
 
+class DangerousEditNode extends LiteGraph.LGraphNode {
+    constructor() {
+        super();
+        this.title = "Dangerous Edit Agent";
+        this.addInput("in", "task");
+        this.addOutput("pass", "task");
+        this.addOutput("fail", "task");
+        this.properties = {
+            stage_id:            null,
+            stage_key:           "",
+            label:               "",
+            agent_type:          "dangerous_edit_llm_agent",
+            system_prompt:       "",
+            max_turns:           200,
+            agent_tools:         "",   // comma-sep; empty = INDEV_AGENT_TOOLS default
+            required_input_keys: "",   // comma-sep
+        };
+        this.color   = "#7f1d1d";  // deep red — signals "writes to project working tree"
+        this.bgcolor = "#3b0a0a";
+        this.size = [220, 90];
+    }
+
+    onDrawBackground(ctx) {
+        ctx.save();
+        ctx.fillStyle = "rgba(255,255,255,0.3)";
+        ctx.font = "18px serif";
+        ctx.fillText("⚠", 8, 26);
+        ctx.fillStyle = "rgba(255,255,255,0.5)";
+        ctx.font = "11px monospace";
+        ctx.fillText((this.properties.stage_key || "dangerous_edit").substring(0, 20), 32, 20);
+        ctx.restore();
+    }
+
+    onDblClick() { openPanel(this); }
+}
+DangerousEditNode.title = "Dangerous Edit Agent";
+DangerousEditNode.desc = "Wraps MaestroLoop — writes to project working tree inside a git worktree. ⚠ Configurable system prompt, tools, and max_turns.";
+
 function registerNodeTypes() {
     LiteGraph.registerNodeType("maestro/stage", StageNode);
     LiteGraph.registerNodeType("maestro/factory", FactoryNode);
@@ -303,6 +341,7 @@ function registerNodeTypes() {
     LiteGraph.registerNodeType("maestro/fan_out", FanOutNode);
     LiteGraph.registerNodeType("maestro/human_gate", HumanGateNode);
     LiteGraph.registerNodeType("maestro/static_analysis", StaticAnalysisNode);
+    LiteGraph.registerNodeType("maestro/dangerous_edit",   DangerousEditNode);
 
     // Port type colors
     LiteGraph.default_connection_color_byType = {
@@ -431,12 +470,14 @@ function buildGraphFromTemplate(data) {
     // --- create nodes for each stage ---
     const stages = (data.stages || []).sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
     stages.forEach((stage, idx) => {
-        const isFactory       = stage.agent_type === "factory_node";
-        const isHumanGate     = stage.agent_type === "human_gate";
-        const isStaticAnalysis = stage.agent_type === "static_analysis_widget";
-        const nodeType = isFactory ? "maestro/factory"
-                       : isHumanGate ? "maestro/human_gate"
+        const isFactory         = stage.agent_type === "factory_node";
+        const isHumanGate       = stage.agent_type === "human_gate";
+        const isStaticAnalysis  = stage.agent_type === "static_analysis_widget";
+        const isDangerousEdit   = stage.agent_type === "dangerous_edit_llm_agent";
+        const nodeType = isFactory       ? "maestro/factory"
+                       : isHumanGate     ? "maestro/human_gate"
                        : isStaticAnalysis ? "maestro/static_analysis"
+                       : isDangerousEdit  ? "maestro/dangerous_edit"
                        : "maestro/stage";
         const node      = LiteGraph.createNode(nodeType);
         const x = 80 + idx * 280;
@@ -475,6 +516,21 @@ function buildGraphFromTemplate(data) {
                 output_key:   cfg.output_key   || "static_analysis",
                 file_pattern: cfg.file_pattern || "**/*.py",
                 max_files:    cfg.max_files    ?? 50,
+            };
+        } else if (isDangerousEdit) {
+            node.properties = {
+                stage_id:            stage.id,
+                stage_key:           stage.stage_key,
+                label:               stage.label || stage.stage_key,
+                agent_type:          "dangerous_edit_llm_agent",
+                system_prompt:       cfg.system_prompt || "",
+                max_turns:           cfg.max_turns ?? 200,
+                agent_tools:         Array.isArray(cfg.agent_tools)
+                                       ? cfg.agent_tools.join(", ")
+                                       : (cfg.agent_tools || ""),
+                required_input_keys: Array.isArray(cfg.required_input_keys)
+                                       ? cfg.required_input_keys.join(", ")
+                                       : (cfg.required_input_keys || ""),
             };
         } else {
             node.properties = {
@@ -689,7 +745,7 @@ async function saveGraph() {
     try {
         // 1. Upsert all stage + factory + static_analysis nodes (sorted by canvas x for position order)
         const allPipelineNodes = _graph._nodes
-            .filter(n => n.type === "maestro/stage" || n.type === "maestro/factory" || n.type === "maestro/static_analysis" || n.type === "maestro/human_gate")
+            .filter(n => n.type === "maestro/stage" || n.type === "maestro/factory" || n.type === "maestro/static_analysis" || n.type === "maestro/human_gate" || n.type === "maestro/dangerous_edit")
             .sort((a, b) => a.pos[0] - b.pos[0]);
 
         for (let posIdx = 0; posIdx < allPipelineNodes.length; posIdx++) {
@@ -738,6 +794,24 @@ async function saveGraph() {
                         _canvas_y: Math.round(node.pos[1]),
                     },
                 };
+            } else if (node.type === "maestro/dangerous_edit") {
+                const _agentTools = (p.agent_tools || "").split(",").map(s=>s.trim()).filter(Boolean);
+                const _reqKeys    = (p.required_input_keys || "").split(",").map(s=>s.trim()).filter(Boolean);
+                stageBody = {
+                    stage_key:  p.stage_key,
+                    label:      p.label || p.stage_key,
+                    agent_type: "dangerous_edit_llm_agent",
+                    color:      "#7f1d1d",
+                    position:   posIdx,
+                    config: {
+                        system_prompt:        p.system_prompt || null,
+                        max_turns:            parseInt(p.max_turns) || 200,
+                        agent_tools:          _agentTools.length ? _agentTools : null,
+                        required_input_keys:  _reqKeys,
+                        _canvas_x: Math.round(node.pos[0]),
+                        _canvas_y: Math.round(node.pos[1]),
+                    },
+                };
             } else {
                 stageBody = {
                     stage_key:  p.stage_key,
@@ -769,7 +843,7 @@ async function saveGraph() {
 
         // Update stage position map after save so back-edge detection uses new positions
         const stageNodes = allPipelineNodes.filter(n =>
-            n.type === "maestro/stage" || n.type === "maestro/static_analysis" || n.type === "maestro/human_gate"
+            n.type === "maestro/stage" || n.type === "maestro/static_analysis" || n.type === "maestro/human_gate" || n.type === "maestro/dangerous_edit"
         );
         stageNodes.forEach((n, i) => { _stagePosMap[n.id] = i; });
 
@@ -785,7 +859,7 @@ async function saveGraph() {
             const fromNode = nodeById[link.origin_id];
             const toNode   = nodeById[link.target_id];
             if (!fromNode || !toNode) continue;
-            const validTypes = new Set(["maestro/stage", "maestro/factory", "maestro/human_gate", "maestro/static_analysis"]);
+            const validTypes = new Set(["maestro/stage", "maestro/factory", "maestro/human_gate", "maestro/static_analysis", "maestro/dangerous_edit"]);
             if (!validTypes.has(fromNode.type) || !validTypes.has(toNode.type)) continue;
 
             const condition = fromNode.outputs?.[link.origin_slot]?.name || "pass";
@@ -853,6 +927,7 @@ function openPanel(node) {
         "maestro/fan_out":          "tpl-fan_out",
         "maestro/human_gate":       "tpl-human_gate",
         "maestro/static_analysis":  "tpl-static-analysis",
+        "maestro/dangerous_edit":   "tpl-dangerous_edit",
     };
     const tplId = typeMap[node.type] || "tpl-stage";
     const tpl = document.getElementById(tplId);

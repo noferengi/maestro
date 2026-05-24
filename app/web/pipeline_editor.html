@@ -454,6 +454,41 @@
       </p>
     </template>
 
+    <template id="tpl-dangerous_edit">
+      <div class="pe-field-row">
+        <label>System prompt <span style="color:#f87171;font-size:11px;">(empty = built-in Maestro prompt)</span></label>
+        <div class="pe-input-row pe-input-row--col">
+          <textarea data-bind="system_prompt" class="pe-textarea" rows="7"
+            placeholder="Leave empty to use the built-in MAESTRO_SYSTEM_PROMPT. Override only when you need a fundamentally different implementation persona."></textarea>
+          <button class="pe-lightning pe-lightning--inline" data-field="system_prompt" title="Generate with AI">⚡</button>
+        </div>
+      </div>
+
+      <div class="pe-field-row">
+        <label for="pf-de-max-turns">Max turns</label>
+        <input type="number" id="pf-de-max-turns" data-bind="max_turns"
+          class="pe-input pe-input--sm" min="1" max="500" value="200">
+      </div>
+
+      <div class="pe-field-row">
+        <label for="pf-de-tools">Agent tools <span style="color:#94a3b8;font-size:11px;">(comma-sep; empty = full indev set)</span></label>
+        <input type="text" id="pf-de-tools" data-bind="agent_tools" class="pe-input"
+          placeholder="read_file, write_file, run_test_pytest, submit_work …">
+      </div>
+
+      <div class="pe-field-row">
+        <label for="pf-de-keys">Required input keys <span style="color:#94a3b8;font-size:11px;">(comma-sep)</span></label>
+        <input type="text" id="pf-de-keys" data-bind="required_input_keys" class="pe-input"
+          placeholder="survey_summary, static_analysis">
+      </div>
+
+      <p class="pe-field-note" style="margin-top:6px;color:#f87171;font-size:11px;">
+        ⚠ This node has <strong>write access</strong> to the project working tree.
+        Worktree isolation is applied automatically — each task runs on its own
+        <code>maestro/task-{id}</code> branch inside <code>.maestro-worktrees/</code>.
+      </p>
+    </template>
+
   </div><!-- /#pe-panel-body -->
 
   <div id="pe-panel-footer">

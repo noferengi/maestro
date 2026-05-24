@@ -110,6 +110,9 @@ class MaestroLoop:
         llm_id: int | None = None,
         budget_id: int | None = None,
         project_path: str | None = None,
+        system_prompt: str | None = None,
+        agent_tools: list[str] | None = None,
+        required_input_keys: list[str] | None = None,
     ) -> None:
         self.task_id = task_id
         self.max_turns = max_turns
@@ -119,6 +122,9 @@ class MaestroLoop:
         self.llm_id = llm_id
         self.budget_id = budget_id
         self.project_path = project_path
+        self._system_prompt_override = system_prompt
+        self._tool_schemas = build_tool_schemas(agent_tools) if agent_tools else _INDEV_TOOL_SCHEMAS
+        self._required_input_keys: list[str] = required_input_keys or []
         self._messages: list[dict] = []
         self._turn: int = 0
         self._consecutive_errors: int = 0
@@ -497,11 +503,26 @@ class MaestroLoop:
         except Exception:
             pass  # episodic injection is always best-effort
 
+        # Build required_input_keys preamble from task.content
+        preamble = ""
+        if self._required_input_keys:
+            from app.database import get_task as _gt
+            _t = _gt(self.task_id)
+            _content = (_t.content or {}) if _t else {}
+            parts = []
+            for k in self._required_input_keys:
+                v = _content.get(k)
+                if v:
+                    parts.append(f"## {k}\n{v}")
+            if parts:
+                preamble = "\n\n".join(parts) + "\n\n"
+
         return [
-            {"role": "system", "content": MAESTRO_SYSTEM_PROMPT},
+            {"role": "system", "content": self._system_prompt_override or MAESTRO_SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": (
+                    f"{preamble}"
                     f"Your assigned task ID is: **{self.task_id}**"
                     f"{snapshot_block}{arch_block}{pip_block}{episode_block}\n\n"
                     f"Begin by calling get_task('{self.task_id}') to load the full "
@@ -555,7 +576,7 @@ class MaestroLoop:
             messages,
             base_url=self.llm_base_url,
             model=self.llm_model,
-            tools=_INDEV_TOOL_SCHEMAS,
+            tools=self._tool_schemas,
             tool_choice="auto",
             task_id=self.task_id,
             llm_id=self.llm_id,
