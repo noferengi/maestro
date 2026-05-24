@@ -427,6 +427,33 @@
       </div>
     </template>
 
+    <!-- ── Static Analysis node template ─────────────────────────────── -->
+    <template id="tpl-static-analysis">
+      <div class="pe-field-row">
+        <label for="pf-sa-output-key">Output key</label>
+        <input type="text" id="pf-sa-output-key" data-bind="output_key" class="pe-input"
+          placeholder="static_analysis">
+      </div>
+
+      <div class="pe-field-row">
+        <label for="pf-sa-file-pattern">File pattern (glob)</label>
+        <input type="text" id="pf-sa-file-pattern" data-bind="file_pattern" class="pe-input"
+          placeholder="**/*.py">
+      </div>
+
+      <div class="pe-field-row">
+        <label for="pf-sa-max-files">Max files</label>
+        <input type="number" id="pf-sa-max-files" data-bind="max_files"
+          class="pe-input pe-input--sm" min="1" max="500" value="50">
+      </div>
+
+      <p class="pe-field-note" style="margin-top:6px;color:#d97706;font-size:11px;">
+        ⚙ Tool node — no LLM call. Runs tree-sitter and writes JSON to
+        <code>task.content[output_key]</code>. Wire the <em>pass</em> output to the
+        next stage that reads this key via <em>required_input_keys</em>.
+      </p>
+    </template>
+
   </div><!-- /#pe-panel-body -->
 
   <div id="pe-panel-footer">

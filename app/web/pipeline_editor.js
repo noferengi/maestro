@@ -259,6 +259,42 @@ class HumanGateNode extends LiteGraph.LGraphNode {
 HumanGateNode.title = "Human Gate";
 HumanGateNode.desc = "Blocks until human approval";
 
+class StaticAnalysisNode extends LiteGraph.LGraphNode {
+    constructor() {
+        super();
+        this.title = "Static Analysis";
+        this.addInput("in", "task");
+        this.addOutput("pass", "task");
+        this.properties = {
+            stage_id:     null,
+            stage_key:    "",
+            label:        "",
+            agent_type:   "static_analysis_widget",
+            output_key:   "static_analysis",
+            file_pattern: "**/*.py",
+            max_files:    50,
+        };
+        this.color   = "#b45309";  // amber — signals "tool, not LLM"
+        this.bgcolor = "#451a03";
+        this.size = [220, 80];
+    }
+
+    onDrawBackground(ctx) {
+        ctx.save();
+        ctx.fillStyle = "rgba(255,255,255,0.25)";
+        ctx.font = "20px serif";
+        ctx.fillText("⚙", 8, 28);  // gear icon ⚙
+        ctx.fillStyle = "rgba(255,255,255,0.5)";
+        ctx.font = "11px monospace";
+        ctx.fillText((this.properties.stage_key || "static_analysis").substring(0, 20), 34, 22);
+        ctx.restore();
+    }
+
+    onDblClick() { openPanel(this); }
+}
+StaticAnalysisNode.title = "Static Analysis";
+StaticAnalysisNode.desc = "Deterministic tree-sitter analysis — no LLM, injects JSON into task.content";
+
 function registerNodeTypes() {
     LiteGraph.registerNodeType("maestro/stage", StageNode);
     LiteGraph.registerNodeType("maestro/factory", FactoryNode);
@@ -266,6 +302,7 @@ function registerNodeTypes() {
     LiteGraph.registerNodeType("maestro/judgment_gate", JudgmentGateNode);
     LiteGraph.registerNodeType("maestro/fan_out", FanOutNode);
     LiteGraph.registerNodeType("maestro/human_gate", HumanGateNode);
+    LiteGraph.registerNodeType("maestro/static_analysis", StaticAnalysisNode);
 
     // Port type colors
     LiteGraph.default_connection_color_byType = {
@@ -394,9 +431,13 @@ function buildGraphFromTemplate(data) {
     // --- create nodes for each stage ---
     const stages = (data.stages || []).sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
     stages.forEach((stage, idx) => {
-        const isFactory   = stage.agent_type === "factory_node";
-        const isHumanGate = stage.agent_type === "human_gate";
-        const nodeType    = isFactory ? "maestro/factory" : isHumanGate ? "maestro/human_gate" : "maestro/stage";
+        const isFactory       = stage.agent_type === "factory_node";
+        const isHumanGate     = stage.agent_type === "human_gate";
+        const isStaticAnalysis = stage.agent_type === "static_analysis_widget";
+        const nodeType = isFactory ? "maestro/factory"
+                       : isHumanGate ? "maestro/human_gate"
+                       : isStaticAnalysis ? "maestro/static_analysis"
+                       : "maestro/stage";
         const node      = LiteGraph.createNode(nodeType);
         const x = 80 + idx * 280;
         const y = 200 + (idx % 2) * 120;
@@ -425,6 +466,16 @@ function buildGraphFromTemplate(data) {
                 factory_cron_schedule:      srcCfg.cron_schedule || cfg.factory_cron_schedule || "",
                 intent:                     cfg.intent || "",
             };
+        } else if (isStaticAnalysis) {
+            node.properties = {
+                stage_id:     stage.id,
+                stage_key:    stage.stage_key,
+                label:        stage.label || stage.stage_key,
+                agent_type:   "static_analysis_widget",
+                output_key:   cfg.output_key   || "static_analysis",
+                file_pattern: cfg.file_pattern || "**/*.py",
+                max_files:    cfg.max_files    ?? 50,
+            };
         } else {
             node.properties = {
                 stage_id:             stage.id,
@@ -448,7 +499,11 @@ function buildGraphFromTemplate(data) {
             };
         }
 
-        node.color   = node.properties.color || (isFactory ? "#065f46" : isHumanGate ? "#be185d" : "#1e40af");
+        const _defaultColor = isFactory ? "#065f46"
+                            : isHumanGate ? "#be185d"
+                            : isStaticAnalysis ? "#b45309"
+                            : "#1e40af";
+        node.color   = node.properties.color || _defaultColor;
         node.bgcolor = _darken(node.color);
 
         _graph.add(node);
@@ -632,9 +687,9 @@ async function saveGraph() {
     setSaveStatus("Saving…");
 
     try {
-        // 1. Upsert all stage + factory nodes (sorted by canvas x for position order)
+        // 1. Upsert all stage + factory + static_analysis nodes (sorted by canvas x for position order)
         const allPipelineNodes = _graph._nodes
-            .filter(n => n.type === "maestro/stage" || n.type === "maestro/factory")
+            .filter(n => n.type === "maestro/stage" || n.type === "maestro/factory" || n.type === "maestro/static_analysis" || n.type === "maestro/human_gate")
             .sort((a, b) => a.pos[0] - b.pos[0]);
 
         for (let posIdx = 0; posIdx < allPipelineNodes.length; posIdx++) {
@@ -664,6 +719,21 @@ async function saveGraph() {
                             description_template: p.factory_desc_template  || "",
                         },
                         intent:    p.intent,
+                        _canvas_x: Math.round(node.pos[0]),
+                        _canvas_y: Math.round(node.pos[1]),
+                    },
+                };
+            } else if (node.type === "maestro/static_analysis") {
+                stageBody = {
+                    stage_key:  p.stage_key,
+                    label:      p.label || p.stage_key,
+                    agent_type: "static_analysis_widget",
+                    color:      "#b45309",
+                    position:   posIdx,
+                    config: {
+                        output_key:   p.output_key   || "static_analysis",
+                        file_pattern: p.file_pattern || "**/*.py",
+                        max_files:    parseInt(p.max_files) || 50,
                         _canvas_x: Math.round(node.pos[0]),
                         _canvas_y: Math.round(node.pos[1]),
                     },
@@ -698,7 +768,9 @@ async function saveGraph() {
         }
 
         // Update stage position map after save so back-edge detection uses new positions
-        const stageNodes = allPipelineNodes.filter(n => n.type === "maestro/stage");
+        const stageNodes = allPipelineNodes.filter(n =>
+            n.type === "maestro/stage" || n.type === "maestro/static_analysis" || n.type === "maestro/human_gate"
+        );
         stageNodes.forEach((n, i) => { _stagePosMap[n.id] = i; });
 
         // 2. Delete ALL existing transitions, then recreate from current graph
@@ -713,7 +785,7 @@ async function saveGraph() {
             const fromNode = nodeById[link.origin_id];
             const toNode   = nodeById[link.target_id];
             if (!fromNode || !toNode) continue;
-            const validTypes = new Set(["maestro/stage", "maestro/factory", "maestro/human_gate"]);
+            const validTypes = new Set(["maestro/stage", "maestro/factory", "maestro/human_gate", "maestro/static_analysis"]);
             if (!validTypes.has(fromNode.type) || !validTypes.has(toNode.type)) continue;
 
             const condition = fromNode.outputs?.[link.origin_slot]?.name || "pass";
@@ -774,12 +846,13 @@ function openPanel(node) {
 
     // Determine node sub-type for template selection
     const typeMap = {
-        "maestro/stage":          "tpl-stage",
-        "maestro/factory":        "tpl-factory",
-        "maestro/conditional":    "tpl-conditional",
-        "maestro/judgment_gate":  "tpl-judgment_gate",
-        "maestro/fan_out":        "tpl-fan_out",
-        "maestro/human_gate":     "tpl-human_gate",
+        "maestro/stage":            "tpl-stage",
+        "maestro/factory":          "tpl-factory",
+        "maestro/conditional":      "tpl-conditional",
+        "maestro/judgment_gate":    "tpl-judgment_gate",
+        "maestro/fan_out":          "tpl-fan_out",
+        "maestro/human_gate":       "tpl-human_gate",
+        "maestro/static_analysis":  "tpl-static-analysis",
     };
     const tplId = typeMap[node.type] || "tpl-stage";
     const tpl = document.getElementById(tplId);

@@ -144,6 +144,11 @@ class FinalReviewPipeline:
             self._stage_cfg = (_sc.config or {}) if _sc else {}
         except Exception:
             pass
+        # Build a name → system_prompt lookup from stage config reviewers
+        self._reviewer_sys_prompts: dict[str, str] = {}
+        for r in (self._stage_cfg.get("reviewers") or []):
+            if r.get("name") and r.get("system_prompt"):
+                self._reviewer_sys_prompts[r["name"]] = r["system_prompt"]
 
     async def run(self) -> FinalReviewPipelineResult:
         """Run all review agents in parallel."""
@@ -284,7 +289,10 @@ class FinalReviewPipeline:
             "Read what you need, reach a verdict, then call submit_work — "
             "do not loop back to re-check things you have already seen."
         )
-        _sys = self._stage_cfg.get("system_prompt") or _default_sys
+        # Per-reviewer prompt (from config) > stage-level prompt > default
+        _sys = (self._reviewer_sys_prompts.get(reviewer["type"])
+                or self._stage_cfg.get("system_prompt")
+                or _default_sys)
         messages: list[dict] = [
             {"role": "system", "content": _sys},
             {"role": "user", "content": prompt},

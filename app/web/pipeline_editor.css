@@ -267,3 +267,16 @@ html, body {
 .pe-factory-run-row { border-top: 1px solid #1e293b; padding-top: 10px; margin-top: 4px; }
 
 .pe-mono { font-family: monospace; font-size: 12px; }
+
+/* ── Tool node (amber/gold — non-LLM deterministic nodes) ────────────── */
+/* Node background colours are set in JS; this class can be applied to
+   any auxiliary DOM element that should carry the amber tool-node identity. */
+.pe-node--tool {
+    --pe-node-color:   #b45309;
+    --pe-node-bgcolor: #451a03;
+}
+
+.pe-field-note {
+    font-size: 11px; color: #94a3b8; margin: 4px 0 0; line-height: 1.5;
+}
+.pe-field-note code { background: #1e293b; padding: 1px 4px; border-radius: 3px; font-size: 10px; }

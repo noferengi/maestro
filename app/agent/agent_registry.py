@@ -133,4 +133,10 @@ AGENT_REGISTRY: dict[str, AgentSpec] = {
         description="Runs N parallel proposal agents then an LLM judge selects the best one",
         gate_type="llm_judge",
     ),
+    "static_analysis_widget": AgentSpec(
+        cls=None,
+        display_name="Static Analysis",
+        description="Runs tree-sitter static analysis on the project and injects structured JSON into task.content. No LLM call.",
+        gate_type="none",
+    ),
 }

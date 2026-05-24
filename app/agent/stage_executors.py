@@ -3,11 +3,12 @@ app/agent/stage_executors.py
 ------------------------------
 Generic pipeline node executors registered via register_agent_type_executor().
 
-Four executor types:
-  circuit_breaker  — configurable attempt counter; parks or fails when exhausted
-  voting_panel     — N-voter LLM panel with tally strategy
-  fan_out_judge    — best-of-N parallel agents + LLM judge picks the winner
-  reflection_agent — skeptical post-stage reviewer; stores confidence report
+Five executor types:
+  circuit_breaker        — configurable attempt counter; parks or fails when exhausted
+  voting_panel           — N-voter LLM panel with tally strategy
+  fan_out_judge          — best-of-N parallel agents + LLM judge picks the winner
+  reflection_agent       — skeptical post-stage reviewer; stores confidence report
+  static_analysis_widget — deterministic tree-sitter analysis; no LLM; injects JSON into task.content
 
 Each executor has a public runner function (_run_*) that is registered in
 scheduler.py at import time.  The function signature matches the agent-type
@@ -222,6 +223,36 @@ def _run_circuit_breaker(
 
 
 # ---------------------------------------------------------------------------
+# Veto tally helper
+# ---------------------------------------------------------------------------
+
+def _tally_veto(votes: list) -> str:
+    """Returns 'fail' if any vote is REJECTED or NOT_SUITABLE, else 'pass'."""
+    from app.agent.verdicts import Verdict
+    for v in votes:
+        if v.verdict in (Verdict.REJECTED, Verdict.NOT_SUITABLE):
+            return "fail"
+    return "pass"
+
+
+def _build_required_keys_preamble(task_id: str, required_input_keys: list[str]) -> str:
+    """Fetch task.content and build a preamble block for required_input_keys."""
+    if not required_input_keys:
+        return ""
+    try:
+        from app.database import get_task as _get_task
+        t = _get_task(task_id)
+        blob = (t.content or {}) if t else {}
+        lines = ["\n== Prior Stage Outputs =="]
+        for key in required_input_keys:
+            if key in blob:
+                lines.append(f"{key}: {blob[key]}")
+        return "\n".join(lines) + "\n\n"
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
 # Voting Panel
 # ---------------------------------------------------------------------------
 
@@ -238,12 +269,16 @@ def _run_voting_panel(
     """
     Spawn voter_count LLM agents concurrently, tally their votes, advance stage.
 
-    Stage config shape:
+    Stage config shape (legacy — single shared prompt):
         voter_count          — number of voters (default 3)
         voter_system_prompt  — system prompt for each voter
         voter_tools          — tool allowlist for voters (default: submit_work only)
         voter_max_turns      — max turns per voter (default 10)
-        tally                — "majority" (default) — uses verdicts.tally_votes()
+
+    Stage config shape (per-reviewer — takes precedence when present):
+        reviewers            — list of {name, system_prompt, tools?, max_turns?}
+        tally_strategy       — "majority" (default) | "veto" (any REJECTED/NOT_SUITABLE blocks)
+        required_input_keys  — list of task.content keys to inject into voter user message preamble
         on_tie               — "reject" | "pass" (default "reject")
         output_key           — task.content key to write tally result (default "vote_result")
     """
@@ -255,6 +290,13 @@ def _run_voting_panel(
     from app.agent.verdicts import Vote, Verdict, tally_votes
 
     cfg = stage_config.config or {}
+    reviewers_cfg       = cfg.get("reviewers")  # list of {name, system_prompt, tools?, max_turns?}
+    tally_strategy      = cfg.get("tally_strategy", "majority")
+    required_input_keys = cfg.get("required_input_keys") or []
+    if isinstance(required_input_keys, str):
+        required_input_keys = [k.strip() for k in required_input_keys.split(",") if k.strip()]
+
+    # Legacy single-prompt config
     voter_count         = int(cfg.get("voter_count", 3))
     voter_system_prompt = cfg.get("voter_system_prompt", "Review the task and vote ACCEPTED or REJECTED.")
     voter_tools         = list(cfg.get("voter_tools") or [])
@@ -275,8 +317,10 @@ def _run_voting_panel(
 
     try:
         task = get_task(task_id)
+        keys_preamble = _build_required_keys_preamble(task_id, required_input_keys)
         user_msg = (
-            f"Task ID: {task_id}\n"
+            keys_preamble
+            + f"Task ID: {task_id}\n"
             f"Title: {task.title if task else '(unknown)'}\n"
             f"Description:\n{task.description or '' if task else ''}\n\n"
             "Vote on whether this task should proceed. Call submit_work with:\n"
@@ -285,22 +329,40 @@ def _run_voting_panel(
             "  payload={'verdict': 'ACCEPTED'|'REJECTED', 'confidence': 0-100, 'justification': '...'}"
         )
 
-        voters = [
-            _CollectorAgent(
-                task_id=task_id,
-                system_prompt=voter_system_prompt,
-                tool_allowlist=voter_tools,
-                max_turns=voter_max_turns,
-                llm_id=llm_id,
-                budget_id=budget_id,
-                llm_base_url=llm_base_url,
-                llm_model=llm_model,
-                max_context=max_context,
-                user_message=user_msg,
-                agent_name=f"voter_{i}:{stage_config.stage_key}",
-            )
-            for i in range(voter_count)
-        ]
+        if reviewers_cfg:
+            voters = [
+                _CollectorAgent(
+                    task_id=task_id,
+                    system_prompt=r.get("system_prompt", voter_system_prompt),
+                    tool_allowlist=list(r.get("tools") or voter_tools),
+                    max_turns=int(r.get("max_turns") or voter_max_turns),
+                    llm_id=llm_id,
+                    budget_id=budget_id,
+                    llm_base_url=llm_base_url,
+                    llm_model=llm_model,
+                    max_context=max_context,
+                    user_message=user_msg,
+                    agent_name=f"voter_{r.get('name', i)}:{stage_config.stage_key}",
+                )
+                for i, r in enumerate(reviewers_cfg)
+            ]
+        else:
+            voters = [
+                _CollectorAgent(
+                    task_id=task_id,
+                    system_prompt=voter_system_prompt,
+                    tool_allowlist=voter_tools,
+                    max_turns=voter_max_turns,
+                    llm_id=llm_id,
+                    budget_id=budget_id,
+                    llm_base_url=llm_base_url,
+                    llm_model=llm_model,
+                    max_context=max_context,
+                    user_message=user_msg,
+                    agent_name=f"voter_{i}:{stage_config.stage_key}",
+                )
+                for i in range(voter_count)
+            ]
 
         payloads: list[dict | None] = loop.run_until_complete(
             asyncio.gather(*[v.run() for v in voters], return_exceptions=False)
@@ -335,6 +397,9 @@ def _run_voting_panel(
         if not votes:
             condition    = "fail"
             tally_outcome = "rejected"
+        elif tally_strategy == "veto":
+            condition    = _tally_veto(votes)
+            tally_outcome = "rejected" if condition == "fail" else "passed"
         else:
             tally        = tally_votes(votes)
             tally_outcome = tally.outcome
@@ -417,11 +482,19 @@ def _run_fan_out_judge(
     """
     Run N parallel proposal agents, then a judge picks the best one.
 
-    Stage config shape:
+    Stage config shape (legacy — single shared prompt):
         n                    — number of parallel agents (default 3)
-        agent_system_prompt  — system prompt for proposal agents
+        agent_system_prompt  — system prompt for all proposal agents
         agent_tools          — tool allowlist for proposal agents
         agent_max_turns      — max turns per proposal agent (default 30)
+
+    Stage config shape (per-persona — takes precedence when present):
+        personas             — list of {name, system_prompt}; N = len(personas)
+        required_input_keys  — list of task.content keys to inject into proposer user message preamble
+        agent_tools          — tool allowlist shared across all proposers
+        agent_max_turns      — max turns per proposer (default 30)
+
+    Shared keys:
         judge_system_prompt  — system prompt for the judge
         judge_max_turns      — max turns for judge (default 10)
         output_key           — task.content key to write winning proposal (default "winning_proposal")
@@ -431,6 +504,12 @@ def _run_fan_out_judge(
     )
 
     cfg = stage_config.config or {}
+    personas_cfg        = cfg.get("personas")  # list of {name, system_prompt}
+    required_input_keys = cfg.get("required_input_keys") or []
+    if isinstance(required_input_keys, str):
+        required_input_keys = [k.strip() for k in required_input_keys.split(",") if k.strip()]
+
+    # Legacy single-prompt config
     n                   = int(cfg.get("n", 3))
     agent_system_prompt = cfg.get("agent_system_prompt", "Produce a proposal for the task. Submit it via submit_work.")
     agent_tools         = list(cfg.get("agent_tools") or [])
@@ -438,6 +517,9 @@ def _run_fan_out_judge(
     judge_system_prompt = cfg.get("judge_system_prompt", "Compare the proposals below and pick the best one.")
     judge_max_turns     = int(cfg.get("judge_max_turns", 10))
     output_key          = cfg.get("output_key", "winning_proposal")
+
+    if personas_cfg:
+        n = len(personas_cfg)
 
     session_id = create_agent_session(
         task_id=task_id,
@@ -455,8 +537,10 @@ def _run_fan_out_judge(
         task_title = task.title if task else "(unknown)"
         task_desc  = task.description or "" if task else ""
 
-        proposer_user_msg = (
-            f"Task ID: {task_id}\n"
+        keys_preamble = _build_required_keys_preamble(task_id, required_input_keys)
+        proposer_user_msg_base = (
+            keys_preamble
+            + f"Task ID: {task_id}\n"
             f"Title: {task_title}\n"
             f"Description:\n{task_desc}\n\n"
             "Produce your best proposal. When done, call submit_work with:\n"
@@ -465,22 +549,40 @@ def _run_fan_out_judge(
             "  payload={'proposal': '<your full proposal text>'}"
         )
 
-        proposers = [
-            _CollectorAgent(
-                task_id=task_id,
-                system_prompt=agent_system_prompt,
-                tool_allowlist=agent_tools,
-                max_turns=agent_max_turns,
-                llm_id=llm_id,
-                budget_id=budget_id,
-                llm_base_url=llm_base_url,
-                llm_model=llm_model,
-                max_context=max_context,
-                user_message=proposer_user_msg,
-                agent_name=f"proposer_{i}:{stage_config.stage_key}",
-            )
-            for i in range(n)
-        ]
+        if personas_cfg:
+            proposers = [
+                _CollectorAgent(
+                    task_id=task_id,
+                    system_prompt=p.get("system_prompt", agent_system_prompt),
+                    tool_allowlist=agent_tools,
+                    max_turns=agent_max_turns,
+                    llm_id=llm_id,
+                    budget_id=budget_id,
+                    llm_base_url=llm_base_url,
+                    llm_model=llm_model,
+                    max_context=max_context,
+                    user_message=proposer_user_msg_base,
+                    agent_name=f"proposer_{p.get('name', i)}:{stage_config.stage_key}",
+                )
+                for i, p in enumerate(personas_cfg)
+            ]
+        else:
+            proposers = [
+                _CollectorAgent(
+                    task_id=task_id,
+                    system_prompt=agent_system_prompt,
+                    tool_allowlist=agent_tools,
+                    max_turns=agent_max_turns,
+                    llm_id=llm_id,
+                    budget_id=budget_id,
+                    llm_base_url=llm_base_url,
+                    llm_model=llm_model,
+                    max_context=max_context,
+                    user_message=proposer_user_msg_base,
+                    agent_name=f"proposer_{i}:{stage_config.stage_key}",
+                )
+                for i in range(n)
+            ]
 
         payloads: list[dict | None] = loop.run_until_complete(
             asyncio.gather(*[p.run() for p in proposers], return_exceptions=False)
@@ -496,7 +598,7 @@ def _run_fan_out_judge(
         # Build judge prompt (truncate long proposals to fit context).
         _MAX_CHARS = 2000
         proposals_text = "\n\n".join(
-            f"=== Proposal {i} ===\n{str(p)[:_MAX_CHARS]}"
+            f"=== Proposal {i} ({personas_cfg[i]['name'] if personas_cfg and i < len(personas_cfg) else ''}) ===\n{str(p)[:_MAX_CHARS]}"
             for i, p in enumerate(proposals)
         )
         judge_user_msg = (
@@ -626,3 +728,94 @@ def _run_reflection_agent(
             loop.close()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Static Analysis Widget
+# ---------------------------------------------------------------------------
+
+def _run_static_analysis_widget(
+    task_id: str,
+    stage_config: StageConfig,
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """
+    Deterministic non-LLM node. Runs tree-sitter on the project folder and writes
+    structured JSON to task.content[output_key]. Advances with 'pass' immediately.
+
+    Stage config shape:
+        output_key    — task.content key to write result (default "static_analysis")
+        file_pattern  — glob filter applied to relative file paths (default "**/*.py")
+        max_files     — cap to avoid large projects (default 50)
+    """
+    import fnmatch
+    import os
+
+    from app.database import get_task, update_task
+    from app.agent.path_filter import walk_safe
+
+    cfg         = stage_config.config or {}
+    output_key  = cfg.get("output_key", "static_analysis")
+    file_pattern = cfg.get("file_pattern", "**/*.py")
+    max_files   = int(cfg.get("max_files", 50))
+
+    if not project_path:
+        logger.warning("[static_analysis_widget] task '%s': no project_path — skipping analysis.", task_id)
+        advance_stage(task_id, "pass")
+        return
+
+    # Collect matching files
+    file_paths: list[str] = []
+    # Normalise pattern for per-filename matching (last component of a glob)
+    _basename_pattern = file_pattern.split("/")[-1] if "/" in file_pattern else file_pattern
+    for root, dirs, files in walk_safe(project_path):
+        for fname in files:
+            full = os.path.join(root, fname)
+            rel  = os.path.relpath(full, project_path).replace("\\", "/")
+            if fnmatch.fnmatch(rel, file_pattern) or fnmatch.fnmatch(fname, _basename_pattern):
+                file_paths.append(full)
+            if len(file_paths) >= max_files:
+                break
+        if len(file_paths) >= max_files:
+            break
+
+    if not file_paths:
+        logger.info("[static_analysis_widget] task '%s': no files matched pattern '%s'.", task_id, file_pattern)
+        task = get_task(task_id)
+        blob = dict((task.content or {}) if task else {})
+        blob[output_key] = {"file_count": 0, "files": {}, "import_graph": {}, "reverse_import_graph": {}}
+        update_task(task_id, content=blob)
+        advance_stage(task_id, "pass")
+        return
+
+    try:
+        from app.agent.static_analysis import analyze_project, _file_analysis_to_dict
+        analysis = analyze_project(file_paths)
+        result = {
+            "file_count": len(analysis.files),
+            "files": {
+                path: _file_analysis_to_dict(fa)
+                for path, fa in analysis.files.items()
+            },
+            "import_graph": analysis.import_graph,
+            "reverse_import_graph": analysis.reverse_import_graph,
+        }
+    except Exception:
+        logger.exception("[static_analysis_widget] task '%s': analyze_project failed.", task_id)
+        result = {"error": "analysis failed", "file_count": len(file_paths)}
+
+    task = get_task(task_id)
+    blob = dict((task.content or {}) if task else {})
+    blob[output_key] = result
+    update_task(task_id, content=blob)
+
+    logger.info(
+        "[static_analysis_widget] task '%s': analysed %d file(s) → '%s'.",
+        task_id, result.get("file_count", 0), output_key,
+    )
+    advance_stage(task_id, "pass")

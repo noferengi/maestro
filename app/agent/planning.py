@@ -504,6 +504,12 @@ class PlanningPipeline:
             self._stage_cfg = (_sc.config or {}) if _sc else {}
         except Exception:
             pass
+        # If stage config defines per-persona overrides, build a matching list of (label, concern) tuples
+        _cfg_personas = self._stage_cfg.get("personas")
+        self._config_personas: list[tuple[str, str]] | None = (
+            [(p["name"], p["system_prompt"]) for p in _cfg_personas if p.get("name") and p.get("system_prompt")]
+            if _cfg_personas else None
+        )
         # Set in run() after the survey, used by _stage_design_review
         self._is_simple: bool = False
         self._is_proof: bool = False
@@ -626,7 +632,12 @@ class PlanningPipeline:
             # the plan might be weaker than expected.
             valid_count = sum(1 for d in designs if "error" not in d and "parse_error" not in d)
             if 0 < valid_count < self._effective_best_of_n:
-                _active_personas = _PROOF_DESIGN_PERSONAS if self._is_proof else _DESIGN_PERSONAS
+                if self._is_proof:
+                    _active_personas = _PROOF_DESIGN_PERSONAS
+                elif self._config_personas:
+                    _active_personas = self._config_personas
+                else:
+                    _active_personas = _DESIGN_PERSONAS
                 failed_labels = [
                     _active_personas[i % len(_active_personas)][0]
                     for i, d in enumerate(designs)
@@ -1123,7 +1134,12 @@ class PlanningPipeline:
             if is_shutting_down():
                 raise ShutdownError("Server is shutting down")
 
-            _personas = _PROOF_DESIGN_PERSONAS if self._is_proof else _DESIGN_PERSONAS
+            if self._is_proof:
+                _personas = _PROOF_DESIGN_PERSONAS
+            elif self._config_personas:
+                _personas = self._config_personas
+            else:
+                _personas = _DESIGN_PERSONAS
             persona_label, persona_concern = _personas[i % len(_personas)]
             _role = "formal proof specialist" if self._is_proof else "software architect"
             _spec_suffix = (

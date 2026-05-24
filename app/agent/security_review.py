@@ -136,6 +136,12 @@ class SecurityPipeline:
             self._stage_cfg = (_sc.config or {}) if _sc else {}
         except Exception:
             pass
+        # Per-reviewer config overrides _REVIEWERS when set in stage config
+        _cfg_reviewers = self._stage_cfg.get("reviewers")
+        if _cfg_reviewers:
+            self._effective_reviewers = _cfg_reviewers
+        else:
+            self._effective_reviewers = self._REVIEWERS
 
     _REVIEWERS = [
         {
@@ -178,14 +184,14 @@ class SecurityPipeline:
         # Phase 0: Deterministic pre-scan (bandit, detect-secrets)
         scan_context = await self._run_pre_scan()
 
-        tasks = [self._run_reviewer(r, scan_context) for r in self._REVIEWERS]
+        tasks = [self._run_reviewer(r, scan_context) for r in self._effective_reviewers]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         votes: list[Vote] = []
         findings: list[dict] = []
 
         for i, result in enumerate(results):
-            reviewer_type = self._REVIEWERS[i]["type"]
+            reviewer_type = self._effective_reviewers[i].get("type") or self._effective_reviewers[i].get("name", f"reviewer_{i}")
             if isinstance(result, Exception):
                 logger.warning(f"[{AGENT_NAME}] Reviewer '%s' failed: %s", reviewer_type, result)
                 votes.append(Vote(
@@ -199,7 +205,7 @@ class SecurityPipeline:
             vote, reviewer_findings = result
             votes.append(vote)
             findings.extend(reviewer_findings)
-            self._store_reviewer_result(vote, reviewer_findings, reviewer_type)
+            self._store_reviewer_result(vote, reviewer_findings, str(reviewer_type))
 
         # Phase 1: Handle NEEDS_RESEARCH via research agent
         needs_research = [v for v in votes if v.verdict == Verdict.NEEDS_RESEARCH]
@@ -298,7 +304,10 @@ class SecurityPipeline:
 
         # Re-vote affected reviewers with research context appended
         needs_research_stages = {v.stage for v in research_votes}
-        stage_to_reviewer = {f"security_{r['type']}": r for r in self._REVIEWERS}
+        stage_to_reviewer = {
+            f"security_{r.get('type') or r.get('name', '')}": r
+            for r in self._effective_reviewers
+        }
         extra_context = f"{scan_context}\n## Security Research Findings\n{findings_text}\n\n"
 
         re_vote_tasks = []
@@ -329,9 +338,14 @@ class SecurityPipeline:
         self, reviewer: dict, scan_context: str = ""
     ) -> tuple[Vote, list[dict]]:
         """Run a single security reviewer using a mini-loop with tool access."""
+        reviewer_type = reviewer.get("type") or reviewer.get("name", "unknown")
+        perspective   = reviewer.get("perspective") or reviewer.get("name", "security expert")
+        focus         = reviewer.get("focus", "")
+
+        focus_line = f"Focus: {focus}\n\n" if focus else ""
         prompt = (
-            f"You are a security reviewer ({reviewer['perspective']}).\n"
-            f"Focus: {reviewer['focus']}\n\n"
+            f"You are a security reviewer ({perspective}).\n"
+            f"{focus_line}"
             f"{sanitize_user_content(scan_context)}"
             f"Task being reviewed: {sanitize_user_content(self.task_description)}\n\n"
             "Analyze for security issues. You may use tools to inspect code files. "
@@ -344,7 +358,9 @@ class SecurityPipeline:
             "\"description\": \"...\", \"demotion_target\": \"development|planning|optimization\"}]}"
         )
 
-        _sys = (self._stage_cfg.get("system_prompt")
+        # Per-reviewer system_prompt (from config) takes priority over stage-level system_prompt
+        _sys = (reviewer.get("system_prompt")
+                or self._stage_cfg.get("system_prompt")
                 or "You are a security expert. Use submit_work to output your verdict when ready.")
         messages: list[dict] = [
             {"role": "system", "content": _sys},
@@ -425,7 +441,7 @@ class SecurityPipeline:
                             justification = data.get("summary", "")
                             findings = payload.get("findings", [])
                             vote = Vote(
-                                stage=f"security_{reviewer['type']}",
+                                stage=f"security_{reviewer_type}",
                                 verdict=verdict,
                                 confidence=confidence,
                                 justification=justification,
@@ -445,7 +461,7 @@ class SecurityPipeline:
 
         # Fallback: turns exhausted
         vote = Vote(
-            stage=f"security_{reviewer['type']}",
+            stage=f"security_{reviewer_type}",
             verdict=Verdict.NEEDS_RESEARCH,
             confidence=65,
             justification="Reviewer exhausted turns",
