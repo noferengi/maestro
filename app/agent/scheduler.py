@@ -5863,6 +5863,9 @@ from app.agent.stage_executors import (  # noqa: E402
     _run_parallel_agents,
     _run_parallel_subagent,
     _run_parallel_subagent_aggregator,
+    _run_optimization_node,
+    _run_json_schema_gate,
+    _run_planning_correction_stage,
 )
 from app.agent.pipeline_router import register_agent_type_executor as _reg_executor  # noqa: E402
 
@@ -5875,6 +5878,9 @@ _reg_executor("dangerous_edit_llm_agent",      _run_dangerous_edit_llm_agent)
 _reg_executor("parallel_agents",               _run_parallel_agents)
 _reg_executor("parallel_subagent",             _run_parallel_subagent)
 _reg_executor("parallel_subagent_aggregator",  _run_parallel_subagent_aggregator)
+_reg_executor("optimization_node",             _run_optimization_node)
+_reg_executor("json_schema_gate",              _run_json_schema_gate)
+_reg_executor("planning_correction_stage",     _run_planning_correction_stage)
 
 # ---------------------------------------------------------------------------
 # Helpers

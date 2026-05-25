@@ -1470,3 +1470,509 @@ def _run_parallel_subagent_aggregator(
         logger.exception("[parallel_subagent_aggregator] task '%s' raised.", task_id)
     finally:
         close_agent_session(session_id, exit_reason, "")
+
+
+# ---------------------------------------------------------------------------
+# optimization_node — parallel proposals + two-round judge vote
+# ---------------------------------------------------------------------------
+
+def _two_round_vote(
+    *,
+    proposals: list[dict],
+    judge_count: int,
+    judge_system_prompt: str,
+    judge_max_turns: int,
+    loop: asyncio.AbstractEventLoop,
+    task_id: str,
+    llm_id: int | None,
+    budget_id: int | None,
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    stage_key: str,
+) -> tuple[int, float]:
+    """
+    Run N judge agents over proposals; majority wins.
+    Returns (winner_index, winner_score) or (-1, 0.0) for no consensus after revote.
+    """
+    _MAX_PROPOSAL_CHARS = 1500
+    majority = judge_count / 2
+
+    def _proposals_text(extra: str = "") -> str:
+        lines = []
+        for i, p in enumerate(proposals):
+            lines.append(f"=== Proposal {i} ===\n{str(p)[:_MAX_PROPOSAL_CHARS]}")
+        body = "\n\n".join(lines)
+        return body + (f"\n\n{extra}" if extra else "")
+
+    def _run_round(extra: str = "") -> dict[int, int]:
+        user_msg = (
+            f"{_proposals_text(extra)}\n\n"
+            "Pick the best proposal. Call submit_work with:\n"
+            "  signal='ACCEPTED'\n"
+            "  payload={'winner_index': N, 'rationale': '...'}"
+        )
+        judges = [
+            _CollectorAgent(
+                task_id=task_id,
+                system_prompt=judge_system_prompt,
+                tool_allowlist=[],
+                max_turns=judge_max_turns,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                max_context=max_context,
+                user_message=user_msg,
+                agent_name=f"opt_judge:{stage_key}",
+            )
+            for _ in range(judge_count)
+        ]
+        payloads = loop.run_until_complete(
+            asyncio.gather(*[j.run() for j in judges], return_exceptions=False)
+        )
+        votes: dict[int, int] = {}
+        for p in payloads:
+            if not p:
+                continue
+            try:
+                idx = int(p.get("winner_index", 0))
+                votes[idx] = votes.get(idx, 0) + 1
+            except (TypeError, ValueError):
+                pass
+        return votes
+
+    r1 = _run_round()
+    best = max(r1, key=r1.get) if r1 else None
+    if best is not None and r1[best] > majority:
+        return best, r1[best] / judge_count
+
+    tally_str = ", ".join(f"Proposal {k}: {v} vote(s)" for k, v in sorted(r1.items()))
+    r2 = _run_round(f"Previous round had no majority. Votes: {tally_str}. Please reconsider.")
+    best2 = max(r2, key=r2.get) if r2 else None
+    if best2 is not None and r2[best2] > majority:
+        return best2, r2[best2] / judge_count
+
+    return -1, 0.0
+
+
+def _run_optimization_node(
+    task_id: str,
+    stage_config: "StageConfig",
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """
+    Parallel proposal agents + two-round judge selection.
+
+    Stage config shape:
+        proposal_personas    — list of {name, system_prompt}
+        proposer_tools       — tool allowlist for proposers
+        proposer_max_turns   — turns per proposer (default 20)
+        judge_count          — number of judges (default 3)
+        judge_max_turns      — turns per judge (default 10)
+        judge_system_prompt  — system prompt for judges
+        min_improvement_pct  — below this → skip path (default 10.0)
+        output_key           — task.content key for winning proposal
+    """
+    from app.database import (
+        create_agent_session, close_agent_session, get_task, update_task,
+    )
+
+    cfg = stage_config.config or {}
+    personas_cfg: list[dict] = cfg.get("proposal_personas") or []
+    proposer_tools: list[str] = list(cfg.get("proposer_tools") or [])
+    proposer_max_turns: int = int(cfg.get("proposer_max_turns", 20))
+    judge_count: int = int(cfg.get("judge_count", 3))
+    judge_max_turns: int = int(cfg.get("judge_max_turns", 10))
+    judge_system_prompt: str = cfg.get(
+        "judge_system_prompt",
+        "You are an optimization expert judging proposals. Pick the best one based on feasibility and estimated impact.",
+    )
+    min_improvement_pct: float = float(cfg.get("min_improvement_pct", 10.0))
+    output_key: str = cfg.get("output_key", "winning_optimization_proposal")
+
+    if not personas_cfg:
+        logger.warning("[optimization_node] task '%s': no proposal_personas configured — skip.", task_id)
+        advance_stage(task_id, "skip")
+        return
+
+    session_id = create_agent_session(
+        task_id=task_id,
+        agent_type=f"optimization_node:{stage_config.stage_key}",
+        llm_id=llm_id,
+        budget_id=budget_id,
+        scheduler_reason="scheduler",
+    )
+    exit_reason = "error"
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        task = get_task(task_id)
+        task_title = task.title if task else "(unknown)"
+        task_desc = (task.description or "") if task else ""
+
+        user_msg = (
+            f"Task ID: {task_id}\nTitle: {task_title}\nDescription:\n{task_desc}\n\n"
+            "Analyze the codebase and propose a concrete optimization. "
+            "Call submit_work with:\n"
+            "  signal='ACCEPTED'\n"
+            "  payload={"
+            "'lens': '<your lens name>', "
+            "'proposals': [{'description': '...', 'estimated_improvement_pct': 0, "
+            "'risk': 'low|medium|high', 'implementation_steps': ['...']}]}"
+        )
+
+        proposers = [
+            _CollectorAgent(
+                task_id=task_id,
+                system_prompt=p.get("system_prompt", "You are an optimization expert. Propose one improvement."),
+                tool_allowlist=proposer_tools,
+                max_turns=proposer_max_turns,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                max_context=max_context,
+                user_message=user_msg,
+                agent_name=f"opt_proposer_{p.get('name', i)}:{stage_config.stage_key}",
+            )
+            for i, p in enumerate(personas_cfg)
+        ]
+
+        payloads: list[dict | None] = loop.run_until_complete(
+            asyncio.gather(*[p.run() for p in proposers], return_exceptions=False)
+        )
+        proposals = [p for p in payloads if p]
+
+        if not proposals:
+            logger.info("[optimization_node] task '%s': no proposals — skip.", task_id)
+            advance_stage(task_id, "skip")
+            exit_reason = "skip"
+            return
+
+        winner_idx, winner_score = _two_round_vote(
+            proposals=proposals,
+            judge_count=judge_count,
+            judge_system_prompt=judge_system_prompt,
+            judge_max_turns=judge_max_turns,
+            loop=loop,
+            task_id=task_id,
+            llm_id=llm_id,
+            budget_id=budget_id,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            max_context=max_context,
+            stage_key=stage_config.stage_key,
+        )
+
+        if winner_idx == -1:
+            logger.info("[optimization_node] task '%s': no consensus — fail.", task_id)
+            advance_stage(task_id, "fail")
+            exit_reason = "fail"
+            return
+
+        winning = proposals[winner_idx]
+
+        # Check min_improvement_pct from the winning proposal's proposals list
+        best_sub = (winning.get("proposals") or [{}])[0]
+        estimated_pct = float(best_sub.get("estimated_improvement_pct", 0))
+        if estimated_pct < min_improvement_pct:
+            logger.info(
+                "[optimization_node] task '%s': winning proposal improvement %.1f%% < %.1f%% min — skip.",
+                task_id, estimated_pct, min_improvement_pct,
+            )
+            advance_stage(task_id, "skip")
+            exit_reason = "skip"
+            return
+
+        task = get_task(task_id)
+        blob = dict((task.content or {}) if task else {})
+        blob[output_key] = winning
+        update_task(task_id, content=blob)
+
+        advance_stage(task_id, "pass")
+        exit_reason = "pass"
+
+    except Exception:
+        logger.exception("[optimization_node] task '%s' stage '%s' raised.", task_id, stage_config.stage_key)
+    finally:
+        close_agent_session(session_id, exit_reason, "")
+        try:
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=5.0))
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# json_schema_gate — deterministic plan validation + retry routing
+# ---------------------------------------------------------------------------
+
+def _validate_non_empty_list(value: Any) -> tuple[bool, str]:
+    if isinstance(value, list):
+        return (len(value) > 0), ("empty list" if not value else "ok")
+    if isinstance(value, str):
+        import json as _j
+        try:
+            parsed = _j.loads(value)
+            if isinstance(parsed, list):
+                return (len(parsed) > 0), ("empty list" if not parsed else "ok")
+        except _j.JSONDecodeError:
+            pass
+    return False, f"not a list (got {type(value).__name__})"
+
+
+def _validate_valid_dag(value: Any) -> tuple[bool, str]:
+    if not value:
+        return True, "empty graph — no cycles possible"
+    if isinstance(value, str):
+        import json as _j
+        try:
+            value = _j.loads(value)
+        except _j.JSONDecodeError:
+            return False, "not valid JSON"
+    if not isinstance(value, dict):
+        return False, f"not a dict (got {type(value).__name__})"
+    from app.agent.static_analysis import _detect_cycles
+    cycles = _detect_cycles(value)
+    if cycles:
+        cycle_strs = [" -> ".join(c) for c in cycles[:3]]
+        return False, f"{len(cycles)} cycle(s): {'; '.join(cycle_strs)}"
+    return True, f"no cycles in {len(value)} nodes"
+
+
+_VALIDATORS = {
+    "non_empty_list": _validate_non_empty_list,
+    "valid_dag":       _validate_valid_dag,
+}
+
+
+def _run_json_schema_gate(
+    task_id: str,
+    stage_config: "StageConfig",
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """
+    Validate planning_result fields.  Routes to retry → planning_correction or
+    fail → park when retries exhausted.
+
+    Stage config shape:
+        source           — always "planning_result"
+        required_fields  — list of {key, validator, hard_fail?}
+        on_pass          — condition on success (default "pass")
+        on_fail          — condition when retries exhausted (default "fail")
+        max_retries      — number of correction attempts before failing (default 3)
+        retry_condition  — condition to fire when retrying (default "retry")
+        output_key       — task.content key for gate result (default "gate_result")
+    """
+    import json as _j
+    from app.database import get_task, update_task, get_planning_result
+
+    cfg = stage_config.config or {}
+    required_fields: list[dict] = cfg.get("required_fields") or []
+    on_pass: str = cfg.get("on_pass", "pass")
+    on_fail: str = cfg.get("on_fail", "fail")
+    max_retries: int = int(cfg.get("max_retries", 3))
+    retry_condition: str = cfg.get("retry_condition", "retry")
+    output_key: str = cfg.get("output_key", "gate_result")
+
+    task = get_task(task_id)
+    if not task:
+        return
+
+    blob = dict(task.content or {})
+    retry_count: int = int(blob.get("_gate_retry_count", 0))
+
+    pr = get_planning_result(task_id)
+    if not pr:
+        logger.warning("[json_schema_gate] task '%s': no planning_result found — fail.", task_id)
+        blob[output_key] = {"passed": False, "failures": ["no planning_result"]}
+        update_task(task_id, content=blob)
+        advance_stage(task_id, on_fail)
+        return
+
+    # Build a field map from planning_result columns
+    field_map: dict[str, Any] = {}
+    for field_cfg in required_fields:
+        key = field_cfg.get("key", "")
+        if not key:
+            continue
+        raw = getattr(pr, key, None)
+        if raw is None:
+            field_map[key] = None
+            continue
+        if isinstance(raw, str):
+            try:
+                field_map[key] = _j.loads(raw)
+            except _j.JSONDecodeError:
+                field_map[key] = raw
+        else:
+            field_map[key] = raw
+
+    failures: list[dict] = []
+    for field_cfg in required_fields:
+        key = field_cfg.get("key", "")
+        validator_name = field_cfg.get("validator", "non_empty_list")
+        hard_fail: bool = field_cfg.get("hard_fail", True)
+        if not key:
+            continue
+        value = field_map.get(key)
+        validator = _VALIDATORS.get(validator_name, _validate_non_empty_list)
+        passed, detail = validator(value)
+        if not passed:
+            failures.append({"key": key, "detail": detail, "hard_fail": hard_fail})
+
+    hard_failures = [f for f in failures if f.get("hard_fail", True)]
+
+    blob[output_key] = {
+        "passed": len(hard_failures) == 0,
+        "failures": failures,
+        "retry_count": retry_count,
+    }
+
+    if not hard_failures:
+        blob["_gate_retry_count"] = 0
+        blob.pop("_gate_failures", None)
+        update_task(task_id, content=blob)
+        logger.info("[json_schema_gate] task '%s': passed (%d soft failures).", task_id, len(failures))
+        advance_stage(task_id, on_pass)
+        return
+
+    logger.info(
+        "[json_schema_gate] task '%s': %d hard failure(s) — retry %d/%d.",
+        task_id, len(hard_failures), retry_count, max_retries,
+    )
+
+    if retry_count < max_retries:
+        blob["_gate_retry_count"] = retry_count + 1
+        blob["_gate_failures"] = hard_failures
+        update_task(task_id, content=blob)
+        advance_stage(task_id, retry_condition)
+    else:
+        blob["_gate_retry_count"] = retry_count
+        blob["_gate_failures"] = hard_failures
+        update_task(task_id, content=blob)
+        logger.info("[json_schema_gate] task '%s': retries exhausted — fail.", task_id)
+        advance_stage(task_id, on_fail)
+
+
+# ---------------------------------------------------------------------------
+# planning_correction_stage — thin wrapper around PlanningCorrectionAgent
+# ---------------------------------------------------------------------------
+
+def _run_planning_correction_stage(
+    task_id: str,
+    stage_config: "StageConfig",
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """
+    Thin executor wrapper for PlanningCorrectionAgent.
+
+    Reads _gate_failures from task.content, runs the correction agent, then
+    advances with 'pass' (back to json_schema_gate) or 'fail' (park).
+    """
+    from app.database import (
+        get_task, get_planning_result, get_tasks,
+        create_agent_session, close_agent_session,
+    )
+    from app.agent.planning_correction import PlanningCorrectionAgent
+    import json as _j
+
+    task = get_task(task_id)
+    if not task:
+        return
+
+    blob = dict(task.content or {})
+    gate_failures: list[dict] = blob.get("_gate_failures", [])
+
+    pr = get_planning_result(task_id)
+    if not pr:
+        logger.warning("[planning_correction_stage] task '%s': no planning_result — fail.", task_id)
+        advance_stage(task_id, "fail")
+        return
+
+    try:
+        current_plan = {
+            "file_manifest":        _j.loads(pr.file_manifest or "[]"),
+            "implementation_steps": _j.loads(pr.implementation_steps or "[]"),
+            "interface_contracts":  _j.loads(pr.interface_contracts or "[]"),
+            "dependency_graph":     _j.loads(pr.dependency_graph or "{}"),
+            "test_strategy":        _j.loads(pr.test_strategy or "[]"),
+        }
+    except (_j.JSONDecodeError, TypeError):
+        current_plan = {}
+
+    all_tasks = [
+        {"id": t.id, "type": t.type, "prerequisites": t.prerequisites or []}
+        for t in get_tasks()
+    ]
+
+    session_id = create_agent_session(
+        task_id=task_id,
+        agent_type=f"planning_correction_stage:{stage_config.stage_key}",
+        llm_id=llm_id,
+        budget_id=budget_id,
+        scheduler_reason="scheduler",
+    )
+    exit_reason = "error"
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        agent = PlanningCorrectionAgent(
+            task_id=task_id,
+            planning_result_id=pr.id,
+            current_plan=current_plan,
+            gate_failures=gate_failures,
+            project_root=project_path,
+            llm_id=llm_id,
+            budget_id=budget_id,
+            all_tasks=all_tasks,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            max_context=max_context,
+            task_title=task.title or "",
+            task_description=task.description or "",
+        )
+        result = loop.run_until_complete(agent.run())
+        outcome = (result or {}).get("outcome", "error")
+        if outcome == "corrected":
+            advance_stage(task_id, "pass")
+            exit_reason = "pass"
+        else:
+            advance_stage(task_id, "fail")
+            exit_reason = "fail"
+    except Exception:
+        logger.exception(
+            "[planning_correction_stage] task '%s' stage '%s' raised.", task_id, stage_config.stage_key
+        )
+        advance_stage(task_id, "fail")
+    finally:
+        close_agent_session(session_id, exit_reason, "")
+        try:
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=5.0))
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
