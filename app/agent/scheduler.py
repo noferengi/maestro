@@ -4549,12 +4549,17 @@ def _run_planning_correction(
     return correction_result
 
 
-def _run_planning_task(task_id: str, llm_base_url: str, llm_model: str,
-                       max_context: int | None = None,
-                       llm_id: int | None = None,
-                       budget_id: int | None = None,
-                       project_path: str | None = None) -> None:
-    """Run the planning pipeline for a PLANNING task."""
+def _run_planning_node(
+    task_id: str,
+    stage_config: "StageConfig",
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None = None,
+    llm_id: int | None = None,
+    budget_id: int | None = None,
+    project_path: str | None = None,
+) -> None:
+    """planning_node executor — runs the full PlanningPipeline for a task."""
     from app.agent.planning import run_planning_pipeline
     from app.agent.planning_gate import run_planning_gate
     from app.database import update_task, get_task, get_all_tasks, create_transition_result, task_to_dict
@@ -5096,144 +5101,6 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
             pass
 
 
-def _run_dev_orchestrator_task(task_id: str, llm_base_url: str, llm_model: str,
-                                max_context: int | None = None,
-                                llm_id: int | None = None,
-                                budget_id: int | None = None,
-                                project_path: str | None = None) -> None:
-    """Run the DevOrchestrator for an IN DEV task."""
-    from app.agent.dev_orchestrator import run_dev_orchestrator
-    from app.agent.tools import set_task_git_cwd
-    from app.database import get_planning_result, update_task
-    from app.database import create_agent_session, close_agent_session
-    from app.agent.pipeline_router import advance_stage
-    import json
-
-    set_task_git_cwd(project_path, task_id=task_id)
-
-    planning_result_obj = get_planning_result(task_id)
-    if not planning_result_obj:
-        logger.warning("No planning result for task '%s', demoting to planning.", task_id)
-        advance_stage(task_id, "fail", from_stage="indev")
-        _record_demotion_inline(task_id, "indev", "planning", "Missing planning results")
-        _failed_cooldowns[task_id] = time.time()
-        return
-
-    try:
-        planning_result = {
-            "implementation_steps": json.loads(planning_result_obj.implementation_steps or "[]"),
-            "file_manifest": json.loads(planning_result_obj.file_manifest or "[]"),
-            "dependency_graph": json.loads(planning_result_obj.dependency_graph or "{}"),
-            "interface_contracts": json.loads(planning_result_obj.interface_contracts or "[]"),
-            "test_strategy": json.loads(planning_result_obj.test_strategy or "[]"),
-        }
-    except json.JSONDecodeError as exc:
-        logger.warning("Corrupt planning result JSON for task '%s' (%s), demoting to planning.", task_id, exc)
-        advance_stage(task_id, "fail", from_stage="indev")
-        _record_demotion_inline(task_id, "indev", "planning", f"Corrupt planning result JSON: {exc}")
-        return
-
-    # Fetch the most recent review rejection so the dev agent knows what to fix.
-    review_feedback: str | None = None
-    try:
-        from app.database import get_transition_results as _gtr_dev
-        _review_transitions = {"conceptual_to_optimization", "optimization_to_security",
-                                "security_to_final_review", "final_review_to_human_review"}
-        for _tr in _gtr_dev(task_id):  # ordered desc by created_at
-            if _tr.outcome in ("rejected", "failed") and _tr.transition in _review_transitions:
-                _vs = _tr.vote_summary or {}
-                _lines = [f"[PRIOR REVIEW REJECTION — {_tr.transition}]"]
-                if isinstance(_vs, dict):
-                    if _vs.get("summary"):
-                        _lines.append(f"Summary: {_vs['summary']}")
-                    for _f in _vs.get("high_severity_findings", []):
-                        _lines.append(
-                            f"  HIGH [{_f.get('stage', '')}]: {_f.get('justification', '')[:500]}"
-                        )
-                    for _f in _vs.get("medium_severity_findings", []):
-                        _lines.append(
-                            f"  MEDIUM [{_f.get('stage', '')}]: {_f.get('justification', '')[:400]}"
-                        )
-                elif isinstance(_vs, str):
-                    _lines.append(_vs[:800])
-                review_feedback = "\n".join(_lines)
-                logger.info("[dev_orch] Loaded review feedback for task '%s': %s", task_id, _lines[0])
-                break
-    except Exception as _rf_exc:
-        logger.warning("[dev_orch] Could not load review feedback for '%s': %s", task_id, _rf_exc)
-
-    _session_id = create_agent_session(
-        task_id=task_id,
-        agent_type="dev_orchestrator",
-        llm_id=llm_id,
-        budget_id=budget_id,
-        scheduler_reason="scheduler",
-    )
-    if _session_id is not None:
-        register_db_session(task_id, _session_id)
-    _exit_reason = "error"
-    _exit_summary = ""
-    _prompt_tokens = 0
-    _completion_tokens = 0
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        result = loop.run_until_complete(
-            run_dev_orchestrator(
-                task_id=task_id,
-                planning_result=planning_result,
-                llm_base_url=llm_base_url,
-                llm_model=llm_model,
-                llm_id=llm_id,
-                budget_id=budget_id,
-                review_feedback=review_feedback,
-                project_path=project_path,
-            )
-        )
-        _prompt_tokens = result.get("prompt_tokens", 0)
-        _completion_tokens = result.get("completion_tokens", 0)
-        if result.get("status") == "ACCEPTED":
-            _exit_reason = "completed"
-            _exit_summary = f"Dev orchestrator completed. {result.get('batches_completed', 0)}/{result.get('total_batches', 0)} batches done."
-            advance_stage(task_id, "pass", from_stage="indev")
-            logger.info("Task '%s' advanced to CONCEPTUAL REVIEW via scheduler.", task_id)
-        elif result.get("status") == "REVERT_TO_DESIGN":
-            # Agent explicitly signalled the design is wrong — demote to planning.
-            _exit_reason = "rejected"
-            _error_detail = result.get("error_detail") or "Agent requested design revision."
-            _exit_summary = _error_detail[:300]
-            advance_stage(task_id, "reject", from_stage="indev")
-            _record_demotion_inline(task_id, "indev", "planning", _exit_summary)
-            logger.warning("Task '%s' reverted to PLANNING (agent REVERT_TO_DESIGN): %s", task_id, _exit_summary)
-        else:
-            # Transient failure (loop, LLM error, context saturation) — stay in INDEV.
-            _exit_reason = "rejected"
-            _error_detail = result.get("error_detail") or "Dev orchestrator transient failure."
-            _exit_summary = _error_detail[:300]
-            logger.warning("Task '%s' dev orchestrator transient failure — staying in INDEV: %s", task_id, _exit_summary)
-    except ShutdownError:
-        _exit_reason = "shutdown"
-        _exit_summary = "Server shutdown during dev orchestrator."
-        logger.info(f"[{AGENT_NAME}] Dev orchestrator for task '%s' aborted due to server shutdown.", task_id)
-    except Exception:
-        _exit_reason = "error"
-        _exit_summary = "Dev orchestrator raised an unexpected exception."
-        logger.exception(f"[{AGENT_NAME}] Dev orchestrator for task '%s' failed.", task_id)
-        # Stay in INDEV — an unexpected exception is not a design problem.
-    finally:
-        close_agent_session(_session_id, _exit_reason, _exit_summary,
-                            prompt_tokens=_prompt_tokens, completion_tokens=_completion_tokens)
-        try:
-            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
-        except Exception:
-            pass
-        try:
-            loop.close()
-        except Exception:
-            pass
-
-
 def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
                                  max_context: int | None = None,
                                  llm_id: int | None = None,
@@ -5353,85 +5220,6 @@ def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
     finally:
         close_agent_session(_session_id, _exit_reason, _exit_summary,
                             prompt_tokens=_prompt_tokens, completion_tokens=_completion_tokens)
-        try:
-            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
-        except Exception:
-            pass
-        try:
-            loop.close()
-        except Exception:
-            pass
-
-
-def _run_optimization_task(task_id: str, llm_base_url: str, llm_model: str,
-                            max_context: int | None = None,
-                            llm_id: int | None = None,
-                            budget_id: int | None = None,
-                            project_path: str | None = None) -> None:
-    """Run optimization pipeline for an OPTIMIZATION task; advance to security on pass."""
-    from app.agent.optimization import run_optimization_pipeline
-    from app.agent.tools import set_task_git_cwd
-    from app.database import get_task, update_task
-    from app.database import create_agent_session, close_agent_session
-    from app.agent.pipeline_router import advance_stage
-
-    set_task_git_cwd(project_path, task_id=task_id)
-
-    task = get_task(task_id)
-    if not task:
-        return
-
-    _session_id = create_agent_session(
-        task_id=task_id, agent_type="optimization",
-        llm_id=llm_id, budget_id=budget_id, scheduler_reason="scheduler",
-    )
-    if _session_id is not None:
-        register_db_session(task_id, _session_id)
-    _exit_reason = "error"
-    _exit_summary = ""
-    _prompt = _compl = 0
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        # Pre-flight PIP gate — runs at optimization stage entry
-        if not _run_pip_preflight_and_gate(task_id, "optimization", llm_id, budget_id, project_path, loop):
-            _exit_reason = "pip_blocked"
-            _exit_summary = "PIP pre-flight gate blocked optimization entry."
-            return  # card stays in optimization; resolution jobs dispatched
-
-        opt_result = loop.run_until_complete(
-            run_optimization_pipeline(
-                task_id=task_id,
-                task_description=task.description or "",
-                llm_base_url=llm_base_url,
-                llm_model=llm_model,
-                llm_id=llm_id,
-                budget_id=budget_id,
-                project_path=project_path,
-            )
-        )
-        _exit_reason = opt_result.get("outcome", "error")
-        _exit_summary = opt_result.get("improvement_summary", "")
-        _prompt = opt_result.get("total_prompt_tokens", 0)
-        _compl = opt_result.get("total_completion_tokens", 0)
-        logger.info("[optimization] Task '%s' via scheduler: %s", task_id, opt_result.get("outcome"))
-
-        advance_stage(task_id, "pass", from_stage="optimization")
-        logger.info("[optimization] Task '%s' advanced to SECURITY via scheduler.", task_id)
-    except ShutdownError:
-        _exit_reason = "shutdown"
-        _exit_summary = "Server shutdown during optimization."
-        logger.info(f"[{AGENT_NAME}] Optimization for task '%s' aborted due to server shutdown.", task_id)
-    except Exception:
-        _exit_reason = "error"
-        _exit_summary = "Exception during optimization pipeline."
-        logger.exception(f"[{AGENT_NAME}] Optimization for task '%s' failed.", task_id)
-        advance_stage(task_id, "fail", from_stage="optimization")
-        _record_demotion_inline(task_id, "optimization", "indev", "Exception in optimization")
-    finally:
-        close_agent_session(_session_id, _exit_reason, _exit_summary,
-                            prompt_tokens=_prompt, completion_tokens=_compl)
         try:
             loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
         except Exception:
@@ -5841,10 +5629,7 @@ def _make_late_handler(fn_name: str) -> Callable:
 
 
 _register_stage_handler("idea",              _make_late_handler("_run_intake"))
-_register_stage_handler("planning",          _make_late_handler("_run_planning_task"))
-_register_stage_handler("indev",             _make_late_handler("_run_dev_orchestrator_task"))
 _register_stage_handler("conceptual_review", _make_late_handler("_run_conceptual_review_task"))
-_register_stage_handler("optimization",      _make_late_handler("_run_optimization_task"))
 _register_stage_handler("security",          _make_late_handler("_run_security_task"))
 _register_stage_handler("final_review",      _make_late_handler("_run_final_review_task"))
 _register_stage_handler("factory_node",      _make_late_handler("_run_factory_node"))
@@ -5881,6 +5666,7 @@ _reg_executor("parallel_subagent_aggregator",  _run_parallel_subagent_aggregator
 _reg_executor("optimization_node",             _run_optimization_node)
 _reg_executor("json_schema_gate",              _run_json_schema_gate)
 _reg_executor("planning_correction_stage",     _run_planning_correction_stage)
+_reg_executor("planning_node",                 _run_planning_node)
 
 # ---------------------------------------------------------------------------
 # Helpers

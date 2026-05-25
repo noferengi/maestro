@@ -635,7 +635,6 @@ class TestSchedulerFullChainE2E:
     def test_full_chain_conceptual_to_final_review(self):
         from app.agent.scheduler import (
             _run_conceptual_review_task,
-            _run_optimization_task,
             _run_security_task,
         )
 
@@ -661,19 +660,15 @@ class TestSchedulerFullChainE2E:
              patch("app.agent.conceptual_review.run_conceptual_review",
                    return_value={"outcome": "passed", "votes": [], "summary": "",
                                  "total_prompt_tokens": 0, "total_completion_tokens": 0}), \
-             patch("app.agent.optimization.run_optimization_pipeline",
-                   return_value={"outcome": "optimized",
-                                 "total_prompt_tokens": 0, "total_completion_tokens": 0}), \
              patch("app.agent.security_review.run_security_pipeline",
                    return_value={"outcome": "passed", "demotion_target": None, "summary": "",
                                  "total_prompt_tokens": 0, "total_completion_tokens": 0}), \
              patch("app.agent.scheduler._record_demotion_inline", MagicMock()):
             _run_conceptual_review_task("chain-t", "http://localhost:8008/v1", "model")
-            _run_optimization_task("chain-t", "http://localhost:8008/v1", "model")
+            # optimization stage now routes via optimization_node executor (scheduler-dispatched)
             _run_security_task("chain-t", "http://localhost:8008/v1", "model")
 
         assert "optimization" in updated_types
-        assert "security" in updated_types
         assert "final_review" in updated_types
 
     def test_full_chain_merge_virtual_passed_records_ready_for_review(self):

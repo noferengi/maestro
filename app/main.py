@@ -833,9 +833,7 @@ def _pipeline_session(func):
     # Map wrapper function names to agent_type values
     _AGENT_TYPE_MAP = {
         "_run_regenerate_subdivision": "subdivision",
-        "_run_planning_pipeline_bg": "planning",
         "_run_review_pipeline_bg": "conceptual_review",
-        "_run_optimization_pipeline_bg": "optimization",
         "_run_security_pipeline_bg": "security",
         "_run_final_review_pipeline_bg": "final_review",
         "_run_loop_bg": "maestro_loop",
@@ -1065,292 +1063,6 @@ def _run_intake_pipeline(task_id: str) -> None:
         logger.exception("[intake] Pipeline for '%s' failed.", task_id)
 
 
-@_pipeline_session
-def _run_planning_pipeline_bg(task_id: str) -> None:
-    """Background runner for the planning pipeline."""
-    project_path = None
-    worktree_path = None
-    loop = None
-    try:
-        import asyncio
-        from app.agent.planning import run_planning_pipeline
-        from app.agent.planning_gate import run_planning_gate
-        from app.database import (
-            supersede_planning_results, create_planning_result, update_planning_result,
-        )
-        from app.database.session import SessionLocal as _SL
-
-        task = get_task(task_id)
-        if not task:
-            return
-        project_path = _setup_thread_context(task)
-
-        # Derive planning domain from the project's pipeline template.
-        _pipeline_template_id = getattr(task, 'pipeline_template_id', None)
-        try:
-            from app.agent.planning import _get_domain as _gd
-            _domain = _gd(_pipeline_template_id, task.title, task.description or "")
-        except Exception:
-            _domain = "software"
-
-        # --- Planning cache gate (DB-only, runs before worktree setup) ---
-        _content_hash = None
-        try:
-            from hashlib import sha256 as _sha256
-            _content_hash = _sha256(f"{task.title}||{task.description or ''}".encode()).hexdigest()
-        except Exception:
-            pass
-
-        _cache_mode = getattr(task, 'cache_mode', None) or 'normal'
-        if _cache_mode == 'normal' and _content_hash:
-            try:
-                from app.database import get_reusable_planning_result, restore_planning_result
-                _cached = get_reusable_planning_result(task_id, _content_hash)
-                if _cached:
-                    supersede_planning_results(task_id)
-                    restore_planning_result(_cached.id)
-                    update_task(task_id, type='indev')
-                    logger.info(
-                        "[planning] Cache HIT task '%s' — reusing plan %d, skipping pipeline.",
-                        task_id, _cached.id,
-                    )
-                    return
-            except Exception:
-                logger.exception("[planning] Cache gate check failed for '%s' — running full pipeline.", task_id)
-        elif _cache_mode in ('force_with_context', 'force_fresh'):
-            try:
-                update_task(task_id, cache_mode='normal')
-            except Exception:
-                pass
-
-        _prior_failures = []
-        if _cache_mode != 'force_fresh':
-            try:
-                from app.database import get_prior_failure_context
-                _prior_failures = get_prior_failure_context(task_id)
-            except Exception:
-                pass
-
-        worktree_path, _aborted = _setup_worktree(task_id, project_path)
-        if _aborted:
-            return
-
-        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
-        all_tasks = [task_to_dict(t) for t in (get_tasks_by_project(task.project) if task.project else get_all_tasks())]
-
-        # Lifecycle: supersede any stale active/in_progress rows, then create a
-        # fresh in_progress row so the Stage Journal can show "Pipeline running…"
-        # immediately rather than displaying the old stale result.
-        supersede_planning_results(task_id)
-        in_prog = create_planning_result(task_id, status='in_progress')
-        run_row_id = in_prog.id if in_prog else None
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            # Run planning pipeline — _store_result inside will update run_row_id
-            # row to status='active' on success.
-            result = loop.run_until_complete(
-                run_planning_pipeline(
-                    task_id=task_id,
-                    task_title=task.title,
-                    task_description=task.description or "",
-                    all_tasks=all_tasks,
-                    llm_base_url=llm_base_url,
-                    llm_model=llm_model,
-                    llm_id=task.llm_id,
-                    budget_id=task.budget_id,
-                    max_context=max_context,
-                    project_path=worktree_path,
-                    project_name=task.project,
-                    run_row_id=run_row_id,
-                    prior_failure_context=_prior_failures,
-                )
-            )
-        except ShutdownError:
-            logger.info("[planning] Pipeline for '%s' aborted due to server shutdown.", task_id)
-            return
-        except PipelineAbortedError as exc:
-            logger.warning(
-                "[planning] Task '%s' aborted due to infra error at stage '%s': %s — will retry.",
-                task_id, exc.stage, exc.cause,
-            )
-            try:
-                _store_infra_abort_result(task_id, exc, budget_id=getattr(task, "budget_id", None),
-                                          transition="planning_to_indev")
-            except Exception:
-                pass
-            return
-        except Exception:
-            logger.exception("[planning] Pipeline for '%s' failed.", task_id)
-            return
-
-        try:
-            # Store transition result
-            _store_pipeline_result_generic(task_id, result, task.budget_id, "planning_to_indev")
-
-            if result.get("outcome") == "subdivide":
-                # Scope too large — demote to IDEA and trigger subdivision immediately
-                scope_reason = result.get("scope_reason", "Design scope too large.")
-                logger.info(
-                    "[planning] Task '%s' scope too large — demoting to IDEA for subdivision. %s",
-                    task_id, scope_reason,
-                )
-                _rejection_ctx = {
-                    "reason": "planning_scope_too_large",
-                    "scope_reason": scope_reason,
-                    "design_rationale": result.get("design_rationale", ""),
-                    "file_manifest": result.get("file_manifest", []),
-                    "survey_summary": result.get("survey_summary", ""),
-                }
-                update_task(task_id, type="subdividing")
-                try:
-                    _execute_subdivision(
-                        task,
-                        llm_base_url=llm_base_url,
-                        llm_model=llm_model,
-                        max_context=max_context,
-                        scope_vote=None,
-                        rejection_context=_rejection_ctx,
-                        loop=loop,
-                    )
-                except Exception:
-                    logger.exception("[planning] Subdivision after scope-fail failed for '%s'.", task_id)
-                    update_task(task_id, type="idea")
-            elif result.get("outcome") == "passed":
-                # Run planning gate
-                gate_result = loop.run_until_complete(
-                    run_planning_gate(
-                        task_id=task_id,
-                        planning_result=result,
-                        all_tasks=all_tasks,
-                        max_context=max_context,
-                        llm_base_url=llm_base_url,
-                        llm_model=llm_model,
-                        llm_id=task.llm_id,
-                        budget_id=task.budget_id,
-                        project_path=worktree_path,
-                        domain=_domain,
-                    )
-                )
-                # Persist gate check details so the UI can surface why a gate failed
-                pr_row = get_planning_result(task_id)
-                if pr_row:
-                    _db = _SL()
-                    try:
-                        update_planning_result(_db, pr_row.id,
-                                               gate_checks=json.dumps(gate_result.get("checks", [])))
-                    finally:
-                        _db.close()
-                if gate_result.get("passed"):
-                    # Mark the planning result as gate-passed so future runs can reuse it.
-                    if pr_row:
-                        try:
-                            from app.database import mark_gate_passed
-                            mark_gate_passed(pr_row.id, _content_hash)
-                        except Exception:
-                            pass
-                    update_task(task_id, type="indev")
-                    logger.info("[planning] Task '%s' advanced to IN DEV.", task_id)
-                else:
-                    logger.warning("[planning] Task '%s' failed planning gate.", task_id)
-            else:
-                logger.info("[planning] Task '%s' planning result: %s", task_id, result.get('outcome'))
-        except Exception as exc:
-            # Write the failure reason into the in_progress row so the Stage Journal
-            # shows "run failed: <reason>" instead of the old stale result.
-            if run_row_id is not None:
-                _db = _SL()
-                try:
-                    update_planning_result(
-                        _db, run_row_id,
-                        status='failed',
-                        error_message=str(exc)[:1000],
-                    )
-                finally:
-                    _db.close()
-            logger.exception("[planning] Pipeline for '%s' failed.", task_id)
-    finally:
-        if loop is not None:
-            loop.close()
-        _teardown_worktree(task_id, project_path, worktree_path)
-
-
-@_pipeline_session
-def _run_dev_orchestrator_bg(task_id: str) -> None:
-    """Background runner for the development orchestrator."""
-    project_path = None
-    worktree_path = None
-    try:
-        import asyncio
-        from app.agent.dev_orchestrator import run_dev_orchestrator
-
-        task = get_task(task_id)
-        if not task:
-            return
-        project_path = _setup_thread_context(task)
-        worktree_path, _aborted = _setup_worktree(task_id, project_path)
-        if _aborted:
-            return
-
-        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
-        planning_result_obj = get_planning_result(task_id)
-
-        if not planning_result_obj:
-            logger.warning("[indev] No planning result for task '%s'.", task_id)
-            return
-
-        # Reconstruct planning result dict
-        planning_result = {
-            "implementation_steps": json.loads(planning_result_obj.implementation_steps or "[]"),
-            "file_manifest": json.loads(planning_result_obj.file_manifest or "[]"),
-            "dependency_graph": json.loads(planning_result_obj.dependency_graph or "{}"),
-            "interface_contracts": json.loads(planning_result_obj.interface_contracts or "[]"),
-            "test_strategy": json.loads(planning_result_obj.test_strategy or "[]"),
-            "design_rationale": planning_result_obj.codebase_survey or "",
-            "pitfalls_identified": json.loads(planning_result_obj.pitfalls_identified or "[]"),
-            "review_votes": json.loads(planning_result_obj.review_votes or "[]"),
-        }
-
-        llm_record = get_llm(task.llm_id) if task.llm_id else None
-        max_parallel = llm_record.parallel_sessions if llm_record else 1
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(
-                run_dev_orchestrator(
-                    task_id=task_id,
-                    planning_result=planning_result,
-                    max_parallel=max_parallel,
-                    llm_base_url=llm_base_url,
-                    llm_model=llm_model,
-                    llm_id=task.llm_id,
-                    budget_id=task.budget_id,
-                    project_path=worktree_path,
-                )
-            )
-        except ShutdownError:
-            logger.info("[indev] Orchestrator for '%s' aborted due to server shutdown.", task_id)
-            return
-        except Exception:
-            logger.exception("[indev] Orchestrator for '%s' failed.", task_id)
-            return
-
-        try:
-            if result.get("status") == "ACCEPTED":
-                update_task(task_id, type="conceptual_review")
-                logger.info("[indev] Task '%s' advanced to CONCEPTUAL REVIEW.", task_id)
-            else:
-                update_task(task_id, type="planning")
-                logger.warning("[indev] Task '%s' reverted to PLANNING: %s", task_id, result.get('error_detail'))
-        finally:
-            loop.close()
-    except Exception as exc:
-        logger.exception("[indev] Orchestrator for '%s' failed.", task_id)
-    finally:
-        _teardown_worktree(task_id, project_path, worktree_path)
-
 
 @_pipeline_session
 def _advance_to_optimization(task_id: str) -> None:
@@ -1431,54 +1143,6 @@ def _advance_to_optimization(task_id: str) -> None:
 
 
 @_pipeline_session
-def _run_optimization_only_bg(task_id: str) -> None:
-    """On-demand: run only the optimization pipeline (no security)."""
-    project_path = None
-    worktree_path = None
-    try:
-        import asyncio
-        from app.agent.optimization import run_optimization_pipeline
-
-        task = get_task(task_id)
-        if not task:
-            return
-        project_path = _setup_thread_context(task)
-        worktree_path, _aborted = _setup_worktree(task_id, project_path)
-        if _aborted:
-            return
-        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(
-                run_optimization_pipeline(
-                    task_id=task_id,
-                    task_description=task.description or "",
-                    llm_base_url=llm_base_url,
-                    llm_model=llm_model,
-                    llm_id=task.llm_id,
-                    budget_id=task.budget_id,
-                    project_path=worktree_path,
-                )
-            )
-            logger.info("[optimization-only] Task '%s': %s", task_id, result.get('outcome'))
-        except ShutdownError:
-            logger.info("[optimization-only] Pipeline for '%s' aborted due to server shutdown.", task_id)
-        except PipelineAbortedError as exc:
-            logger.warning("[optimization-only] Task '%s' aborted at stage '%s': %s — will retry.",
-                           task_id, exc.stage, exc.cause)
-        except Exception:
-            logger.exception("[optimization-only] Pipeline for '%s' failed.", task_id)
-        finally:
-            loop.close()
-    except Exception as exc:
-        logger.exception("[optimization-only] Pipeline for '%s' failed.", task_id)
-    finally:
-        _teardown_worktree(task_id, project_path, worktree_path)
-
-
-@_pipeline_session
 def _run_security_only_bg(task_id: str) -> None:
     """On-demand: run only the security review pipeline (no optimization)."""
     project_path = None
@@ -1530,59 +1194,6 @@ def _run_security_only_bg(task_id: str) -> None:
             loop.close()
     except Exception as exc:
         logger.exception("[security-only] Pipeline for '%s' failed.", task_id)
-    finally:
-        _teardown_worktree(task_id, project_path, worktree_path)
-
-
-@_pipeline_session
-def _run_optimization_pipeline_bg(task_id: str) -> None:
-    """Advance handler for CONCEPTUAL_REVIEW cards: run optimization, advance to security on pass."""
-    project_path = None
-    worktree_path = None
-    try:
-        import asyncio
-        from app.agent.optimization import run_optimization_pipeline
-
-        task = get_task(task_id)
-        if not task:
-            return
-        project_path = _setup_thread_context(task)
-        worktree_path, _aborted = _setup_worktree(task_id, project_path)
-        if _aborted:
-            return
-
-        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            opt_result = loop.run_until_complete(
-                run_optimization_pipeline(
-                    task_id=task_id,
-                    task_description=task.description or "",
-                    llm_base_url=llm_base_url,
-                    llm_model=llm_model,
-                    llm_id=task.llm_id,
-                    budget_id=task.budget_id,
-                    project_path=worktree_path,
-                )
-            )
-            _store_pipeline_result_generic(task_id, opt_result, task.budget_id, "optimization")
-            logger.info("[optimization] Task '%s': %s", task_id, opt_result.get('outcome'))
-
-            update_task(task_id, type="security")
-            logger.info("[optimization] Task '%s' advanced to SECURITY.", task_id)
-        except ShutdownError:
-            logger.info("[optimization] Pipeline for '%s' aborted due to server shutdown.", task_id)
-        except PipelineAbortedError as exc:
-            logger.warning("[optimization] Task '%s' aborted at stage '%s': %s — will retry.",
-                           task_id, exc.stage, exc.cause)
-        except Exception:
-            logger.exception("[optimization] Pipeline for '%s' failed.", task_id)
-        finally:
-            loop.close()
-    except Exception as exc:
-        logger.exception("[optimization] Pipeline for '%s' failed.", task_id)
     finally:
         _teardown_worktree(task_id, project_path, worktree_path)
 
@@ -1967,13 +1578,10 @@ def _record_demotion(task_id: str, from_stage: str, to_stage: str, reason: str) 
 # Pipeline handler dispatch table
 ADVANCE_HANDLERS = {
     "idea": "_run_intake_pipeline",
-    "planning": "_run_planning_pipeline_bg",
-    "indev": "_run_dev_orchestrator_bg",
-    "conceptual_review": "_run_optimization_pipeline_bg",
-    "optimization": "_run_security_pipeline_bg",
     "security": "_run_security_pipeline_bg",
     "final_review": "_run_final_review_pipeline_bg",
     # "human_review": "_execute_merge_bg",  # DISABLED: Requires manual review/merge
+    # planning is dispatched by the scheduler via planning_node executor — no advance endpoint
 }
 
 
@@ -2021,12 +1629,6 @@ def advance_task(task_id: str):
     # Dispatch to appropriate handler
     if handler_name == "_run_intake_pipeline":
         _start_bg(_run_intake_pipeline, task_id)
-    elif handler_name == "_run_planning_pipeline_bg":
-        _start_bg(_run_planning_pipeline_bg, task_id)
-    elif handler_name == "_run_dev_orchestrator_bg":
-        _start_bg(_run_dev_orchestrator_bg, task_id)
-    elif handler_name == "_run_optimization_pipeline_bg":
-        _start_bg(_run_optimization_pipeline_bg, task_id)
     elif handler_name == "_run_security_pipeline_bg":
         _start_bg(_run_security_pipeline_bg, task_id)
     elif handler_name == "_run_final_review_pipeline_bg":
@@ -6467,10 +6069,9 @@ def run_planning_on_demand(task_id: str, body: Optional[RunPlanningRequest] = No
         update_task(task_id, cache_mode='force_fresh')
     elif body and body.force:
         update_task(task_id, cache_mode='force_with_context')
-    # Clear stopped state so the scheduler (and status API) no longer shows this as stopped.
+    # Clear stopped state so the scheduler picks the task up on the next tick.
     from app.agent.scheduler import clear_planning_stopped
     clear_planning_stopped(task_id)
-    _start_bg(_run_planning_pipeline_bg, task_id)
     return {"task_id": task_id, "status": "STARTED", "pipeline": "planning"}
 
 
@@ -6488,14 +6089,8 @@ def run_conceptual_review_on_demand(task_id: str):
 
 @app.post("/api/tasks/{task_id}/run-optimization", response_model=dict)
 def run_optimization_on_demand(task_id: str):
-    """Manually trigger the optimization pipeline only (no security)."""
-    task = get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    if not task.llm_id or not task.budget_id:
-        raise HTTPException(status_code=400, detail="Task needs an LLM endpoint and budget assigned.")
-    _start_bg(_run_optimization_only_bg, task_id)
-    return {"task_id": task_id, "status": "STARTED", "pipeline": "optimization"}
+    """Deprecated: optimization is now an autonomous node stage (optimization_propose → optimization_implement)."""
+    raise HTTPException(status_code=410, detail="run-optimization is deprecated; the scheduler dispatches optimization_propose automatically.")
 
 
 @app.post("/api/tasks/{task_id}/run-security", response_model=dict)

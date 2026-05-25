@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -41,6 +43,45 @@ _INDEV_TOOL_SCHEMAS: list[dict] = build_tool_schemas(INDEV_AGENT_TOOLS)
 
 logger = logging.getLogger(__name__)
 AGENT_NAME = "Maestro Loop"
+
+# ---------------------------------------------------------------------------
+# Test-gate helpers
+# ---------------------------------------------------------------------------
+
+_TEST_PASS_PATTERNS: list[re.Pattern] = [
+    re.compile(r"\d+\s+passed", re.IGNORECASE),           # pytest: "3 passed, 0 warnings"
+    re.compile(r"test result:\s*ok", re.IGNORECASE),       # rust/cargo
+    re.compile(r"^ok\s+\S+\s+\d+\.\d+s", re.MULTILINE),  # go test
+    re.compile(r"\d+\s+passing", re.IGNORECASE),           # mocha/jest
+    re.compile(r"Tests:\s+\d+\s+passed", re.IGNORECASE),  # jest
+    re.compile(r"all\s+tests\s+passed", re.IGNORECASE),
+]
+
+_TEST_FAIL_PATTERNS: list[re.Pattern] = [
+    re.compile(r"\d+\s+failed", re.IGNORECASE),           # pytest
+    re.compile(r"FAILED\s+\S+", re.MULTILINE),            # pytest FAILED lines
+    re.compile(r"test result:\s*FAILED", re.IGNORECASE),  # rust/cargo
+    re.compile(r"^--- FAIL:", re.MULTILINE),              # go test
+    re.compile(r"\d+\s+failing", re.IGNORECASE),          # mocha
+    re.compile(r"Tests:\s+\d+\s+failed", re.IGNORECASE), # jest
+]
+
+_TEST_TOOL_NAMES: frozenset[str] = frozenset({
+    "run_pytest", "run_unittest", "run_cargo_test", "run_go_test", "run_npm_test",
+})
+
+_TESTABLE_EXTENSIONS: frozenset[str] = frozenset({
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs",
+    ".java", ".c", ".cpp", ".cs", ".rb", ".php", ".kt", ".swift",
+})
+
+
+def _is_testable_component(files: list[str]) -> bool:
+    """Return True if the file manifest contains at least one source file with a testable extension."""
+    for f in files:
+        if os.path.splitext(f)[1].lower() in _TESTABLE_EXTENSIONS:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +154,8 @@ class MaestroLoop:
         system_prompt: str | None = None,
         agent_tools: list[str] | None = None,
         required_input_keys: list[str] | None = None,
+        require_passing_tests: bool = False,
+        file_manifest: list[str] | None = None,
     ) -> None:
         self.task_id = task_id
         self.max_turns = max_turns
@@ -134,6 +177,9 @@ class MaestroLoop:
         self._last_prompt_tokens: int = 0
         self._warnings_fired: set[float] = set()
         self._turn_warnings_fired: set[int] = set()
+        self._require_passing_tests: bool = require_passing_tests
+        self._file_manifest: list[str] | None = file_manifest
+        self._tests_passed: bool = False
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -653,6 +699,25 @@ class MaestroLoop:
                 llm_model=self.llm_model,
             )
 
+            # Track test pass/fail from test runner tool results
+            if name in _TEST_TOOL_NAMES and isinstance(result_content, str):
+                if any(p.search(result_content) for p in _TEST_PASS_PATTERNS):
+                    if hasattr(self, "_tests_passed"):
+                        self._tests_passed = True
+                elif any(p.search(result_content) for p in _TEST_FAIL_PATTERNS):
+                    if hasattr(self, "_tests_passed"):
+                        self._tests_passed = False
+
+            # Warn on writes outside file_manifest (non-blocking, mirrors ComponentLoop behavior)
+            _fm = getattr(self, "_file_manifest", None)
+            if name in ("write_file", "append_file") and _fm is not None:
+                written_path = arguments.get("path", "")
+                if written_path and written_path not in _fm:
+                    result_content = (
+                        f"[WARNING: '{written_path}' is outside your assigned file manifest. "
+                        f"Assigned files: {_fm}]\n{result_content}"
+                    )
+
             # Check for terminal signal from submit_work
             if isinstance(result_content, str) and "__maestro_terminal__" in result_content:
                 try:
@@ -685,8 +750,15 @@ class MaestroLoop:
         Called before a terminal submit_work signal is accepted.
         Returns None if the gate passes, or a rejection message string that
         will be injected into the agent context so the loop can continue.
-        Base implementation always passes; CustomLLMAgent overrides this.
         """
+        signal = terminal_data.get("signal", "")
+        if getattr(self, "_require_passing_tests", False) and signal == SIGNAL_ACCEPTED:
+            files = getattr(self, "_file_manifest", None) or []
+            if _is_testable_component(files) and not getattr(self, "_tests_passed", False):
+                return (
+                    "Gate blocked: no passing test run recorded for this component. "
+                    "Run your test suite and ensure all tests pass before calling submit_work(ACCEPTED)."
+                )
         return None
 
     def _resolve_previous_submit(self, current_args: dict) -> dict | None:

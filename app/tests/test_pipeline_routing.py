@@ -123,14 +123,12 @@ def _make_llm(address, port, model):
 # ---------------------------------------------------------------------------
 
 class TestAdvanceHandlersMap:
-    """ADVANCE_HANDLERS covers the 7 AI-driven pipeline stages; human_review is a manual gate."""
+    """ADVANCE_HANDLERS covers AI-driven pipeline stages handled by the advance endpoint."""
 
     def test_all_advanceable_types_present(self):
         import main
         expected = {
-            "idea", "planning", "indev",
-            "conceptual_review", "optimization", "security",
-            "final_review",
+            "idea", "security", "final_review",
         }
         assert set(main.ADVANCE_HANDLERS.keys()) == expected
 
@@ -142,14 +140,12 @@ class TestAdvanceHandlersMap:
 
     def test_correct_handlers(self):
         import main
-        assert main.ADVANCE_HANDLERS["idea"]               == "_run_intake_pipeline"
-        assert main.ADVANCE_HANDLERS["planning"]           == "_run_planning_pipeline_bg"
-        assert main.ADVANCE_HANDLERS["indev"]              == "_run_dev_orchestrator_bg"
-        assert main.ADVANCE_HANDLERS["conceptual_review"]  == "_run_optimization_pipeline_bg"
-        assert main.ADVANCE_HANDLERS["optimization"]       == "_run_security_pipeline_bg"
-        assert main.ADVANCE_HANDLERS["security"]           == "_run_security_pipeline_bg"
-        assert main.ADVANCE_HANDLERS["final_review"]       == "_run_final_review_pipeline_bg"
-        # human_review is a manual gate — no automated advance handler; merge via /merge endpoint
+        assert main.ADVANCE_HANDLERS["idea"]         == "_run_intake_pipeline"
+        assert main.ADVANCE_HANDLERS["security"]     == "_run_security_pipeline_bg"
+        assert main.ADVANCE_HANDLERS["final_review"] == "_run_final_review_pipeline_bg"
+        # planning uses planning_node executor (scheduler-dispatched, not advance endpoint)
+        # indev/conceptual_review/optimization route through parallel_agents node executors
+        # human_review is a manual gate — merge via /merge endpoint
 
     def test_non_advanceable_types_absent(self):
         """architecture, completed, cancelled, subdividing are never in the map."""
@@ -248,18 +244,16 @@ class TestAdvanceEndpointValidation:
             _cleanup_llm(llm_id)
             _cleanup_budget(budget_id)
 
-    def test_200_pipeline_started_planning_task(self):
-        """Valid planning task fires planning pipeline in the background."""
+    def test_422_planning_task_not_advanceable(self):
+        """Planning tasks are no longer advanceable via this endpoint; scheduling is scheduler-driven."""
         task_id = "test-adv-plan"
         llm_id = _make_llm("test-plan-host", 19997, "test-plan")
         budget_id = _make_budget("test-budget-advance-plan")
         _make_task(task_id, "planning", description="Design auth module",
                    llm_id=llm_id, budget_id=budget_id)
         try:
-            with patch("main._run_planning_pipeline_bg"):
-                r = self.client.post(f"/api/tasks/{task_id}/advance")
-            assert r.status_code == 200
-            assert r.json()["status"] == "PIPELINE_STARTED"
+            r = self.client.post(f"/api/tasks/{task_id}/advance")
+            assert r.status_code == 422
         finally:
             _delete_task(task_id)
             _cleanup_llm(llm_id)

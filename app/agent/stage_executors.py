@@ -1373,6 +1373,8 @@ def _run_parallel_subagent_dangerous(
             project_path=project_path,
             system_prompt=system_prompt,
             agent_tools=agent_tools,
+            require_passing_tests=cfg.get("require_passing_tests", False),
+            file_manifest=cfg.get("assigned_files"),
         )
         result = loop.run_until_complete(maestro.run())
         exit_summary = result.final_message or ""

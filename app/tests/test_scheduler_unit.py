@@ -587,19 +587,6 @@ class TestNewDispatcherRouting:
         mock_fn.assert_called_once()
         mock_loop.assert_not_called()
 
-    def test_optimization_routes_to_new_dispatcher(self):
-        llm = _fake_llm(llm_id=31)
-        db_task = _fake_db_task(task_type="optimization", task_id="t-opt")
-        with _llm_counts_lock:
-            _llm_session_counts[31] = 1
-
-        with patch("app.agent.scheduler._run_optimization_task") as mock_fn, \
-             patch("app.agent.scheduler._run_maestro_loop") as mock_loop:
-            _run_task("t-opt", "optimization", llm, db_task, None)
-
-        mock_fn.assert_called_once()
-        mock_loop.assert_not_called()
-
     def test_final_review_routes_to_new_dispatcher(self):
         llm = _fake_llm(llm_id=32)
         db_task = _fake_db_task(task_type="final_review", task_id="t-fr")
@@ -671,57 +658,6 @@ class TestRunConceptualReviewTask:
              patch("app.agent.conceptual_review.run_conceptual_review",
                    return_value={"outcome": "failed", "votes": [], "summary": "Issues found", "total_prompt_tokens": 0, "total_completion_tokens": 0}):
             _run_conceptual_review_task("cr-2", "http://localhost:8008/v1", "model")
-
-        assert "indev" in updated_types
-
-
-# ===========================================================================
-# _run_optimization_task unit tests
-# ===========================================================================
-
-class TestRunOptimizationTask:
-    _OPT_PASS = {
-        "outcome": "optimized",
-        "total_prompt_tokens": 10,
-        "total_completion_tokens": 20,
-    }
-
-    def test_advances_to_security_on_pass(self):
-        from app.agent.scheduler import _run_optimization_task
-
-        updated_types = []
-
-        def _capture(task_id, **kwargs):
-            if "type" in kwargs:
-                updated_types.append(kwargs["type"])
-
-        with patch("app.database.get_task", return_value=_fake_db_task(task_id="opt-1", task_type="optimization")), \
-             patch("app.database.update_task", side_effect=_capture), \
-             patch("app.database.create_transition_result", MagicMock()), \
-             patch("app.agent.tools.set_task_git_cwd", MagicMock()), \
-             patch("app.agent.optimization.run_optimization_pipeline",
-                   return_value=self._OPT_PASS):
-            _run_optimization_task("opt-1", "http://localhost:8008/v1", "model")
-
-        assert "security" in updated_types
-
-    def test_demotes_to_indev_on_exception(self):
-        from app.agent.scheduler import _run_optimization_task
-
-        updated_types = []
-
-        def _capture(task_id, **kwargs):
-            if "type" in kwargs:
-                updated_types.append(kwargs["type"])
-
-        with patch("app.database.get_task", return_value=_fake_db_task(task_id="opt-x")), \
-             patch("app.database.update_task", side_effect=_capture), \
-             patch("app.database.create_transition_result", MagicMock()), \
-             patch("app.agent.tools.set_task_git_cwd", MagicMock()), \
-             patch("app.agent.scheduler._record_demotion_inline", MagicMock()), \
-             patch("app.agent.optimization.run_optimization_pipeline",
-                   side_effect=RuntimeError("pipeline crash")):
-            _run_optimization_task("opt-x", "http://localhost:8008/v1", "model")
 
         assert "indev" in updated_types
 
