@@ -1001,7 +1001,7 @@ def get_scheduler_status() -> dict:
         if t.get("parent_task_id")
     }
 
-    dispatchable_set = {s.lower() for s in SCHEDULER_DISPATCHABLE_TYPES} | {"_psubagent", "_psubagent_join"}
+    dispatchable_set = {s.lower() for s in SCHEDULER_DISPATCHABLE_TYPES} | {"_psubagent", "_psubagent_join", "_psubagent_dangerous"}
     done_set = {s.lower() for s in PIPELINE_DONE_STATUSES}
     never_dispatch = {"completed", "cancelled", "subdividing", "accepted"}
 
@@ -4183,8 +4183,9 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
             ensure_project_ready(project_path)
 
         # Worktree isolation: give each task its own git checkout.
-        # Virtual tasks (_psubagent, _psubagent_join) are read-only and skip worktrees.
-        if project_path and not task_type.startswith("_p"):
+        # Read-only virtual tasks (_psubagent, _psubagent_join) skip worktrees.
+        # _psubagent_dangerous runs MaestroLoop with write access and needs one.
+        if project_path and (not task_type.startswith("_p") or task_type == "_psubagent_dangerous"):
             from app.agent.worktree import setup_task_worktree
             wt = setup_task_worktree(task_id, project_path)
             if wt is None:
@@ -4201,7 +4202,7 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
         llm_id = llm.id
         budget_id = db_task.budget_id if db_task else None
 
-        # Virtual dispatch: _psubagent and _psubagent_join bypass the pipeline router.
+        # Virtual dispatch: _psubagent* and _psubagent_join bypass the pipeline router.
         if task_type.startswith("_p"):
             from app.database import get_task as _gvt
             from app.agent.pipeline_router import StageConfig as _SC
@@ -4213,6 +4214,15 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
                     task_id,
                     _SC(stage_key="_psubagent", label="Parallel Subagent",
                         agent_type="parallel_subagent", position=0,
+                        config=_vcfg, template_id=0, stage_id=0),
+                    llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path,
+                )
+            elif task_type == "_psubagent_dangerous":
+                from app.agent.stage_executors import _run_parallel_subagent_dangerous
+                _run_parallel_subagent_dangerous(
+                    task_id,
+                    _SC(stage_key="_psubagent_dangerous", label="Parallel Subagent (Write)",
+                        agent_type="parallel_subagent_dangerous", position=0,
                         config=_vcfg, template_id=0, stage_id=0),
                     llm_base_url, llm_model, max_context, llm_id, budget_id, worktree_path,
                 )

@@ -170,4 +170,14 @@ AGENT_REGISTRY: dict[str, AgentSpec] = {
         description="Internal virtual task that merges parallel subagent outputs and advances the parent stage.",
         gate_type="none",
     ),
+    "parallel_subagent_dangerous": AgentSpec(
+        cls=None,
+        display_name="Parallel Subagent (Write)",
+        description=(
+            "Internal virtual sub-task created by parallel_agents when subagent_type='dangerous_edit'. "
+            "Runs a scoped MaestroLoop with worktree isolation and write access. "
+            "Does not advance stage — the aggregator drives the parent forward."
+        ),
+        gate_type="none",
+    ),
 }

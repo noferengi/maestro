@@ -325,13 +325,13 @@ def dispatch_task(
     project_path: "str | None",
 ) -> bool:
     """
-    Dispatch `task_id` using the three-tier hierarchy:
+    Dispatch `task_id` using the two-tier hierarchy:
 
-    1. Stage-key handler — the 8 hardcoded Software Dev stage functions.
-    2. Generic path — reads stage config, then:
-       a. Returns False for no-auto-dispatch agent types (human_gate, terminal).
-       b. Agent-type executor — circuit_breaker, voting_panel, fan_out_judge.
-       c. Universal GenericStageAgent fallback.
+    1. Template-driven path — reads stage config from the task's pipeline template,
+       then routes to the registered executor (voting_panel, fan_out_judge, etc.) or
+       GenericStageAgent. Takes priority so malleable node configs always win.
+    2. Legacy stage-key handler — the hardcoded Software Dev stage functions, only
+       reached when no template stage config exists (tasks without a pipeline template).
 
     Returns False only when nothing fires (no stage, no config, human_gate).
     Returning False causes _run_task to attempt the legacy MaestroLoop fallback.
@@ -347,85 +347,88 @@ def dispatch_task(
             logger.error("[pipeline_router] dispatch_task: task %s has no stage", task_id)
             return False
 
-    # Tier 1: stage-key-specific handler (hardcoded Software Dev pipeline)
+    # Tier 1: template-driven dispatch — look up stage config
+    stage_config = get_stage_config(task_id)
+    if not stage_config:
+        # No template stage config — fall through to legacy handlers below
+        pass
+    else:
+        agent_type = stage_config.agent_type or ""
+
+        # 1a. No-auto-dispatch agent types
+        if agent_type in _NO_AUTO_DISPATCH_AGENT_TYPES:
+            logger.debug(
+                "[pipeline_router] Stage '%s' agent_type='%s' is not auto-dispatchable (task=%s).",
+                stage_key, agent_type, task_id,
+            )
+            return False
+
+        # 1b. Definition-driven dispatch: agent_type may name a custom_agent_definitions row.
+        #     If the definition has a behavior_type, route to the corresponding handler/executor
+        #     so that built-in pipeline semantics fire even for user-named stages.
+        defn = _load_definition_by_name(agent_type)
+        if defn is not None and getattr(defn, "behavior_type", None):
+            behavior_type = defn.behavior_type
+            if behavior_type in _NO_AUTO_DISPATCH_BEHAVIOR_TYPES:
+                logger.debug(
+                    "[pipeline_router] Stage '%s' definition behavior_type='%s' is not auto-dispatchable (task=%s).",
+                    stage_key, behavior_type, task_id,
+                )
+                return False
+            # Merge behavior_config into stage_config.config (stage wins on conflict)
+            merged_config = {**(defn.behavior_config or {}), **(stage_config.config or {})}
+            merged_stage = StageConfig(
+                stage_key=stage_config.stage_key,
+                label=stage_config.label,
+                agent_type=stage_config.agent_type,
+                position=stage_config.position,
+                config=merged_config,
+                template_id=stage_config.template_id,
+                stage_id=stage_config.stage_id,
+            )
+            # Try executor registry first (voting_panel, circuit_breaker, fan_out_judge)
+            executor = _agent_type_executors.get(behavior_type)
+            if executor is not None:
+                logger.debug(
+                    "[pipeline_router] Definition '%s' behavior_type='%s' -> executor (task=%s).",
+                    agent_type, behavior_type, task_id,
+                )
+                executor(task_id, merged_stage, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
+                return True
+            # Try stage-handler map (intake_pipeline, planning_pipeline, maestro_loop, …)
+            handler_key = _BEHAVIOR_TYPE_TO_STAGE_HANDLER.get(behavior_type)
+            if handler_key:
+                handler = _stage_handlers.get(handler_key)
+                if handler is not None:
+                    logger.debug(
+                        "[pipeline_router] Definition '%s' behavior_type='%s' -> stage handler '%s' (task=%s).",
+                        agent_type, behavior_type, handler_key, task_id,
+                    )
+                    handler(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
+                    return True
+            # single_pass_llm and unknown behavior types fall through to GenericStageAgent below
+
+        # 1c. Agent-type-specific executor (registered directly, e.g. custom executor keys)
+        executor = _agent_type_executors.get(agent_type)
+        if executor is not None:
+            executor(task_id, stage_config, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
+            return True
+
+        # 1d. Universal fallback: GenericStageAgent
+        _run_generic_stage(task_id, stage_config, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
+        return True
+
+    # Tier 2: legacy stage-key handlers (tasks without a pipeline template stage config)
     handler = _stage_handlers.get(stage_key)
     if handler is not None:
         handler(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
         return True
 
-    # Tier 2: generic path — look up stage config
-    stage_config = get_stage_config(task_id)
-    if not stage_config:
-        logger.warning(
-            "[pipeline_router] No stage config for '%s' (task=%s) — no handler registered.",
-            stage_key, task_id,
-        )
-        return False
-
-    agent_type = stage_config.agent_type or ""
-
-    # 2a. No-auto-dispatch agent types
-    if agent_type in _NO_AUTO_DISPATCH_AGENT_TYPES:
-        logger.debug(
-            "[pipeline_router] Stage '%s' agent_type='%s' is not auto-dispatchable (task=%s).",
-            stage_key, agent_type, task_id,
-        )
-        return False
-
-    # 2b. Definition-driven dispatch: agent_type may name a custom_agent_definitions row.
-    #     If the definition has a behavior_type, route to the corresponding handler/executor
-    #     so that built-in pipeline semantics fire even for user-named stages.
-    defn = _load_definition_by_name(agent_type)
-    if defn is not None and getattr(defn, "behavior_type", None):
-        behavior_type = defn.behavior_type
-        if behavior_type in _NO_AUTO_DISPATCH_BEHAVIOR_TYPES:
-            logger.debug(
-                "[pipeline_router] Stage '%s' definition behavior_type='%s' is not auto-dispatchable (task=%s).",
-                stage_key, behavior_type, task_id,
-            )
-            return False
-        # Merge behavior_config into stage_config.config (stage wins on conflict)
-        merged_config = {**(defn.behavior_config or {}), **(stage_config.config or {})}
-        merged_stage = StageConfig(
-            stage_key=stage_config.stage_key,
-            label=stage_config.label,
-            agent_type=stage_config.agent_type,
-            position=stage_config.position,
-            config=merged_config,
-            template_id=stage_config.template_id,
-            stage_id=stage_config.stage_id,
-        )
-        # Try executor registry first (voting_panel, circuit_breaker, fan_out_judge)
-        executor = _agent_type_executors.get(behavior_type)
-        if executor is not None:
-            logger.debug(
-                "[pipeline_router] Definition '%s' behavior_type='%s' -> executor (task=%s).",
-                agent_type, behavior_type, task_id,
-            )
-            executor(task_id, merged_stage, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
-            return True
-        # Try stage-handler map (intake_pipeline, planning_pipeline, maestro_loop, …)
-        handler_key = _BEHAVIOR_TYPE_TO_STAGE_HANDLER.get(behavior_type)
-        if handler_key:
-            handler = _stage_handlers.get(handler_key)
-            if handler is not None:
-                logger.debug(
-                    "[pipeline_router] Definition '%s' behavior_type='%s' -> stage handler '%s' (task=%s).",
-                    agent_type, behavior_type, handler_key, task_id,
-                )
-                handler(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
-                return True
-        # single_pass_llm and unknown behavior types fall through to GenericStageAgent below
-
-    # 2c. Agent-type-specific executor (registered directly, e.g. custom executor keys)
-    executor = _agent_type_executors.get(agent_type)
-    if executor is not None:
-        executor(task_id, stage_config, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
-        return True
-
-    # 2d. Universal fallback: GenericStageAgent
-    _run_generic_stage(task_id, stage_config, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
-    return True
+    logger.warning(
+        "[pipeline_router] No stage config or legacy handler for '%s' (task=%s) — nothing fired.",
+        stage_key, task_id,
+    )
+    return False
 
 
 def _load_definition_by_name(name: str):

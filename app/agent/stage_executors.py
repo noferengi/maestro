@@ -1045,10 +1045,12 @@ def _run_parallel_agents(
     for i, agent in enumerate(agents_cfg):
         name = agent.get("name", f"agent_{i}")
         tg_id = agent.get("tool_grouping_id")
+        subagent_type: str = agent.get("subagent_type", "collector")
+        child_task_type = "_psubagent_dangerous" if subagent_type == "dangerous_edit" else "_psubagent"
         child = create_task(
             title=f"[PA] {parent.title[:50]} — {name}",
-            task_type="_psubagent",
-            stage_key="_psubagent",
+            task_type=child_task_type,
+            stage_key=child_task_type,
             project_id=parent.project_id,
             pipeline_template_id=None,
             llm_id=llm_id,
@@ -1056,11 +1058,12 @@ def _run_parallel_agents(
             content={"_subagent_cfg": {
                 "name": name,
                 "system_prompt": agent.get("system_prompt", "Complete the task and call submit_work."),
-                "max_turns": max_turns,
+                "max_turns": agent.get("max_turns", max_turns),
                 "output_key": output_key,
                 "parent_task_id": task_id,
                 "parent_stage_key": stage_config.stage_key,
                 "tool_grouping_id": tg_id,
+                "agent_tools": agent.get("agent_tools"),
             }},
         )
         if child:
@@ -1185,6 +1188,106 @@ def _run_parallel_subagent(
         # Still complete so the aggregator can fire
     finally:
         close_agent_session(session_id, exit_reason, "")
+        try:
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=5.0))
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# _psubagent_dangerous — write-capable parallel subagent (MaestroLoop)
+# ---------------------------------------------------------------------------
+
+def _run_parallel_subagent_dangerous(
+    task_id: str,
+    stage_config: "StageConfig",
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """
+    Write-capable parallel subagent — runs a scoped MaestroLoop for one component.
+    Config comes from task.content._subagent_cfg (injected by _run_parallel_agents).
+
+    Unlike _run_parallel_subagent (_CollectorAgent, read-only), this variant has a
+    worktree and full write access.  It does NOT call advance_stage; the aggregator
+    drives the parent forward once all children complete.
+    """
+    import json as _json
+    from app.agent.loop import MaestroLoop
+    from app.agent.config import MAX_TURNS as _DEFAULT_MAX_TURNS
+    from app.database import get_task, update_task, create_agent_session, close_agent_session
+
+    task = get_task(task_id)
+    if not task:
+        return
+
+    cfg: dict = (task.content or {}).get("_subagent_cfg", {})
+    name: str = cfg.get("name", "subagent")
+    system_prompt: str | None = cfg.get("system_prompt") or None
+    max_turns: int = int(cfg.get("max_turns", _DEFAULT_MAX_TURNS))
+
+    # agent_tools: list or comma-sep string; None falls back to INDEV_AGENT_TOOLS inside MaestroLoop
+    _raw_tools = cfg.get("agent_tools")
+    if isinstance(_raw_tools, list):
+        agent_tools: list[str] | None = [t.strip() for t in _raw_tools if t.strip()] or None
+    elif isinstance(_raw_tools, str) and _raw_tools.strip():
+        agent_tools = [t.strip() for t in _raw_tools.split(",") if t.strip()] or None
+    else:
+        agent_tools = None
+
+    session_id = create_agent_session(
+        task_id=task_id,
+        agent_type=f"parallel_subagent_dangerous:{name}",
+        llm_id=llm_id,
+        budget_id=budget_id,
+        scheduler_reason="scheduler",
+        max_turns=max_turns,
+    )
+    exit_reason = "error"
+    exit_summary = ""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        maestro = MaestroLoop(
+            task_id=task_id,
+            max_turns=max_turns,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            max_context=max_context,
+            llm_id=llm_id,
+            budget_id=budget_id,
+            project_path=project_path,
+            system_prompt=system_prompt,
+            agent_tools=agent_tools,
+        )
+        result = loop.run_until_complete(maestro.run())
+        exit_summary = result.final_message or ""
+        blob = dict(task.content or {})
+        if result.status == "ACCEPTED":
+            exit_reason = "completed"
+            blob["output"] = exit_summary
+        else:
+            exit_reason = result.status.lower()
+            blob["output"] = f"subagent '{name}' ended with status {result.status}: {exit_summary}"
+            blob["_subagent_failed"] = True
+        update_task(task_id, content=blob, type="completed", stage_key="completed")
+    except Exception:
+        logger.exception("[parallel_subagent_dangerous] task '%s' agent '%s' raised.", task_id, name)
+        fresh = get_task(task_id)
+        blob = dict((fresh.content or {}) if fresh else {})
+        blob["output"] = f"ERROR: subagent '{name}' failed."
+        blob["_subagent_failed"] = True
+        update_task(task_id, content=blob, type="completed", stage_key="completed")
+    finally:
+        close_agent_session(session_id, exit_reason, exit_summary)
         try:
             loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=5.0))
         except Exception:

@@ -163,16 +163,21 @@ def test_get_stage_config_missing_task_returns_none(router_db):
 # ---------------------------------------------------------------------------
 
 def test_dispatch_task_calls_registered_handler(router_db):
-    db_mod, _, _, task_id = router_db
+    """Legacy handlers only fire when no template stage config exists for the stage key."""
+    db_mod, _, project_id, task_id = router_db
     from app.agent.pipeline_router import register_handler, dispatch_task
+
+    # Move task to a stage that is NOT in the RouterTest template — this forces
+    # get_stage_config to return None, so dispatch falls through to legacy handlers.
+    db_mod.update_task(task_id, stage_key="_legacy_test_stage", type="_legacy_test_stage")
 
     called_with = {}
 
     def fake_handler(tid, base_url, model, ctx, lid, bid, ppath):
         called_with["task_id"] = tid
-        called_with["stage"] = "idea"
+        called_with["stage"] = "_legacy_test_stage"
 
-    register_handler("idea", fake_handler)
+    register_handler("_legacy_test_stage", fake_handler)
     try:
         result = dispatch_task(
             task_id,
@@ -186,8 +191,8 @@ def test_dispatch_task_calls_registered_handler(router_db):
         assert result is True
         assert called_with["task_id"] == task_id
     finally:
-        # Restore — don't pollute other tests with fake handler
-        register_handler("idea", lambda *a: None)
+        # Remove test handler — don't pollute other tests
+        register_handler("_legacy_test_stage", lambda *a: None)
 
 
 def test_dispatch_task_no_handler_returns_false(router_db):
