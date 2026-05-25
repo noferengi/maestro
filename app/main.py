@@ -988,84 +988,6 @@ def _run_regenerate_subdivision(task_id: str) -> None:
         logger.exception("[regen] Regeneration for '%s' failed.", task_id)
 
 
-@_pipeline_session
-def _run_intake_pipeline(task_id: str) -> None:
-    """Background runner for the intake pipeline."""
-    try:
-        import asyncio
-        from app.agent.intake import run_intake_pipeline
-
-        task = get_task(task_id)
-        if not task:
-            logger.warning("[intake] Task '%s' not found.", task_id)
-            return
-        _setup_thread_context(task)
-
-        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
-        if llm_base_url:
-            logger.info("[intake] Using LLM: %s model=%s", llm_base_url, llm_model)
-
-        project_tasks = get_tasks_by_project(task.project) if task.project else get_all_tasks()
-        task_dicts = [task_to_dict(t) for t in project_tasks]
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(
-                run_intake_pipeline(
-                    task_id=task_id,
-                    task_description=task.description or "",
-                    task_title=task.title,
-                    all_tasks=task_dicts,
-                    budget_id=task.budget_id,
-                    llm_id=task.llm_id,
-                    llm_base_url=llm_base_url,
-                    llm_model=llm_model,
-                    project=task.project or None,  # Must be configured or pipeline will fail
-                )
-            )
-
-            # Store the result
-            _store_pipeline_result(task_id, result, task.budget_id)
-
-            # Act on the result
-            if result["outcome"] == "passed":
-                update_task(task_id, type="planning")
-                logger.info("[intake] Task '%s' advanced to PLANNING.", task_id)
-
-            elif result["outcome"] == "subdivide":
-                _handle_subdivision_outcome(
-                    task, result, llm_base_url, llm_model, max_context, loop
-                )
-
-            elif result["outcome"] in ("rejected", "failed"):
-                # Check if this is a system-generated sub-idea that should self-heal
-                if task.parent_task_id:
-                    logger.info("[intake] System-generated task '%s' rejected. Triggering self-healing.", task_id)
-                    _handle_self_healing_rejection(
-                        task, result, llm_base_url, llm_model, max_context, loop
-                    )
-                else:
-                    logger.info("[intake] Task '%s' pipeline result: %s", task_id, result['outcome'])
-
-            else:
-                logger.info("[intake] Task '%s' pipeline result: %s", task_id, result['outcome'])
-
-        finally:
-            loop.close()
-    except PipelineAbortedError as exc:
-        logger.warning(
-            "[intake] Task '%s' aborted due to infra error at stage '%s': %s — will retry.",
-            task_id, exc.stage, exc.cause,
-        )
-        try:
-            _store_infra_abort_result(task_id, exc, budget_id=None)
-        except Exception:
-            pass  # best-effort; don't mask the original abort
-    except Exception as exc:
-        logger.exception("[intake] Pipeline for '%s' failed.", task_id)
-
-
 
 def _merge_to_integration_branch(task_id: str) -> "str | None":
     """Merge maestro/task-{task_id} into maestro/self-improvement. Returns new HEAD SHA or None."""
@@ -1231,8 +1153,8 @@ def _record_demotion(task_id: str, from_stage: str, to_stage: str, reason: str) 
             asyncio.run(generate_pip(task_id, from_stage, reason))
 
 # Pipeline handler dispatch table
-ADVANCE_HANDLERS = {
-    "idea": "_run_intake_pipeline",
+ADVANCE_HANDLERS: dict[str, str] = {
+    # idea: dispatched by scheduler via intake_node executor — no manual advance endpoint
     # security, final_review: dispatched by scheduler via voting_panel — no advance endpoint
     # human_review: "_execute_merge_bg" — DISABLED: Requires manual review/merge
     # planning: dispatched by scheduler via planning_node executor — no advance endpoint
@@ -1281,9 +1203,7 @@ def advance_task(task_id: str):
     handler_name = ADVANCE_HANDLERS[current_type]
 
     # Dispatch to appropriate handler
-    if handler_name == "_run_intake_pipeline":
-        _start_bg(_run_intake_pipeline, task_id)
-    elif handler_name == "_execute_merge_bg":
+    if handler_name == "_execute_merge_bg":
         _start_bg(_execute_merge_bg, task_id)
 
     return {

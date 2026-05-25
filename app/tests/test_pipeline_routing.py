@@ -127,28 +127,15 @@ class TestAdvanceHandlersMap:
 
     def test_all_advanceable_types_present(self):
         import main
-        # security/final_review/planning/indev now dispatched by scheduler via node executors
-        expected = {"idea"}
-        assert set(main.ADVANCE_HANDLERS.keys()) == expected
-
-    def test_handler_values_are_nonempty_strings(self):
-        import main
-        for col_type, handler in main.ADVANCE_HANDLERS.items():
-            assert isinstance(handler, str) and handler, \
-                f"Handler for '{col_type}' must be a non-empty string"
-
-    def test_correct_handlers(self):
-        import main
-        assert main.ADVANCE_HANDLERS["idea"] == "_run_intake_pipeline"
-        # planning/indev/conceptual_review/security/final_review: scheduler node executors
-        # human_review: manual gate — merge via /merge endpoint
+        # idea/security/final_review/planning/indev now all dispatched by scheduler via node executors
+        assert set(main.ADVANCE_HANDLERS.keys()) == set()
 
     def test_non_advanceable_types_absent(self):
-        """architecture, completed, cancelled, subdividing are never in the map."""
+        """architecture, completed, cancelled, subdividing, idea are never in the map."""
         import main
-        for t in ("architecture", "completed", "cancelled", "subdividing"):
+        for t in ("architecture", "completed", "cancelled", "subdividing", "idea"):
             assert t not in main.ADVANCE_HANDLERS, \
-                f"'{t}' should not be advanceable"
+                f"'{t}' should not be manually advanceable"
 
 
 # ---------------------------------------------------------------------------
@@ -168,37 +155,16 @@ class TestAdvanceEndpointValidation:
         r = self.client.post("/api/tasks/nonexistent-xyz-99999/advance")
         assert r.status_code == 404
 
-    def test_422_empty_description(self):
-        task_id = "test-adv-nodesc"
-        _make_task(task_id, "idea", description="")
-        try:
-            r = self.client.post(f"/api/tasks/{task_id}/advance")
-            assert r.status_code == 422
-            assert "description" in r.json()["detail"].lower()
-        finally:
-            _delete_task(task_id)
-
-    def test_422_missing_llm_id(self):
-        task_id = "test-adv-nollm"
+    def test_422_idea_not_manually_advanceable(self):
+        """Idea tasks are scheduler-dispatched; manual advance returns 422."""
+        task_id = "test-adv-idea"
         _make_task(task_id, "idea", description="Some description")
         try:
             r = self.client.post(f"/api/tasks/{task_id}/advance")
             assert r.status_code == 422
-            assert "llm" in r.json()["detail"].lower()
+            assert "idea" in r.json()["detail"].lower()
         finally:
             _delete_task(task_id)
-
-    def test_422_missing_budget_id(self):
-        task_id = "test-adv-nobud"
-        llm_id = _make_llm("test-nobud-host", 19999, "test-nobud")
-        _make_task(task_id, "idea", description="Some description", llm_id=llm_id)
-        try:
-            r = self.client.post(f"/api/tasks/{task_id}/advance")
-            assert r.status_code == 422
-            assert "budget" in r.json()["detail"].lower()
-        finally:
-            _delete_task(task_id)
-            _cleanup_llm(llm_id)
 
     def test_422_architecture_not_advanceable(self):
         task_id = "test-adv-arch"
@@ -219,26 +185,6 @@ class TestAdvanceEndpointValidation:
             assert "completed" in r.json()["detail"].lower()
         finally:
             _delete_task(task_id)
-
-    def test_200_pipeline_started_idea_task(self):
-        """Valid idea task fires intake pipeline in the background."""
-        task_id = "test-adv-ok"
-        llm_id = _make_llm("test-ok-host", 19998, "test-ok")
-        budget_id = _make_budget("test-budget-advance-ok")
-        _make_task(task_id, "idea", description="Implement login",
-                   llm_id=llm_id, budget_id=budget_id,
-                   clarification_status="approved")
-        try:
-            with patch("main._run_intake_pipeline"):
-                r = self.client.post(f"/api/tasks/{task_id}/advance")
-            assert r.status_code == 200
-            body = r.json()
-            assert body["status"] == "PIPELINE_STARTED"
-            assert task_id in body["task_id"]
-        finally:
-            _delete_task(task_id)
-            _cleanup_llm(llm_id)
-            _cleanup_budget(budget_id)
 
     def test_422_planning_task_not_advanceable(self):
         """Planning tasks are no longer advanceable via this endpoint; scheduling is scheduler-driven."""

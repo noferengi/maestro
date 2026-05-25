@@ -3022,16 +3022,45 @@ def run_deps_cargo(head: int | None = None, tail: int | None = None, grep: str |
 
 # --- Security scanners ---
 
+_SECURITY_TOOL_BUILDERS: dict = {
+    "bandit":         lambda path: [sys.executable, "-m", "bandit", "-r", path],
+    "safety":         lambda path: [sys.executable, "-m", "safety", "check"],
+    "pip-audit":      lambda path: [sys.executable, "-m", "pip_audit"],
+    "detect-secrets": lambda path: [sys.executable, "-m", "detect_secrets", "scan"],
+    "semgrep":        lambda path: ["semgrep", "--config", "auto", path],
+    "trivy":          lambda path: ["trivy", "fs", path],
+    "npm-audit":      lambda path: ["npm", "audit", "--json"],
+}
+
+
+def run_shell_security(tool: str, path: str = ".", *, project_path: str | None = None) -> str:
+    """Run a whitelisted security scanner with shell=False.
+
+    tool: one of bandit | safety | pip-audit | detect-secrets | semgrep | trivy | npm-audit
+    path: relative path within the project to scan (validated).
+    """
+    cwd = project_path or _task_git_cwd.get() or PROJECT_ROOT
+    builder = _SECURITY_TOOL_BUILDERS.get(tool.lower().strip())
+    if builder is None:
+        known = ", ".join(_SECURITY_TOOL_BUILDERS)
+        logger.warning("[security] run_shell_security rejected tool=%r (known: %s)", tool, known)
+        return f"[security] Unknown security tool {tool!r}. Known tools: {known}"
+    safe_path = _validate_tool_path(path, f"run_shell_security:{tool}")
+    if safe_path is None:
+        return f"[security] path {path!r} rejected"
+    args = builder(safe_path)
+    rc, out = _run_tool_subprocess(args, cwd, SHELL_TIMEOUT_SECONDS, f"ERROR: {tool} timed out after {SHELL_TIMEOUT_SECONDS}s")
+    return out if out else "(no output)"
+
+
 def run_audit_bandit(path: str = ".", head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
     """[RUN — audit] Run bandit Python security linter. No project-file mutation. path: dir or file (default '.'). head/tail/grep filter output."""
-    from app.agent.security_review import run_shell_security
     out = run_shell_security("bandit", path)
     return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
 def run_audit_pip(head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
     """[RUN — audit] Audit installed Python packages for known vulnerabilities (pip-audit). No project-file mutation. head/tail/grep filter output."""
-    from app.agent.security_review import run_shell_security
     out = run_shell_security("pip-audit")
     return _slice_output(out, head=head, tail=tail, grep=grep)
 
@@ -3040,14 +3069,12 @@ def run_audit_semgrep(path: str = ".", config: str = "auto", head: int | None = 
     """[RUN — audit] Run semgrep static analysis. No project-file mutation. config: ruleset (default 'auto', always used). head/tail/grep filter output."""
     if config != "auto":
         logger.warning("[security] run_audit_semgrep: config=%r ignored, using 'auto'", config)
-    from app.agent.security_review import run_shell_security
     out = run_shell_security("semgrep", path)
     return _slice_output(out, head=head, tail=tail, grep=grep)
 
 
 def run_audit_npm(head: int | None = None, tail: int | None = None, grep: str | None = None) -> str:
     """[RUN — audit] Run npm audit to check Node.js dependencies for vulnerabilities. No project-file mutation. head/tail/grep filter output."""
-    from app.agent.security_review import run_shell_security
     out = run_shell_security("npm-audit")
     return _slice_output(out, head=head, tail=tail, grep=grep)
 

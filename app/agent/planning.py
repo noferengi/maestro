@@ -1939,6 +1939,156 @@ class PlanningPipeline:
 # Public entry point
 # ---------------------------------------------------------------------------
 
+async def run_planning_survey(
+    task_id: str,
+    task_title: str,
+    task_description: str,
+    *,
+    llm_base_url: str | None = None,
+    llm_model: str | None = None,
+    llm_id: int | None = None,
+    budget_id: int | None = None,
+    max_context: int | None = None,
+    project_path: str | None = None,
+    project_name: str | None = None,
+) -> dict:
+    """Codebase survey + task classification for planning_survey_node.
+
+    Returns dict: survey_summary, is_proof, is_simple, best_of_n.
+    """
+    if project_path is not None:
+        from app.agent.tools import set_task_git_cwd
+        set_task_git_cwd(project_path)
+    pipeline = PlanningPipeline(
+        task_id=task_id,
+        task_title=task_title,
+        task_description=task_description,
+        all_tasks=[],
+        llm_base_url=llm_base_url,
+        llm_model=llm_model,
+        llm_id=llm_id,
+        budget_id=budget_id,
+        max_context=max_context,
+        project_name=project_name,
+        project_root=project_path,
+    )
+    pipeline._is_proof = _is_proof_task(task_title, task_description)
+    survey_summary = await pipeline._stage_codebase_survey()
+    try:
+        from app.database import get_task as _get_task_hist
+        _t = _get_task_hist(task_id)
+        if _t and _t.demotion_history:
+            _recent = _t.demotion_history[-3:]
+            _hist_block = "\n\n[PRIOR INDEV FAILURES — consider before designing]\n"
+            for _d in _recent:
+                _ts = _d.get("timestamp", "?")[:19]
+                _reason = _d.get("reason", "?")
+                _hist_block += f"  {_ts}: {_reason[:400]}\n"
+            survey_summary += _hist_block
+    except Exception:
+        pass
+    is_proof = pipeline._is_proof
+    is_simple = (
+        not is_proof
+        and not _is_unit_test_task(task_title, task_description)
+        and _is_simple_task(task_title, task_description, survey_summary)
+    )
+    best_of_n = 2 if is_simple else PLANNING_BEST_OF_N
+    return {
+        "survey_summary": survey_summary,
+        "is_proof": is_proof,
+        "is_simple": is_simple,
+        "best_of_n": best_of_n,
+    }
+
+
+async def run_pitfall_detection(
+    task_id: str,
+    task_title: str,
+    task_description: str,
+    winning_design: dict,
+    survey_summary: str,
+    *,
+    llm_base_url: str | None = None,
+    llm_model: str | None = None,
+    llm_id: int | None = None,
+    budget_id: int | None = None,
+    max_context: int | None = None,
+    project_path: str | None = None,
+    project_name: str | None = None,
+    is_proof: bool = False,
+) -> list:
+    """Pitfall detection for planning_pitfalls node. Returns list of pitfall dicts."""
+    if project_path is not None:
+        from app.agent.tools import set_task_git_cwd
+        set_task_git_cwd(project_path)
+    pipeline = PlanningPipeline(
+        task_id=task_id,
+        task_title=task_title,
+        task_description=task_description,
+        all_tasks=[],
+        llm_base_url=llm_base_url,
+        llm_model=llm_model,
+        llm_id=llm_id,
+        budget_id=budget_id,
+        max_context=max_context,
+        project_name=project_name,
+        project_root=project_path,
+    )
+    pipeline._is_proof = is_proof
+    return await pipeline._stage_pitfall_detection(winning_design, survey_summary)
+
+
+async def run_consolidation_and_store(
+    task_id: str,
+    task_title: str,
+    task_description: str,
+    winning_design: dict,
+    pitfalls: list,
+    survey_summary: str,
+    all_tasks: list[dict],
+    *,
+    llm_base_url: str | None = None,
+    llm_model: str | None = None,
+    llm_id: int | None = None,
+    budget_id: int | None = None,
+    max_context: int | None = None,
+    project_path: str | None = None,
+    project_name: str | None = None,
+    is_proof: bool = False,
+) -> None:
+    """Consolidate design + pitfall mitigations and store PlanningResult for planning_consolidate node."""
+    if project_path is not None:
+        from app.agent.tools import set_task_git_cwd
+        set_task_git_cwd(project_path)
+    pipeline = PlanningPipeline(
+        task_id=task_id,
+        task_title=task_title,
+        task_description=task_description,
+        all_tasks=all_tasks,
+        llm_base_url=llm_base_url,
+        llm_model=llm_model,
+        llm_id=llm_id,
+        budget_id=budget_id,
+        max_context=max_context,
+        project_name=project_name,
+        project_root=project_path,
+    )
+    pipeline._is_proof = is_proof
+    consolidated = await pipeline._stage_consolidation(winning_design, pitfalls, survey_summary)
+    result = pipeline._build_result(
+        consolidated=consolidated,
+        all_designs=[winning_design],
+        selected_index=0,
+        review_votes=[],
+        pitfalls=pitfalls,
+        survey=survey_summary,
+        passed=True,
+    )
+    result.survey_summary = survey_summary
+    pipeline._store_result(result)
+
+
 async def run_planning_pipeline(
     task_id: str,
     task_title: str,

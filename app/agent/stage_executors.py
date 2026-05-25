@@ -524,6 +524,17 @@ def _run_fan_out_judge(
     if personas_cfg:
         n = len(personas_cfg)
 
+    # Allow task.content["best_of_n"] to override n at runtime (set by planning_survey_node).
+    try:
+        _task_for_n = get_task(task_id)
+        _content_n = (_task_for_n.content or {}).get("best_of_n") if _task_for_n else None
+        if _content_n is not None:
+            n = int(_content_n)
+            if personas_cfg and len(personas_cfg) > n:
+                personas_cfg = personas_cfg[:n]
+    except Exception:
+        pass
+
     session_id = create_agent_session(
         task_id=task_id,
         agent_type=f"fan_out_judge:{stage_config.stage_key}",
@@ -1993,6 +2004,329 @@ def _run_planning_correction_stage(
         logger.exception(
             "[planning_correction_stage] task '%s' stage '%s' raised.", task_id, stage_config.stage_key
         )
+        advance_stage(task_id, "fail")
+    finally:
+        close_agent_session(session_id, exit_reason, "")
+        try:
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=5.0))
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — Decomposed planning nodes
+# ---------------------------------------------------------------------------
+
+def _run_planning_survey_node(
+    task_id: str,
+    stage_config: StageConfig,
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """planning_survey_node executor — codebase survey + task classification.
+
+    Writes to task.content: survey_summary, is_proof, is_simple, best_of_n.
+    """
+    from app.database import create_agent_session, close_agent_session, get_task, update_task
+    from app.agent.planning import run_planning_survey
+
+    task = get_task(task_id)
+    if not task:
+        return
+
+    session_id = create_agent_session(
+        task_id=task_id,
+        agent_type="planning_survey",
+        llm_id=llm_id,
+        budget_id=budget_id,
+        scheduler_reason="scheduler",
+    )
+    exit_reason = "error"
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        result = loop.run_until_complete(
+            run_planning_survey(
+                task_id=task_id,
+                task_title=task.title,
+                task_description=task.description or "",
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                max_context=max_context,
+                project_path=project_path,
+                project_name=task.project,
+            )
+        )
+        blob = dict(task.content or {})
+        blob["survey_summary"] = result["survey_summary"]
+        blob["is_proof"] = result["is_proof"]
+        blob["is_simple"] = result["is_simple"]
+        blob["best_of_n"] = result["best_of_n"]
+        update_task(task_id, content=blob)
+        advance_stage(task_id, "pass")
+        exit_reason = "pass"
+    except Exception:
+        logger.exception("[planning_survey_node] task '%s' raised.", task_id)
+        advance_stage(task_id, "fail")
+    finally:
+        close_agent_session(session_id, exit_reason, "")
+        try:
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=5.0))
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+def _run_pitfall_node(
+    task_id: str,
+    stage_config: StageConfig,
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """planning_pitfalls node — deterministic checks + LLM pitfall detection.
+
+    Reads winning_design + survey_summary from task.content.
+    Writes pitfalls list to task.content. Always advances to pass (informational).
+    """
+    from app.database import create_agent_session, close_agent_session, get_task, update_task
+    from app.agent.planning import run_pitfall_detection
+
+    task = get_task(task_id)
+    if not task:
+        return
+
+    content = task.content or {}
+    winning_design = content.get("winning_design") or {}
+    survey_summary = content.get("survey_summary") or ""
+    is_proof = bool(content.get("is_proof", False))
+
+    session_id = create_agent_session(
+        task_id=task_id,
+        agent_type="planning_pitfalls",
+        llm_id=llm_id,
+        budget_id=budget_id,
+        scheduler_reason="scheduler",
+    )
+    exit_reason = "pass"
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        pitfalls = loop.run_until_complete(
+            run_pitfall_detection(
+                task_id=task_id,
+                task_title=task.title,
+                task_description=task.description or "",
+                winning_design=winning_design,
+                survey_summary=survey_summary,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                max_context=max_context,
+                project_path=project_path,
+                project_name=task.project,
+                is_proof=is_proof,
+            )
+        )
+        blob = dict(task.content or {})
+        blob["pitfalls"] = pitfalls
+        update_task(task_id, content=blob)
+    except Exception:
+        logger.exception("[pitfall_node] task '%s' raised.", task_id)
+    finally:
+        advance_stage(task_id, "pass")  # always informational — never blocks
+        close_agent_session(session_id, exit_reason, "")
+        try:
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=5.0))
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+def _run_consolidation_node(
+    task_id: str,
+    stage_config: StageConfig,
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """planning_consolidate node — merge winning_design + pitfalls, store PlanningResult.
+
+    Reads winning_design, pitfalls, survey_summary from task.content.
+    Stores a PlanningResult row. Advances to pass on success.
+    """
+    from app.database import (
+        create_agent_session, close_agent_session, get_task, get_all_tasks,
+        task_to_dict, supersede_planning_results,
+    )
+    from app.agent.planning import run_consolidation_and_store
+
+    task = get_task(task_id)
+    if not task:
+        return
+
+    content = task.content or {}
+    winning_design = content.get("winning_design") or {}
+    pitfalls = content.get("pitfalls") or []
+    survey_summary = content.get("survey_summary") or ""
+    is_proof = bool(content.get("is_proof", False))
+
+    session_id = create_agent_session(
+        task_id=task_id,
+        agent_type="planning_consolidate",
+        llm_id=llm_id,
+        budget_id=budget_id,
+        scheduler_reason="scheduler",
+    )
+    exit_reason = "error"
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        all_tasks = [task_to_dict(t) for t in get_all_tasks()]
+        supersede_planning_results(task_id)
+        loop.run_until_complete(
+            run_consolidation_and_store(
+                task_id=task_id,
+                task_title=task.title,
+                task_description=task.description or "",
+                winning_design=winning_design,
+                pitfalls=pitfalls,
+                survey_summary=survey_summary,
+                all_tasks=all_tasks,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                max_context=max_context,
+                project_path=project_path,
+                project_name=task.project,
+                is_proof=is_proof,
+            )
+        )
+        advance_stage(task_id, "pass")
+        exit_reason = "pass"
+    except Exception:
+        logger.exception("[consolidation_node] task '%s' raised.", task_id)
+        advance_stage(task_id, "fail")
+    finally:
+        close_agent_session(session_id, exit_reason, "")
+        try:
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=5.0))
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+def _run_planning_gate_node(
+    task_id: str,
+    stage_config: StageConfig,
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """planning_gate node — runs PlanningGate checks on the stored PlanningResult.
+
+    Pass → json_schema_gate. Fail → planning_correction.
+    """
+    import json as _json
+    from app.database import (
+        create_agent_session, close_agent_session, get_task, get_all_tasks,
+        task_to_dict, get_planning_result,
+    )
+    from app.agent.planning_gate import run_planning_gate
+    from app.agent.planning import _get_domain
+
+    task = get_task(task_id)
+    if not task:
+        return
+
+    session_id = create_agent_session(
+        task_id=task_id,
+        agent_type="planning_gate",
+        llm_id=llm_id,
+        budget_id=budget_id,
+        scheduler_reason="scheduler",
+    )
+    exit_reason = "error"
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        pr = get_planning_result(task_id)
+        if not pr:
+            logger.warning("[planning_gate_node] task '%s': no planning result found.", task_id)
+            advance_stage(task_id, "fail")
+            exit_reason = "fail"
+        else:
+            planning_result_dict = {
+                "file_manifest": _json.loads(pr.file_manifest or "[]"),
+                "interface_contracts": _json.loads(pr.interface_contracts or "[]"),
+                "implementation_steps": _json.loads(pr.implementation_steps or "[]"),
+                "design_rationale": pr.design_rationale or "",
+                "dependency_graph": _json.loads(pr.dependency_graph or "{}"),
+                "test_strategy": _json.loads(pr.test_strategy or "[]"),
+                "outcome": "passed",
+            }
+            all_tasks = [task_to_dict(t) for t in get_all_tasks()]
+            try:
+                domain = _get_domain(
+                    getattr(task, "pipeline_template_id", None),
+                    task.title,
+                    task.description or "",
+                )
+            except Exception:
+                domain = "software"
+            gate_result = loop.run_until_complete(
+                run_planning_gate(
+                    task_id=task_id,
+                    planning_result=planning_result_dict,
+                    all_tasks=all_tasks,
+                    max_context=max_context,
+                    llm_base_url=llm_base_url,
+                    llm_model=llm_model,
+                    llm_id=llm_id,
+                    budget_id=budget_id,
+                    project_path=project_path,
+                    task_description=task.description or "",
+                    domain=domain,
+                )
+            )
+            if gate_result.get("passed"):
+                advance_stage(task_id, "pass")
+                exit_reason = "pass"
+            else:
+                advance_stage(task_id, "fail")
+                exit_reason = "fail"
+    except Exception:
+        logger.exception("[planning_gate_node] task '%s' raised.", task_id)
         advance_stage(task_id, "fail")
     finally:
         close_agent_session(session_id, exit_reason, "")

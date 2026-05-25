@@ -22,7 +22,7 @@ class TestRunShellSecurity(unittest.TestCase):
 
     def test_uses_explicit_project_path(self):
         """_run_tool_subprocess should receive the explicit cwd, not the ContextVar value."""
-        from app.agent.security_review import run_shell_security
+        from app.agent.tools import run_shell_security
 
         with patch("app.agent.tools._run_tool_subprocess", return_value=(0, "bandit ok")) as mock_run:
             run_shell_security("bandit", ".", project_path="/explicit/path")
@@ -32,7 +32,7 @@ class TestRunShellSecurity(unittest.TestCase):
 
     def test_falls_back_to_context_var(self):
         """When project_path is None, cwd comes from the ContextVar."""
-        from app.agent.security_review import run_shell_security
+        from app.agent.tools import run_shell_security
         from app.agent.tools import set_task_git_cwd
 
         set_task_git_cwd("/contextvar/path")
@@ -47,7 +47,7 @@ class TestRunShellSecurity(unittest.TestCase):
 
     def test_unknown_tool_is_rejected(self):
         """Unknown tool names are rejected with a [security] message."""
-        from app.agent.security_review import run_shell_security
+        from app.agent.tools import run_shell_security
 
         result = run_shell_security("rm -rf /", project_path="/some/path")
         self.assertIn("[security]", result)

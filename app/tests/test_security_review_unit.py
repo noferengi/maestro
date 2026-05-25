@@ -22,7 +22,7 @@ class TestAllowlist:
     """run_shell_security() uses a strict tool-map allowlist."""
 
     def _call(self, tool: str, path: str = ".") -> str:
-        from app.agent.security_review import run_shell_security
+        from app.agent.tools import run_shell_security
         return run_shell_security(tool, path)
 
     def test_allowlist_bandit_passes(self):

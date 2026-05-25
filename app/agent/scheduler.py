@@ -4289,16 +4289,21 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
             teardown_task_worktree(task_id, project_path)
 
 
-def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
-                max_context: int | None = None,
-                llm_id: int | None = None,
-                budget_id: int | None = None,
-                project_path: str | None = None) -> None:
-    """Run the intake pipeline for an IDEA task."""
+def _run_intake_node(
+    task_id: str,
+    stage_config: "StageConfig",
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None = None,
+    llm_id: int | None = None,
+    budget_id: int | None = None,
+    project_path: str | None = None,
+) -> None:
+    """intake_node executor — runs the intake pipeline for an IDEA task."""
     from app.agent.intake import run_intake_pipeline
     from app.agent.tools import set_task_git_cwd
     from app.database import (
-        get_task, get_all_tasks, update_task,
+        get_task, get_all_tasks,
         create_transition_vote, create_transition_result,
         create_agent_session, close_agent_session,
     )
@@ -4309,7 +4314,6 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
         return
     set_task_git_cwd(project_path or "", task_id=task_id)
 
-    # Require description, llm_id, budget_id before advancing
     if not task.description or not task.llm_id or not task.budget_id:
         logger.debug("Task '%s' missing required fields for intake, skipping.", task_id)
         return
@@ -4344,7 +4348,7 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
                 llm_id=task.llm_id,
                 llm_base_url=llm_base_url,
                 llm_model=llm_model,
-                project=task.project or None,  # Must be configured or pipeline will fail
+                project=task.project or None,
             )
         )
         _exit_reason = result.get("outcome", "error")
@@ -4384,7 +4388,6 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
         return
 
     try:
-        # Persist results
         create_transition_result(
             task_id=task_id,
             transition="idea_to_planning",
@@ -4415,11 +4418,8 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
             # Lazy import avoids circular import; main.py is fully loaded by call time.
             from app.main import _handle_subdivision_outcome
             _handle_subdivision_outcome(task, result, llm_base_url, llm_model, max_context, loop)
-            logger.info("Task '%s' intake result: subdivide (subdivision dispatched via scheduler).", task_id)
+            logger.info("Task '%s' intake result: subdivide.", task_id)
         else:
-            # Rejected — count all intake rejection results for this task.
-            # After MAX_INTAKE_REJECTIONS attempts, mark as intake-exhausted so the
-            # scheduler stops auto-retrying. Human must reset via /reset-intake.
             from app.database import get_transition_results as _gtr
             all_results = _gtr(task_id, transition="idea_to_planning") or []
             rejection_count = sum(
@@ -4460,20 +4460,6 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
             loop.close()
         except Exception:
             pass
-
-
-def _run_intake_node(
-    task_id: str,
-    stage_config: "StageConfig",
-    llm_base_url: str,
-    llm_model: str,
-    max_context: int | None = None,
-    llm_id: int | None = None,
-    budget_id: int | None = None,
-    project_path: str | None = None,
-) -> None:
-    """intake_node executor — delegates to _run_intake for use as a malleable stage node."""
-    _run_intake(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
 
 
 def _run_planning_correction(
@@ -5269,7 +5255,6 @@ def _make_late_handler(fn_name: str) -> Callable:
     return _handler
 
 
-_register_stage_handler("idea",              _make_late_handler("_run_intake"))
 _register_stage_handler("factory_node",      _make_late_handler("_run_factory_node"))
 
 # ---------------------------------------------------------------------------
@@ -5289,6 +5274,10 @@ from app.agent.stage_executors import (  # noqa: E402
     _run_optimization_node,
     _run_json_schema_gate,
     _run_planning_correction_stage,
+    _run_planning_survey_node,
+    _run_pitfall_node,
+    _run_consolidation_node,
+    _run_planning_gate_node,
 )
 from app.agent.pipeline_router import register_agent_type_executor as _reg_executor  # noqa: E402
 
@@ -5306,6 +5295,10 @@ _reg_executor("json_schema_gate",              _run_json_schema_gate)
 _reg_executor("planning_correction_stage",     _run_planning_correction_stage)
 _reg_executor("planning_node",                 _run_planning_node)
 _reg_executor("intake_node",                   _run_intake_node)
+_reg_executor("planning_survey_node",          _run_planning_survey_node)
+_reg_executor("pitfall_node",                  _run_pitfall_node)
+_reg_executor("consolidation_node",            _run_consolidation_node)
+_reg_executor("planning_gate_node",            _run_planning_gate_node)
 
 # ---------------------------------------------------------------------------
 # Helpers

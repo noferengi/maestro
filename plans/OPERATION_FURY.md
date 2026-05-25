@@ -446,3 +446,173 @@ venv/Scripts/python.exe -m pytest app/tests/ -q
 | 4 — planning.py + 3 review files | ~0 | ~3,804 | **-3,804** |
 | **Phase 5 total** | **~200** | **~5,680** | **~-5,480** |
 | **Fury cumulative** | **~1,145** | **~10,518** | **~-9,373** |
+
+---
+
+# Operation Fury Phase 6
+
+## Context
+
+`planning_node` is a thin wrapper around `PlanningPipeline` in `planning.py` (2,011 lines).
+Phase 6 decomposes this monolith into 6 sequential DB stages so `planning.py` can be deleted.
+Each stage becomes either a reuse of an existing executor or a new wrapper (~100 lines each).
+
+The current `planning → json_schema_gate → planning_correction → indev` sequence expands to:
+
+```
+planning_survey → planning_propose → planning_review → planning_pitfalls
+    → planning_consolidate → planning_gate → json_schema_gate → planning_correction → indev
+```
+
+The retry loop (design → judge → review → reject → retry) becomes a DB back-transition:
+`planning_review` fail → `planning_propose`. No retry logic needed in any executor.
+
+---
+
+## PlanningPipeline stage map (what is being decomposed)
+
+`planning.py:PlanningPipeline` has 6 distinct stages inside `run()` (lines 535–787):
+
+| Internal method | Lines | What it does | LLM calls |
+|---|---|---|---|
+| inline in `run()` | 542–565 | Task classification (`_is_proof`, `_is_simple`, `_effective_best_of_n`) | 0 |
+| `_stage_codebase_survey()` | 793–1012 | Multi-turn agentic codebase exploration (read-only tools) | N sequential turns |
+| `_stage_design_generation()` | 1018–1261 | N sequential persona LLM calls; each outputs full JSON design | N |
+| `_stage_judge_designs()` | 1263–1392 | 1 LLM call selects best design by index | 1 |
+| `_stage_design_review()` | 1398–1624 | 2–5 sequential reviewer LLMs; ACCEPTED/REJECTED/NEEDS_RESEARCH | 2–5 |
+| `_stage_pitfall_detection()` | 1630–1732 | Deterministic graph checks + 1 LLM call | 1 |
+| `_stage_consolidation()` | 1738–1803 | 1 LLM call merging winning_design + pitfalls | 1 |
+
+---
+
+## Stage decomposition
+
+### Stage 1 — `planning_survey` (`planning_survey_node`, new executor ~150 lines)
+
+**File:** `app/agent/stage_executors.py`
+**Wraps:** `_stage_codebase_survey()` + inline classification block (`run()` lines 542–565)
+
+- Runs the multi-turn agentic survey loop (read-only tools, up to `PLANNING_SURVEY_MAX_TURNS`)
+- Computes task classification: `_is_proof`, `_is_simple`, `_effective_best_of_n` from task title/description/demotion history
+- Writes to `task.content`: `survey_summary` (str), `is_proof` (bool), `is_simple` (bool), `best_of_n` (int)
+- `advance_stage("pass")` on completion; `advance_stage("fail")` on ShutdownError
+
+### Stage 2 — `planning_propose` (reuse `fan_out_judge`, no new code)
+
+**Existing executor:** `_run_fan_out_judge` at `stage_executors.py:475`
+
+Stage config:
+```json
+{
+  "required_input_keys": ["survey_summary"],
+  "personas": [
+    {"name": "pragmatic",  "system_prompt": "..."},
+    {"name": "defensive",  "system_prompt": "..."},
+    {"name": "innovative", "system_prompt": "..."},
+    {"name": "minimal",    "system_prompt": "..."},
+    {"name": "resilient",  "system_prompt": "..."}
+  ],
+  "judge_system_prompt": "Select the design best suited for production...",
+  "output_key": "winning_design"
+}
+```
+
+- `survey_summary` injected into each persona's preamble via `_build_required_keys_preamble()` (stage_executors.py:241)
+- `best_of_n` from `task.content` overrides config `n` at runtime (add this 1-line read to `_run_fan_out_judge`)
+- Judge selects winning design; written to `task.content["winning_design"]`
+
+### Stage 3 — `planning_review` (reuse `voting_panel`, no new code)
+
+**Existing executor:** `_run_voting_panel` at `stage_executors.py:262`
+
+Stage config:
+```json
+{
+  "required_input_keys": ["survey_summary", "winning_design"],
+  "reviewers": [
+    {"name": "coupling",    "system_prompt": "...", "max_turns": 12},
+    {"name": "interface",   "system_prompt": "...", "max_turns": 12},
+    {"name": "testability", "system_prompt": "...", "max_turns": 12},
+    {"name": "security",    "system_prompt": "...", "max_turns": 12},
+    {"name": "performance", "system_prompt": "...", "max_turns": 12}
+  ],
+  "tally_strategy": "majority",
+  "output_key": "design_review_result"
+}
+```
+
+- `fail` DB transition → `planning_propose` (this replaces the Python retry loop)
+- `NEEDS_RESEARCH` verdict is treated as `fail` in Phase 6; full research intercept deferred to
+  Phase 7 when `research_node` is built
+
+### Stage 4 — `planning_pitfalls` (`pitfall_node`, new executor ~100 lines)
+
+**File:** `app/agent/stage_executors.py`
+**Wraps:** `_stage_pitfall_detection()` lines 1630–1732
+
+- Deterministic checks: circular dependencies via `static_analysis._detect_cycles()`, path safety via `tools._assert_safe_path()`
+- 1 LLM call for edge-case/race-condition detection
+- Reads `winning_design` from `task.content`
+- Writes `pitfalls` list to `task.content`
+- Always `advance_stage("pass")` — pitfall detection is informational, not a gate
+
+### Stage 5 — `planning_consolidate` (`consolidation_node`, new executor ~80 lines)
+
+**File:** `app/agent/stage_executors.py`
+**Wraps:** `_stage_consolidation()` lines 1738–1803 + `_build_result()` + `_store_result()` lines 1830–1935
+
+- Single LLM call merging `winning_design` + `pitfalls` from `task.content`
+- Writes `consolidated_design` and persists full `PlanningResult` to `planning_results` table
+- `advance_stage("pass")` on success
+
+> **Note on `_build_result()` / `_store_result()`:** These two helpers in `planning.py`
+> (lines 1830–1935) are the only pieces that must be kept accessible to `consolidation_node`.
+> Options: (a) move them to a new `app/agent/planning_utils.py` before deleting `planning.py`;
+> (b) inline them directly into the new executor. Decision deferred to implementation.
+
+### Stage 6 — `planning_gate` (`planning_gate_node`, new executor ~100 lines)
+
+**File:** `app/agent/stage_executors.py`
+**Wraps:** `run_planning_gate()` from `app/agent/planning_gate.py`
+
+- Thin wrapper identical in structure to `_run_planning_node`'s existing gate call path
+- Runs the 10-check gate (namespace conflicts, interface completeness, cycles, test strategy, feasibility recheck, context budget)
+- `pass` → `json_schema_gate` (existing, unchanged)
+- `fail` → `planning_correction` (existing, unchanged)
+
+---
+
+## Migration 0124 — `planning_decompose_sw_dev`
+
+- Remove the single `planning` stage from the SW Dev template
+- Insert 6 new stages with positions slotting between `idea`/`planning_survey` and `json_schema_gate`
+- Seed stage configs for `planning_propose` (5 personas + judge prompt) and `planning_review` (5 reviewer configs)
+- Wire transitions: survey→propose, propose→review, review pass→pitfalls, **review fail→propose**, pitfalls→consolidate, consolidate→planning_gate, gate pass→json_schema_gate, gate fail→planning_correction
+- Existing `json_schema_gate`, `planning_correction`, and `indev` stages are **unchanged**
+
+---
+
+## Deletion precondition
+
+Once at least 3 SW Dev tasks complete the full 6-node planning path without regression
+(check `agent_sessions` for the new `agent_type` values completing with `exit_reason='completed'`):
+
+1. Delete `_run_planning_node` from `stage_executors.py` and its `_reg_executor` call
+2. Delete `app/agent/planning.py` (2,011 lines)
+3. Remove any remaining `"planning"` references in `scheduler.py`
+
+`planning_gate.py` and `planning_correction.py` are **not deleted** — they remain active
+domain logic used by `planning_gate_node` and `planning_correction_stage` respectively.
+
+---
+
+## LOC Delta (Phase 6)
+
+| Move | Added | Deleted | Net |
+|---|---|---|---|
+| 4 new executors (survey, pitfalls, consolidate, gate_node) | ~430 | 0 | **+430** |
+| Migration 0124 (stage config + transitions) | ~60 | 0 | **+60** |
+| Delete `_run_planning_node` executor | 0 | ~385 | **-385** |
+| Delete `planning.py` | 0 | ~2,011 | **-2,011** |
+| **Phase 6 total** | **~490** | **~2,396** | **~-1,906** |
+| **Fury cumulative** | **~1,635** | **~12,914** | **~-11,279** |
