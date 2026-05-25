@@ -4462,6 +4462,20 @@ def _run_intake(task_id: str, llm_base_url: str, llm_model: str,
             pass
 
 
+def _run_intake_node(
+    task_id: str,
+    stage_config: "StageConfig",
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None = None,
+    llm_id: int | None = None,
+    budget_id: int | None = None,
+    project_path: str | None = None,
+) -> None:
+    """intake_node executor — delegates to _run_intake for use as a malleable stage node."""
+    _run_intake(task_id, llm_base_url, llm_model, max_context, llm_id, budget_id, project_path)
+
+
 def _run_planning_correction(
     loop,
     task_id: str,
@@ -5101,379 +5115,6 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
             pass
 
 
-def _run_conceptual_review_task(task_id: str, llm_base_url: str, llm_model: str,
-                                 max_context: int | None = None,
-                                 llm_id: int | None = None,
-                                 budget_id: int | None = None,
-                                 project_path: str | None = None) -> None:
-    """Run the conceptual review pipeline for a CONCEPTUAL_REVIEW task."""
-    from app.agent.conceptual_review import run_conceptual_review
-    from app.agent.tools import set_task_git_cwd
-    from app.database import get_task, update_task, get_planning_result
-    from app.database import (
-        create_transition_vote, create_transition_result,
-        create_agent_session, close_agent_session,
-    )
-    from app.agent.pipeline_router import advance_stage
-    from datetime import datetime
-    import json as _json
-
-    set_task_git_cwd(project_path, task_id=task_id)
-
-    task = get_task(task_id)
-    if not task:
-        return
-
-    planning_result_obj = get_planning_result(task_id)
-    if not planning_result_obj:
-        logger.warning("No planning result for task '%s' in conceptual review. Demoting to indev.", task_id)
-        advance_stage(task_id, "fail", from_stage="conceptual_review")
-        _record_demotion_inline(task_id, "conceptual_review", "indev", "Missing planning results")
-        return
-
-    planning_result = {
-        "file_manifest": _json.loads(planning_result_obj.file_manifest or "[]"),
-        "dependency_graph": _json.loads(planning_result_obj.dependency_graph or "{}"),
-        "implementation_steps": _json.loads(planning_result_obj.implementation_steps or "[]"),
-        "test_strategy": _json.loads(planning_result_obj.test_strategy or "[]"),
-    }
-
-    _session_id = create_agent_session(
-        task_id=task_id,
-        agent_type="conceptual_review",
-        llm_id=llm_id,
-        budget_id=budget_id,
-        scheduler_reason="scheduler",
-    )
-    if _session_id is not None:
-        register_db_session(task_id, _session_id)
-    _exit_reason = "error"
-    _exit_summary = ""
-    _prompt_tokens = 0
-    _completion_tokens = 0
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        # Pre-flight PIP gate — blocks stage entry if any PIP has unmet requirements
-        if not _run_pip_preflight_and_gate(task_id, "conceptual_review", llm_id, budget_id, project_path, loop):
-            _exit_reason = "pip_blocked"
-            _exit_summary = "PIP pre-flight gate blocked stage entry."
-            return  # card stays in conceptual_review; resolution jobs dispatched
-
-        result = loop.run_until_complete(
-            run_conceptual_review(
-                task_id=task_id,
-                task_description=task.description or "",
-                planning_result=planning_result,
-                llm_base_url=llm_base_url,
-                llm_model=llm_model,
-                llm_id=llm_id,
-                budget_id=budget_id,
-                project_path=project_path,
-            )
-        )
-        _exit_reason = result.get("outcome", "error")
-        _exit_summary = result.get("summary", "")
-        _prompt_tokens = result.get("total_prompt_tokens", 0)
-        _completion_tokens = result.get("total_completion_tokens", 0)
-        create_transition_result(
-            task_id=task_id,
-            transition="conceptual_to_optimization",
-            outcome=result.get("outcome", "unknown"),
-            vote_summary=result,
-            total_prompt_tokens=_prompt_tokens,
-            total_completion_tokens=_completion_tokens,
-        )
-        if result.get("outcome") == "needs_human":
-            _exit_reason = "needs_human"
-            _exit_summary = result.get("summary", "Reviewer escalated for human judgment.")
-            advance_stage(task_id, "pass", from_stage="conceptual_review")
-            from app.database import create_inbox_message as _create_inbox_cr
-            _create_inbox_cr(
-                subject=f"Human review needed: {(task.title or task_id)[:60]}",
-                source_type="needs_human",
-                task_id=task_id,
-                project_id=task.project,
-                task_title=task.title,
-                outcome="needs_human",
-                data_json=__import__("json").dumps({"summary": _exit_summary}),
-            )
-            logger.info("Task '%s' escalated to HUMAN REVIEW by conceptual reviewer.", task_id)
-        elif result.get("outcome") == "passed":
-            advance_stage(task_id, "pass", from_stage="conceptual_review")
-            logger.info("Task '%s' advanced to OPTIMIZATION via scheduler.", task_id)
-        else:
-            advance_stage(task_id, "fail", from_stage="conceptual_review")
-            _record_demotion_inline(task_id, "conceptual_review", "indev", result.get("summary", ""))
-            logger.info("Task '%s' demoted to INDEV from conceptual review via scheduler.", task_id)
-    except ShutdownError:
-        _exit_reason = "shutdown"
-        _exit_summary = "Server shutdown during conceptual review."
-        logger.info(f"[{AGENT_NAME}] Conceptual review for task '%s' aborted due to server shutdown.", task_id)
-    except Exception:
-        _exit_reason = "error"
-        _exit_summary = "Conceptual review raised an unexpected exception."
-        logger.exception(f"[{AGENT_NAME}] Conceptual review for task '%s' failed.", task_id)
-        advance_stage(task_id, "fail", from_stage="conceptual_review")
-        _record_demotion_inline(task_id, "conceptual_review", "indev", "Exception in conceptual review")
-    finally:
-        close_agent_session(_session_id, _exit_reason, _exit_summary,
-                            prompt_tokens=_prompt_tokens, completion_tokens=_completion_tokens)
-        try:
-            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
-        except Exception:
-            pass
-        try:
-            loop.close()
-        except Exception:
-            pass
-
-
-def _run_security_task(task_id: str, llm_base_url: str, llm_model: str,
-                        max_context: int | None = None,
-                        llm_id: int | None = None,
-                        budget_id: int | None = None,
-                        project_path: str | None = None) -> None:
-    """Run security pipeline for a task already in the 'security' stage.
-
-    Called when a task re-enters the security column after PIP resolution.
-    Optimization has already passed; this function runs the security pre-flight
-    gate and the security pipeline only.
-    """
-    from app.agent.security_review import run_security_pipeline
-    from app.agent.tools import set_task_git_cwd
-    from app.database import get_task, update_task
-    from app.database import create_transition_result, create_agent_session, close_agent_session
-    from app.agent.pipeline_router import advance_stage
-
-    set_task_git_cwd(project_path, task_id=task_id)
-
-    task = get_task(task_id)
-    if not task:
-        return
-
-    _session_id = create_agent_session(
-        task_id=task_id, agent_type="security",
-        llm_id=llm_id, budget_id=budget_id, scheduler_reason="scheduler",
-    )
-    if _session_id is not None:
-        register_db_session(task_id, _session_id)
-    _exit_reason = "error"
-    _exit_summary = ""
-    _prompt_tokens = _completion_tokens = 0
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        # Pre-flight PIP gate — blocks security pipeline if any PIP is unmet
-        if not _run_pip_preflight_and_gate(task_id, "security", llm_id, budget_id, project_path, loop):
-            _exit_reason = "pip_blocked"
-            _exit_summary = "PIP pre-flight gate blocked security entry."
-            return  # card stays in security; resolution jobs dispatched
-
-        sec_result = loop.run_until_complete(
-            run_security_pipeline(
-                task_id=task_id,
-                task_description=task.description or "",
-                llm_base_url=llm_base_url,
-                llm_model=llm_model,
-                llm_id=llm_id,
-                budget_id=budget_id,
-                project_path=project_path,
-            )
-        )
-        _exit_reason = sec_result.get("outcome", "error")
-        _exit_summary = sec_result.get("summary", "")
-        _prompt_tokens = sec_result.get("total_prompt_tokens", 0)
-        _completion_tokens = sec_result.get("total_completion_tokens", 0)
-        create_transition_result(
-            task_id=task_id,
-            transition="security_review",
-            outcome=sec_result.get("outcome", "unknown"),
-            vote_summary=sec_result,
-            total_prompt_tokens=_prompt_tokens,
-            total_completion_tokens=_completion_tokens,
-        )
-
-        if sec_result.get("outcome") == "passed":
-            advance_stage(task_id, "pass", from_stage="security")
-            logger.info("[security] Task '%s' advanced to FINAL REVIEW via scheduler.", task_id)
-        else:
-            # Demotion target is determined by the reviewer (variable: "indev" or "optimization").
-            # Use update_task directly since advance_stage has a single fail edge that may
-            # not match the reviewer's chosen target.
-            demotion = sec_result.get("demotion_target", "indev")
-            update_task(task_id, type=demotion, stage_key=demotion)
-            _record_demotion_inline(task_id, "security", demotion, sec_result.get("summary", ""))
-            logger.warning("[security] Task '%s' demoted to %s via scheduler.", task_id, demotion)
-    except ShutdownError:
-        _exit_reason = "shutdown"
-        _exit_summary = "Server shutdown during security pipeline."
-        logger.info(f"[{AGENT_NAME}] Security for task '%s' aborted due to server shutdown.", task_id)
-    except Exception:
-        _exit_reason = "error"
-        _exit_summary = "Security pipeline raised an unexpected exception."
-        logger.exception(f"[{AGENT_NAME}] Security for task '%s' failed.", task_id)
-        advance_stage(task_id, "fail", from_stage="security")
-        _record_demotion_inline(task_id, "security", "indev", "Exception in security pipeline")
-    finally:
-        close_agent_session(_session_id, _exit_reason, _exit_summary,
-                            prompt_tokens=_prompt_tokens, completion_tokens=_completion_tokens)
-        try:
-            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
-        except Exception:
-            pass
-        try:
-            loop.close()
-        except Exception:
-            pass
-
-
-
-def _run_final_review_task(task_id: str, llm_base_url: str, llm_model: str,
-                            max_context: int | None = None,
-                            llm_id: int | None = None,
-                            budget_id: int | None = None,
-                            project_path: str | None = None) -> None:
-    """Run the final review pipeline for a FINAL_REVIEW task; advance to human_review (manual) on pass."""
-    from app.agent.final_review import run_final_review_pipeline
-    from app.agent.tools import set_task_git_cwd
-    from app.database import get_task, update_task, append_task_history
-    from app.database import (
-        create_transition_vote, create_transition_result,
-        create_agent_session, close_agent_session,
-    )
-    from app.agent.pipeline_router import advance_stage
-
-    set_task_git_cwd(project_path, task_id=task_id)
-
-    task = get_task(task_id)
-    if not task:
-        return
-
-    _session_id = create_agent_session(
-        task_id=task_id, agent_type="final_review",
-        llm_id=llm_id, budget_id=budget_id, scheduler_reason="scheduler",
-    )
-    if _session_id is not None:
-        register_db_session(task_id, _session_id)
-    _exit_reason = "error"
-    _exit_summary = ""
-    _prompt_tokens = _completion_tokens = 0
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        if not _run_pip_preflight_and_gate(task_id, "final_review", llm_id, budget_id, project_path, loop):
-            _exit_reason = "pip_blocked"
-            _exit_summary = "PIP pre-flight gate blocked final_review entry."
-            return
-
-        result = loop.run_until_complete(
-            run_final_review_pipeline(
-                task_id=task_id,
-                task_description=task.description or "",
-                llm_base_url=llm_base_url,
-                llm_model=llm_model,
-                llm_id=llm_id,
-                budget_id=budget_id,
-                project_path=project_path,
-            )
-        )
-        _exit_reason = result.get("outcome", "error")
-        _exit_summary = result.get("summary", "")
-        _prompt_tokens = result.get("total_prompt_tokens", 0)
-        _completion_tokens = result.get("total_completion_tokens", 0)
-        create_transition_result(
-            task_id=task_id,
-            transition="final_review",
-            outcome=result.get("outcome", "unknown"),
-            vote_summary=result,
-            total_prompt_tokens=_prompt_tokens,
-            total_completion_tokens=_completion_tokens,
-        )
-
-        if result.get("outcome") == "needs_human":
-            _exit_reason = "needs_human"
-            _exit_summary = result.get("summary", "Reviewer escalated for human judgment.")
-            advance_stage(task_id, "pass", from_stage="final_review")
-            from app.database import create_inbox_message as _create_inbox_fr
-            _create_inbox_fr(
-                subject=f"Human review needed: {(task.title or task_id)[:60]}",
-                source_type="needs_human",
-                task_id=task_id,
-                project_id=task.project,
-                task_title=task.title,
-                outcome="needs_human",
-                data_json=__import__("json").dumps({"summary": _exit_summary}),
-            )
-            logger.info("[final_review] Task '%s' escalated to HUMAN REVIEW by reviewer.", task_id)
-
-        elif result.get("outcome") == "passed":
-            from app.agent.merge import execute_merge
-            from app.database import get_project_path as _get_project_path
-            # Always use real project root for merge — project_path here is the
-            # worktree path; git checkout base_branch inside a worktree fails.
-            real_pp = (_get_project_path(task.project) if task.project else None) or project_path
-
-            merge_test = execute_merge(
-                task_id, project_path=real_pp, dry_run=True,
-                llm_id=llm_id, budget_id=budget_id,
-            )
-            if merge_test.status == "virtual_passed":
-                _exit_summary = "Final AI review passed. Virtual merge SUCCEEDED. Ready for human review."
-                append_task_history(task_id, "ready_for_review", message=_exit_summary)
-                advance_stage(task_id, "pass", from_stage="final_review")
-                logger.info("[final_review] Task '%s' passed. Advanced to HUMAN REVIEW.", task_id)
-            elif merge_test.status in ("conflict", "test_failure"):
-                _exit_summary = f"Final AI review passed, but virtual merge {merge_test.status.upper()}. Demoting to indev."
-                append_task_history(
-                    task_id, "merge_test_failed",
-                    message=f"{_exit_summary}\n\n{merge_test.error_detail or ''}",
-                )
-                advance_stage(task_id, "fail", from_stage="final_review")
-                _record_demotion_inline(task_id, "final_review", "indev", _exit_summary)
-                logger.warning("[final_review] Task '%s' virtual merge %s. Demoted to indev.", task_id, merge_test.status)
-            else:
-                # "error" = infrastructure failure; code review passed, advance anyway
-                _exit_summary = f"Final AI review passed, but virtual merge FAILED: {merge_test.status}."
-                append_task_history(
-                    task_id, "merge_test_failed",
-                    message=f"{_exit_summary} Detail: {merge_test.error_detail}",
-                )
-                advance_stage(task_id, "pass", from_stage="final_review")
-                logger.warning("[final_review] Task '%s' virtual merge infrastructure error (%s). Advanced to HUMAN REVIEW with warning.", task_id, merge_test.status)
-        else:
-            # Demotion target is determined by the reviewer (variable).
-            # Use update_task directly since advance_stage has a single fail edge.
-            demotion = result.get("demotion_target", "indev")
-            update_task(task_id, type=demotion, stage_key=demotion)
-            _record_demotion_inline(task_id, "final_review", demotion, result.get("summary", ""))
-            logger.warning("[final_review] Task '%s' demoted to %s via scheduler.", task_id, demotion)
-    except ShutdownError:
-        _exit_reason = "shutdown"
-        _exit_summary = "Server shutdown during final review."
-        logger.info(f"[{AGENT_NAME}] Final review for task '%s' aborted due to server shutdown.", task_id)
-    except Exception:
-        _exit_reason = "error"
-        _exit_summary = "Final review raised an unexpected exception."
-        logger.exception(f"[{AGENT_NAME}] Final review for task '%s' failed.", task_id)
-        advance_stage(task_id, "fail", from_stage="final_review")
-        _record_demotion_inline(task_id, "final_review", "indev", "Exception in final review")
-    finally:
-        close_agent_session(_session_id, _exit_reason, _exit_summary,
-                            prompt_tokens=_prompt_tokens, completion_tokens=_completion_tokens)
-        try:
-            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
-        except Exception:
-            pass
-        try:
-            loop.close()
-        except Exception:
-            pass
-
-
 def _record_demotion_inline(task_id: str, from_stage: str, to_stage: str, reason: str) -> None:
     """Record a demotion event - scheduler-local version (avoids importing from main.py)."""
     from datetime import datetime, timezone
@@ -5629,9 +5270,6 @@ def _make_late_handler(fn_name: str) -> Callable:
 
 
 _register_stage_handler("idea",              _make_late_handler("_run_intake"))
-_register_stage_handler("conceptual_review", _make_late_handler("_run_conceptual_review_task"))
-_register_stage_handler("security",          _make_late_handler("_run_security_task"))
-_register_stage_handler("final_review",      _make_late_handler("_run_final_review_task"))
 _register_stage_handler("factory_node",      _make_late_handler("_run_factory_node"))
 
 # ---------------------------------------------------------------------------
@@ -5667,6 +5305,7 @@ _reg_executor("optimization_node",             _run_optimization_node)
 _reg_executor("json_schema_gate",              _run_json_schema_gate)
 _reg_executor("planning_correction_stage",     _run_planning_correction_stage)
 _reg_executor("planning_node",                 _run_planning_node)
+_reg_executor("intake_node",                   _run_intake_node)
 
 # ---------------------------------------------------------------------------
 # Helpers

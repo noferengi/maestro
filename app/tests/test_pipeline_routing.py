@@ -127,9 +127,8 @@ class TestAdvanceHandlersMap:
 
     def test_all_advanceable_types_present(self):
         import main
-        expected = {
-            "idea", "security", "final_review",
-        }
+        # security/final_review/planning/indev now dispatched by scheduler via node executors
+        expected = {"idea"}
         assert set(main.ADVANCE_HANDLERS.keys()) == expected
 
     def test_handler_values_are_nonempty_strings(self):
@@ -140,12 +139,9 @@ class TestAdvanceHandlersMap:
 
     def test_correct_handlers(self):
         import main
-        assert main.ADVANCE_HANDLERS["idea"]         == "_run_intake_pipeline"
-        assert main.ADVANCE_HANDLERS["security"]     == "_run_security_pipeline_bg"
-        assert main.ADVANCE_HANDLERS["final_review"] == "_run_final_review_pipeline_bg"
-        # planning uses planning_node executor (scheduler-dispatched, not advance endpoint)
-        # indev/conceptual_review/optimization route through parallel_agents node executors
-        # human_review is a manual gate — merge via /merge endpoint
+        assert main.ADVANCE_HANDLERS["idea"] == "_run_intake_pipeline"
+        # planning/indev/conceptual_review/security/final_review: scheduler node executors
+        # human_review: manual gate — merge via /merge endpoint
 
     def test_non_advanceable_types_absent(self):
         """architecture, completed, cancelled, subdividing are never in the map."""
@@ -436,58 +432,6 @@ class TestSchedulerDispatch:
             initial_cooldowns={"sched-cool-1": time.time() - 5}
         )
         mock_thread.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# 4. Direct column transitions
-# ---------------------------------------------------------------------------
-
-class TestDirectTransitions:
-    """_advance_to_optimization dispatches conceptual review and moves column."""
-
-    def test_passes_moves_to_optimization(self):
-        task_id = "test-trans-pass"
-        budget_id = None
-        try:
-            budget_id = _make_budget("test-trans-pass-budget")
-            _make_task(task_id, "conceptual_review", description="desc",
-                       budget_id=budget_id)
-            import main
-            from app.database import get_task
-            with patch("app.agent.conceptual_review.run_conceptual_review",
-                       return_value={"outcome": "passed", "votes": []}), \
-                 patch("main._store_pipeline_result_generic"), \
-                 patch("main._resolve_llm_endpoint",
-                       return_value=("http://localhost:8008/v1", "test", 4096)):
-                main._advance_to_optimization(task_id)
-            updated = get_task(task_id)
-            assert updated.type == "optimization"
-        finally:
-            _delete_task(task_id)
-            if budget_id is not None:
-                _cleanup_budget(budget_id)
-
-    def test_failure_demotes_to_indev(self):
-        task_id = "test-trans-fail"
-        budget_id = None
-        try:
-            budget_id = _make_budget("test-trans-fail-budget")
-            _make_task(task_id, "conceptual_review", description="desc",
-                       budget_id=budget_id)
-            import main
-            from app.database import get_task
-            with patch("app.agent.conceptual_review.run_conceptual_review",
-                       return_value={"outcome": "rejected", "votes": []}), \
-                 patch("main._store_pipeline_result_generic"), \
-                 patch("main._resolve_llm_endpoint",
-                       return_value=("http://localhost:8008/v1", "test", 4096)):
-                main._advance_to_optimization(task_id)
-            updated = get_task(task_id)
-            assert updated.type == "indev"
-        finally:
-            _delete_task(task_id)
-            if budget_id is not None:
-                _cleanup_budget(budget_id)
 
 
 # ---------------------------------------------------------------------------

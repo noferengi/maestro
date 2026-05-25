@@ -207,6 +207,8 @@ const fingerprintCache = {};
 
 // Active pipeline template for the current project (null = use default column order)
 let activePipelineTemplate = null;
+// Which template's columns the board currently shows (view filter — not a hard task constraint)
+let activeViewTemplateId = null;
 
 // Load tasks from database on startup (scoped to currentProject)
 async function loadTasksFromDatabase() {
@@ -249,10 +251,14 @@ async function loadTasksFromDatabase() {
 async function _loadActivePipelineTemplate() {
     activePipelineTemplate = null;
     const project = (allProjects || []).find(p => p.name === currentProject);
-    const templateId = project?.pipeline_template_id;
-    if (!templateId) return;
+    // On project switch activeViewTemplateId is reset to null; initialize from project default.
+    // When the user changes the view filter, activeViewTemplateId is already set — preserve it.
+    if (activeViewTemplateId === null) {
+        activeViewTemplateId = project?.pipeline_template_id ?? null;
+    }
+    if (!activeViewTemplateId) return;
     try {
-        activePipelineTemplate = await fetch(`${API_BASE}/pipelines/${templateId}`)
+        activePipelineTemplate = await fetch(`${API_BASE}/pipelines/${activeViewTemplateId}`)
             .then(r => r.ok ? r.json() : null);
     } catch (_) {
         activePipelineTemplate = null;
@@ -889,7 +895,12 @@ function renderTasksFromDatabase() {
     //
     // If currentBigIdeaFilter is set, only show descendants of that Big Idea
     // plus the Big Idea itself.
-    const allVisible = Object.values(taskData).filter(t => t && t.type && t.type !== 'cancelled');
+    const allVisible = Object.values(taskData).filter(t => {
+        if (!t || !t.type || t.type === 'cancelled') return false;
+        // Template view filter: hide tasks belonging to other templates when a view is active
+        if (activeViewTemplateId && t.pipeline_template_id && t.pipeline_template_id !== activeViewTemplateId) return false;
+        return true;
+    });
     const filteredTasks = currentBigIdeaFilter
         ? allVisible.filter(t => {
             if (t.id === currentBigIdeaFilter) return true;
@@ -1367,9 +1378,20 @@ function reconcile(newTasks) {
 
     // 2. Create new cards and rebuild changed ones; architecture tasks are handled
     //    by renderArchBar() — skip them here entirely.
+    //    Also skip tasks filtered out by the active view template.
     let archChanged = false;
     for (const task of newTasks) {
         if (task.type === 'cancelled') continue;
+        // Template view filter: remove and skip tasks not belonging to the current view
+        if (activeViewTemplateId && task.pipeline_template_id && task.pipeline_template_id !== activeViewTemplateId) {
+            if (cardCache[task.id]) {
+                const card = cardCache[task.id];
+                if (card.parentNode) card.parentNode.removeChild(card);
+                delete cardCache[task.id];
+                delete fingerprintCache[task.id];
+            }
+            continue;
+        }
         if (task.type === 'architecture') {
             // Track whether any arch card changed so we know to re-render the bar
             const newFp = taskFingerprint(task);
@@ -2650,6 +2672,7 @@ function _refreshJobIndicators(schedulerData) {
 // Switch to a different project: update state, fetch its tasks, and re-render
 async function switchProject(projectName) {
     currentProject = projectName;
+    activeViewTemplateId = null;  // reset to project default on project switch
 
     document.querySelectorAll('.project-tab').forEach(t => t.classList.remove('active'));
     const matchingTab = document.querySelector(`.project-tab[data-project="${projectName}"]`);
@@ -2696,14 +2719,21 @@ async function loadPipelineTemplates() {
 function populatePipelineDropdown() {
     const sel = document.getElementById('pipeline-select');
     if (!sel) return;
-    const activeProject = allProjects.find(p => p.name === currentProject);
-    const activeTid = activeProject?.pipeline_template_id ?? null;
-    sel.innerHTML = allPipelineTemplates.map(t =>
-        `<option value="${t.id}"${t.id === activeTid ? ' selected' : ''}>${t.name}</option>`
-    ).join('');
+    // Count tasks per template from the current project's loaded tasks
+    const countByTemplate = {};
+    (allTasks || []).forEach(t => {
+        if (t.pipeline_template_id && t.type !== 'architecture' && t.type !== 'cancelled') {
+            countByTemplate[t.pipeline_template_id] = (countByTemplate[t.pipeline_template_id] || 0) + 1;
+        }
+    });
+    sel.innerHTML = allPipelineTemplates.map(t => {
+        const count = countByTemplate[t.id];
+        const label = count ? `${t.name} (${count})` : t.name;
+        return `<option value="${t.id}"${t.id === activeViewTemplateId ? ' selected' : ''}>${label}</option>`;
+    }).join('');
     const editLink = document.getElementById('pipeline-edit-link');
     if (editLink) {
-        const tid = activePipelineTemplate?.id || activeTid;
+        const tid = activeViewTemplateId;
         editLink.href = tid ? `/pipelines/${tid}/edit` : '/pipelines';
     }
 }
@@ -2711,6 +2741,8 @@ function populatePipelineDropdown() {
 async function onPipelineSelectChange(templateIdStr) {
     const templateId = parseInt(templateIdStr, 10);
     if (!currentProject) return;
+    // Set view filter first so _loadActivePipelineTemplate preserves it (not null → no reset)
+    activeViewTemplateId = templateId;
     const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(currentProject)}/pipeline`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -2875,6 +2907,13 @@ function openAddTaskModal(targetStatus) {
     const defaultBudgetId = allBudgets.length > 0 ? allBudgets[0].id : null;
     populateLlmSelect(defaultLlmId);
     populateBudgetSelect(defaultBudgetId);
+    // Populate pipeline selector (default to active view template)
+    const pipelineSel = document.getElementById('new-task-pipeline');
+    if (pipelineSel) {
+        pipelineSel.innerHTML = allPipelineTemplates.map(t =>
+            `<option value="${t.id}"${t.id === activeViewTemplateId ? ' selected' : ''}>${t.name}</option>`
+        ).join('');
+    }
     // Also refresh the new-project LLM dropdown in case it was opened before allLlms loaded.
     populateProjectLlmSelect('new-project-llm-select', currentProjectData ? currentProjectData.llm_id : null);
 
@@ -2888,6 +2927,11 @@ function showArchContentFields(targetStatus) {
     // Architecture cards don't need LLM / budget assignment
     document.getElementById('task-llm-group').style.display    = isArch ? 'none' : 'block';
     document.getElementById('task-budget-group').style.display = isArch ? 'none' : 'block';
+    // Pipeline selector: only for non-arch tasks when multiple templates exist
+    const pipelineGroup = document.getElementById('task-pipeline-group');
+    if (pipelineGroup) {
+        pipelineGroup.style.display = (!isArch && allPipelineTemplates.length > 1) ? 'block' : 'none';
+    }
     // Owner / tags are also not meaningful for arch cards — hide them
     const ownerRow = document.getElementById('task-owner') && document.getElementById('task-owner').closest('.form-group');
     const tagsRow  = document.getElementById('task-tags')  && document.getElementById('task-tags').closest('.form-group');
@@ -3521,13 +3565,16 @@ async function saveTask() {
             return;
         }
 
+        const pipelineSel = document.getElementById('new-task-pipeline');
+        const _ptid = (!isArch && pipelineSel && pipelineSel.value) ? parseInt(pipelineSel.value) : null;
         const newTaskData = {
             title,
             type: currentTargetStatus,
             description,
             ...(isArch ? {} : { owner, tags, llm_id, budget_id }),
             project: currentProject,
-            ...(content && { content })
+            ...(content && { content }),
+            ...(_ptid ? { pipeline_template_id: _ptid } : {}),
         };
 
         const response = await fetch(`${API_BASE}/tasks`, {

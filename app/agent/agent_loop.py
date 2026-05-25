@@ -317,7 +317,7 @@ class AgentLoop(ABC):
 class ReviewerLoop(AgentLoop):
     """
     Concrete subclass for 'read code → return verdict' loops.
-    Used by ConceptualReviewPipeline, SecurityPipeline, FinalReviewPipeline.
+    Used by pipeline reviewer loops (voting_panel, etc.).
     run() returns a Vote object.
     """
 

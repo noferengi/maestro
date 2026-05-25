@@ -113,21 +113,24 @@ _LEGACY_TRANSITIONS: dict[str, dict[str, str]] = {
 # ---------------------------------------------------------------------------
 
 def _get_template_id_for_task(task) -> int | None:
-    """Return the pipeline_template_id for a task's project, falling back to default."""
-    template_id = None
+    """Return the pipeline_template_id for a task, falling back to project then default."""
+    # Prefer the task's own template (authoritative since migration 0077)
+    tid = getattr(task, "pipeline_template_id", None)
+    if isinstance(tid, int):
+        return tid
+    # Fallback for tasks pre-dating migration 0077
     if task.project_ref is not None:
         raw = getattr(task.project_ref, "pipeline_template_id", None)
         if isinstance(raw, int):
-            template_id = raw
-    if template_id is None:
-        try:
-            from app.database import get_default_template
-            tmpl = get_default_template()
-            if tmpl:
-                template_id = tmpl.id
-        except Exception:
-            pass
-    return template_id
+            return raw
+    try:
+        from app.database import get_default_template
+        tmpl = get_default_template()
+        if tmpl:
+            return tmpl.id
+    except Exception:
+        pass
+    return None
 
 
 def _current_stage_key(task) -> str | None:

@@ -1,12 +1,77 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Maestro Agents when working with code in this repository.
 
 ## What this is
 
-Project Maestro — a Kanban board with an agentic LLM orchestration backend. The board is the UI face of a "Wiggum Loop": a Do-While that drives a local LLM through Design → Implement → Test → Verify cycles until all DAG task nodes reach ACCEPTED. Tasks transition IDEA → PLANNING → INDEV → CONCEPTUAL_REVIEW → OPTIMIZATION → SECURITY → FINAL_REVIEW → HUMAN_REVIEW → COMPLETED, gated by a multi-stage intake pipeline with LLM voting.
+Project Maestro — a general-purpose agentic workflow platform. The kanban board is the
+face of an LLM orchestration backend that drives any workflow through a user-defined
+pipeline of AI agents.
 
-**See `ARCHITECTURE.md`** for the full system reference: pipeline stages, compute resource model (LLM Endpoints + Compute Nodes), scheduler tick lifecycle, all agent types, planning pipeline deep-dive, git worktree isolation, safety layers, and data schema overview. **See `PRD.md`** for the product roadmap and feature specs.
+**The pipeline is malleable.** Stage definitions, agent assignments, transition edges,
+and kanban columns are all stored in the DB as `pipeline_templates` — not hardcoded in
+Python or JS. A visual **Litegraph.js node editor** at `/pipelines/{id}/edit` lets you
+draw stages, wire transitions, and use ⚡ to generate system prompts. The kanban board
+derives its columns from whatever template the project uses.
+
+**Built-in templates** ship out of the box: Software Development (the original pipeline),
+Novel Writing, Research Report, Data Analysis, Mathematics/Proof Exploration, Bug Triage,
+and an Overnight Story Factory. Templates can be cloned, edited, exported as JSON, and
+shared.
+
+**Direction:** The hardcoded Software Development pipeline (`IDEA → PLANNING → INDEV →
+CONCEPTUAL_REVIEW → OPTIMIZATION → SECURITY → FINAL_REVIEW → HUMAN_REVIEW → COMPLETED`)
+is now the "Software Development" built-in template. `task.type` is being phased out in
+favor of `task.stage_key`; both are kept in sync during the transition. New features
+should be designed for the malleable system, not the hardcoded pipeline.
+
+**See `ARCHITECTURE.md`** for the full system reference: compute resource model, scheduler
+tick lifecycle, all agent types, git worktree isolation, and safety layers. **See
+`CLAUDE_PIPELINE.md`** for the malleable pipeline system reference (templates, agent
+registry, CRUD API, editor, document store, card factory, autopilot). **See
+`plans/PRD.md`** for the product roadmap.
+
+## Database: PostgreSQL only
+
+**Maestro runs on PostgreSQL. SQLite is abandoned.** Do not add SQLite compatibility shims,
+`IF NOT EXISTS` fallbacks, `conn.is_postgres` branches, or any other SQLite workarounds to
+new code or migrations. SQLite support constrained every migration and test; it is gone.
+Any effort spent preserving SQLite compatibility is unwelcome and will be reverted.
+
+The test suite uses a real PostgreSQL database (configured via `MAESTRO_TEST_DB` →
+`MAESTRO_DATABASE_URL`). There is no `data/test.db`. There is no `data/kanban.db`.
+
+## Environment & configuration
+
+**Remote server — `arcbox`:** A single remote machine called `arcbox` hosts both the
+PostgreSQL database cluster and the Docker daemon. All database URLs point to `arcbox:5432`
+and all Docker operations route through `DOCKER_HOST=ssh://freazer@arcbox`. The math
+pipeline sandbox image (`sympy-lean4-sandbox:latest`, ~2 GB, Lean 4.29.1 + SymPy 1.14)
+is pre-built and resident on arcbox — container startup is instant with no network download.
+
+**Credentials:** All secrets and connection overrides are fully configured in `.env` and
+must not be re-entered or re-prompted. The `.env` file sets:
+
+```
+MAESTRO_DATABASE_URL          # app user → arcbox PostgreSQL
+MAESTRO_ADMIN_DATABASE_URL    # admin user → arcbox PostgreSQL (DDL / migrations)
+MAESTRO_TEST_DATABASE_URL     # test DB → arcbox PostgreSQL
+MAESTRO_TEST_ADMIN_DATABASE_URL
+DOCKER_HOST=ssh://freazer@arcbox   # remote Docker daemon
+TAVILY_API_KEY / BRAVE_API_KEY     # search provider keys
+```
+
+Copy `.env.example` to `.env` and fill in credentials for a fresh setup; on this machine
+the file is already populated and all services are reachable.
+
+Config load order (highest priority wins): env vars → `maestro.ini` → built-in defaults.
+
+**maestro.ini sections:** `[intake]`, `[subdivision]`, `[capacity]`, `[context_warnings]`,
+`[scheduler]`, `[verdicts]`, `[search]`, `[pip]`, `[monitor]`, `[pipeline_editor]`.
+`[pipeline_editor] llm_id` pins a cheap fast model for ⚡ field-generation calls.
+
+**Full schema reference:** `CLAUDE_SCHEMA.md` — every table, column, type, nullability,
+and default value. **Pipeline system reference:** `CLAUDE_PIPELINE.md`.
 
 ## Maestro Server
 
@@ -71,10 +136,10 @@ five pattern flags: `rapid_cycling`, `token_limited`, `zombie_sessions`, `stage_
 
 ### When MCP tool calls hang or return no result
 
-MCP tools in this project are **synchronous** and make direct PostgreSQL calls via
-SQLAlchemy with no timeout configured (`mcp_tools/helpers.py:15-26`). If the scheduler
-is holding a write lock (e.g., committing a task update, running an intake vote, persisting
-budget entries), MCP reads queue behind it and can appear to hang.
+MCP tools in this project are **synchronous** and make direct PostgreSQL calls with no timeout
+configured (`mcp_tools/helpers.py:15-26`). If the scheduler is holding a write lock (e.g.,
+committing a task update, running an intake vote, persisting budget entries), MCP reads queue
+behind it and can appear to hang.
 
 **Root causes (structural — can happen any time):**
 - `mcp_tools/helpers.py` — `get_conn()` / `get_rw_conn()` have no `timeout=` argument
@@ -118,7 +183,7 @@ venv\Scripts\python.exe -m pytest app/tests/ -q
 venv/Scripts/python.exe -m pytest app/tests/ -q
 ```
 
-If you are **Qwen**, the shell is actually Windows Powershell. Use **backward slashes** — forward slashes are instead
+If you are **Qwen**, **Gemini**, or a **Maestro Agent**, the shell is actually Windows Powershell. Use **backward slashes** — forward slashes are instead
 silently dropped, mushing the path together:
 
 ```
@@ -178,8 +243,6 @@ venv/Scripts/python.exe scripts/create_migration.py "your migration name"
 # prints the path of the created file, e.g. app/migrations/versions/0055_your_migration_name.py
 ```
 
-**Full schema reference:** See `CLAUDE_SCHEMA.md` in the project root — every table, column, type, nullability, and default value.
-
 ## Debugging scheduler and card status
 
 Use `scripts/inspect_cards.py` to diagnose why cards aren't progressing. All output is ASCII-safe (Windows cp1252 terminal compatible).
@@ -204,81 +267,117 @@ Key diagnostics to check first when cards are stuck:
 
 For stuck planning tasks use `diagnose_task(task_id)` — covers budget traces, gate history, and session state in one call.
 
+## Direct PostgreSQL access
+
+`scripts/psql.py` — runs SQL against the live database using credentials from `.env`. No
+connection string needed; the script loads `MAESTRO_DATABASE_URL` (app user, default) or
+`MAESTRO_ADMIN_DATABASE_URL` (`--admin`, required for VACUUM / DDL).
+
+```bash
+# Common one-liners
+venv/Scripts/python.exe scripts/psql.py --list-tables               # all tables: size, live/dead rows
+venv/Scripts/python.exe scripts/psql.py --budget-entries            # heap vs TOAST vs indexes for budget_entries
+venv/Scripts/python.exe scripts/psql.py "SELECT count(*) FROM tasks WHERE is_active"
+venv/Scripts/python.exe scripts/psql.py --admin "SELECT pg_size_pretty(pg_database_size('maestro_db'))"
+venv/Scripts/python.exe scripts/psql.py --vacuum-full budget_entries  # VACUUM FULL shortcut (admin + autocommit)
+echo "SELECT version()" | venv/Scripts/python.exe scripts/psql.py --admin -  # stdin
+```
+
+Use `--admin` for anything that needs DDL privileges: `VACUUM FULL`, `ALTER TABLE`,
+`GRANT`, `REINDEX`. The `--vacuum-full <table>` shorthand handles autocommit automatically
+and prints the new size when done.
+
 ## Architecture
 
 ### Backend (`app/`)
-- `main.py` — FastAPI app. All routes. Mounts static files from `app/web/`. On startup calls `init_db()` + `seed_sample_tasks()` (skips seeding if data exists). Quick-action endpoints: `/demote`, `/set-stage`, `/clone`, `/pin`, `/run-planning`, `/run-review`, `/run-security`, `/run-final-review`. Task serialization (`_task_to_dict`) always includes a `"pips"` array. `sync_update_llm_with_cache` / `sync_delete_llm_with_cache` call `invalidate_llm_cache` after LLM record mutations so stale context/capacity state is flushed immediately.
-- `database/` — DB package. `models.py` has SQLAlchemy ORM definitions. `__init__.py` re-exports the main CRUD surface. Specialized modules: `crud_pipeline.py` (planning/review/component results), `crud_tasks.py` (task + PIP CRUD), `crud_sessions.py` (agent sessions), `crud_infra.py` (LLMs, budgets, compute nodes), `crud_jobs.py` (research + file-summary jobs), `crud_costs.py` (budget entries + expenses), `crud_projects.py`, `crud_files.py`, `crud_maestro.py`, `crud_survey.py`, `crud_inbox.py`, `session.py` (SQLAlchemy session factory). `delete_task()` is a **soft-delete**: sets `is_active=False` on the target and all descendants via BFS. All read queries filter `is_active=True`. `upsert_project()` uses `...` (Ellipsis) sentinel for `llm_id`/`budget_id` — pass Ellipsis to leave unchanged, None to clear. `pip_status_at_stage(pip, stage)` derives status at read time — no stored status column.
-- `migrations/runner.py` — PostgreSQL migration engine using psycopg2 via `MAESTRO_ADMIN_DATABASE_URL`.
+- `main.py` — FastAPI app. All routes. Mounts static files from `app/web/`. On startup calls `init_db()` + `seed_sample_tasks()` (skips seeding if data exists) + `_check_builtin_templates()` (drift warning). Quick-action endpoints: `/demote`, `/set-stage`, `/clone`, `/pin`, `/run-planning`, `/run-review`, `/run-security`, `/run-final-review`. Task serialization (`_task_to_dict`) always includes a `"pips"` array. `sync_update_llm_with_cache` / `sync_delete_llm_with_cache` call `invalidate_llm_cache` after LLM record mutations.
+- `database/` — DB package. See `app/database/CLAUDE.md` for full file map. Core modules: `models.py` (all ORM models), `crud_tasks.py` (task + PIP CRUD), `crud_projects.py`, `crud_infra.py`, `crud_costs.py` (budget entries store **deltas** only since migration 0076; `reconstruct_messages_for_entry(entry_id, db)` accumulates them back to full history), `crud_pipeline.py`, `crud_jobs.py`, `crud_files.py`, `crud_malleable.py` (pipeline templates, stages, transitions, arch categories, custom agent defs, system_settings, project_settings — 50+ functions), `crud_documents.py` (project document store), `crud_factory.py` (factory_runs audit), `session.py`. `delete_task()` is a **soft-delete** (BFS, sets `is_active=False`). `upsert_project()` uses `...` (Ellipsis) sentinel for `llm_id`/`budget_id`.
+- `migrations/runner.py` — PostgreSQL migration engine. Latest migrations: 0074 (expand AI review group), 0075 (custom agent definition extensions), 0076 (budget_entries delta storage — adds `prompt_message_count`).
 
 ### Agent system (`app/agent/`)
 
-See **`app/agent/CLAUDE.md`** for per-file descriptions, key invariants, and project isolation details.
+See **`app/agent/CLAUDE.md`** for per-file descriptions, key invariants, and project isolation details. New files since the malleable pipeline work: `pipeline_router.py` (stage transitions), `agent_registry.py` (AGENT_REGISTRY dict), `custom_llm_agent.py` (DB-driven agent), `verifiers.py` (formal verification gate), `workspace.py` (deletion-protected file ops), `doc_store.py` (shared document store), `card_factory.py` + `factory_sources.py` (batch card creation from external data).
 
 ### Frontend (`app/web/`)
 
-See **`app/web/CLAUDE.md`** for board, arch bar, column map, diagnostics viewer, and CSS reference.
+See **`app/web/CLAUDE.md`** for board, arch bar, column map, diagnostics viewer, and CSS reference. New pages: `pipeline_editor.html` / `pipeline_editor.js` / `pipeline_editor.css` (Litegraph canvas editor at `/pipelines/{id}/edit`), `gallery.html` (template gallery at `/pipelines`).
 
 ### Configuration (`maestro.ini`)
-INI file with sections: `[intake]`, `[subdivision]`, `[capacity]`, `[context_warnings]`, `[scheduler]`, `[verdicts]`, `[search]`, `[pip]`.
+INI file. Key sections:
 
-- `[intake]` — research lives, tiebreaker, allowed research tools, `context_budget_ratio` (fraction of context window for research agent, default 0.60). `research_agent_tools` includes `web_search` — dispatches `WebSearchAgent` asynchronously (search + fetch + synthesize). `web_fetch` is intentionally absent; it is private to `WebSearchAgent`.
-- `[subdivision]` — max_depth, max_retries_per_level, max_total_sub_ideas, subdivision_agent_tools, `context_budget_ratio` (default 0.60). Both `subdivision_agent_tools` and `subdivision_planning_tools` include `web_search` for domain research during decomposition.
-- `[search]` — `provider` (duckduckgo | brave, default duckduckgo), `brave_api_key` (required only if provider=brave). Env overrides: `MAESTRO_SEARCH_PROVIDER`, `BRAVE_API_KEY`.
-- `[pip]` — `resolution_max_turns` (default: 20, max turns for `PIPResolutionAgent` before it auto-stalls).
+- `[intake]` — research lives, tiebreaker, allowed research tools, `context_budget_ratio` (default 0.60). `research_agent_tools` includes `web_search` (dispatches `WebSearchAgent`). `web_fetch` is private to `WebSearchAgent`.
+- `[subdivision]` — max_depth, max_retries_per_level, max_total_sub_ideas, `context_budget_ratio` (default 0.60).
+- `[search]` — `provider` (duckduckgo | brave | tavily). Env overrides: `MAESTRO_SEARCH_PROVIDER`, `BRAVE_API_KEY`, `TAVILY_API_KEY`.
+- `[pip]` — `resolution_max_turns` (default: 20).
 - `[monitor]` — `duration_seconds` (default: 300, blocking window for `mcp__maestro__monitor()`).
+- `[pipeline_editor]` — `llm_id` (cheap fast model for ⚡ field-generation calls; optional).
 
 ### Data flow
-Tasks are per-project. Switching projects calls `loadTasksFromDatabase()` which re-fetches `/api/projects/{name}/tasks` and fully rebuilds `taskData`. `renderTasksFromDatabase()` groups tasks by type, sorts each group by `position`, appends pipeline cards to their column containers, and calls `renderArchBar()` to rebuild the architecture bar. Architecture tasks (`type='architecture'`) are excluded from the pipeline columns array and rendered only in the arch bar. Drag-and-drop reorder POSTs to `/api/tasks/{id}/reorder`, then re-fetches the full project task list to get authoritative positions before re-rendering. When `columnMapActive` is true, `reconcile()` only refreshes `taskData` and skips DOM reconciliation.
+Tasks are per-project. Switching projects calls `loadTasksFromDatabase()` which re-fetches `/api/projects/{name}/tasks`, the project's active pipeline template (`/api/pipelines/{id}`), and arch categories (`/api/projects/{name}/arch-categories`). `renderTasksFromDatabase()` derives kanban columns from `activePipelineTemplate.stages` (sorted by `position`) — no hardcoded column list. Architecture tasks (`type='architecture'`) are excluded from pipeline columns and rendered only in the arch bar. Drag-and-drop reorder POSTs to `/api/tasks/{id}/reorder`. When `columnMapActive` is true, `reconcile()` skips DOM reconciliation.
 
 ### Key API routes
 ```
-GET    /api/projects                      — list projects (name, path, description, llm_id, budget_id)
+# Projects & tasks
+GET    /api/projects                      — list projects
 POST   /api/projects                      — create project
-PUT    /api/projects/{name}               — update project (llm_id/budget_id use Ellipsis sentinel)
+PUT    /api/projects/{name}               — update (llm_id/budget_id use Ellipsis sentinel)
 DELETE /api/projects/{name}               — delete project record
-GET    /api/projects/{project_name}/tasks — all tasks for a project (active only)
-POST   /api/tasks                         — create task (include project field)
+GET    /api/projects/{project_name}/tasks — all tasks (active only)
+POST   /api/tasks                         — create task
 PUT    /api/tasks/{id}                    — update task
-DELETE /api/tasks/{id}                    — soft-delete: sets is_active=False on task + all descendants; returns {deactivated: N}
-POST   /api/tasks/{id}/reorder            — {position, type} — reorder within column
-PATCH  /api/tasks/map-positions           — [{id, map_x, map_y}] — bulk-save 2D positions (no history)
-POST   /api/tasks/{task_id}/advance       — trigger intake pipeline (IDEA→PLANNING)
-GET    /api/tasks/{task_id}/transition-status — latest transition result + vote history
-POST   /api/tasks/{task_id}/demote        — move one stage backward; optional body {target} to force a stage; records demotion
-POST   /api/tasks/{task_id}/set-stage     — {stage} force to any pipeline stage (no demotion record)
-POST   /api/tasks/{task_id}/clone         — duplicate as new IDEA in same project
-POST   /api/tasks/{task_id}/pin           — set position=0 (top of column)
-POST   /api/tasks/{task_id}/run-planning  — trigger PlanningPipeline + gate in background
-POST   /api/tasks/{task_id}/run-review    — trigger ConceptualReviewPipeline in background
-POST   /api/tasks/{task_id}/run-security  — trigger OptimizationPipeline + SecurityPipeline in background
-POST   /api/tasks/{task_id}/run-final-review — trigger FinalReviewPipeline in background
-POST   /api/agent/run/{task_id}           — start MaestroLoop (background)
+DELETE /api/tasks/{id}                    — soft-delete (BFS); returns {deactivated: N}
+POST   /api/tasks/{id}/reorder            — {position, type}
+PATCH  /api/tasks/map-positions           — [{id, map_x, map_y}] bulk-save
+POST   /api/tasks/{task_id}/advance       — intake pipeline (IDEA→first stage)
+POST   /api/tasks/{task_id}/demote        — backward; optional {target}; records demotion
+POST   /api/tasks/{task_id}/set-stage     — {stage} force (no demotion record)
+POST   /api/tasks/{task_id}/clone / pin / run-planning / run-review / run-security / run-final-review
+
+# Malleable pipeline (full CRUD — see CLAUDE_PIPELINE.md for detail)
+GET/POST/PUT/DELETE  /api/pipelines[/{id}]
+GET/POST/PUT/DELETE  /api/pipelines/{id}/stages[/{stage_id}]
+POST                 /api/pipelines/{id}/stages/{stage_id}/delete-with-redirect
+GET/POST/PUT/DELETE  /api/pipelines/{id}/transitions[/{t_id}]
+GET/POST/PUT/DELETE  /api/pipelines/{id}/groups[/{g_id}]
+GET/POST/PUT/DELETE  /api/pipelines/{id}/arch-categories[/{c_id}]
+GET/PUT/DELETE       /api/projects/{name}/documents[/{key}]    — document store
+GET                  /api/projects/{name}/arch-categories      — active template categories
+POST                 /api/projects/{name}/pipeline             — assign template (body: {template_id})
+POST                 /api/projects/{name}/use-template         — alias for /pipeline
+GET/POST/PUT/DELETE  /api/agent-definitions[/{id}]             — custom agent definitions
+GET/POST             /api/settings/autopilot                   — autopilot toggle + mission
+GET/POST             /api/projects/{name}/settings             — per-project overrides
+GET                  /api/pipelines/{id}/export                — JSON
+POST                 /api/pipelines/import                     — JSON → new template
+POST                 /api/pipelines/generate-field             — ⚡ LLM field generation
+GET                  /api/pipelines/agent-types                — registry listing
+POST                 /api/pipelines/stages/{id}/trigger-factory — manual factory trigger
+GET                  /api/tasks/{id}/archived-files            — workspace deletion audit
+POST                 /api/tasks/{id}/undelete                  — restore archived file
+
+# Agent & scheduler
+POST   /api/agent/run/{task_id}           — start MaestroLoop
 GET    /api/agent/status/{task_id}        — loop status
-POST   /api/agent/stop/{task_id}          — request graceful stop (MaestroLoop only; pipeline agents are not stoppable)
+POST   /api/agent/stop/{task_id}          — graceful stop
 GET    /api/agent/tasks/ready             — DAG-ready tasks
 GET    /api/scheduler/status              — scheduler state
-CRUD   /api/llms, /api/llms/{id}          — LLM endpoint management (compute_node_id accepted in create/update)
-CRUD   /api/budgets, /api/budgets/{id}    — budget management
-CRUD   /api/compute-nodes, /api/compute-nodes/{id} — compute node management
-GET    /api/budget-entries                — budget entry listing; task_id=__file_summaries__ returns null-task entries
-GET    /api/budget-entries/{id}/full      — single entry with full prompt/response
-GET    /api/budgets/{id}/summary          — aggregated budget usage
-GET    /api/tasks/{id}/children           — direct child tasks of a subdivided task
-GET    /api/tasks/{id}/subdivision-records — audit trail of subdivision attempts
-GET    /api/diagnostics/tasks             — tasks with LLM activity + synthetic __file_summaries__ row
-GET    /api/projects/{name}/arch-gen-jobs — pending/running arch gen jobs [{id, category, status, created_at, retry_count}]
-GET    /api/tasks/{id}/pips               — full PIP list with verification history per PIP (for PIP detail modal)
-GET    /api/tasks/{id}/stage-summary      — rolled-up stage status (planning gate, component counts, review outcomes)
-GET    /api/tasks/{id}/planning-result    — full planning_result row (file_manifest, steps, interface_contracts, gate_checks, etc.)
-GET    /api/tasks/{id}/component-status   — list of component_results rows for this task
-GET    /api/tasks/{id}/optimization-status — latest optimization pipeline outcome
-GET    /api/tasks/{id}/security-status    — list of security reviewer verdicts
-GET    /api/tasks/{id}/final-review-status — list of final-review verdicts
-GET    /api/tasks/{id}/merge-status       — branch name + merge_commit_sha if merged
-GET    /api/tasks/{id}/diff               — git diff for the task branch (method, branch, stat, diff text, truncated flag)
-GET    /api/tasks/{id}/research-jobs      — research jobs associated with this task
-GET    /api/tasks/{id}/transition-status  — full transition history with per-run vote detail (powers Stage Journal transitions section)
+
+# Infrastructure
+CRUD   /api/llms[/{id}]                   — LLM endpoints
+CRUD   /api/budgets[/{id}]                — budgets
+CRUD   /api/compute-nodes[/{id}]          — compute nodes
+GET    /api/budget-entries                — budget entries (task_id=__file_summaries__ for prewarm)
+GET    /api/budget-entries/{id}/full      — full reconstructed prompt/response (accumulates deltas)
+GET    /api/sessions/{session_id}/entries/full — all entries for a session with raw prompt_delta per entry
+GET    /api/budgets/{id}/summary          — aggregated usage
+
+# Diagnostics / task detail
+GET    /api/tasks/{id}/children / subdivision-records / pips / stage-summary
+GET    /api/tasks/{id}/planning-result / component-status / optimization-status
+GET    /api/tasks/{id}/security-status / final-review-status / merge-status
+GET    /api/tasks/{id}/diff / research-jobs / transition-status / documents
+GET    /api/diagnostics/tasks
+GET    /api/projects/{name}/arch-gen-jobs
 ```
 
 ## Safety rules (for the agent tools)

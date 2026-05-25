@@ -2,9 +2,9 @@
 Tests for explicit project_path threading through pipeline entry points.
 
 Verifies that:
-1. run_shell_security / run_shell_review use an explicit project_path when given
-2. Both functions fall back to the ContextVar when no explicit path is given
-3. All pipeline entry points accept a project_path keyword argument
+1. run_shell_security uses an explicit project_path when given
+2. run_shell_security falls back to the ContextVar when no explicit path is given
+3. Active pipeline entry points accept a project_path keyword argument
 """
 
 from __future__ import annotations
@@ -55,37 +55,6 @@ class TestRunShellSecurity(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# run_shell_review
-# ---------------------------------------------------------------------------
-
-class TestRunShellReview(unittest.TestCase):
-
-    def test_uses_explicit_project_path(self):
-        """_run_tool_subprocess should receive the explicit cwd."""
-        from app.agent.final_review import run_shell_review
-
-        with patch("app.agent.tools._run_tool_subprocess", return_value=(0, "pytest ok")) as mock_run:
-            run_shell_review("pytest", ".", project_path="/explicit/path")
-            args, kwargs = mock_run.call_args
-            self.assertEqual(args[1], "/explicit/path")
-
-    def test_falls_back_to_context_var(self):
-        """When project_path is None, cwd comes from the ContextVar."""
-        from app.agent.final_review import run_shell_review
-        from app.agent.tools import set_task_git_cwd
-
-        set_task_git_cwd("/contextvar/path")
-
-        try:
-            with patch("app.agent.tools._run_tool_subprocess", return_value=(0, "pytest ok")) as mock_run:
-                run_shell_review("pytest", ".")
-                args, kwargs = mock_run.call_args
-                self.assertEqual(args[1], "/contextvar/path")
-        finally:
-            set_task_git_cwd(None)
-
-
-# ---------------------------------------------------------------------------
 # Pipeline entry point signatures
 # ---------------------------------------------------------------------------
 
@@ -96,14 +65,6 @@ class TestPipelineSignatures(unittest.TestCase):
         sig = inspect.signature(func)
         return "project_path" in sig.parameters
 
-    def test_run_security_pipeline(self):
-        from app.agent.security_review import run_security_pipeline
-        self.assertTrue(self._has_project_path(run_security_pipeline))
-
-    def test_run_final_review_pipeline(self):
-        from app.agent.final_review import run_final_review_pipeline
-        self.assertTrue(self._has_project_path(run_final_review_pipeline))
-
     def test_run_planning_pipeline(self):
         from app.agent.planning import run_planning_pipeline
         self.assertTrue(self._has_project_path(run_planning_pipeline))
@@ -111,18 +72,6 @@ class TestPipelineSignatures(unittest.TestCase):
     def test_run_planning_gate(self):
         from app.agent.planning_gate import run_planning_gate
         self.assertTrue(self._has_project_path(run_planning_gate))
-
-    def test_run_conceptual_review(self):
-        from app.agent.conceptual_review import run_conceptual_review
-        self.assertTrue(self._has_project_path(run_conceptual_review))
-
-    def test_run_optimization_pipeline(self):
-        from app.agent.optimization import run_optimization_pipeline
-        self.assertTrue(self._has_project_path(run_optimization_pipeline))
-
-    def test_run_dev_orchestrator(self):
-        from app.agent.dev_orchestrator import run_dev_orchestrator
-        self.assertTrue(self._has_project_path(run_dev_orchestrator))
 
 
 if __name__ == "__main__":

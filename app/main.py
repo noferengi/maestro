@@ -240,6 +240,10 @@ def create_new_task(task_data: dict):
                    f"Create an IDEA and advance it through the pipeline."
         )
 
+    _ptid = task_data.get('pipeline_template_id') or None
+    if _ptid is not None:
+        _ptid = int(_ptid)
+
     task = create_task(
         title=task_data['title'],
         task_type=requested_type,
@@ -250,7 +254,8 @@ def create_new_task(task_data: dict):
         llm_id=task_data.get('llm_id'),
         budget_id=task_data.get('budget_id'),
         prerequisites=task_data.get('prerequisites', []),
-        project=task_data.get('project', 'TheMaestro')
+        project=task_data.get('project', 'TheMaestro'),
+        pipeline_template_id=_ptid,
     )
 
     if not task:
@@ -833,9 +838,7 @@ def _pipeline_session(func):
     # Map wrapper function names to agent_type values
     _AGENT_TYPE_MAP = {
         "_run_regenerate_subdivision": "subdivision",
-        "_run_review_pipeline_bg": "conceptual_review",
-        "_run_security_pipeline_bg": "security",
-        "_run_final_review_pipeline_bg": "final_review",
+
         "_run_loop_bg": "maestro_loop",
         "_run_intake_bg": "intake",
         "_run_reflection_bg": "reflection_agent",
@@ -1064,354 +1067,6 @@ def _run_intake_pipeline(task_id: str) -> None:
 
 
 
-@_pipeline_session
-def _advance_to_optimization(task_id: str) -> None:
-    """Auto-advance from conceptual review to optimization."""
-    project_path = None
-    worktree_path = None
-    try:
-        import asyncio
-        from app.agent.conceptual_review import run_conceptual_review
-
-        task = get_task(task_id)
-        if not task:
-            return
-        project_path = _setup_thread_context(task)
-        worktree_path, _aborted = _setup_worktree(task_id, project_path)
-        if _aborted:
-            return
-
-        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
-        planning_result_obj = get_planning_result(task_id)
-        planning_result = {}
-        if planning_result_obj:
-            planning_result = {
-                "file_manifest": json.loads(planning_result_obj.file_manifest or "[]"),
-                "dependency_graph": json.loads(planning_result_obj.dependency_graph or "{}"),
-                "implementation_steps": json.loads(planning_result_obj.implementation_steps or "[]"),
-                "test_strategy": json.loads(planning_result_obj.test_strategy or "[]"),
-            }
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(
-                run_conceptual_review(
-                    task_id=task_id,
-                    task_description=task.description or "",
-                    planning_result=planning_result,
-                    llm_base_url=llm_base_url,
-                    llm_model=llm_model,
-                    llm_id=task.llm_id,
-                    budget_id=task.budget_id,
-                    project_path=worktree_path,
-                )
-            )
-        except ShutdownError:
-            logger.info("[review] Pipeline for '%s' aborted due to server shutdown.", task_id)
-            return
-        except PipelineAbortedError as exc:
-            logger.warning(
-                "[review] Task '%s' aborted at stage '%s': %s — will retry.",
-                task_id, exc.stage, exc.cause,
-            )
-            try:
-                _store_infra_abort_result(task_id, exc, getattr(task, "budget_id", None),
-                                          transition="conceptual_to_optimization")
-            except Exception:
-                pass
-            return
-        except Exception:
-            logger.exception("[review] Pipeline for '%s' failed.", task_id)
-            return
-
-        try:
-            _store_pipeline_result_generic(task_id, result, task.budget_id, "conceptual_to_optimization")
-
-            if result.get("outcome") == "passed":
-                update_task(task_id, type="optimization")
-                logger.info("[review] Task '%s' advanced to OPTIMIZATION.", task_id)
-            else:
-                update_task(task_id, type="indev")
-                logger.warning("[review] Task '%s' demoted to IN DEV.", task_id)
-        finally:
-            loop.close()
-    except Exception as exc:
-        logger.exception("[review] Pipeline for '%s' failed.", task_id)
-    finally:
-        _teardown_worktree(task_id, project_path, worktree_path)
-
-
-@_pipeline_session
-def _run_security_only_bg(task_id: str) -> None:
-    """On-demand: run only the security review pipeline (no optimization)."""
-    project_path = None
-    worktree_path = None
-    try:
-        import asyncio
-        from app.agent.security_review import run_security_pipeline
-
-        task = get_task(task_id)
-        if not task:
-            return
-        project_path = _setup_thread_context(task)
-        worktree_path, _aborted = _setup_worktree(task_id, project_path)
-        if _aborted:
-            return
-        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            sec_result = loop.run_until_complete(
-                run_security_pipeline(
-                    task_id=task_id,
-                    task_description=task.description or "",
-                    llm_base_url=llm_base_url,
-                    llm_model=llm_model,
-                    llm_id=task.llm_id,
-                    budget_id=task.budget_id,
-                    project_path=worktree_path,
-                )
-            )
-            _store_pipeline_result_generic(task_id, sec_result, task.budget_id, "security_review")
-            if sec_result.get("outcome") == "passed":
-                update_task(task_id, type="security")
-                logger.info("[security-only] Task '%s' advanced to SECURITY.", task_id)
-            else:
-                demotion = sec_result.get("demotion_target", "indev")
-                update_task(task_id, type=demotion)
-                _record_demotion(task_id, "security", demotion, sec_result.get("summary", ""))
-                logger.warning("[security-only] Task '%s' demoted to %s.", task_id, demotion)
-        except ShutdownError:
-            logger.info("[security-only] Pipeline for '%s' aborted due to server shutdown.", task_id)
-        except PipelineAbortedError as exc:
-            logger.warning("[security-only] Task '%s' aborted at stage '%s': %s — will retry.",
-                           task_id, exc.stage, exc.cause)
-        except Exception:
-            logger.exception("[security-only] Pipeline for '%s' failed.", task_id)
-        finally:
-            loop.close()
-    except Exception as exc:
-        logger.exception("[security-only] Pipeline for '%s' failed.", task_id)
-    finally:
-        _teardown_worktree(task_id, project_path, worktree_path)
-
-
-@_pipeline_session
-def _run_security_pipeline_bg(task_id: str) -> None:
-    """Advance handler for SECURITY cards: run security, advance to final_review on pass."""
-    project_path = None
-    worktree_path = None
-    try:
-        import asyncio
-        from app.agent.security_review import run_security_pipeline
-
-        task = get_task(task_id)
-        if not task:
-            return
-        project_path = _setup_thread_context(task)
-        worktree_path, _aborted = _setup_worktree(task_id, project_path)
-        if _aborted:
-            return
-
-        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            sec_result = loop.run_until_complete(
-                run_security_pipeline(
-                    task_id=task_id,
-                    task_description=task.description or "",
-                    llm_base_url=llm_base_url,
-                    llm_model=llm_model,
-                    llm_id=task.llm_id,
-                    budget_id=task.budget_id,
-                    project_path=worktree_path,
-                )
-            )
-            _store_pipeline_result_generic(task_id, sec_result, task.budget_id, "security_review")
-
-            if sec_result.get("outcome") == "passed":
-                update_task(task_id, type="final_review")
-                logger.info("[security] Task '%s' passed. Advanced to FINAL REVIEW.", task_id)
-            else:
-                demotion = sec_result.get("demotion_target", "indev")
-                update_task(task_id, type=demotion)
-                _record_demotion(task_id, "security", demotion, sec_result.get("summary", ""))
-                logger.warning("[security] Task '%s' demoted to %s.", task_id, demotion)
-        except ShutdownError:
-            logger.info("[security] Pipeline for '%s' aborted due to server shutdown.", task_id)
-        except PipelineAbortedError as exc:
-            logger.warning("[security] Task '%s' aborted at stage '%s': %s — will retry.",
-                           task_id, exc.stage, exc.cause)
-        except Exception:
-            logger.exception("[security] Pipeline for '%s' failed.", task_id)
-        finally:
-            loop.close()
-    except Exception as exc:
-        logger.exception("[security] Pipeline for '%s' failed.", task_id)
-    finally:
-        _teardown_worktree(task_id, project_path, worktree_path)
-
-
-@_pipeline_session
-def _run_final_review_only_bg(task_id: str) -> None:
-    """On-demand: run only the final review pipeline (no security, no stage advancement)."""
-    project_path = None
-    worktree_path = None
-    try:
-        import asyncio
-        from app.agent.final_review import run_final_review_pipeline
-        from app.agent.merge import execute_merge
-
-        task = get_task(task_id)
-        if not task:
-            return
-        project_path = _setup_thread_context(task)
-        worktree_path, _aborted = _setup_worktree(task_id, project_path)
-        if _aborted:
-            return
-
-        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            fr_result = loop.run_until_complete(
-                run_final_review_pipeline(
-                    task_id=task_id,
-                    task_description=task.description or "",
-                    llm_base_url=llm_base_url,
-                    llm_model=llm_model,
-                    llm_id=task.llm_id,
-                    budget_id=task.budget_id,
-                    project_path=worktree_path,
-                )
-            )
-            _store_pipeline_result_generic(task_id, fr_result, task.budget_id, "final_review")
-
-            if fr_result.get("outcome") == "passed":
-                logger.info("[final_review] Task '%s' passed. Running virtual merge test.", task_id)
-                # Use real project root, not worktree path — git checkout fails inside a worktree.
-                from app.database import get_project_path as _get_project_path
-                real_pp = (_get_project_path(task.project) if task.project else None) or project_path
-                merge_test = execute_merge(
-                    task_id, project_path=real_pp, dry_run=True,
-                    llm_id=task.llm_id, budget_id=task.budget_id,
-                )
-                if merge_test.status == "virtual_passed":
-                    append_task_history(task_id, "ready_for_review", message="Final review passed. Virtual merge/test SUCCEEDED. Ready for final manual review and merge.")
-                    logger.info("[final_review] Task '%s' virtual merge SUCCEEDED.", task_id)
-                elif merge_test.status in ("conflict", "test_failure"):
-                    msg = f"Final review passed, but virtual merge {merge_test.status.upper()}. Demoting to indev.\n\n{merge_test.error_detail or ''}"
-                    append_task_history(task_id, "merge_test_failed", message=msg)
-                    update_task(task_id, type="indev")
-                    _record_demotion(task_id, "final_review", "indev", msg[:200])
-                    logger.warning("[final_review] Task '%s' virtual merge %s. Demoted to indev.", task_id, merge_test.status)
-                else:
-                    append_task_history(task_id, "merge_test_failed", message=f"Final review passed, but VIRTUAL MERGE FAILED: {merge_test.status}. Detail: {merge_test.error_detail}")
-                    logger.warning("[final_review] Task '%s' virtual merge FAILED: %s", task_id, merge_test.status)
-            else:
-                demotion = fr_result.get("demotion_target", "indev")
-                update_task(task_id, type=demotion)
-                _record_demotion(task_id, "final_review", demotion, fr_result.get("summary", ""))
-                logger.warning("[final_review] Task '%s' demoted to %s.", task_id, demotion)
-        except ShutdownError:
-            logger.info("[final_review] Pipeline for '%s' aborted due to server shutdown.", task_id)
-        except PipelineAbortedError as exc:
-            logger.warning("[final_review] Task '%s' aborted at stage '%s': %s — will retry.",
-                           task_id, exc.stage, exc.cause)
-        except Exception:
-            logger.exception("[final_review] Pipeline for '%s' failed.", task_id)
-        finally:
-            loop.close()
-    except Exception as exc:
-        logger.exception("[final_review] Pipeline for '%s' failed.", task_id)
-    finally:
-        _teardown_worktree(task_id, project_path, worktree_path)
-
-
-@_pipeline_session
-def _run_final_review_pipeline_bg(task_id: str) -> None:
-    """Advance handler for FINAL_REVIEW cards: run final review pipeline, advance to human_review on pass."""
-    project_path = None
-    worktree_path = None
-    try:
-        import asyncio
-        from app.agent.final_review import run_final_review_pipeline
-        from app.agent.merge import execute_merge
-
-        task = get_task(task_id)
-        if not task:
-            return
-        project_path = _setup_thread_context(task)
-        worktree_path, _aborted = _setup_worktree(task_id, project_path)
-        if _aborted:
-            return
-
-        llm_base_url, llm_model, max_context = _resolve_llm_endpoint(task)
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            fr_result = loop.run_until_complete(
-                run_final_review_pipeline(
-                    task_id=task_id,
-                    task_description=task.description or "",
-                    llm_base_url=llm_base_url,
-                    llm_model=llm_model,
-                    llm_id=task.llm_id,
-                    budget_id=task.budget_id,
-                    project_path=worktree_path,
-                    acceptance_criteria=json.loads(task.acceptance_criteria) if getattr(task, "acceptance_criteria", None) else None,
-                )
-            )
-            _store_pipeline_result_generic(task_id, fr_result, task.budget_id, "final_review")
-
-            if fr_result.get("outcome") == "passed":
-                # Use real project root, not worktree path — git checkout fails inside a worktree.
-                from app.database import get_project_path as _get_project_path
-                real_pp = (_get_project_path(task.project) if task.project else None) or project_path
-                merge_test = execute_merge(
-                    task_id, project_path=real_pp, dry_run=True,
-                    llm_id=task.llm_id, budget_id=task.budget_id,
-                )
-                if merge_test.status == "virtual_passed":
-                    append_task_history(task_id, "ready_for_review", message="Final AI review passed. Virtual merge SUCCEEDED. Ready for human review.")
-                    update_task(task_id, type="human_review")
-                    logger.info("[final_review] Task '%s' advanced to HUMAN REVIEW.", task_id)
-                elif merge_test.status in ("conflict", "test_failure"):
-                    msg = f"Final AI review passed, but virtual merge {merge_test.status.upper()}. Demoting to indev.\n\n{merge_test.error_detail or ''}"
-                    append_task_history(task_id, "merge_test_failed", message=msg)
-                    update_task(task_id, type="indev")
-                    _record_demotion(task_id, "final_review", "indev", msg[:200])
-                    logger.warning("[final_review] Task '%s' virtual merge %s. Demoted to indev.", task_id, merge_test.status)
-                else:
-                    append_task_history(task_id, "merge_test_failed", message=f"Final AI review passed, but VIRTUAL MERGE FAILED: {merge_test.status}. Detail: {merge_test.error_detail}")
-                    update_task(task_id, type="human_review")
-                    logger.warning("[final_review] Task '%s' virtual merge infrastructure error (%s). Advanced to HUMAN REVIEW with warning.", task_id, merge_test.status)
-            else:
-                demotion = fr_result.get("demotion_target", "indev")
-                update_task(task_id, type=demotion)
-                _record_demotion(task_id, "final_review", demotion, fr_result.get("summary", ""))
-                logger.warning("[final_review] Task '%s' demoted to %s.", task_id, demotion)
-        except ShutdownError:
-            logger.info("[final_review] Pipeline for '%s' aborted due to server shutdown.", task_id)
-        except PipelineAbortedError as exc:
-            logger.warning("[final_review] Task '%s' aborted at stage '%s': %s — will retry.",
-                           task_id, exc.stage, exc.cause)
-        except Exception:
-            logger.exception("[final_review] Pipeline for '%s' failed.", task_id)
-        finally:
-            loop.close()
-    except Exception as exc:
-        logger.exception("[final_review] Pipeline for '%s' failed.", task_id)
-    finally:
-        _teardown_worktree(task_id, project_path, worktree_path)
-
-
 def _merge_to_integration_branch(task_id: str) -> "str | None":
     """Merge maestro/task-{task_id} into maestro/self-improvement. Returns new HEAD SHA or None."""
     import subprocess as _sp
@@ -1578,10 +1233,9 @@ def _record_demotion(task_id: str, from_stage: str, to_stage: str, reason: str) 
 # Pipeline handler dispatch table
 ADVANCE_HANDLERS = {
     "idea": "_run_intake_pipeline",
-    "security": "_run_security_pipeline_bg",
-    "final_review": "_run_final_review_pipeline_bg",
-    # "human_review": "_execute_merge_bg",  # DISABLED: Requires manual review/merge
-    # planning is dispatched by the scheduler via planning_node executor — no advance endpoint
+    # security, final_review: dispatched by scheduler via voting_panel — no advance endpoint
+    # human_review: "_execute_merge_bg" — DISABLED: Requires manual review/merge
+    # planning: dispatched by scheduler via planning_node executor — no advance endpoint
 }
 
 
@@ -1629,10 +1283,6 @@ def advance_task(task_id: str):
     # Dispatch to appropriate handler
     if handler_name == "_run_intake_pipeline":
         _start_bg(_run_intake_pipeline, task_id)
-    elif handler_name == "_run_security_pipeline_bg":
-        _start_bg(_run_security_pipeline_bg, task_id)
-    elif handler_name == "_run_final_review_pipeline_bg":
-        _start_bg(_run_final_review_pipeline_bg, task_id)
     elif handler_name == "_execute_merge_bg":
         _start_bg(_execute_merge_bg, task_id)
 
@@ -5585,21 +5235,9 @@ AGENT_TOOL_ACCESS: dict = {
         "description": "Batch execution orchestrator for development. Runs component loops in parallel with file write containment.",
         "tools": "*",
     },
-    "ConceptualReviewPipeline": {
-        "description": "4 deterministic + 4 LLM reviewers for conceptual review after development. No direct tool dispatch.",
-        "tools": [],
-    },
     "OptimizationPipeline": {
         "description": "Profile → propose → vote → implement → verify optimization pipeline. No direct tool dispatch.",
         "tools": [],
-    },
-    "SecurityPipeline": {
-        "description": "3 parallel security reviewer agents with veto power. Uses allowlisted security scanner shell.",
-        "tools": ["run_shell_security", "read_file", "search_files", "find_files", "list_directory"],
-    },
-    "FinalReviewPipeline": {
-        "description": "4-agent final review (functional, code quality, integration, UX). Uses allowlisted review runner shell.",
-        "tools": ["run_shell_review", "read_file", "search_files", "find_files", "list_directory"],
     },
     "MergeWorker": {
         "description": "Deterministic git merge workflow (no LLM). Verifies branch, merges --no-ff, runs test suite, pushes if configured.",
@@ -6075,16 +5713,6 @@ def run_planning_on_demand(task_id: str, body: Optional[RunPlanningRequest] = No
     return {"task_id": task_id, "status": "STARTED", "pipeline": "planning"}
 
 
-@app.post("/api/tasks/{task_id}/run-review", response_model=dict)
-def run_conceptual_review_on_demand(task_id: str):
-    """Manually trigger the conceptual review pipeline for a task."""
-    task = get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    if not task.llm_id or not task.budget_id:
-        raise HTTPException(status_code=400, detail="Task needs an LLM endpoint and budget assigned.")
-    _start_bg(_advance_to_optimization, task_id)
-    return {"task_id": task_id, "status": "STARTED", "pipeline": "conceptual_review"}
 
 
 @app.post("/api/tasks/{task_id}/run-optimization", response_model=dict)
@@ -6093,28 +5721,7 @@ def run_optimization_on_demand(task_id: str):
     raise HTTPException(status_code=410, detail="run-optimization is deprecated; the scheduler dispatches optimization_propose automatically.")
 
 
-@app.post("/api/tasks/{task_id}/run-security", response_model=dict)
-def run_security_on_demand(task_id: str):
-    """Manually trigger the security review pipeline only (no optimization)."""
-    task = get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    if not task.llm_id or not task.budget_id:
-        raise HTTPException(status_code=400, detail="Task needs an LLM endpoint and budget assigned.")
-    _start_bg(_run_security_only_bg, task_id)
-    return {"task_id": task_id, "status": "STARTED", "pipeline": "security"}
 
-
-@app.post("/api/tasks/{task_id}/run-final-review", response_model=dict)
-def run_final_review_on_demand(task_id: str):
-    """Manually trigger the final review pipeline for a task."""
-    task = get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    if not task.llm_id or not task.budget_id:
-        raise HTTPException(status_code=400, detail="Task needs an LLM endpoint and budget assigned.")
-    _start_bg(_run_final_review_pipeline_bg, task_id)
-    return {"task_id": task_id, "status": "STARTED", "pipeline": "final_review"}
 
 
 @_pipeline_session

@@ -1039,31 +1039,45 @@ def _load_planning_context_for_task(task_id: str) -> str:
 
 def _build_dynamic_agents(task_id: str, dynamic_key: str, cfg: dict) -> list[dict]:
     """
-    Build an agent-spec list by reading a field from the task's planning_result row.
+    Build an agent-spec list from a planning_result column or task.content key.
 
-    dynamic_key must be the name of a JSON-serialised list column on planning_results
-    (e.g. "implementation_steps").  Each row item must have at least a "component" key
-    (falling back to "path") and an optional "files" list.
+    When cfg["items_from_content_key"] is set, reads items from task.content[key]
+    instead of from a planning_results column.  Each item must have at least a
+    "component" key (falling back to "path") and an optional "files" list.
+
+    Otherwise, dynamic_key is treated as a planning_results column name
+    (e.g. "implementation_steps").
     """
     import json as _j
-    from app.database import get_planning_result as _gpr
+    from app.database import get_task as _gt
 
-    pr = _gpr(task_id)
-    if not pr:
-        logger.warning(
-            "[parallel_agents] task '%s': dynamic_agents_from_key='%s' but no planning_result found.",
-            task_id, dynamic_key,
-        )
-        return []
-
-    try:
-        raw_items: list[dict] = _j.loads(getattr(pr, dynamic_key, None) or "[]")
-    except (_j.JSONDecodeError, TypeError):
-        logger.warning(
-            "[parallel_agents] task '%s': could not parse planning_result.%s as JSON list.",
-            task_id, dynamic_key,
-        )
-        return []
+    content_key: str | None = cfg.get("items_from_content_key")
+    if content_key:
+        task = _gt(task_id)
+        raw_items = (task.content or {}).get(content_key, []) if task else []
+        if not isinstance(raw_items, list):
+            logger.warning(
+                "[parallel_agents] task '%s': items_from_content_key='%s' is not a list.",
+                task_id, content_key,
+            )
+            return []
+    else:
+        from app.database import get_planning_result as _gpr
+        pr = _gpr(task_id)
+        if not pr:
+            logger.warning(
+                "[parallel_agents] task '%s': dynamic_agents_from_key='%s' but no planning_result found.",
+                task_id, dynamic_key,
+            )
+            return []
+        try:
+            raw_items = _j.loads(getattr(pr, dynamic_key, None) or "[]")
+        except (_j.JSONDecodeError, TypeError):
+            logger.warning(
+                "[parallel_agents] task '%s': could not parse planning_result.%s as JSON list.",
+                task_id, dynamic_key,
+            )
+            return []
 
     if not raw_items:
         return []
@@ -1769,22 +1783,26 @@ def _run_json_schema_gate(
     project_path: str | None,
 ) -> None:
     """
-    Validate planning_result fields.  Routes to retry → planning_correction or
-    fail → park when retries exhausted.
+    Validate fields from a planning_result row or task.content.  Routes to
+    retry → correction stage or fail → park when retries exhausted.
 
     Stage config shape:
-        source           — always "planning_result"
+        source           — "planning_result" (default) or "task_content"
         required_fields  — list of {key, validator, hard_fail?}
         on_pass          — condition on success (default "pass")
         on_fail          — condition when retries exhausted (default "fail")
         max_retries      — number of correction attempts before failing (default 3)
         retry_condition  — condition to fire when retrying (default "retry")
         output_key       — task.content key for gate result (default "gate_result")
+
+    When source="task_content", required_fields[*].key is resolved directly from
+    task.content rather than from a planning_results table column.
     """
     import json as _j
     from app.database import get_task, update_task, get_planning_result
 
     cfg = stage_config.config or {}
+    source: str = cfg.get("source", "planning_result")
     required_fields: list[dict] = cfg.get("required_fields") or []
     on_pass: str = cfg.get("on_pass", "pass")
     on_fail: str = cfg.get("on_fail", "fail")
@@ -1799,31 +1817,39 @@ def _run_json_schema_gate(
     blob = dict(task.content or {})
     retry_count: int = int(blob.get("_gate_retry_count", 0))
 
-    pr = get_planning_result(task_id)
-    if not pr:
-        logger.warning("[json_schema_gate] task '%s': no planning_result found — fail.", task_id)
-        blob[output_key] = {"passed": False, "failures": ["no planning_result"]}
-        update_task(task_id, content=blob)
-        advance_stage(task_id, on_fail)
-        return
-
-    # Build a field map from planning_result columns
+    # Build field_map from the configured source
     field_map: dict[str, Any] = {}
-    for field_cfg in required_fields:
-        key = field_cfg.get("key", "")
-        if not key:
-            continue
-        raw = getattr(pr, key, None)
-        if raw is None:
-            field_map[key] = None
-            continue
-        if isinstance(raw, str):
-            try:
-                field_map[key] = _j.loads(raw)
-            except _j.JSONDecodeError:
+    if source == "task_content":
+        content_data = task.content or {}
+        for field_cfg in required_fields:
+            key = field_cfg.get("key", "")
+            if key:
+                field_map[key] = content_data.get(key)
+    else:
+        # Default: read from planning_results table columns
+        pr = get_planning_result(task_id)
+        if not pr:
+            logger.warning("[json_schema_gate] task '%s': no planning_result found — fail.", task_id)
+            blob[output_key] = {"passed": False, "failures": ["no planning_result"]}
+            update_task(task_id, content=blob)
+            advance_stage(task_id, on_fail)
+            return
+
+        for field_cfg in required_fields:
+            key = field_cfg.get("key", "")
+            if not key:
+                continue
+            raw = getattr(pr, key, None)
+            if raw is None:
+                field_map[key] = None
+                continue
+            if isinstance(raw, str):
+                try:
+                    field_map[key] = _j.loads(raw)
+                except _j.JSONDecodeError:
+                    field_map[key] = raw
+            else:
                 field_map[key] = raw
-        else:
-            field_map[key] = raw
 
     failures: list[dict] = []
     for field_cfg in required_fields:
