@@ -3,12 +3,15 @@ app/agent/stage_executors.py
 ------------------------------
 Generic pipeline node executors registered via register_agent_type_executor().
 
-Five executor types:
+Executor types:
   circuit_breaker        — configurable attempt counter; parks or fails when exhausted
   voting_panel           — N-voter LLM panel with tally strategy
   fan_out_judge          — best-of-N parallel agents + LLM judge picks the winner
   reflection_agent       — skeptical post-stage reviewer; stores confidence report
   static_analysis_widget — deterministic tree-sitter analysis; no LLM; injects JSON into task.content
+  parallel_agents        — fan-out N child tasks (read-only or dangerous_edit); supports
+                           dynamic agent lists derived from planning_result fields via
+                           dynamic_agents_from_key config option
 
 Each executor has a public runner function (_run_*) that is registered in
 scheduler.py at import time.  The function signature matches the agent-type
@@ -1001,6 +1004,98 @@ def _run_dangerous_edit_llm_agent(
 
 
 # ---------------------------------------------------------------------------
+# parallel_agents — helpers for dynamic agent list construction
+# ---------------------------------------------------------------------------
+
+_DEFAULT_COMPONENT_PROMPT_TPL: str = (
+    "You are implementing component '{component}'.\n"
+    "Your assigned files: {files}\n\n"
+    "Planning context:\n{planning_context}\n\n"
+    "Write or update only your assigned files. "
+    "Call submit_work with signal=ACCEPTED when done, "
+    "or signal=REVERT_TO_DESIGN if the design is fundamentally wrong."
+)
+
+
+def _load_planning_context_for_task(task_id: str) -> str:
+    """Return a JSON planning context string (capped at 8 KiB) for use in component prompts."""
+    try:
+        import json as _j
+        from app.database import get_planning_result as _gpr
+        pr = _gpr(task_id)
+        if not pr:
+            return ""
+        ctx = {
+            "implementation_steps": _j.loads(pr.implementation_steps or "[]"),
+            "file_manifest": _j.loads(pr.file_manifest or "[]"),
+            "interface_contracts": _j.loads(pr.interface_contracts or "[]"),
+        }
+        raw = _j.dumps(ctx, indent=1)
+        return raw[:8000] + ("\n...[truncated]" if len(raw) > 8000 else "")
+    except Exception:
+        logger.warning("[parallel_agents] failed to load planning context for task '%s'", task_id, exc_info=True)
+        return ""
+
+
+def _build_dynamic_agents(task_id: str, dynamic_key: str, cfg: dict) -> list[dict]:
+    """
+    Build an agent-spec list by reading a field from the task's planning_result row.
+
+    dynamic_key must be the name of a JSON-serialised list column on planning_results
+    (e.g. "implementation_steps").  Each row item must have at least a "component" key
+    (falling back to "path") and an optional "files" list.
+    """
+    import json as _j
+    from app.database import get_planning_result as _gpr
+
+    pr = _gpr(task_id)
+    if not pr:
+        logger.warning(
+            "[parallel_agents] task '%s': dynamic_agents_from_key='%s' but no planning_result found.",
+            task_id, dynamic_key,
+        )
+        return []
+
+    try:
+        raw_items: list[dict] = _j.loads(getattr(pr, dynamic_key, None) or "[]")
+    except (_j.JSONDecodeError, TypeError):
+        logger.warning(
+            "[parallel_agents] task '%s': could not parse planning_result.%s as JSON list.",
+            task_id, dynamic_key,
+        )
+        return []
+
+    if not raw_items:
+        return []
+
+    planning_context = _load_planning_context_for_task(task_id)
+    tpl: str = cfg.get("agent_system_prompt_template", _DEFAULT_COMPONENT_PROMPT_TPL)
+    subagent_type: str = cfg.get("subagent_type", "dangerous_edit")
+    agent_max_turns: int = int(cfg.get("max_turns", 200))
+    # agent_tools from cfg-level is inherited by all dynamic children
+    agent_tools: list[str] | None = cfg.get("agent_tools")
+
+    agents: list[dict] = []
+    for item in raw_items:
+        component: str = item.get("component") or item.get("path", "unknown")
+        files: list[str] = item.get("files") or ([item["path"]] if item.get("path") else [])
+        spec: dict = {
+            "name": component,
+            "system_prompt": tpl.format(
+                component=component,
+                files=", ".join(files),
+                planning_context=planning_context,
+            ),
+            "subagent_type": subagent_type,
+            "max_turns": agent_max_turns,
+        }
+        if agent_tools is not None:
+            spec["agent_tools"] = agent_tools
+        agents.append(spec)
+    return agents
+
+
+# ---------------------------------------------------------------------------
 # parallel_agents — fan-out creator
 # ---------------------------------------------------------------------------
 
@@ -1025,13 +1120,24 @@ def _run_parallel_agents(
     from app.database import get_task, update_task, create_task
 
     cfg: dict = stage_config.config or {}
-    agents_cfg: list[dict] = cfg.get("agents", [])
+    agents_cfg: list[dict] = list(cfg.get("agents", []))
     output_key: str = cfg.get("output_key", "parallel_agents_output")
     max_turns: int = int(cfg.get("max_turns", 30))
 
     parent = get_task(task_id)
     if not parent:
         return
+
+    # Dynamic agent list: build from a planning_result field when no static agents are configured.
+    dynamic_key: str | None = cfg.get("dynamic_agents_from_key")
+    if dynamic_key and not agents_cfg:
+        agents_cfg = _build_dynamic_agents(task_id, dynamic_key, cfg)
+        if not agents_cfg:
+            logger.warning(
+                "[parallel_agents] task '%s': dynamic_agents_from_key='%s' produced no agents — staying put.",
+                task_id, dynamic_key,
+            )
+            return
 
     # Idempotency guard: skip if children already created
     if (parent.content or {}).get("_psubagent_child_ids"):
