@@ -583,8 +583,12 @@ def get_tasks_by_project(project_name):
                     Task.pipeline_template_id == None,  # arch tasks and legacy NULLs
                 )
             )
-        # Exclude virtual scheduler tasks — they live in the DB but are not kanban cards
-        q = q.filter(~Task.stage_key.in_(["_psubagent", "_psubagent_join"]))
+        # Exclude virtual scheduler tasks — they live in the DB but are not kanban cards.
+        # NULL stage_key (arch tasks, legacy cards) must NOT be excluded: SQL treats
+        # NOT (NULL IN (...)) as NULL/unknown which silently drops the row.
+        q = q.filter(
+            or_(Task.stage_key.is_(None), ~Task.stage_key.in_(["_psubagent", "_psubagent_join"]))
+        )
         tasks = q.order_by(Task.position, Task.created_at).all()
         return tasks
     except Exception as e:

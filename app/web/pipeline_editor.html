@@ -54,475 +54,6 @@
   </div>
 
   <div id="pe-panel-body">
-
-    <!-- ── Stage node template ─────────────────────────────────────────── -->
-    <template id="tpl-stage">
-      <div class="pe-field-row pe-field-readonly">
-        <label>Stage key</label>
-        <span class="pe-field-value" data-bind="stage_key"></span>
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-label">Display label</label>
-        <div class="pe-input-row">
-          <input type="text" id="pf-label" data-bind="label" class="pe-input">
-          <button class="pe-lightning" data-field="label" title="Generate with AI">⚡</button>
-        </div>
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-agent-type">Agent type</label>
-        <div class="pe-input-row">
-          <select id="pf-agent-type" data-bind="agent_type" class="pe-input pe-select"></select>
-          <button class="pe-lightning" data-field="agent_type" title="Generate with AI">⚡</button>
-        </div>
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-color">Color</label>
-        <input type="color" id="pf-color" data-bind="color" class="pe-color-input">
-      </div>
-
-      <div class="pe-field-row">
-        <label>Intent</label>
-        <div class="pe-input-row pe-input-row--col">
-          <textarea id="pf-intent" data-bind="intent" class="pe-textarea" rows="3"
-            placeholder="What should this stage accomplish?"></textarea>
-          <button class="pe-lightning pe-lightning--inline" data-field="intent" title="Generate with AI">⚡</button>
-        </div>
-      </div>
-
-      <div class="pe-field-row">
-        <label>System prompt</label>
-        <div class="pe-input-row pe-input-row--col">
-          <textarea id="pf-system-prompt" data-bind="system_prompt" class="pe-textarea" rows="5"
-            placeholder="Agent system prompt…"></textarea>
-          <button class="pe-lightning pe-lightning--inline" data-field="system_prompt" title="Generate with AI">⚡</button>
-        </div>
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-gate-type">Gate type</label>
-        <select id="pf-gate-type" data-bind="gate_type" class="pe-input pe-select">
-          <option value="llm_judge">LLM Judge</option>
-          <option value="single_pass">Single Pass</option>
-          <option value="test_suite">Test Suite</option>
-          <option value="human">Human</option>
-          <option value="voting">Voting</option>
-          <option value="none">None</option>
-        </select>
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-max-retries">Max retries</label>
-        <input type="number" id="pf-max-retries" data-bind="max_retries"
-          class="pe-input pe-input--sm" min="0" max="20" value="3">
-      </div>
-
-      <div class="pe-field-row">
-        <label>Required input keys</label>
-        <div class="pe-input-row">
-          <input type="text" data-bind="required_input_keys" class="pe-input"
-            placeholder="key1, key2">
-          <button class="pe-lightning" data-field="required_input_keys" title="Generate with AI">⚡</button>
-        </div>
-      </div>
-
-      <div class="pe-field-row">
-        <label>Output keys</label>
-        <div class="pe-input-row">
-          <input type="text" data-bind="output_keys" class="pe-input"
-            placeholder="key1, key2">
-          <button class="pe-lightning" data-field="output_keys" title="Generate with AI">⚡</button>
-        </div>
-      </div>
-
-      <div class="pe-field-row">
-        <label>Conditions (outputs)</label>
-        <div id="pf-conditions-list" class="pe-conditions-list"></div>
-        <button id="pf-add-condition" class="pe-btn pe-btn-xs pe-btn-secondary">+ Add condition</button>
-      </div>
-
-      <div class="pe-field-row">
-        <label>Required tool groups <span class="pe-field-hint">(OR within group · AND across groups)</span></label>
-        <div id="pf-tool-groups-list" class="pe-tool-groups-list"></div>
-        <button id="pf-add-tool-group" class="pe-btn pe-btn-xs pe-btn-secondary">+ Add group</button>
-      </div>
-    </template>
-
-    <!-- ── Factory node template ───────────────────────────────────────── -->
-    <template id="tpl-factory">
-      <div class="pe-field-row">
-        <label>Label</label>
-        <div class="pe-input-row">
-          <input type="text" data-bind="label" class="pe-input" placeholder="Factory label">
-          <button class="pe-lightning" data-field="label" title="Generate with AI">⚡</button>
-        </div>
-      </div>
-
-      <div class="pe-field-row">
-        <label>Color</label>
-        <input type="color" data-bind="color" class="pe-color-input">
-      </div>
-
-      <div class="pe-field-row">
-        <label>Source type</label>
-        <select data-bind="factory_source_type" class="pe-input" id="pf-factory-source-type">
-          <option value="folder">folder</option>
-          <option value="file_list">file_list</option>
-          <option value="csv">csv</option>
-          <option value="json_array">json_array</option>
-          <option value="sqlite_query">sqlite_query</option>
-          <option value="manual_prompt">manual_prompt</option>
-          <option value="maestro_cards">maestro_cards</option>
-        </select>
-      </div>
-
-      <div class="pe-field-row">
-        <label>Source config (JSON)</label>
-        <textarea data-bind="factory_source_config_json" class="pe-textarea pe-mono" rows="4"
-          placeholder='{"path": "/data/", "file_glob": "*.pdf"}'></textarea>
-      </div>
-
-      <div class="pe-field-row">
-        <label>Segmentation</label>
-        <select data-bind="factory_segmentation_mode" class="pe-input">
-          <option value="mechanical">Mechanical (1 per item)</option>
-          <option value="llm">LLM-segmented</option>
-        </select>
-      </div>
-
-      <div class="pe-field-row">
-        <label>Entry stage</label>
-        <input type="text" data-bind="factory_entry_stage" class="pe-input" placeholder="idea">
-      </div>
-
-      <div class="pe-field-row">
-        <label>Card title template</label>
-        <div class="pe-input-row">
-          <input type="text" data-bind="factory_title_template" class="pe-input"
-            placeholder="Process: {filename}">
-          <button class="pe-lightning" data-field="factory_title_template" title="Generate with AI">⚡</button>
-        </div>
-      </div>
-
-      <div class="pe-field-row">
-        <label>Card description template</label>
-        <div class="pe-input-row">
-          <textarea data-bind="factory_desc_template" class="pe-textarea" rows="2"
-            placeholder="Summarize {filepath}"></textarea>
-          <button class="pe-lightning" data-field="factory_desc_template" title="Generate with AI">⚡</button>
-        </div>
-      </div>
-
-      <div class="pe-field-row">
-        <label>Intent (for LLM mode)</label>
-        <div class="pe-input-row">
-          <textarea data-bind="intent" class="pe-textarea" rows="2"
-            placeholder="Describe how to segment this data into cards"></textarea>
-          <button class="pe-lightning" data-field="intent" title="Generate with AI">⚡</button>
-        </div>
-      </div>
-
-      <div class="pe-field-row">
-        <label>Triggers</label>
-        <div class="pe-checkbox-row">
-          <label><input type="checkbox" id="pf-trigger-manual"> Manual button</label>
-          <label><input type="checkbox" id="pf-trigger-predecessor"> Predecessor complete</label>
-          <label><input type="checkbox" id="pf-trigger-cron"> Cron schedule</label>
-        </div>
-        <input type="text" id="pf-cron-schedule" data-bind="factory_cron_schedule"
-          class="pe-input" placeholder="0 23 * * *" style="margin-top:4px">
-      </div>
-
-      <div class="pe-field-row pe-factory-run-row">
-        <button id="pf-run-now" class="pe-btn pe-btn-accent" style="width:100%">▶ Run Now</button>
-        <div id="pf-run-status" class="pe-run-status"></div>
-      </div>
-    </template>
-
-    <!-- ── Conditional node template ──────────────────────────────────── -->
-    <template id="tpl-conditional">
-      <div class="pe-field-row">
-        <label for="pf-branch-key">Branch key</label>
-        <input type="text" id="pf-branch-key" data-bind="branch_key" class="pe-input"
-          placeholder="content blob key to branch on">
-      </div>
-    </template>
-
-    <!-- ── Judgment Gate node template ────────────────────────────────── -->
-    <template id="tpl-judgment_gate">
-      <div class="pe-field-row">
-        <label for="pf-fan-n">Fan-in N</label>
-        <input type="number" id="pf-fan-n" data-bind="fan_n"
-          class="pe-input pe-input--sm" min="2" max="10" value="3">
-      </div>
-    </template>
-
-    <!-- ── Fan-out node template ──────────────────────────────────────── -->
-    <template id="tpl-fan_out">
-      <div class="pe-field-row">
-        <label for="pf-fan-out-n">Attempts N</label>
-        <input type="number" id="pf-fan-out-n" data-bind="attempts_n"
-          class="pe-input pe-input--sm" min="2" max="10" value="3">
-      </div>
-    </template>
-
-    <!-- ── Human Gate node template ───────────────────────────────────── -->
-    <template id="tpl-human_gate">
-      <div class="pe-field-row">
-        <label for="pf-autopilot">Autopilot after (hours)</label>
-        <input type="number" id="pf-autopilot" data-bind="autopilot_hours"
-          class="pe-input pe-input--sm" min="0" step="1" value="0"
-          placeholder="0 = wait forever">
-      </div>
-    </template>
-
-    <!-- ── Circuit Breaker node template ──────────────────────────────── -->
-    <template id="tpl-circuit_breaker">
-      <div class="pe-field-row">
-        <label for="pf-cb-counter-key">Counter key</label>
-        <input type="text" id="pf-cb-counter-key" data-bind="counter_key" class="pe-input"
-          placeholder="planning_rejections">
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-cb-max-attempts">Max attempts</label>
-        <input type="number" id="pf-cb-max-attempts" data-bind="max_attempts"
-          class="pe-input pe-input--sm" min="1" max="50" value="3">
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-cb-count-source">Count source</label>
-        <select id="pf-cb-count-source" data-bind="count_source" class="pe-input pe-select">
-          <option value="transition_results">TransitionResult rows</option>
-          <option value="content_counter">task.content counter</option>
-        </select>
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-cb-count-transition">Count transition</label>
-        <input type="text" id="pf-cb-count-transition" data-bind="count_transition" class="pe-input"
-          placeholder="planning_to_indev">
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-cb-count-outcome">Count outcome</label>
-        <input type="text" id="pf-cb-count-outcome" data-bind="count_outcome" class="pe-input"
-          placeholder="rejected">
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-cb-on-exhaust">On exhaust</label>
-        <select id="pf-cb-on-exhaust" data-bind="on_exhaust" class="pe-input pe-select">
-          <option value="park">Park (require manual reset)</option>
-          <option value="fail">Fail (advance via fail edge)</option>
-          <option value="notify_only">Notify only (advance via pass)</option>
-        </select>
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-cb-notify-inbox">Notify inbox</label>
-        <input type="checkbox" id="pf-cb-notify-inbox" data-bind="notify_inbox">
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-cb-exhaust-msg">Exhaust message</label>
-        <div class="pe-input-row pe-input-row--col">
-          <textarea id="pf-cb-exhaust-msg" data-bind="exhaust_message" class="pe-textarea" rows="2"
-            placeholder="Design review exhausted — revise and click Run Planning."></textarea>
-          <button class="pe-lightning pe-lightning--inline" data-field="exhaust_message" title="Generate with AI">⚡</button>
-        </div>
-      </div>
-    </template>
-
-    <!-- ── Voting Panel node template ─────────────────────────────────── -->
-    <template id="tpl-voting_panel">
-      <div class="pe-field-row">
-        <label for="pf-vp-voter-count">Voter count</label>
-        <input type="number" id="pf-vp-voter-count" data-bind="voter_count"
-          class="pe-input pe-input--sm" min="2" max="10" value="3">
-      </div>
-
-      <div class="pe-field-row">
-        <label>Voter system prompt</label>
-        <div class="pe-input-row pe-input-row--col">
-          <textarea id="pf-vp-voter-prompt" data-bind="voter_system_prompt" class="pe-textarea" rows="4"
-            placeholder="You are a critical reviewer. Evaluate the task and vote ACCEPTED or REJECTED…"></textarea>
-          <button class="pe-lightning pe-lightning--inline" data-field="voter_system_prompt" title="Generate with AI">⚡</button>
-        </div>
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-vp-voter-tools">Voter tools (comma-separated)</label>
-        <input type="text" id="pf-vp-voter-tools" data-bind="voter_tools" class="pe-input"
-          placeholder="read_file, search_files">
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-vp-voter-turns">Voter max turns</label>
-        <input type="number" id="pf-vp-voter-turns" data-bind="voter_max_turns"
-          class="pe-input pe-input--sm" min="1" max="50" value="10">
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-vp-on-tie">On tie</label>
-        <select id="pf-vp-on-tie" data-bind="on_tie" class="pe-input pe-select">
-          <option value="reject">Reject (fail edge)</option>
-          <option value="pass">Pass (pass edge)</option>
-        </select>
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-vp-output-key">Output key</label>
-        <input type="text" id="pf-vp-output-key" data-bind="output_key" class="pe-input"
-          placeholder="vote_result">
-      </div>
-    </template>
-
-    <!-- ── Fan-Out + Judge node template ──────────────────────────────── -->
-    <template id="tpl-fan_out_judge">
-      <div class="pe-field-row">
-        <label for="pf-foj-n">Parallel agents (N)</label>
-        <input type="number" id="pf-foj-n" data-bind="n"
-          class="pe-input pe-input--sm" min="2" max="10" value="3">
-      </div>
-
-      <div class="pe-field-row">
-        <label>Agent system prompt</label>
-        <div class="pe-input-row pe-input-row--col">
-          <textarea id="pf-foj-agent-prompt" data-bind="agent_system_prompt" class="pe-textarea" rows="4"
-            placeholder="You are a designer. Produce a plan for the task…"></textarea>
-          <button class="pe-lightning pe-lightning--inline" data-field="agent_system_prompt" title="Generate with AI">⚡</button>
-        </div>
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-foj-agent-tools">Agent tools (comma-separated)</label>
-        <input type="text" id="pf-foj-agent-tools" data-bind="agent_tools" class="pe-input"
-          placeholder="read_file, search_files">
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-foj-agent-turns">Agent max turns</label>
-        <input type="number" id="pf-foj-agent-turns" data-bind="agent_max_turns"
-          class="pe-input pe-input--sm" min="1" max="100" value="30">
-      </div>
-
-      <div class="pe-field-row">
-        <label>Judge system prompt</label>
-        <div class="pe-input-row pe-input-row--col">
-          <textarea id="pf-foj-judge-prompt" data-bind="judge_system_prompt" class="pe-textarea" rows="3"
-            placeholder="Compare these proposals and pick the best one…"></textarea>
-          <button class="pe-lightning pe-lightning--inline" data-field="judge_system_prompt" title="Generate with AI">⚡</button>
-        </div>
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-foj-judge-turns">Judge max turns</label>
-        <input type="number" id="pf-foj-judge-turns" data-bind="judge_max_turns"
-          class="pe-input pe-input--sm" min="1" max="30" value="10">
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-foj-output-key">Output key</label>
-        <input type="text" id="pf-foj-output-key" data-bind="output_key" class="pe-input"
-          placeholder="winning_proposal">
-      </div>
-    </template>
-
-    <!-- ── Static Analysis node template ─────────────────────────────── -->
-    <template id="tpl-static-analysis">
-      <div class="pe-field-row">
-        <label for="pf-sa-output-key">Output key</label>
-        <input type="text" id="pf-sa-output-key" data-bind="output_key" class="pe-input"
-          placeholder="static_analysis">
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-sa-file-pattern">File pattern (glob)</label>
-        <input type="text" id="pf-sa-file-pattern" data-bind="file_pattern" class="pe-input"
-          placeholder="**/*.py">
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-sa-max-files">Max files</label>
-        <input type="number" id="pf-sa-max-files" data-bind="max_files"
-          class="pe-input pe-input--sm" min="1" max="500" value="50">
-      </div>
-
-      <p class="pe-field-note" style="margin-top:6px;color:#d97706;font-size:11px;">
-        ⚙ Tool node — no LLM call. Runs tree-sitter and writes JSON to
-        <code>task.content[output_key]</code>. Wire the <em>pass</em> output to the
-        next stage that reads this key via <em>required_input_keys</em>.
-      </p>
-    </template>
-
-    <template id="tpl-dangerous_edit">
-      <div class="pe-field-row">
-        <label>System prompt <span style="color:#f87171;font-size:11px;">(empty = built-in Maestro prompt)</span></label>
-        <div class="pe-input-row pe-input-row--col">
-          <textarea data-bind="system_prompt" class="pe-textarea" rows="7"
-            placeholder="Leave empty to use the built-in MAESTRO_SYSTEM_PROMPT. Override only when you need a fundamentally different implementation persona."></textarea>
-          <button class="pe-lightning pe-lightning--inline" data-field="system_prompt" title="Generate with AI">⚡</button>
-        </div>
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-de-max-turns">Max turns</label>
-        <input type="number" id="pf-de-max-turns" data-bind="max_turns"
-          class="pe-input pe-input--sm" min="1" max="500" value="200">
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-de-tools">Agent tools <span style="color:#94a3b8;font-size:11px;">(comma-sep; empty = full indev set)</span></label>
-        <input type="text" id="pf-de-tools" data-bind="agent_tools" class="pe-input"
-          placeholder="read_file, write_file, run_test_pytest, submit_work …">
-      </div>
-
-      <div class="pe-field-row">
-        <label for="pf-de-keys">Required input keys <span style="color:#94a3b8;font-size:11px;">(comma-sep)</span></label>
-        <input type="text" id="pf-de-keys" data-bind="required_input_keys" class="pe-input"
-          placeholder="survey_summary, static_analysis">
-      </div>
-
-      <p class="pe-field-note" style="margin-top:6px;color:#f87171;font-size:11px;">
-        ⚠ This node has <strong>write access</strong> to the project working tree.
-        Worktree isolation is applied automatically — each task runs on its own
-        <code>maestro/task-{id}</code> branch inside <code>.maestro-worktrees/</code>.
-      </p>
-    </template>
-
-    <template id="tpl-parallel_agents">
-      <div class="pe-field-row pe-field-readonly">
-        <label>Stage key</label>
-        <span class="pe-field-value" data-bind="stage_key"></span>
-      </div>
-      <div class="pe-field-row">
-        <label for="pf-pa-label">Display label</label>
-        <input type="text" id="pf-pa-label" data-bind="label" class="pe-input">
-      </div>
-      <div class="pe-field-row">
-        <label for="pf-pa-n">Number of agents (N)</label>
-        <input type="number" id="pf-pa-n" data-bind="n"
-          class="pe-input pe-input--sm" min="1" max="10" value="3">
-      </div>
-      <div class="pe-field-row">
-        <label for="pf-pa-output-key">Output key</label>
-        <input type="text" id="pf-pa-output-key" data-bind="output_key" class="pe-input"
-          placeholder="parallel_agents_output">
-      </div>
-      <div class="pe-field-row">
-        <label for="pf-pa-max-turns">Max turns per agent</label>
-        <input type="number" id="pf-pa-max-turns" data-bind="max_turns"
-          class="pe-input pe-input--sm" min="1" max="200" value="30">
-      </div>
-      <div class="pe-field-row">
-        <label>Agent cards</label>
-        <div id="pf-pa-cards" class="pe-agent-cards-container"></div>
-      </div>
-    </template>
-
   </div><!-- /#pe-panel-body -->
 
   <div id="pe-panel-footer">
@@ -530,6 +61,480 @@
     <button id="pe-save-node" class="pe-btn pe-btn-primary">Apply</button>
   </div>
 </div><!-- /#pipeline-property-panel -->
+
+<!-- ── Property panel templates (kept outside #pe-panel-body so body.innerHTML="" doesn't destroy them) ── -->
+<!-- ── Stage node template ─────────────────────────────────────────── -->
+<template id="tpl-stage">
+  <div class="pe-field-row pe-field-readonly">
+    <label>Stage key</label>
+    <span class="pe-field-value" data-bind="stage_key"></span>
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-label">Display label</label>
+    <div class="pe-input-row">
+      <input type="text" id="pf-label" data-bind="label" class="pe-input">
+      <button class="pe-lightning" data-field="label" title="Generate with AI">⚡</button>
+    </div>
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-agent-type">Agent type</label>
+    <div class="pe-input-row">
+      <select id="pf-agent-type" data-bind="agent_type" class="pe-input pe-select"></select>
+      <button class="pe-lightning" data-field="agent_type" title="Generate with AI">⚡</button>
+    </div>
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-color">Color</label>
+    <input type="color" id="pf-color" data-bind="color" class="pe-color-input">
+  </div>
+
+  <div class="pe-field-row">
+    <label>Intent</label>
+    <div class="pe-input-row pe-input-row--col">
+      <textarea id="pf-intent" data-bind="intent" class="pe-textarea" rows="3"
+        placeholder="What should this stage accomplish?"></textarea>
+      <button class="pe-lightning pe-lightning--inline" data-field="intent" title="Generate with AI">⚡</button>
+    </div>
+  </div>
+
+  <div class="pe-field-row">
+    <label>System prompt</label>
+    <div class="pe-input-row pe-input-row--col">
+      <textarea id="pf-system-prompt" data-bind="system_prompt" class="pe-textarea" rows="5"
+        placeholder="Agent system prompt…"></textarea>
+      <button class="pe-lightning pe-lightning--inline" data-field="system_prompt" title="Generate with AI">⚡</button>
+    </div>
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-gate-type">Gate type</label>
+    <select id="pf-gate-type" data-bind="gate_type" class="pe-input pe-select">
+      <option value="llm_judge">LLM Judge</option>
+      <option value="single_pass">Single Pass</option>
+      <option value="test_suite">Test Suite</option>
+      <option value="human">Human</option>
+      <option value="voting">Voting</option>
+      <option value="none">None</option>
+    </select>
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-max-retries">Max retries</label>
+    <input type="number" id="pf-max-retries" data-bind="max_retries"
+      class="pe-input pe-input--sm" min="0" max="20" value="3">
+  </div>
+
+  <div class="pe-field-row">
+    <label>Required input keys</label>
+    <div class="pe-input-row">
+      <input type="text" data-bind="required_input_keys" class="pe-input"
+        placeholder="key1, key2">
+      <button class="pe-lightning" data-field="required_input_keys" title="Generate with AI">⚡</button>
+    </div>
+  </div>
+
+  <div class="pe-field-row">
+    <label>Output keys</label>
+    <div class="pe-input-row">
+      <input type="text" data-bind="output_keys" class="pe-input"
+        placeholder="key1, key2">
+      <button class="pe-lightning" data-field="output_keys" title="Generate with AI">⚡</button>
+    </div>
+  </div>
+
+  <div class="pe-field-row">
+    <label>Conditions (outputs)</label>
+    <div id="pf-conditions-list" class="pe-conditions-list"></div>
+    <button id="pf-add-condition" class="pe-btn pe-btn-xs pe-btn-secondary">+ Add condition</button>
+  </div>
+
+  <div class="pe-field-row">
+    <label>Required tool groups <span class="pe-field-hint">(OR within group · AND across groups)</span></label>
+    <div id="pf-tool-groups-list" class="pe-tool-groups-list"></div>
+    <button id="pf-add-tool-group" class="pe-btn pe-btn-xs pe-btn-secondary">+ Add group</button>
+  </div>
+</template>
+
+<!-- ── Factory node template ───────────────────────────────────────── -->
+<template id="tpl-factory">
+  <div class="pe-field-row">
+    <label>Label</label>
+    <div class="pe-input-row">
+      <input type="text" data-bind="label" class="pe-input" placeholder="Factory label">
+      <button class="pe-lightning" data-field="label" title="Generate with AI">⚡</button>
+    </div>
+  </div>
+
+  <div class="pe-field-row">
+    <label>Color</label>
+    <input type="color" data-bind="color" class="pe-color-input">
+  </div>
+
+  <div class="pe-field-row">
+    <label>Source type</label>
+    <select data-bind="factory_source_type" class="pe-input" id="pf-factory-source-type">
+      <option value="folder">folder</option>
+      <option value="file_list">file_list</option>
+      <option value="csv">csv</option>
+      <option value="json_array">json_array</option>
+      <option value="sqlite_query">sqlite_query</option>
+      <option value="manual_prompt">manual_prompt</option>
+      <option value="maestro_cards">maestro_cards</option>
+    </select>
+  </div>
+
+  <div class="pe-field-row">
+    <label>Source config (JSON)</label>
+    <textarea data-bind="factory_source_config_json" class="pe-textarea pe-mono" rows="4"
+      placeholder='{"path": "/data/", "file_glob": "*.pdf"}'></textarea>
+  </div>
+
+  <div class="pe-field-row">
+    <label>Segmentation</label>
+    <select data-bind="factory_segmentation_mode" class="pe-input">
+      <option value="mechanical">Mechanical (1 per item)</option>
+      <option value="llm">LLM-segmented</option>
+    </select>
+  </div>
+
+  <div class="pe-field-row">
+    <label>Entry stage</label>
+    <input type="text" data-bind="factory_entry_stage" class="pe-input" placeholder="idea">
+  </div>
+
+  <div class="pe-field-row">
+    <label>Card title template</label>
+    <div class="pe-input-row">
+      <input type="text" data-bind="factory_title_template" class="pe-input"
+        placeholder="Process: {filename}">
+      <button class="pe-lightning" data-field="factory_title_template" title="Generate with AI">⚡</button>
+    </div>
+  </div>
+
+  <div class="pe-field-row">
+    <label>Card description template</label>
+    <div class="pe-input-row">
+      <textarea data-bind="factory_desc_template" class="pe-textarea" rows="2"
+        placeholder="Summarize {filepath}"></textarea>
+      <button class="pe-lightning" data-field="factory_desc_template" title="Generate with AI">⚡</button>
+    </div>
+  </div>
+
+  <div class="pe-field-row">
+    <label>Intent (for LLM mode)</label>
+    <div class="pe-input-row">
+      <textarea data-bind="intent" class="pe-textarea" rows="2"
+        placeholder="Describe how to segment this data into cards"></textarea>
+      <button class="pe-lightning" data-field="intent" title="Generate with AI">⚡</button>
+    </div>
+  </div>
+
+  <div class="pe-field-row">
+    <label>Triggers</label>
+    <div class="pe-checkbox-row">
+      <label><input type="checkbox" id="pf-trigger-manual"> Manual button</label>
+      <label><input type="checkbox" id="pf-trigger-predecessor"> Predecessor complete</label>
+      <label><input type="checkbox" id="pf-trigger-cron"> Cron schedule</label>
+    </div>
+    <input type="text" id="pf-cron-schedule" data-bind="factory_cron_schedule"
+      class="pe-input" placeholder="0 23 * * *" style="margin-top:4px">
+  </div>
+
+  <div class="pe-field-row pe-factory-run-row">
+    <button id="pf-run-now" class="pe-btn pe-btn-accent" style="width:100%">▶ Run Now</button>
+    <div id="pf-run-status" class="pe-run-status"></div>
+  </div>
+</template>
+
+<!-- ── Conditional node template ──────────────────────────────────── -->
+<template id="tpl-conditional">
+  <div class="pe-field-row">
+    <label for="pf-branch-key">Branch key</label>
+    <input type="text" id="pf-branch-key" data-bind="branch_key" class="pe-input"
+      placeholder="content blob key to branch on">
+  </div>
+</template>
+
+<!-- ── Judgment Gate node template ────────────────────────────────── -->
+<template id="tpl-judgment_gate">
+  <div class="pe-field-row">
+    <label for="pf-fan-n">Fan-in N</label>
+    <input type="number" id="pf-fan-n" data-bind="fan_n"
+      class="pe-input pe-input--sm" min="2" max="10" value="3">
+  </div>
+</template>
+
+<!-- ── Fan-out node template ──────────────────────────────────────── -->
+<template id="tpl-fan_out">
+  <div class="pe-field-row">
+    <label for="pf-fan-out-n">Attempts N</label>
+    <input type="number" id="pf-fan-out-n" data-bind="attempts_n"
+      class="pe-input pe-input--sm" min="2" max="10" value="3">
+  </div>
+</template>
+
+<!-- ── Human Gate node template ───────────────────────────────────── -->
+<template id="tpl-human_gate">
+  <div class="pe-field-row">
+    <label for="pf-autopilot">Autopilot after (hours)</label>
+    <input type="number" id="pf-autopilot" data-bind="autopilot_hours"
+      class="pe-input pe-input--sm" min="0" step="1" value="0"
+      placeholder="0 = wait forever">
+  </div>
+</template>
+
+<!-- ── Circuit Breaker node template ──────────────────────────────── -->
+<template id="tpl-circuit_breaker">
+  <div class="pe-field-row">
+    <label for="pf-cb-counter-key">Counter key</label>
+    <input type="text" id="pf-cb-counter-key" data-bind="counter_key" class="pe-input"
+      placeholder="planning_rejections">
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-cb-max-attempts">Max attempts</label>
+    <input type="number" id="pf-cb-max-attempts" data-bind="max_attempts"
+      class="pe-input pe-input--sm" min="1" max="50" value="3">
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-cb-count-source">Count source</label>
+    <select id="pf-cb-count-source" data-bind="count_source" class="pe-input pe-select">
+      <option value="transition_results">TransitionResult rows</option>
+      <option value="content_counter">task.content counter</option>
+    </select>
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-cb-count-transition">Count transition</label>
+    <input type="text" id="pf-cb-count-transition" data-bind="count_transition" class="pe-input"
+      placeholder="planning_to_indev">
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-cb-count-outcome">Count outcome</label>
+    <input type="text" id="pf-cb-count-outcome" data-bind="count_outcome" class="pe-input"
+      placeholder="rejected">
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-cb-on-exhaust">On exhaust</label>
+    <select id="pf-cb-on-exhaust" data-bind="on_exhaust" class="pe-input pe-select">
+      <option value="park">Park (require manual reset)</option>
+      <option value="fail">Fail (advance via fail edge)</option>
+      <option value="notify_only">Notify only (advance via pass)</option>
+    </select>
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-cb-notify-inbox">Notify inbox</label>
+    <input type="checkbox" id="pf-cb-notify-inbox" data-bind="notify_inbox">
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-cb-exhaust-msg">Exhaust message</label>
+    <div class="pe-input-row pe-input-row--col">
+      <textarea id="pf-cb-exhaust-msg" data-bind="exhaust_message" class="pe-textarea" rows="2"
+        placeholder="Design review exhausted — revise and click Run Planning."></textarea>
+      <button class="pe-lightning pe-lightning--inline" data-field="exhaust_message" title="Generate with AI">⚡</button>
+    </div>
+  </div>
+</template>
+
+<!-- ── Voting Panel node template ─────────────────────────────────── -->
+<template id="tpl-voting_panel">
+  <div class="pe-field-row">
+    <label for="pf-vp-voter-count">Voter count</label>
+    <input type="number" id="pf-vp-voter-count" data-bind="voter_count"
+      class="pe-input pe-input--sm" min="2" max="10" value="3">
+  </div>
+
+  <div class="pe-field-row">
+    <label>Voter system prompt</label>
+    <div class="pe-input-row pe-input-row--col">
+      <textarea id="pf-vp-voter-prompt" data-bind="voter_system_prompt" class="pe-textarea" rows="4"
+        placeholder="You are a critical reviewer. Evaluate the task and vote ACCEPTED or REJECTED…"></textarea>
+      <button class="pe-lightning pe-lightning--inline" data-field="voter_system_prompt" title="Generate with AI">⚡</button>
+    </div>
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-vp-voter-tools">Voter tools (comma-separated)</label>
+    <input type="text" id="pf-vp-voter-tools" data-bind="voter_tools" class="pe-input"
+      placeholder="read_file, search_files">
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-vp-voter-turns">Voter max turns</label>
+    <input type="number" id="pf-vp-voter-turns" data-bind="voter_max_turns"
+      class="pe-input pe-input--sm" min="1" max="50" value="10">
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-vp-on-tie">On tie</label>
+    <select id="pf-vp-on-tie" data-bind="on_tie" class="pe-input pe-select">
+      <option value="reject">Reject (fail edge)</option>
+      <option value="pass">Pass (pass edge)</option>
+    </select>
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-vp-output-key">Output key</label>
+    <input type="text" id="pf-vp-output-key" data-bind="output_key" class="pe-input"
+      placeholder="vote_result">
+  </div>
+</template>
+
+<!-- ── Fan-Out + Judge node template ──────────────────────────────── -->
+<template id="tpl-fan_out_judge">
+  <div class="pe-field-row">
+    <label for="pf-foj-n">Parallel agents (N)</label>
+    <input type="number" id="pf-foj-n" data-bind="n"
+      class="pe-input pe-input--sm" min="2" max="10" value="3">
+  </div>
+
+  <div class="pe-field-row">
+    <label>Agent system prompt</label>
+    <div class="pe-input-row pe-input-row--col">
+      <textarea id="pf-foj-agent-prompt" data-bind="agent_system_prompt" class="pe-textarea" rows="4"
+        placeholder="You are a designer. Produce a plan for the task…"></textarea>
+      <button class="pe-lightning pe-lightning--inline" data-field="agent_system_prompt" title="Generate with AI">⚡</button>
+    </div>
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-foj-agent-tools">Agent tools (comma-separated)</label>
+    <input type="text" id="pf-foj-agent-tools" data-bind="agent_tools" class="pe-input"
+      placeholder="read_file, search_files">
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-foj-agent-turns">Agent max turns</label>
+    <input type="number" id="pf-foj-agent-turns" data-bind="agent_max_turns"
+      class="pe-input pe-input--sm" min="1" max="100" value="30">
+  </div>
+
+  <div class="pe-field-row">
+    <label>Judge system prompt</label>
+    <div class="pe-input-row pe-input-row--col">
+      <textarea id="pf-foj-judge-prompt" data-bind="judge_system_prompt" class="pe-textarea" rows="3"
+        placeholder="Compare these proposals and pick the best one…"></textarea>
+      <button class="pe-lightning pe-lightning--inline" data-field="judge_system_prompt" title="Generate with AI">⚡</button>
+    </div>
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-foj-judge-turns">Judge max turns</label>
+    <input type="number" id="pf-foj-judge-turns" data-bind="judge_max_turns"
+      class="pe-input pe-input--sm" min="1" max="30" value="10">
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-foj-output-key">Output key</label>
+    <input type="text" id="pf-foj-output-key" data-bind="output_key" class="pe-input"
+      placeholder="winning_proposal">
+  </div>
+</template>
+
+<!-- ── Static Analysis node template ─────────────────────────────── -->
+<template id="tpl-static-analysis">
+  <div class="pe-field-row">
+    <label for="pf-sa-output-key">Output key</label>
+    <input type="text" id="pf-sa-output-key" data-bind="output_key" class="pe-input"
+      placeholder="static_analysis">
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-sa-file-pattern">File pattern (glob)</label>
+    <input type="text" id="pf-sa-file-pattern" data-bind="file_pattern" class="pe-input"
+      placeholder="**/*.py">
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-sa-max-files">Max files</label>
+    <input type="number" id="pf-sa-max-files" data-bind="max_files"
+      class="pe-input pe-input--sm" min="1" max="500" value="50">
+  </div>
+
+  <p class="pe-field-note" style="margin-top:6px;color:#d97706;font-size:11px;">
+    ⚙ Tool node — no LLM call. Runs tree-sitter and writes JSON to
+    <code>task.content[output_key]</code>. Wire the <em>pass</em> output to the
+    next stage that reads this key via <em>required_input_keys</em>.
+  </p>
+</template>
+
+<template id="tpl-dangerous_edit">
+  <div class="pe-field-row">
+    <label>System prompt <span style="color:#f87171;font-size:11px;">(empty = built-in Maestro prompt)</span></label>
+    <div class="pe-input-row pe-input-row--col">
+      <textarea data-bind="system_prompt" class="pe-textarea" rows="7"
+        placeholder="Leave empty to use the built-in MAESTRO_SYSTEM_PROMPT. Override only when you need a fundamentally different implementation persona."></textarea>
+      <button class="pe-lightning pe-lightning--inline" data-field="system_prompt" title="Generate with AI">⚡</button>
+    </div>
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-de-max-turns">Max turns</label>
+    <input type="number" id="pf-de-max-turns" data-bind="max_turns"
+      class="pe-input pe-input--sm" min="1" max="500" value="200">
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-de-tools">Agent tools <span style="color:#94a3b8;font-size:11px;">(comma-sep; empty = full indev set)</span></label>
+    <input type="text" id="pf-de-tools" data-bind="agent_tools" class="pe-input"
+      placeholder="read_file, write_file, run_test_pytest, submit_work …">
+  </div>
+
+  <div class="pe-field-row">
+    <label for="pf-de-keys">Required input keys <span style="color:#94a3b8;font-size:11px;">(comma-sep)</span></label>
+    <input type="text" id="pf-de-keys" data-bind="required_input_keys" class="pe-input"
+      placeholder="survey_summary, static_analysis">
+  </div>
+
+  <p class="pe-field-note" style="margin-top:6px;color:#f87171;font-size:11px;">
+    ⚠ This node has <strong>write access</strong> to the project working tree.
+    Worktree isolation is applied automatically — each task runs on its own
+    <code>maestro/task-{id}</code> branch inside <code>.maestro-worktrees/</code>.
+  </p>
+</template>
+
+<template id="tpl-parallel_agents">
+  <div class="pe-field-row pe-field-readonly">
+    <label>Stage key</label>
+    <span class="pe-field-value" data-bind="stage_key"></span>
+  </div>
+  <div class="pe-field-row">
+    <label for="pf-pa-label">Display label</label>
+    <input type="text" id="pf-pa-label" data-bind="label" class="pe-input">
+  </div>
+  <div class="pe-field-row">
+    <label for="pf-pa-n">Number of agents (N)</label>
+    <input type="number" id="pf-pa-n" data-bind="n"
+      class="pe-input pe-input--sm" min="1" max="10" value="3">
+  </div>
+  <div class="pe-field-row">
+    <label for="pf-pa-output-key">Output key</label>
+    <input type="text" id="pf-pa-output-key" data-bind="output_key" class="pe-input"
+      placeholder="parallel_agents_output">
+  </div>
+  <div class="pe-field-row">
+    <label for="pf-pa-max-turns">Max turns per agent</label>
+    <input type="number" id="pf-pa-max-turns" data-bind="max_turns"
+      class="pe-input pe-input--sm" min="1" max="200" value="30">
+  </div>
+  <div class="pe-field-row">
+    <label for="pf-pa-dyn-key">Dynamic agents from key <span class="pe-field-hint">(empty = use agent cards)</span></label>
+    <input type="text" id="pf-pa-dyn-key" data-bind="dynamic_agents_from_key" class="pe-input"
+      placeholder="e.g. implementation_steps">
+  </div>
+  <div class="pe-field-row">
+    <label>Agent cards</label>
+    <div id="pf-pa-cards" class="pe-agent-cards-container"></div>
+  </div>
+</template>
 
 <!-- ── Tool Groups modal ─────────────────────────────────────────────────── -->
 <div id="pe-tg-modal" class="pe-modal-overlay pe-hidden">
@@ -557,6 +562,6 @@
   </div>
 </div>
 
-<script src="/static/pipeline_editor.js?v=13"></script>
+<script src="/static/pipeline_editor.js?v=15"></script>
 </body>
 </html>

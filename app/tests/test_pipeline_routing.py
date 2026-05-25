@@ -304,10 +304,29 @@ class TestSchedulerDispatch:
         mock_thread = MagicMock()
         mock_thread.return_value.is_alive.return_value = False
 
+        # Patch all side-effect-heavy dispatch helpers that are not under test here.
+        # Each makes multiple DB round-trips to arcbox; skipping them cuts ~200 ms/tick.
+        _noop = "app.agent.scheduler."
         patches = [
             patch(self._DB_GET_ALL, return_value=[]),
             patch("app.agent.scheduler._cleanup_finished"),
+            patch("app.agent.scheduler._recover_hung_sessions"),
+            patch("app.agent.scheduler._rescue_stale_jobs"),
             patch("app.agent.scheduler._check_model_block_timeout"),
+            patch("app.agent.scheduler._dispatch_clarification_jobs"),
+            patch("app.agent.scheduler._expire_autopilot_objectives"),
+            patch("app.agent.scheduler._dispatch_maestro", return_value=None),
+            patch("app.agent.scheduler._dispatch_heartbeat_maestro", return_value=None),
+            patch("app.agent.scheduler._dispatch_file_summary_jobs", return_value=None),
+            patch("app.agent.scheduler._dispatch_scope_survey_jobs", return_value=None),
+            patch("app.agent.scheduler._dispatch_arch_gen_jobs", return_value=None),
+            patch("app.agent.scheduler._dispatch_pip_resolution_jobs", return_value=None),
+            patch("app.agent.scheduler._dispatch_goal_verification_jobs", return_value=None),
+            patch("app.agent.scheduler._dispatch_research_jobs", return_value=None),
+            patch("app.agent.scheduler._dispatch_episodic_summary_jobs", return_value=None),
+            patch("app.agent.scheduler._dispatch_stranded_subdivisions"),
+            patch("app.agent.scheduler._dispatch_factory_triggers"),
+            patch("app.agent.scheduler._run_episodic_cleanup"),
             patch(self._DAG_RESOLVER, return_value=self._resolver_returning(ready_tasks)),
             patch("threading.Thread", mock_thread),
         ]

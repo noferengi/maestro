@@ -629,6 +629,11 @@ function buildGraphFromTemplate(data) {
                 output_key: cfg.output_key || "parallel_agents_output",
                 max_turns:  cfg.max_turns ?? 30,
                 agents:     Array.isArray(cfg.agents) ? cfg.agents : [],
+                dynamic_agents_from_key: cfg.dynamic_agents_from_key || "",
+                // preserved transparently — not exposed as editable fields
+                _cfg_subagent_type:                cfg.subagent_type || "",
+                _cfg_agent_tools:                  cfg.agent_tools   || null,
+                _cfg_agent_system_prompt_template: cfg.agent_system_prompt_template || "",
             };
             node._syncSize?.();
         } else {
@@ -933,6 +938,10 @@ async function saveGraph() {
                         max_turns:  parseInt(p.max_turns) || 30,
                         _canvas_x:  Math.round(node.pos[0]),
                         _canvas_y:  Math.round(node.pos[1]),
+                        ...(p.dynamic_agents_from_key             ? { dynamic_agents_from_key:             p.dynamic_agents_from_key }             : {}),
+                        ...(p._cfg_subagent_type                  ? { subagent_type:                       p._cfg_subagent_type }                  : {}),
+                        ...(p._cfg_agent_tools                    ? { agent_tools:                         p._cfg_agent_tools }                    : {}),
+                        ...(p._cfg_agent_system_prompt_template   ? { agent_system_prompt_template:        p._cfg_agent_system_prompt_template }   : {}),
                     },
                 };
             } else {
@@ -1258,6 +1267,14 @@ function _setupParallelAgentsPanel(body, node) {
     };
 
     renderCards(parseInt(nInput?.value || "3"));
+
+    if (p.dynamic_agents_from_key) {
+        const note = document.createElement("p");
+        note.className = "pe-field-note";
+        note.style.cssText = "color:#94a3b8;font-size:11px;margin:4px 0 0;";
+        note.textContent = `Dynamic mode: one agent is spawned per item in "${p.dynamic_agents_from_key}" at runtime. Agent cards below are ignored.`;
+        container.insertBefore(note, container.firstChild);
+    }
 
     if (nInput) {
         nInput.addEventListener("change", () => {

@@ -479,6 +479,31 @@ class TestTickFiltering:
     and DAGResolver lazily from app.agent.dag.  Patch those source locations.
     """
 
+    @pytest.fixture(autouse=True)
+    def _patch_tick_side_effects(self):
+        """Suppress all dispatch helpers that make DB round-trips to arcbox.
+        Tests here only care about threading.Thread call counts, not whether
+        research/file-summary/maestro jobs get dispatched."""
+        with (
+            patch("app.agent.scheduler._recover_hung_sessions"),
+            patch("app.agent.scheduler._rescue_stale_jobs"),
+            patch("app.agent.scheduler._dispatch_clarification_jobs"),
+            patch("app.agent.scheduler._expire_autopilot_objectives"),
+            patch("app.agent.scheduler._dispatch_maestro", return_value=None),
+            patch("app.agent.scheduler._dispatch_heartbeat_maestro", return_value=None),
+            patch("app.agent.scheduler._dispatch_file_summary_jobs", return_value=None),
+            patch("app.agent.scheduler._dispatch_scope_survey_jobs", return_value=None),
+            patch("app.agent.scheduler._dispatch_arch_gen_jobs", return_value=None),
+            patch("app.agent.scheduler._dispatch_pip_resolution_jobs", return_value=None),
+            patch("app.agent.scheduler._dispatch_goal_verification_jobs", return_value=None),
+            patch("app.agent.scheduler._dispatch_research_jobs", return_value=None),
+            patch("app.agent.scheduler._dispatch_episodic_summary_jobs", return_value=None),
+            patch("app.agent.scheduler._dispatch_stranded_subdivisions"),
+            patch("app.agent.scheduler._dispatch_factory_triggers"),
+            patch("app.agent.scheduler._run_episodic_cleanup"),
+        ):
+            yield
+
     def _make_ready_task(self, task_id, task_type):
         return {"id": task_id, "type": task_type, "position": 0, "prerequisites": []}
 
