@@ -1001,7 +1001,7 @@ def get_scheduler_status() -> dict:
         if t.get("parent_task_id")
     }
 
-    dispatchable_set = {s.lower() for s in SCHEDULER_DISPATCHABLE_TYPES} | {"_psubagent", "_psubagent_join", "_psubagent_dangerous"}
+    dispatchable_set = {s.lower() for s in SCHEDULER_DISPATCHABLE_TYPES} | {"_psubagent", "_psubagent_join", "_psubagent_dangerous", "_fan_out_child", "_fan_out_collapser"}
     done_set = {s.lower() for s in PIPELINE_DONE_STATUSES}
     never_dispatch = {"completed", "cancelled", "subdividing", "accepted"}
 
@@ -4183,9 +4183,9 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
             ensure_project_ready(project_path)
 
         # Worktree isolation: give each task its own git checkout.
-        # Read-only virtual tasks (_psubagent, _psubagent_join) skip worktrees.
+        # Read-only virtual tasks (_psubagent, _psubagent_join, _fan_out_*) skip worktrees.
         # _psubagent_dangerous runs MaestroLoop with write access and needs one.
-        if project_path and (not task_type.startswith("_p") or task_type == "_psubagent_dangerous"):
+        if project_path and (not task_type.startswith("_p") or task_type == "_psubagent_dangerous") and not task_type.startswith("_fan_out"):
             from app.agent.worktree import setup_task_worktree
             wt = setup_task_worktree(task_id, project_path)
             if wt is None:
@@ -4202,8 +4202,27 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
         llm_id = llm.id
         budget_id = db_task.budget_id if db_task else None
 
-        # Virtual dispatch: _psubagent* and _psubagent_join bypass the pipeline router.
-        if task_type.startswith("_p"):
+        # Virtual dispatch: _psubagent* and _fan_out_* bypass the pipeline router.
+        if task_type.startswith("_fan_out"):
+            from app.agent.pipeline_router import StageConfig as _SC
+            if task_type == "_fan_out_child":
+                _run_fan_out_child(
+                    task_id,
+                    _SC(stage_key="_fan_out_child", label="Fan-Out Child",
+                        agent_type="_fan_out_child", position=0,
+                        config={}, template_id=0, stage_id=0),
+                    llm_base_url, llm_model, max_context, llm_id, budget_id, None,
+                )
+            elif task_type == "_fan_out_collapser":
+                _run_fan_out_collapser(
+                    task_id,
+                    _SC(stage_key="_fan_out_collapser", label="Fan-Out Collapser",
+                        agent_type="_fan_out_collapser", position=0,
+                        config={}, template_id=0, stage_id=0),
+                    llm_base_url, llm_model, max_context, llm_id, budget_id, None,
+                )
+            # Fall through to finally for LLM slot release
+        elif task_type.startswith("_p"):
             from app.database import get_task as _gvt
             from app.agent.pipeline_router import StageConfig as _SC
             _vt = _gvt(task_id)
@@ -5286,6 +5305,9 @@ from app.agent.stage_executors import (  # noqa: E402
     _run_intake_conflict_node,
     _run_intake_feasibility_node,
     _run_intake_gate_node,
+    _run_multiplier_node,
+    _run_fan_out_child,
+    _run_fan_out_collapser,
 )
 from app.agent.pipeline_router import register_agent_type_executor as _reg_executor  # noqa: E402
 
@@ -5312,6 +5334,9 @@ _reg_executor("intake_static",                 _run_intake_static_node)
 _reg_executor("intake_conflict",               _run_intake_conflict_node)
 _reg_executor("intake_feasibility",            _run_intake_feasibility_node)
 _reg_executor("intake_gate",                   _run_intake_gate_node)
+_reg_executor("multiplier_node",               _run_multiplier_node)
+_reg_executor("_fan_out_child",                _run_fan_out_child)
+_reg_executor("_fan_out_collapser",            _run_fan_out_collapser)
 
 # ---------------------------------------------------------------------------
 # Helpers

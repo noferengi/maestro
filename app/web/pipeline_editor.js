@@ -489,6 +489,48 @@ class IntakeGateNode extends LiteGraph.LGraphNode {
 IntakeGateNode.title = "Intake: Gate";
 IntakeGateNode.desc = "Tallies all intake votes — passes, rejects, or triggers subdivide/research";
 
+class MultiplierNode extends LiteGraph.LGraphNode {
+    constructor() {
+        super();
+        this.properties = {
+            stage_key: "multiplier_node",
+            label: "Multiplier",
+            agent_type: "multiplier_node",
+            color: "#5b21b6",
+            n: 3,
+            agent_system_prompt: "",
+            agent_tools: "",
+            agent_max_turns: 15,
+            agents: "",
+            collapser_mode: "vote_tally",
+            tally_strategy: "majority",
+            on_tie: "reject",
+            judge_system_prompt: "Compare the proposals and select the best one.",
+            judge_max_turns: 10,
+            required_input_keys: "",
+            output_key: "fan_out_result",
+        };
+        this.addInput("in", "transition");
+        this.addOutput("pass", "transition");
+        this.addOutput("fail", "transition");
+        this.size = [200, 70];
+    }
+    onDrawBackground(ctx) {
+        ctx.save();
+        ctx.fillStyle = "rgba(255,255,255,0.35)";
+        ctx.font = "bold 12px sans-serif";
+        ctx.fillText("1→N", 8, 22);
+        ctx.fillStyle = "rgba(255,255,255,0.5)";
+        ctx.font = "10px monospace";
+        const mode = this.properties.collapser_mode === "judge_select" ? "[judge]" : "[vote]";
+        ctx.fillText(mode, 8, this.size[1] - 8);
+        ctx.restore();
+    }
+    onDblClick() { openPanel(this); }
+}
+MultiplierNode.title = "Multiplier (Fan-Out)";
+MultiplierNode.desc = "Spawns N crash-survivable child tasks; collapser aggregates via vote tally or LLM judge";
+
 
 function registerNodeTypes() {
     LiteGraph.registerNodeType("maestro/stage", StageNode);
@@ -505,6 +547,7 @@ function registerNodeTypes() {
     LiteGraph.registerNodeType("maestro/intake_conflict",    IntakeConflictNode);
     LiteGraph.registerNodeType("maestro/intake_feasibility", IntakeFeasibilityNode);
     LiteGraph.registerNodeType("maestro/intake_gate",        IntakeGateNode);
+    LiteGraph.registerNodeType("maestro/multiplier_node",    MultiplierNode);
 
     // Port type colors
     LiteGraph.default_connection_color_byType = {
@@ -638,6 +681,7 @@ function buildGraphFromTemplate(data) {
         const isStaticAnalysis  = stage.agent_type === "static_analysis_widget";
         const isDangerousEdit   = stage.agent_type === "dangerous_edit_llm_agent";
         const isParallelAgents  = stage.agent_type === "parallel_agents";
+        const isMultiplierNode  = stage.agent_type === "multiplier_node";
         const isVotingPanel     = stage.agent_type === "voting_panel";
         const isFanOutJudge     = stage.agent_type === "fan_out_judge";
         const nodeType = isFactory        ? "maestro/factory"
@@ -645,6 +689,7 @@ function buildGraphFromTemplate(data) {
                        : isStaticAnalysis  ? "maestro/static_analysis"
                        : isDangerousEdit   ? "maestro/dangerous_edit"
                        : isParallelAgents  ? "maestro/parallel_agents"
+                       : isMultiplierNode  ? "maestro/multiplier_node"
                        : "maestro/stage";
         const node      = LiteGraph.createNode(nodeType);
         const x = 80 + idx * 280;
@@ -716,6 +761,30 @@ function buildGraphFromTemplate(data) {
                 _cfg_agent_system_prompt_template: cfg.agent_system_prompt_template || "",
             };
             node._syncSize?.();
+        } else if (isMultiplierNode) {
+            node.properties = {
+                stage_id:            stage.id,
+                stage_key:           stage.stage_key,
+                label:               stage.label || stage.stage_key,
+                agent_type:          "multiplier_node",
+                color:               stage.color || "#5b21b6",
+                n:                   cfg.n ?? 3,
+                agent_system_prompt: cfg.agent_system_prompt || "",
+                agent_tools:         Array.isArray(cfg.agent_tools)
+                                       ? cfg.agent_tools.join(", ")
+                                       : (cfg.agent_tools || ""),
+                agent_max_turns:     cfg.agent_max_turns ?? 15,
+                agents:              cfg.agents ? JSON.stringify(cfg.agents, null, 2) : "",
+                collapser_mode:      cfg.collapser_mode || "vote_tally",
+                tally_strategy:      cfg.tally_strategy || "majority",
+                on_tie:              cfg.on_tie || "reject",
+                judge_system_prompt: cfg.judge_system_prompt || "",
+                judge_max_turns:     cfg.judge_max_turns ?? 10,
+                required_input_keys: Array.isArray(cfg.required_input_keys)
+                                       ? cfg.required_input_keys.join(", ")
+                                       : (cfg.required_input_keys || ""),
+                output_key:          cfg.output_key || "fan_out_result",
+            };
         } else {
             node.properties = {
                 stage_id:             stage.id,
@@ -933,7 +1002,7 @@ async function saveGraph() {
     try {
         // 1. Upsert all stage + factory + static_analysis nodes (sorted by canvas x for position order)
         const allPipelineNodes = _graph._nodes
-            .filter(n => n.type === "maestro/stage" || n.type === "maestro/factory" || n.type === "maestro/static_analysis" || n.type === "maestro/human_gate" || n.type === "maestro/dangerous_edit" || n.type === "maestro/parallel_agents")
+            .filter(n => n.type === "maestro/stage" || n.type === "maestro/factory" || n.type === "maestro/static_analysis" || n.type === "maestro/human_gate" || n.type === "maestro/dangerous_edit" || n.type === "maestro/parallel_agents" || n.type === "maestro/multiplier_node")
             .sort((a, b) => a.pos[0] - b.pos[0]);
 
         for (let posIdx = 0; posIdx < allPipelineNodes.length; posIdx++) {
@@ -1024,6 +1093,36 @@ async function saveGraph() {
                         ...(p._cfg_agent_system_prompt_template   ? { agent_system_prompt_template:        p._cfg_agent_system_prompt_template }   : {}),
                     },
                 };
+            } else if (node.type === "maestro/multiplier_node") {
+                let agentsList = null;
+                if (p.agents) {
+                    try { agentsList = JSON.parse(p.agents); } catch (_) { agentsList = null; }
+                }
+                const _reqKeys = (p.required_input_keys || "").split(",").map(s=>s.trim()).filter(Boolean);
+                const _tools   = (p.agent_tools || "").split(",").map(s=>s.trim()).filter(Boolean);
+                stageBody = {
+                    stage_key:  p.stage_key,
+                    label:      p.label || p.stage_key,
+                    agent_type: "multiplier_node",
+                    color:      p.color || "#5b21b6",
+                    position:   posIdx,
+                    config: {
+                        n:                    Math.max(1, Math.min(20, parseInt(p.n) || 3)),
+                        agent_system_prompt:  p.agent_system_prompt || "",
+                        agent_tools:          _tools.length ? _tools : [],
+                        agent_max_turns:      parseInt(p.agent_max_turns) || 15,
+                        collapser_mode:       p.collapser_mode || "vote_tally",
+                        tally_strategy:       p.tally_strategy || "majority",
+                        on_tie:               p.on_tie || "reject",
+                        judge_system_prompt:  p.judge_system_prompt || "",
+                        judge_max_turns:      parseInt(p.judge_max_turns) || 10,
+                        required_input_keys:  _reqKeys,
+                        output_key:           p.output_key || "fan_out_result",
+                        ...(agentsList ? { agents: agentsList } : {}),
+                        _canvas_x: Math.round(node.pos[0]),
+                        _canvas_y: Math.round(node.pos[1]),
+                    },
+                };
             } else {
                 stageBody = {
                     stage_key:  p.stage_key,
@@ -1055,7 +1154,7 @@ async function saveGraph() {
 
         // Update stage position map after save so back-edge detection uses new positions
         const stageNodes = allPipelineNodes.filter(n =>
-            n.type === "maestro/stage" || n.type === "maestro/static_analysis" || n.type === "maestro/human_gate" || n.type === "maestro/dangerous_edit" || n.type === "maestro/parallel_agents"
+            n.type === "maestro/stage" || n.type === "maestro/static_analysis" || n.type === "maestro/human_gate" || n.type === "maestro/dangerous_edit" || n.type === "maestro/parallel_agents" || n.type === "maestro/multiplier_node"
         );
         stageNodes.forEach((n, i) => { _stagePosMap[n.id] = i; });
 
@@ -1071,7 +1170,7 @@ async function saveGraph() {
             const fromNode = nodeById[link.origin_id];
             const toNode   = nodeById[link.target_id];
             if (!fromNode || !toNode) continue;
-            const validTypes = new Set(["maestro/stage", "maestro/factory", "maestro/human_gate", "maestro/static_analysis", "maestro/dangerous_edit", "maestro/parallel_agents"]);
+            const validTypes = new Set(["maestro/stage", "maestro/factory", "maestro/human_gate", "maestro/static_analysis", "maestro/dangerous_edit", "maestro/parallel_agents", "maestro/multiplier_node"]);
             if (!validTypes.has(fromNode.type) || !validTypes.has(toNode.type)) continue;
 
             const condition = fromNode.outputs?.[link.origin_slot]?.name || "pass";
@@ -1141,6 +1240,7 @@ function openPanel(node) {
         "maestro/static_analysis":  "tpl-static-analysis",
         "maestro/dangerous_edit":   "tpl-dangerous_edit",
         "maestro/parallel_agents":  "tpl-parallel_agents",
+        "maestro/multiplier_node":  "tpl-multiplier_node",
     };
     const tplId = typeMap[node.type] || "tpl-stage";
     const tpl = document.getElementById(tplId);

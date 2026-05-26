@@ -210,4 +210,26 @@ AGENT_REGISTRY: dict[str, AgentSpec] = {
         ),
         gate_type="none",
     ),
+    "multiplier_node": AgentSpec(
+        cls=None,
+        display_name="Multiplier (Fan-Out)",
+        description=(
+            "Spawns N independent child tasks (voters or proposers), then creates a collapser task "
+            "that aggregates their outputs via vote tally or LLM judge. Crash-survivable — each "
+            "child is a real DB-backed scheduled task."
+        ),
+        gate_type="voting",
+    ),
+    "_fan_out_child": AgentSpec(
+        cls=None,
+        display_name="Fan-Out Child",
+        description="Internal virtual task created by multiplier_node. Runs one agent and writes submission to task.content.",
+        gate_type="none",
+    ),
+    "_fan_out_collapser": AgentSpec(
+        cls=None,
+        display_name="Fan-Out Collapser",
+        description="Internal virtual task created by multiplier_node. Aggregates child submissions and advances the parent stage.",
+        gate_type="none",
+    ),
 }

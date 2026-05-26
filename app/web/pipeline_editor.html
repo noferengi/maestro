@@ -536,6 +536,85 @@
   </div>
 </template>
 
+<!-- ── Multiplier (fan-out) node template ────────────────────────────────── -->
+<template id="tpl-multiplier_node">
+  <div class="pe-field-row pe-field-readonly">
+    <label>Stage key</label>
+    <span class="pe-field-value" data-bind="stage_key"></span>
+  </div>
+  <div class="pe-field-row">
+    <label for="pf-mul-label">Display label</label>
+    <input type="text" id="pf-mul-label" data-bind="label" class="pe-input">
+  </div>
+  <div class="pe-field-row">
+    <label for="pf-mul-mode">Collapser mode</label>
+    <select id="pf-mul-mode" data-bind="collapser_mode" class="pe-input">
+      <option value="vote_tally">vote_tally — majority/veto verdict</option>
+      <option value="judge_select">judge_select — LLM picks best proposal</option>
+    </select>
+  </div>
+  <div class="pe-field-row">
+    <label for="pf-mul-n">Number of agents (N) <span class="pe-field-hint">ignored when agents JSON is set</span></label>
+    <input type="number" id="pf-mul-n" data-bind="n"
+      class="pe-input pe-input--sm" min="1" max="20" value="3">
+  </div>
+  <div class="pe-field-row">
+    <label for="pf-mul-output-key">Output key</label>
+    <input type="text" id="pf-mul-output-key" data-bind="output_key" class="pe-input"
+      placeholder="fan_out_result">
+  </div>
+  <div class="pe-field-row">
+    <label for="pf-mul-strategy">Tally strategy <span class="pe-field-hint">(vote_tally mode only)</span></label>
+    <select id="pf-mul-strategy" data-bind="tally_strategy" class="pe-input">
+      <option value="majority">majority</option>
+      <option value="veto">veto — any REJECTED blocks</option>
+    </select>
+  </div>
+  <div class="pe-field-row">
+    <label for="pf-mul-tie">On tie</label>
+    <select id="pf-mul-tie" data-bind="on_tie" class="pe-input">
+      <option value="reject">reject</option>
+      <option value="pass">pass</option>
+    </select>
+  </div>
+  <div class="pe-field-row">
+    <label for="pf-mul-sys">Agent system prompt <span class="pe-field-hint">(shared / scalar mode)</span>
+      <button class="pe-lightning" data-field="agent_system_prompt" title="⚡ Generate">⚡</button>
+    </label>
+    <textarea id="pf-mul-sys" data-bind="agent_system_prompt" class="pe-textarea" rows="4"></textarea>
+  </div>
+  <div class="pe-field-row">
+    <label for="pf-mul-tools">Agent tools <span class="pe-field-hint">comma-separated</span></label>
+    <input type="text" id="pf-mul-tools" data-bind="agent_tools" class="pe-input"
+      placeholder="submit_work">
+  </div>
+  <div class="pe-field-row">
+    <label for="pf-mul-turns">Max turns per agent</label>
+    <input type="number" id="pf-mul-turns" data-bind="agent_max_turns"
+      class="pe-input pe-input--sm" min="1" max="100" value="15">
+  </div>
+  <div class="pe-field-row">
+    <label for="pf-mul-judge-sys">Judge system prompt <span class="pe-field-hint">(judge_select mode)</span>
+      <button class="pe-lightning" data-field="judge_system_prompt" title="⚡ Generate">⚡</button>
+    </label>
+    <textarea id="pf-mul-judge-sys" data-bind="judge_system_prompt" class="pe-textarea" rows="3"></textarea>
+  </div>
+  <div class="pe-field-row">
+    <label for="pf-mul-judge-turns">Judge max turns</label>
+    <input type="number" id="pf-mul-judge-turns" data-bind="judge_max_turns"
+      class="pe-input pe-input--sm" min="1" max="50" value="10">
+  </div>
+  <div class="pe-field-row">
+    <label for="pf-mul-input-keys">Required input keys <span class="pe-field-hint">comma-separated task.content keys to inject</span></label>
+    <input type="text" id="pf-mul-input-keys" data-bind="required_input_keys" class="pe-input">
+  </div>
+  <div class="pe-field-row">
+    <label for="pf-mul-agents">Agents JSON <span class="pe-field-hint">array of {name, system_prompt, tools?, max_turns?}; overrides N</span></label>
+    <textarea id="pf-mul-agents" data-bind="agents" class="pe-textarea pe-code" rows="5"
+      placeholder='[{"name":"Reviewer A","system_prompt":"..."},{"name":"Reviewer B","system_prompt":"..."}]'></textarea>
+  </div>
+</template>
+
 <!-- ── Tool Groups modal ─────────────────────────────────────────────────── -->
 <div id="pe-tg-modal" class="pe-modal-overlay pe-hidden">
   <div class="pe-modal-box">
@@ -562,6 +641,6 @@
   </div>
 </div>
 
-<script src="/static/pipeline_editor.js?v=16"></script>
+<script src="/static/pipeline_editor.js?v=17"></script>
 </body>
 </html>

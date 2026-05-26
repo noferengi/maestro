@@ -2690,3 +2690,467 @@ def _run_intake_gate_node(
     finally:
         close_agent_session(session_id, exit_reason, "")
         _loop_cleanup(loop)
+
+
+# ---------------------------------------------------------------------------
+# Multiplier Node — fan-out creator
+# ---------------------------------------------------------------------------
+
+def _run_multiplier_node(
+    task_id: str,
+    stage_config: "StageConfig",
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """
+    Fan-out creator for the multiplier_node pipeline stage.
+
+    Creates N _fan_out_child tasks plus one _fan_out_collapser task that
+    aggregates their outputs and advances the parent stage.  The collapser ID
+    is appended to the parent's prerequisites so the parent blocks until
+    aggregation completes.  Does NOT call advance_stage — the collapser drives
+    the parent forward.
+
+    Stage config shape:
+        agents              — list of {name, system_prompt, tools?, max_turns?}
+                              (takes precedence over scalar config)
+        n                   — number of child agents in scalar mode (default 3)
+        agent_system_prompt — shared system prompt (scalar mode)
+        agent_tools         — tool allowlist for children (scalar mode)
+        agent_max_turns     — max turns per child (default 15)
+        collapser_mode      — "vote_tally" (default) | "judge_select"
+        tally_strategy      — "majority" (default) | "veto"
+        on_tie              — "reject" (default) | "pass"
+        judge_system_prompt — system prompt for the LLM judge (judge_select mode)
+        judge_max_turns     — max turns for judge (default 10)
+        required_input_keys — task.content keys to inject into child user messages
+        output_key          — task.content key for final result (default "fan_out_result")
+    """
+    from app.database import get_task, update_task, create_task as _create_task
+
+    cfg: dict = stage_config.config or {}
+    agents_cfg: list[dict] = list(cfg.get("agents") or [])
+    n: int = int(cfg.get("n", 3))
+    agent_system_prompt: str = cfg.get("agent_system_prompt", "Complete the task and call submit_work.")
+    agent_tools: list[str] = list(cfg.get("agent_tools") or [])
+    agent_max_turns: int = int(cfg.get("agent_max_turns", 15))
+    required_input_keys: list[str] = cfg.get("required_input_keys") or []
+    if isinstance(required_input_keys, str):
+        required_input_keys = [k.strip() for k in required_input_keys.split(",") if k.strip()]
+    output_key: str = cfg.get("output_key", "fan_out_result")
+    collapser_mode: str = cfg.get("collapser_mode", "vote_tally")
+    tally_strategy: str = cfg.get("tally_strategy", "majority")
+    on_tie: str = cfg.get("on_tie", "reject")
+    judge_system_prompt: str = cfg.get("judge_system_prompt", "Compare the proposals and select the best one.")
+    judge_max_turns: int = int(cfg.get("judge_max_turns", 10))
+
+    parent = get_task(task_id)
+    if not parent:
+        return
+
+    # Idempotency guard: skip if children already created.
+    if (parent.content or {}).get("_multiplier_child_ids"):
+        return
+
+    # Build agent config list (per-agent mode takes precedence).
+    if not agents_cfg:
+        agents_cfg = [
+            {"name": f"agent_{i}", "system_prompt": agent_system_prompt,
+             "tools": agent_tools, "max_turns": agent_max_turns}
+            for i in range(n)
+        ]
+
+    context_preamble = _build_required_keys_preamble(task_id, required_input_keys)
+
+    child_ids: list[str] = []
+    for i, agent in enumerate(agents_cfg):
+        name = agent.get("name", f"agent_{i}")
+        child = _create_task(
+            title=f"[MUL] {name} ← {parent.title[:45]}",
+            task_type="_fan_out_child",
+            stage_key="_fan_out_child",
+            project_id=parent.project_id,
+            pipeline_template_id=None,
+            llm_id=llm_id,
+            budget_id=budget_id,
+            content={"_fan_out_cfg": {
+                "name": name,
+                "system_prompt": agent.get("system_prompt", agent_system_prompt),
+                "tools": list(agent.get("tools") or agent_tools),
+                "max_turns": int(agent.get("max_turns") or agent_max_turns),
+                "collapser_mode": collapser_mode,
+                "parent_task_id": task_id,
+                "context_preamble": context_preamble,
+            }},
+        )
+        if child:
+            child_ids.append(child.id)
+
+    collapser = _create_task(
+        title=f"[MUL-join] {parent.title[:50]}",
+        task_type="_fan_out_collapser",
+        stage_key="_fan_out_collapser",
+        project_id=parent.project_id,
+        pipeline_template_id=None,
+        llm_id=llm_id,
+        budget_id=budget_id,
+        prerequisites=child_ids,
+        content={"_collapser_cfg": {
+            "parent_task_id": task_id,
+            "parent_stage_key": stage_config.stage_key,
+            "child_ids": child_ids,
+            "collapser_mode": collapser_mode,
+            "tally_strategy": tally_strategy,
+            "on_tie": on_tie,
+            "judge_system_prompt": judge_system_prompt,
+            "judge_max_turns": judge_max_turns,
+            "output_key": output_key,
+        }},
+    )
+
+    blob = dict(parent.content or {})
+    blob["_multiplier_child_ids"] = child_ids
+    blob["_multiplier_collapser_id"] = collapser.id if collapser else None
+    existing_prereqs = list(parent.prerequisites or [])
+    update_task(task_id, content=blob,
+                prerequisites=existing_prereqs + ([collapser.id] if collapser else []))
+
+    logger.info(
+        "[multiplier_node] task '%s': created %d children + collapser '%s'.",
+        task_id, len(child_ids), (collapser.id if collapser else "None"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# _fan_out_child — runs one fan-out child agent
+# ---------------------------------------------------------------------------
+
+def _run_fan_out_child(
+    task_id: str,
+    stage_config: "StageConfig",
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """
+    Runs one fan-out child created by multiplier_node.
+
+    Config comes from task.content._fan_out_cfg (injected at creation time).
+    Writes the submit_work payload to task.content["submission"] and sets the
+    task to completed.
+    """
+    from app.database import get_task, update_task, create_agent_session, close_agent_session
+
+    task = get_task(task_id)
+    if not task:
+        return
+
+    cfg: dict = (task.content or {}).get("_fan_out_cfg", {})
+    name: str = cfg.get("name", "agent")
+    system_prompt: str = cfg.get("system_prompt", "Complete the task and call submit_work.")
+    tools: list[str] = list(cfg.get("tools") or [])
+    max_turns: int = int(cfg.get("max_turns", 15))
+    collapser_mode: str = cfg.get("collapser_mode", "vote_tally")
+    context_preamble: str = cfg.get("context_preamble", "")
+    parent_task_id: str | None = cfg.get("parent_task_id")
+
+    parent = get_task(parent_task_id) if parent_task_id else None
+
+    if collapser_mode == "vote_tally":
+        user_msg = (
+            context_preamble
+            + f"Task ID: {parent_task_id or task_id}\n"
+            f"Title: {parent.title if parent else task.title}\n"
+            f"Description:\n{(parent.description or '') if parent else (task.description or '')}\n\n"
+            "Review and vote. Call submit_work with:\n"
+            "  signal='ACCEPTED' or 'REJECTED'\n"
+            "  summary='your reasoning'\n"
+            "  payload={'verdict': 'ACCEPTED'|'REJECTED', 'confidence': 0-100, 'justification': '...'}"
+        )
+    else:
+        user_msg = (
+            context_preamble
+            + f"Task ID: {parent_task_id or task_id}\n"
+            f"Title: {parent.title if parent else task.title}\n"
+            f"Description:\n{(parent.description or '') if parent else (task.description or '')}\n\n"
+            "Produce your best proposal and call submit_work with:\n"
+            "  signal='ACCEPTED'\n"
+            "  summary='brief description'\n"
+            "  payload={your full proposal as a dict or string}"
+        )
+
+    session_id = create_agent_session(
+        task_id=task_id,
+        agent_type=f"_fan_out_child:{name}",
+        llm_id=llm_id,
+        budget_id=budget_id,
+        scheduler_reason="scheduler",
+    )
+    exit_reason = "error"
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        collector = _CollectorAgent(
+            task_id=task_id,
+            system_prompt=system_prompt,
+            tool_allowlist=tools,
+            max_turns=max_turns,
+            llm_id=llm_id,
+            budget_id=budget_id,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            max_context=max_context,
+            user_message=user_msg,
+            agent_name=f"fan_out_child:{name}",
+        )
+        payload: dict | None = loop.run_until_complete(collector.run())
+
+        fresh = get_task(task_id)
+        blob = dict((fresh.content or {}) if fresh else {})
+        blob["submission"] = payload or {}
+        update_task(task_id, content=blob, type="completed", stage_key="completed")
+        exit_reason = "completed"
+
+    except Exception:
+        logger.exception("[fan_out_child] task '%s' agent '%s' raised.", task_id, name)
+        fresh = get_task(task_id)
+        blob = dict((fresh.content or {}) if fresh else {})
+        blob["submission"] = {"verdict": "REJECTED", "confidence": 0, "justification": "Agent errored."}
+        update_task(task_id, content=blob, type="completed", stage_key="completed")
+    finally:
+        close_agent_session(session_id, exit_reason, "")
+        try:
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=5.0))
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# _fan_out_collapser — aggregates child outputs and advances parent
+# ---------------------------------------------------------------------------
+
+def _run_fan_out_collapser(
+    task_id: str,
+    stage_config: "StageConfig",
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """
+    Aggregator for multiplier_node.  Reads all child submissions and either:
+      vote_tally  — tallies ACCEPTED/REJECTED votes via tally_votes()
+      judge_select — runs an LLM judge to pick the best proposal
+
+    Calls advance_stage on the parent task when done.
+    Config comes from task.content._collapser_cfg (injected by multiplier_node).
+    """
+    from app.database import get_task, update_task, create_agent_session, close_agent_session
+    from app.database.session import SessionLocal
+    from app.database.models import TransitionVote
+    from app.agent.verdicts import Vote, Verdict, tally_votes
+
+    task = get_task(task_id)
+    if not task:
+        return
+
+    cfg: dict = (task.content or {}).get("_collapser_cfg", {})
+    parent_task_id: str | None = cfg.get("parent_task_id")
+    parent_stage_key: str = cfg.get("parent_stage_key", "")
+    child_ids: list[str] = cfg.get("child_ids", [])
+    collapser_mode: str = cfg.get("collapser_mode", "vote_tally")
+    tally_strategy: str = cfg.get("tally_strategy", "majority")
+    on_tie: str = cfg.get("on_tie", "reject")
+    judge_system_prompt: str = cfg.get("judge_system_prompt", "Compare the proposals and select the best one.")
+    judge_max_turns: int = int(cfg.get("judge_max_turns", 10))
+    output_key: str = cfg.get("output_key", "fan_out_result")
+
+    if not parent_task_id:
+        logger.error("[fan_out_collapser] task '%s': no parent_task_id in _collapser_cfg.", task_id)
+        return
+
+    session_id = create_agent_session(
+        task_id=task_id,
+        agent_type="fan_out_collapser",
+        llm_id=llm_id,
+        budget_id=budget_id,
+        scheduler_reason="scheduler",
+    )
+    exit_reason = "error"
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        children = [get_task(cid) for cid in child_ids]
+        submissions: list[dict] = [
+            (c.content or {}).get("submission", {}) for c in children if c
+        ]
+
+        parent_task = get_task(parent_task_id)
+        parent_title = parent_task.title if parent_task else "(unknown)"
+
+        if collapser_mode == "judge_select":
+            proposals = [s for s in submissions if s]
+            if not proposals:
+                logger.warning("[fan_out_collapser] task '%s': no proposals — advancing fail.", task_id)
+                advance_stage(parent_task_id, "fail", from_stage=parent_stage_key)
+                exit_reason = "fail"
+                update_task(task_id, type="completed", stage_key="completed")
+                return
+
+            _MAX_CHARS = 2000
+            proposals_text = "\n\n".join(
+                f"=== Proposal {i} ===\n{str(p)[:_MAX_CHARS]}"
+                for i, p in enumerate(proposals)
+            )
+            judge_user_msg = (
+                f"Task: {parent_title}\n\n"
+                f"You have {len(proposals)} proposal(s):\n\n{proposals_text}\n\n"
+                "Pick the best one. Call submit_work with:\n"
+                "  signal='ACCEPTED'\n"
+                "  summary='your rationale'\n"
+                "  payload={'selected_index': N, 'rationale': '...'}"
+            )
+            judge = _CollectorAgent(
+                task_id=task_id,
+                system_prompt=judge_system_prompt,
+                tool_allowlist=[],
+                max_turns=judge_max_turns,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                max_context=max_context,
+                user_message=judge_user_msg,
+                agent_name="fan_out_judge",
+            )
+            judgment: dict | None = loop.run_until_complete(judge.run())
+
+            selected_idx = 0
+            if judgment:
+                try:
+                    selected_idx = int(judgment.get("selected_index", 0))
+                    selected_idx = max(0, min(selected_idx, len(proposals) - 1))
+                except (TypeError, ValueError):
+                    selected_idx = 0
+
+            winning = proposals[selected_idx]
+            parent_fresh = get_task(parent_task_id)
+            blob = dict((parent_fresh.content or {}) if parent_fresh else {})
+            blob[output_key] = winning
+            if judgment:
+                blob[f"{output_key}_rationale"] = judgment.get("rationale", "")
+            update_task(parent_task_id, content=blob)
+            advance_stage(parent_task_id, "pass", from_stage=parent_stage_key)
+            exit_reason = "pass"
+
+        else:
+            votes: list[Vote] = []
+            for i, sub in enumerate(submissions):
+                verdict_str = str(sub.get("verdict", "REJECTED")).upper()
+                raw_conf = int(sub.get("confidence", 50))
+                justification = str(sub.get("justification", ""))
+
+                if verdict_str == "ACCEPTED":
+                    confidence = max(92, min(100, raw_conf if raw_conf >= 76 else 92))
+                    verdict = Verdict.LIKELY
+                else:
+                    confidence = max(0, min(50, raw_conf if raw_conf <= 50 else 25))
+                    verdict = Verdict.REJECTED
+
+                try:
+                    votes.append(Vote(
+                        stage=f"fan_out_voter_{i}",
+                        verdict=verdict,
+                        confidence=confidence,
+                        justification=justification,
+                    ))
+                except Exception:
+                    logger.warning("[fan_out_collapser] task '%s': child_%d produced invalid vote.", task_id, i)
+
+            if not votes:
+                condition = "fail"
+                tally_outcome = "rejected"
+            elif tally_strategy == "veto":
+                condition = _tally_veto(votes)
+                tally_outcome = "rejected" if condition == "fail" else "passed"
+            else:
+                tally = tally_votes(votes)
+                tally_outcome = tally.outcome
+                if tally_outcome in ("passed", "conditional_pass", "warned"):
+                    condition = "pass"
+                elif tally_outcome == "tie":
+                    condition = "fail" if on_tie == "reject" else "pass"
+                else:
+                    condition = "fail"
+
+            parent_fresh = get_task(parent_task_id)
+            blob = dict((parent_fresh.content or {}) if parent_fresh else {})
+            blob[output_key] = {
+                "outcome": tally_outcome,
+                "votes": [
+                    {
+                        "stage": v.stage,
+                        "verdict": v.verdict.value,
+                        "confidence": v.confidence,
+                        "justification": v.justification,
+                    }
+                    for v in votes
+                ],
+            }
+            update_task(parent_task_id, content=blob)
+
+            db = SessionLocal()
+            try:
+                for v in votes:
+                    db.add(TransitionVote(
+                        task_id=parent_task_id,
+                        transition=f"{parent_stage_key}_multiplier",
+                        stage=v.stage,
+                        verdict=v.verdict.value,
+                        confidence=v.confidence,
+                        justification=v.justification,
+                        budget_id=budget_id,
+                    ))
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception("[fan_out_collapser] task '%s': failed to save TransitionVote rows.", task_id)
+            finally:
+                db.close()
+
+            advance_stage(parent_task_id, condition, from_stage=parent_stage_key)
+            exit_reason = condition
+
+        update_task(task_id, type="completed", stage_key="completed")
+        logger.info(
+            "[fan_out_collapser] task '%s': aggregated %d children → parent '%s' result '%s'.",
+            task_id, len(submissions), parent_task_id, exit_reason,
+        )
+
+    except Exception:
+        logger.exception("[fan_out_collapser] task '%s' raised.", task_id)
+    finally:
+        close_agent_session(session_id, exit_reason, "")
+        try:
+            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=5.0))
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
