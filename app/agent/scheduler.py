@@ -4989,18 +4989,19 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
                 return
 
             current_type = (task.type or "").lower()
-            if current_type in ("planning", "indev"):
-                advance_stage(task_id, "pass", from_stage=current_type)
+            advanced = advance_stage(task_id, "pass", from_stage=current_type)
+            if advanced:
                 logger.info("Task '%s' advanced from %s via scheduler (ACCEPTED).", task_id, current_type.upper())
             else:
-                logger.info("Task '%s' reached ACCEPTED but current type '%s' has no auto-transition.", task_id, current_type)
+                logger.info("Task '%s' reached terminal ACCEPTED state (no pass edge from '%s').", task_id, current_type)
 
         elif result.status == "NEEDS_HUMAN":
             _exit_reason = "needs_human"
             _exit_summary = result.final_message or "Agent escalated for human review."
-            advance_stage(task_id, "pass", from_stage="indev")
             from app.database import create_inbox_message as _create_inbox
             task_obj = get_task(task_id)
+            _nh_stage = (task_obj.type or "indev").lower() if task_obj else "indev"
+            advance_stage(task_id, "pass", from_stage=_nh_stage)
             _create_inbox(
                 subject=f"Human review needed: {(task_obj.title if task_obj else task_id)[:60]}",
                 source_type="needs_human",
@@ -5042,9 +5043,11 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
 
         elif result.status in ("REVERT_TO_DESIGN", "REJECTED"):
             _exit_reason = "rejected"
-            advance_stage(task_id, "fail", from_stage="indev")
-            _record_demotion_inline(task_id, "indev", "planning", result.final_message or "Agent requested revert")
-            logger.warning("Task '%s' reverted to PLANNING via scheduler: %s", task_id, result.final_message)
+            _rtd_task = get_task(task_id)
+            _rtd_stage = (_rtd_task.type or "indev").lower() if _rtd_task else "indev"
+            advance_stage(task_id, "fail", from_stage=_rtd_stage)
+            _record_demotion_inline(task_id, _rtd_stage, _rtd_stage, result.final_message or "Agent requested revert")
+            logger.warning("Task '%s' reverted via fail edge from '%s': %s", task_id, _rtd_stage, result.final_message)
 
         elif result.status == "MAX_TURNS":
             _exit_reason = "max_turns"
@@ -5053,12 +5056,12 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
                 return
 
             current_type = (task.type or "").lower()
-            if current_type in ("planning", "indev"):
-                logger.warning("Task '%s' demoted to PLANNING (max_turns).", task_id)
-                _record_demotion_inline(task_id, current_type, "planning", f"Max turns ({_MAX_TURNS}) exceeded without completion.")
-                advance_stage(task_id, "fail", from_stage=current_type)
+            advanced = advance_stage(task_id, "fail", from_stage=current_type)
+            if advanced:
+                logger.warning("Task '%s' demoted via fail edge from '%s' (max_turns).", task_id, current_type)
+                _record_demotion_inline(task_id, current_type, current_type, f"Max turns ({_MAX_TURNS}) exceeded without completion.")
             else:
-                logger.warning("Task '%s' reached terminal state (MAX_TURNS) but current type '%s' has no auto-transition.", task_id, current_type)
+                logger.warning("Task '%s' reached max turns in '%s' but has no fail edge; left in place.", task_id, current_type)
 
         elif result.status == "ERROR":
             _exit_reason = "error"
@@ -5067,12 +5070,12 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
                 return
 
             current_type = (task.type or "").lower()
-            if current_type in ("planning", "indev"):
-                logger.warning("Task '%s' demoted to PLANNING (error).", task_id)
-                _record_demotion_inline(task_id, current_type, "planning", f"Execution error in {current_type} stage.")
-                advance_stage(task_id, "fail", from_stage=current_type)
+            advanced = advance_stage(task_id, "fail", from_stage=current_type)
+            if advanced:
+                logger.warning("Task '%s' demoted via fail edge from '%s' (error).", task_id, current_type)
+                _record_demotion_inline(task_id, current_type, current_type, f"Execution error in {current_type} stage.")
             else:
-                logger.warning("Task '%s' reached terminal state (ERROR) but current type '%s' has no auto-transition.", task_id, current_type)
+                logger.warning("Task '%s' error in '%s' but has no fail edge; left in place.", task_id, current_type)
 
     except ShutdownError:
         _exit_reason = "shutdown"
@@ -5086,9 +5089,9 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
         task = get_task(task_id)
         if task:
             current_type = (task.type or "").lower()
-            if current_type in ("planning", "indev"):
-                advance_stage(task_id, "fail", from_stage=current_type)
-                logger.warning("Task '%s' demoted via advance_stage (exception in %s).", task_id, current_type)
+            advanced = advance_stage(task_id, "fail", from_stage=current_type)
+            if advanced:
+                logger.warning("Task '%s' demoted via fail edge (exception in %s).", task_id, current_type)
     finally:
         close_agent_session(_session_id, _exit_reason, _exit_summary, turn_count=_turn_count)
         try:
@@ -5278,6 +5281,11 @@ from app.agent.stage_executors import (  # noqa: E402
     _run_pitfall_node,
     _run_consolidation_node,
     _run_planning_gate_node,
+    _run_intake_scope_node,
+    _run_intake_static_node,
+    _run_intake_conflict_node,
+    _run_intake_feasibility_node,
+    _run_intake_gate_node,
 )
 from app.agent.pipeline_router import register_agent_type_executor as _reg_executor  # noqa: E402
 
@@ -5299,6 +5307,11 @@ _reg_executor("planning_survey_node",          _run_planning_survey_node)
 _reg_executor("pitfall_node",                  _run_pitfall_node)
 _reg_executor("consolidation_node",            _run_consolidation_node)
 _reg_executor("planning_gate_node",            _run_planning_gate_node)
+_reg_executor("intake_scope",                  _run_intake_scope_node)
+_reg_executor("intake_static",                 _run_intake_static_node)
+_reg_executor("intake_conflict",               _run_intake_conflict_node)
+_reg_executor("intake_feasibility",            _run_intake_feasibility_node)
+_reg_executor("intake_gate",                   _run_intake_gate_node)
 
 # ---------------------------------------------------------------------------
 # Helpers

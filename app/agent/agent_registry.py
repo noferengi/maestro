@@ -33,6 +33,36 @@ AGENT_REGISTRY: dict[str, AgentSpec] = {
         description="4-stage intake voting pipeline (scope, static, feasibility, conflict)",
         gate_type="voting",
     ),
+    "intake_scope": AgentSpec(
+        cls=None,
+        display_name="Intake: Scope",
+        description="Intake stage 1 — LLM scope analysis (size, complexity, decomposition).",
+        gate_type="single_pass",
+    ),
+    "intake_static": AgentSpec(
+        cls=None,
+        display_name="Intake: Static",
+        description="Intake stage 2 — deterministic tree-sitter code structure analysis.",
+        gate_type="none",
+    ),
+    "intake_conflict": AgentSpec(
+        cls=None,
+        display_name="Intake: Conflict",
+        description="Intake stage 3 — LLM conflict detection against existing project tasks.",
+        gate_type="voting",
+    ),
+    "intake_feasibility": AgentSpec(
+        cls=None,
+        display_name="Intake: Feasibility",
+        description="Intake stage 4 — LLM feasibility analysis informed by static output.",
+        gate_type="single_pass",
+    ),
+    "intake_gate": AgentSpec(
+        cls=None,
+        display_name="Intake: Gate",
+        description="Intake stage 5 — tally all votes; passes, rejects, or triggers subdivide/research.",
+        gate_type="voting",
+    ),
     "planning_agent": AgentSpec(
         cls=None,
         display_name="Planning",

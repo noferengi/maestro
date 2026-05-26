@@ -511,7 +511,7 @@ MERGE_PUSH_RETRIES: int  = _getint("merge", "push_retries",        None,        
 PIPELINE_COLUMN_ORDER: list[str] = _getlist(
     "pipeline", "column_order",
     "architecture, idea, planning, indev, conceptual_review, "
-    "optimization, security, final_review, completed",
+    "optimization, security, final_review, human_review, completed, accepted",
 )
 
 PIPELINE_DONE_STATUSES: frozenset[str] = frozenset(

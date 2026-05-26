@@ -415,6 +415,81 @@ ParallelAgentsNode.title = "Parallel Agents";
 ParallelAgentsNode.desc = "FOR LOOP — runs N agents in parallel as real scheduler tasks, merges outputs";
 
 
+// ---------------------------------------------------------------------------
+// Intake stage nodes (Phase 7 — each wraps the corresponding executor)
+// ---------------------------------------------------------------------------
+
+class IntakeScopeNode extends LiteGraph.LGraphNode {
+    constructor() {
+        super();
+        this.properties = { stage_key: "intake_scope", label: "Intake: Scope", agent_type: "intake_scope", color: "#2d6a4f" };
+        this.addInput("in", "transition");
+        this.addOutput("pass", "transition");
+        this.addOutput("fail", "transition");
+        this.size = [180, 60];
+    }
+    onDblClick() { openPanel(this); }
+}
+IntakeScopeNode.title = "Intake: Scope";
+IntakeScopeNode.desc = "LLM scope analysis — votes on size, complexity, decomposition";
+
+class IntakeStaticNode extends LiteGraph.LGraphNode {
+    constructor() {
+        super();
+        this.properties = { stage_key: "intake_static", label: "Intake: Static", agent_type: "intake_static", color: "#1b4332" };
+        this.addInput("in", "transition");
+        this.addOutput("pass", "transition");
+        this.addOutput("fail", "transition");
+        this.size = [180, 60];
+    }
+    onDblClick() { openPanel(this); }
+}
+IntakeStaticNode.title = "Intake: Static";
+IntakeStaticNode.desc = "Deterministic tree-sitter code structure analysis";
+
+class IntakeConflictNode extends LiteGraph.LGraphNode {
+    constructor() {
+        super();
+        this.properties = { stage_key: "intake_conflict", label: "Intake: Conflict", agent_type: "intake_conflict", color: "#40916c" };
+        this.addInput("in", "transition");
+        this.addOutput("pass", "transition");
+        this.addOutput("fail", "transition");
+        this.size = [180, 60];
+    }
+    onDblClick() { openPanel(this); }
+}
+IntakeConflictNode.title = "Intake: Conflict";
+IntakeConflictNode.desc = "LLM conflict detection against existing tasks";
+
+class IntakeFeasibilityNode extends LiteGraph.LGraphNode {
+    constructor() {
+        super();
+        this.properties = { stage_key: "intake_feasibility", label: "Intake: Feasibility", agent_type: "intake_feasibility", color: "#52b788" };
+        this.addInput("in", "transition");
+        this.addOutput("pass", "transition");
+        this.addOutput("fail", "transition");
+        this.size = [180, 60];
+    }
+    onDblClick() { openPanel(this); }
+}
+IntakeFeasibilityNode.title = "Intake: Feasibility";
+IntakeFeasibilityNode.desc = "LLM feasibility analysis informed by static output";
+
+class IntakeGateNode extends LiteGraph.LGraphNode {
+    constructor() {
+        super();
+        this.properties = { stage_key: "intake_gate", label: "Intake: Gate", agent_type: "intake_gate", color: "#74c69d" };
+        this.addInput("in", "transition");
+        this.addOutput("pass", "transition");
+        this.addOutput("fail", "transition");
+        this.size = [180, 60];
+    }
+    onDblClick() { openPanel(this); }
+}
+IntakeGateNode.title = "Intake: Gate";
+IntakeGateNode.desc = "Tallies all intake votes — passes, rejects, or triggers subdivide/research";
+
+
 function registerNodeTypes() {
     LiteGraph.registerNodeType("maestro/stage", StageNode);
     LiteGraph.registerNodeType("maestro/factory", FactoryNode);
@@ -425,6 +500,11 @@ function registerNodeTypes() {
     LiteGraph.registerNodeType("maestro/static_analysis", StaticAnalysisNode);
     LiteGraph.registerNodeType("maestro/dangerous_edit",   DangerousEditNode);
     LiteGraph.registerNodeType("maestro/parallel_agents",  ParallelAgentsNode);
+    LiteGraph.registerNodeType("maestro/intake_scope",       IntakeScopeNode);
+    LiteGraph.registerNodeType("maestro/intake_static",      IntakeStaticNode);
+    LiteGraph.registerNodeType("maestro/intake_conflict",    IntakeConflictNode);
+    LiteGraph.registerNodeType("maestro/intake_feasibility", IntakeFeasibilityNode);
+    LiteGraph.registerNodeType("maestro/intake_gate",        IntakeGateNode);
 
     // Port type colors
     LiteGraph.default_connection_color_byType = {

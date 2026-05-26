@@ -4178,10 +4178,11 @@ def _arch_cat_to_dict(c) -> dict:
     return {"id": c.id, "template_id": c.template_id, "key": c.key, "label": c.label, "color": c.color, "position": c.position}
 
 
-def _template_meta_to_dict(t) -> dict:
+def _template_meta_to_dict(t, task_count: int = 0) -> dict:
     return {
         "id": t.id, "name": t.name, "description": t.description,
         "is_default": t.is_default, "is_builtin": t.is_builtin, "version": t.version,
+        "task_count": task_count,
         "created_at": t.created_at.isoformat() if t.created_at else None,
         "updated_at": t.updated_at.isoformat() if t.updated_at else None,
     }
@@ -4461,9 +4462,26 @@ async def generate_pipeline_field(body: dict = Body(...)):
 
 @app.get("/api/pipelines", response_model=List[dict])
 def list_pipeline_templates():
-    """List all pipeline templates (id, name, is_default, version)."""
+    """List all pipeline templates (id, name, is_default, version, project_count)."""
     from app.database import get_all_templates as _all
-    return [_template_meta_to_dict(t) for t in _all()]
+    from app.database.session import SessionLocal
+    from sqlalchemy import text as _text
+    templates = _all()
+    counts: dict[int, int] = {}
+    try:
+        db = SessionLocal()
+        try:
+            rows = db.execute(_text(
+                "SELECT pipeline_template_id, COUNT(*) FROM tasks "
+                "WHERE is_active AND pipeline_template_id IS NOT NULL "
+                "AND type != 'architecture' GROUP BY pipeline_template_id"
+            )).fetchall()
+            counts = {row[0]: row[1] for row in rows}
+        finally:
+            db.close()
+    except Exception:
+        pass
+    return [_template_meta_to_dict(t, task_count=counts.get(t.id, 0)) for t in templates]
 
 
 @app.post("/api/pipelines", response_model=dict, status_code=201)

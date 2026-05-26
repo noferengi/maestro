@@ -2338,3 +2338,355 @@ def _run_planning_gate_node(
             loop.close()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Intake decomposition executors (Operation Fury Phase 7)
+# ---------------------------------------------------------------------------
+
+def _intake_write_vote(task_id: str, stage_name: str, vote: dict) -> None:
+    from app.database import get_task, update_task
+    task = get_task(task_id)
+    blob = dict(task.content or {}) if task else {}
+    votes_map = dict(blob.get("intake_votes", {}))
+    votes_map[stage_name] = vote
+    blob["intake_votes"] = votes_map
+    update_task(task_id, content=blob)
+
+
+def _intake_read_vote(task_id: str, stage_name: str) -> dict:
+    from app.database import get_task
+    task = get_task(task_id)
+    blob = task.content or {} if task else {}
+    return (blob.get("intake_votes") or {}).get(stage_name, {})
+
+
+def _loop_cleanup(loop: asyncio.AbstractEventLoop) -> None:
+    try:
+        loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=5.0))
+    except Exception:
+        pass
+    try:
+        loop.close()
+    except Exception:
+        pass
+
+
+def _run_intake_scope_node(
+    task_id: str,
+    stage_config: StageConfig,
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """intake_scope executor — LLM scope analysis (Stage 1 of 5)."""
+    from app.database import create_agent_session, close_agent_session, get_task
+    from app.agent.intake import run_intake_scope_stage
+
+    task = get_task(task_id)
+    if not task or not task.description:
+        return
+
+    session_id = create_agent_session(
+        task_id=task_id, agent_type="intake_scope",
+        llm_id=llm_id, budget_id=budget_id, scheduler_reason="scheduler",
+    )
+    exit_reason = "error"
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        vote = loop.run_until_complete(
+            run_intake_scope_stage(
+                task_id=task_id,
+                task_title=task.title,
+                task_description=task.description,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                project=task.project or None,
+                stage_cfg=stage_config.config or {},
+            )
+        )
+        _intake_write_vote(task_id, "scope", vote)
+        advance_stage(task_id, "pass")
+        exit_reason = "pass"
+    except Exception:
+        logger.exception("[intake_scope] task '%s' raised.", task_id)
+        advance_stage(task_id, "fail")
+    finally:
+        close_agent_session(session_id, exit_reason, "")
+        _loop_cleanup(loop)
+
+
+def _run_intake_static_node(
+    task_id: str,
+    stage_config: StageConfig,
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """intake_static executor — deterministic static analysis (Stage 2 of 5)."""
+    from app.database import create_agent_session, close_agent_session, get_task
+    from app.agent.intake import run_intake_static_stage
+
+    task = get_task(task_id)
+    if not task or not task.description:
+        return
+
+    scope_vote = _intake_read_vote(task_id, "scope")
+    session_id = create_agent_session(
+        task_id=task_id, agent_type="intake_static",
+        llm_id=llm_id, budget_id=budget_id, scheduler_reason="scheduler",
+    )
+    exit_reason = "error"
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        vote = loop.run_until_complete(
+            run_intake_static_stage(
+                task_id=task_id,
+                task_title=task.title,
+                task_description=task.description,
+                scope_vote=scope_vote,
+                project=task.project or None,
+                project_path=project_path,
+            )
+        )
+        _intake_write_vote(task_id, "static", vote)
+        advance_stage(task_id, "pass")
+        exit_reason = "pass"
+    except Exception:
+        logger.exception("[intake_static] task '%s' raised.", task_id)
+        advance_stage(task_id, "fail")
+    finally:
+        close_agent_session(session_id, exit_reason, "")
+        _loop_cleanup(loop)
+
+
+def _run_intake_conflict_node(
+    task_id: str,
+    stage_config: StageConfig,
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """intake_conflict executor — LLM conflict detection (Stage 3 of 5)."""
+    from app.database import create_agent_session, close_agent_session, get_task, get_all_tasks
+    from app.agent.intake import run_intake_conflict_stage
+
+    task = get_task(task_id)
+    if not task or not task.description:
+        return
+
+    scope_vote = _intake_read_vote(task_id, "scope")
+    all_tasks = [
+        {"id": t.id, "title": t.title, "type": t.type,
+         "description": (t.description or "")[:300]}
+        for t in get_all_tasks()
+    ]
+    session_id = create_agent_session(
+        task_id=task_id, agent_type="intake_conflict",
+        llm_id=llm_id, budget_id=budget_id, scheduler_reason="scheduler",
+    )
+    exit_reason = "error"
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        vote = loop.run_until_complete(
+            run_intake_conflict_stage(
+                task_id=task_id,
+                task_title=task.title,
+                task_description=task.description,
+                scope_vote=scope_vote,
+                all_tasks=all_tasks,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                project=task.project or None,
+            )
+        )
+        _intake_write_vote(task_id, "conflict", vote)
+        advance_stage(task_id, "pass")
+        exit_reason = "pass"
+    except Exception:
+        logger.exception("[intake_conflict] task '%s' raised.", task_id)
+        advance_stage(task_id, "fail")
+    finally:
+        close_agent_session(session_id, exit_reason, "")
+        _loop_cleanup(loop)
+
+
+def _run_intake_feasibility_node(
+    task_id: str,
+    stage_config: StageConfig,
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """intake_feasibility executor — LLM feasibility analysis (Stage 4 of 5)."""
+    from app.database import create_agent_session, close_agent_session, get_task
+    from app.agent.intake import run_intake_feasibility_stage
+
+    task = get_task(task_id)
+    if not task or not task.description:
+        return
+
+    scope_vote = _intake_read_vote(task_id, "scope")
+    static_vote = _intake_read_vote(task_id, "static")
+    session_id = create_agent_session(
+        task_id=task_id, agent_type="intake_feasibility",
+        llm_id=llm_id, budget_id=budget_id, scheduler_reason="scheduler",
+    )
+    exit_reason = "error"
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        vote = loop.run_until_complete(
+            run_intake_feasibility_stage(
+                task_id=task_id,
+                task_title=task.title,
+                task_description=task.description,
+                scope_vote=scope_vote,
+                static_vote=static_vote,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                project=task.project or None,
+            )
+        )
+        _intake_write_vote(task_id, "feasibility", vote)
+        advance_stage(task_id, "pass")
+        exit_reason = "pass"
+    except Exception:
+        logger.exception("[intake_feasibility] task '%s' raised.", task_id)
+        advance_stage(task_id, "fail")
+    finally:
+        close_agent_session(session_id, exit_reason, "")
+        _loop_cleanup(loop)
+
+
+def _run_intake_gate_node(
+    task_id: str,
+    stage_config: StageConfig,
+    llm_base_url: str,
+    llm_model: str,
+    max_context: int | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project_path: str | None,
+) -> None:
+    """intake_gate executor — tally all votes + advance/fail (Stage 5 of 5)."""
+    from app.database import (
+        create_agent_session, close_agent_session, get_task, get_all_tasks,
+        create_transition_vote, create_transition_result,
+        get_transition_results as _gtr,
+    )
+    from app.agent.intake import run_intake_gate
+    from app.agent.pipeline_router import advance_stage
+
+    task = get_task(task_id)
+    if not task or not task.description:
+        return
+
+    blob = task.content or {}
+    votes_map = blob.get("intake_votes") or {}
+    votes = [v for v in [
+        votes_map.get("scope"),
+        votes_map.get("static"),
+        votes_map.get("conflict"),
+        votes_map.get("feasibility"),
+    ] if v]
+
+    all_tasks = [
+        {"id": t.id, "title": t.title, "type": t.type,
+         "description": (t.description or "")[:300]}
+        for t in get_all_tasks()
+    ]
+    session_id = create_agent_session(
+        task_id=task_id, agent_type="intake_gate",
+        llm_id=llm_id, budget_id=budget_id, scheduler_reason="scheduler",
+    )
+    exit_reason = "error"
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        result = loop.run_until_complete(
+            run_intake_gate(
+                task_id=task_id,
+                task_title=task.title,
+                task_description=task.description,
+                votes=votes,
+                all_tasks=all_tasks,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                project=task.project or None,
+            )
+        )
+        create_transition_result(
+            task_id=task_id,
+            transition="idea_to_planning",
+            outcome=result["outcome"],
+            vote_summary=result,
+            total_prompt_tokens=result.get("total_prompt_tokens", 0),
+            total_completion_tokens=result.get("total_completion_tokens", 0),
+        )
+        for vote in result.get("votes", []):
+            create_transition_vote(
+                task_id=task_id,
+                transition="idea_to_planning",
+                stage=vote["stage"],
+                verdict=vote["verdict"],
+                confidence=vote.get("confidence", 0),
+                justification=vote.get("justification", ""),
+                raw_response=vote.get("raw_response"),
+                prompt_tokens=vote.get("prompt_tokens", 0),
+                completion_tokens=vote.get("completion_tokens", 0),
+                model=vote.get("model", ""),
+                budget_id=task.budget_id,
+            )
+
+        if result["outcome"] == "passed":
+            advance_stage(task_id, "pass")
+            exit_reason = "pass"
+            logger.info("[intake_gate] task '%s' passed → advancing.", task_id)
+        elif result["outcome"] == "subdivide":
+            from app.main import _handle_subdivision_outcome
+            _handle_subdivision_outcome(task, result, llm_base_url, llm_model, max_context, loop)
+            exit_reason = "subdivide"
+            logger.info("[intake_gate] task '%s' → subdivide.", task_id)
+        else:
+            all_results = _gtr(task_id, transition="idea_to_planning") or []
+            rejection_count = sum(1 for r in all_results if r.outcome in ("rejected", "needs_research"))
+            MAX_INTAKE_REJECTIONS = 3
+            if rejection_count >= MAX_INTAKE_REJECTIONS:
+                from datetime import datetime as _dt
+                from app.database import update_task, append_task_history
+                update_task(task_id, intake_exhausted_at=_dt.utcnow().isoformat())
+                append_task_history(task_id, "intake_exhausted",
+                                    message=f"Intake exhausted after {rejection_count} rejections.")
+                logger.warning("[intake_gate] task '%s' intake exhausted.", task_id)
+            advance_stage(task_id, "fail")
+            exit_reason = "fail"
+    except Exception:
+        logger.exception("[intake_gate] task '%s' raised.", task_id)
+        advance_stage(task_id, "fail")
+    finally:
+        close_agent_session(session_id, exit_reason, "")
+        _loop_cleanup(loop)

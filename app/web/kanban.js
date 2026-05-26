@@ -2719,15 +2719,8 @@ async function loadPipelineTemplates() {
 function populatePipelineDropdown() {
     const sel = document.getElementById('pipeline-select');
     if (!sel) return;
-    // Count tasks per template from the current project's loaded tasks
-    const countByTemplate = {};
-    (allTasks || []).forEach(t => {
-        if (t.pipeline_template_id && t.type !== 'architecture' && t.type !== 'cancelled') {
-            countByTemplate[t.pipeline_template_id] = (countByTemplate[t.pipeline_template_id] || 0) + 1;
-        }
-    });
     sel.innerHTML = allPipelineTemplates.map(t => {
-        const count = countByTemplate[t.id];
+        const count = t.task_count || 0;
         const label = count ? `${t.name} (${count})` : t.name;
         return `<option value="${t.id}"${t.id === activeViewTemplateId ? ' selected' : ''}>${label}</option>`;
     }).join('');

@@ -1065,3 +1065,144 @@ async def run_intake_pipeline(
         project=project,
     )
     return await pipeline.run()
+
+
+# ---------------------------------------------------------------------------
+# Per-stage standalone functions (used by decomposed stage executors)
+# ---------------------------------------------------------------------------
+
+def _make_pipeline(
+    task_id: str,
+    task_title: str,
+    task_description: str,
+    llm_base_url: str | None,
+    llm_model: str | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    project: str | None,
+    all_tasks: list[dict] | None = None,
+    stage_cfg: dict | None = None,
+) -> "IntakePipeline":
+    p = IntakePipeline(
+        task_id=task_id,
+        task_description=task_description,
+        task_title=task_title,
+        all_tasks=all_tasks or [],
+        budget_id=budget_id,
+        llm_id=llm_id,
+        llm_base_url=llm_base_url,
+        llm_model=llm_model,
+        project=project,
+    )
+    if stage_cfg:
+        p._stage_cfg = stage_cfg
+    return p
+
+
+async def run_intake_scope_stage(
+    task_id: str,
+    task_title: str,
+    task_description: str,
+    llm_base_url: str | None = None,
+    llm_model: str | None = None,
+    llm_id: int | None = None,
+    budget_id: int | None = None,
+    project: str | None = None,
+    stage_cfg: dict | None = None,
+) -> dict:
+    """Run only the scope analysis stage and return its vote dict."""
+    p = _make_pipeline(task_id, task_title, task_description,
+                       llm_base_url, llm_model, llm_id, budget_id, project,
+                       stage_cfg=stage_cfg)
+    return await p._stage_scope_analysis()
+
+
+async def run_intake_static_stage(
+    task_id: str,
+    task_title: str,
+    task_description: str,
+    scope_vote: dict,
+    project: str | None = None,
+    project_path: str | None = None,
+) -> dict:
+    """Run only the static analysis stage and return its vote dict."""
+    p = _make_pipeline(task_id, task_title, task_description,
+                       None, None, None, None, project)
+    if project_path:
+        import app.database as _db
+        _orig = _db.get_project_path
+        try:
+            _db.get_project_path = lambda _: project_path
+            return await p._stage_static_analysis(scope_vote)
+        finally:
+            _db.get_project_path = _orig
+    return await p._stage_static_analysis(scope_vote)
+
+
+async def run_intake_conflict_stage(
+    task_id: str,
+    task_title: str,
+    task_description: str,
+    scope_vote: dict,
+    all_tasks: list[dict],
+    llm_base_url: str | None = None,
+    llm_model: str | None = None,
+    llm_id: int | None = None,
+    budget_id: int | None = None,
+    project: str | None = None,
+) -> dict:
+    """Run only the conflict detection stage and return its vote dict."""
+    p = _make_pipeline(task_id, task_title, task_description,
+                       llm_base_url, llm_model, llm_id, budget_id, project,
+                       all_tasks=all_tasks)
+    return await p._stage_conflict_detection(scope_vote)
+
+
+async def run_intake_feasibility_stage(
+    task_id: str,
+    task_title: str,
+    task_description: str,
+    scope_vote: dict,
+    static_vote: dict,
+    llm_base_url: str | None = None,
+    llm_model: str | None = None,
+    llm_id: int | None = None,
+    budget_id: int | None = None,
+    project: str | None = None,
+) -> dict:
+    """Run only the feasibility analysis stage and return its vote dict."""
+    p = _make_pipeline(task_id, task_title, task_description,
+                       llm_base_url, llm_model, llm_id, budget_id, project)
+    return await p._stage_feasibility(scope_vote, static_vote)
+
+
+async def run_intake_gate(
+    task_id: str,
+    task_title: str,
+    task_description: str,
+    votes: list[dict],
+    all_tasks: list[dict],
+    llm_base_url: str | None = None,
+    llm_model: str | None = None,
+    llm_id: int | None = None,
+    budget_id: int | None = None,
+    project: str | None = None,
+) -> dict:
+    """Tally all intake votes and run post-tally handlers (research/subdivide/tie).
+
+    Returns the final tally dict (same structure as run_intake_pipeline).
+    """
+    p = _make_pipeline(task_id, task_title, task_description,
+                       llm_base_url, llm_model, llm_id, budget_id, project,
+                       all_tasks=all_tasks)
+    p.votes = votes
+    tally = p._build_tally()
+
+    if tally["outcome"] == "needs_research":
+        tally = await p._handle_needs_research(tally)
+    if tally["outcome"] == "subdivide":
+        tally = await p._handle_subdivide(tally)
+    if tally["outcome"] == "tie":
+        tally = await p._handle_tie(tally)
+
+    return tally
