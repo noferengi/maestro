@@ -151,12 +151,6 @@ AGENT_REGISTRY: dict[str, AgentSpec] = {
         description="Counts attempts via TransitionResult rows or task.content counters; parks or fails when max is reached",
         gate_type="none",
     ),
-    "voting_panel": AgentSpec(
-        cls=None,
-        display_name="Voting Panel",
-        description="Spawns N concurrent LLM voters; tallies results; advances on majority",
-        gate_type="voting",
-    ),
     "static_analysis_widget": AgentSpec(
         cls=None,
         display_name="Static Analysis",

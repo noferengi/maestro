@@ -395,7 +395,7 @@ def _run_async(coro):
 
 
 def _make_pipeline(title="Write a function", description="A simple task."):
-    from app.agent.planning import PlanningPipeline
+    from app.agent.planning_utils import PlanningPipeline
     return PlanningPipeline(
         task_id="test-task",
         task_title=title,
@@ -434,8 +434,8 @@ class TestFailedGenerationShortCircuit:
              _patch.object(pipeline.__class__, "_stage_design_review", mock_review), \
              _patch.object(pipeline.__class__, "_stage_pitfall_detection", mock_pitfall), \
              _patch.object(pipeline.__class__, "_stage_consolidation", mock_consolidate), \
-             _patch("app.agent.planning.is_shutting_down", return_value=False), \
-             _patch("app.agent.planning.PlanningPipeline._store_result", return_value=None):
+             _patch("app.agent.planning_utils.is_shutting_down", return_value=False), \
+             _patch("app.agent.planning_utils.PlanningPipeline._store_result", return_value=None):
             result = _run_async(pipeline.run())
 
         assert reviewer_calls == [], (
@@ -468,8 +468,8 @@ class TestFailedGenerationShortCircuit:
              _patch.object(pipeline.__class__, "_stage_design_review", mock_review), \
              _patch.object(pipeline.__class__, "_stage_pitfall_detection", mock_pitfall), \
              _patch.object(pipeline.__class__, "_stage_consolidation", mock_consolidate), \
-             _patch("app.agent.planning.is_shutting_down", return_value=False), \
-             _patch("app.agent.planning.PlanningPipeline._store_result", return_value=None):
+             _patch("app.agent.planning_utils.is_shutting_down", return_value=False), \
+             _patch("app.agent.planning_utils.PlanningPipeline._store_result", return_value=None):
             result = _run_async(pipeline.run())
 
         # After all retries fail, the last review_votes should be the synthetic one
@@ -483,19 +483,19 @@ class TestComplexityClassifier:
     """_is_simple_task() heuristics."""
 
     def test_greenfield_keyword_simple(self):
-        from app.agent.planning import _is_simple_task
+        from app.agent.planning_utils import _is_simple_task
         assert _is_simple_task("Build something", "A greenfield project") is True
 
     def test_naive_keyword_simple(self):
-        from app.agent.planning import _is_simple_task
+        from app.agent.planning_utils import _is_simple_task
         assert _is_simple_task("naive recursive Fibonacci", "Write a naive recursive function") is True
 
     def test_short_description_simple(self):
-        from app.agent.planning import _is_simple_task
+        from app.agent.planning_utils import _is_simple_task
         assert _is_simple_task("Add logging", "Add a log line.") is True
 
     def test_long_complex_description_not_simple(self):
-        from app.agent.planning import _is_simple_task
+        from app.agent.planning_utils import _is_simple_task
         long_desc = (
             "Refactor the authentication middleware to support OAuth2 PKCE flows. "
             "This involves updating the token validation pipeline, adding refresh-token "
@@ -507,7 +507,7 @@ class TestComplexityClassifier:
 
     def test_simple_task_gets_reduced_best_of_n(self):
         """Simple tasks must use a smaller design pool in run()."""
-        from app.agent.planning import PlanningPipeline, PLANNING_BEST_OF_N
+        from app.agent.planning_utils import PlanningPipeline, PLANNING_BEST_OF_N
         pipeline = _make_pipeline(
             title="Write a recursive Fibonacci",
             description="Write a naive recursive Fibonacci function in Python.",
@@ -535,8 +535,8 @@ class TestComplexityClassifier:
              _patch.object(pipeline.__class__, "_stage_design_review", mock_review), \
              _patch.object(pipeline.__class__, "_stage_pitfall_detection", mock_pitfall), \
              _patch.object(pipeline.__class__, "_stage_consolidation", mock_consolidate), \
-             _patch("app.agent.planning.is_shutting_down", return_value=False), \
-             _patch("app.agent.planning.PlanningPipeline._store_result", return_value=None):
+             _patch("app.agent.planning_utils.is_shutting_down", return_value=False), \
+             _patch("app.agent.planning_utils.PlanningPipeline._store_result", return_value=None):
             _run_async(pipeline.run())
 
         assert all(n < PLANNING_BEST_OF_N for n in generation_counts), (
@@ -545,7 +545,7 @@ class TestComplexityClassifier:
 
     def test_simple_task_uses_lite_reviewer_subset(self):
         """Simple tasks must run fewer reviewers in _stage_design_review."""
-        from app.agent.planning import PlanningPipeline, _SIMPLE_TASK_REVIEWER_SUBSET
+        from app.agent.planning_utils import PlanningPipeline, _SIMPLE_TASK_REVIEWER_SUBSET
         pipeline = _make_pipeline(
             title="Write a recursive Fibonacci",
             description="Write a naive recursive Fibonacci function.",
@@ -569,7 +569,7 @@ class TestComplexityClassifier:
                 "usage": {"prompt_tokens": 5, "completion_tokens": 5},
             }
 
-        with _patch("app.agent.planning.call_llm", mock_call_llm):
+        with _patch("app.agent.planning_utils.call_llm", mock_call_llm):
             result = _run_async(pipeline._stage_design_review(_MINIMAL_DESIGN, "survey"))
 
         final_reviewer_names = {r["name"] for r in [

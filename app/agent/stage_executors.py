@@ -254,220 +254,6 @@ def _build_required_keys_preamble(task_id: str, required_input_keys: list[str]) 
 
 
 # ---------------------------------------------------------------------------
-# Voting Panel
-# ---------------------------------------------------------------------------
-
-def _run_voting_panel(
-    task_id: str,
-    stage_config: StageConfig,
-    llm_base_url: str,
-    llm_model: str,
-    max_context: int | None,
-    llm_id: int | None,
-    budget_id: int | None,
-    project_path: str | None,
-) -> None:
-    """
-    Spawn voter_count LLM agents concurrently, tally their votes, advance stage.
-
-    Stage config shape (legacy — single shared prompt):
-        voter_count          — number of voters (default 3)
-        voter_system_prompt  — system prompt for each voter
-        voter_tools          — tool allowlist for voters (default: submit_work only)
-        voter_max_turns      — max turns per voter (default 10)
-
-    Stage config shape (per-reviewer — takes precedence when present):
-        reviewers            — list of {name, system_prompt, tools?, max_turns?}
-        tally_strategy       — "majority" (default) | "veto" (any REJECTED/NOT_SUITABLE blocks)
-        required_input_keys  — list of task.content keys to inject into voter user message preamble
-        on_tie               — "reject" | "pass" (default "reject")
-        output_key           — task.content key to write tally result (default "vote_result")
-    """
-    from app.database import (
-        create_agent_session, close_agent_session, get_task, update_task,
-    )
-    from app.database.session import SessionLocal
-    from app.database.models import TransitionVote
-    from app.agent.verdicts import Vote, Verdict, tally_votes
-
-    cfg = stage_config.config or {}
-    reviewers_cfg       = cfg.get("reviewers")  # list of {name, system_prompt, tools?, max_turns?}
-    tally_strategy      = cfg.get("tally_strategy", "majority")
-    required_input_keys = cfg.get("required_input_keys") or []
-    if isinstance(required_input_keys, str):
-        required_input_keys = [k.strip() for k in required_input_keys.split(",") if k.strip()]
-
-    # Legacy single-prompt config
-    voter_count         = int(cfg.get("voter_count", 3))
-    voter_system_prompt = cfg.get("voter_system_prompt", "Review the task and vote ACCEPTED or REJECTED.")
-    voter_tools         = list(cfg.get("voter_tools") or [])
-    voter_max_turns     = int(cfg.get("voter_max_turns", 10))
-    on_tie              = cfg.get("on_tie", "reject")
-    output_key          = cfg.get("output_key", "vote_result")
-
-    session_id = create_agent_session(
-        task_id=task_id,
-        agent_type=f"voting_panel:{stage_config.stage_key}",
-        llm_id=llm_id,
-        budget_id=budget_id,
-        scheduler_reason="scheduler",
-    )
-    exit_reason = "error"
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    try:
-        task = get_task(task_id)
-        keys_preamble = _build_required_keys_preamble(task_id, required_input_keys)
-        user_msg = (
-            keys_preamble
-            + f"Task ID: {task_id}\n"
-            f"Title: {task.title if task else '(unknown)'}\n"
-            f"Description:\n{task.description or '' if task else ''}\n\n"
-            "Vote on whether this task should proceed. Call submit_work with:\n"
-            "  signal='ACCEPTED' or 'REJECTED'\n"
-            "  summary='your reasoning'\n"
-            "  payload={'verdict': 'ACCEPTED'|'REJECTED', 'confidence': 0-100, 'justification': '...'}"
-        )
-
-        if reviewers_cfg:
-            voters = [
-                _CollectorAgent(
-                    task_id=task_id,
-                    system_prompt=r.get("system_prompt", voter_system_prompt),
-                    tool_allowlist=list(r.get("tools") or voter_tools),
-                    max_turns=int(r.get("max_turns") or voter_max_turns),
-                    llm_id=llm_id,
-                    budget_id=budget_id,
-                    llm_base_url=llm_base_url,
-                    llm_model=llm_model,
-                    max_context=max_context,
-                    user_message=user_msg,
-                    agent_name=f"voter_{r.get('name', i)}:{stage_config.stage_key}",
-                )
-                for i, r in enumerate(reviewers_cfg)
-            ]
-        else:
-            voters = [
-                _CollectorAgent(
-                    task_id=task_id,
-                    system_prompt=voter_system_prompt,
-                    tool_allowlist=voter_tools,
-                    max_turns=voter_max_turns,
-                    llm_id=llm_id,
-                    budget_id=budget_id,
-                    llm_base_url=llm_base_url,
-                    llm_model=llm_model,
-                    max_context=max_context,
-                    user_message=user_msg,
-                    agent_name=f"voter_{i}:{stage_config.stage_key}",
-                )
-                for i in range(voter_count)
-            ]
-
-        payloads: list[dict | None] = loop.run_until_complete(
-            asyncio.gather(*[v.run() for v in voters], return_exceptions=False)
-        )
-
-        # Convert payloads to Vote objects (map ACCEPTED→LIKELY, REJECTED→REJECTED).
-        votes: list[Vote] = []
-        for i, payload in enumerate(payloads):
-            if not payload:
-                continue
-            verdict_str = str(payload.get("verdict", "REJECTED")).upper()
-            raw_conf    = int(payload.get("confidence", 50))
-            justification = str(payload.get("justification", ""))
-
-            if verdict_str == "ACCEPTED":
-                confidence = max(92, min(100, raw_conf if raw_conf >= 76 else 92))
-                verdict    = Verdict.LIKELY
-            else:
-                confidence = max(0, min(50, raw_conf if raw_conf <= 50 else 25))
-                verdict    = Verdict.REJECTED
-
-            try:
-                votes.append(Vote(
-                    stage=f"voter_{i}",
-                    verdict=verdict,
-                    confidence=confidence,
-                    justification=justification,
-                ))
-            except Exception:
-                logger.warning("[voting_panel] task '%s': voter_%d produced invalid vote — skipped.", task_id, i)
-
-        if not votes:
-            condition    = "fail"
-            tally_outcome = "rejected"
-        elif tally_strategy == "veto":
-            condition    = _tally_veto(votes)
-            tally_outcome = "rejected" if condition == "fail" else "passed"
-        else:
-            tally        = tally_votes(votes)
-            tally_outcome = tally.outcome
-            if tally_outcome in ("passed", "conditional_pass", "warned"):
-                condition = "pass"
-            elif tally_outcome == "tie":
-                condition = "fail" if on_tie == "reject" else "pass"
-            else:
-                condition = "fail"
-
-        # Persist tally result in task.content.
-        task = get_task(task_id)
-        blob = dict((task.content or {}) if task else {})
-        blob[output_key] = {
-            "outcome": tally_outcome,
-            "votes": [
-                {
-                    "stage": v.stage,
-                    "verdict": v.verdict.value,
-                    "confidence": v.confidence,
-                    "justification": v.justification,
-                }
-                for v in votes
-            ],
-        }
-        update_task(task_id, content=blob)
-
-        # Persist TransitionVote rows.
-        db = SessionLocal()
-        try:
-            for v in votes:
-                db.add(TransitionVote(
-                    task_id=task_id,
-                    transition=f"{stage_config.stage_key}_voting_panel",
-                    stage=v.stage,
-                    verdict=v.verdict.value,
-                    confidence=v.confidence,
-                    justification=v.justification,
-                    llm_id=llm_id,
-                    budget_id=budget_id,
-                ))
-            db.commit()
-        except Exception:
-            db.rollback()
-            logger.exception("[voting_panel] task '%s': failed to save TransitionVote rows.", task_id)
-        finally:
-            db.close()
-
-        advance_stage(task_id, condition)
-        exit_reason = condition
-
-    except Exception:
-        logger.exception("[voting_panel] task '%s' stage '%s' raised.", task_id, stage_config.stage_key)
-    finally:
-        close_agent_session(session_id, exit_reason, "")
-        try:
-            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=5.0))
-        except Exception:
-            pass
-        try:
-            loop.close()
-        except Exception:
-            pass
-
-
-
-# ---------------------------------------------------------------------------
 # Reflection Agent
 # ---------------------------------------------------------------------------
 
@@ -1828,7 +1614,7 @@ def _run_planning_survey_node(
     Writes to task.content: survey_summary, is_proof, is_simple, best_of_n.
     """
     from app.database import create_agent_session, close_agent_session, get_task, update_task
-    from app.agent.planning import run_planning_survey
+    from app.agent.planning_utils import run_planning_survey
 
     task = get_task(task_id)
     if not task:
@@ -1898,7 +1684,7 @@ def _run_pitfall_node(
     Writes pitfalls list to task.content. Always advances to pass (informational).
     """
     from app.database import create_agent_session, close_agent_session, get_task, update_task
-    from app.agent.planning import run_pitfall_detection
+    from app.agent.planning_utils import run_pitfall_detection
 
     task = get_task(task_id)
     if not task:
@@ -1974,7 +1760,7 @@ def _run_consolidation_node(
         create_agent_session, close_agent_session, get_task, get_all_tasks,
         task_to_dict, supersede_planning_results,
     )
-    from app.agent.planning import run_consolidation_and_store
+    from app.agent.planning_utils import run_consolidation_and_store
 
     task = get_task(task_id)
     if not task:
@@ -2055,7 +1841,7 @@ def _run_planning_gate_node(
         task_to_dict, get_planning_result,
     )
     from app.agent.planning_gate import run_planning_gate
-    from app.agent.planning import _get_domain
+    from app.agent.planning_utils import _get_domain
 
     task = get_task(task_id)
     if not task:

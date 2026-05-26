@@ -65,10 +65,6 @@ class TestPipelineSignatures(unittest.TestCase):
         sig = inspect.signature(func)
         return "project_path" in sig.parameters
 
-    def test_run_planning_pipeline(self):
-        from app.agent.planning import run_planning_pipeline
-        self.assertTrue(self._has_project_path(run_planning_pipeline))
-
     def test_run_planning_gate(self):
         from app.agent.planning_gate import run_planning_gate
         self.assertTrue(self._has_project_path(run_planning_gate))
