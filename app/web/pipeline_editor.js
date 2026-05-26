@@ -510,9 +510,9 @@ class MultiplierNode extends LiteGraph.LGraphNode {
             required_input_keys: "",
             output_key: "fan_out_result",
         };
-        this.addInput("in", "transition");
-        this.addOutput("pass", "transition");
-        this.addOutput("fail", "transition");
+        this.addInput("in", "task");
+        this.addOutput("pass", "task");
+        this.addOutput("fail", "task");
         this.size = [200, 70];
     }
     onDrawBackground(ctx) {

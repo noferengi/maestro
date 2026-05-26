@@ -157,12 +157,6 @@ AGENT_REGISTRY: dict[str, AgentSpec] = {
         description="Spawns N concurrent LLM voters; tallies results; advances on majority",
         gate_type="voting",
     ),
-    "fan_out_judge": AgentSpec(
-        cls=None,
-        display_name="Fan-Out + Judge",
-        description="Runs N parallel proposal agents then an LLM judge selects the best one",
-        gate_type="llm_judge",
-    ),
     "static_analysis_widget": AgentSpec(
         cls=None,
         display_name="Static Analysis",

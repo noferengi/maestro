@@ -6,7 +6,6 @@ Generic pipeline node executors registered via register_agent_type_executor().
 Executor types:
   circuit_breaker        — configurable attempt counter; parks or fails when exhausted
   voting_panel           — N-voter LLM panel with tally strategy
-  fan_out_judge          — best-of-N parallel agents + LLM judge picks the winner
   reflection_agent       — skeptical post-stage reviewer; stores confidence report
   static_analysis_widget — deterministic tree-sitter analysis; no LLM; injects JSON into task.content
   parallel_agents        — fan-out N child tasks (read-only or dangerous_edit); supports
@@ -22,8 +21,7 @@ executor contract:
 
 A helper _CollectorAgent class (local to this module) runs an AgentLoop turn
 loop but suppresses advance_stage — it just returns the submit_work payload.
-This is used by voting_panel (voter agents) and fan_out_judge (proposer agents
-and the judge).
+This is used by voting_panel (voter agents) and the multiplier_node collapser (judge agent).
 """
 
 from __future__ import annotations
@@ -46,7 +44,7 @@ logger = logging.getLogger(__name__)
 class _CollectorAgent(AgentLoop):
     """
     Runs a turn loop and returns the submit_work payload without advancing stage.
-    Used as individual voters (voting_panel) and proposers/judge (fan_out_judge).
+    Used as individual voters (voting_panel) and the multiplier_node collapser judge.
     """
 
     def __init__(
@@ -467,212 +465,6 @@ def _run_voting_panel(
         except Exception:
             pass
 
-
-# ---------------------------------------------------------------------------
-# Fan-Out + Judge
-# ---------------------------------------------------------------------------
-
-def _run_fan_out_judge(
-    task_id: str,
-    stage_config: StageConfig,
-    llm_base_url: str,
-    llm_model: str,
-    max_context: int | None,
-    llm_id: int | None,
-    budget_id: int | None,
-    project_path: str | None,
-) -> None:
-    """
-    Run N parallel proposal agents, then a judge picks the best one.
-
-    Stage config shape (legacy — single shared prompt):
-        n                    — number of parallel agents (default 3)
-        agent_system_prompt  — system prompt for all proposal agents
-        agent_tools          — tool allowlist for proposal agents
-        agent_max_turns      — max turns per proposal agent (default 30)
-
-    Stage config shape (per-persona — takes precedence when present):
-        personas             — list of {name, system_prompt}; N = len(personas)
-        required_input_keys  — list of task.content keys to inject into proposer user message preamble
-        agent_tools          — tool allowlist shared across all proposers
-        agent_max_turns      — max turns per proposer (default 30)
-
-    Shared keys:
-        judge_system_prompt  — system prompt for the judge
-        judge_max_turns      — max turns for judge (default 10)
-        output_key           — task.content key to write winning proposal (default "winning_proposal")
-    """
-    from app.database import (
-        create_agent_session, close_agent_session, get_task, update_task,
-    )
-
-    cfg = stage_config.config or {}
-    personas_cfg        = cfg.get("personas")  # list of {name, system_prompt}
-    required_input_keys = cfg.get("required_input_keys") or []
-    if isinstance(required_input_keys, str):
-        required_input_keys = [k.strip() for k in required_input_keys.split(",") if k.strip()]
-
-    # Legacy single-prompt config
-    n                   = int(cfg.get("n", 3))
-    agent_system_prompt = cfg.get("agent_system_prompt", "Produce a proposal for the task. Submit it via submit_work.")
-    agent_tools         = list(cfg.get("agent_tools") or [])
-    agent_max_turns     = int(cfg.get("agent_max_turns", 30))
-    judge_system_prompt = cfg.get("judge_system_prompt", "Compare the proposals below and pick the best one.")
-    judge_max_turns     = int(cfg.get("judge_max_turns", 10))
-    output_key          = cfg.get("output_key", "winning_proposal")
-
-    if personas_cfg:
-        n = len(personas_cfg)
-
-    # Allow task.content["best_of_n"] to override n at runtime (set by planning_survey_node).
-    try:
-        _task_for_n = get_task(task_id)
-        _content_n = (_task_for_n.content or {}).get("best_of_n") if _task_for_n else None
-        if _content_n is not None:
-            n = int(_content_n)
-            if personas_cfg and len(personas_cfg) > n:
-                personas_cfg = personas_cfg[:n]
-    except Exception:
-        pass
-
-    session_id = create_agent_session(
-        task_id=task_id,
-        agent_type=f"fan_out_judge:{stage_config.stage_key}",
-        llm_id=llm_id,
-        budget_id=budget_id,
-        scheduler_reason="scheduler",
-    )
-    exit_reason = "error"
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    try:
-        task = get_task(task_id)
-        task_title = task.title if task else "(unknown)"
-        task_desc  = task.description or "" if task else ""
-
-        keys_preamble = _build_required_keys_preamble(task_id, required_input_keys)
-        proposer_user_msg_base = (
-            keys_preamble
-            + f"Task ID: {task_id}\n"
-            f"Title: {task_title}\n"
-            f"Description:\n{task_desc}\n\n"
-            "Produce your best proposal. When done, call submit_work with:\n"
-            "  signal='ACCEPTED'\n"
-            "  summary='brief summary'\n"
-            "  payload={'proposal': '<your full proposal text>'}"
-        )
-
-        if personas_cfg:
-            proposers = [
-                _CollectorAgent(
-                    task_id=task_id,
-                    system_prompt=p.get("system_prompt", agent_system_prompt),
-                    tool_allowlist=agent_tools,
-                    max_turns=agent_max_turns,
-                    llm_id=llm_id,
-                    budget_id=budget_id,
-                    llm_base_url=llm_base_url,
-                    llm_model=llm_model,
-                    max_context=max_context,
-                    user_message=proposer_user_msg_base,
-                    agent_name=f"proposer_{p.get('name', i)}:{stage_config.stage_key}",
-                )
-                for i, p in enumerate(personas_cfg)
-            ]
-        else:
-            proposers = [
-                _CollectorAgent(
-                    task_id=task_id,
-                    system_prompt=agent_system_prompt,
-                    tool_allowlist=agent_tools,
-                    max_turns=agent_max_turns,
-                    llm_id=llm_id,
-                    budget_id=budget_id,
-                    llm_base_url=llm_base_url,
-                    llm_model=llm_model,
-                    max_context=max_context,
-                    user_message=proposer_user_msg_base,
-                    agent_name=f"proposer_{i}:{stage_config.stage_key}",
-                )
-                for i in range(n)
-            ]
-
-        payloads: list[dict | None] = loop.run_until_complete(
-            asyncio.gather(*[p.run() for p in proposers], return_exceptions=False)
-        )
-        proposals = [p for p in payloads if p]
-
-        if not proposals:
-            logger.warning("[fan_out_judge] task '%s': no proposals — advancing fail.", task_id)
-            advance_stage(task_id, "fail")
-            exit_reason = "fail"
-            return
-
-        # Build judge prompt (truncate long proposals to fit context).
-        _MAX_CHARS = 2000
-        proposals_text = "\n\n".join(
-            f"=== Proposal {i} ({personas_cfg[i]['name'] if personas_cfg and i < len(personas_cfg) else ''}) ===\n{str(p)[:_MAX_CHARS]}"
-            for i, p in enumerate(proposals)
-        )
-        judge_user_msg = (
-            f"Task: {task_title}\n\n"
-            f"You have {len(proposals)} proposal(s):\n\n{proposals_text}\n\n"
-            "Pick the best one. Call submit_work with:\n"
-            "  signal='ACCEPTED'\n"
-            "  summary='your rationale'\n"
-            "  payload={'selected_index': N, 'rationale': '...'}"
-        )
-
-        judge = _CollectorAgent(
-            task_id=task_id,
-            system_prompt=judge_system_prompt,
-            tool_allowlist=[],
-            max_turns=judge_max_turns,
-            llm_id=llm_id,
-            budget_id=budget_id,
-            llm_base_url=llm_base_url,
-            llm_model=llm_model,
-            max_context=max_context,
-            user_message=judge_user_msg,
-            agent_name=f"judge:{stage_config.stage_key}",
-        )
-
-        judgment: dict | None = loop.run_until_complete(judge.run())
-
-        selected_idx = 0
-        if judgment:
-            try:
-                selected_idx = int(judgment.get("selected_index", 0))
-                selected_idx = max(0, min(selected_idx, len(proposals) - 1))
-            except (TypeError, ValueError):
-                selected_idx = 0
-
-        winning = proposals[selected_idx]
-
-        # Persist result in task.content.
-        task = get_task(task_id)
-        blob = dict((task.content or {}) if task else {})
-        blob[output_key] = winning
-        if judgment:
-            blob[f"{output_key}_rationale"] = judgment.get("rationale", "")
-        update_task(task_id, content=blob)
-
-        advance_stage(task_id, "pass")
-        exit_reason = "pass"
-
-    except Exception:
-        logger.exception("[fan_out_judge] task '%s' stage '%s' raised.", task_id, stage_config.stage_key)
-    finally:
-        close_agent_session(session_id, exit_reason, "")
-        try:
-            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=5.0))
-        except Exception:
-            pass
-        try:
-            loop.close()
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -2764,6 +2556,14 @@ def _run_multiplier_node(
             for i in range(n)
         ]
 
+    # Allow task.content["best_of_n"] to trim the agent list at runtime (set by planning_survey).
+    best_of_n = (parent.content or {}).get("best_of_n")
+    if best_of_n is not None:
+        try:
+            agents_cfg = agents_cfg[:int(best_of_n)]
+        except (ValueError, TypeError):
+            pass
+
     context_preamble = _build_required_keys_preamble(task_id, required_input_keys)
 
     child_ids: list[str] = []
@@ -3036,7 +2836,7 @@ def _run_fan_out_collapser(
                 llm_model=llm_model,
                 max_context=max_context,
                 user_message=judge_user_msg,
-                agent_name="fan_out_judge",
+                agent_name="multiplier_judge",
             )
             judgment: dict | None = loop.run_until_complete(judge.run())
 
