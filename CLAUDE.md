@@ -236,12 +236,16 @@ Or directly: `venv/Scripts/python.exe app/migrations/runner.py <command>`
 
 Migrations live in `app/migrations/versions/` as `NNNN_description.py`. Never edit an existing migration — always add a new one. Each exposes `up(conn)`, `down(conn)`, and `description`.
 
-To scaffold the next migration file automatically:
+**Always use the scaffolder — never manually compute the next migration number or copy-paste an existing file.** The script auto-detects the highest number and increments it:
 
 ```bash
 venv/Scripts/python.exe scripts/create_migration.py "your migration name"
 # prints the path of the created file, e.g. app/migrations/versions/0055_your_migration_name.py
 ```
+
+Or use `/migrate <name>` (Mode A) which runs the same command and prints the path.
+
+**`conn` API** — `conn.execute(sql, {":name": value})` with named `:param` style (PostgreSQL only). For JSONB columns use `CAST(:x AS jsonb)`. Multiple statements = multiple `conn.execute()` calls. Do **not** use `conn.executescript()` — it is a legacy SQLite-compat shim and should be avoided in new migrations.
 
 ## Debugging scheduler and card status
 

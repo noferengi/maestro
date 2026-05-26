@@ -11,8 +11,8 @@ Next Steps:
     1. Open the created file (path printed below).
     2. Edit the 'up(conn)' function with your PostgreSQL SQL changes.
     3. Edit the 'down(conn)' function with the rollback SQL.
-    4. Run '.\migrate.bat status' to verify the new file is detected as 'pending'.
-    5. Run '.\migrate.bat migrate' to apply the changes.
+    4. Run 'migrate.bat status' to verify the new file is detected as 'pending'.
+    5. Run 'migrate.bat migrate' to apply the changes.
 
 Example:
     python scripts/create_migration.py "add clarification status to tasks"
@@ -29,16 +29,18 @@ description = "{description}"
 
 
 def up(conn):
-    conn.executescript("""
+    # conn.execute(sql, {{":name": value}}) — named params, PostgreSQL syntax only.
+    # JSON/JSONB columns: CAST(:x AS jsonb).  Multiple statements = multiple execute() calls.
+    conn.execute("""
         -- TODO: write your migration SQL here
     """)
 
 
 def down(conn):
-    # To undo column additions: ALTER TABLE ... DROP COLUMN ...
-    # To undo table creation: DROP TABLE IF EXISTS ...
-    conn.executescript("""
-        -- TODO: write your rollback SQL here
+    conn.execute("""
+        -- TODO: write rollback SQL here
+        -- Column addition: ALTER TABLE ... DROP COLUMN IF EXISTS ...
+        -- Table creation:  DROP TABLE IF EXISTS ...
     """)
 '''
 
