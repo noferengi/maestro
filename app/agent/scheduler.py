@@ -4308,179 +4308,6 @@ def _run_task(task_id: str, task_type: str, llm: Any, db_task: Any = None, proje
             teardown_task_worktree(task_id, project_path)
 
 
-def _run_intake_node(
-    task_id: str,
-    stage_config: "StageConfig",
-    llm_base_url: str,
-    llm_model: str,
-    max_context: int | None = None,
-    llm_id: int | None = None,
-    budget_id: int | None = None,
-    project_path: str | None = None,
-) -> None:
-    """intake_node executor — runs the intake pipeline for an IDEA task."""
-    from app.agent.intake import run_intake_pipeline
-    from app.agent.tools import set_task_git_cwd
-    from app.database import (
-        get_task, get_all_tasks,
-        create_transition_vote, create_transition_result,
-        create_agent_session, close_agent_session,
-    )
-    from app.agent.pipeline_router import advance_stage
-
-    task = get_task(task_id)
-    if not task:
-        return
-    set_task_git_cwd(project_path or "", task_id=task_id)
-
-    if not task.description or not task.llm_id or not task.budget_id:
-        logger.debug("Task '%s' missing required fields for intake, skipping.", task_id)
-        return
-
-    _session_id = create_agent_session(
-        task_id=task_id,
-        agent_type="intake",
-        llm_id=task.llm_id,
-        budget_id=task.budget_id,
-        scheduler_reason="scheduler",
-    )
-    if _session_id is not None:
-        register_db_session(task_id, _session_id)
-    _exit_reason = "error"
-    _exit_summary = ""
-    _prompt_tokens = 0
-    _completion_tokens = 0
-
-    all_tasks = get_all_tasks()
-    task_dicts = [_task_to_mini_dict(t) for t in all_tasks]
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        result = loop.run_until_complete(
-            run_intake_pipeline(
-                task_id=task_id,
-                task_description=task.description or "",
-                task_title=task.title,
-                all_tasks=task_dicts,
-                budget_id=task.budget_id,
-                llm_id=task.llm_id,
-                llm_base_url=llm_base_url,
-                llm_model=llm_model,
-                project=task.project or None,
-            )
-        )
-        _exit_reason = result.get("outcome", "error")
-        _prompt_tokens = result.get("total_prompt_tokens", 0)
-        _completion_tokens = result.get("total_completion_tokens", 0)
-        reasons = result.get("rejection_reasons", [])
-        _exit_summary = "; ".join(reasons[:3]) if reasons else result.get("outcome", "")
-    except ShutdownError:
-        _exit_reason = "shutdown"
-        _exit_summary = "Server shutdown during intake."
-        logger.info("[intake] Task '%s' aborted due to server shutdown.", task_id)
-        close_agent_session(_session_id, _exit_reason, _exit_summary,
-                            prompt_tokens=_prompt_tokens, completion_tokens=_completion_tokens)
-        try:
-            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
-        except Exception:
-            pass
-        try:
-            loop.close()
-        except Exception:
-            pass
-        return
-    except Exception:
-        _exit_reason = "error"
-        _exit_summary = "Pipeline raised an unexpected exception."
-        logger.exception("[intake] Pipeline for '%s' failed.", task_id)
-        close_agent_session(_session_id, _exit_reason, _exit_summary,
-                            prompt_tokens=_prompt_tokens, completion_tokens=_completion_tokens)
-        try:
-            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
-        except Exception:
-            pass
-        try:
-            loop.close()
-        except Exception:
-            pass
-        return
-
-    try:
-        create_transition_result(
-            task_id=task_id,
-            transition="idea_to_planning",
-            outcome=result["outcome"],
-            vote_summary=result,
-            total_prompt_tokens=result.get("total_prompt_tokens", 0),
-            total_completion_tokens=result.get("total_completion_tokens", 0),
-        )
-        for vote in result.get("votes", []):
-            create_transition_vote(
-                task_id=task_id,
-                transition="idea_to_planning",
-                stage=vote["stage"],
-                verdict=vote["verdict"],
-                confidence=vote.get("confidence", 0),
-                justification=vote.get("justification", ""),
-                raw_response=vote.get("raw_response"),
-                prompt_tokens=vote.get("prompt_tokens", 0),
-                completion_tokens=vote.get("completion_tokens", 0),
-                model=vote.get("model", ""),
-                budget_id=task.budget_id,
-            )
-
-        if result["outcome"] == "passed":
-            advance_stage(task_id, "pass", from_stage="idea")
-            logger.info("Task '%s' advanced to PLANNING via scheduler.", task_id)
-        elif result["outcome"] == "subdivide":
-            # Lazy import avoids circular import; main.py is fully loaded by call time.
-            from app.main import _handle_subdivision_outcome
-            _handle_subdivision_outcome(task, result, llm_base_url, llm_model, max_context, loop)
-            logger.info("Task '%s' intake result: subdivide.", task_id)
-        else:
-            from app.database import get_transition_results as _gtr
-            all_results = _gtr(task_id, transition="idea_to_planning") or []
-            rejection_count = sum(
-                1 for r in all_results
-                if r.outcome in ("rejected", "needs_research")
-            )
-            MAX_INTAKE_REJECTIONS = 3
-            if rejection_count >= MAX_INTAKE_REJECTIONS:
-                from datetime import datetime as _dt
-                from app.database import update_task as _update_task, append_task_history as _ath
-                _update_task(task_id, intake_exhausted_at=_dt.utcnow().isoformat())
-                _ath(
-                    task_id, "intake_exhausted",
-                    message=(
-                        f"Intake pipeline rejected {rejection_count} times. "
-                        f"Manual review required. Use Reset Intake to retry."
-                    ),
-                )
-                logger.warning(
-                    "[intake] Task '%s' intake exhausted after %d rejections — stopping auto-retry.",
-                    task_id, rejection_count,
-                )
-            else:
-                _rejection_cooldowns[task_id] = time.time()
-                logger.info(
-                    "[intake] Task '%s' rejected (attempt %d/%d) — retry in %ds.",
-                    task_id, rejection_count, MAX_INTAKE_REJECTIONS,
-                    int(_REJECTION_RETRY_COOLDOWN),
-                )
-    finally:
-        close_agent_session(_session_id, _exit_reason, _exit_summary,
-                            prompt_tokens=_prompt_tokens, completion_tokens=_completion_tokens)
-        try:
-            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=10.0))
-        except Exception:
-            pass
-        try:
-            loop.close()
-        except Exception:
-            pass
-
-
 def _run_planning_correction(
     loop,
     task_id: str,
@@ -4904,7 +4731,6 @@ from app.agent.stage_executors import (  # noqa: E402
     _run_parallel_agents,
     _run_parallel_subagent,
     _run_parallel_subagent_aggregator,
-    _run_optimization_node,
     _run_json_schema_gate,
     _run_planning_correction_stage,
     _run_planning_survey_node,
@@ -4929,10 +4755,8 @@ _reg_executor("dangerous_edit_llm_agent",      _run_dangerous_edit_llm_agent)
 _reg_executor("parallel_agents",               _run_parallel_agents)
 _reg_executor("parallel_subagent",             _run_parallel_subagent)
 _reg_executor("parallel_subagent_aggregator",  _run_parallel_subagent_aggregator)
-_reg_executor("optimization_node",             _run_optimization_node)
 _reg_executor("json_schema_gate",              _run_json_schema_gate)
 _reg_executor("planning_correction_stage",     _run_planning_correction_stage)
-_reg_executor("intake_node",                   _run_intake_node)
 _reg_executor("planning_survey_node",          _run_planning_survey_node)
 _reg_executor("pitfall_node",                  _run_pitfall_node)
 _reg_executor("consolidation_node",            _run_consolidation_node)
