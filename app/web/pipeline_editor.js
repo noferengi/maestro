@@ -29,6 +29,9 @@ let _nodeByKey = {};
 // Tracks DB transition IDs for the current graph (transition_id → {from_key, to_key, condition})
 let _dbTransitions = {};
 
+// Kanban column band definitions: [{key, label, color, x_min}] sorted by x_min
+let _kanbanColumns = [];
+
 // Panel state
 let _panelNode = null;    // node whose properties are currently open
 let _panelSnapshot = {};  // copy of node.properties when panel was opened (for Revert)
@@ -75,15 +78,14 @@ class StageNode extends LiteGraph.LGraphNode {
     onDrawBackground(ctx) {
         if (!this.properties.label) return;
         ctx.save();
-        const agentType = this.properties.agent_type || "";
-        if (agentType === "voting_panel") {
-            ctx.fillStyle = "rgba(255,255,255,0.3)";
-            ctx.font = "bold 11px sans-serif";
-            ctx.fillText("[vote]", 8, 22);
-        } else if (agentType === "fan_out_judge") {
-            ctx.fillStyle = "rgba(255,255,255,0.3)";
-            ctx.font = "bold 11px sans-serif";
-            ctx.fillText("[fan]", 8, 22);
+        if ((this.properties.executor_type || "infrastructure") === "custom_python") {
+            const badge = "⚙ custom";
+            ctx.font = "bold 9px monospace";
+            const bw = ctx.measureText(badge).width + 8;
+            ctx.fillStyle = "rgba(180, 83, 9, 0.85)";
+            ctx.fillRect(this.size[0] - bw - 4, 6, bw, 13);
+            ctx.fillStyle = "#fff";
+            ctx.fillText(badge, this.size[0] - bw, 16);
         }
         ctx.fillStyle = "rgba(255,255,255,0.55)";
         ctx.font = "11px monospace";
@@ -662,7 +664,12 @@ async function loadTemplate() {
         banner.style.display = "none";
     }
 
+    _kanbanColumns = (_templateData.config?.kanban_columns || [])
+        .slice()
+        .sort((a, b) => (a.x_min ?? 0) - (b.x_min ?? 0));
+
     buildGraphFromTemplate(_templateData);
+    renderColumnBandHeaders();
     setSaveStatus("Loaded");
 }
 
@@ -682,8 +689,6 @@ function buildGraphFromTemplate(data) {
         const isDangerousEdit   = stage.agent_type === "dangerous_edit_llm_agent";
         const isParallelAgents  = stage.agent_type === "parallel_agents";
         const isMultiplierNode  = stage.agent_type === "multiplier_node";
-        const isVotingPanel     = stage.agent_type === "voting_panel";
-        const isFanOutJudge     = stage.agent_type === "fan_out_judge";
         const nodeType = isFactory        ? "maestro/factory"
                        : isHumanGate      ? "maestro/human_gate"
                        : isStaticAnalysis  ? "maestro/static_analysis"
@@ -786,11 +791,14 @@ function buildGraphFromTemplate(data) {
                 output_key:          cfg.output_key || "fan_out_result",
             };
         } else {
+            const agentTypeKey = stage.agent_type || "planning_agent";
+            const agentTypeMeta = _agentTypes.find(at => (at.type_key || at.key || at.name) === agentTypeKey);
             node.properties = {
                 stage_id:             stage.id,
                 stage_key:            stage.stage_key,
                 label:                stage.label || stage.stage_key,
-                agent_type:           stage.agent_type || "planning_agent",
+                agent_type:           agentTypeKey,
+                executor_type:        agentTypeMeta?.executor_type || "infrastructure",
                 color:                stage.color || (isHumanGate ? "#be185d" : "#1e40af"),
                 intent:               cfg.intent || "",
                 system_prompt:        cfg.system_prompt || "",
@@ -813,8 +821,6 @@ function buildGraphFromTemplate(data) {
                             : isStaticAnalysis  ? "#b45309"
                             : isDangerousEdit   ? "#7f1d1d"
                             : isParallelAgents  ? "#0c4a6e"
-                            : isVotingPanel     ? "#4c1d95"
-                            : isFanOutJudge     ? "#0e7490"
                             : "#1e40af";
         node.color   = node.properties.color || _defaultColor;
         node.bgcolor = _darken(node.color);
@@ -967,6 +973,94 @@ function drawBackEdgeOverlays(ctx) {
     }
 
     ctx.restore();
+}
+
+// ============================================================
+// KANBAN COLUMN BANDS
+// ============================================================
+
+function _kanbanColumnForX(x) {
+    // Return the column key for a given graph X coordinate, or null if none defined.
+    if (!_kanbanColumns.length) return null;
+    let col = _kanbanColumns[0];
+    for (const c of _kanbanColumns) {
+        if (x >= c.x_min) col = c;
+        else break;
+    }
+    return col.key;
+}
+
+// Two alternating band fill colors — even/odd indices, never the same adjacent
+const PE_BAND_EVEN = "#1e3a5f";  // blue-navy tint
+const PE_BAND_ODD  = "#1a2e1a";  // forest-green tint
+
+function drawColumnBands(ctx) {
+    if (!_kanbanColumns.length || !_canvas) return;
+    const visRect = _canvas.visible_rect || [0, 0, 2000, 2000];
+    const scale = _canvas.ds?.scale || 1;
+    const BAND_HEIGHT = 100000;
+
+    ctx.save();
+    for (let i = 0; i < _kanbanColumns.length; i++) {
+        const col = _kanbanColumns[i];
+        const x1 = col.x_min;
+        const x2 = i + 1 < _kanbanColumns.length ? _kanbanColumns[i + 1].x_min : x1 + 3000;
+        const bandColor = (i % 2 === 0) ? PE_BAND_EVEN : PE_BAND_ODD;
+
+        // Band fill
+        ctx.globalAlpha = 0.18;
+        ctx.fillStyle = bandColor;
+        ctx.fillRect(x1, -BAND_HEIGHT / 2, x2 - x1, BAND_HEIGHT);
+        ctx.globalAlpha = 1.0;
+
+        // Divider line (not for first column)
+        if (i > 0) {
+            ctx.globalAlpha = 0.3;
+            ctx.strokeStyle = "#475569";
+            ctx.lineWidth = 1.5 / scale;
+            ctx.setLineDash([5 / scale, 4 / scale]);
+            ctx.beginPath();
+            ctx.moveTo(x1, -BAND_HEIGHT / 2);
+            ctx.lineTo(x1, BAND_HEIGHT / 2);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.globalAlpha = 1.0;
+        }
+
+        // Column label pinned to top of visible area
+        const topY = visRect[1] + 8 / scale;
+        const fontSize = Math.max(9, Math.min(14, 13 / scale));
+        ctx.globalAlpha = 0.55;
+        ctx.fillStyle = "#94a3b8";
+        ctx.font = `bold ${fontSize}px sans-serif`;
+        ctx.textAlign = "center";
+        ctx.fillText(col.label.toUpperCase(), x1 + (x2 - x1) / 2, topY + fontSize);
+        ctx.globalAlpha = 1.0;
+    }
+    ctx.restore();
+}
+
+// Update the fixed HTML column header strip above the canvas
+function renderColumnBandHeaders() {
+    let strip = document.getElementById("pe-col-header-strip");
+    if (!strip) {
+        strip = document.createElement("div");
+        strip.id = "pe-col-header-strip";
+        document.getElementById("pe-canvas-wrap").prepend(strip);
+    }
+    strip.innerHTML = "";
+    if (!_kanbanColumns.length) {
+        strip.style.display = "none";
+        return;
+    }
+    strip.style.display = "flex";
+    _kanbanColumns.forEach((col, i) => {
+        const div = document.createElement("div");
+        div.className = "pe-col-header-cell";
+        div.style.background = (i % 2 === 0) ? PE_BAND_EVEN + "44" : PE_BAND_ODD + "44";
+        div.textContent = col.label.toUpperCase();
+        strip.appendChild(div);
+    });
 }
 
 function _lastCreatedLink(node, slotIdx) {
@@ -1144,12 +1238,24 @@ async function saveGraph() {
                 };
             }
 
+            // Stamp kanban_column from current X position
+            if (_kanbanColumns.length) {
+                stageBody.config.kanban_column = _kanbanColumnForX(node.pos[0]);
+            }
+
             if (p.stage_id) {
                 await apiPut(`/pipelines/${_templateId}/stages/${p.stage_id}`, stageBody);
             } else {
                 const created = await apiPost(`/pipelines/${_templateId}/stages`, stageBody);
                 node.properties.stage_id = created.id;
             }
+        }
+
+        // Persist kanban column definitions on the template config
+        if (_templateId) {
+            await apiPut(`/pipelines/${_templateId}`, {
+                config: { kanban_columns: _kanbanColumns },
+            });
         }
 
         // Update stage position map after save so back-edge detection uses new positions
@@ -1494,6 +1600,16 @@ async function runFactoryNow(node, statusEl) {
     }
 }
 
+function _agentTypeHint(typeKey) {
+    const meta = _agentTypes.find(at => (at.type_key || at.key || at.name) === typeKey);
+    if (!meta) return "";
+    if (meta.executor_type === "custom_python")
+        return "⚙ Backed by custom Python — prompt lives in stage config but logic is in app/agent/";
+    if (meta.executor_type === "user_defined")
+        return "User-defined agent from custom_agent_definitions";
+    return "";
+}
+
 function _populateAgentTypeSelect(body, selectedType) {
     const sel = body.querySelector("#pf-agent-type");
     if (!sel) return;
@@ -1513,6 +1629,11 @@ function _populateAgentTypeSelect(body, selectedType) {
         opt.selected = true;
         sel.prepend(opt);
     }
+    const hint = body.querySelector("#pf-agent-type-hint");
+    if (hint) hint.textContent = _agentTypeHint(sel.value);
+    sel.addEventListener("change", () => {
+        if (hint) hint.textContent = _agentTypeHint(sel.value);
+    });
 }
 
 function _renderConditionsList(body, node) {
@@ -2095,10 +2216,115 @@ async function _deleteToolGroup(groupingId) {
 }
 
 
+// ============================================================
+// COLUMNS MODAL
+// ============================================================
+
+const PE_COL_PRESETS = [
+    { key: "idea",         label: "Idea" },
+    { key: "planning",     label: "Planning" },
+    { key: "indev",        label: "In Development" },
+    { key: "ai_review",    label: "AI Review" },
+    { key: "human_review", label: "Human Review" },
+    { key: "complete",     label: "Complete" },
+];
+
+function openColumnsModal() {
+    document.getElementById("pe-columns-modal").classList.remove("pe-hidden");
+    _renderColumnRows();
+}
+
+function closeColumnsModal() {
+    document.getElementById("pe-columns-modal").classList.add("pe-hidden");
+}
+
+function _renderColumnRows() {
+    const list = document.getElementById("pe-col-list");
+    list.innerHTML = "";
+
+    if (!_kanbanColumns.length) {
+        list.innerHTML = '<div style="color:#64748b;font-size:12px;padding:8px 0">No columns defined. Add one below.</div>';
+        return;
+    }
+
+    _kanbanColumns.forEach((col, i) => {
+        const row = document.createElement("div");
+        row.className = "pe-col-row";
+        row.innerHTML = `
+            <span class="pe-col-band-swatch" style="background:${i % 2 === 0 ? PE_BAND_EVEN : PE_BAND_ODD}"></span>
+            <input class="pe-col-input pe-col-label" data-idx="${i}" value="${_escHtml(col.label)}" placeholder="Label" title="Column label" />
+            <input class="pe-col-input pe-col-key" data-idx="${i}" value="${_escHtml(col.key)}" placeholder="key" title="Column key (used in stage config)" style="font-family:monospace;width:110px" />
+            <input class="pe-col-input pe-col-xmin" data-idx="${i}" type="number" value="${col.x_min}" placeholder="X start" title="Left edge X in graph space" style="width:80px" />
+            <button class="pe-col-del pe-btn pe-btn-danger-sm" data-idx="${i}" title="Remove column">✕</button>
+        `;
+        list.appendChild(row);
+    });
+
+    // Wire live-update events
+    list.querySelectorAll(".pe-col-label").forEach(el => {
+        el.addEventListener("input", e => {
+            _kanbanColumns[+e.target.dataset.idx].label = e.target.value;
+            _refreshBands();
+        });
+    });
+    list.querySelectorAll(".pe-col-key").forEach(el => {
+        el.addEventListener("input", e => {
+            _kanbanColumns[+e.target.dataset.idx].key = e.target.value;
+        });
+    });
+    list.querySelectorAll(".pe-col-xmin").forEach(el => {
+        el.addEventListener("input", e => {
+            const v = parseInt(e.target.value);
+            if (!isNaN(v)) {
+                _kanbanColumns[+e.target.dataset.idx].x_min = v;
+                _kanbanColumns.sort((a, b) => a.x_min - b.x_min);
+                _refreshBands();
+                _renderColumnRows();
+            }
+        });
+    });
+    list.querySelectorAll(".pe-col-del").forEach(el => {
+        el.addEventListener("click", e => {
+            _kanbanColumns.splice(+e.target.dataset.idx, 1);
+            _refreshBands();
+            _renderColumnRows();
+        });
+    });
+}
+
+function _refreshBands() {
+    renderColumnBandHeaders();
+    if (_canvas) _canvas.setDirty(true, true);
+}
+
+function _escHtml(s) {
+    return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function _addColumn() {
+    const maxX = _kanbanColumns.reduce((m, c) => Math.max(m, c.x_min), 0);
+    const idx = _kanbanColumns.length;
+    _kanbanColumns.push({
+        key:   `column_${idx}`,
+        label: `Column ${idx + 1}`,
+        x_min: maxX + 500,
+    });
+    _refreshBands();
+    _renderColumnRows();
+}
+
+function _applyPreset() {
+    const COL_W = 500;
+    _kanbanColumns = PE_COL_PRESETS.map((p, i) => ({ ...p, x_min: i * COL_W }));
+    _refreshBands();
+    _renderColumnRows();
+}
+
 function setupEvents() {
     // Top bar buttons
     document.getElementById("btn-save").addEventListener("click", saveGraph);
     document.getElementById("btn-tidy").addEventListener("click", tidyLayout);
+    document.getElementById("btn-columns").addEventListener("click", openColumnsModal);
     document.getElementById("btn-tool-groups").addEventListener("click", openToolGroupsModal);
     document.getElementById("btn-simulate").addEventListener("click", () => {
         if (_simActive) stopSimulation();
@@ -2290,6 +2516,9 @@ document.addEventListener("DOMContentLoaded", async function () {
 
     // Patch rendering
     patchLinkRendering();
+
+    // Draw column bands behind graph content
+    _canvas.onDrawBackground = function(ctx) { drawColumnBands(ctx); };
 
     // Draw back-edge overlay arrows above all LiteGraph content
     _canvas.onDrawForeground = function(ctx) { drawBackEdgeOverlays(ctx); };

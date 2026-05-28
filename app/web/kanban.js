@@ -327,17 +327,65 @@ function buildKanbanColumns(stages) {
     const board = document.querySelector('.kanban-board');
     if (!board) return;
 
-    // Remove all columns from the previous template
     board.querySelectorAll('.column[data-board-col]').forEach(col => col.remove());
 
     if (!stages || !stages.length) return;
 
-    // Architecture stages render in the arch bar only — never as kanban columns.
     const sortedStages = [...stages]
         .filter(s => s.agent_type !== 'arch_agent' && s.stage_key !== 'architecture')
         .sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
 
-    // Build group map: group_id → { group, stages: [] } ordered by position
+    const kanbanCols = activePipelineTemplate?.config?.kanban_columns;
+    if (kanbanCols && kanbanCols.length) {
+        _buildKanbanColumnsBanded(board, sortedStages, kanbanCols);
+    } else {
+        _buildKanbanColumnsLegacy(board, sortedStages);
+    }
+}
+
+function _buildKanbanColumnsBanded(board, sortedStages, kanbanCols) {
+    // Group stages by their kanban_column key
+    const colDefs = [...kanbanCols].sort((a, b) => (a.x_min ?? 0) - (b.x_min ?? 0));
+    const stagesByCol = {};
+    colDefs.forEach(cd => { stagesByCol[cd.key] = []; });
+
+    const unassigned = [];
+    sortedStages.forEach(s => {
+        const ck = s.config?.kanban_column;
+        if (ck && stagesByCol[ck]) stagesByCol[ck].push(s);
+        else unassigned.push(s);
+    });
+
+    // Append unassigned stages to the last column
+    const lastKey = colDefs[colDefs.length - 1]?.key;
+    if (lastKey) unassigned.forEach(s => stagesByCol[lastKey].push(s));
+
+    colDefs.forEach(cd => {
+        const colStages = stagesByCol[cd.key] || [];
+        const label = (cd.label || cd.key).toUpperCase();
+        const hasEntry = colStages.some(s => s.agent_type === 'intake_agent');
+        const firstKey = colStages[0]?.stage_key || cd.key;
+
+        const col = document.createElement('div');
+        col.className = 'column';
+        col.id = `column-kc-${cd.key}`;
+        col.dataset.boardCol = '1';
+        col.innerHTML =
+            `<div class="column-header" onclick="openColumnMap('${firstKey}')" ` +
+            `title="Click to open ${label} Map">` +
+            `<span class="column-title">${label}</span>` +
+            `<span class="task-count" id="count-kc-${cd.key}">0</span>` +
+            `</div>` +
+            (hasEntry ? `<button class="add-task-btn" onclick="openAddTaskModal('idea')">+ Add Idea</button>` : '') +
+            colStages.map(s =>
+                `<div class="tasks-container" id="tasks-${s.stage_key}" ` +
+                `onclick="handleTasksContainerClick(event,'${s.stage_key}')"></div>`
+            ).join('');
+        board.appendChild(col);
+    });
+}
+
+function _buildKanbanColumnsLegacy(board, sortedStages) {
     const groups = activePipelineTemplate?.groups || [];
     const groupMap = {};
     groups.forEach(g => { groupMap[g.id] = { group: g, stages: [] }; });
@@ -349,7 +397,6 @@ function buildKanbanColumns(stages) {
 
     sortedStages.forEach(stage => {
         if (stage.group_id && groupMap[stage.group_id]) {
-            // Grouped stage — render the whole group column once on first encounter
             if (renderedGroupIds.has(stage.group_id)) return;
             renderedGroupIds.add(stage.group_id);
 
@@ -373,7 +420,6 @@ function buildKanbanColumns(stages) {
                 ).join('');
             board.appendChild(col);
         } else {
-            // Standalone stage column
             const label = (stage.label || stage.stage_key).toUpperCase();
             const isEntryStage = stage.agent_type === 'intake_agent';
 
@@ -954,7 +1000,7 @@ function updateTaskCounts() {
     const stages = activePipelineTemplate.stages;
     const groups = activePipelineTemplate.groups || [];
 
-    // Standalone stage columns have a count-{stage_key} badge in their header.
+    // Per-stage counts (always update these — both banded and legacy modes have tasks-{key} containers)
     stages.forEach(stage => {
         const container = document.getElementById(`tasks-${stage.stage_key}`);
         const countEl = document.getElementById(`count-${stage.stage_key}`);
@@ -963,7 +1009,21 @@ function updateTaskCounts() {
         }
     });
 
-    // Group column headers have a count-group-{groupId} badge; value = sum of member stages.
+    // Banded column headers: sum all stage containers in each kanban column
+    const kanbanCols = activePipelineTemplate.config?.kanban_columns;
+    if (kanbanCols && kanbanCols.length) {
+        kanbanCols.forEach(cd => {
+            const colStages = stages.filter(s => s.config?.kanban_column === cd.key);
+            const total = colStages.reduce((sum, s) => {
+                const c = document.getElementById(`tasks-${s.stage_key}`);
+                return sum + (c ? c.querySelectorAll('.task-card').length : 0);
+            }, 0);
+            const countEl = document.getElementById(`count-kc-${cd.key}`);
+            if (countEl) countEl.textContent = total;
+        });
+    }
+
+    // Legacy group column headers
     groups.forEach(g => {
         const memberKeys = stages.filter(s => s.group_id === g.id).map(s => s.stage_key);
         const total = memberKeys.reduce((sum, key) => {

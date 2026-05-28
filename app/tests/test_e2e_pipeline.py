@@ -163,7 +163,7 @@ def _sec_response_content(verdict: str, pt: int = 50, ct: int = 100) -> str:
 
 class TestIntakePipelineE2E:
     def _run_intake(self, scenario: str, *, budget_id=1, llm_id=1):
-        from app.agent.intake import IntakePipeline
+        from app.agent._intake_pipeline import IntakePipeline
         from app.agent.mock_llm import MockLLM
 
         mock_llm = MockLLM(scenario=scenario)
@@ -201,7 +201,7 @@ class TestIntakePipelineE2E:
 
 class TestIntakeBudgetEntries:
     def test_intake_budget_entries_recorded(self):
-        from app.agent.intake import IntakePipeline
+        from app.agent._intake_pipeline import IntakePipeline
         from app.agent.mock_llm import MockLLM
 
         mock_llm = MockLLM(scenario="intake_all_pass")
@@ -274,7 +274,7 @@ class TestPlanningGateE2E:
 
 class TestBudgetIdEnforcement:
     def test_budget_id_enforcement_in_pipeline(self):
-        from app.agent.intake import IntakePipeline
+        from app.agent._intake_pipeline import IntakePipeline
 
         async def _go():
             pipeline = IntakePipeline(

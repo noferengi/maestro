@@ -135,7 +135,7 @@ async def _run_pipeline_direct(call_llm_responses, task_id="test-task-1",
     Create an IntakePipeline, patch call_llm and the static analysis stage,
     then run it. Returns the tally result.
     """
-    from app.agent.intake import IntakePipeline
+    from app.agent._intake_pipeline import IntakePipeline
     from app.database import get_project_path
 
     pipeline = IntakePipeline(
@@ -147,7 +147,7 @@ async def _run_pipeline_direct(call_llm_responses, task_id="test-task-1",
     )
     _patch_static(pipeline)
 
-    with patch("app.agent.intake.call_llm",
+    with patch("app.agent._intake_pipeline.call_llm",
                new=_SequentialCallLLM(call_llm_responses)):
         result = await pipeline.run()
     return result, pipeline
@@ -245,7 +245,7 @@ class TestNeedsResearch:
             return tally  # return as-is (outcome stays needs_research)
 
         async def _run():
-            from app.agent.intake import IntakePipeline
+            from app.agent._intake_pipeline import IntakePipeline
             pipeline = IntakePipeline(
                 task_id="test-nr", task_description="Vague task",
                 task_title="Vague", all_tasks=[],
@@ -257,7 +257,7 @@ class TestNeedsResearch:
                 _llm_response(_CONFLICT_PASS),
                 _llm_response(_FEASIBILITY_PASS),
             ]
-            with patch("app.agent.intake.call_llm",
+            with patch("app.agent._intake_pipeline.call_llm",
                        new=_SequentialCallLLM(responses)):
                 with patch.object(pipeline, "_handle_needs_research",
                                   new=_fake_handle):
@@ -275,7 +275,7 @@ class TestNeedsResearch:
 class TestStageErrorFallback:
     def test_error_vote_structure(self):
         """_error_vote returns a NEEDS_RESEARCH vote dict with zero tokens."""
-        from app.agent.intake import IntakePipeline
+        from app.agent._intake_pipeline import IntakePipeline
         pipeline = IntakePipeline(
             task_id="err-test", task_description="x",
             task_title="x", all_tasks=[],
@@ -294,14 +294,14 @@ class TestStageErrorFallback:
             raise RuntimeError("LLM connection refused")
 
         async def _run():
-            from app.agent.intake import IntakePipeline
+            from app.agent._intake_pipeline import IntakePipeline
             pipeline = IntakePipeline(
                 task_id="err-test-2", task_description="x",
                 task_title="x", all_tasks=[],
                 project="TheMaestro",  # Required for static analysis
             )
             _patch_static(pipeline)
-            with patch("app.agent.intake.call_llm", new=_raising_call_llm):
+            with patch("app.agent._intake_pipeline.call_llm", new=_raising_call_llm):
                 # Mock research agent to avoid extra complexity
                 with patch.object(pipeline, "_handle_needs_research",
                                   new=AsyncMock(return_value={
@@ -350,7 +350,7 @@ class TestStaticAnalysisIntegration:
     def test_static_analysis_uses_affected_areas(self):
         """Static analysis collects files from affected_areas in scope vote."""
         async def _run():
-            from app.agent.intake import IntakePipeline
+            from app.agent._intake_pipeline import IntakePipeline
             from app.agent.static_analysis import analyze_project, generate_vote
             pipeline = IntakePipeline(
                 task_id="static-test-1", task_description="Add auth",
@@ -368,7 +368,7 @@ class TestStaticAnalysisIntegration:
             async def mock_generate(analysis, desc):
                 return {"verdict": "POSSIBLE", "confidence": 80, "justification": "OK"}
 
-            with patch("app.agent.intake.call_llm",
+            with patch("app.agent._intake_pipeline.call_llm",
                        new=_SequentialCallLLM([
                            _llm_response({
                                **_SCOPE_PASS,
@@ -407,14 +407,14 @@ class TestStaticAnalysisIntegration:
     def test_static_analysis_fallback_when_no_affected_areas(self):
         """Static analysis falls back to all Python files when no affected_areas."""
         async def _run():
-            from app.agent.intake import IntakePipeline
+            from app.agent._intake_pipeline import IntakePipeline
             pipeline = IntakePipeline(
                 task_id="static-test-2", task_description="Global change",
                 task_title="Global", all_tasks=[],
                 project="TheMaestro",
             )
             _patch_static(pipeline)
-            with patch("app.agent.intake.call_llm",
+            with patch("app.agent._intake_pipeline.call_llm",
                        new=_SequentialCallLLM([
                            _llm_response({
                                "scope": "medium", "complexity": 5,
@@ -444,7 +444,7 @@ class TestNeedsResearchIntegration:
     def test_needs_research_spawns_agent(self):
         """NEEDS_RESEARCH outcome triggers research agent."""
         async def _run():
-            from app.agent.intake import IntakePipeline
+            from app.agent._intake_pipeline import IntakePipeline
             from app.agent.research import run_research
             pipeline = IntakePipeline(
                 task_id="nr-test", task_description="Unclear task",
@@ -468,7 +468,7 @@ class TestNeedsResearchIntegration:
                 })()
 
             with patch("app.agent.research.run_research", new_callable=lambda: mock_run_research):
-                with patch("app.agent.intake.call_llm",
+                with patch("app.agent._intake_pipeline.call_llm",
                            new=_SequentialCallLLM([
                                _llm_response(_SCOPE_NEEDS_RESEARCH),
                                _llm_response(_CONFLICT_PASS),
@@ -484,7 +484,7 @@ class TestNeedsResearchIntegration:
     def test_needs_research_fallback_on_agent_failure(self):
         """Research agent failure results in NOT_SUITABLE fallback."""
         async def _run():
-            from app.agent.intake import IntakePipeline
+            from app.agent._intake_pipeline import IntakePipeline
             pipeline = IntakePipeline(
                 task_id="nr-fail-test", task_description="Unclear task",
                 task_title="Unclear", all_tasks=[],
@@ -495,7 +495,7 @@ class TestNeedsResearchIntegration:
                 raise RuntimeError("Research agent crashed")
 
             with patch("app.agent.research.run_research", new=failing_research):
-                with patch("app.agent.intake.call_llm",
+                with patch("app.agent._intake_pipeline.call_llm",
                            new=_SequentialCallLLM([
                                _llm_response(_SCOPE_NEEDS_RESEARCH),
                                _llm_response(_CONFLICT_PASS),

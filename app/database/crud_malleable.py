@@ -59,6 +59,7 @@ def create_template(
     description: Optional[str] = None,
     is_default: bool = False,
     is_builtin: bool = False,
+    config: Optional[dict] = None,
 ) -> Optional[PipelineTemplate]:
     db = SessionLocal()
     try:
@@ -70,6 +71,7 @@ def create_template(
             is_default=is_default,
             is_builtin=is_builtin,
             version=1,
+            config=config or {},
         )
         db.add(t)
         db.commit()
@@ -89,6 +91,7 @@ def update_template(
     description: Optional[str] = None,
     is_default: Optional[bool] = None,
     version_bump: bool = False,
+    config: Optional[dict] = None,
 ) -> Optional[PipelineTemplate]:
     db = SessionLocal()
     try:
@@ -101,6 +104,8 @@ def update_template(
             t.description = description
         if is_default is not None:
             t.is_default = is_default
+        if config is not None:
+            t.config = config
         if version_bump:
             t.version = (t.version or 1) + 1
         t.updated_at = datetime.utcnow()
@@ -824,6 +829,7 @@ def template_to_dict(template: PipelineTemplate) -> Dict[str, Any]:
         "is_default": template.is_default,
         "is_builtin": template.is_builtin,
         "version": template.version,
+        "config": template.config or {},
         "stages": [
             {
                 "id": s.id,
@@ -1281,6 +1287,7 @@ def load_custom_agents_into_registry() -> int:
             description=defn.description or "",
             default_tools=list(defn.allowed_tools or []),
             gate_type=defn.gate_type or "llm_judge",
+            executor_type="user_defined",
         )
     return len(defns)
 

@@ -164,6 +164,7 @@ class PlanningGate:
         project_path: str | None = None,
         task_description: str = "",
         domain: str = "software",
+        stage_cfg: dict | None = None,
     ):
         self.task_id = task_id
         self.plan = planning_result
@@ -176,6 +177,7 @@ class PlanningGate:
         self.project_path = project_path
         self.task_description = task_description
         self.domain = domain
+        self._stage_cfg: dict = stage_cfg or {}
 
     async def run(self) -> GateResult:
         """Execute all 7 checks and return the gate result."""
@@ -828,8 +830,12 @@ class PlanningGate:
             '  }\n'
             "}"
         )
+        system_prompt = (
+            self._stage_cfg.get("feasibility_recheck_prompt")
+            or "You are a feasibility and spec-compliance reviewer. Use submit_work to output your result when ready."
+        )
         messages = [
-            {"role": "system", "content": "You are a feasibility and spec-compliance reviewer. Use submit_work to output your result when ready."},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ]
 
@@ -969,6 +975,7 @@ async def run_planning_gate(
     project_path: str | None = None,
     task_description: str = "",
     domain: str = "software",
+    stage_cfg: dict | None = None,
 ) -> dict:
     """Run the planning gate and return a result dict."""
     if project_path is not None:
@@ -986,6 +993,7 @@ async def run_planning_gate(
         project_path=project_path,
         task_description=task_description,
         domain=domain,
+        stage_cfg=stage_cfg,
     )
     result = await gate.run()
     return {

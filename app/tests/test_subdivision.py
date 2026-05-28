@@ -510,7 +510,7 @@ class TestIntakeBuildTallySubdivide:
     """The IntakePipeline._build_tally() method handles SUBDIVIDE_IDEA."""
 
     def test_build_tally_subdivide(self):
-        from app.agent.intake import IntakePipeline
+        from app.agent._intake_pipeline import IntakePipeline
 
         pipeline = IntakePipeline(
             task_id="test-1",

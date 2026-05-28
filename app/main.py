@@ -4217,6 +4217,7 @@ def list_agent_types():
             "description": spec.description,
             "default_tools": spec.default_tools,
             "gate_type": spec.gate_type,
+            "executor_type": spec.executor_type,
         }
         for key, spec in AGENT_REGISTRY.items()
     ]
@@ -4559,6 +4560,7 @@ def update_pipeline_template(template_id: int, data: dict = Body(...)):
         description=data.get("description"),
         is_default=data.get("is_default"),
         version_bump=bool(data.get("version_bump", False)),
+        config=data.get("config"),
     )
     if not t:
         raise HTTPException(status_code=404, detail="Template not found")

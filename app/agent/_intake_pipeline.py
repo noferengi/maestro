@@ -1,7 +1,10 @@
 """
-app/agent/intake.py
--------------------
-Intake pipeline orchestrator for the IDEA -> PLANNING task transition.
+app/agent/_intake_pipeline.py
+------------------------------
+Intake pipeline implementation: IntakePipeline class and per-stage wrapper functions.
+
+Called exclusively by the decomposed intake stage executors in stage_executors.py.
+Internal module — import from here, not from the deleted intake.py.
 
 When a task is requested to move from IDEA to PLANNING, this module coordinates
 four analysis stages to determine whether the transition should proceed:
@@ -865,7 +868,8 @@ class IntakePipeline:
         )
 
         try:
-            result = await self._call_llm(_FEASIBILITY_SYSTEM_PROMPT, user_prompt)
+            system_prompt = self._stage_cfg.get("system_prompt") or _FEASIBILITY_SYSTEM_PROMPT
+            result = await self._call_llm(system_prompt, user_prompt)
             return self._extract_vote("feasibility_analysis", result)
         except Exception as exc:
             return self._error_vote("feasibility_analysis", exc)
@@ -917,7 +921,8 @@ class IntakePipeline:
         )
 
         try:
-            result = await self._call_llm(_CONFLICT_SYSTEM_PROMPT, user_prompt)
+            system_prompt = self._stage_cfg.get("system_prompt") or _CONFLICT_SYSTEM_PROMPT
+            result = await self._call_llm(system_prompt, user_prompt)
             return self._extract_vote("conflict_detection", result)
         except Exception as exc:
             return self._error_vote("conflict_detection", exc)
@@ -1006,68 +1011,6 @@ class IntakePipeline:
 # ---------------------------------------------------------------------------
 # Module-level convenience function
 # ---------------------------------------------------------------------------
-
-async def run_intake_pipeline(
-    task_id: str,
-    task_description: str,
-    task_title: str,
-    all_tasks: list[dict],
-    budget_id: int | None = None,
-    llm_id: int | None = None,
-    llm_base_url: str | None = None,
-    llm_model: str | None = None,
-    project: str | None = None,
-) -> dict:
-    """
-    Convenience function to run the full intake pipeline.
-
-    Creates an IntakePipeline instance and executes all stages,
-    returning the aggregated tally result dict.
-
-    Parameters
-    ----------
-    task_id : str
-        The unique identifier of the task being evaluated.
-    task_description : str
-        The full description/body of the task.
-    task_title : str
-        The short title of the task.
-    all_tasks : list[dict]
-        All current tasks in the project (used for conflict detection).
-    budget_id : int | None
-        Optional LLM budget identifier for token tracking.
-    llm_base_url : str | None
-        Base URL for the LLM endpoint (e.g. ``http://localhost:8008/v1``).
-        Falls back to the global ``LLM_BASE_URL`` config when *None*.
-    llm_model : str | None
-        Model identifier to send in the request payload.
-        Falls back to the global ``LLM_MODEL`` config when *None*.
-    project : str | None
-        Project name to look up the project root for static analysis.
-        Falls back to "TheMaestro" if not provided.
-
-    Returns
-    -------
-    dict
-        Tally result with keys: task_id, transition, votes, outcome,
-        rejection_reasons, research_needed, total_prompt_tokens,
-        total_completion_tokens.
-    """
-    pipeline = IntakePipeline(
-        task_id=task_id,
-        task_description=task_description,
-        task_title=task_title,
-        all_tasks=all_tasks,
-        budget_id=budget_id,
-        llm_id=llm_id,
-        llm_base_url=llm_base_url,
-        llm_model=llm_model,
-        project=project,
-    )
-    return await pipeline.run()
-
-
-# ---------------------------------------------------------------------------
 # Per-stage standalone functions (used by decomposed stage executors)
 # ---------------------------------------------------------------------------
 
@@ -1150,11 +1093,12 @@ async def run_intake_conflict_stage(
     llm_id: int | None = None,
     budget_id: int | None = None,
     project: str | None = None,
+    stage_cfg: dict | None = None,
 ) -> dict:
     """Run only the conflict detection stage and return its vote dict."""
     p = _make_pipeline(task_id, task_title, task_description,
                        llm_base_url, llm_model, llm_id, budget_id, project,
-                       all_tasks=all_tasks)
+                       all_tasks=all_tasks, stage_cfg=stage_cfg)
     return await p._stage_conflict_detection(scope_vote)
 
 
@@ -1169,10 +1113,12 @@ async def run_intake_feasibility_stage(
     llm_id: int | None = None,
     budget_id: int | None = None,
     project: str | None = None,
+    stage_cfg: dict | None = None,
 ) -> dict:
     """Run only the feasibility analysis stage and return its vote dict."""
     p = _make_pipeline(task_id, task_title, task_description,
-                       llm_base_url, llm_model, llm_id, budget_id, project)
+                       llm_base_url, llm_model, llm_id, budget_id, project,
+                       stage_cfg=stage_cfg)
     return await p._stage_feasibility(scope_vote, static_vote)
 
 

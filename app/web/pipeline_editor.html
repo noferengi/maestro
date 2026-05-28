@@ -8,7 +8,7 @@
 <script src="/static/vendor/litegraph.js?v=0.7.18"></script>
 
 <link rel="stylesheet" href="/static/vendor/litegraph.css?v=1">
-<link rel="stylesheet" href="/static/pipeline_editor.css?v=4">
+<link rel="stylesheet" href="/static/pipeline_editor.css?v=5">
 </head>
 <body>
 
@@ -35,6 +35,7 @@
         <div class="pe-add-item" data-node-type="maestro/parallel_agents">Parallel Agents</div>
       </div>
     </div>
+    <button id="btn-columns" class="pe-btn pe-btn-secondary" title="Define kanban column bands">⊞ Columns</button>
     <button id="btn-tool-groups" class="pe-btn pe-btn-secondary" title="Manage tool groupings for parallel agents">⚙ Tool Groups</button>
     <button id="btn-tidy" class="pe-btn pe-btn-secondary" title="Topological auto-layout">Tidy Layout</button>
     <button id="btn-simulate" class="pe-btn pe-btn-secondary" title="Step a ghost token through the pipeline">Simulate</button>
@@ -85,6 +86,7 @@
       <select id="pf-agent-type" data-bind="agent_type" class="pe-input pe-select"></select>
       <button class="pe-lightning" data-field="agent_type" title="Generate with AI">⚡</button>
     </div>
+    <div id="pf-agent-type-hint" class="pe-field-hint"></div>
   </div>
 
   <div class="pe-field-row">
@@ -616,6 +618,25 @@
   </div>
 </template>
 
+<!-- ── Columns modal ─────────────────────────────────────────────────────── -->
+<div id="pe-columns-modal" class="pe-modal-overlay pe-hidden">
+  <div class="pe-modal-box" style="width:560px">
+    <div class="pe-modal-header">
+      <span>⊞ Kanban Column Bands</span>
+      <button onclick="closeColumnsModal()" class="pe-btn pe-btn-secondary" style="padding:2px 8px;">✕</button>
+    </div>
+    <div style="padding:10px 16px;color:#94a3b8;font-size:12px;border-bottom:1px solid #1e293b;">
+      Nodes are assigned to whichever band their left edge falls in. Drag nodes left/right to move them between columns. Changes take effect on Save.
+    </div>
+    <div id="pe-col-list" class="pe-tg-body" style="min-height:60px"></div>
+    <div class="pe-modal-footer" style="display:flex;gap:8px;align-items:center">
+      <button onclick="_addColumn()" class="pe-btn pe-btn-primary">+ Add Column</button>
+      <button onclick="_applyPreset()" class="pe-btn pe-btn-secondary" title="Apply Software Dev default columns">Preset: SW Dev</button>
+      <button onclick="closeColumnsModal()" class="pe-btn pe-btn-secondary" style="margin-left:auto">Close</button>
+    </div>
+  </div>
+</div>
+
 <!-- ── Tool Groups modal ─────────────────────────────────────────────────── -->
 <div id="pe-tg-modal" class="pe-modal-overlay pe-hidden">
   <div class="pe-modal-box">
@@ -642,6 +663,6 @@
   </div>
 </div>
 
-<script src="/static/pipeline_editor.js?v=17"></script>
+<script src="/static/pipeline_editor.js?v=18"></script>
 </body>
 </html>

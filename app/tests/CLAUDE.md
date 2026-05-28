@@ -160,7 +160,7 @@ keeps a call counter.
 **Patch target:** Always patch on the **module where `call_llm` is called**, not where it is
 defined.
 - `"app.agent.research.call_llm"` — for research agent tests
-- `"app.agent.intake.call_llm"` — for intake pipeline tests
+- `"app.agent._intake_pipeline.call_llm"` — for intake pipeline tests
 - `"app.agent.file_summary_agent.execute_file_summary"` (or `app.agent.llm_client.call_llm`)
   — for file summary tests
 

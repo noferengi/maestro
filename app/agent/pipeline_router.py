@@ -57,8 +57,6 @@ _NO_AUTO_DISPATCH_BEHAVIOR_TYPES: frozenset[str] = frozenset({"human_gate", "arc
 # When dispatch_task resolves a definition with behavior_type in this map, it
 # calls _stage_handlers[mapped_key] so the full built-in pipeline runs.
 _BEHAVIOR_TYPE_TO_STAGE_HANDLER: dict[str, str] = {
-    "intake_pipeline":   "idea",
-    "planning_pipeline": "planning",
     "maestro_loop":      "indev",
     "conceptual_review": "conceptual_review",
     "optimization":      "optimization",

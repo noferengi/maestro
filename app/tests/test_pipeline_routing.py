@@ -439,7 +439,7 @@ class TestIntakePipelineMockLLM:
         AsyncMock instances returning the specified verdicts.  run_research
         and run_tiebreaker are also patched so no real I/O can escape.
         """
-        from app.agent.intake import IntakePipeline
+        from app.agent._intake_pipeline import IntakePipeline
 
         pipeline = IntakePipeline(
             task_id="test-intk-unit",

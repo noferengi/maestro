@@ -5,12 +5,11 @@ Generic pipeline node executors registered via register_agent_type_executor().
 
 Executor types:
   circuit_breaker        — configurable attempt counter; parks or fails when exhausted
-  voting_panel           — N-voter LLM panel with tally strategy
   reflection_agent       — skeptical post-stage reviewer; stores confidence report
   static_analysis_widget — deterministic tree-sitter analysis; no LLM; injects JSON into task.content
   parallel_agents        — fan-out N child tasks (read-only or dangerous_edit); supports
-                           dynamic agent lists derived from planning_result fields via
-                           dynamic_agents_from_key config option
+                           dynamic agent lists derived from planning_result fields
+  multiplier_node        — crash-survivable fan-out: N child tasks + collapser (vote_tally or judge_select)
 
 Each executor has a public runner function (_run_*) that is registered in
 scheduler.py at import time.  The function signature matches the agent-type
@@ -21,7 +20,7 @@ executor contract:
 
 A helper _CollectorAgent class (local to this module) runs an AgentLoop turn
 loop but suppresses advance_stage — it just returns the submit_work payload.
-This is used by voting_panel (voter agents) and the multiplier_node collapser (judge agent).
+This is used by the multiplier_node collapser (judge agent) and parallel subagents.
 """
 
 from __future__ import annotations
@@ -44,7 +43,7 @@ logger = logging.getLogger(__name__)
 class _CollectorAgent(AgentLoop):
     """
     Runs a turn loop and returns the submit_work payload without advancing stage.
-    Used as individual voters (voting_panel) and the multiplier_node collapser judge.
+    Used as individual voters/proposers in multiplier_node children and the collapser judge.
     """
 
     def __init__(
@@ -1078,247 +1077,6 @@ def _run_parallel_subagent_aggregator(
 
 
 # ---------------------------------------------------------------------------
-# optimization_node — parallel proposals + two-round judge vote
-# ---------------------------------------------------------------------------
-
-def _two_round_vote(
-    *,
-    proposals: list[dict],
-    judge_count: int,
-    judge_system_prompt: str,
-    judge_max_turns: int,
-    loop: asyncio.AbstractEventLoop,
-    task_id: str,
-    llm_id: int | None,
-    budget_id: int | None,
-    llm_base_url: str,
-    llm_model: str,
-    max_context: int | None,
-    stage_key: str,
-) -> tuple[int, float]:
-    """
-    Run N judge agents over proposals; majority wins.
-    Returns (winner_index, winner_score) or (-1, 0.0) for no consensus after revote.
-    """
-    _MAX_PROPOSAL_CHARS = 1500
-    majority = judge_count / 2
-
-    def _proposals_text(extra: str = "") -> str:
-        lines = []
-        for i, p in enumerate(proposals):
-            lines.append(f"=== Proposal {i} ===\n{str(p)[:_MAX_PROPOSAL_CHARS]}")
-        body = "\n\n".join(lines)
-        return body + (f"\n\n{extra}" if extra else "")
-
-    def _run_round(extra: str = "") -> dict[int, int]:
-        user_msg = (
-            f"{_proposals_text(extra)}\n\n"
-            "Pick the best proposal. Call submit_work with:\n"
-            "  signal='ACCEPTED'\n"
-            "  payload={'winner_index': N, 'rationale': '...'}"
-        )
-        judges = [
-            _CollectorAgent(
-                task_id=task_id,
-                system_prompt=judge_system_prompt,
-                tool_allowlist=[],
-                max_turns=judge_max_turns,
-                llm_id=llm_id,
-                budget_id=budget_id,
-                llm_base_url=llm_base_url,
-                llm_model=llm_model,
-                max_context=max_context,
-                user_message=user_msg,
-                agent_name=f"opt_judge:{stage_key}",
-            )
-            for _ in range(judge_count)
-        ]
-        payloads = loop.run_until_complete(
-            asyncio.gather(*[j.run() for j in judges], return_exceptions=False)
-        )
-        votes: dict[int, int] = {}
-        for p in payloads:
-            if not p:
-                continue
-            try:
-                idx = int(p.get("winner_index", 0))
-                votes[idx] = votes.get(idx, 0) + 1
-            except (TypeError, ValueError):
-                pass
-        return votes
-
-    r1 = _run_round()
-    best = max(r1, key=r1.get) if r1 else None
-    if best is not None and r1[best] > majority:
-        return best, r1[best] / judge_count
-
-    tally_str = ", ".join(f"Proposal {k}: {v} vote(s)" for k, v in sorted(r1.items()))
-    r2 = _run_round(f"Previous round had no majority. Votes: {tally_str}. Please reconsider.")
-    best2 = max(r2, key=r2.get) if r2 else None
-    if best2 is not None and r2[best2] > majority:
-        return best2, r2[best2] / judge_count
-
-    return -1, 0.0
-
-
-def _run_optimization_node(
-    task_id: str,
-    stage_config: "StageConfig",
-    llm_base_url: str,
-    llm_model: str,
-    max_context: int | None,
-    llm_id: int | None,
-    budget_id: int | None,
-    project_path: str | None,
-) -> None:
-    """
-    Parallel proposal agents + two-round judge selection.
-
-    Stage config shape:
-        proposal_personas    — list of {name, system_prompt}
-        proposer_tools       — tool allowlist for proposers
-        proposer_max_turns   — turns per proposer (default 20)
-        judge_count          — number of judges (default 3)
-        judge_max_turns      — turns per judge (default 10)
-        judge_system_prompt  — system prompt for judges
-        min_improvement_pct  — below this → skip path (default 10.0)
-        output_key           — task.content key for winning proposal
-    """
-    from app.database import (
-        create_agent_session, close_agent_session, get_task, update_task,
-    )
-
-    cfg = stage_config.config or {}
-    personas_cfg: list[dict] = cfg.get("proposal_personas") or []
-    proposer_tools: list[str] = list(cfg.get("proposer_tools") or [])
-    proposer_max_turns: int = int(cfg.get("proposer_max_turns", 20))
-    judge_count: int = int(cfg.get("judge_count", 3))
-    judge_max_turns: int = int(cfg.get("judge_max_turns", 10))
-    judge_system_prompt: str = cfg.get(
-        "judge_system_prompt",
-        "You are an optimization expert judging proposals. Pick the best one based on feasibility and estimated impact.",
-    )
-    min_improvement_pct: float = float(cfg.get("min_improvement_pct", 10.0))
-    output_key: str = cfg.get("output_key", "winning_optimization_proposal")
-
-    if not personas_cfg:
-        logger.warning("[optimization_node] task '%s': no proposal_personas configured — skip.", task_id)
-        advance_stage(task_id, "skip")
-        return
-
-    session_id = create_agent_session(
-        task_id=task_id,
-        agent_type=f"optimization_node:{stage_config.stage_key}",
-        llm_id=llm_id,
-        budget_id=budget_id,
-        scheduler_reason="scheduler",
-    )
-    exit_reason = "error"
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    try:
-        task = get_task(task_id)
-        task_title = task.title if task else "(unknown)"
-        task_desc = (task.description or "") if task else ""
-
-        user_msg = (
-            f"Task ID: {task_id}\nTitle: {task_title}\nDescription:\n{task_desc}\n\n"
-            "Analyze the codebase and propose a concrete optimization. "
-            "Call submit_work with:\n"
-            "  signal='ACCEPTED'\n"
-            "  payload={"
-            "'lens': '<your lens name>', "
-            "'proposals': [{'description': '...', 'estimated_improvement_pct': 0, "
-            "'risk': 'low|medium|high', 'implementation_steps': ['...']}]}"
-        )
-
-        proposers = [
-            _CollectorAgent(
-                task_id=task_id,
-                system_prompt=p.get("system_prompt", "You are an optimization expert. Propose one improvement."),
-                tool_allowlist=proposer_tools,
-                max_turns=proposer_max_turns,
-                llm_id=llm_id,
-                budget_id=budget_id,
-                llm_base_url=llm_base_url,
-                llm_model=llm_model,
-                max_context=max_context,
-                user_message=user_msg,
-                agent_name=f"opt_proposer_{p.get('name', i)}:{stage_config.stage_key}",
-            )
-            for i, p in enumerate(personas_cfg)
-        ]
-
-        payloads: list[dict | None] = loop.run_until_complete(
-            asyncio.gather(*[p.run() for p in proposers], return_exceptions=False)
-        )
-        proposals = [p for p in payloads if p]
-
-        if not proposals:
-            logger.info("[optimization_node] task '%s': no proposals — skip.", task_id)
-            advance_stage(task_id, "skip")
-            exit_reason = "skip"
-            return
-
-        winner_idx, winner_score = _two_round_vote(
-            proposals=proposals,
-            judge_count=judge_count,
-            judge_system_prompt=judge_system_prompt,
-            judge_max_turns=judge_max_turns,
-            loop=loop,
-            task_id=task_id,
-            llm_id=llm_id,
-            budget_id=budget_id,
-            llm_base_url=llm_base_url,
-            llm_model=llm_model,
-            max_context=max_context,
-            stage_key=stage_config.stage_key,
-        )
-
-        if winner_idx == -1:
-            logger.info("[optimization_node] task '%s': no consensus — fail.", task_id)
-            advance_stage(task_id, "fail")
-            exit_reason = "fail"
-            return
-
-        winning = proposals[winner_idx]
-
-        # Check min_improvement_pct from the winning proposal's proposals list
-        best_sub = (winning.get("proposals") or [{}])[0]
-        estimated_pct = float(best_sub.get("estimated_improvement_pct", 0))
-        if estimated_pct < min_improvement_pct:
-            logger.info(
-                "[optimization_node] task '%s': winning proposal improvement %.1f%% < %.1f%% min — skip.",
-                task_id, estimated_pct, min_improvement_pct,
-            )
-            advance_stage(task_id, "skip")
-            exit_reason = "skip"
-            return
-
-        task = get_task(task_id)
-        blob = dict((task.content or {}) if task else {})
-        blob[output_key] = winning
-        update_task(task_id, content=blob)
-
-        advance_stage(task_id, "pass")
-        exit_reason = "pass"
-
-    except Exception:
-        logger.exception("[optimization_node] task '%s' stage '%s' raised.", task_id, stage_config.stage_key)
-    finally:
-        close_agent_session(session_id, exit_reason, "")
-        try:
-            loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), timeout=5.0))
-        except Exception:
-            pass
-        try:
-            loop.close()
-        except Exception:
-            pass
-
-
-# ---------------------------------------------------------------------------
 # json_schema_gate — deterministic plan validation + retry routing
 # ---------------------------------------------------------------------------
 
@@ -1895,6 +1653,7 @@ def _run_planning_gate_node(
                     project_path=project_path,
                     task_description=task.description or "",
                     domain=domain,
+                    stage_cfg=stage_config.config or {},
                 )
             )
             if gate_result.get("passed"):
@@ -1962,7 +1721,7 @@ def _run_intake_scope_node(
 ) -> None:
     """intake_scope executor — LLM scope analysis (Stage 1 of 5)."""
     from app.database import create_agent_session, close_agent_session, get_task
-    from app.agent.intake import run_intake_scope_stage
+    from app.agent._intake_pipeline import run_intake_scope_stage
 
     task = get_task(task_id)
     if not task or not task.description:
@@ -2012,7 +1771,7 @@ def _run_intake_static_node(
 ) -> None:
     """intake_static executor — deterministic static analysis (Stage 2 of 5)."""
     from app.database import create_agent_session, close_agent_session, get_task
-    from app.agent.intake import run_intake_static_stage
+    from app.agent._intake_pipeline import run_intake_static_stage
 
     task = get_task(task_id)
     if not task or not task.description:
@@ -2060,7 +1819,7 @@ def _run_intake_conflict_node(
 ) -> None:
     """intake_conflict executor — LLM conflict detection (Stage 3 of 5)."""
     from app.database import create_agent_session, close_agent_session, get_task, get_all_tasks
-    from app.agent.intake import run_intake_conflict_stage
+    from app.agent._intake_pipeline import run_intake_conflict_stage
 
     task = get_task(task_id)
     if not task or not task.description:
@@ -2092,6 +1851,7 @@ def _run_intake_conflict_node(
                 llm_id=llm_id,
                 budget_id=budget_id,
                 project=task.project or None,
+                stage_cfg=stage_config.config or {},
             )
         )
         _intake_write_vote(task_id, "conflict", vote)
@@ -2117,7 +1877,7 @@ def _run_intake_feasibility_node(
 ) -> None:
     """intake_feasibility executor — LLM feasibility analysis (Stage 4 of 5)."""
     from app.database import create_agent_session, close_agent_session, get_task
-    from app.agent.intake import run_intake_feasibility_stage
+    from app.agent._intake_pipeline import run_intake_feasibility_stage
 
     task = get_task(task_id)
     if not task or not task.description:
@@ -2145,6 +1905,7 @@ def _run_intake_feasibility_node(
                 llm_id=llm_id,
                 budget_id=budget_id,
                 project=task.project or None,
+                stage_cfg=stage_config.config or {},
             )
         )
         _intake_write_vote(task_id, "feasibility", vote)
@@ -2174,7 +1935,7 @@ def _run_intake_gate_node(
         create_transition_vote, create_transition_result,
         get_transition_results as _gtr,
     )
-    from app.agent.intake import run_intake_gate
+    from app.agent._intake_pipeline import run_intake_gate
     from app.agent.pipeline_router import advance_stage
 
     task = get_task(task_id)
@@ -2325,6 +2086,7 @@ def _run_multiplier_node(
     on_tie: str = cfg.get("on_tie", "reject")
     judge_system_prompt: str = cfg.get("judge_system_prompt", "Compare the proposals and select the best one.")
     judge_max_turns: int = int(cfg.get("judge_max_turns", 10))
+    min_improvement_pct: float = float(cfg.get("min_improvement_pct", 0.0))
 
     parent = get_task(task_id)
     if not parent:
@@ -2394,6 +2156,7 @@ def _run_multiplier_node(
             "on_tie": on_tie,
             "judge_system_prompt": judge_system_prompt,
             "judge_max_turns": judge_max_turns,
+            "min_improvement_pct": min_improvement_pct,
             "output_key": output_key,
         }},
     )
@@ -2564,6 +2327,7 @@ def _run_fan_out_collapser(
     judge_system_prompt: str = cfg.get("judge_system_prompt", "Compare the proposals and select the best one.")
     judge_max_turns: int = int(cfg.get("judge_max_turns", 10))
     output_key: str = cfg.get("output_key", "fan_out_result")
+    min_improvement_pct: float = float(cfg.get("min_improvement_pct", 0.0))
 
     if not parent_task_id:
         logger.error("[fan_out_collapser] task '%s': no parent_task_id in _collapser_cfg.", task_id)
@@ -2641,6 +2405,20 @@ def _run_fan_out_collapser(
             if judgment:
                 blob[f"{output_key}_rationale"] = judgment.get("rationale", "")
             update_task(parent_task_id, content=blob)
+
+            if min_improvement_pct > 0.0:
+                best_sub = (winning.get("proposals") or [{}])[0]
+                estimated_pct = float(best_sub.get("estimated_improvement_pct", 0))
+                if estimated_pct < min_improvement_pct:
+                    logger.info(
+                        "[fan_out_collapser] task '%s': winning proposal %.1f%% < %.1f%% min — skip.",
+                        task_id, estimated_pct, min_improvement_pct,
+                    )
+                    advance_stage(parent_task_id, "skip", from_stage=parent_stage_key)
+                    exit_reason = "skip"
+                    update_task(task_id, type="completed", stage_key="completed")
+                    return
+
             advance_stage(parent_task_id, "pass", from_stage=parent_stage_key)
             exit_reason = "pass"
 

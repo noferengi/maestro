@@ -24,81 +24,125 @@ class AgentSpec:
     description: str
     default_tools: list[str] = field(default_factory=list)
     gate_type: str = "llm_judge"  # llm_judge | single_pass | test_suite | human | voting | none
+    executor_type: str = "infrastructure"  # infrastructure | custom_python | user_defined
 
 
 AGENT_REGISTRY: dict[str, AgentSpec] = {
-    "intake_agent": AgentSpec(
-        cls=None,
-        display_name="Intake",
-        description="4-stage intake voting pipeline (scope, static, feasibility, conflict)",
-        gate_type="voting",
-    ),
+    # -------------------------------------------------------------------------
+    # Intake sub-stages (custom_python — executors in stage_executors.py)
+    # -------------------------------------------------------------------------
     "intake_scope": AgentSpec(
         cls=None,
         display_name="Intake: Scope",
         description="Intake stage 1 — LLM scope analysis (size, complexity, decomposition).",
         gate_type="single_pass",
+        executor_type="custom_python",
     ),
     "intake_static": AgentSpec(
         cls=None,
         display_name="Intake: Static",
         description="Intake stage 2 — deterministic tree-sitter code structure analysis.",
         gate_type="none",
+        executor_type="custom_python",
     ),
     "intake_conflict": AgentSpec(
         cls=None,
         display_name="Intake: Conflict",
         description="Intake stage 3 — LLM conflict detection against existing project tasks.",
         gate_type="voting",
+        executor_type="custom_python",
     ),
     "intake_feasibility": AgentSpec(
         cls=None,
         display_name="Intake: Feasibility",
         description="Intake stage 4 — LLM feasibility analysis informed by static output.",
         gate_type="single_pass",
+        executor_type="custom_python",
     ),
     "intake_gate": AgentSpec(
         cls=None,
         display_name="Intake: Gate",
         description="Intake stage 5 — tally all votes; passes, rejects, or triggers subdivide/research.",
         gate_type="voting",
+        executor_type="custom_python",
     ),
-    "planning_agent": AgentSpec(
+    # -------------------------------------------------------------------------
+    "planning_survey_node": AgentSpec(
         cls=None,
-        display_name="Planning",
-        description="Design + planning pipeline with LLM gate and correction agent",
-        gate_type="llm_judge",
+        display_name="Planning: Survey",
+        description="Agentic codebase survey + task classification (is_proof, is_simple, best_of_n). Wraps planning_utils.run_planning_survey.",
+        gate_type="single_pass",
+        executor_type="custom_python",
     ),
+    "pitfall_node": AgentSpec(
+        cls=None,
+        display_name="Planning: Pitfalls",
+        description="Deterministic dependency/cycle checks + LLM edge-case detection. Wraps planning_utils.run_pitfall_detection.",
+        gate_type="single_pass",
+        executor_type="custom_python",
+    ),
+    "consolidation_node": AgentSpec(
+        cls=None,
+        display_name="Planning: Consolidate",
+        description="Merges winning design + pitfalls into final PlanningResult. Wraps planning_utils.run_consolidation_and_store.",
+        gate_type="single_pass",
+        executor_type="custom_python",
+    ),
+    "planning_gate_node": AgentSpec(
+        cls=None,
+        display_name="Planning: Gate",
+        description="10-check gate: namespace conflicts, interface completeness, cycles, feasibility recheck, context budget. Wraps planning_gate.run_planning_gate.",
+        gate_type="llm_judge",
+        executor_type="custom_python",
+    ),
+    "planning_correction_stage": AgentSpec(
+        cls=None,
+        display_name="Planning: Correction",
+        description="Surgical JSON repair of a failing plan. Wraps planning_correction.PlanningCorrectionAgent.",
+        gate_type="llm_judge",
+        executor_type="custom_python",
+    ),
+    # -------------------------------------------------------------------------
+    # Legacy SW Dev stage agents (custom_python — bespoke per-stage Python)
+    # -------------------------------------------------------------------------
     "implementation_agent": AgentSpec(
         cls=None,
         display_name="Dev Orchestrator",
         description="Parallel implementation orchestrator with test-suite gate",
         gate_type="test_suite",
+        executor_type="custom_python",
     ),
     "review_agent": AgentSpec(
         cls=None,
         display_name="Conceptual Review",
         description="Multi-agent code quality review",
         gate_type="voting",
+        executor_type="custom_python",
     ),
     "optimization_agent": AgentSpec(
         cls=None,
         display_name="Optimization",
         description="Performance and code quality optimization pipeline",
         gate_type="single_pass",
+        executor_type="custom_python",
     ),
     "security_agent": AgentSpec(
         cls=None,
         display_name="Security Review",
         description="Security vulnerability and compliance pipeline",
         gate_type="voting",
+        executor_type="custom_python",
     ),
     "final_review_agent": AgentSpec(
         cls=None,
         display_name="Final Review",
         description="Multi-stage final quality gate with virtual merge check",
         gate_type="voting",
+        executor_type="custom_python",
     ),
+    # -------------------------------------------------------------------------
+    # Infrastructure nodes (executor_type="infrastructure" — default)
+    # -------------------------------------------------------------------------
     "human_gate": AgentSpec(
         cls=None,
         display_name="Human Review",
@@ -126,7 +170,7 @@ AGENT_REGISTRY: dict[str, AgentSpec] = {
     "factory_node": AgentSpec(
         cls=None,
         display_name="Card Factory",
-        description="Sub-card subdivision factory (Phase 9)",
+        description="Sub-card subdivision factory",
         gate_type="single_pass",
     ),
     "generic_stage": AgentSpec(
@@ -155,6 +199,12 @@ AGENT_REGISTRY: dict[str, AgentSpec] = {
         cls=None,
         display_name="Static Analysis",
         description="Runs tree-sitter static analysis on the project and injects structured JSON into task.content. No LLM call.",
+        gate_type="none",
+    ),
+    "json_schema_gate": AgentSpec(
+        cls=None,
+        display_name="JSON Schema Gate",
+        description="Validates task.content or planning_result fields against a configurable schema; routes to correction on failure.",
         gate_type="none",
     ),
     "dangerous_edit_llm_agent": AgentSpec(

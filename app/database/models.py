@@ -31,6 +31,7 @@ class PipelineTemplate(Base):
     is_default = Column(Boolean, nullable=False, default=False)
     is_builtin = Column(Boolean, nullable=False, default=False)
     version = Column(Integer, nullable=False, default=1)
+    config = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
