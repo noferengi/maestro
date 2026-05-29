@@ -39,7 +39,22 @@
     <button id="btn-tool-groups" class="pe-btn pe-btn-secondary" title="Manage tool groupings for parallel agents">⚙ Tool Groups</button>
     <button id="btn-tidy" class="pe-btn pe-btn-secondary" title="Topological auto-layout">Tidy Layout</button>
     <button id="btn-simulate" class="pe-btn pe-btn-secondary" title="Step a ghost token through the pipeline">Simulate</button>
+    <button id="btn-tags" class="pe-btn pe-btn-secondary" title="Edit template tags" onclick="openTagsModal()">🏷 Tags</button>
     <button id="btn-save" class="pe-btn pe-btn-primary">Save</button>
+  </div>
+</div>
+
+<!-- ── Tags modal ── -->
+<div id="pe-tags-modal" style="display:none;position:fixed;inset:0;background:#00000099;z-index:999;align-items:center;justify-content:center">
+  <div style="background:#1e293b;border:1px solid #334155;border-radius:12px;padding:24px;width:400px;max-width:95vw;box-shadow:0 16px 48px #00000088">
+    <h3 style="font-size:15px;font-weight:600;margin-bottom:12px;color:#f1f5f9">Template Tags</h3>
+    <p style="font-size:12px;color:#64748b;margin-bottom:10px">Comma-separated list of tags (e.g. Scientific, Multi-Agent, Research)</p>
+    <input id="pe-tags-input" type="text" placeholder="Tag1, Tag2, Tag3"
+      style="width:100%;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:13px;padding:8px 12px;outline:none;margin-bottom:16px">
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="pe-btn pe-btn-secondary" onclick="closeTagsModal()">Cancel</button>
+      <button class="pe-btn pe-btn-primary" onclick="saveTemplateTags()">Save Tags</button>
+    </div>
   </div>
 </div>
 

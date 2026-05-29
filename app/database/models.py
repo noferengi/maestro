@@ -32,6 +32,7 @@ class PipelineTemplate(Base):
     is_builtin = Column(Boolean, nullable=False, default=False)
     version = Column(Integer, nullable=False, default=1)
     config = Column(JSON, nullable=True)
+    tags = Column(JSON, nullable=False, server_default='[]')
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -1020,13 +1021,36 @@ class MaestroGoal(Base):
     parent_id    = Column(Integer, ForeignKey("maestro_goals.id"), nullable=True)
     priority     = Column(Integer, nullable=False, default=1)
     color        = Column(String, nullable=True)      # hex for card badge
-    created_by   = Column(String, nullable=False, default="human")  # human|maestro
-    arch_card_id = Column(String, ForeignKey("tasks.id"), nullable=True)
-    created_at   = Column(DateTime, default=datetime.utcnow)
-    updated_at   = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_by      = Column(String, nullable=False, default="human")  # human|maestro
+    arch_card_id    = Column(String, ForeignKey("tasks.id"), nullable=True)
+    max_iterations  = Column(Integer, nullable=False, default=10)   # -1 = infinite
+    iteration_count = Column(Integer, nullable=False, default=0)
+    achieved_at     = Column(DateTime, nullable=True)
+    created_at      = Column(DateTime, default=datetime.utcnow)
+    updated_at      = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     def __repr__(self):
         return f"<MaestroGoal(id={self.id}, title={self.title!r}, status={self.status!r})>"
+
+
+class GoalExpertVote(Base):
+    """One judge's vote in a goal expert-panel evaluation round."""
+    __tablename__ = "goal_expert_votes"
+
+    id                  = Column(Integer, primary_key=True, autoincrement=True)
+    goal_id             = Column(Integer, ForeignKey("maestro_goals.id"), nullable=False, index=True)
+    iteration           = Column(Integer, nullable=False)
+    judge_index         = Column(Integer, nullable=False)
+    judge_persona       = Column(String, nullable=False)
+    verdict             = Column(String, nullable=False)   # 'YES' | 'NO'
+    justification       = Column(String, nullable=False)
+    model               = Column(String, nullable=True)
+    prompt_tokens       = Column(Integer, default=0)
+    completion_tokens   = Column(Integer, default=0)
+    created_at          = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<GoalExpertVote(id={self.id}, goal_id={self.goal_id}, iteration={self.iteration}, verdict={self.verdict!r})>"
 
 
 class GoalVerificationJob(Base):

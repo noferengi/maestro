@@ -4182,6 +4182,7 @@ def _template_meta_to_dict(t, task_count: int = 0) -> dict:
     return {
         "id": t.id, "name": t.name, "description": t.description,
         "is_default": t.is_default, "is_builtin": t.is_builtin, "version": t.version,
+        "tags": t.tags or [] if hasattr(t, "tags") else [],
         "task_count": task_count,
         "created_at": t.created_at.isoformat() if t.created_at else None,
         "updated_at": t.updated_at.isoformat() if t.updated_at else None,
@@ -4496,6 +4497,7 @@ def create_pipeline_template(data: dict = Body(...)):
         name=name,
         description=data.get("description"),
         is_default=bool(data.get("is_default", False)),
+        tags=data.get("tags") or [],
     )
     if not t:
         raise HTTPException(status_code=409, detail=f"A template named '{name}' already exists")
@@ -4561,6 +4563,7 @@ def update_pipeline_template(template_id: int, data: dict = Body(...)):
         is_default=data.get("is_default"),
         version_bump=bool(data.get("version_bump", False)),
         config=data.get("config"),
+        tags=data["tags"] if "tags" in data else ...,
     )
     if not t:
         raise HTTPException(status_code=404, detail="Template not found")
@@ -6364,6 +6367,7 @@ class GoalCreate(BaseModel):
     priority: int = 1
     color: Optional[str] = None
     created_by: str = "human"
+    max_iterations: int = 10
 
 
 class GoalUpdate(BaseModel):
@@ -6373,6 +6377,8 @@ class GoalUpdate(BaseModel):
     status: Optional[str] = None
     priority: Optional[int] = None
     color: Optional[str] = None
+    max_iterations: Optional[int] = None
+    progress: Optional[float] = None
 
 
 @app.post("/api/projects/{project_name}/goals", response_model=dict)
@@ -6386,6 +6392,7 @@ def create_project_goal(project_name: str, data: GoalCreate):
 
     goal = create_goal(
         project_id=project.id,
+        max_iterations=data.max_iterations,
         title=data.title,
         statement=data.statement,
         criteria=data.criteria,
@@ -6523,6 +6530,70 @@ def list_goal_verification_jobs(project_name: str, goal_id: int):
     ]
 
 
+@app.get("/api/goals", response_model=List[dict])
+def list_all_goals(status: Optional[str] = None):
+    """List all goals across projects, optionally filtered by status."""
+    from app.database import list_goals, goal_to_dict
+    goals = list_goals(status=status)
+    return [goal_to_dict(g) for g in goals]
+
+
+@app.get("/api/goals/{goal_id}/votes", response_model=dict)
+def get_goal_expert_votes(goal_id: int):
+    """Return all expert votes for a goal, grouped by iteration."""
+    from app.database import get_goal, get_all_expert_votes_for_goal
+    goal = get_goal(goal_id)
+    if not goal:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    votes = get_all_expert_votes_for_goal(goal_id)
+    by_iteration: dict = {}
+    for v in votes:
+        key = str(v.iteration)
+        if key not in by_iteration:
+            by_iteration[key] = []
+        by_iteration[key].append({
+            "judge_index": v.judge_index,
+            "persona": v.judge_persona,
+            "verdict": v.verdict,
+            "justification": v.justification,
+            "model": v.model,
+            "created_at": v.created_at.isoformat() if v.created_at else None,
+        })
+    return {"goal_id": goal_id, "iterations": by_iteration}
+
+
+@app.post("/api/goals/{goal_id}/trigger-evaluation", response_model=dict)
+def trigger_goal_evaluation(goal_id: int):
+    """Manually trigger one iteration of the goal evaluation loop (expert panel + planning)."""
+    from app.database import get_goal, get_project
+    goal = get_goal(goal_id)
+    if not goal:
+        raise HTTPException(status_code=404, detail="Goal not found")
+
+    project = get_project(goal.project_id)
+    llm_id = project.llm_id if project else None
+    budget_id = project.budget_id if project else None
+
+    if not llm_id:
+        raise HTTPException(status_code=422, detail="Project must have an LLM configured")
+
+    import threading
+    import asyncio as _asyncio
+
+    def _run():
+        from app.agent.goal_loop import run_goal_iteration
+        loop = _asyncio.new_event_loop()
+        _asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(run_goal_iteration(goal_id, llm_id, budget_id or 1))
+        finally:
+            loop.close()
+
+    thread = threading.Thread(target=_run, daemon=True, name=f"goal-eval-manual-{goal_id}")
+    thread.start()
+    return {"status": "dispatched", "goal_id": goal_id}
+
+
 class ResumeRequest(BaseModel):
     hint: str
 
@@ -6615,13 +6686,33 @@ def update_maestro_config(data: dict = Body(...)):
 # Autopilot API  (Phase 7)
 # ===========================================================================
 
+@app.get("/api/settings/pipeline-guide", response_model=dict)
+def get_pipeline_guide():
+    """Return the Maestro Pipeline Knowledge Guide (used by the Global Orchestrator)."""
+    from app.agent.system_prompt import DEFAULT_PIPELINE_GUIDE
+    content = get_system_setting("maestro_pipeline_guide") or DEFAULT_PIPELINE_GUIDE
+    return {"content": content}
+
+
+@app.put("/api/settings/pipeline-guide", response_model=dict)
+def update_pipeline_guide(data: dict = Body(...)):
+    """Update the Maestro Pipeline Knowledge Guide."""
+    content = data.get("content")
+    if content is None:
+        raise HTTPException(status_code=400, detail="'content' field is required")
+    set_system_setting("maestro_pipeline_guide", content, "Maestro Pipeline Knowledge Guide")
+    return {"status": "updated"}
+
+
 @app.get("/api/settings/autopilot", response_model=dict)
 def get_autopilot_settings():
     """Return the current autopilot state and scheduled hours."""
     return {
-        "autopilot":   get_system_setting("maestro_autopilot", "off"),
-        "start_hour":  int(get_system_setting("autopilot_start_hour", 0) or 0),
-        "stop_hour":   int(get_system_setting("autopilot_stop_hour",  24) or 24),
+        "autopilot":             get_system_setting("maestro_autopilot", "off"),
+        "start_hour":            int(get_system_setting("autopilot_start_hour", 0) or 0),
+        "stop_hour":             int(get_system_setting("autopilot_stop_hour",  24) or 24),
+        "consult_takeover":      get_system_setting("autopilot_consult_takeover", "off"),
+        "maestro_can_merge":     get_system_setting("autopilot_maestro_can_merge", "off"),
     }
 
 
@@ -6631,11 +6722,13 @@ def set_autopilot_settings(data: dict = Body(...)):
     Toggle autopilot on/off and (optionally) start a mission.
 
     Body fields:
-      autopilot      — 'on' | 'off'
-      start_hour     — int 0-23  (optional; persists if save_schedule=true)
-      stop_hour      — int 0-24  (optional; persists if save_schedule=true)
-      save_schedule  — bool; if true, write start/stop hours to system_settings
-      mission        — {time_limit_seconds, token_budget, card_count_target, goal_card_id}
+      autopilot           — 'on' | 'off'
+      start_hour          — int 0-23  (optional; persists if save_schedule=true)
+      stop_hour           — int 0-24  (optional; persists if save_schedule=true)
+      save_schedule       — bool; if true, write start/stop hours to system_settings
+      consult_takeover    — 'on' | 'off' — autopilot answers NEEDS_HUMAN via ConsultAgent
+      maestro_can_merge   — 'on' | 'off' — Maestro may merge & accept completed cards
+      mission             — {time_limit_seconds, token_budget, card_count_target, goal_card_id}
     """
     from app.agent.scheduler import set_mission, MissionConfig
 
@@ -6650,6 +6743,18 @@ def set_autopilot_settings(data: dict = Body(...)):
         if "stop_hour" in data:
             set_system_setting("autopilot_stop_hour",  int(data["stop_hour"]),
                                "Hour (0-24) when autopilot schedule deactivates; 24 = always")
+
+    if "consult_takeover" in data:
+        val = data["consult_takeover"]
+        if val in ("on", "off"):
+            set_system_setting("autopilot_consult_takeover", val,
+                               "Autopilot answers NEEDS_HUMAN via ConsultAgent: on|off")
+
+    if "maestro_can_merge" in data:
+        val = data["maestro_can_merge"]
+        if val in ("on", "off"):
+            set_system_setting("autopilot_maestro_can_merge", val,
+                               "Autopilot may merge & accept completed cards: on|off")
 
     if autopilot == "on":
         m = data.get("mission") or {}
@@ -6681,9 +6786,11 @@ def set_autopilot_settings(data: dict = Body(...)):
         logger.info("[Autopilot] Disengaged — stop signals sent to %d session(s).", stopped)
 
     return {
-        "autopilot":  get_system_setting("maestro_autopilot", "off"),
-        "start_hour": int(get_system_setting("autopilot_start_hour", 0) or 0),
-        "stop_hour":  int(get_system_setting("autopilot_stop_hour",  24) or 24),
+        "autopilot":         get_system_setting("maestro_autopilot", "off"),
+        "start_hour":        int(get_system_setting("autopilot_start_hour", 0) or 0),
+        "stop_hour":         int(get_system_setting("autopilot_stop_hour",  24) or 24),
+        "consult_takeover":  get_system_setting("autopilot_consult_takeover", "off"),
+        "maestro_can_merge": get_system_setting("autopilot_maestro_can_merge", "off"),
         "status": "updated",
     }
 

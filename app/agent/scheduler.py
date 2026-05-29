@@ -1719,6 +1719,8 @@ def _tick() -> None:
     if _free_slots(allowed_llm_id) > 0:
         allowed_llm_id = _dispatch_pip_resolution_jobs(allowed_llm_id, *_cap_args)
     if _free_slots(allowed_llm_id) > 0:
+        allowed_llm_id = _dispatch_consult_maestro_jobs(allowed_llm_id, *_cap_args)
+    if _free_slots(allowed_llm_id) > 0:
         allowed_llm_id = _dispatch_goal_verification_jobs(allowed_llm_id, *_cap_args)
     if _free_slots(allowed_llm_id) > 0:
         allowed_llm_id = _dispatch_research_jobs(allowed_llm_id, *_cap_args)
@@ -1776,6 +1778,92 @@ def _tick() -> None:
                 ).start()
         except Exception as _export_exc:
             logger.debug("[Scheduler] training export error: %s", _export_exc)
+
+    _check_goal_completion()
+
+
+# Track which goal IDs currently have an evaluation running so we don't double-fire.
+_active_goal_evals: set[int] = set()
+_active_goal_evals_lock = threading.Lock()
+
+
+def _check_goal_completion() -> None:
+    """After each tick: for each active goal, if all linked tasks are done, trigger evaluation."""
+    try:
+        from app.database import list_goals, get_active_goal_tasks, get_llm, get_project_by_id
+        active_goals = list_goals(status="active")
+        for goal in active_goals:
+            try:
+                with _active_goal_evals_lock:
+                    if goal.id in _active_goal_evals:
+                        continue  # evaluation already running
+                active_tasks = get_active_goal_tasks(goal.id)
+                if active_tasks:
+                    continue  # still work in progress
+                project = get_project_by_id(goal.project_id)
+                if not project or not project.llm_id:
+                    continue
+                llm = get_llm(project.llm_id)
+                if not llm:
+                    continue
+                # Simple capacity check
+                cap = getattr(llm, "parallel_sessions", 1) or 1
+                with _llm_counts_lock:
+                    active_count = _llm_session_counts.get(llm.id, 0)
+                if active_count >= cap:
+                    continue
+                with _llm_counts_lock:
+                    _llm_session_counts[llm.id] += 1
+                with _active_goal_evals_lock:
+                    _active_goal_evals.add(goal.id)
+                _dispatch_goal_evaluation(goal, project, llm)
+            except Exception as exc:
+                logger.debug("[Scheduler] goal completion check error for goal %d: %s", goal.id, exc)
+    except Exception as exc:
+        logger.debug("[Scheduler] _check_goal_completion error: %s", exc)
+
+
+def _dispatch_goal_evaluation(goal: Any, project: Any, llm: Any) -> None:
+    """Fire a goal iteration in a daemon thread."""
+    goal_id = goal.id
+    llm_id = llm.id
+    budget_id = getattr(project, "budget_id", None) or 1
+
+    session_key = f"goal-eval-{goal_id}"
+
+    async def _run() -> None:
+        from app.agent.goal_loop import run_goal_iteration
+        await run_goal_iteration(goal_id, llm_id, budget_id)
+
+    def _target() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(_run())
+        except Exception as exc:
+            logger.error("[Scheduler] goal evaluation error for goal %d: %s", goal_id, exc)
+        finally:
+            with _llm_counts_lock:
+                _llm_session_counts[llm_id] = max(0, _llm_session_counts.get(llm_id, 1) - 1)
+            with _active_goal_evals_lock:
+                _active_goal_evals.discard(goal_id)
+            with _active_sessions_lock:
+                _active_sessions.pop(session_key, None)
+                _session_llm_ids.pop(session_key, None)
+                _session_titles.pop(session_key, None)
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            loop.close()
+
+    thread = threading.Thread(target=_target, daemon=True, name=f"maestro-goal-eval-{goal_id}")
+    with _active_sessions_lock:
+        _active_sessions[session_key] = thread
+        _session_llm_ids[session_key] = llm_id
+        _session_titles[session_key] = f"Goal Eval: goal {goal_id}"
+    thread.start()
+    logger.info("[Scheduler] Dispatched goal evaluation for goal %d", goal_id)
 
 
 def _dispatch_heartbeat_maestro(
@@ -4029,6 +4117,174 @@ def _run_pip_resolution_agent(job: Any, task: Any, llm: Any) -> None:
             pass
 
 
+def _dispatch_consult_maestro_jobs(
+    allowed_llm_id: "int | None",
+    node_active_counts: "dict[int, int]",
+    node_session_counts: "dict[int, int]",
+    node_obj_cache: "dict[int, Any]",
+    llm_node_cache: "dict[int, int | None]",
+) -> "int | None":
+    """Dispatch ConsultAgent for tasks parked with NEEDS_HUMAN when autopilot takeover is on.
+
+    Finds tasks whose consultation_payload has a question but no hint (parked), where no
+    consult session is already running, and the 'autopilot_consult_takeover' setting is on.
+    Reserves a Maestro LLM slot and runs ConsultAgent in its own thread.  On completion the
+    thread writes the answer back as the hint, unblocking the scheduler guard at ~line 1497.
+    """
+    from app.database import (
+        get_system_setting as _gs, get_tasks_with_pending_consultation,
+        get_llm, get_task, get_project as _get_proj,
+    )
+
+    if _gs("autopilot_consult_takeover", "off") != "on":
+        return allowed_llm_id
+
+    tasks = get_tasks_with_pending_consultation(limit=10)
+    for task in tasks:
+        task_id = str(task.id)
+        consult_key = f"consult-maestro-{task_id}"
+
+        with _active_sessions_lock:
+            if consult_key in _active_sessions and _active_sessions[consult_key].is_alive():
+                continue
+
+        # Resolve maestro LLM for this task's project
+        project_maestro_llm_id = None
+        if task.project:
+            try:
+                proj = _get_proj(task.project)
+                if proj:
+                    project_maestro_llm_id = getattr(proj, "maestro_llm_id", None)
+            except Exception:
+                pass
+
+        from app.agent.consult_agent import _resolve_maestro_llm
+        maestro_llm_id = _resolve_maestro_llm(project_maestro_llm_id)
+        if maestro_llm_id is None:
+            maestro_llm_id = task.llm_id
+
+        if maestro_llm_id is None:
+            continue
+
+        maestro_llm = get_llm(maestro_llm_id)
+        if not maestro_llm:
+            continue
+
+        if allowed_llm_id is not None and maestro_llm.id != allowed_llm_id:
+            continue
+        if allowed_llm_id is None:
+            allowed_llm_id = maestro_llm.id
+
+        if not _check_and_reserve_slot(
+            maestro_llm, node_active_counts, node_session_counts,
+            node_obj_cache, llm_node_cache, label=consult_key,
+        ):
+            continue
+
+        thread = threading.Thread(
+            target=_run_consult_maestro_job,
+            args=(task_id, task.project, task.llm_id, task.budget_id, maestro_llm_id, consult_key),
+            daemon=True,
+            name=f"maestro-consult-{task_id}",
+        )
+        with _active_sessions_lock:
+            _active_sessions[consult_key] = thread
+            _session_llm_ids[consult_key] = maestro_llm.id
+            _session_titles[consult_key] = f"ConsultAgent: task {task_id}"
+        thread.start()
+        logger.info("[consult_maestro] Dispatched ConsultAgent for task '%s'.", task_id)
+
+    return allowed_llm_id
+
+
+def _run_consult_maestro_job(
+    task_id: str,
+    project_name: "str | None",
+    caller_llm_id: "int | None",
+    budget_id: "int | None",
+    maestro_llm_id: "int | None",
+    session_key: str,
+) -> None:
+    """Thread target: run ConsultAgent for a NEEDS_HUMAN-parked task, then inject the answer."""
+    import json as _json
+    import asyncio as _asyncio
+    from app.database import (
+        update_task as _update_task, create_agent_session, close_agent_session,
+        create_inbox_message as _create_inbox, get_task as _get_task,
+    )
+    from app.agent.consult_agent import run_consult_agent
+
+    session_id = create_agent_session(
+        task_id=task_id,
+        agent_type="consult_maestro",
+        llm_id=maestro_llm_id,
+        budget_id=budget_id,
+        scheduler_reason="consult_maestro_autopilot",
+    )
+
+    try:
+        task = _get_task(task_id)
+        if not task or not task.consultation_payload:
+            return
+
+        try:
+            cp = _json.loads(task.consultation_payload)
+        except Exception:
+            return
+
+        question = cp.get("question")
+        if not question or cp.get("hint"):
+            return  # already answered or no question
+
+        loop = _asyncio.new_event_loop()
+        _asyncio.set_event_loop(loop)
+        try:
+            answer = loop.run_until_complete(run_consult_agent(
+                question=question,
+                task_id=task_id,
+                caller_llm_id=caller_llm_id,
+                budget_id=budget_id,
+                project_name=project_name,
+                project_maestro_llm_id=maestro_llm_id,
+            ))
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            try:
+                loop.close()
+            except Exception:
+                pass
+
+        # Inject answer as hint — unblocks the scheduler guard
+        _update_task(task_id, consultation_payload=_json.dumps({
+            "question": question, "hint": answer, "source": "maestro",
+        }))
+
+        # Audit inbox entry with Q+A
+        task = _get_task(task_id)
+        _create_inbox(
+            subject=f"Maestro answered: {(task.title if task else task_id)[:60]}",
+            source_type="needs_human",
+            task_id=task_id,
+            project_id=task.project if task else None,
+            task_title=task.title if task else None,
+            outcome="maestro_consulted",
+            data_json=_json.dumps({"question": question, "answer": answer}),
+        )
+        logger.info("[consult_maestro] Task '%s' answered by Maestro (autopilot).", task_id)
+
+    except Exception as exc:
+        logger.exception("[consult_maestro] ConsultAgent failed for task '%s': %s", task_id, exc)
+    finally:
+        close_agent_session(session_id)
+        with _active_sessions_lock:
+            _active_sessions.pop(session_key, None)
+            _session_llm_ids.pop(session_key, None)
+            _session_titles.pop(session_key, None)
+
+
 def _dispatch_stranded_subdivisions(
     allowed_llm_id: "int | None",
     node_active_counts: "dict[int, int]",
@@ -4455,12 +4711,20 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
                 logger.info("Task '%s' reached terminal ACCEPTED state (no pass edge from '%s').", task_id, current_type)
 
         elif result.status == "NEEDS_HUMAN":
-            _exit_reason = "needs_human"
+            _exit_reason = "consulting"  # treat as a consultation pause, not a hard advance
             _exit_summary = result.final_message or "Agent escalated for human review."
-            from app.database import create_inbox_message as _create_inbox
+            question = result.consultation_question or _exit_summary
+
+            import json as _json
+            from app.database import update_task as _update_task, create_inbox_message as _create_inbox
             task_obj = get_task(task_id)
-            _nh_stage = (task_obj.type or "indev").lower() if task_obj else "indev"
-            advance_stage(task_id, "pass", from_stage=_nh_stage)
+
+            # Park the task — scheduler guard at ~line 1497 blocks re-dispatch until hint is set
+            _update_task(task_id, consultation_payload=_json.dumps({
+                "question": question, "hint": None, "source": None,
+            }))
+
+            # Inbox entry so the event is always visible
             _create_inbox(
                 subject=f"Human review needed: {(task_obj.title if task_obj else task_id)[:60]}",
                 source_type="needs_human",
@@ -4468,9 +4732,11 @@ def _run_maestro_loop(task_id: str, llm_base_url: str, llm_model: str,
                 project_id=task_obj.project if task_obj else None,
                 task_title=task_obj.title if task_obj else None,
                 outcome="needs_human",
-                data_json=__import__("json").dumps({"summary": _exit_summary}),
+                data_json=_json.dumps({"question": question, "summary": _exit_summary}),
             )
-            logger.info("Task '%s' escalated to HUMAN REVIEW by agent: %s", task_id, _exit_summary)
+            logger.info("Task '%s' parked for human consultation: %s", task_id, question)
+            # ConsultAgent dispatch (autopilot takeover) happens in _dispatch_consult_maestro_jobs
+            # on the next scheduler tick — capacity-managed, not inline.
 
         elif result.status == "CONSULTING":
             _exit_reason = "consulting"

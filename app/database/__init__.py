@@ -122,6 +122,7 @@ from .models import (
     CustomAgentDefinition,
     MaestroGoal,
     GoalVerificationJob,
+    GoalExpertVote,
     AutopilotObjective,
     RevertVote,
     SelfModMergeLog,
@@ -173,6 +174,7 @@ from .crud_tasks import (
     update_pip_resolution_job,
     mark_dispatch_waiting,
     set_task_blocked_on_model,
+    get_tasks_with_pending_consultation,
 )
 
 # Project CRUD
@@ -312,6 +314,7 @@ from .crud_files import (
 # Inbox / notifications
 from .crud_inbox import (
     create_inbox_message,
+    update_inbox_message,
     get_inbox_messages,
     get_inbox_message,
     mark_inbox_read,
@@ -391,12 +394,13 @@ from .crud_documents import (
     list_documents_written_by_task,
 )
 
-# Goals + verification jobs
+# Goals + verification jobs + expert panel
 from .crud_goals import (
     create_goal,
     get_goal,
     get_active_goals_for_project,
     get_goals_for_project,
+    list_goals,
     update_goal,
     append_goal_evidence,
     goal_to_dict,
@@ -404,6 +408,11 @@ from .crud_goals import (
     get_pending_goal_verification_jobs,
     update_goal_verification_job,
     get_verification_jobs_for_goal,
+    record_expert_vote,
+    get_expert_votes,
+    get_all_expert_votes_for_goal,
+    tally_expert_panel,
+    get_active_goal_tasks,
 )
 
 # Autopilot objectives + self-modification CRUD
@@ -537,7 +546,7 @@ __all__ = [
     "PipelineTemplate", "PipelineStage", "PipelineTransition",
     "PipelineStageGroup", "PipelineArchCategory", "ProjectDocument",
     "ArchivedFile", "ProjectSettings", "CustomAgentDefinition",
-    "MaestroGoal", "GoalVerificationJob", "AutopilotObjective",
+    "MaestroGoal", "GoalVerificationJob", "GoalExpertVote", "AutopilotObjective",
     "RevertVote", "SelfModMergeLog",
     "WatchedEvent", "WatchErrorLog",
     # crud_tasks
@@ -557,7 +566,7 @@ __all__ = [
     "get_all_projects", "get_project", "get_project_by_id", "get_project_path", "upsert_project", "rename_project", "delete_project", "project_to_dict",
     "get_project_setting", "set_project_setting", "get_all_project_settings",
     "get_routing_table", "upsert_routing_entry", "delete_routing_entry",
-    "mark_dispatch_waiting", "set_task_blocked_on_model",
+    "mark_dispatch_waiting", "set_task_blocked_on_model", "get_tasks_with_pending_consultation",
     # crud_infra
     "get_all_llms", "get_llm", "create_llm", "update_llm", "delete_llm",
     "get_all_budgets", "get_budget", "create_budget", "update_budget", "delete_budget",
@@ -599,7 +608,7 @@ __all__ = [
     "delete_file_summary",
     "create_archived_file", "get_archived_files_for_task", "get_archived_file", "mark_archived_file_restored",
     # crud_inbox
-    "create_inbox_message", "get_inbox_messages", "get_inbox_message",
+    "create_inbox_message", "update_inbox_message", "get_inbox_messages", "get_inbox_message",
     "mark_inbox_read", "mark_all_inbox_read", "delete_inbox_message", "count_unread_inbox",
     # crud_sessions
     "create_agent_session", "close_agent_session", "close_zombie_sessions", "close_zombie_sessions_for_tasks",

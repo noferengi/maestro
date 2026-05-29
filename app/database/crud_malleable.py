@@ -60,6 +60,7 @@ def create_template(
     is_default: bool = False,
     is_builtin: bool = False,
     config: Optional[dict] = None,
+    tags: Optional[list] = None,
 ) -> Optional[PipelineTemplate]:
     db = SessionLocal()
     try:
@@ -72,6 +73,7 @@ def create_template(
             is_builtin=is_builtin,
             version=1,
             config=config or {},
+            tags=tags or [],
         )
         db.add(t)
         db.commit()
@@ -92,6 +94,7 @@ def update_template(
     is_default: Optional[bool] = None,
     version_bump: bool = False,
     config: Optional[dict] = None,
+    tags=...,
 ) -> Optional[PipelineTemplate]:
     db = SessionLocal()
     try:
@@ -106,6 +109,8 @@ def update_template(
             t.is_default = is_default
         if config is not None:
             t.config = config
+        if tags is not ...:
+            t.tags = tags if tags is not None else []
         if version_bump:
             t.version = (t.version or 1) + 1
         t.updated_at = datetime.utcnow()
@@ -829,6 +834,7 @@ def template_to_dict(template: PipelineTemplate) -> Dict[str, Any]:
         "is_default": template.is_default,
         "is_builtin": template.is_builtin,
         "version": template.version,
+        "tags": template.tags or [],
         "config": template.config or {},
         "stages": [
             {
@@ -895,6 +901,7 @@ def export_template(template_id: int) -> Optional[Dict[str, Any]]:
         "schema_version": 1,
         "name": t.name,
         "description": t.description,
+        "tags": t.tags or [],
         "arch_categories": [
             {"key": ac.key, "label": ac.label, "color": ac.color, "position": ac.position}
             for ac in arch_cats
@@ -948,6 +955,7 @@ def import_template(blob: Dict[str, Any]) -> Optional[PipelineTemplate]:
             is_default=False,
             is_builtin=False,
             version=1,
+            tags=blob.get("tags") or [],
         )
         db.add(t)
         db.flush()  # get t.id

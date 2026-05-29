@@ -10,7 +10,7 @@ import logging
 from datetime import datetime, timezone
 
 from .session import SessionLocal
-from .models import MaestroGoal, GoalVerificationJob, Project
+from .models import MaestroGoal, GoalVerificationJob, GoalExpertVote, Project, Task
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,7 @@ def create_goal(
     priority: int = 1,
     color: "str | None" = None,
     created_by: str = "human",
+    max_iterations: int = 10,
 ) -> "MaestroGoal | None":
     db = SessionLocal()
     try:
@@ -41,6 +42,7 @@ def create_goal(
             priority=priority,
             color=color,
             created_by=created_by,
+            max_iterations=max_iterations,
         )
         db.add(goal)
         db.commit()
@@ -156,9 +158,135 @@ def goal_to_dict(goal: MaestroGoal) -> dict:
         "color": goal.color,
         "created_by": goal.created_by,
         "arch_card_id": goal.arch_card_id,
+        "max_iterations": getattr(goal, "max_iterations", 10),
+        "iteration_count": getattr(goal, "iteration_count", 0),
+        "achieved_at": goal.achieved_at.isoformat() if getattr(goal, "achieved_at", None) else None,
         "created_at": goal.created_at.isoformat() if goal.created_at else None,
         "updated_at": goal.updated_at.isoformat() if goal.updated_at else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Expert vote CRUD
+# ---------------------------------------------------------------------------
+
+def record_expert_vote(
+    goal_id: int,
+    iteration: int,
+    judge_index: int,
+    judge_persona: str,
+    verdict: str,
+    justification: str,
+    *,
+    model: "str | None" = None,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+) -> "GoalExpertVote | None":
+    db = SessionLocal()
+    try:
+        vote = GoalExpertVote(
+            goal_id=goal_id,
+            iteration=iteration,
+            judge_index=judge_index,
+            judge_persona=judge_persona,
+            verdict=verdict,
+            justification=justification,
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+        db.add(vote)
+        db.commit()
+        db.refresh(vote)
+        return vote
+    except Exception as exc:
+        db.rollback()
+        logger.error("Error recording expert vote: %s", exc)
+        return None
+    finally:
+        db.close()
+
+
+def get_expert_votes(goal_id: int, iteration: int) -> "list[GoalExpertVote]":
+    db = SessionLocal()
+    try:
+        return (
+            db.query(GoalExpertVote)
+            .filter(GoalExpertVote.goal_id == goal_id, GoalExpertVote.iteration == iteration)
+            .order_by(GoalExpertVote.judge_index.asc())
+            .all()
+        )
+    finally:
+        db.close()
+
+
+def get_all_expert_votes_for_goal(goal_id: int) -> "list[GoalExpertVote]":
+    db = SessionLocal()
+    try:
+        return (
+            db.query(GoalExpertVote)
+            .filter(GoalExpertVote.goal_id == goal_id)
+            .order_by(GoalExpertVote.iteration.asc(), GoalExpertVote.judge_index.asc())
+            .all()
+        )
+    finally:
+        db.close()
+
+
+def tally_expert_panel(goal_id: int, iteration: int) -> dict:
+    """Return {achieved, votes, dissenting_critiques}.
+
+    achieved=True only when ALL 5 judges voted YES with no exceptions.
+    """
+    votes = get_expert_votes(goal_id, iteration)
+    if not votes:
+        return {"achieved": False, "votes": [], "dissenting_critiques": []}
+
+    dissenting = [v.justification for v in votes if v.verdict.upper() != "YES"]
+    achieved = len(dissenting) == 0 and len(votes) > 0
+
+    return {
+        "achieved": achieved,
+        "votes": [
+            {
+                "judge_index": v.judge_index,
+                "persona": v.judge_persona,
+                "verdict": v.verdict,
+                "justification": v.justification,
+            }
+            for v in votes
+        ],
+        "dissenting_critiques": dissenting,
+    }
+
+
+def get_active_goal_tasks(goal_id: int) -> "list[Task]":
+    """Return tasks linked to a goal that are not completed/abandoned."""
+    db = SessionLocal()
+    try:
+        return (
+            db.query(Task)
+            .filter(
+                Task.goal_id == goal_id,
+                Task.is_active == True,
+                Task.type.notin_(["completed", "abandoned"]),
+            )
+            .all()
+        )
+    finally:
+        db.close()
+
+
+def list_goals(status: "str | None" = None) -> "list[MaestroGoal]":
+    """List all goals, optionally filtered by status."""
+    db = SessionLocal()
+    try:
+        q = db.query(MaestroGoal)
+        if status:
+            q = q.filter(MaestroGoal.status == status)
+        return q.order_by(MaestroGoal.priority.asc(), MaestroGoal.created_at.asc()).all()
+    finally:
+        db.close()
 
 
 # ---------------------------------------------------------------------------

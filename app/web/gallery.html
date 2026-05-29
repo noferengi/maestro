@@ -102,6 +102,22 @@ body {
 .badge-builtin { background: #312e81; color: #a5b4fc; }
 .badge-custom  { background: #14532d; color: #86efac; }
 .badge-stages  { background: #0f2231; color: #7dd3fc; }
+.badge-tag     { background: #1c2a3a; color: #94a3b8; border: 1px solid #334155; }
+
+/* ── Tag filter bar ── */
+#tag-filter-bar {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  padding: 8px 24px 0;
+}
+.tag-chip {
+  background: #1e293b; border: 1px solid #334155; border-radius: 99px;
+  color: #94a3b8; font-size: 12px; padding: 3px 10px;
+  cursor: pointer; transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.tag-chip:hover { border-color: #3b82f6; color: #e2e8f0; }
+.tag-chip.active { background: #1e3a5f; border-color: #3b82f6; color: #93c5fd; }
+
+.card-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: -4px; }
 
 .card-desc {
   font-size: 12px; color: #94a3b8; line-height: 1.45;
@@ -197,6 +213,9 @@ body {
   </label>
   <span id="count-label" style="margin-left:auto;font-size:12px;color:#64748b"></span>
 </div>
+
+<!-- Tag filter chips -->
+<div id="tag-filter-bar"></div>
 
 <!-- Grid -->
 <div id="grid"></div>
@@ -297,6 +316,7 @@ let _templates = [];
 let _cloneTargetId = null;
 let _useTargetId   = null;
 let _projects      = [];
+let _activeTags    = new Set();
 
 // stage-map flow state
 let _smapFromId   = null;
@@ -329,10 +349,33 @@ async function loadTemplates() {
     const r = await fetch("/api/pipeline-templates");
     const data = await r.json();
     _templates = data;
+    renderTagFilterBar();
     applyFilters();
   } catch (e) {
     showToast("Failed to load templates: " + e.message, true);
   }
+}
+
+function collectAllTags(templates) {
+  const set = new Set();
+  templates.forEach(t => (t.tags || []).forEach(tag => set.add(tag)));
+  return [...set].sort();
+}
+
+function renderTagFilterBar() {
+  const bar = document.getElementById("tag-filter-bar");
+  const tags = collectAllTags(_templates);
+  if (!tags.length) { bar.innerHTML = ""; return; }
+  bar.innerHTML = tags.map(tag =>
+    `<button class="tag-chip${_activeTags.has(tag) ? " active" : ""}" onclick="toggleTag(${JSON.stringify(tag)})">${esc(tag)}</button>`
+  ).join("");
+}
+
+function toggleTag(tag) {
+  if (_activeTags.has(tag)) _activeTags.delete(tag);
+  else _activeTags.add(tag);
+  renderTagFilterBar();
+  applyFilters();
 }
 
 async function loadProjects() {
@@ -349,6 +392,7 @@ function applyFilters() {
   let filtered = _templates.filter(t => {
     if (onlyB && !t.is_builtin) return false;
     if (q && !t.name.toLowerCase().includes(q) && !(t.description||"").toLowerCase().includes(q)) return false;
+    if (_activeTags.size > 0 && ![..._activeTags].some(tag => (t.tags || []).includes(tag))) return false;
     return true;
   });
   renderGrid(filtered);
@@ -380,6 +424,7 @@ function renderGrid(templates) {
     </div>
   </div>
   <div class="card-desc">${esc(t.description || "No description.")}</div>
+  ${(t.tags||[]).length ? `<div class="card-tags">${(t.tags||[]).map(tag=>`<span class="badge badge-tag">${esc(tag)}</span>`).join("")}</div>` : ""}
   <div class="card-actions">
     <button class="btn btn-primary btn-sm" onclick="openUseModal(${t.id})">Use</button>
     <button class="btn btn-secondary btn-sm" onclick="openCloneModal(${t.id}, ${builtin})">Clone</button>

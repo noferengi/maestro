@@ -2554,3 +2554,30 @@ document.addEventListener("DOMContentLoaded", async function () {
     // Start graph engine (required for litegraph to process events)
     _graph.start();
 });
+
+// ── Template Tags Modal ──────────────────────────────────────────────────────
+
+function openTagsModal() {
+    const tags = (_templateData && _templateData.tags) ? _templateData.tags : [];
+    document.getElementById("pe-tags-input").value = tags.join(", ");
+    const modal = document.getElementById("pe-tags-modal");
+    modal.style.display = "flex";
+}
+
+function closeTagsModal() {
+    document.getElementById("pe-tags-modal").style.display = "none";
+}
+
+async function saveTemplateTags() {
+    if (!_templateId) { peToast("Save the template first before editing tags.", "warn"); return; }
+    const raw = document.getElementById("pe-tags-input").value;
+    const tags = raw.split(",").map(s => s.trim()).filter(Boolean);
+    try {
+        const updated = await apiPut(`/pipelines/${_templateId}`, { tags });
+        if (_templateData) _templateData.tags = updated.tags || tags;
+        closeTagsModal();
+        peToast(`Tags saved: ${tags.length ? tags.join(", ") : "(none)"}`);
+    } catch (e) {
+        peToast(`Failed to save tags: ${e.message}`, "err");
+    }
+}
