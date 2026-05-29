@@ -16,7 +16,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markup.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-css.min.js"></script>
-    <script src="/static/kanban.js?v=84"></script>
+    <script src="/static/kanban.js?v=85"></script>
 </head>
 <body>
     <!-- Inline drag preview initialization -->
@@ -1194,6 +1194,20 @@
                         <select id="mc-goal-card" style="flex:1">
                             <option value="">Select card&hellip;</option>
                         </select>
+                    </label>
+                </div>
+
+                <hr style="margin:1rem 0">
+
+                <p style="color:#6c757d;font-size:0.85rem;margin-bottom:0.5rem">Maestro autonomy</p>
+                <div style="display:grid;gap:0.5rem;margin-bottom:0.75rem">
+                    <label style="display:flex;align-items:center;gap:0.7rem">
+                        <input type="checkbox" id="mc-consult-takeover" onchange="_applyConsultTakeoverDependency()">
+                        <span>Take over <em>consult_human</em> escalations with ConsultAgent</span>
+                    </label>
+                    <label style="display:flex;align-items:center;gap:0.7rem" id="mc-merge-label">
+                        <input type="checkbox" id="mc-maestro-can-merge" disabled>
+                        <span style="color:#6c757d">Maestro can Merge &amp; Accept</span>
                     </label>
                 </div>
 

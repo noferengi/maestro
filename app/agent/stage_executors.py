@@ -1721,7 +1721,7 @@ def _run_intake_scope_node(
 ) -> None:
     """intake_scope executor — LLM scope analysis (Stage 1 of 5)."""
     from app.database import create_agent_session, close_agent_session, get_task
-    from app.agent._intake_pipeline import run_intake_scope_stage
+    from app.agent.intake_stages import run_intake_scope_stage
 
     task = get_task(task_id)
     if not task or not task.description:
@@ -1771,7 +1771,7 @@ def _run_intake_static_node(
 ) -> None:
     """intake_static executor — deterministic static analysis (Stage 2 of 5)."""
     from app.database import create_agent_session, close_agent_session, get_task
-    from app.agent._intake_pipeline import run_intake_static_stage
+    from app.agent.intake_stages import run_intake_static_stage
 
     task = get_task(task_id)
     if not task or not task.description:
@@ -1819,7 +1819,7 @@ def _run_intake_conflict_node(
 ) -> None:
     """intake_conflict executor — LLM conflict detection (Stage 3 of 5)."""
     from app.database import create_agent_session, close_agent_session, get_task, get_all_tasks
-    from app.agent._intake_pipeline import run_intake_conflict_stage
+    from app.agent.intake_stages import run_intake_conflict_stage
 
     task = get_task(task_id)
     if not task or not task.description:
@@ -1877,7 +1877,7 @@ def _run_intake_feasibility_node(
 ) -> None:
     """intake_feasibility executor — LLM feasibility analysis (Stage 4 of 5)."""
     from app.database import create_agent_session, close_agent_session, get_task
-    from app.agent._intake_pipeline import run_intake_feasibility_stage
+    from app.agent.intake_stages import run_intake_feasibility_stage
 
     task = get_task(task_id)
     if not task or not task.description:
@@ -1935,7 +1935,7 @@ def _run_intake_gate_node(
         create_transition_vote, create_transition_result,
         get_transition_results as _gtr,
     )
-    from app.agent._intake_pipeline import run_intake_gate
+    from app.agent.intake_stages import run_intake_gate
     from app.agent.pipeline_router import advance_stage
 
     task = get_task(task_id)

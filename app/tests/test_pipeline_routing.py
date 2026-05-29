@@ -435,38 +435,36 @@ class TestIntakePipelineMockLLM:
     def _run_pipeline(self, scope="LIKELY", static="POSSIBLE",
                       conflict="LIKELY", feasibility="LIKELY"):
         """
-        Run IntakePipeline.run() with all four stage methods replaced by
+        Run run_intake_pipeline with all four stage functions replaced by
         AsyncMock instances returning the specified verdicts.  run_research
         and run_tiebreaker are also patched so no real I/O can escape.
         """
-        from app.agent._intake_pipeline import IntakePipeline
-
-        pipeline = IntakePipeline(
-            task_id="test-intk-unit",
-            task_description="Add user authentication to the app",
-            task_title="User Auth",
-            all_tasks=[],
-            budget_id=1,
-            llm_id=1,
-            llm_base_url="http://localhost:8008/v1",
-            llm_model="mock-model",
-            project=None,
-        )
+        from app.agent.intake_stages import run_intake_pipeline
 
         canned = self._make_canned_research()
 
         async def _go():
-            with patch.object(pipeline, "_stage_scope_analysis",
-                              AsyncMock(return_value=self._make_vote("scope_analysis", scope))), \
-                 patch.object(pipeline, "_stage_static_analysis",
-                              AsyncMock(return_value=self._make_vote("static_analysis", static))), \
-                 patch.object(pipeline, "_stage_conflict_detection",
-                              AsyncMock(return_value=self._make_vote("conflict_detection", conflict))), \
-                 patch.object(pipeline, "_stage_feasibility",
-                              AsyncMock(return_value=self._make_vote("feasibility", feasibility))), \
+            with patch("app.agent.intake_stages._intake_scope_analysis",
+                       AsyncMock(return_value=self._make_vote("scope_analysis", scope))), \
+                 patch("app.agent.intake_stages._intake_static_analysis",
+                       AsyncMock(return_value=self._make_vote("static_analysis", static))), \
+                 patch("app.agent.intake_stages._intake_conflict_detection",
+                       AsyncMock(return_value=self._make_vote("conflict_detection", conflict))), \
+                 patch("app.agent.intake_stages._intake_feasibility",
+                       AsyncMock(return_value=self._make_vote("feasibility_analysis", feasibility))), \
                  patch("app.agent.research.run_research", AsyncMock(return_value=canned)), \
                  patch("app.agent.research.run_tiebreaker", AsyncMock(return_value=canned)):
-                return await pipeline.run()
+                return await run_intake_pipeline(
+                    task_id="test-intk-unit",
+                    task_description="Add user authentication to the app",
+                    task_title="User Auth",
+                    all_tasks=[],
+                    budget_id=1,
+                    llm_id=1,
+                    llm_base_url="http://localhost:8008/v1",
+                    llm_model="mock-model",
+                    project=None,
+                )
 
         return asyncio.run(_go())
 

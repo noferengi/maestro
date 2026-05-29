@@ -9037,15 +9037,34 @@ async function openMissionModal() {
         }
     }
 
-    // Prefill hours from API
+    // Prefill hours and autonomy settings from API
     const r = await fetch('/api/settings/autopilot').catch(() => null);
     if (r && r.ok) {
         const d = await r.json();
         document.getElementById('mc-start-hour').value = d.start_hour;
         document.getElementById('mc-stop-hour').value  = d.stop_hour;
+        const consultChk = document.getElementById('mc-consult-takeover');
+        const mergeChk   = document.getElementById('mc-maestro-can-merge');
+        consultChk.checked = d.consult_takeover === 'on';
+        mergeChk.checked   = d.maestro_can_merge === 'on';
+        _applyConsultTakeoverDependency();
     }
 
     document.getElementById('mission-modal').style.display = 'flex';
+}
+
+function _applyConsultTakeoverDependency() {
+    const consultChk   = document.getElementById('mc-consult-takeover');
+    const mergeChk     = document.getElementById('mc-maestro-can-merge');
+    const mergeLabel   = document.getElementById('mc-merge-label');
+    if (!consultChk || !mergeChk) return;
+    const enabled = consultChk.checked;
+    mergeChk.disabled = !enabled;
+    if (mergeLabel) {
+        const span = mergeLabel.querySelector('span');
+        if (span) span.style.color = enabled ? '' : '#6c757d';
+    }
+    if (!enabled) mergeChk.checked = false;
 }
 
 function closeMissionModal() {
@@ -9061,9 +9080,11 @@ async function startMission() {
     const cardsN        = parseInt(document.getElementById('mc-cards-n').value) || 0;
     const goalEnabled   = document.getElementById('mc-goal-enabled').checked;
     const goalCardId    = document.getElementById('mc-goal-card').value || null;
-    const saveSchedule  = document.getElementById('mc-save-schedule').checked;
-    const startHour     = parseInt(document.getElementById('mc-start-hour').value) || 0;
-    const stopHour      = parseInt(document.getElementById('mc-stop-hour').value) || 24;
+    const saveSchedule     = document.getElementById('mc-save-schedule').checked;
+    const startHour        = parseInt(document.getElementById('mc-start-hour').value) || 0;
+    const stopHour         = parseInt(document.getElementById('mc-stop-hour').value) || 24;
+    const consultTakeover  = document.getElementById('mc-consult-takeover').checked;
+    const maestroCanMerge  = document.getElementById('mc-maestro-can-merge').checked;
 
     // Save to localStorage
     localStorage.setItem('maestro_mission_defaults', JSON.stringify({
@@ -9082,10 +9103,12 @@ async function startMission() {
     };
 
     const body = {
-        autopilot: 'on',
-        start_hour: startHour,
-        stop_hour:  stopHour,
-        save_schedule: saveSchedule,
+        autopilot:          'on',
+        start_hour:         startHour,
+        stop_hour:          stopHour,
+        save_schedule:      saveSchedule,
+        consult_takeover:   consultTakeover ? 'on' : 'off',
+        maestro_can_merge:  (consultTakeover && maestroCanMerge) ? 'on' : 'off',
         mission,
     };
 

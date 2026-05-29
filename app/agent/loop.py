@@ -398,9 +398,14 @@ class MaestroLoop:
                     payload = json.loads(task_rec.consultation_payload)
                     hint = payload.get("hint")
                     if hint:
+                        source = payload.get("source", "user")
+                        if source == "maestro":
+                            prefix = "Maestro answered your escalation:"
+                        else:
+                            prefix = "User feedback on your question:"
                         messages.append({
                             "role": "user",
-                            "content": f"[MAESTRO STEERING HINT] {hint}\n\nPlease proceed with implementation based on this guidance."
+                            "content": f"[MAESTRO STEERING HINT] {prefix} {hint}\n\nPlease proceed with implementation based on this guidance."
                         })
                 except:
                     pass
@@ -827,12 +832,28 @@ class MaestroLoop:
                 files_changed=signal_dict.get("files_changed") or self._files_changed,
             )
         elif sig == SIGNAL_NEEDS_HUMAN:
+            # Save message history so we can resume after a hint is provided
+            from app.database import save_task_session_state
+            session_id = None
+            try:
+                from app.agent.llm_client import get_active_session_id
+                session_id = get_active_session_id()
+            except Exception:
+                pass
+            save_task_session_state(
+                task_id=self.task_id,
+                session_id=session_id or 0,
+                turn_count=self._turn,
+                messages=self._messages,
+            )
+            _nh_question = signal_dict.get("summary", "Agent escalated for human review.")
             result = LoopResult(
                 task_id=self.task_id,
                 status="NEEDS_HUMAN",
                 turns=self._turn,
-                final_message=signal_dict.get("summary", "Agent escalated for human review."),
+                final_message=_nh_question,
                 git_branch=self._git_branch,
+                consultation_question=_nh_question,
             )
         elif sig == SIGNAL_REJECTED:
             # Dev agent self-reporting rejection — treat like a design revert
@@ -888,7 +909,7 @@ class MaestroLoop:
         _LOOP_STATUS[self.task_id] = self._status_dict(result)
 
         # Enqueue async session-end summary job (Gap 7 — episodic memory)
-        if sig != SIGNAL_CONSULT:  # don't summarise paused sessions
+        if sig not in (SIGNAL_CONSULT, SIGNAL_NEEDS_HUMAN):  # don't summarise paused sessions
             try:
                 import app.agent.config as _cfg
                 if _cfg.EPISODIC_MEMORY_ENABLED:

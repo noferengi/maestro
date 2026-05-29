@@ -81,6 +81,28 @@ def get_inbox_message(msg_id: str) -> dict | None:
         return _row_to_dict(msg) if msg else None
 
 
+def update_inbox_message(
+    msg_id: str,
+    subject: str | None = None,
+    outcome: str | None = None,
+    data_json: str | None = None,
+) -> dict | None:
+    """Patch mutable fields on an existing inbox message. Returns updated dict or None if not found."""
+    with SessionLocal() as db:
+        msg = db.query(InboxMessage).filter(InboxMessage.id == msg_id).first()
+        if msg is None:
+            return None
+        if subject is not None:
+            msg.subject = subject
+        if outcome is not None:
+            msg.outcome = outcome
+        if data_json is not None:
+            msg.data_json = data_json
+        db.commit()
+        db.refresh(msg)
+        return _row_to_dict(msg)
+
+
 def mark_inbox_read(msg_id: str, read: bool = True) -> dict | None:
     with SessionLocal() as db:
         msg = db.query(InboxMessage).filter(InboxMessage.id == msg_id).first()

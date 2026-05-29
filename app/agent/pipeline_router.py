@@ -56,13 +56,11 @@ _NO_AUTO_DISPATCH_BEHAVIOR_TYPES: frozenset[str] = frozenset({"human_gate", "arc
 # Maps behavior_type → the stage-handler key registered by scheduler.py.
 # When dispatch_task resolves a definition with behavior_type in this map, it
 # calls _stage_handlers[mapped_key] so the full built-in pipeline runs.
+# NOTE: maestro_loop/conceptual_review/optimization/security/final_review were
+# removed — those stages were converted to multiplier_node in migrations 0126/0129
+# and no longer have registered stage handlers.
 _BEHAVIOR_TYPE_TO_STAGE_HANDLER: dict[str, str] = {
-    "maestro_loop":      "indev",
-    "conceptual_review": "conceptual_review",
-    "optimization":      "optimization",
-    "security":          "security",
-    "final_review":      "final_review",
-    "factory":           "factory_node",
+    "factory": "factory_node",
 }
 
 
@@ -92,7 +90,9 @@ class StageConfig:
 
 
 # ---------------------------------------------------------------------------
-# Legacy transition fallback (used when no pipeline template is configured)
+# Legacy transition fallback — safety net only; unreachable in normal operation
+# (tasks without a pipeline_template_id cannot be created by normal flows post
+# migration-0077). Retained for data-integrity edge cases only.
 # ---------------------------------------------------------------------------
 
 _LEGACY_TRANSITIONS: dict[str, dict[str, str]] = {

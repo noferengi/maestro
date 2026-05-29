@@ -1086,6 +1086,206 @@ function _darken(hex) {
 // GRAPH → DB (SAVE)
 // ============================================================
 
+// Build the API body for a single pipeline node (pure — no API calls).
+function _buildStageBody(node, posIdx) {
+    const p = node.properties;
+    let body;
+
+    if (node.type === "maestro/factory") {
+        let srcCfg = {};
+        try { srcCfg = JSON.parse(p.factory_source_config_json || "{}"); } catch (_) {}
+        const triggers = Array.isArray(p.factory_triggers) ? p.factory_triggers : [];
+        if (p.factory_cron_schedule) srcCfg.cron_schedule = p.factory_cron_schedule;
+        body = {
+            stage_key:  p.stage_key,
+            label:      p.label || p.stage_key,
+            agent_type: "factory_node",
+            color:      p.color,
+            position:   posIdx,
+            config: {
+                factory_source_type:        p.factory_source_type,
+                factory_source_config:      srcCfg,
+                factory_segmentation_mode:  p.factory_segmentation_mode,
+                factory_entry_stage:        p.factory_entry_stage || "idea",
+                factory_trigger:            triggers,
+                factory_card_template: {
+                    title_template:       p.factory_title_template || "{filename}",
+                    description_template: p.factory_desc_template  || "",
+                },
+                intent:    p.intent,
+                _canvas_x: Math.round(node.pos[0]),
+                _canvas_y: Math.round(node.pos[1]),
+            },
+        };
+    } else if (node.type === "maestro/static_analysis") {
+        body = {
+            stage_key:  p.stage_key,
+            label:      p.label || p.stage_key,
+            agent_type: "static_analysis_widget",
+            color:      "#b45309",
+            position:   posIdx,
+            config: {
+                output_key:   p.output_key   || "static_analysis",
+                file_pattern: p.file_pattern || "**/*.py",
+                max_files:    parseInt(p.max_files) || 50,
+                _canvas_x: Math.round(node.pos[0]),
+                _canvas_y: Math.round(node.pos[1]),
+            },
+        };
+    } else if (node.type === "maestro/dangerous_edit") {
+        const _agentTools = (p.agent_tools || "").split(",").map(s=>s.trim()).filter(Boolean);
+        const _reqKeys    = (p.required_input_keys || "").split(",").map(s=>s.trim()).filter(Boolean);
+        body = {
+            stage_key:  p.stage_key,
+            label:      p.label || p.stage_key,
+            agent_type: "dangerous_edit_llm_agent",
+            color:      "#7f1d1d",
+            position:   posIdx,
+            config: {
+                system_prompt:        p.system_prompt || null,
+                max_turns:            parseInt(p.max_turns) || 200,
+                agent_tools:          _agentTools.length ? _agentTools : null,
+                required_input_keys:  _reqKeys,
+                _canvas_x: Math.round(node.pos[0]),
+                _canvas_y: Math.round(node.pos[1]),
+            },
+        };
+    } else if (node.type === "maestro/parallel_agents") {
+        const n = Math.max(1, Math.min(10, parseInt(p.n) || 3));
+        const agents = (Array.isArray(p.agents) ? p.agents : []).slice(0, n);
+        while (agents.length < n)
+            agents.push({name: `agent_${agents.length}`, description: "", system_prompt: "", tool_grouping_id: null});
+        body = {
+            stage_key:  p.stage_key,
+            label:      p.label || p.stage_key,
+            agent_type: "parallel_agents",
+            color:      "#0c4a6e",
+            position:   posIdx,
+            config: {
+                n,
+                agents,
+                output_key: p.output_key || "parallel_agents_output",
+                max_turns:  parseInt(p.max_turns) || 30,
+                _canvas_x:  Math.round(node.pos[0]),
+                _canvas_y:  Math.round(node.pos[1]),
+                ...(p.dynamic_agents_from_key             ? { dynamic_agents_from_key:             p.dynamic_agents_from_key }             : {}),
+                ...(p._cfg_subagent_type                  ? { subagent_type:                       p._cfg_subagent_type }                  : {}),
+                ...(p._cfg_agent_tools                    ? { agent_tools:                         p._cfg_agent_tools }                    : {}),
+                ...(p._cfg_agent_system_prompt_template   ? { agent_system_prompt_template:        p._cfg_agent_system_prompt_template }   : {}),
+            },
+        };
+    } else if (node.type === "maestro/multiplier_node") {
+        let agentsList = null;
+        if (p.agents) {
+            try { agentsList = JSON.parse(p.agents); } catch (_) { agentsList = null; }
+        }
+        const _reqKeys = (p.required_input_keys || "").split(",").map(s=>s.trim()).filter(Boolean);
+        const _tools   = (p.agent_tools || "").split(",").map(s=>s.trim()).filter(Boolean);
+        body = {
+            stage_key:  p.stage_key,
+            label:      p.label || p.stage_key,
+            agent_type: "multiplier_node",
+            color:      p.color || "#5b21b6",
+            position:   posIdx,
+            config: {
+                n:                    Math.max(1, Math.min(20, parseInt(p.n) || 3)),
+                agent_system_prompt:  p.agent_system_prompt || "",
+                agent_tools:          _tools.length ? _tools : [],
+                agent_max_turns:      parseInt(p.agent_max_turns) || 15,
+                collapser_mode:       p.collapser_mode || "vote_tally",
+                tally_strategy:       p.tally_strategy || "majority",
+                on_tie:               p.on_tie || "reject",
+                judge_system_prompt:  p.judge_system_prompt || "",
+                judge_max_turns:      parseInt(p.judge_max_turns) || 10,
+                required_input_keys:  _reqKeys,
+                output_key:           p.output_key || "fan_out_result",
+                ...(agentsList ? { agents: agentsList } : {}),
+                _canvas_x: Math.round(node.pos[0]),
+                _canvas_y: Math.round(node.pos[1]),
+            },
+        };
+    } else {
+        body = {
+            stage_key:  p.stage_key,
+            label:      p.label || p.stage_key,
+            agent_type: p.agent_type,
+            color:      p.color,
+            position:   posIdx,
+            config: {
+                intent:              p.intent,
+                system_prompt:       p.system_prompt,
+                gate_type:           p.gate_type,
+                max_retries:         parseInt(p.max_retries) || 3,
+                required_input_keys:  p.required_input_keys.split(",").map(s=>s.trim()).filter(Boolean),
+                output_keys:          p.output_keys.split(",").map(s=>s.trim()).filter(Boolean),
+                required_tool_groups: Array.isArray(p.required_tool_groups) ? p.required_tool_groups : [],
+                _canvas_x: Math.round(node.pos[0]),
+                _canvas_y: Math.round(node.pos[1]),
+            },
+        };
+    }
+
+    if (_kanbanColumns.length) {
+        body.config.kanban_column = _kanbanColumnForX(node.pos[0]);
+    }
+    return body;
+}
+
+// Build the full list of desired transition payloads from the current graph state (pure — no API calls).
+// Returns null and calls peToast if any node lacks a stage_id (unsaved node).
+function _buildTransitionPlan() {
+    const nodeById = {};
+    for (const n of _graph._nodes) nodeById[n.id] = n;
+
+    const validTypes = new Set([
+        "maestro/stage", "maestro/factory", "maestro/human_gate",
+        "maestro/static_analysis", "maestro/dangerous_edit",
+        "maestro/parallel_agents", "maestro/multiplier_node",
+    ]);
+
+    const plan = [];
+
+    for (const link of Object.values(_graph.links)) {
+        const fromNode = nodeById[link.origin_id];
+        const toNode   = nodeById[link.target_id];
+        if (!fromNode || !toNode) continue;
+        if (!validTypes.has(fromNode.type) || !validTypes.has(toNode.type)) continue;
+        plan.push({
+            from_stage_id: fromNode.properties.stage_id,
+            to_stage_id:   toNode.properties.stage_id,
+            condition:     fromNode.outputs?.[link.origin_slot]?.name || "pass",
+            priority:      link._back_edge ? 10 : 1,
+        });
+    }
+
+    // Back-edges stored as node annotations (not LiteGraph links)
+    for (const n of _graph._nodes) {
+        if (!n._backSources?.length) continue;
+        for (const be of n._backSources) {
+            const fromN = _nodeByKey[be.from_key];
+            const toN   = _nodeByKey[be.to_key];
+            if (!fromN || !toN) continue;
+            plan.push({
+                from_stage_id: fromN.properties.stage_id,
+                to_stage_id:   toN.properties.stage_id,
+                condition:     be.condition,
+                priority:      10,
+            });
+        }
+    }
+
+    // Validate before any destructive DB operation — all referenced stage_ids must exist
+    const broken = plan.filter(t => !t.from_stage_id || !t.to_stage_id);
+    if (broken.length) {
+        peToast(
+            `Save aborted: ${broken.length} edge(s) reference unsaved nodes. ` +
+            `Existing transitions are untouched.`, "err"
+        );
+        return null;
+    }
+    return plan;
+}
+
 async function saveGraph() {
     if (!_templateId) { peToast("No template ID — cannot save", "err"); return; }
 
@@ -1094,214 +1294,61 @@ async function saveGraph() {
     setSaveStatus("Saving…");
 
     try {
-        // 1. Upsert all stage + factory + static_analysis nodes (sorted by canvas x for position order)
+        // === PHASE 1: BUILD STAGE PLAN (pure, no API calls) ===
         const allPipelineNodes = _graph._nodes
-            .filter(n => n.type === "maestro/stage" || n.type === "maestro/factory" || n.type === "maestro/static_analysis" || n.type === "maestro/human_gate" || n.type === "maestro/dangerous_edit" || n.type === "maestro/parallel_agents" || n.type === "maestro/multiplier_node")
+            .filter(n => ["maestro/stage","maestro/factory","maestro/static_analysis","maestro/human_gate","maestro/dangerous_edit","maestro/parallel_agents","maestro/multiplier_node"].includes(n.type))
             .sort((a, b) => a.pos[0] - b.pos[0]);
 
-        for (let posIdx = 0; posIdx < allPipelineNodes.length; posIdx++) {
-            const node = allPipelineNodes[posIdx];
-            const p = node.properties;
-            let stageBody;
+        const stagePlan = allPipelineNodes.map((node, posIdx) => ({
+            node,
+            body: _buildStageBody(node, posIdx),
+        }));
 
-            if (node.type === "maestro/factory") {
-                let srcCfg = {};
-                try { srcCfg = JSON.parse(p.factory_source_config_json || "{}"); } catch (_) {}
-                const triggers = Array.isArray(p.factory_triggers) ? p.factory_triggers : [];
-                if (p.factory_cron_schedule) srcCfg.cron_schedule = p.factory_cron_schedule;
-                stageBody = {
-                    stage_key:  p.stage_key,
-                    label:      p.label || p.stage_key,
-                    agent_type: "factory_node",
-                    color:      p.color,
-                    position:   posIdx,
-                    config: {
-                        factory_source_type:        p.factory_source_type,
-                        factory_source_config:      srcCfg,
-                        factory_segmentation_mode:  p.factory_segmentation_mode,
-                        factory_entry_stage:        p.factory_entry_stage || "idea",
-                        factory_trigger:            triggers,
-                        factory_card_template: {
-                            title_template:       p.factory_title_template || "{filename}",
-                            description_template: p.factory_desc_template  || "",
-                        },
-                        intent:    p.intent,
-                        _canvas_x: Math.round(node.pos[0]),
-                        _canvas_y: Math.round(node.pos[1]),
-                    },
-                };
-            } else if (node.type === "maestro/static_analysis") {
-                stageBody = {
-                    stage_key:  p.stage_key,
-                    label:      p.label || p.stage_key,
-                    agent_type: "static_analysis_widget",
-                    color:      "#b45309",
-                    position:   posIdx,
-                    config: {
-                        output_key:   p.output_key   || "static_analysis",
-                        file_pattern: p.file_pattern || "**/*.py",
-                        max_files:    parseInt(p.max_files) || 50,
-                        _canvas_x: Math.round(node.pos[0]),
-                        _canvas_y: Math.round(node.pos[1]),
-                    },
-                };
-            } else if (node.type === "maestro/dangerous_edit") {
-                const _agentTools = (p.agent_tools || "").split(",").map(s=>s.trim()).filter(Boolean);
-                const _reqKeys    = (p.required_input_keys || "").split(",").map(s=>s.trim()).filter(Boolean);
-                stageBody = {
-                    stage_key:  p.stage_key,
-                    label:      p.label || p.stage_key,
-                    agent_type: "dangerous_edit_llm_agent",
-                    color:      "#7f1d1d",
-                    position:   posIdx,
-                    config: {
-                        system_prompt:        p.system_prompt || null,
-                        max_turns:            parseInt(p.max_turns) || 200,
-                        agent_tools:          _agentTools.length ? _agentTools : null,
-                        required_input_keys:  _reqKeys,
-                        _canvas_x: Math.round(node.pos[0]),
-                        _canvas_y: Math.round(node.pos[1]),
-                    },
-                };
-            } else if (node.type === "maestro/parallel_agents") {
-                const n = Math.max(1, Math.min(10, parseInt(p.n) || 3));
-                const agents = (Array.isArray(p.agents) ? p.agents : []).slice(0, n);
-                while (agents.length < n)
-                    agents.push({name: `agent_${agents.length}`, description: "", system_prompt: "", tool_grouping_id: null});
-                stageBody = {
-                    stage_key:  p.stage_key,
-                    label:      p.label || p.stage_key,
-                    agent_type: "parallel_agents",
-                    color:      "#0c4a6e",
-                    position:   posIdx,
-                    config: {
-                        n,
-                        agents,
-                        output_key: p.output_key || "parallel_agents_output",
-                        max_turns:  parseInt(p.max_turns) || 30,
-                        _canvas_x:  Math.round(node.pos[0]),
-                        _canvas_y:  Math.round(node.pos[1]),
-                        ...(p.dynamic_agents_from_key             ? { dynamic_agents_from_key:             p.dynamic_agents_from_key }             : {}),
-                        ...(p._cfg_subagent_type                  ? { subagent_type:                       p._cfg_subagent_type }                  : {}),
-                        ...(p._cfg_agent_tools                    ? { agent_tools:                         p._cfg_agent_tools }                    : {}),
-                        ...(p._cfg_agent_system_prompt_template   ? { agent_system_prompt_template:        p._cfg_agent_system_prompt_template }   : {}),
-                    },
-                };
-            } else if (node.type === "maestro/multiplier_node") {
-                let agentsList = null;
-                if (p.agents) {
-                    try { agentsList = JSON.parse(p.agents); } catch (_) { agentsList = null; }
-                }
-                const _reqKeys = (p.required_input_keys || "").split(",").map(s=>s.trim()).filter(Boolean);
-                const _tools   = (p.agent_tools || "").split(",").map(s=>s.trim()).filter(Boolean);
-                stageBody = {
-                    stage_key:  p.stage_key,
-                    label:      p.label || p.stage_key,
-                    agent_type: "multiplier_node",
-                    color:      p.color || "#5b21b6",
-                    position:   posIdx,
-                    config: {
-                        n:                    Math.max(1, Math.min(20, parseInt(p.n) || 3)),
-                        agent_system_prompt:  p.agent_system_prompt || "",
-                        agent_tools:          _tools.length ? _tools : [],
-                        agent_max_turns:      parseInt(p.agent_max_turns) || 15,
-                        collapser_mode:       p.collapser_mode || "vote_tally",
-                        tally_strategy:       p.tally_strategy || "majority",
-                        on_tie:               p.on_tie || "reject",
-                        judge_system_prompt:  p.judge_system_prompt || "",
-                        judge_max_turns:      parseInt(p.judge_max_turns) || 10,
-                        required_input_keys:  _reqKeys,
-                        output_key:           p.output_key || "fan_out_result",
-                        ...(agentsList ? { agents: agentsList } : {}),
-                        _canvas_x: Math.round(node.pos[0]),
-                        _canvas_y: Math.round(node.pos[1]),
-                    },
-                };
+        // === PHASE 2: COMMIT STAGES (upserts — safe; transitions untouched) ===
+        setSaveStatus("Saving stages…");
+        for (const { node, body } of stagePlan) {
+            if (node.properties.stage_id) {
+                await apiPut(`/pipelines/${_templateId}/stages/${node.properties.stage_id}`, body);
             } else {
-                stageBody = {
-                    stage_key:  p.stage_key,
-                    label:      p.label || p.stage_key,
-                    agent_type: p.agent_type,
-                    color:      p.color,
-                    position:   posIdx,
-                    config: {
-                        intent:              p.intent,
-                        system_prompt:       p.system_prompt,
-                        gate_type:           p.gate_type,
-                        max_retries:         parseInt(p.max_retries) || 3,
-                        required_input_keys:  p.required_input_keys.split(",").map(s=>s.trim()).filter(Boolean),
-                        output_keys:          p.output_keys.split(",").map(s=>s.trim()).filter(Boolean),
-                        required_tool_groups: Array.isArray(p.required_tool_groups) ? p.required_tool_groups : [],
-                        _canvas_x: Math.round(node.pos[0]),
-                        _canvas_y: Math.round(node.pos[1]),
-                    },
-                };
-            }
-
-            // Stamp kanban_column from current X position
-            if (_kanbanColumns.length) {
-                stageBody.config.kanban_column = _kanbanColumnForX(node.pos[0]);
-            }
-
-            if (p.stage_id) {
-                await apiPut(`/pipelines/${_templateId}/stages/${p.stage_id}`, stageBody);
-            } else {
-                const created = await apiPost(`/pipelines/${_templateId}/stages`, stageBody);
+                const created = await apiPost(`/pipelines/${_templateId}/stages`, body);
                 node.properties.stage_id = created.id;
             }
         }
 
         // Persist kanban column definitions on the template config
-        if (_templateId) {
-            await apiPut(`/pipelines/${_templateId}`, {
-                config: { kanban_columns: _kanbanColumns },
-            });
-        }
+        await apiPut(`/pipelines/${_templateId}`, {
+            config: { kanban_columns: _kanbanColumns },
+        });
 
-        // Update stage position map after save so back-edge detection uses new positions
+        // Update stage position map so back-edge detection uses new positions
         const stageNodes = allPipelineNodes.filter(n =>
-            n.type === "maestro/stage" || n.type === "maestro/static_analysis" || n.type === "maestro/human_gate" || n.type === "maestro/dangerous_edit" || n.type === "maestro/parallel_agents" || n.type === "maestro/multiplier_node"
+            ["maestro/stage","maestro/static_analysis","maestro/human_gate","maestro/dangerous_edit","maestro/parallel_agents","maestro/multiplier_node"].includes(n.type)
         );
         stageNodes.forEach((n, i) => { _stagePosMap[n.id] = i; });
 
-        // 2. Delete ALL existing transitions, then recreate from current graph
-        const existing = await apiGet(`/pipelines/${_templateId}/transitions`);
-        await Promise.all(existing.map(t => apiDel(`/pipelines/${_templateId}/transitions/${t.id}`)));
-
-        // 3. Create transitions from graph links
-        const nodeById = {};
-        for (const n of _graph._nodes) nodeById[n.id] = n;
-
-        for (const link of Object.values(_graph.links)) {
-            const fromNode = nodeById[link.origin_id];
-            const toNode   = nodeById[link.target_id];
-            if (!fromNode || !toNode) continue;
-            const validTypes = new Set(["maestro/stage", "maestro/factory", "maestro/human_gate", "maestro/static_analysis", "maestro/dangerous_edit", "maestro/parallel_agents", "maestro/multiplier_node"]);
-            if (!validTypes.has(fromNode.type) || !validTypes.has(toNode.type)) continue;
-
-            const condition = fromNode.outputs?.[link.origin_slot]?.name || "pass";
-            const priority  = link._back_edge ? 10 : 1;
-
-            await apiPost(`/pipelines/${_templateId}/transitions`, {
-                from_stage_key: fromNode.properties.stage_key,
-                to_stage_key:   toNode.properties.stage_key,
-                condition,
-                priority,
-            });
+        // === PHASE 3: BUILD TRANSITION PLAN (pure, validates all stage_ids exist) ===
+        // If any node is missing a stage_id the plan returns null and shows an error.
+        // We abort here — existing transitions in the DB are completely untouched.
+        setSaveStatus("Validating transitions…");
+        const transitionPlan = _buildTransitionPlan();
+        if (transitionPlan === null) {
+            setSaveStatus("Save failed");
+            return;
         }
 
-        // Save back-edges stored as node annotations (not LiteGraph links)
-        for (const n of _graph._nodes) {
-            if (!n._backSources?.length) continue;
-            for (const be of n._backSources) {
-                await apiPost(`/pipelines/${_templateId}/transitions`, {
-                    from_stage_key: be.from_key,
-                    to_stage_key:   be.to_key,
-                    condition:      be.condition,
-                    priority:       10,
-                });
-            }
+        // === PHASE 4: ATOMIC TRANSITION REPLACEMENT ===
+        // Snapshot the current transition IDs BEFORE creating anything.
+        // New transitions are created FIRST so the graph is never in a zero-edge state.
+        // Old transitions are deleted only after all new ones are confirmed written.
+        setSaveStatus("Saving transitions…");
+        const existingTransitions = await apiGet(`/pipelines/${_templateId}/transitions`);
+
+        for (const payload of transitionPlan) {
+            await apiPost(`/pipelines/${_templateId}/transitions`, payload);
         }
+
+        // All new transitions written — now it is safe to remove the old ones.
+        await Promise.all(existingTransitions.map(t => apiDel(`/pipelines/${_templateId}/transitions/${t.id}`)));
 
         // Re-classify back edges after save
         classifyBackEdges();

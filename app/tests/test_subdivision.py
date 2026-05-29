@@ -507,22 +507,13 @@ class TestSubdivisionStrategyGuidance:
 # ============================================================
 
 class TestIntakeBuildTallySubdivide:
-    """The IntakePipeline._build_tally() method handles SUBDIVIDE_IDEA."""
+    """_intake_build_tally handles SUBDIVIDE_IDEA."""
 
     def test_build_tally_subdivide(self):
-        from app.agent._intake_pipeline import IntakePipeline
+        from app.agent.intake_stages import _intake_build_tally
 
-        pipeline = IntakePipeline(
-            task_id="test-1",
-            task_description="Big task",
-            task_title="Big task",
-            all_tasks=[],
-            budget_id=1,
-            llm_id=1,
-            project="TheMaestro",  # Required for static analysis
-        )
         # Two LLM stages vote SUBDIVIDE_IDEA; threshold = max(2, 2) = 2 → fires
-        pipeline.votes = [
+        votes = [
             {
                 "stage": "scope_analysis",
                 "verdict": "SUBDIVIDE_IDEA",
@@ -545,6 +536,6 @@ class TestIntakeBuildTallySubdivide:
             },
         ]
 
-        tally = pipeline._build_tally()
+        tally = _intake_build_tally("test-1", votes)
         assert tally["outcome"] == "subdivide"
         assert "SUBDIVIDE_IDEA" in tally.get("summary", "")

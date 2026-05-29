@@ -26,7 +26,8 @@
       "mcp__maestro__list_pending_merges",
       "mcp__maestro__get_gate_history",
       "mcp__maestro__get_budget_entry_full",
-      "mcp__maestro__get_scheduler_api_status"
+      "mcp__maestro__get_scheduler_api_status",
+      "Bash(migrate.bat migrate *)"
     ]
   },
   "enableAllProjectMcpServers": true,

@@ -67,23 +67,16 @@ def _run(coro):
         loop.close()
 
 
-def _patch_static(pipeline_instance):
-    """Monkey-patch _stage_static_analysis to avoid tree-sitter I/O."""
-    _STATIC_VOTE = {
-        "stage": "static_analysis",
-        "verdict": "LIKELY",
-        "confidence": 0.95,
-        "justification": "Clean static analysis.",
-        "raw_response": None,
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
-        "model": "static_analysis",
-    }
-
-    async def _mock_static(scope_vote):
-        return _STATIC_VOTE
-
-    pipeline_instance._stage_static_analysis = _mock_static
+_E2E_STATIC_VOTE = {
+    "stage": "static_analysis",
+    "verdict": "LIKELY",
+    "confidence": 0.95,
+    "justification": "Clean static analysis.",
+    "raw_response": None,
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "model": "static_analysis",
+}
 
 
 def _mock_client_cls(mock_llm):
@@ -163,23 +156,23 @@ def _sec_response_content(verdict: str, pt: int = 50, ct: int = 100) -> str:
 
 class TestIntakePipelineE2E:
     def _run_intake(self, scenario: str, *, budget_id=1, llm_id=1):
-        from app.agent._intake_pipeline import IntakePipeline
+        from app.agent.intake_stages import run_intake_pipeline
         from app.agent.mock_llm import MockLLM
 
         mock_llm = MockLLM(scenario=scenario)
 
         async def _go():
-            pipeline = IntakePipeline(
-                task_id="e2e-intake",
-                task_description="Add authentication endpoint",
-                task_title="Auth",
-                all_tasks=[],
-                project="TheMaestro",
-                llm_id=llm_id,
-                budget_id=budget_id,
-            )
-            _patch_static(pipeline)
-            return await pipeline.run()
+            with patch("app.agent.intake_stages._intake_static_analysis",
+                       new=AsyncMock(return_value=_E2E_STATIC_VOTE)):
+                return await run_intake_pipeline(
+                    task_id="e2e-intake",
+                    task_description="Add authentication endpoint",
+                    task_title="Auth",
+                    all_tasks=[],
+                    project="TheMaestro",
+                    llm_id=llm_id,
+                    budget_id=budget_id,
+                )
 
         with patch("httpx.AsyncClient", _mock_client_cls(mock_llm)):
             with patch("app.database.create_budget_entry", MagicMock()):
@@ -201,24 +194,24 @@ class TestIntakePipelineE2E:
 
 class TestIntakeBudgetEntries:
     def test_intake_budget_entries_recorded(self):
-        from app.agent._intake_pipeline import IntakePipeline
+        from app.agent.intake_stages import run_intake_pipeline
         from app.agent.mock_llm import MockLLM
 
         mock_llm = MockLLM(scenario="intake_all_pass")
         mock_create = MagicMock()
 
         async def _go():
-            pipeline = IntakePipeline(
-                task_id="e2e-budget",
-                task_description="Add authentication endpoint",
-                task_title="Auth",
-                all_tasks=[],
-                project="TheMaestro",
-                llm_id=1,
-                budget_id=1,
-            )
-            _patch_static(pipeline)
-            return await pipeline.run()
+            with patch("app.agent.intake_stages._intake_static_analysis",
+                       new=AsyncMock(return_value=_E2E_STATIC_VOTE)):
+                return await run_intake_pipeline(
+                    task_id="e2e-budget",
+                    task_description="Add authentication endpoint",
+                    task_title="Auth",
+                    all_tasks=[],
+                    project="TheMaestro",
+                    llm_id=1,
+                    budget_id=1,
+                )
 
         with patch("httpx.AsyncClient", _mock_client_cls(mock_llm)):
             with patch("app.database.create_budget_entry", mock_create):
@@ -274,23 +267,23 @@ class TestPlanningGateE2E:
 
 class TestBudgetIdEnforcement:
     def test_budget_id_enforcement_in_pipeline(self):
-        from app.agent._intake_pipeline import IntakePipeline
+        from app.agent.intake_stages import run_intake_pipeline
 
         async def _go():
-            pipeline = IntakePipeline(
-                task_id="enforcement-test",
-                task_description="Test",
-                task_title="Test",
-                all_tasks=[],
-                project="TheMaestro",
-                llm_id=1,
-                budget_id=None,  # Missing - should be enforced
-            )
-            _patch_static(pipeline)
-            return await pipeline.run()
+            with patch("app.agent.intake_stages._intake_static_analysis",
+                       new=AsyncMock(return_value=_E2E_STATIC_VOTE)):
+                return await run_intake_pipeline(
+                    task_id="enforcement-test",
+                    task_description="Test",
+                    task_title="Test",
+                    all_tasks=[],
+                    project="TheMaestro",
+                    llm_id=1,
+                    budget_id=None,  # Missing - should be enforced
+                )
 
         # call_llm raises ValueError for missing budget_id.
-        # IntakePipeline catches stage exceptions internally -> outcome is not "passed".
+        # intake stages catch stage exceptions internally -> outcome is not "passed".
         result = _run(_go())
         assert result["outcome"] != "passed"
 

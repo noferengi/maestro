@@ -1133,3 +1133,32 @@ def set_task_blocked_on_model(task_id: str, llm_id: int) -> None:
         logger.error("Error setting blocked_on_model for task %s: %s", task_id, e)
     finally:
         db.close()
+
+
+def get_tasks_with_pending_consultation(limit: int = 20) -> list:
+    """Return active tasks with a consultation_payload question but no hint set."""
+    import json
+    db = SessionLocal()
+    try:
+        tasks = (
+            db.query(Task)
+            .filter(
+                Task.is_active == True,
+                Task.consultation_payload.isnot(None),
+            )
+            .limit(limit * 3)  # over-fetch; filter in Python (JSONB extraction)
+            .all()
+        )
+        result = []
+        for task in tasks:
+            try:
+                cp = json.loads(task.consultation_payload or "{}")
+            except Exception:
+                continue
+            if cp.get("question") and not cp.get("hint"):
+                result.append(task)
+                if len(result) >= limit:
+                    break
+        return result
+    finally:
+        db.close()

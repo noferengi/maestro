@@ -103,44 +103,6 @@ AGENT_REGISTRY: dict[str, AgentSpec] = {
         executor_type="custom_python",
     ),
     # -------------------------------------------------------------------------
-    # Legacy SW Dev stage agents (custom_python — bespoke per-stage Python)
-    # -------------------------------------------------------------------------
-    "implementation_agent": AgentSpec(
-        cls=None,
-        display_name="Dev Orchestrator",
-        description="Parallel implementation orchestrator with test-suite gate",
-        gate_type="test_suite",
-        executor_type="custom_python",
-    ),
-    "review_agent": AgentSpec(
-        cls=None,
-        display_name="Conceptual Review",
-        description="Multi-agent code quality review",
-        gate_type="voting",
-        executor_type="custom_python",
-    ),
-    "optimization_agent": AgentSpec(
-        cls=None,
-        display_name="Optimization",
-        description="Performance and code quality optimization pipeline",
-        gate_type="single_pass",
-        executor_type="custom_python",
-    ),
-    "security_agent": AgentSpec(
-        cls=None,
-        display_name="Security Review",
-        description="Security vulnerability and compliance pipeline",
-        gate_type="voting",
-        executor_type="custom_python",
-    ),
-    "final_review_agent": AgentSpec(
-        cls=None,
-        display_name="Final Review",
-        description="Multi-stage final quality gate with virtual merge check",
-        gate_type="voting",
-        executor_type="custom_python",
-    ),
-    # -------------------------------------------------------------------------
     # Infrastructure nodes (executor_type="infrastructure" — default)
     # -------------------------------------------------------------------------
     "human_gate": AgentSpec(
@@ -246,6 +208,8 @@ AGENT_REGISTRY: dict[str, AgentSpec] = {
             "Runs a scoped MaestroLoop with worktree isolation and write access. "
             "Does not advance stage — the aggregator drives the parent forward."
         ),
+        # NOTE: dispatched via internal task type _psubagent_dangerous, not via
+        # stage_config.agent_type — this entry is for gallery display only.
         gate_type="none",
     ),
     "multiplier_node": AgentSpec(

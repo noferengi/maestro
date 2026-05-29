@@ -1,14 +1,14 @@
 """
-app/agent/planning.py
----------------------
-Planning pipeline for the PLANNING stage.
+app/agent/planning_utils.py
+---------------------------
+Planning pipeline utilities: survey, pitfall detection, consolidation.
 
-Sub-stages:
-  1. Codebase Survey - agentic loop (read-only tools, max N turns)
-  2. Best-of-N Design Generation - N parallel structured LLM calls
-  3. Design Review Panel - 3 parallel LLM reviewers
-  4. Pitfall Detection - deterministic + 1 LLM call
-  5. Plan Consolidation - 1 LLM call to merge winner + pitfall mitigations
+Module-level async functions drive the planning node executors registered in
+scheduler.py. Public entry points:
+
+  run_planning_survey()            — planning_survey_node
+  run_pitfall_detection()          — planning_pitfalls_node
+  run_consolidation_and_store()    — planning_consolidate_node
 
 Output: PlanningResult stored in planning_results table.
 """
@@ -182,90 +182,6 @@ def _is_simple_task(title: str, description: str, survey: str = "") -> bool:
     if "greenfield" in survey_l or ("empty" in survey_l and "project" in survey_l):
         return True
     return False
-
-
-def _extract_spec_constraints(description: str) -> str:
-    """Extract explicit algorithmic/design constraints from a task description.
-
-    Returns a bulleted list of constraints to inject into the design prompt,
-    or an empty string if none are detected.
-    """
-    if not description:
-        return ""
-
-    desc_lower = description.lower()
-    constraints: list[str] = []
-
-    constraint_signals = [
-        ("naive recursive", "Algorithm must be naive recursive — no memoization, no iteration"),
-        ("naive recursion", "Algorithm must be naive recursive — no memoization, no iteration"),
-        ("no memoization", "Memoization is explicitly forbidden"),
-        ("without memoization", "Memoization is explicitly forbidden"),
-        ("no caching", "Caching is explicitly forbidden"),
-        ("without caching", "Caching is explicitly forbidden"),
-        ("simple recursive", "Algorithm must be simple/naive recursive"),
-        ("do not use", "Explicit exclusion present — see description"),
-        ("must not use", "Explicit exclusion present — see description"),
-        ("intentionally not", "Intentional design constraint present — see description"),
-        ("explicitly", "Explicit constraint present — see description"),
-        ("keep it simple", "Implementation must remain simple — no unnecessary abstractions"),
-        ("greenfield", "This is a greenfield project — start from scratch, minimal structure only"),
-    ]
-
-    for signal, label in constraint_signals:
-        if signal in desc_lower:
-            constraints.append(f"• {label}")
-
-    if not constraints:
-        return ""
-
-    return (
-        "The task description contains BINDING design constraints:\n"
-        + "\n".join(constraints)
-        + "\n\nYou MUST respect these constraints. Do not 'improve' the design beyond what is asked."
-        + "\n\nIf the existing codebase already uses a forbidden approach (e.g. memoization exists"
-        " but is forbidden), write design_rationale to describe ONLY the target implementation."
-        " One sentence naming what you are replacing is fine (e.g. 'Replaces the existing"
-        " memoized implementation with naive recursion.'). After that, describe the target"
-        " design only — do not repeat the forbidden approach name."
-    )
-
-
-def _scan_existing_files(project_root: str, survey_text: str) -> list[str]:
-    """Return a list of existing source files in the project root (up to 30).
-
-    Used to warn the design LLM that the project is not greenfield.
-    Skips hidden dirs, venv, __pycache__, node_modules.
-    """
-    import os
-
-    _SKIP_DIRS = frozenset({
-        "venv", ".venv", "env", "__pycache__", "node_modules", ".git",
-        ".archive", ".maestro-worktrees", "dist", "build", ".eggs",
-        "site-packages", ".mypy_cache", ".pytest_cache", ".ruff_cache",
-    })
-    found: list[str] = []
-
-    try:
-        for root, dirs, files in os.walk(project_root):
-            dirs[:] = [
-                d for d in dirs
-                if d not in _SKIP_DIRS and not d.startswith(".")
-            ]
-            rel_root = os.path.relpath(root, project_root)
-            for fname in files:
-                if fname.startswith("."):
-                    continue
-                rel = os.path.join(rel_root, fname).replace("\\", "/")
-                if rel.startswith("./"):
-                    rel = rel[2:]
-                found.append(rel)
-                if len(found) >= 30:
-                    return found
-    except Exception:
-        pass
-
-    return found
 
 
 # Design personas for formal-proof / theorem-proving tasks.  Replaces the SW-dev
@@ -459,609 +375,573 @@ def _get_survey_tool_schemas(*, is_proof: bool = False) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Pipeline class
+# Private helpers
 # ---------------------------------------------------------------------------
 
-class PlanningPipeline:
-    """Orchestrates the planning pipeline for a single task."""
+def _get_arch_ctx(project_name: str | None) -> str:
+    if not project_name:
+        return ""
+    try:
+        from app.agent.project_snapshot import build_architecture_context
+        return build_architecture_context(project_name, agent_type="planning") or ""
+    except Exception:
+        return ""
 
-    def __init__(
-        self,
-        task_id: str,
-        task_title: str,
-        task_description: str,
-        all_tasks: list[dict],
-        *,
-        llm_base_url: str | None = None,
-        llm_model: str | None = None,
-        llm_id: int | None = None,
-        budget_id: int | None = None,
-        max_context: int | None = None,
-        run_row_id: int | None = None,
-        project_name: str | None = None,
-        project_root: str | None = None,
-        prior_failure_context: list | None = None,
-    ):
-        self.task_id = task_id
-        self.task_title = task_title
-        self.task_description = task_description
-        self.all_tasks = all_tasks
-        self.llm_base_url = llm_base_url
-        self.llm_model = llm_model
-        self.llm_id = llm_id
-        self.budget_id = budget_id
-        self.max_context = max_context
-        self.run_row_id = run_row_id
-        self.project_name = project_name
-        self.project_root = project_root
-        self.prior_failure_context = prior_failure_context or []
-        self._total_prompt = 0
-        self._total_completion = 0
-        self._stage_cfg: dict = {}
-        try:
-            from app.agent.pipeline_router import get_stage_config as _gsc
-            _sc = _gsc(task_id)
-            self._stage_cfg = (_sc.config or {}) if _sc else {}
-        except Exception:
-            pass
-        # If stage config defines per-persona overrides, build a matching list of (label, concern) tuples
-        _cfg_personas = self._stage_cfg.get("personas")
-        self._config_personas: list[tuple[str, str]] | None = (
-            [(p["name"], p["system_prompt"]) for p in _cfg_personas if p.get("name") and p.get("system_prompt")]
-            if _cfg_personas else None
+
+def _get_stage_cfg(task_id: str) -> dict:
+    try:
+        from app.agent.pipeline_router import get_stage_config as _gsc
+        _sc = _gsc(task_id)
+        return (_sc.config or {}) if _sc else {}
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Standalone stage functions
+# ---------------------------------------------------------------------------
+
+async def _planning_codebase_survey(
+    task_id: str,
+    task_title: str,
+    task_description: str,
+    *,
+    llm_base_url: str | None,
+    llm_model: str | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    max_context: int | None,
+    stage_cfg: dict,
+    is_proof: bool,
+    arch_ctx: str,
+) -> str:
+    """Run an agentic loop with read-only tools to survey the codebase."""
+    from app.agent.tools import dispatch_tool, _restrict_reads_to_root as _survey_root_flag
+
+    _task_ctx = f"\n\nTask: {task_title}\nDescription: {task_description}" + (f"\n\n{arch_ctx}" if arch_ctx else "")
+    if is_proof:
+        _base = stage_cfg.get("system_prompt_proof") or (
+            "You are a formal-proof surveyor. Your job is to gather the information "
+            "a proof designer needs: what Mathlib already provides, what the mathematical "
+            "strategy should be, and what project structure (if any) already exists.\n\n"
+            "WORKFLOW:\n"
+            "1. Check whether any Lean/proof files already exist with list_directory / find_files.\n"
+            "2. If the project is EMPTY (no .lean files), that is EXPECTED — skip immediately to step 3.\n"
+            "3. Call list_mathlib_topics() to see available topic areas, then use search_mathlib for the "
+            "specific lemmas you need. For Fermat's Little Theorem or modular arithmetic tasks, "
+            "search for terms like 'ZMod', 'Finset.card', 'ZMod.pow_card_sub_one_eq_one', "
+            "'Nat.Prime', 'Finset.prod_pow_eq_pow_sum'. "
+            "Run 2-4 targeted searches covering the key lemmas you expect to need.\n"
+            "4. Optionally use search_arxiv if a literature reference would sharpen the proof strategy.\n"
+            "5. Once you have identified the relevant Mathlib lemmas and understand the proof strategy, "
+            "call submit_work(signal='ACCEPTED', summary='<your findings>') to finish the survey.\n\n"
+            "GREENFIELD SHORTCUT — if list_directory shows no .lean files, do NOT keep searching "
+            "the filesystem. Go directly to list_mathlib_topics(), then search_mathlib."
         )
-        # Set in run() after the survey, used by _stage_design_review
-        self._is_simple: bool = False
-        self._is_proof: bool = False
-        self._effective_best_of_n: int = PLANNING_BEST_OF_N
-        # Lazily computed architecture context (cached on first access)
-        self.__arch_ctx: str | None = None
+        # Cheatsheet is always appended (dynamic, not stored in stage config)
+        system_prompt = _base + "\n\n" + _cheatsheet() + _task_ctx
+        user_content = (
+            "Survey the proof environment. Check for existing .lean files, then search Mathlib "
+            "for the key lemmas this proof will need. When done, call submit_work to finish."
+        )
+    else:
+        _base = stage_cfg.get("system_prompt") or (
+            "You are a codebase surveyor. Your job is to understand the existing code "
+            "structure relevant to the following task.\n\n"
+            "WORKFLOW:\n"
+            "1. Use tools to read 3-8 key files most relevant to the task.\n"
+            "2. Once you have a clear picture of the existing structure, STOP reading "
+            "and synthesize your findings.\n"
+            "3. Call submit_work(signal='ACCEPTED', summary='<your findings>') to finish. "
+            "Alternatively, output a message starting with 'SURVEY_COMPLETE:' followed by "
+            "your summary.\n\n"
+            "GREENFIELD SHORTCUT — if list_directory shows the project is empty, call "
+            "submit_work immediately with summary='Greenfield project — no existing files.'\n\n"
+            "SYNTHESIS TRIGGERS — finish when ANY of these are true:\n"
+            "- You have read 5+ files and understand the relevant interfaces.\n"
+            "- You have confirmed the relevant modules and their responsibilities.\n"
+            "- You have identified what needs to change and what can be reused."
+        )
+        system_prompt = _base + _task_ctx
+        user_content = (
+            "Survey the codebase. Focus only on files most relevant to this task. "
+            "Read 3-8 key files, then call submit_work to finish. "
+            "Do not exhaustively read every file — stop once you understand the key structure."
+        )
 
-    @property
-    def _arch_ctx(self) -> str:
-        if self.__arch_ctx is None:
-            if not self.project_name:
-                self.__arch_ctx = ""
-            else:
-                try:
-                    from app.agent.project_snapshot import build_architecture_context
-                    self.__arch_ctx = build_architecture_context(
-                        self.project_name, agent_type="planning"
-                    ) or ""
-                except Exception:
-                    self.__arch_ctx = ""
-        return self.__arch_ctx
+    messages: list[dict] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
 
-    # run() removed — planning pipeline is now driven by individual node executors
-    # (planning_survey_node, multiplier_node, pitfall_node, consolidation_node,
-    # planning_gate_node) registered in scheduler.py.  All remaining methods below
-    # are still used by those executors via run_planning_survey / run_pitfall_detection
-    # / run_consolidation_and_store entry points.
+    tool_schemas = _get_survey_tool_schemas(is_proof=is_proof)
+    survey_result = ""
+    content = ""
+    _ctx_warned: set[float] = set()
+    _turn_warned: set[int] = set()
 
-    # ------------------------------------------------------------------
-    # Stage 1: Codebase Survey (entry: run_planning_survey)
-    # ------------------------------------------------------------------
-    #
-    # NOTE: The original Stage 1 comment block has been merged here.
-    # _stage_codebase_survey is called directly by run_planning_survey().
-    # ------------------------------------------------------------------
+    # Repetition guard: track (tool_name, arguments_hash)
+    _tool_call_history: set[tuple[str, str]] = set()
 
-    async def _stage_codebase_survey(self) -> str:
-        """Run an agentic loop with read-only tools to survey the codebase."""
-        from app.agent.tools import dispatch_tool, _restrict_reads_to_root as _survey_root_flag
+    # RC5: Restrict absolute-path reads to this project's root for the survey phase.
+    # Prevents the LLM from wandering into unrelated project trees on the same machine.
+    _root_token = _survey_root_flag.set(True)
+    try:
+        for turn in range(PLANNING_SURVEY_MAX_TURNS):
+            if is_shutting_down():
+                raise ShutdownError("Server is shutting down")
 
-        _arch = self._arch_ctx
+            # Context saturation check
+            if check_context_saturation(
+                response.get("usage", {}).get("prompt_tokens", 0) if turn > 0 else 0,
+                max_context or 0,
+                _ctx_warned,
+                messages,
+            ):
+                logger.warning("Planning survey context saturation (turn %d) - terminating", turn)
+                break
 
-        _task_ctx = f"\n\nTask: {self.task_title}\nDescription: {self.task_description}" + (f"\n\n{_arch}" if _arch else "")
-        if self._is_proof:
-            _base = self._stage_cfg.get("system_prompt_proof") or (
-                "You are a formal-proof surveyor. Your job is to gather the information "
-                "a proof designer needs: what Mathlib already provides, what the mathematical "
-                "strategy should be, and what project structure (if any) already exists.\n\n"
-                "WORKFLOW:\n"
-                "1. Check whether any Lean/proof files already exist with list_directory / find_files.\n"
-                "2. If the project is EMPTY (no .lean files), that is EXPECTED — skip immediately to step 3.\n"
-                "3. Call list_mathlib_topics() to see available topic areas, then use search_mathlib for the "
-                "specific lemmas you need. For Fermat's Little Theorem or modular arithmetic tasks, "
-                "search for terms like 'ZMod', 'Finset.card', 'ZMod.pow_card_sub_one_eq_one', "
-                "'Nat.Prime', 'Finset.prod_pow_eq_pow_sum'. "
-                "Run 2-4 targeted searches covering the key lemmas you expect to need.\n"
-                "4. Optionally use search_arxiv if a literature reference would sharpen the proof strategy.\n"
-                "5. Once you have identified the relevant Mathlib lemmas and understand the proof strategy, "
-                "call submit_work(signal='ACCEPTED', summary='<your findings>') to finish the survey.\n\n"
-                "GREENFIELD SHORTCUT — if list_directory shows no .lean files, do NOT keep searching "
-                "the filesystem. Go directly to list_mathlib_topics(), then search_mathlib."
-            )
-            # Cheatsheet is always appended (dynamic, not stored in stage config)
-            system_prompt = _base + "\n\n" + _cheatsheet() + _task_ctx
-            user_content = (
-                "Survey the proof environment. Check for existing .lean files, then search Mathlib "
-                "for the key lemmas this proof will need. When done, call submit_work to finish."
-            )
-        else:
-            _base = self._stage_cfg.get("system_prompt") or (
-                "You are a codebase surveyor. Your job is to understand the existing code "
-                "structure relevant to the following task.\n\n"
-                "WORKFLOW:\n"
-                "1. Use tools to read 3-8 key files most relevant to the task.\n"
-                "2. Once you have a clear picture of the existing structure, STOP reading "
-                "and synthesize your findings.\n"
-                "3. Call submit_work(signal='ACCEPTED', summary='<your findings>') to finish. "
-                "Alternatively, output a message starting with 'SURVEY_COMPLETE:' followed by "
-                "your summary.\n\n"
-                "GREENFIELD SHORTCUT — if list_directory shows the project is empty, call "
-                "submit_work immediately with summary='Greenfield project — no existing files.'\n\n"
-                "SYNTHESIS TRIGGERS — finish when ANY of these are true:\n"
-                "- You have read 5+ files and understand the relevant interfaces.\n"
-                "- You have confirmed the relevant modules and their responsibilities.\n"
-                "- You have identified what needs to change and what can be reused."
-            )
-            system_prompt = _base + _task_ctx
-            user_content = (
-                "Survey the codebase. Focus only on files most relevant to this task. "
-                "Read 3-8 key files, then call submit_work to finish. "
-                "Do not exhaustively read every file — stop once you understand the key structure."
+            # Turn saturation check
+            from app.agent.config import check_turn_saturation
+            if check_turn_saturation(
+                turn, PLANNING_SURVEY_MAX_TURNS, _turn_warned, messages
+            ):
+                pass
+
+            response = await call_llm(
+                messages,
+                base_url=llm_base_url,
+                model=llm_model,
+                tools=tool_schemas,
+                task_id=task_id,
+                llm_id=llm_id,
+                budget_id=budget_id,
+                agent_name=AGENT_NAME,
             )
 
-        messages: list[dict] = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ]
+            # Context saturation check
+            if check_context_saturation(
+                response.get("usage", {}).get("prompt_tokens", 0),
+                max_context or 0,
+                _ctx_warned,
+                messages,
+            ):
+                logger.warning(f"[{AGENT_NAME}] Survey context saturation (turn %d) - terminating", turn + 1)
+                break
+            choice = response.get("choices", [{}])[0]
+            msg = choice.get("message", {})
+            content = msg.get("content", "")
+            tool_calls = msg.get("tool_calls", [])
 
-        tool_schemas = _get_survey_tool_schemas(is_proof=self._is_proof)
-        survey_result = ""
-        content = ""
-        _ctx_warned: set[float] = set()
-        _turn_warned: set[int] = set()
-        
-        # Repetition guard: track (tool_name, arguments_hash)
-        _tool_call_history: set[tuple[str, str]] = set()
+            messages.append(msg)
 
-        # RC5: Restrict absolute-path reads to this project's root for the survey phase.
-        # Prevents the LLM from wandering into unrelated project trees on the same machine.
-        _root_token = _survey_root_flag.set(True)
-        try:
-            for turn in range(PLANNING_SURVEY_MAX_TURNS):
-                if is_shutting_down():
-                    raise ShutdownError("Server is shutting down")
+            # Check for completion signal
+            if content and "SURVEY_COMPLETE:" in content:
+                survey_result = content.split("SURVEY_COMPLETE:", 1)[1].strip()
+                logger.info(f"[{AGENT_NAME}] Survey completed at turn %d/%d",
+                            turn + 1, PLANNING_SURVEY_MAX_TURNS)
+                break
 
-                # Context saturation check
-                if check_context_saturation(
-                    response.get("usage", {}).get("prompt_tokens", 0) if turn > 0 else 0,
-                    self.max_context or 0,
-                    _ctx_warned,
-                    messages,
-                ):
-                    logger.warning("Planning survey context saturation (turn %d) - terminating", turn)
-                    break
+            # Dispatch tool calls
+            if tool_calls:
+                for tc in tool_calls:
+                    fn_name = tc["function"]["name"]
+                    fn_args_raw = tc["function"]["arguments"]
 
-                # Turn saturation check
-                from app.agent.config import check_turn_saturation
-                if check_turn_saturation(
-                    turn, PLANNING_SURVEY_MAX_TURNS, _turn_warned, messages
-                ):
-                    pass
+                    # Guard: Check for repeated tool calls with same args
+                    args_str = json.dumps(fn_args_raw, sort_keys=True)
+                    call_key = (fn_name, args_str)
+                    if call_key in _tool_call_history:
+                        logger.warning(
+                            f"[{AGENT_NAME}] Repetitive tool call detected: %s(%s). Breaking survey loop.",
+                            fn_name, args_str
+                        )
+                        survey_result = content or "Survey terminated due to tool call loop."
+                        break
+                    _tool_call_history.add(call_key)
 
-                response = await call_llm(
-                    messages,
-                    base_url=self.llm_base_url,
-                    model=self.llm_model,
-                    tools=tool_schemas,
-                    task_id=self.task_id,
-                    llm_id=self.llm_id,
-                    budget_id=self.budget_id,
-                    agent_name=AGENT_NAME,
-                )
-
-                self._track_tokens(response)
-
-                # Context saturation check
-                if check_context_saturation(
-                    response.get("usage", {}).get("prompt_tokens", 0),
-                    self.max_context or 0,
-                    _ctx_warned,
-                    messages,
-                ):
-                    logger.warning(f"[{AGENT_NAME}] Survey context saturation (turn %d) - terminating", turn + 1)
-                    break
-                choice = response.get("choices", [{}])[0]
-                msg = choice.get("message", {})
-                content = msg.get("content", "")
-                tool_calls = msg.get("tool_calls", [])
-
-                messages.append(msg)
-
-                # Check for completion signal
-                if content and "SURVEY_COMPLETE:" in content:
-                    survey_result = content.split("SURVEY_COMPLETE:", 1)[1].strip()
-                    logger.info(f"[{AGENT_NAME}] Survey completed at turn %d/%d",
-                                turn + 1, PLANNING_SURVEY_MAX_TURNS)
-                    break
-
-                # Dispatch tool calls
-                if tool_calls:
-                    for tc in tool_calls:
-                        fn_name = tc["function"]["name"]
-                        fn_args_raw = tc["function"]["arguments"]
-                        
-                        # Guard: Check for repeated tool calls with same args
-                        args_str = json.dumps(fn_args_raw, sort_keys=True)
-                        call_key = (fn_name, args_str)
-                        if call_key in _tool_call_history:
-                            logger.warning(
-                                f"[{AGENT_NAME}] Repetitive tool call detected: %s(%s). Breaking survey loop.",
-                                fn_name, args_str
-                            )
-                            survey_result = content or "Survey terminated due to tool call loop."
-                            break
-                        _tool_call_history.add(call_key)
-
-                        try:
-                            fn_args = fn_args_raw if isinstance(fn_args_raw, dict) else json.loads(fn_args_raw)
-                        except json.JSONDecodeError as e:
-                            logger.warning(
-                                f"[{AGENT_NAME}] Malformed tool call args for %s: %s — skipping call",
-                                fn_name, e,
-                            )
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tc["id"],
-                                "content": f"Error: malformed arguments JSON — {e}",
-                            })
-                            continue
-                        try:
-                            result = dispatch_tool(fn_name, fn_args)
-                        except Exception as e:
-                            result = f"Error: {e}"
-                        result_str = str(result)
-
-                        # submit_work terminal signal — extract summary and end survey.
-                        # Parse from untruncated `result` so a long summary doesn't
-                        # silently truncate the JSON and cause the loop to continue.
-                        if fn_name == "submit_work":
-                            try:
-                                _terminal = json.loads(str(result))
-                                if _terminal.get("__maestro_terminal__"):
-                                    survey_result = _terminal.get("summary", result_str)
-                                    logger.info(
-                                        "[%s] Survey ended via submit_work at turn %d",
-                                        AGENT_NAME, turn + 1,
-                                    )
-                                    messages.append({
-                                        "role": "tool",
-                                        "tool_call_id": tc["id"],
-                                        "content": result_str,
-                                    })
-                                    break
-                            except (json.JSONDecodeError, AttributeError):
-                                pass
-
-                        logger.debug(f"[{AGENT_NAME}] Survey turn %d: %s(%s) → %d chars",
-                                     turn + 1, fn_name,
-                                     ", ".join(f"{k}={v!r}" for k, v in fn_args.items()),
-                                     len(result_str))
+                    try:
+                        fn_args = fn_args_raw if isinstance(fn_args_raw, dict) else json.loads(fn_args_raw)
+                    except json.JSONDecodeError as e:
+                        logger.warning(
+                            f"[{AGENT_NAME}] Malformed tool call args for %s: %s — skipping call",
+                            fn_name, e,
+                        )
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tc["id"],
-                            "content": result_str,
+                            "content": f"Error: malformed arguments JSON — {e}",
                         })
+                        continue
+                    try:
+                        result = dispatch_tool(fn_name, fn_args)
+                    except Exception as e:
+                        result = f"Error: {e}"
+                    result_str = str(result)
 
-                    if survey_result:  # Loop broken by submit_work or repetition guard
-                        break
-                elif not content:
+                    # submit_work terminal signal — extract summary and end survey.
+                    # Parse from untruncated `result` so a long summary doesn't
+                    # silently truncate the JSON and cause the loop to continue.
+                    if fn_name == "submit_work":
+                        try:
+                            _terminal = json.loads(str(result))
+                            if _terminal.get("__maestro_terminal__"):
+                                survey_result = _terminal.get("summary", result_str)
+                                logger.info(
+                                    "[%s] Survey ended via submit_work at turn %d",
+                                    AGENT_NAME, turn + 1,
+                                )
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tc["id"],
+                                    "content": result_str,
+                                })
+                                break
+                        except (json.JSONDecodeError, AttributeError):
+                            pass
+
+                    logger.debug(f"[{AGENT_NAME}] Survey turn %d: %s(%s) → %d chars",
+                                 turn + 1, fn_name,
+                                 ", ".join(f"{k}={v!r}" for k, v in fn_args.items()),
+                                 len(result_str))
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": result_str,
+                    })
+
+                if survey_result:  # Loop broken by submit_work or repetition guard
                     break
-        finally:
-            _survey_root_flag.reset(_root_token)
+            elif not content:
+                break
+    finally:
+        _survey_root_flag.reset(_root_token)
 
-        if not survey_result:
-            logger.warning(
-                f"[{AGENT_NAME}] Survey exhausted %d turns without SURVEY_COMPLETE signal. "
-                "Using last LLM response (%d chars) as fallback — design quality may be reduced.",
-                PLANNING_SURVEY_MAX_TURNS, len(content),
-            )
-            survey_result = content or "Survey completed without explicit summary."
+    if not survey_result:
+        logger.warning(
+            f"[{AGENT_NAME}] Survey exhausted %d turns without SURVEY_COMPLETE signal. "
+            "Using last LLM response (%d chars) as fallback — design quality may be reduced.",
+            PLANNING_SURVEY_MAX_TURNS, len(content),
+        )
+        survey_result = content or "Survey completed without explicit summary."
 
-        logger.info(f"[{AGENT_NAME}] Codebase survey completed (%d chars)", len(survey_result))
-        return survey_result
+    logger.info(f"[{AGENT_NAME}] Codebase survey completed (%d chars)", len(survey_result))
+    return survey_result
 
-    # ------------------------------------------------------------------
-    # Stage 4: Pitfall Detection
-    # ------------------------------------------------------------------
 
-    async def _stage_pitfall_detection(
-        self, design: dict, survey: str
-    ) -> list[dict]:
-        """Deterministic checks + LLM edge case detection."""
-        pitfalls: list[dict] = []
+async def _planning_pitfall_detection(
+    task_id: str,
+    design: dict,
+    survey: str,
+    *,
+    llm_base_url: str | None,
+    llm_model: str | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    stage_cfg: dict,
+    is_proof: bool,
+    arch_ctx: str,
+) -> list[dict]:
+    """Deterministic checks + LLM edge case detection."""
+    pitfalls: list[dict] = []
 
-        # Deterministic: check dependency graph for cycles
-        dep_graph = design.get("dependency_graph", {})
-        if dep_graph:
-            from app.agent.static_analysis import _detect_cycles
-            cycles = _detect_cycles(dep_graph)
-            if cycles:
-                for cycle in cycles:
-                    pitfalls.append({
-                        "type": "circular_dependency",
-                        "severity": "high",
-                        "detail": f"Circular dependency: {' -> '.join(cycle)}",
-                    })
+    # Deterministic: check dependency graph for cycles
+    dep_graph = design.get("dependency_graph", {})
+    if dep_graph:
+        from app.agent.static_analysis import _detect_cycles
+        cycles = _detect_cycles(dep_graph)
+        if cycles:
+            for cycle in cycles:
+                pitfalls.append({
+                    "type": "circular_dependency",
+                    "severity": "high",
+                    "detail": f"Circular dependency: {' -> '.join(cycle)}",
+                })
 
-        # Deterministic: file path safety
-        from app.agent.tools import _assert_safe_path
-        for entry in design.get("file_manifest", []):
-            path = entry.get("path", "")
-            if path:
-                try:
-                    # Pass path directly — _assert_safe_path uses set_task_git_cwd effective root.
-                    _assert_safe_path(path)
-                except ValueError as e:
-                    pitfalls.append({
-                        "type": "unsafe_path",
-                        "severity": "critical",
-                        "detail": str(e),
-                    })
+    # Deterministic: file path safety
+    from app.agent.tools import _assert_safe_path
+    for entry in design.get("file_manifest", []):
+        path = entry.get("path", "")
+        if path:
+            try:
+                # Pass path directly — _assert_safe_path uses set_task_git_cwd effective root.
+                _assert_safe_path(path)
+            except ValueError as e:
+                pitfalls.append({
+                    "type": "unsafe_path",
+                    "severity": "critical",
+                    "detail": str(e),
+                })
 
-        # LLM: edge case detection
-        _arch = self._arch_ctx
-        if self._is_proof:
-            _pitfall_system = self._stage_cfg.get("system_prompt_proof") or "You are a formal-proof quality reviewer. Use submit_work to output pitfalls."
-            _pitfall_focus = (
-                "Look for: missing helper lemmas, proof obligations without a clear tactic, "
-                "`sorry` placeholders in the plan, import paths that don't exist in Mathlib, "
-                "name clashes with existing Mathlib theorems, universe level mismatches, "
-                "overly complex tactic chains that are likely to fail."
-            )
-        else:
-            _pitfall_system = self._stage_cfg.get("system_prompt") or "You are a software quality analyst. Use submit_work to output pitfalls when ready."
-            _pitfall_focus = (
-                "Look for: edge cases, implicit dependencies, race conditions, "
-                "state management issues, migration risks."
-            )
-        prompt = (
-            (f"{_arch}\n\n" if _arch else "")
-            + "Analyze this design for potential pitfalls:\n"
-            f"{json.dumps(design, indent=1, ensure_ascii=True)}\n\n"
-            f"{_pitfall_focus}\n"
-            "To output pitfalls, call the submit_work tool with:\n"
-            "payload={\"pitfalls\": [{\"type\": \"...\", \"severity\": \"low|medium|high|critical\", \"detail\": \"...\"}]}"
+    # LLM: edge case detection
+    if is_proof:
+        _pitfall_system = stage_cfg.get("system_prompt_proof") or "You are a formal-proof quality reviewer. Use submit_work to output pitfalls."
+        _pitfall_focus = (
+            "Look for: missing helper lemmas, proof obligations without a clear tactic, "
+            "`sorry` placeholders in the plan, import paths that don't exist in Mathlib, "
+            "name clashes with existing Mathlib theorems, universe level mismatches, "
+            "overly complex tactic chains that are likely to fail."
+        )
+    else:
+        _pitfall_system = stage_cfg.get("system_prompt") or "You are a software quality analyst. Use submit_work to output pitfalls when ready."
+        _pitfall_focus = (
+            "Look for: edge cases, implicit dependencies, race conditions, "
+            "state management issues, migration risks."
+        )
+    prompt = (
+        (f"{arch_ctx}\n\n" if arch_ctx else "")
+        + "Analyze this design for potential pitfalls:\n"
+        f"{json.dumps(design, indent=1, ensure_ascii=True)}\n\n"
+        f"{_pitfall_focus}\n"
+        "To output pitfalls, call the submit_work tool with:\n"
+        "payload={\"pitfalls\": [{\"type\": \"...\", \"severity\": \"low|medium|high|critical\", \"detail\": \"...\"}]}"
+    )
+
+    from app.agent.tools import build_tool_schemas, dispatch_tool
+    pitfall_tools = build_tool_schemas(["submit_work"])
+
+    try:
+        response = await call_llm(
+            [
+                {"role": "system", "content": _pitfall_system},
+                {"role": "user", "content": prompt},
+            ],
+            base_url=llm_base_url,
+            model=llm_model,
+            tools=pitfall_tools,
+            tool_choice="auto",
+            task_id=task_id,
+            llm_id=llm_id,
+            budget_id=budget_id,
+            agent_name=AGENT_NAME,
         )
 
-        from app.agent.tools import build_tool_schemas, dispatch_tool
-        pitfall_tools = build_tool_schemas(["submit_work"])
+        assistant_msg = response.get("choices", [{}])[0].get("message", {})
+        tool_calls = assistant_msg.get("tool_calls") or []
 
-        try:
-            response = await call_llm(
-                [
-                    {"role": "system", "content": _pitfall_system},
-                    {"role": "user", "content": prompt},
-                ],
-                base_url=self.llm_base_url,
-                model=self.llm_model,
-                tools=pitfall_tools,
-                tool_choice="auto",
-                task_id=self.task_id,
-                llm_id=self.llm_id,
-                budget_id=self.budget_id,
-                agent_name=AGENT_NAME,
-            )
-            self._track_tokens(response)
-            
-            assistant_msg = response.get("choices", [{}])[0].get("message", {})
-            tool_calls = assistant_msg.get("tool_calls") or []
-            
-            data = None
-            if tool_calls:
-                for tc in tool_calls:
-                    tc_result = dispatch_tool(
-                        tc["function"]["name"],
-                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
-                    )
-                    if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
-                        data = json.loads(tc_result).get("payload")
-                        break
-            
-            if data is None:
-                # Fallback
-                content = assistant_msg.get("content", "")
-                data, _ = json.JSONDecoder().raw_decode(content.lstrip())
-            
-            pitfalls.extend(data.get("pitfalls", []))
-        except Exception as e:
-            logger.warning(f"[{AGENT_NAME}] Pitfall LLM check failed: %s", e)
+        data = None
+        if tool_calls:
+            for tc in tool_calls:
+                tc_result = dispatch_tool(
+                    tc["function"]["name"],
+                    json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                )
+                if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
+                    data = json.loads(tc_result).get("payload")
+                    break
 
-        return pitfalls
+        if data is None:
+            # Fallback
+            content = assistant_msg.get("content", "")
+            data, _ = json.JSONDecoder().raw_decode(content.lstrip())
 
-    # ------------------------------------------------------------------
-    # Stage 5: Plan Consolidation
-    # ------------------------------------------------------------------
+        pitfalls.extend(data.get("pitfalls", []))
+    except Exception as e:
+        logger.warning(f"[{AGENT_NAME}] Pitfall LLM check failed: %s", e)
 
-    async def _stage_consolidation(
-        self, design: dict, pitfalls: list[dict], survey: str
-    ) -> dict:
-        """Merge the winning design with pitfall mitigations."""
-        if not pitfalls:
-            return design
+    return pitfalls
 
-        _arch = self._arch_ctx
-        prompt = (
-            (f"{_arch}\n\n" if _arch else "")
-            + "You have a winning design and identified pitfalls. "
-            "Produce a consolidated final design that incorporates mitigations "
-            "for the identified pitfalls. Use the submit_work tool to output the result.\n\n"
-            f"Original design:\n{json.dumps(design, indent=1, ensure_ascii=True)}\n\n"
-            f"Pitfalls:\n{json.dumps(pitfalls, indent=1, ensure_ascii=True)}"
+
+async def _planning_consolidation(
+    task_id: str,
+    design: dict,
+    pitfalls: list[dict],
+    survey: str,
+    *,
+    llm_base_url: str | None,
+    llm_model: str | None,
+    llm_id: int | None,
+    budget_id: int | None,
+    stage_cfg: dict,
+    is_proof: bool,
+    arch_ctx: str,
+) -> tuple[dict, int, int]:
+    """Merge the winning design with pitfall mitigations.
+
+    Returns (consolidated_design, prompt_tokens, completion_tokens).
+    """
+    if not pitfalls:
+        return design, 0, 0
+
+    prompt = (
+        (f"{arch_ctx}\n\n" if arch_ctx else "")
+        + "You have a winning design and identified pitfalls. "
+        "Produce a consolidated final design that incorporates mitigations "
+        "for the identified pitfalls. Use the submit_work tool to output the result.\n\n"
+        f"Original design:\n{json.dumps(design, indent=1, ensure_ascii=True)}\n\n"
+        f"Pitfalls:\n{json.dumps(pitfalls, indent=1, ensure_ascii=True)}"
+    )
+
+    from app.agent.tools import build_tool_schemas, dispatch_tool
+    consol_tools = build_tool_schemas(["submit_work"])
+
+    _consol_system = (
+        stage_cfg.get("system_prompt_proof") or "You are a formal proof specialist. Use submit_work to output the final proof design."
+        if is_proof
+        else stage_cfg.get("system_prompt") or "You are a software architect. Use submit_work to output the final design."
+    )
+
+    try:
+        response = await call_llm(
+            [
+                {"role": "system", "content": _consol_system},
+                {"role": "user", "content": prompt},
+            ],
+            base_url=llm_base_url,
+            model=llm_model,
+            tools=consol_tools,
+            tool_choice="auto",
+            task_id=task_id,
+            llm_id=llm_id,
+            budget_id=budget_id,
+            agent_name=AGENT_NAME,
         )
 
-        from app.agent.tools import build_tool_schemas, dispatch_tool
-        consol_tools = build_tool_schemas(["submit_work"])
-
-        _consol_system = (
-            self._stage_cfg.get("system_prompt_proof") or "You are a formal proof specialist. Use submit_work to output the final proof design."
-            if self._is_proof
-            else self._stage_cfg.get("system_prompt") or "You are a software architect. Use submit_work to output the final design."
-        )
-
-        try:
-            response = await call_llm(
-                [
-                    {"role": "system", "content": _consol_system},
-                    {"role": "user", "content": prompt},
-                ],
-                base_url=self.llm_base_url,
-                model=self.llm_model,
-                tools=consol_tools,
-                tool_choice="auto",
-                task_id=self.task_id,
-                llm_id=self.llm_id,
-                budget_id=self.budget_id,
-                agent_name=AGENT_NAME,
-            )
-            self._track_tokens(response)
-            
-            assistant_msg = response.get("choices", [{}])[0].get("message", {})
-            tool_calls = assistant_msg.get("tool_calls") or []
-            
-            result = None
-            if tool_calls:
-                for tc in tool_calls:
-                    tc_result = dispatch_tool(
-                        tc["function"]["name"],
-                        json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
-                    )
-                    if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
-                        result = json.loads(tc_result).get("payload")
-                        break
-            
-            if result is None:
-                # Fallback
-                content = assistant_msg.get("content", "")
-                result, _ = json.JSONDecoder().raw_decode(content.lstrip())
-            
-            return result
-        except Exception as e:
-            logger.warning(f"[{AGENT_NAME}] Consolidation failed: %s. Using original design.", e)
-            return design
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _track_tokens(self, response: dict) -> None:
         usage = response.get("usage", {})
-        self._total_prompt += usage.get("prompt_tokens", 0)
-        self._total_completion += usage.get("completion_tokens", 0)
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
 
-    def _build_result(
-        self, consolidated: dict, all_designs: list[dict],
-        selected_index: int, review_votes: list[Vote],
-        pitfalls: list[dict], survey: str,
-        passed: bool = True,
-    ) -> PlanningResult:
-        # Parse file manifest
-        file_manifest = []
-        for entry in consolidated.get("file_manifest", []):
-            file_manifest.append(FileManifestEntry(
-                path=entry.get("path", ""),
-                action=entry.get("action", "create"),
-                purpose=entry.get("purpose", ""),
-                estimated_lines=entry.get("estimated_lines", 0),
-                depends_on=entry.get("depends_on", []),
-            ))
+        assistant_msg = response.get("choices", [{}])[0].get("message", {})
+        tool_calls = assistant_msg.get("tool_calls") or []
 
-        # Parse interface contracts
-        contracts = []
-        for c in consolidated.get("interface_contracts", []):
-            contracts.append(InterfaceContract(
-                component=c.get("component", ""),
-                provides=c.get("provides", []),
-                consumes=c.get("consumes", []),
-                invariants=c.get("invariants", []),
-            ))
+        result = None
+        if tool_calls:
+            for tc in tool_calls:
+                tc_result = dispatch_tool(
+                    tc["function"]["name"],
+                    json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                )
+                if isinstance(tc_result, str) and "__maestro_terminal__" in tc_result:
+                    result = json.loads(tc_result).get("payload")
+                    break
 
-        # Parse test strategy
-        test_strategy = []
-        for t in consolidated.get("test_strategy", []):
-            test_strategy.append(TestStrategyEntry(
-                component=t.get("component", ""),
-                test_file=t.get("test_file", ""),
-                test_cases=t.get("test_cases", []),
-                fixtures=t.get("fixtures", []),
-            ))
+        if result is None:
+            # Fallback
+            content = assistant_msg.get("content", "")
+            result, _ = json.JSONDecoder().raw_decode(content.lstrip())
 
-        # Parse implementation steps
-        steps = []
-        for s in consolidated.get("implementation_steps", []):
-            steps.append(ImplementationStep(
-                order=s.get("order", 0),
-                component=s.get("component", ""),
-                files=s.get("files", []),
-                description=s.get("description", ""),
-                depends_on=s.get("depends_on", []),
-                estimated_context_tokens=s.get("estimated_context_tokens", 0),
-            ))
+        return result, prompt_tokens, completion_tokens
+    except Exception as e:
+        logger.warning(f"[{AGENT_NAME}] Consolidation failed: %s. Using original design.", e)
+        return design, 0, 0
 
-        return PlanningResult(
-            task_id=self.task_id,
-            design_rationale=consolidated.get("design_rationale", ""),
-            file_manifest=file_manifest,
-            dependency_graph=consolidated.get("dependency_graph", {}),
-            interface_contracts=contracts,
-            test_strategy=test_strategy,
-            implementation_steps=sorted(steps, key=lambda s: s.order),
-            pitfalls_identified=pitfalls,
-            review_votes=review_votes,
-            best_of_n_designs=all_designs,
-            selected_design_index=selected_index,
-            confidence=80 if passed else 0,
-            prompt_tokens=self._total_prompt,
-            completion_tokens=self._total_completion,
-        )
 
-    def _store_result(self, result: PlanningResult) -> None:
-        """Persist PlanningResult to the database.
+def _planning_build_result(
+    task_id: str,
+    consolidated: dict,
+    all_designs: list[dict],
+    selected_index: int,
+    review_votes: list[Vote],
+    pitfalls: list[dict],
+    survey: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    passed: bool = True,
+) -> PlanningResult:
+    # Parse file manifest
+    file_manifest = []
+    for entry in consolidated.get("file_manifest", []):
+        file_manifest.append(FileManifestEntry(
+            path=entry.get("path", ""),
+            action=entry.get("action", "create"),
+            purpose=entry.get("purpose", ""),
+            estimated_lines=entry.get("estimated_lines", 0),
+            depends_on=entry.get("depends_on", []),
+        ))
 
-        If ``self.run_row_id`` is set (i.e. the caller pre-created an
-        ``in_progress`` row), update that row in-place so the row ID stays
-        stable.  Otherwise fall back to creating a new row (scheduler path).
-        """
-        kwargs = dict(
-            file_manifest=json.dumps([asdict(f) for f in result.file_manifest]),
-            dependency_graph=json.dumps(result.dependency_graph),
-            interface_contracts=json.dumps([asdict(c) for c in result.interface_contracts]),
-            test_strategy=json.dumps([asdict(t) for t in result.test_strategy]),
-            implementation_steps=json.dumps([asdict(s) for s in result.implementation_steps]),
-            pitfalls_identified=json.dumps(result.pitfalls_identified),
-            review_votes=json.dumps([
-                {"stage": v.stage, "verdict": v.verdict.value, "confidence": v.confidence,
-                 "justification": v.justification}
-                for v in result.review_votes
-            ]),
-            best_of_n_designs=json.dumps(result.best_of_n_designs),
-            selected_design_index=result.selected_design_index,
-            confidence=result.confidence,
-            prompt_tokens=result.prompt_tokens,
-            completion_tokens=result.completion_tokens,
-            status='active',
-        )
-        try:
-            if self.run_row_id is not None:
-                from app.database import update_planning_result
-                from app.database.session import SessionLocal as _SL
-                _db = _SL()
-                try:
-                    update_planning_result(_db, self.run_row_id, **kwargs)
-                finally:
-                    _db.close()
-            else:
-                from app.database import create_planning_result
-                create_planning_result(task_id=result.task_id, **kwargs)
-        except Exception as e:
-            logger.error(f"[{AGENT_NAME}] Failed to store result: %s", e)
+    # Parse interface contracts
+    contracts = []
+    for c in consolidated.get("interface_contracts", []):
+        contracts.append(InterfaceContract(
+            component=c.get("component", ""),
+            provides=c.get("provides", []),
+            consumes=c.get("consumes", []),
+            invariants=c.get("invariants", []),
+        ))
+
+    # Parse test strategy
+    test_strategy = []
+    for t in consolidated.get("test_strategy", []):
+        test_strategy.append(TestStrategyEntry(
+            component=t.get("component", ""),
+            test_file=t.get("test_file", ""),
+            test_cases=t.get("test_cases", []),
+            fixtures=t.get("fixtures", []),
+        ))
+
+    # Parse implementation steps
+    steps = []
+    for s in consolidated.get("implementation_steps", []):
+        steps.append(ImplementationStep(
+            order=s.get("order", 0),
+            component=s.get("component", ""),
+            files=s.get("files", []),
+            description=s.get("description", ""),
+            depends_on=s.get("depends_on", []),
+            estimated_context_tokens=s.get("estimated_context_tokens", 0),
+        ))
+
+    return PlanningResult(
+        task_id=task_id,
+        design_rationale=consolidated.get("design_rationale", ""),
+        file_manifest=file_manifest,
+        dependency_graph=consolidated.get("dependency_graph", {}),
+        interface_contracts=contracts,
+        test_strategy=test_strategy,
+        implementation_steps=sorted(steps, key=lambda s: s.order),
+        pitfalls_identified=pitfalls,
+        review_votes=review_votes,
+        best_of_n_designs=all_designs,
+        selected_design_index=selected_index,
+        confidence=80 if passed else 0,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    )
+
+
+def _planning_store_result(result: PlanningResult, run_row_id: int | None = None) -> None:
+    """Persist PlanningResult to the database.
+
+    If ``run_row_id`` is set, update that row in-place so the row ID stays
+    stable. Otherwise fall back to creating a new row (scheduler path).
+    """
+    kwargs = dict(
+        file_manifest=json.dumps([asdict(f) for f in result.file_manifest]),
+        dependency_graph=json.dumps(result.dependency_graph),
+        interface_contracts=json.dumps([asdict(c) for c in result.interface_contracts]),
+        test_strategy=json.dumps([asdict(t) for t in result.test_strategy]),
+        implementation_steps=json.dumps([asdict(s) for s in result.implementation_steps]),
+        pitfalls_identified=json.dumps(result.pitfalls_identified),
+        review_votes=json.dumps([
+            {"stage": v.stage, "verdict": v.verdict.value, "confidence": v.confidence,
+             "justification": v.justification}
+            for v in result.review_votes
+        ]),
+        best_of_n_designs=json.dumps(result.best_of_n_designs),
+        selected_design_index=result.selected_design_index,
+        confidence=result.confidence,
+        prompt_tokens=result.prompt_tokens,
+        completion_tokens=result.completion_tokens,
+        status='active',
+    )
+    try:
+        if run_row_id is not None:
+            from app.database import update_planning_result
+            from app.database.session import SessionLocal as _SL
+            _db = _SL()
+            try:
+                update_planning_result(_db, run_row_id, **kwargs)
+            finally:
+                _db.close()
+        else:
+            from app.database import create_planning_result
+            create_planning_result(task_id=result.task_id, **kwargs)
+    except Exception as e:
+        logger.error(f"[{AGENT_NAME}] Failed to store result: %s", e)
 
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# Public entry points
 # ---------------------------------------------------------------------------
 
 async def run_planning_survey(
@@ -1084,21 +964,24 @@ async def run_planning_survey(
     if project_path is not None:
         from app.agent.tools import set_task_git_cwd
         set_task_git_cwd(project_path)
-    pipeline = PlanningPipeline(
+
+    stage_cfg = _get_stage_cfg(task_id)
+    arch_ctx = _get_arch_ctx(project_name)
+    is_proof = _is_proof_task(task_title, task_description)
+
+    survey_summary = await _planning_codebase_survey(
         task_id=task_id,
         task_title=task_title,
         task_description=task_description,
-        all_tasks=[],
         llm_base_url=llm_base_url,
         llm_model=llm_model,
         llm_id=llm_id,
         budget_id=budget_id,
         max_context=max_context,
-        project_name=project_name,
-        project_root=project_path,
+        stage_cfg=stage_cfg,
+        is_proof=is_proof,
+        arch_ctx=arch_ctx,
     )
-    pipeline._is_proof = _is_proof_task(task_title, task_description)
-    survey_summary = await pipeline._stage_codebase_survey()
     try:
         from app.database import get_task as _get_task_hist
         _t = _get_task_hist(task_id)
@@ -1112,7 +995,6 @@ async def run_planning_survey(
             survey_summary += _hist_block
     except Exception:
         pass
-    is_proof = pipeline._is_proof
     is_simple = (
         not is_proof
         and not _is_unit_test_task(task_title, task_description)
@@ -1147,21 +1029,22 @@ async def run_pitfall_detection(
     if project_path is not None:
         from app.agent.tools import set_task_git_cwd
         set_task_git_cwd(project_path)
-    pipeline = PlanningPipeline(
+
+    stage_cfg = _get_stage_cfg(task_id)
+    arch_ctx = _get_arch_ctx(project_name)
+
+    return await _planning_pitfall_detection(
         task_id=task_id,
-        task_title=task_title,
-        task_description=task_description,
-        all_tasks=[],
+        design=winning_design,
+        survey=survey_summary,
         llm_base_url=llm_base_url,
         llm_model=llm_model,
         llm_id=llm_id,
         budget_id=budget_id,
-        max_context=max_context,
-        project_name=project_name,
-        project_root=project_path,
+        stage_cfg=stage_cfg,
+        is_proof=is_proof,
+        arch_ctx=arch_ctx,
     )
-    pipeline._is_proof = is_proof
-    return await pipeline._stage_pitfall_detection(winning_design, survey_summary)
 
 
 async def run_consolidation_and_store(
@@ -1186,30 +1069,34 @@ async def run_consolidation_and_store(
     if project_path is not None:
         from app.agent.tools import set_task_git_cwd
         set_task_git_cwd(project_path)
-    pipeline = PlanningPipeline(
+
+    stage_cfg = _get_stage_cfg(task_id)
+    arch_ctx = _get_arch_ctx(project_name)
+
+    consolidated, prompt_tokens, completion_tokens = await _planning_consolidation(
         task_id=task_id,
-        task_title=task_title,
-        task_description=task_description,
-        all_tasks=all_tasks,
+        design=winning_design,
+        pitfalls=pitfalls,
+        survey=survey_summary,
         llm_base_url=llm_base_url,
         llm_model=llm_model,
         llm_id=llm_id,
         budget_id=budget_id,
-        max_context=max_context,
-        project_name=project_name,
-        project_root=project_path,
+        stage_cfg=stage_cfg,
+        is_proof=is_proof,
+        arch_ctx=arch_ctx,
     )
-    pipeline._is_proof = is_proof
-    consolidated = await pipeline._stage_consolidation(winning_design, pitfalls, survey_summary)
-    result = pipeline._build_result(
+    result = _planning_build_result(
+        task_id=task_id,
         consolidated=consolidated,
         all_designs=[winning_design],
         selected_index=0,
         review_votes=[],
         pitfalls=pitfalls,
         survey=survey_summary,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
         passed=True,
     )
     result.survey_summary = survey_summary
-    pipeline._store_result(result)
-
+    _planning_store_result(result)
